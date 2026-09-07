@@ -1,0 +1,113 @@
+# issue: none
+# red_on: 2026-09-07, main @ 5f94a741: after `branch merge main into feature` reported fast_forward, feature's edges lacked a->c; merging feature back then dropped a->c from main
+# notes: from PR 630. `feature` writes its edge table three times, so its table
+# notes: version passes `main`'s. Merge `feature` into `main`, add an edge on
+# notes: `main`, merge `main` into `feature`: the adopted edge must be visible
+# notes: on `feature`. Then edit only a node on `feature` and merge back: `main`
+# notes: must keep the edge.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query add_b_c() {
+    insert Knows { from: "b", to: "c" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: feature
+query add_c_a() {
+    insert Knows { from: "c", to: "a" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: feature
+query drop_b_c() {
+    delete Knows where from = "b"
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query add_a_c_on_main() {
+    insert Knows { from: "a", to: "c" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- query branch: feature
+query edges_on_feature() {
+    match {
+        $x: Person
+        $x knows $y
+    }
+    return { $x.name, $y.name }
+}
+
+--- expect unordered
+{"x.name": "a", "y.name": "b"}
+{"x.name": "a", "y.name": "c"}
+{"x.name": "c", "y.name": "a"}
+
+--- expect shape
+x.name: String
+y.name: String
+
+--- mutate branch: feature
+query add_d_on_feature() {
+    insert Person { name: "d" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- restart
+
+--- query
+query edges_on_main() {
+    match {
+        $x: Person
+        $x knows $y
+    }
+    return { $x.name, $y.name }
+}
+
+--- expect unordered
+{"x.name": "a", "y.name": "b"}
+{"x.name": "a", "y.name": "c"}
+{"x.name": "c", "y.name": "a"}
+
+--- expect shape
+x.name: String
+y.name: String

@@ -1856,6 +1856,227 @@ async fn branch_merge_applies_node_insert_to_main() {
     assert_eq!(qr.num_rows(), 1);
 }
 
+/// Rust because the pins are native table versions, the target ref's physical
+/// HEAD, and the entry retained on an empty delta; the row-visible half is
+/// `merge_adopt_*.gqt`.
+#[tokio::test]
+async fn branch_merge_preserves_state_when_native_versions_differ() {
+    for branch_updates in [8, 2] {
+        for lazy_target in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let main = init_and_load(&dir).await;
+            main.branch_create("feature").await.unwrap();
+            let history_branch = if lazy_target { "main" } else { "feature" };
+            let history_updates = branch_updates + i64::from(lazy_target);
+            for age in 40..40 + history_updates {
+                main.mutate(
+                    history_branch,
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            let (source, target) = if lazy_target {
+                main.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    main.branch_merge("main", "feature").await.unwrap(),
+                    MergeOutcome::Merged
+                );
+                main.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+                )
+                .await
+                .unwrap();
+                main.branch_create_from(ReadTarget::branch("main"), "child")
+                    .await
+                    .unwrap();
+                ("feature", "child")
+            } else {
+                assert_eq!(
+                    main.branch_merge("feature", "main").await.unwrap(),
+                    MergeOutcome::FastForward
+                );
+                main.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+                )
+                .await
+                .unwrap();
+                ("main", "feature")
+            };
+            let target_native = graph_native_ref(uri, target).await;
+            let source_entry = snapshot_branch(&main, source)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            let target_entry = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            if branch_updates == 2 {
+                assert_eq!(
+                    source_entry.published_dataset_version, target_entry.published_dataset_version,
+                    "fixture must exercise equal numeric versions on different refs"
+                );
+            } else {
+                assert!(
+                    source_entry.published_dataset_version < target_entry.published_dataset_version,
+                    "fixture must exercise a lower source version"
+                );
+            }
+            assert_ne!(
+                source_entry.native_dataset_branch,
+                target_entry.native_dataset_branch
+            );
+            assert_eq!(
+                target_entry.native_dataset_branch.as_deref() == Some(target_native.as_str()),
+                !lazy_target
+            );
+            assert_eq!(
+                main.branch_merge(source, target).await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let merged_entry = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            assert!(
+                merged_entry.published_dataset_version > target_entry.published_dataset_version,
+                "{target}, {branch_updates} updates: changed rows must advance target's own version"
+            );
+            assert_eq!(
+                merged_entry.native_dataset_branch.as_deref(),
+                Some(target_native.as_str())
+            );
+            let reopened = Omnigraph::open(uri).await.unwrap();
+            for handle in [&main, &reopened] {
+                let result = handle
+                    .query(
+                        ReadTarget::branch(target),
+                        TEST_QUERIES,
+                        "get_person",
+                        &params(&[("$name", "Alice")]),
+                    )
+                    .await
+                    .unwrap();
+                let batch = result.concat_batches().unwrap();
+                assert_eq!(
+                    batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    50,
+                    "{target}, {branch_updates} updates: source value must survive adoption"
+                );
+            }
+            main.mutate(
+                target,
+                MUTATION_QUERIES,
+                "add_friend",
+                &params(&[("$from", "Alice"), ("$to", "Diana")]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                main.branch_merge(target, "main").await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let result = main
+                .query(
+                    ReadTarget::branch("main"),
+                    TEST_QUERIES,
+                    "get_person",
+                    &params(&[("$name", "Alice")]),
+                )
+                .await
+                .unwrap();
+            let batch = result.concat_batches().unwrap();
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                50,
+                "{target}, {branch_updates} updates: an unrelated edit must not roll back main"
+            );
+
+            let before_empty = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            let table_uri = format!("{uri}/{}", before_empty.dataset_path);
+            let head_before =
+                open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+                    .await
+                    .version()
+                    .version;
+            assert_eq!(
+                main.branch_merge("main", target).await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let reopened = Omnigraph::open(uri).await.unwrap();
+            for handle in [&main, &reopened] {
+                let after_empty = snapshot_branch(handle, target)
+                    .await
+                    .unwrap()
+                    .dataset("node:Person")
+                    .unwrap()
+                    .clone();
+                assert_eq!(after_empty.type_key, before_empty.type_key);
+                assert_eq!(after_empty.dataset_path, before_empty.dataset_path);
+                assert_eq!(
+                    after_empty.native_dataset_branch,
+                    before_empty.native_dataset_branch
+                );
+                assert_eq!(
+                    after_empty.published_dataset_version,
+                    before_empty.published_dataset_version
+                );
+                assert_eq!(after_empty.entity_count, before_empty.entity_count);
+                assert!(
+                    after_empty.same_registration(&before_empty),
+                    "empty adoption must retain the target's Lance manifest metadata"
+                );
+            }
+            assert_eq!(
+                open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+                    .await
+                    .version()
+                    .version,
+                head_before,
+                "empty adoption must not advance the physical target HEAD"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn branch_merge_records_single_latest_commit_with_two_parents() {
     let dir = tempfile::tempdir().unwrap();

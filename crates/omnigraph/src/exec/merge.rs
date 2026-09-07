@@ -3499,11 +3499,25 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(ids.value(row).to_string())
 }
 
+/// A source version at or below the target's must be written onto the target's
+/// lineage (`docs/dev/merge.md` §Table classification); rows still decide the delta.
+fn adopt_requires_target_lineage(
+    source_entry: &crate::db::DatasetEntry,
+    target_entry: Option<&crate::db::DatasetEntry>,
+) -> bool {
+    target_entry.is_some_and(|target| {
+        source_entry.published_dataset_version <= target.published_dataset_version
+    })
+}
+
 fn adopt_advances_head(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
     target_entry: Option<&crate::db::DatasetEntry>,
 ) -> bool {
+    if adopt_requires_target_lineage(source_entry, target_entry) {
+        return true;
+    }
     match (target_active, source_entry.native_dataset_branch.as_deref()) {
         // Source on a branch, target on main — delta applied onto main's lineage.
         (None, Some(_)) => true,
@@ -3512,23 +3526,13 @@ fn adopt_advances_head(
             target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
                 == Some(target_branch)
         }
-        // Source on main (pointer switch) or target doesn't own (fork): no advance.
         _ => false,
     }
 }
 
-/// Classify a table whose target state equals base (the adopt / fast-forward
-/// case). A proven insertion-only descendant becomes
-/// [`CandidateTableState::AdoptPureInserts`]; every other non-empty delta that
-/// advances target HEAD becomes [`CandidateTableState::AdoptWithDelta`] with
-/// its write payload pre-computed for recovery planning. Pointer switches and
-/// forks become [`CandidateTableState::AdoptSourceState`] and do not advance
-/// data HEAD.
-///
-/// The HEAD-advancing subcases mirror [`publish_adopted_source_state`]: source
-/// on a branch with the target either on main or owning the table. Computing the
-/// delta here (rather than inside the publish) is what closes the recovery gap —
-/// the classifier knows whether the publish will move Lance HEAD.
+/// Classify a table whose target equals base: a proven insertion-only descendant
+/// is `AdoptPureInserts`, any other HEAD-advancing delta (a source at or below the
+/// target's version included) is `AdoptWithDelta`, a newer pointer or fork is `AdoptSourceState`.
 async fn classify_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -3622,12 +3626,9 @@ async fn classify_general_adopt(
     }
 }
 
-/// What publishing a table's adopted source state does to `__manifest`.
-///
-/// An empty delta does not imply an empty publish: source and target can hold
-/// the same content at different Lance versions. Planning purely lets
-/// classification drop a table whose registration is already stored, which the
-/// registry guard would otherwise reject (#473).
+/// What publishing a table's adopted source state does to `__manifest`; planning
+/// lets classification drop a table whose registration is already stored (#473)
+/// or whose source version is at or below the target's.
 #[must_use = "the adopt plan decides whether this table is a merge candidate"]
 enum AdoptPublish {
     /// The planned registration is field-for-field the stored entry.
@@ -3642,11 +3643,8 @@ enum AdoptPublish {
     },
 }
 
-/// Plan what adopting the source's table state publishes, without an effect.
-///
-/// Reaching a branch-bearing arm means the delta was empty: the HEAD-advancing
-/// case is classified [`CandidateTableState::AdoptWithDelta`] and published by
-/// [`publish_adopted_delta`].
+/// Plan what adopting the source's table state publishes, without an effect;
+/// only a source newer than the target reaches a branch-bearing arm.
 fn plan_adopted_source_state(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
@@ -3740,10 +3738,11 @@ fn keep_publishing_candidate(
         CandidateTableState::AdoptSourceState {
             validation_delta: None
         }
-    ) && matches!(
-        plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
-        AdoptPublish::Nothing
-    );
+    ) && (adopt_requires_target_lineage(source_entry, target_entry)
+        || matches!(
+            plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
+            AdoptPublish::Nothing
+        ));
     if publishes_nothing {
         return None;
     }
@@ -3782,6 +3781,21 @@ mod adopt_plan_tests {
             entity_count: row_count,
             version_metadata: metadata(manifest_path),
         }
+    }
+
+    /// `adopt_requires_target_lineage` mirrors the projection fold's `>=`
+    /// (`db/manifest/state.rs`): a source at or below the target's version
+    /// advances HEAD; a newer source on main does not; no target entry, no rule.
+    #[test]
+    fn source_at_or_below_target_version_advances_head() {
+        let target = entry(4, Some("feature"), 3, "manifest-v4");
+        let below = entry(3, None, 3, "manifest-v3");
+        let equal = entry(4, None, 3, "manifest-v4-main");
+        let above = entry(5, None, 3, "manifest-v5");
+        assert!(adopt_advances_head(Some("feature"), &below, Some(&target)));
+        assert!(adopt_advances_head(Some("feature"), &equal, Some(&target)));
+        assert!(!adopt_advances_head(Some("feature"), &above, Some(&target)));
+        assert!(!adopt_advances_head(Some("feature"), &below, None));
     }
 
     /// The #473 shape: the source advanced two Lance versions on a branch and
@@ -3914,6 +3928,16 @@ async fn publish_adopted_source_state(
     )?;
 
     match plan_adopted_source_state(target_active, source_entry, target_entry, table_key) {
+        AdoptPublish::Pointer(update)
+            if target_entry.is_some_and(|current| {
+                update.published_dataset_version <= current.published_dataset_version
+            }) =>
+        {
+            Err(OmniError::manifest_internal(format!(
+                "branch merge table '{table_key}' plans a pointer at version {} at or below the target's registration; classification must route that onto the target lineage",
+                update.published_dataset_version
+            )))
+        }
         AdoptPublish::Pointer(update) => Ok(update),
         AdoptPublish::Fork {
             source_branch,
@@ -5058,6 +5082,7 @@ impl Omnigraph {
             }),
         };
         let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
+        let mut fenced_but_unpublished_table_keys: Vec<String> = Vec::new();
         let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
         let mut blob_table_keys = HashSet::new();
         let mut blob_selection = crate::table_store::PersistedBlobSelection::default();
@@ -5088,7 +5113,7 @@ impl Omnigraph {
             let has_blob = schema_has_blob(&schema_for_table_key(catalog, table_key)?)?;
             if !has_blob {
                 if same_manifest_state(base_entry, target_entry) {
-                    if let Some(candidate) = classify_adopt(
+                    match classify_adopt(
                         self,
                         catalog,
                         base_snapshot,
@@ -5100,7 +5125,10 @@ impl Omnigraph {
                     )
                     .await?
                     {
-                        candidates.insert(table_key.clone(), candidate);
+                        Some(candidate) => {
+                            candidates.insert(table_key.clone(), candidate);
+                        }
+                        None => fenced_but_unpublished_table_keys.push(table_key.clone()),
                     }
                 } else {
                     let table_walk_timing = crate::instrumentation::start_merge_timing(
@@ -5301,8 +5329,11 @@ impl Omnigraph {
                     )
                     .await?
                 };
-                if let Some(candidate) = candidate {
-                    candidates.insert(table_key.clone(), candidate);
+                match candidate {
+                    Some(candidate) => {
+                        candidates.insert(table_key.clone(), candidate);
+                    }
+                    None => fenced_but_unpublished_table_keys.push(table_key.clone()),
                 }
                 continue;
             }
@@ -5475,6 +5506,7 @@ impl Omnigraph {
 
         let expected_versions = candidates
             .keys()
+            .chain(fenced_but_unpublished_table_keys.iter())
             .filter_map(|table_key| {
                 let identity = target_snapshot
                     .dataset(table_key)
