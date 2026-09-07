@@ -137,6 +137,13 @@ when it changed unrelated data. A mismatch has no effect and exits with code
 missing branch from an explicit base. Overwrite is destructive and may require
 `--yes` for non-local storage.
 
+In a selected managed folder, implicit `load --graph <ID>` uses the separate
+cached data credential. It requires `change`, plus `branch_create` when
+`--from` is present. Managed loads bound input to 32 MiB, responses to 8 MiB,
+and one request to 300 seconds; uncertain writes are never automatically
+retried. See [managed bulk loading](managed-data.md#bulk-loading) for limits,
+permissions, ordinary addressing, and reconciliation.
+
 Change-feed commands, cursor checkpointing, and baseline recovery are described
 in [Changes and Change Feeds](../branching/changes.md).
 
@@ -303,7 +310,7 @@ context is present. API failures never trigger direct execution.
 
 ## Managed data access
 
-Use `cluster token` to cache scoped data authority, then `query` or `mutate`
+Use `cluster token` to cache scoped data authority, then `query`, `mutate`, or `load`
 with `--graph` from the managed folder. See [managed data access](managed-data.md)
 for permissions, offline behavior, expiry, and local credential clearing.
 

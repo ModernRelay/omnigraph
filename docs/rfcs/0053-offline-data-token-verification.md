@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-07
 discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
@@ -232,13 +232,13 @@ until expiry or trust retirement, and local clearing is not server revocation.
 Automation may use the explicit origin-bound control credential to mint into
 the same keychain; unattended raw-token consumers use the issuance API.
 
-Only implicitly addressed `query`, `mutate`, and `load` consult managed context in the
-exact current directory. An explicit `--server`, `--profile`, `--store`, or
+Only implicitly addressed `query`, `mutate`, and `load` consult managed context
+in the exact current directory. An explicit `--server`, `--profile`, `--store`, or
 `--cluster` retains ordinary addressing and command-applicability validation,
-without reading that context; a positional load URI does the same. Every other graph, storage, alias, or local
-command likewise retains its existing handler. This does not add managed
-transport support to those commands. Global `--direct` bypasses context as
-before, including for cluster commands.
+without reading that context; a positional load URI does the same. Every other
+graph, storage, alias, or local command retains its existing handler. This does
+not add managed transport support to those commands. Global `--direct` bypasses
+context as before, including for cluster commands.
 
 For implicit `query`/`mutate`/`load`, absent context leaves ordinary resolution
 unchanged; malformed context refuses. Valid context plus a nonempty
@@ -254,20 +254,19 @@ An unambiguous managed request requires explicit `--graph`, rejects explicit
 `--as`, and uses the separately cached data endpoint/credential. Missing,
 malformed, expired, or under-scoped credentials never fall through to static
 credentials, a profile, or direct storage. Legacy token settings never supply
-managed authority. Managed requests refuse redirects and have a 10-second
-deadline and 8 MiB response bound. Managed `load` uses the existing authenticated
-NDJSON endpoint with `change` authority, additionally requiring `branch_create`
-when `--from` is present; the server still intersects signed grants with Cedar
-and owns branch creation and graph publication. One managed load accepts at most
+managed authority. Managed queries and mutations refuse redirects and have a
+10-second deadline and 8 MiB response bound. Managed `load` uses the existing
+authenticated NDJSON endpoint with `change` authority, additionally requiring
+`branch_create` when `--from` is present; the server still intersects signed grants
+with Cedar and owns branch creation and graph publication. One managed load accepts at most
 32 MiB of UTF-8 input, retains the 8 MiB response bound, and uses a 300-second
 request deadline with a 10-second connection bound. The existing engine's keyed
 table row and parsed-byte limits remain unchanged. No load request is retried by
 the CLI: a timeout, interrupted response, or unverified receipt requires
 reconciliation of the target branch before a caller decides whether to retry.
 Ordinary direct and profile-based loading keep their existing transport.
-Cluster control dispatch and token issuance
-retain their existing scope requirements. New named managed connections are
-a separate change.
+Cluster control dispatch and token issuance retain their existing scope
+requirements. New named managed connections are a separate change.
 
 ## Invariants
 
@@ -371,6 +370,14 @@ None for the bounded wire and authorization contract. Implementation and
 qualification remain separate from acceptance.
 
 ## Decision log
+
+2026-09-07: Extended managed CLI routing to implicit `load`, preserving explicit
+ordinary targets and the compatibility repair's ambiguity rules. The existing
+authenticated NDJSON protocol, graph publication, and server policy owners are
+unchanged. This adds a 32 MiB input bound and a separate 300-second load deadline
+while retaining the 8 MiB response bound and requiring branch creation authority
+for `--from`. Local transport and permission evidence is separate from live
+managed corpus qualification.
 
 2026-09-06: The compatibility repair restores the three public struct shapes
 and isolates canonical-root validation in opt-in managed boot. This replaces

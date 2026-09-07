@@ -451,7 +451,49 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
         vec!["change", "m", "--cluster", "local"],
         vec!["query", "q", "--direct"],
         vec!["init", "--schema", "schema.pg", "file:///scratch"],
-        vec!["load", "--data", "data.jsonl", "--mode", "append"],
+        vec![
+            "load",
+            "--data",
+            "data.jsonl",
+            "--mode",
+            "append",
+            "--direct",
+        ],
+        vec![
+            "load",
+            "--data",
+            "data.jsonl",
+            "--mode",
+            "append",
+            "file:///scratch",
+        ],
+        vec![
+            "load",
+            "--data",
+            "data.jsonl",
+            "--mode",
+            "append",
+            "--store",
+            "file:///scratch",
+        ],
+        vec![
+            "load",
+            "--data",
+            "data.jsonl",
+            "--mode",
+            "append",
+            "--profile",
+            "legacy",
+        ],
+        vec![
+            "load",
+            "--data",
+            "data.jsonl",
+            "--mode",
+            "append",
+            "--server",
+            "legacy",
+        ],
         vec!["schema", "plan", "--schema", "schema.pg"],
         vec!["commit", "list"],
         vec!["graphs", "list"],
@@ -472,6 +514,91 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
             .is_none()
         );
     }
+}
+
+#[test]
+fn managed_load_requires_exact_graph_change_and_explicit_fork_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let context = context();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let store = MemoryStore::default();
+    let args = [
+        "omnigraph",
+        "load",
+        "--data",
+        "batch.jsonl",
+        "--mode",
+        "append",
+        "--graph",
+        "knowledge",
+    ];
+    let cli = Cli::try_parse_from(args).unwrap();
+    assert_eq!(
+        resolve(&cli, dir.path(), &store, || Ok(false))
+            .err()
+            .unwrap()
+            .body["type"],
+        "data_credential_required"
+    );
+    assert_eq!(
+        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
+            .err()
+            .unwrap()
+            .body["type"],
+        "managed_target_ambiguous"
+    );
+    for (actions, graph, from, allowed) in [
+        (vec!["read"], "knowledge", false, false),
+        (vec!["change"], "other", false, false),
+        (vec!["change"], "knowledge", false, true),
+        (vec!["branch_create"], "knowledge", true, false),
+        (vec!["change"], "knowledge", true, false),
+        (vec!["change", "branch_create"], "knowledge", true, true),
+    ] {
+        let mut cached = credential(&context, "https://data.example");
+        cached.grants[0].graph_id = graph.into();
+        cached.grants[0].actions = actions.into_iter().map(str::to_string).collect();
+        save(&store, &context, &cached);
+        let extra = if from {
+            vec!["--branch", "review", "--from", "main"]
+        } else {
+            vec![]
+        };
+        let cli = Cli::try_parse_from(args.into_iter().chain(extra)).unwrap();
+        let result = resolve(&cli, dir.path(), &store, || Ok(false));
+        if allowed {
+            assert!(result.unwrap().is_some());
+        } else {
+            assert_eq!(result.err().unwrap().body["type"], "data_scope_missing");
+        }
+    }
+    let cli = Cli::try_parse_from(args.into_iter().chain(["--as", "fake"])).unwrap();
+    assert_eq!(
+        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(false))
+            .err()
+            .unwrap()
+            .body["type"],
+        "managed_scope_conflict"
+    );
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    assert!(
+        resolve(&cli, &child, &NoCredentialAccess, || panic!(
+            "parent context was read"
+        ))
+        .unwrap()
+        .is_none()
+    );
+    std::fs::write(dir.path().join(".omnigraph/context"), "invalid").unwrap();
+    assert_eq!(
+        resolve(&cli, dir.path(), &NoCredentialAccess, || panic!(
+            "invalid context consulted defaults"
+        ))
+        .err()
+        .unwrap()
+        .body["type"],
+        "context_invalid"
+    );
 }
 
 #[test]
@@ -513,6 +640,8 @@ fn managed_data_issue_633_ambiguity_and_invalid_context_precede_credentials() {
 #[tokio::test]
 async fn managed_data_transport_refuses_redirect_and_bounds_body() {
     let target = IntentApiFixture::new(vec![]);
+    let batch = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(batch.path(), "{}\n").unwrap();
     let mut chunked = format!("{:x}\r\n", 8 * 1024 * 1024 + 1).into_bytes();
     chunked.extend(vec![b' '; 8 * 1024 * 1024 + 1]);
     chunked.extend_from_slice(b"\r\n0\r\n\r\n");
@@ -542,19 +671,34 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
             "8 MiB",
         ),
     ] {
-        let server = IntentApiFixture::new(vec![reply]);
-        let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-        let error = client
-            .query(
-                ReadTarget::Branch("main".into()),
-                "query q() {}",
-                Some("q"),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains(expected), "{error}");
-        server.assert_complete();
+        for loading in [false, true] {
+            let server = IntentApiFixture::new(vec![reply.clone()]);
+            let client =
+                GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+            let error = if loading {
+                client
+                    .load(
+                        "main",
+                        None,
+                        batch.path().to_str().unwrap(),
+                        crate::cli::CliLoadMode::Append,
+                    )
+                    .await
+                    .unwrap_err()
+            } else {
+                client
+                    .query(
+                        ReadTarget::Branch("main".into()),
+                        "query q() {}",
+                        Some("q"),
+                        None,
+                    )
+                    .await
+                    .unwrap_err()
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            server.assert_complete();
+        }
     }
     target.assert_complete();
 }
@@ -562,6 +706,8 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
 #[tokio::test]
 async fn managed_data_errors_redact_reflected_credentials_including_preconditions() {
     let encoded = DATA_TOKEN.replace('h', "\\u0068");
+    let batch = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(batch.path(), "{}\n").unwrap();
     for (status, body) in [
         (200, json!(DATA_TOKEN).to_string()),
         (401, format!("{{\"error\":\"rejected {encoded}\"}}")),
@@ -573,16 +719,15 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
             json!({"error":format!("rejected {DATA_TOKEN}"),"precondition_failure":{"expected":DATA_TOKEN,"actual":null}}).to_string(),
         ),
     ] {
-        let server = IntentApiFixture::new(vec![IntentReply {
-            status,
-            headers: vec![],
-            body: body.into_bytes(),
-        }]);
+      for loading in [false, true] {
+        let server = IntentApiFixture::new(vec![IntentReply { status, headers: vec![], body: body.as_bytes().to_vec() }]);
         let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-        let error = client
+        let error = if loading {
+            client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append).await.unwrap_err()
+        } else { client
             .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"))
             .await
-            .unwrap_err();
+            .unwrap_err() };
         let rendered = if status == 412 {
             serde_json::to_string(
                 &error.downcast_ref::<crate::helpers::PreconditionFailedCli>().unwrap().output,
@@ -597,6 +742,142 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         } else {
             assert!(rendered.contains("[redacted]"), "{rendered}");
         }
+        server.assert_complete();
+      }
+    }
+}
+
+#[tokio::test]
+async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let context = context();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let batch = dir.path().join("batch.jsonl");
+    let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
+    std::fs::write(&batch, ndjson).unwrap();
+    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
+    let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"actor_id":"principal:alice","commit":commit});
+    // This is a real response past the ordinary managed 10-second deadline.
+    // The request-construction owner separately pins load's 300-second ceiling.
+    let server = IntentApiFixture::with_response_delay(
+        vec![IntentReply::json(200, reply)],
+        std::time::Duration::from_millis(10_250),
+    );
+    let store = MemoryStore::default();
+    let mut cached = credential(&context, &server.origin);
+    cached.grants[0].actions = vec!["change".into(), "branch_create".into()];
+    save(&store, &context, &cached);
+    let cli = Cli::try_parse_from([
+        "omnigraph",
+        "load",
+        "--data",
+        batch.to_str().unwrap(),
+        "--graph",
+        "knowledge",
+        "--mode",
+        "append",
+        "--branch",
+        "review",
+        "--from",
+        "main",
+    ])
+    .unwrap();
+    let client = resolve(&cli, dir.path(), &store, || Ok(false))
+        .unwrap()
+        .unwrap();
+    let result = client
+        .load(
+            "review",
+            Some("main"),
+            batch.to_str().unwrap(),
+            crate::cli::CliLoadMode::Append,
+        )
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["commit"], commit);
+    assert_eq!(result["commit"]["actor_id"], "principal:alice");
+    assert_eq!(result["base_branch"], "main");
+    assert_eq!(result["branch_created"], true);
+    assert_eq!(result["total_entities"], 2);
+    assert_eq!(result["branch"], "review");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(
+        requests[0].path,
+        "/graphs/knowledge/load/ndjson?branch=review&mode=append&from=main"
+    );
+    assert_eq!(requests[0].headers["content-type"], "application/x-ndjson");
+    assert_eq!(
+        requests[0].headers["authorization"],
+        format!("Bearer {DATA_TOKEN}")
+    );
+    assert_eq!(requests[0].raw_body, ndjson.as_bytes());
+    assert!(!requests[0].headers.contains_key("x-actor-id"));
+    server.assert_complete();
+}
+
+#[tokio::test]
+async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_receipts() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let empty_server = IntentApiFixture::new(vec![]);
+    let client =
+        GraphClient::managed(&empty_server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    file.as_file().set_len(32 * 1024 * 1024 + 1).unwrap();
+    assert!(
+        client
+            .load(
+                "review",
+                Some("main"),
+                file.path().to_str().unwrap(),
+                crate::cli::CliLoadMode::Append
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("32 MiB")
+    );
+    std::fs::write(file.path(), [255]).unwrap();
+    assert!(
+        client
+            .load(
+                "review",
+                Some("main"),
+                file.path().to_str().unwrap(),
+                crate::cli::CliLoadMode::Append
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8")
+    );
+    empty_server.assert_complete();
+    std::fs::write(file.path(), "{}\n").unwrap();
+    for reply in [
+        IntentReply::json(500, json!({"error":"load failed"})),
+        IntentReply::json(429, json!({"error":"busy"})),
+        IntentReply::json(503, json!({"error":"recover first"})),
+        IntentReply {
+            status: 200,
+            headers: vec![("Content-Length".into(), "1000".into())],
+            body: b"{}".to_vec(),
+        },
+        IntentReply::json(200, json!({"not":"a receipt"})),
+    ] {
+        let server = IntentApiFixture::new(vec![reply]);
+        let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+        assert!(
+            client
+                .load(
+                    "review",
+                    Some("main"),
+                    file.path().to_str().unwrap(),
+                    crate::cli::CliLoadMode::Append
+                )
+                .await
+                .is_err()
+        );
         server.assert_complete();
     }
 }

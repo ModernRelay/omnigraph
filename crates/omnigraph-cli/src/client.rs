@@ -55,10 +55,43 @@ use crate::helpers::{
     apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, build_blob_http_client, build_http_client, is_remote_uri,
     legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
-    remote_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
-    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    remote_json_bounded, remote_response_json_bounded, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
+
+const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
+const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The engine owns parsed-table limits. This bound covers only the exact
+/// UTF-8 NDJSON body sent to the existing server route, before any request.
+fn read_managed_load_data(path: &str) -> Result<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MANAGED_LOAD_REQUEST_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MANAGED_LOAD_REQUEST_LIMIT {
+        bail!("managed load request exceeds 32 MiB; split the input into bounded batches");
+    }
+    String::from_utf8(bytes).map_err(|_| eyre!("managed load input must be valid UTF-8"))
+}
+
+fn load_request(
+    request: reqwest::RequestBuilder,
+    data: String,
+    managed: bool,
+) -> reqwest::RequestBuilder {
+    let request = if managed {
+        request.timeout(MANAGED_LOAD_TIMEOUT)
+    } else {
+        request
+    };
+    request
+        .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(data)
+}
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
@@ -122,6 +155,7 @@ impl GraphClient {
         Ok(Self::Remote {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(10))
                 .build()?,
@@ -686,32 +720,34 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
-                ..
+                response_limit,
             } => {
-                let data = std::fs::read_to_string(data)?;
+                let data = if response_limit.is_some() {
+                    read_managed_load_data(data)?
+                } else {
+                    std::fs::read_to_string(data)?
+                };
                 let mut query = vec![("branch", branch), ("mode", mode.as_str())];
                 if let Some(from) = from {
                     query.push(("from", from));
                 }
-                let request = apply_bearer_token(
-                    http.request(
-                        Method::POST,
-                        remote_url(base_url, &["load", "ndjson"], &query)?,
+                let request = load_request(
+                    apply_bearer_token(
+                        http.request(
+                            Method::POST,
+                            remote_url(base_url, &["load", "ndjson"], &query)?,
+                        ),
+                        token.as_deref(),
                     ),
-                    token.as_deref(),
-                )
-                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-                .body(data);
+                    data,
+                    response_limit.is_some(),
+                );
+                // One attempt only. A lost response may follow a committed
+                // load or a created branch; neither can be replayed blindly.
                 let response = request.send().await?;
-                let status = response.status();
-                let text = response.text().await?;
-                if !status.is_success() {
-                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
-                    }
-                    bail!("server returned {}: {}", status, text);
-                }
-                let output: GraphBatchLoadOutput = serde_json::from_str(&text)?;
+                let output: GraphBatchLoadOutput =
+                    remote_response_json_bounded(response, token.as_deref(), *response_limit)
+                        .await?;
                 Ok(load_output_from_graph_batch(
                     base_url,
                     mode.as_str(),
@@ -1619,6 +1655,43 @@ fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeed
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_load_request_has_its_own_deadline_and_exact_input_bound() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(32 * 1024 * 1024).unwrap();
+        assert_eq!(
+            read_managed_load_data(file.path().to_str().unwrap())
+                .unwrap()
+                .len(),
+            32 * 1024 * 1024
+        );
+        file.as_file().set_len(32 * 1024 * 1024 + 1).unwrap();
+        assert!(
+            read_managed_load_data(file.path().to_str().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("32 MiB")
+        );
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        for (managed, expected) in [
+            (true, Some(std::time::Duration::from_secs(300))),
+            (false, None),
+        ] {
+            let request = load_request(http.post("https://data.example"), "{}\n".into(), managed)
+                .build()
+                .unwrap();
+            assert_eq!(request.timeout().copied(), expected);
+            assert_eq!(
+                request.headers()[reqwest::header::CONTENT_TYPE],
+                "application/x-ndjson"
+            );
+            assert_eq!(request.body().unwrap().as_bytes(), Some(b"{}\n".as_slice()));
+        }
+    }
 
     fn content_range_headers(value: &'static str) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
