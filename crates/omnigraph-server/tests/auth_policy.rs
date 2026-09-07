@@ -170,6 +170,66 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         body,
         "branch list cannot probe a graph outside the signed grant",
     );
+
+    // Managed CLI load reuses this existing route. Failed fork+load admission
+    // must leave the branch registry and graph head alone.
+    let (_, before_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    let (_, before_load_commits) =
+        json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    let split_load_grant = tokens.token(json!([
+        {"graph_id":"default","actions":["change"]},
+        {"graph_id":"reports","actions":["branch_create"]}
+    ]));
+    for token in [&read, &write, &create, &split_load_grant] {
+        let (status, body) = json_response(&app, signed_load_request(token, true)).await;
+        assert_forbidden(
+            status,
+            body,
+            "load requires change and fork authority on the same graph",
+        );
+    }
+    let (_, after_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    let (_, after_load_commits) =
+        json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    assert_eq!(before_load_branches, after_load_branches);
+    assert_eq!(before_load_commits, after_load_commits);
+    let load_token =
+        tokens.token(json!([{"graph_id":"default","actions":["read","change","branch_create"]}]));
+    let (status, loaded) = json_response(&app, signed_load_request(&load_token, true)).await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["branch_created"], true);
+    assert_eq!(loaded["actor_id"], tokens.actor);
+    assert_eq!(loaded["commit"]["actor_id"], tokens.actor);
+    let (_, branch_commits) =
+        json_response(&app, get_request(&g("/commits?branch=load_review"), &read)).await;
+    assert_eq!(loaded["commit"], branch_commits["commits"][0]);
+    let (_, unchanged_main) =
+        json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    assert_eq!(unchanged_main, before_load_commits);
+    let (status, loaded_again) = json_response(&app, signed_load_request(&write, false)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "existing branch only needs change: {loaded_again}"
+    );
+    assert_eq!(loaded_again["branch_created"], false);
+}
+
+fn signed_load_request(token: &str, fork: bool) -> Request<Body> {
+    let path = if fork {
+        "/load/ndjson?branch=load_review&from=main&mode=merge"
+    } else {
+        "/load/ndjson?branch=load_review&mode=merge"
+    };
+    Request::builder()
+        .uri(g(path))
+        .method(Method::POST)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"SignedLoad\",\"age\":29}}\n",
+        ))
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -219,6 +279,23 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         status,
         StatusCode::FORBIDDEN,
         "a valid token must not enroll its actor in Cedar"
+    );
+    let load_token =
+        tokens.token(json!([{"graph_id":"default","actions":["change","branch_create"]}]));
+    let (_, before_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
+    for denied_app in [&app, &unknown_actor_app] {
+        let (status, body) =
+            json_response(denied_app, signed_load_request(&load_token, true)).await;
+        assert_forbidden(
+            status,
+            body,
+            "signed load cannot bypass missing Cedar permission",
+        );
+    }
+    let (_, after_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
+    assert_eq!(
+        before_load, after_load,
+        "Cedar denial cannot create the load branch"
     );
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await

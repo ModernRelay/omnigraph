@@ -49,7 +49,7 @@ pub(crate) struct Cli {
     /// Select a graph within a multi-graph scope: on a `--server` it appends
     /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
     /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`). Required for managed data queries, mutations, and token issuance.
+    /// `--store`). Required for managed data queries, mutations, loads, and token issuance.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
@@ -192,7 +192,7 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "format")]
         json: bool,
     },
-    /// Load data into a graph (local or remote)
+    /// Load data into a graph (local, remote, or the selected managed cluster)
     Load {
         /// Graph URI
         uri: Option<String>,
