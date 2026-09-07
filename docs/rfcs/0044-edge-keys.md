@@ -242,13 +242,14 @@ Six localized changes:
    is a pure function of the key) holds only because every id source
    derives, from canonical inputs.
 6. **Version acceptance.** `validate_schema_ir` moves from exact equality
-   (`schema_ir.rs:1067`) to accepting the supported version set {2, 3};
-   3 is the edge-key number, assigned here at acceptance. The
+   (`schema_ir.rs:1067`) to accepting the supported version set {2, 4};
+   4 is the edge-key number, assigned here at acceptance (3 is burned by
+   the withdrawn actor-provenance build, RFC 0054, and stays refused). The
    deliberate v1 rejection is unchanged (pinned by the v1-rejection test
    beside `validate_schema_ir`, `schema_ir.rs:1735`). One stamping rule
    owns every case: an accepted schema is stamped with the highest
    `ir_version` its declared features require. Everything else derives
-   from it: 3 is minted only when a schema declares an edge key; an
+   from it: 4 is minted only when a schema declares an edge key; an
    unkeyed schema accepted by the new binary stamps the base number, as
    does a fresh init without edge keys; and a schema apply that removes
    the last keyed edge type (by drop-and-re-add) re-stamps the base
@@ -294,16 +295,18 @@ introduced.
 
 - **Schema vintage.** Design change 6 carries the guarantees. To the
   operator of an existing graph: the new binary accepts both supported
-  numbers (2 and 3, with the deliberate v1 rejection
-  unchanged), so existing graphs open unchanged, and a schema that
+  numbers (2 and 4; the deliberate v1 rejection and RFC 0054's v3
+  refusal stay unchanged), so existing graphs open unchanged, and a schema that
   declares no edge key stamps the base number even when applied by
   the new binary (change 6's single stamping rule), so an unkeyed
   deployment stays downgrade-safe. Only a
-  schema that declares an edge key mints version 3; from that point an
+  schema that declares an edge key mints version 4; from that point an
   old binary refuses the graph with the existing hard error
   (`schema_ir.rs:1067`), so downgrade after keying fails closed instead of
   misreading identity. The edge-key number is fixed here at acceptance,
-  not at implementation time: 3. How the version composes with PR #546's
+  not at implementation time: 4 (renumbered from 3 on 2026-09-07, see the
+  decision log: 3 was stamped by the withdrawn actor-provenance build and
+  RFC 0054 refuses it). How the version composes with PR #546's
   system columns and later schema features is deferred to a dedicated
   versioning RFC, per change 6; RFC 0040's unresolved question 1 tracks
   it.
@@ -438,7 +441,8 @@ asserts gated 1 vs bound 2).
 
 None. The one settle-before-acceptance candidate (whether every edge key
 must include both endpoints) is settled in Design change 1: it must. The
-edge-key `ir_version` is fixed at acceptance: 3 (change 6, Compatibility).
+edge-key `ir_version` is fixed at acceptance: 4 (change 6, Compatibility;
+renumbered from 3 on 2026-09-07, decision log).
 The cross-feature versioning scheme is out of this RFC's scope and
 deferred to a dedicated versioning RFC, per change 6; RFC 0040's
 unresolved question 1 tracks it.
@@ -452,3 +456,10 @@ unresolved question 1 tracks it.
   express independent features, such as RFC 0040's spellings beside edge
   keys) is deliberately not solved in this RFC and is deferred to a
   dedicated versioning RFC.
+- 2026-09-07: edge-key number renumbered 3 to 4 at the implementation
+  PR's rebase (#593). Between acceptance and the rebase, the interim
+  actor-provenance implementation stamped version 3 and its withdrawal
+  (RFC 0054, Compatibility boundary) requires every version-3 graph to be
+  refused before recovery and never reinterpreted; `lifecycle.rs` pins
+  that refusal. A shared number would reinterpret those graphs as keyed
+  schemas. The number is still fixed here, not at implementation time.

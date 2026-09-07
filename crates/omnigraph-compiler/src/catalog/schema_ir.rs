@@ -28,8 +28,9 @@ use super::schema_shape::{
 pub const SCHEMA_IR_VERSION: u32 = 2;
 
 /// Minted only when a schema declares an edge `@key` (RFC 0044); unkeyed
-/// schemas keep stamping [`SCHEMA_IR_VERSION`].
-pub const SCHEMA_IR_VERSION_EDGE_KEYS: u32 = 3;
+/// schemas keep stamping [`SCHEMA_IR_VERSION`]. 3 is burned: the withdrawn
+/// actor-provenance build stamped it and RFC 0054 refuses it before recovery.
+pub const SCHEMA_IR_VERSION_EDGE_KEYS: u32 = 4;
 
 /// The one owner of "which stamped `ir_version`s this build opens": the
 /// contract validator and the engine's pre-recovery envelope gate both ask here.
