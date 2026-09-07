@@ -10603,12 +10603,15 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
 /// (D2) — without `CommitGraph::open_at_branch`, the recovery sweep
 /// would record the global head as the merge parent on a non-main
 /// target, and future merges between the same pair would lose
-/// already-up-to-date detection. Fast-forwards from an equal or lower native
-/// source version must also recover the delta written onto the target ref.
-#[tokio::test]
+/// already-up-to-date detection.
+#[test]
 #[serial]
 #[serial(branch_merge_phase_b)]
-async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
+fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
+    on_big_stack(branch_merge_phase_b_failure_recovered_on_non_main_target_inner);
+}
+
+async fn branch_merge_phase_b_failure_recovered_on_non_main_target_inner() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
@@ -10616,7 +10619,9 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         ("three-way", 0, "source_branch"),
         ("equal native versions", 2, "main"),
         ("lower source native version", 8, "main"),
+        ("lower source native version, lazy target", 8, "feature"),
     ] {
+        let lazy_target = source_branch == "feature";
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap().to_string();
         let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
@@ -10628,9 +10633,44 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         )
         .await
         .unwrap();
-        db.branch_create("target_branch").await.unwrap();
-        if target_updates == 0 {
-            // Preserve the divergent source/target merge coverage.
+        if lazy_target {
+            db.branch_create(source_branch).await.unwrap();
+            for age in 40..40 + target_updates + 1 {
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "alice")], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            db.mutate(
+                source_branch,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.branch_merge("main", source_branch).await.unwrap(),
+                omnigraph::db::MergeOutcome::Merged,
+                "{case}"
+            );
+            db.mutate(
+                source_branch,
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "alice")], &[("$age", 50)]),
+            )
+            .await
+            .unwrap();
+            db.branch_create("target_branch").await.unwrap();
+        } else {
+            db.branch_create("target_branch").await.unwrap();
+        }
+        if !lazy_target && target_updates == 0 {
             db.mutate(
                 "target_branch",
                 MUTATION_QUERIES,
@@ -10648,10 +10688,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
             )
             .await
             .unwrap();
-        } else {
-            // Replaying these updates onto main takes one native commit.
-            // Main then advances graph lineage while its table version remains
-            // equal to or lower than the target's independent native history.
+        } else if !lazy_target {
             for age in 40..40 + target_updates {
                 db.mutate(
                     "target_branch",
@@ -10717,8 +10754,6 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
             .unwrap();
         drop(db);
 
-        // The fixed effect set is confirmed, but graph publication has not
-        // happened. Recovery must publish it onto this non-main target.
         let operation_id = {
             let db = Omnigraph::open(&uri).await.unwrap();
             let _failpoint = ScopedFailPoint::new(
@@ -10789,7 +10824,9 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
             Some(source_head.as_str()),
             "{case}: recovery must retain the captured source parent"
         );
-        let expected = if target_updates == 0 {
+        let expected = if lazy_target {
+            vec![("Bob", 26), ("alice", 50)]
+        } else if target_updates == 0 {
             vec![("Bob", 40), ("Carol", 50), ("alice", 30)]
         } else {
             vec![("alice", 50)]

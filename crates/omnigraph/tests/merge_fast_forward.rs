@@ -1392,8 +1392,7 @@ async fn fast_forward_merge_streams_blob_columns() {
 /// so publication must use the update-only keyed stage introduced by #481.
 /// Overwrite retains the admitted external descriptor on the source branch;
 /// merge owns the copied bytes while leaving unchanged valid-empty and null
-/// siblings distinct. Cover both feature-to-main adoption and main-to-feature
-/// adoption when main's native version is lower than the owned target's.
+/// siblings distinct.
 #[tokio::test]
 async fn blob_changed_only_adopt_uses_known_present_update() {
     const SET_NOTE: &str = r#"
@@ -1476,9 +1475,6 @@ query set_note($title: String, $note: String) {
         .collect::<Vec<_>>()
         .join("\n");
         let (source, target) = if source_main {
-            // Churn only one note, then merge its net change into main. The owned
-            // feature table now has a higher native version than main while both
-            // have the same logical rows. Main's next overwrite remains below it.
             for step in 0..8 {
                 feature
                     .mutate(

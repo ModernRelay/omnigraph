@@ -29,7 +29,9 @@ refuse one beside it -- and no front offers a conditional merge today.
 A merge preserves changes already integrated into a branch when you later
 merge that branch back. For example, after merging a new edge from `main`
 into `review`, editing only a node on `review` and merging it into `main`
-preserves that edge.
+preserves that edge. A merge whose source and target tables reached the same
+version count on different branches fast-forwards; earlier releases refused
+it with a `table version … already exists` error.
 
 ## Outcomes
 

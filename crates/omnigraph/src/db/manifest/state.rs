@@ -26,6 +26,19 @@ pub struct DatasetEntry {
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
+impl DatasetEntry {
+    /// Field-for-field equal registration, the Lance manifest metadata included.
+    pub fn same_registration(&self, other: &DatasetEntry) -> bool {
+        self.identity == other.identity
+            && self.type_key == other.type_key
+            && self.dataset_path == other.dataset_path
+            && self.published_dataset_version == other.published_dataset_version
+            && self.native_dataset_branch == other.native_dataset_branch
+            && self.entity_count == other.entity_count
+            && self.version_metadata == other.version_metadata
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ManifestState {
     pub(super) version: u64,

@@ -1,0 +1,92 @@
+# issue: none
+# notes: from PR 630, the lazy-target arm. `main` writes its node table four
+# notes: times; `feature` writes once, takes `main` by a three-way merge, then
+# notes: sets a's age; `child` forks from `main` and never writes, so its node
+# notes: table is `main`'s at a version above `feature`'s. Merging `feature`
+# notes: into `child` must show feature's value on child.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":1}}
+{"type":"Person","data":{"name":"b","age":1}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate
+query a_2_on_main() {
+    update Person set { age: 2 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query a_3_on_main() {
+    update Person set { age: 3 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query a_4_on_main() {
+    update Person set { age: 4 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query a_5_on_main() {
+    update Person set { age: 5 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: feature
+query b_9_on_feature() {
+    update Person set { age: 9 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: merged
+
+--- mutate branch: feature
+query a_50_on_feature() {
+    update Person set { age: 50 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create child
+
+--- expect ok
+
+--- mutate
+branch merge feature into child
+
+--- expect outcome: fast_forward
+
+--- query branch: child
+query ages_on_child() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "a", "p.age": 50}
+{"p.name": "b", "p.age": 9}
+
+--- expect shape
+p.name: String
+p.age: I32
