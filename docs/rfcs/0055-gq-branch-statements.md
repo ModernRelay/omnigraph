@@ -95,7 +95,11 @@ inserted on both sides of a fork is duplicated by the merge),
 merge of an already-merged branch, closed: the harness driver re-merged a
 merged branch and the engine answered correctly), and the 2026-09-04
 nightly finding on
-seed 221206, where a merge re-adopted an edge a sibling merge had deleted.
+seed 221206, where a merge re-adopted an edge a sibling merge had deleted
+(filed as [#681](https://github.com/ModernRelay/omnigraph/issues/681),
+ruled on 2026-09-07 the multiset default of RFC 0044 for an unkeyed edge
+type: the engine answered correctly and the red state belonged to the
+harness model, decision log 2026-09-08).
 Each is a five-step story (fork, write, write, merge, read) that the format
 was built to hold and cannot.
 
@@ -1083,25 +1087,29 @@ each fix must turn green.
    an issue only for a failure witnessed on an unfixed build (`0045:84-93`),
    so the [#600](https://github.com/ModernRelay/omnigraph/issues/600)
    provenance is a `# notes:` line and the case carries no `# red_on:`.
-3. The seed-221206 re-adoption (issue not yet filed, `# issue: none`),
-   named `sibling_merge_readopts_deleted_edge.gqt` under the corpus's
-   short-name rule, the scenario the harness found on 2026-09-04, in
-   full; held out, red, the nightly's finding reproduced: `step 9 (query):
-   row mismatch: expected 1 rows, got 2`, the extra row `{"a.name": "w6",
-   "b.name": "charlie"}`, with the read after the `b1` merge green. The
-   two `affected:` lines were blessed from the run: the duplicate add on
-   `b0` counts `nodes=0 edges=1`, because the engine mints a row per edge
-   insert (edges carry no logical key, the mechanism the #583 body names),
-   so the add is a no-op at the set level and one row at the table level.
-   The two `expect unordered` bodies are the claim, each followed by the
+3. The seed-221206 re-adoption
+   ([#681](https://github.com/ModernRelay/omnigraph/issues/681), ruled the
+   multiset default on 2026-09-07; decision log 2026-09-08), named
+   `issue_681_sibling_merge_readopts_deleted_edge.gqt`, the scenario the
+   harness found on 2026-09-04, in full. It witnessed one red, under the
+   expectation the issue filed: `step 9 (query): row mismatch: expected 1 rows, got 2`,
+   the extra row `{"a.name": "w6", "b.name": "charlie"}`, with the read
+   after the `b1` merge green; that extra row is the engine's correct
+   answer, and the case pins it. The two `affected:` lines were blessed
+   from the run: the duplicate add on `b0` counts `nodes=0 edges=1`,
+   because the engine mints a row per edge insert (edges carry no logical
+   key, the mechanism the #583 body names), so the add is a no-op at the
+   set level and one row at the table level; `b1`'s delete removes the
+   inherited row, and the `b0` merge adopts the fresh one. The two
+   `expect unordered` bodies are the claim, each followed by the
    `--- expect shape` section RFC 0045 makes mandatory after a rows
    expect:
 
 ```
-# issue: none
-# red_on: 2026-09-04, DST nightly run #9, seed 221206, arm window:mutation.post_no_effect_pre_gate: main returned (w6, charlie) after the b0 merge; expected only (bob, w6)
-# notes: edge born on main, both forks inherit it, a duplicate add on b0 (zero effect at the set level),
-# notes: delete on b1, merge b1 (the delete reaches main), merge b0 (re-adopts the deleted edge).
+# issue: 681
+# red_on: 2026-09-04, DST nightly run #9, seed 221206, arm window:mutation.post_no_effect_pre_gate, under the expectation issue 681 filed (only (bob, w6) after the b0 merge): main returned (w6, charlie) too; ruled the multiset default 2026-09-07, and that row is the claim below
+# notes: edge born on main, both forks inherit it, a duplicate add on b0 (a second physical row, zero effect at the set level),
+# notes: delete on b1, merge b1 (the delete reaches main), merge b0 (adopts b0's fresh row: the pair is back with one row).
 
 --- schema
 node Person {
@@ -1189,6 +1197,7 @@ query edges_on_main_after_b0() {
 
 --- expect unordered
 {"a.name": "bob", "b.name": "w6"}
+{"a.name": "w6", "b.name": "charlie"}
 
 --- expect shape
 a.name: String
@@ -1460,3 +1469,27 @@ None.
   `run_branch_statement` live in
   `crates/omnigraph-server/src/handlers/dispatch.rs`; `run_query`,
   `run_mutate`, and every `#[utoipa::path]` shell stay in `handlers.rs`.
+- 2026-09-08, from the DST model fix for
+  [#681](https://github.com/ModernRelay/omnigraph/issues/681). The
+  seed-221206 re-adoption was ruled (2026-09-07, on the issue) the multiset
+  default of RFC 0044 for an unkeyed edge type: an insert of a pair the
+  branch already holds is a second physical row, a delete removes only the
+  rows it matched, and the merge walk keys on the row id, so the sibling's
+  delete removes the inherited row and the re-add's fresh row is adopted.
+  The engine answered correctly; the red state belonged to the harness
+  model, a set of pairs that cannot hold two rows for one pair. The case
+  keeps the issue-anchored name, `issue_681_sibling_merge_readopts_deleted_edge.gqt`
+  with `# issue: 681`: it is the regression evidence the fix-regression
+  gate reads for the PR that closes the issue, and its `# red_on:` records
+  the one red it witnessed, under the expectation the issue filed, with the
+  ruling in `# notes:`; it expects the pair BACK on `main` after the `b0`
+  merge and ships green with the model fix, not held out. No Rust test
+  accompanies it: the engine is the subject and the case observes it.
+  Its keyed twin `keyed_edge_delete_wins_over_readd.gqt` (`@key(src,
+  dst)`, [#593](https://github.com/ModernRelay/omnigraph/pull/593)) pins
+  the filed expectation, the pair staying deleted after both merges. This
+  supersedes, for this case only, "held out, red, the nightly's finding
+  reproduced", the `# issue: none` header and the fragment's `# red_on:`
+  expectation in item 3 of the first-cases entry above, "both are red and
+  held out of the corpus until their fixes" in the 2026-09-06 entry, and
+  the Motivation's listing of seed 221206 among the engine findings.
