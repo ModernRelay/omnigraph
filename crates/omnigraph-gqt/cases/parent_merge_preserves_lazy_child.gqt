@@ -1,0 +1,112 @@
+# issue: none
+# red_on: 2026-09-07, PR 630 at 47cb4c02: reading child after the owner's next write failed because historical published dataset version 3 was reclaimed.
+# notes: A child borrows its parent's materialized table before the parent is
+# notes: merged into main. Main changes that table and merges back; the parent's
+# notes: next write must preserve the child's earlier rows across a restart.
+# notes: Reduced from branching.rs::branch_merge_preserves_state_when_native_versions_differ;
+# notes: native-version and cleanup assertions remain in that Rust owner;
+# notes: recovery assertions remain in the existing Rust suites.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create parent
+
+--- expect ok
+
+--- mutate branch: parent
+query parent_first_write() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create child from parent
+
+--- expect ok
+
+--- mutate
+branch merge parent into main
+
+--- expect outcome: fast_forward
+
+--- mutate
+query change_main_after_merge() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into parent
+
+--- expect outcome: fast_forward
+
+--- query branch: parent
+query parent_received_main_change() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate branch: parent
+query owner_next_write() {
+    update Person set { age: 33 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: child
+query child_kept_borrowed_rows() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: parent
+query parent_kept_own_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":33}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query
+query main_kept_its_snapshot() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+
+--- expect shape
+p.name: String
+p.age: I32
