@@ -11,11 +11,12 @@ pub mod types;
 
 pub use catalog::schema_ir::{
     ConstraintIR, EdgeIR, EmbedSourceIR, FieldRefIR, InterfaceIR, NodeIR, PropertyIR,
-    PropertyRefIR, SCHEMA_IR_VERSION, SchemaIR, SchemaIdentityDiagnostic,
-    SchemaIdentityDiagnosticKind, SchemaIdentityDomain, SchemaResolution, StablePropertyId,
-    StableTypeId, SystemFieldRefIR, SystemFieldRole, TableIncarnationId, TypeRefIR,
-    initialize_schema_ir, resolve_schema_ir, schema_ir_hash, schema_ir_json, schema_ir_pretty_json,
-    schema_shape_from_ir, schema_shape_hash_from_ir, validate_schema_ir,
+    PropertyRefIR, SCHEMA_IR_VERSION, SCHEMA_IR_VERSION_EDGE_KEYS, SchemaIR,
+    SchemaIdentityDiagnostic, SchemaIdentityDiagnosticKind, SchemaIdentityDomain, SchemaResolution,
+    StablePropertyId, StableTypeId, SystemFieldRefIR, SystemFieldRole, TableIncarnationId,
+    TypeRefIR, initialize_schema_ir, is_supported_ir_version, resolve_schema_ir, schema_ir_hash,
+    schema_ir_json, schema_ir_pretty_json, schema_shape_from_ir, schema_shape_hash_from_ir,
+    validate_schema_ir,
 };
 pub use catalog::schema_plan::{
     DropMode, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,

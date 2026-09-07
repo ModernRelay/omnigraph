@@ -31,6 +31,12 @@ pub const SCHEMA_IR_VERSION: u32 = 2;
 /// schemas keep stamping [`SCHEMA_IR_VERSION`].
 pub const SCHEMA_IR_VERSION_EDGE_KEYS: u32 = 3;
 
+/// The one owner of "which stamped `ir_version`s this build opens": the
+/// contract validator and the engine's pre-recovery envelope gate both ask here.
+pub fn is_supported_ir_version(version: u32) -> bool {
+    version == SCHEMA_IR_VERSION || version == SCHEMA_IR_VERSION_EDGE_KEYS
+}
+
 /// The `ir_version` an accepted schema is stamped with: the highest version
 /// its declared features require.
 pub fn required_ir_version(ir: &SchemaIR) -> u32 {
@@ -1090,7 +1096,7 @@ pub(crate) fn constraint_from_ir(constraint: &ConstraintIR) -> Constraint {
 
 /// Fail closed on malformed or hand-authored identity authority.
 pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
-    if ir.ir_version != SCHEMA_IR_VERSION && ir.ir_version != SCHEMA_IR_VERSION_EDGE_KEYS {
+    if !is_supported_ir_version(ir.ir_version) {
         return invalid_ir(format!(
             "unsupported ir_version {} (supported {SCHEMA_IR_VERSION} and {SCHEMA_IR_VERSION_EDGE_KEYS})",
             ir.ir_version
