@@ -1,0 +1,353 @@
+# issue: none
+# notes: Passed on PR 662 at f57268dc before this refactor; guards unchanged serial-default semantics.
+# notes: Behavioral coverage for bounded merge preparation: four four-row tables.
+# notes: Both branches change every table. Alpha and Beta have disjoint edits;
+# notes: Gamma and Delta conflict, so refusal must not publish Alpha or Beta.
+# notes: Reopen and check every row on both branches. Then restore only the
+# notes: conflicting target cells to their base values, retain target-only edits,
+# notes: retry, and check the complete combined target and unchanged source.
+# notes: This feature case uses production width one. merge_cost.rs retains
+# notes: the Rust assertions for widths 1/2/4, conflict ordering, heads, lineage,
+# notes: sidecars, bounded resources, and cancellation. No pre-refactor red run
+# notes: is claimed for this unchanged logical contract.
+
+--- schema
+node Alpha {
+    name: String @key
+    value: I32
+}
+node Beta {
+    name: String @key
+    value: I32
+}
+node Gamma {
+    name: String @key
+    value: I32
+}
+node Delta {
+    name: String @key
+    value: I32
+}
+
+--- seed
+{"type":"Alpha","data":{"name":"row-0","value":0}}
+{"type":"Alpha","data":{"name":"row-1","value":0}}
+{"type":"Alpha","data":{"name":"row-2","value":0}}
+{"type":"Alpha","data":{"name":"row-3","value":0}}
+{"type":"Beta","data":{"name":"row-0","value":0}}
+{"type":"Beta","data":{"name":"row-1","value":0}}
+{"type":"Beta","data":{"name":"row-2","value":0}}
+{"type":"Beta","data":{"name":"row-3","value":0}}
+{"type":"Gamma","data":{"name":"row-0","value":0}}
+{"type":"Gamma","data":{"name":"row-1","value":0}}
+{"type":"Gamma","data":{"name":"row-2","value":0}}
+{"type":"Gamma","data":{"name":"row-3","value":0}}
+{"type":"Delta","data":{"name":"row-0","value":0}}
+{"type":"Delta","data":{"name":"row-1","value":0}}
+{"type":"Delta","data":{"name":"row-2","value":0}}
+{"type":"Delta","data":{"name":"row-3","value":0}}
+
+--- mutate
+branch create source
+
+--- expect ok
+
+--- mutate branch: source
+query source_edits() {
+    update Alpha set { value: 10 } where name = "row-0"
+    update Beta set { value: 110 } where name = "row-0"
+    update Gamma set { value: 210 } where name = "row-0"
+    update Delta set { value: 310 } where name = "row-0"
+}
+
+--- expect affected: nodes=4 edges=0
+
+--- mutate
+query target_edits() {
+    update Alpha set { value: 20 } where name = "row-1"
+    update Beta set { value: 120 } where name = "row-1"
+    update Gamma set { value: 220 } where name = "row-1"
+    update Delta set { value: 320 } where name = "row-1"
+    update Gamma set { value: 220 } where name = "row-0"
+    update Delta set { value: 320 } where name = "row-0"
+}
+
+--- expect affected: nodes=6 edges=0
+
+--- mutate
+branch merge source into main
+
+--- expect error: merge conflicts
+
+--- restart
+
+--- query branch: main
+query refused_main_alpha() {
+    match { $n: Alpha }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":0}
+{"n.name":"row-1","n.value":20}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: main
+query refused_main_beta() {
+    match { $n: Beta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":0}
+{"n.name":"row-1","n.value":120}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: main
+query refused_main_gamma() {
+    match { $n: Gamma }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":220}
+{"n.name":"row-1","n.value":220}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: main
+query refused_main_delta() {
+    match { $n: Delta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":320}
+{"n.name":"row-1","n.value":320}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query refused_source_alpha() {
+    match { $n: Alpha }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":10}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query refused_source_beta() {
+    match { $n: Beta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":110}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query refused_source_gamma() {
+    match { $n: Gamma }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":210}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query refused_source_delta() {
+    match { $n: Delta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":310}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- mutate
+query resolve_target_conflicts() {
+    update Gamma set { value: 0 } where name = "row-0"
+    update Delta set { value: 0 } where name = "row-0"
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+branch merge source into main
+
+--- expect outcome: merged
+
+--- restart
+
+--- query branch: main
+query merged_main_alpha() {
+    match { $n: Alpha }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":10}
+{"n.name":"row-1","n.value":20}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: main
+query merged_main_beta() {
+    match { $n: Beta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":110}
+{"n.name":"row-1","n.value":120}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: main
+query merged_main_gamma() {
+    match { $n: Gamma }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":210}
+{"n.name":"row-1","n.value":220}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: main
+query merged_main_delta() {
+    match { $n: Delta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":310}
+{"n.name":"row-1","n.value":320}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query merged_source_alpha() {
+    match { $n: Alpha }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":10}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query merged_source_beta() {
+    match { $n: Beta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":110}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query merged_source_gamma() {
+    match { $n: Gamma }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":210}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
+
+--- query branch: source
+query merged_source_delta() {
+    match { $n: Delta }
+    return { $n.name, $n.value }
+}
+
+--- expect unordered
+{"n.name":"row-0","n.value":310}
+{"n.name":"row-1","n.value":0}
+{"n.name":"row-2","n.value":0}
+{"n.name":"row-3","n.value":0}
+
+--- expect shape
+n.name: String
+n.value: I32
