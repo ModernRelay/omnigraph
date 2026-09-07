@@ -92,6 +92,12 @@ async fn s3_compatible_graph_lifecycle_works() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_branch_change_merge_flow_works() {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    use futures::TryStreamExt;
+    use omnigraph::instrumentation::{MergePreparationOptions, with_merge_preparation_options};
+
     let Some(uri) = s3_test_graph_uri("omnigraph-branching") else {
         eprintln!("skipping s3 branch test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
@@ -143,6 +149,231 @@ async fn s3_branch_change_merge_flow_works() {
         reopened.branch_list().await.unwrap(),
         vec!["main".to_string(), "feature".to_string()]
     );
+
+    // Continue the existing backend journey with four genuinely divergent
+    // tables. Each width gets independent branches from the same unchanged
+    // main state; four inserts per side keep the entire fixture tiny.
+    type Rows = BTreeMap<String, Vec<BTreeMap<String, Option<String>>>>;
+    #[derive(Debug, PartialEq, Eq)]
+    struct BranchState {
+        manifest: u64,
+        head: Option<String>,
+        lineage: Vec<String>,
+        // Dataset path, native lifetime, published version, actual native HEAD.
+        pins: BTreeMap<String, (String, Option<String>, u64, u64)>,
+        rows: Rows,
+    }
+
+    async fn branch_state(db: &Omnigraph, branch: &str) -> BranchState {
+        let snapshot = snapshot_branch(db, branch).await.unwrap();
+        let mut rows = BTreeMap::new();
+        let mut pins = BTreeMap::new();
+        for entry in snapshot.datasets() {
+            let dataset = snapshot.open_dataset(&entry.type_key).await.unwrap();
+            let mut stream = dataset.scan().try_into_stream().await.unwrap();
+            let mut table_rows = Vec::new();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                assert!(table_rows.len() + batch.num_rows() <= 8);
+                for row_index in 0..batch.num_rows() {
+                    let mut row = BTreeMap::new();
+                    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                        // Physical row versions are verified through table
+                        // pins; retain all logical columns, including IDs and
+                        // edge endpoints, with null distinct from empty text.
+                        if matches!(
+                            field.name().as_str(),
+                            "_row_created_at_version" | "_row_last_updated_at_version"
+                        ) {
+                            continue;
+                        }
+                        let value = if column.is_null(row_index) {
+                            None
+                        } else {
+                            Some(
+                                arrow_cast::display::array_value_to_string(
+                                    column.as_ref(),
+                                    row_index,
+                                )
+                                .unwrap(),
+                            )
+                        };
+                        row.insert(field.name().clone(), value);
+                    }
+                    assert!(row.get("id").and_then(Option::as_deref).is_some());
+                    if entry.type_key.starts_with("edge:") {
+                        assert!(row.get("src").and_then(Option::as_deref).is_some());
+                        assert!(row.get("dst").and_then(Option::as_deref).is_some());
+                    }
+                    table_rows.push(row);
+                }
+            }
+            table_rows.sort();
+            rows.insert(entry.type_key.clone(), table_rows);
+            let mut table_uri = format!(
+                "{}/{}",
+                db.uri().trim_end_matches('/'),
+                entry.dataset_path.trim_start_matches('/')
+            );
+            if let Some(native) = &entry.native_dataset_branch {
+                table_uri.push_str("/tree/");
+                table_uri.push_str(native);
+            }
+            pins.insert(
+                entry.type_key.clone(),
+                (
+                    entry.dataset_path.clone(),
+                    entry.native_dataset_branch.clone(),
+                    entry.published_dataset_version,
+                    lance::Dataset::open(&table_uri)
+                        .await
+                        .unwrap()
+                        .version()
+                        .version,
+                ),
+            );
+        }
+        BranchState {
+            manifest: snapshot.graph_manifest_version(),
+            head: snapshot
+                .graph_head((branch != "main").then_some(branch))
+                .map(str::to_string),
+            lineage: db
+                .list_commits(Some(branch))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|commit| commit.graph_commit_id)
+                .collect(),
+            pins,
+            rows,
+        }
+    }
+
+    let main_before = branch_state(&reopened, "main").await;
+    let feature_before = branch_state(&reopened, "feature").await;
+    for width in [1, 4] {
+        let source_branch = format!("general-source-{width}");
+        let target_branch = format!("general-target-{width}");
+        for branch in [&source_branch, &target_branch] {
+            reopened
+                .branch_create_from(ReadTarget::branch("main"), branch)
+                .await
+                .unwrap();
+        }
+        for (branch, side, age) in [
+            (&source_branch, "Source", 31),
+            (&target_branch, "Target", 32),
+        ] {
+            let inserts = format!(
+                r#"{{"type":"Person","data":{{"name":"General-{side}","age":{age}}}}}
+{{"type":"Company","data":{{"name":"General-{side}-Co"}}}}
+{{"edge":"Knows","from":"General-{side}","to":"Alice","data":{{"since":"2026-01-01"}}}}
+{{"edge":"WorksAt","from":"General-{side}","to":"General-{side}-Co"}}"#
+            );
+            reopened
+                .load(branch, &inserts, LoadMode::Append)
+                .await
+                .unwrap();
+        }
+        let source_before = branch_state(&reopened, &source_branch).await;
+        let target_before = branch_state(&reopened, &target_branch).await;
+        let mut expected = target_before.rows.clone();
+        for (key, source_rows) in &source_before.rows {
+            let merged_rows = expected.get_mut(key).unwrap();
+            for row in source_rows {
+                if let Some(existing) = merged_rows.iter().find(|other| other["id"] == row["id"]) {
+                    assert_eq!(existing, row, "shared base row changed unexpectedly");
+                } else {
+                    merged_rows.push(row.clone());
+                }
+            }
+            merged_rows.sort();
+        }
+        assert_eq!(expected.len(), 4);
+        assert_eq!(expected.values().map(Vec::len).sum::<usize>(), 20);
+
+        let probes = MergeWriteProbes::default();
+        let started = Instant::now();
+        let outcome = with_merge_write_probes(
+            probes.clone(),
+            with_merge_preparation_options(
+                MergePreparationOptions {
+                    width,
+                    additional_bytes: 128 * 1024 * 1024,
+                },
+                Box::pin(reopened.branch_merge(&source_branch, &target_branch)),
+            ),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, MergeOutcome::Merged);
+        let preparation = probes.merge_preparation_snapshot();
+        assert_eq!(preparation.admitted, 4, "{preparation:?}");
+        assert_eq!(preparation.collected, 4, "{preparation:?}");
+        assert_eq!(preparation.peak_active, width as u64, "{preparation:?}");
+        assert_eq!(
+            preparation.peak_uncollected, width as u64,
+            "{preparation:?}"
+        );
+        assert_eq!(preparation.discarded, 0, "{preparation:?}");
+        assert_eq!(preparation.budget_fallbacks, 0, "{preparation:?}");
+        assert_eq!(
+            preparation.active + preparation.ready + preparation.uncollected,
+            0
+        );
+        assert_eq!(preparation.accounted_bytes, 0, "{preparation:?}");
+        assert_eq!(preparation.scratch_owners, 0, "{preparation:?}");
+        assert_eq!(preparation.scratch_bytes, 0, "{preparation:?}");
+        assert!(
+            probes.completed_full_walk_classification_calls()
+                + probes.completed_lineage_classification_calls()
+                >= 4,
+            "all four tables must take general reconciliation"
+        );
+        assert_eq!(probes.proven_insert_history_read_calls(), 0);
+
+        let fresh = Omnigraph::open(&uri).await.unwrap();
+        let target_after = branch_state(&fresh, &target_branch).await;
+        assert_eq!(target_after.rows, expected);
+        assert_eq!(target_after.manifest, target_before.manifest + 1);
+        assert_ne!(target_after.head, target_before.head);
+        for (key, (path, native, version, head)) in &target_before.pins {
+            let after = &target_after.pins[key];
+            assert_eq!((&after.0, &after.1), (path, native));
+            assert_eq!(after.2, version + 1);
+            assert_eq!(after.3, head + 1);
+        }
+        assert_eq!(branch_state(&fresh, &source_branch).await, source_before);
+        assert_eq!(branch_state(&fresh, "main").await, main_before);
+        assert_eq!(branch_state(&fresh, "feature").await, feature_before);
+
+        // Actual configured-backend timings are supplemental diagnostics. They
+        // neither assert a speedup nor claim wire-request counts or a qualified
+        // release benchmark; setup and exact state verification are untimed.
+        eprintln!(
+            "S3_MERGE_PREPARATION_DIAGNOSTIC {}",
+            serde_json::json!({
+                "diagnostic_only": true,
+                "backend": "configured-s3-compatible",
+                "width": width,
+                "tables": 4,
+                "merged_rows": 20,
+                "elapsed_us": elapsed.as_micros(),
+                "peak_active": preparation.peak_active,
+                "peak_uncollected": preparation.peak_uncollected,
+                "peak_accounted_bytes": preparation.peak_accounted_bytes,
+                "budget_fallbacks": preparation.budget_fallbacks,
+                "phases": probes.merge_timing_snapshot().into_iter().map(|phase| {
+                    serde_json::json!({
+                        "phase": phase.phase,
+                        "total_us": phase.total_us,
+                        "interval_count": phase.interval_count,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

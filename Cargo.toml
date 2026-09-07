@@ -43,9 +43,9 @@ datafusion-functions-aggregate = "54"
 # late-payload KNN ordering fence remain required; see docs/dev/lance.md.
 lance = { version = "=11.0.0", default-features = false, features = ["aws", "azure"] }
 lance-core = "=11.0.0"
-# lance-io + rand: consumed only by omnigraph-dst (fault injection at the
-# Lance IO seam; the harness PRNG seeds).
+# Native merge scan scheduling and the DST fault-injection seam.
 lance-io = { version = "=11.0.0", default-features = false }
+# The harness PRNG seeds.
 rand = "0.9"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
 lance-select = "=11.0.0"

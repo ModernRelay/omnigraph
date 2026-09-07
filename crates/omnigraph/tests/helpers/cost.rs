@@ -41,6 +41,9 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
 
+#[path = "request_delay.rs"]
+pub mod request_delay;
+
 /// Open a Lance dataset with its object-store tracker installed before the
 /// first manifest load. Cost fixtures must use this seam for cold-open evidence;
 /// wrapping an already-open handle misses latest-manifest resolution entirely.
@@ -481,7 +484,9 @@ tokio::task_local! {
 pub async fn cost_harness<F: Future>(body: F) -> F::Output {
     let meter = GraphIoMeter::default();
     let probes = QueryIoProbes {
-        manifest_wrapper: Some(Arc::new(meter.manifest.clone()) as Arc<dyn WrappingObjectStore>),
+        manifest_wrapper: Some(request_delay::wrap_counter(Arc::new(
+            meter.manifest.clone(),
+        ))),
         ..Default::default()
     };
     // Box the body so the (large) per-test future lives on the heap. Wrapping a whole
@@ -561,8 +566,8 @@ impl OpProbes {
             projection_identity_rows: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
-            manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
-            table_wrapper: Some(Arc::new(h.table.clone()) as Arc<dyn WrappingObjectStore>),
+            manifest_wrapper: Some(request_delay::wrap_counter(Arc::new(h.manifest.clone()))),
+            table_wrapper: Some(request_delay::wrap_counter(Arc::new(h.table.clone()))),
             probe_count: Arc::clone(&h.probe_count),
             data_open_count: Arc::clone(&h.data_open_count),
             internal_open_count: Arc::clone(&h.internal_open_count),

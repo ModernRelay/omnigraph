@@ -27,6 +27,10 @@
 //!   [`OmniError::MergeConflicts`] error), and
 //! * the affected graph state on `main` after a successful merge.
 //!
+//! Every executable cell runs at preparation widths 1, 2, and 4, using a
+//! fresh copy of this same tiny fixture for each width. Widths run sequentially;
+//! actual multi-worker overlap is proved by the scalar merge-cost owner.
+//!
 //! `branch_merge(source, target)` is directional: target acts as the merge
 //! base anchor while source's diff is replayed. The matrix already
 //! enumerates both `(L, R)` and `(R, L)` as independent cells (e.g.
@@ -49,6 +53,7 @@ use std::time::Instant;
 use helpers::{count_rows, mixed_params, mutate_branch, params, query_main};
 use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::error::{MergeConflictKind, OmniError};
+use omnigraph::instrumentation::{MergePreparationOptions, with_merge_preparation_options};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 // ─── Fixture ────────────────────────────────────────────────────────────────
@@ -1006,8 +1011,8 @@ fn check_outcome(label: &str, expected: &Expected, actual: &ActualOutcome) {
 /// directional, and the `(Noop, AddNode)` vs `(AddNode, Noop)` split is
 /// exactly the kind of pair that lives in two distinct cells (one expects
 /// `AlreadyUpToDate`, the other expects `FastForward`).
-async fn run_cell(case: &MergeCase) -> DirectionResult {
-    let label = format!("{}×{}", case.left.label(), case.right.label());
+async fn run_cell(case: &MergeCase, width: usize) -> DirectionResult {
+    let label = format!("width={width}:{}×{}", case.left.label(), case.right.label());
 
     if matches!(case.expected, Expected::Unsupported { .. }) {
         return DirectionResult {
@@ -1023,8 +1028,21 @@ async fn run_cell(case: &MergeCase) -> DirectionResult {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_pair_truth_table() {
+    for width in [1, 2, 4] {
+        with_merge_preparation_options(
+            MergePreparationOptions {
+                width,
+                additional_bytes: 128 * 1024 * 1024,
+            },
+            run_truth_table_at_width(width),
+        )
+        .await;
+    }
+}
+
+async fn run_truth_table_at_width(width: usize) {
     let start = Instant::now();
     let mut total_cells = 0_usize;
     let mut executable_cells = 0_usize;
@@ -1040,7 +1058,7 @@ async fn merge_pair_truth_table() {
             } else {
                 executable_cells += 1;
             }
-            let result = run_cell(&case).await;
+            let result = run_cell(&case, width).await;
             if !matches!(result.outcome, ActualOutcome::Skipped) {
                 directions_run += 1;
             }
@@ -1049,7 +1067,7 @@ async fn merge_pair_truth_table() {
 
     let elapsed = start.elapsed();
     println!(
-        "merge truth table: {} cells total ({} executable, {} unsupported), {} executions in {:.2}s",
+        "merge truth table width={width}: {} cells total ({} executable, {} unsupported), {} executions in {:.2}s",
         total_cells,
         executable_cells,
         unsupported_cells,
@@ -1065,6 +1083,10 @@ async fn merge_pair_truth_table() {
     assert_eq!(
         unsupported_cells, 51,
         "expected 51 cells involving dropProperty/addLabel/removeLabel"
+    );
+    assert_eq!(
+        directions_run, 49,
+        "every executable cell must run at preparation width {width}"
     );
     // No wall-clock assertion here: `elapsed` is logged above for visibility, but
     // a fixed time budget in a correctness test flakes under parallel test load

@@ -27,7 +27,10 @@ use helpers::{
 };
 use lance::Dataset;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use omnigraph::instrumentation::{
+    MergePreparationOptions, MergeWriteProbes, with_merge_preparation_options,
+    with_merge_write_probes,
+};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 /// `Diana` has no outgoing `Knows` in the fixture, so adding one edge from her
@@ -563,6 +566,19 @@ async fn branch_whose_edits_net_to_zero_merges_and_records_its_lineage() {
 /// merge commit and nothing else.
 #[tokio::test]
 async fn net_zero_merge_advances_the_manifest_once_and_moves_no_table() {
+    for width in [1, 2, 4] {
+        with_merge_preparation_options(
+            MergePreparationOptions {
+                width,
+                additional_bytes: 128 * 1024 * 1024,
+            },
+            assert_net_zero_merge_advances_the_manifest_once_and_moves_no_table(),
+        )
+        .await;
+    }
+}
+
+async fn assert_net_zero_merge_advances_the_manifest_once_and_moves_no_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
@@ -666,6 +682,19 @@ async fn net_zero_branch_merges_into_a_target_that_moved() {
 /// table and a table with a real delta; the real delta still lands.
 #[tokio::test]
 async fn merge_publishes_a_real_delta_alongside_a_net_zero_table() {
+    for width in [1, 2, 4] {
+        with_merge_preparation_options(
+            MergePreparationOptions {
+                width,
+                additional_bytes: 128 * 1024 * 1024,
+            },
+            assert_merge_publishes_a_real_delta_alongside_a_net_zero_table(),
+        )
+        .await;
+    }
+}
+
+async fn assert_merge_publishes_a_real_delta_alongside_a_net_zero_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
