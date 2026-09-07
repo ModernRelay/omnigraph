@@ -271,9 +271,9 @@ impl ScanTuning<'_> {
     /// the scan completes (partitions ranked/searched, bytes, IOPS). A
     /// scan-input observation, not an ordering decision.
     ///
-    /// INPUT CONTRACT: honored on the unordered `scan_stream_with` path
-    /// only; `execute_bounded_ordered_scan` builds its own plan from the
-    /// scanner and drops the callback.
+    /// INPUT CONTRACT: honored on the ordinary unordered `scan_stream_with`
+    /// path only; readahead execution and ordered scans build their own plans
+    /// from the scanner and drop the callback.
     pub(crate) fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
         self.scanner.scan_stats_callback(callback);
         self

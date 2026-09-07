@@ -60,7 +60,7 @@ jobs inside the calling operation. Each job returns private candidates and
 conflicts; the collector preserves table order and the existing shared validator
 checks the combined result. Blob descriptor and materialization phases remain
 ordered barriers. Production stays serial until the resource and cancellation
-gates in [RFC 0054](../rfcs/0054-bounded-merge-preparation.md) pass; scoped test
+gates in [RFC 0057](../rfcs/0057-bounded-merge-preparation.md) pass; scoped test
 controls exercise widths two and four.
 
 Parallel attempts share a 128 MiB allowance for controlled speculative buffers
