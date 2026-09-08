@@ -196,7 +196,7 @@ impl std::fmt::Display for CompOp {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Now,
     PropAccess {
@@ -239,6 +239,30 @@ pub enum Expr {
     AliasRef(String),
 }
 
+/// Lance's search output columns, appended under the target's prefix
+/// (`{var}._distance` for `nearest`, `{var}._score` for `bm25`) and reserved
+/// by `schema::is_reserved_search_output_column`.
+pub const DISTANCE_COLUMN: &str = "_distance";
+/// See [`DISTANCE_COLUMN`].
+pub const SCORE_COLUMN: &str = "_score";
+
+impl Expr {
+    /// The `(binding, column)` a projected rank expression reads: the score
+    /// the executed retrieval wrote for that binding (RFC 0047 §Metric
+    /// projection). `None` for every expression that is not a single-source
+    /// rank expression over a property.
+    pub fn score_column(&self) -> Option<(&str, &'static str)> {
+        match self {
+            Expr::Nearest { variable, .. } => Some((variable, DISTANCE_COLUMN)),
+            Expr::Bm25 { field, .. } => match field.as_ref() {
+                Expr::PropAccess { variable, .. } => Some((variable, SCORE_COLUMN)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
     Count,
@@ -260,7 +284,7 @@ impl std::fmt::Display for AggFunc {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
     String(String),

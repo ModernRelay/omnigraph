@@ -122,8 +122,16 @@ distance and `bm25(...)` by descending relevance score, so the score (never
 any internal scan or traversal order) is what the row order means, including
 through multi-hop traversals. Keys after the search function apply as
 secondary sorts before the id tie-breaker; the search function itself must
-lead the order clause. Aggregated queries are outside search ordering: group
-results are not score-ranked. One bound on the tie-break: a `bm25()` ordering
+lead the order clause. The score is also a result value: `return { $d.slug,
+nearest($d.vector, $v) as score }` returns the distance the ordering used, and
+`bm25(...) as score` the relevance score, provided the projected expression
+repeats the leading `order` key (`T33`); without an alias the column is
+`d._distance` or `d._score`. A rank expression under an aggregate (`T32`),
+`rrf(...)` in `return` (`T37`, until the fused score becomes a column), and
+the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
+(`T35`, they belong in `match`) are refused at compile time. Aggregated
+queries are outside search ordering: group
+results are not score-ranked and cannot project a score (`T9`). One bound on the tie-break: a `bm25()` ordering
 with no secondary keys reads a bounded set of top-scoring matches, so among
 rows tied exactly at that bound's cut, which rows enter the result follows
 the scan bound rather than entity ids.

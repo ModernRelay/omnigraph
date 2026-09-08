@@ -71,7 +71,7 @@ pub fn lower_query(
         .return_clause
         .iter()
         .map(|p| IRProjection {
-            expr: lower_expr(&p.expr, &param_names),
+            expr: lower_projection(&p.expr, &param_names),
             alias: p.alias.clone(),
         })
         .collect();
@@ -685,6 +685,19 @@ fn expr_var(expr: &Expr) -> Option<String> {
             .or_else(|| k.as_deref().and_then(expr_var)),
         Expr::Aggregate { arg, .. } => expr_var(arg),
         _ => None,
+    }
+}
+
+/// A projected rank expression lowers to the score column the retrieval
+/// appends under its binding (`Expr::score_column`); typecheck's T33 has
+/// already required `order` to execute that retrieval.
+fn lower_projection(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
+    match expr.score_column() {
+        Some((variable, property)) => IRExpr::PropAccess {
+            variable: variable.to_string(),
+            property: property.to_string(),
+        },
+        None => lower_expr(expr, param_names),
     }
 }
 
