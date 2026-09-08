@@ -4862,7 +4862,10 @@ impl Omnigraph {
                         self.branch_list()
                             .await?
                             .into_iter()
-                            .filter(|branch| !merging_branches.contains(&Some(branch.as_str())))
+                            .filter(|branch| {
+                                !merging_branches.contains(&Some(branch.as_str()))
+                                    && !(branch == "main" && merging_branches.contains(&None))
+                            })
                             .collect(),
                     );
                 }
