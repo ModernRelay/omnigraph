@@ -43,12 +43,22 @@ fn help_groups_commands_by_capability() {
         "capability legend (after_help) missing from --help:\n{stdout}"
     );
 
-    // The Commands list precedes the legend, so first occurrences sit in the
-    // list and must appear in order: an `any` data verb, then a `direct` verb,
-    // then the `control` verb.
+    // Match command names in the Commands list, not words in descriptions or
+    // the capability legend.
+    let commands: Vec<_> = stdout
+        .split_once("Commands:\n")
+        .and_then(|(_, tail)| tail.split_once("\n\n"))
+        .unwrap_or_else(|| panic!("Commands list missing from --help:\n{stdout}"))
+        .0
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter(|line| !line.starts_with(' '))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
     let pos = |needle: &str| {
-        stdout
-            .find(needle)
+        commands
+            .iter()
+            .position(|command| *command == needle)
             .unwrap_or_else(|| panic!("'{needle}' not found in --help:\n{stdout}"))
     };
     assert!(

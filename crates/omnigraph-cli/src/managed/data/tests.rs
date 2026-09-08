@@ -438,39 +438,196 @@ impl Store for NoCredentialAccess {
 
 #[test]
 fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
-    let dir = tempfile::tempdir().unwrap();
-    super::super::save_context(dir.path(), &context()).unwrap();
-    // An unreadable-as-context object makes an accidental context read fail;
-    // the ambient callback and store also fail if either is consulted.
-    std::fs::remove_file(dir.path().join(".omnigraph/context")).unwrap();
-    std::fs::create_dir(dir.path().join(".omnigraph/context")).unwrap();
-    for args in [
-        vec!["query", "q", "--server", "legacy"],
-        vec!["read", "q", "--profile", "legacy"],
-        vec!["mutate", "--store", "file:///scratch", "-e", "source"],
-        vec!["change", "m", "--cluster", "local"],
-        vec!["query", "q", "--direct"],
-        vec!["init", "--schema", "schema.pg", "file:///scratch"],
-        vec!["load", "--data", "data.jsonl", "--mode", "append"],
-        vec!["schema", "plan", "--schema", "schema.pg"],
-        vec!["commit", "list"],
-        vec!["graphs", "list"],
-        vec!["alias", "people"],
-        vec!["queries", "list"],
-        vec!["queries", "validate"],
-        vec!["lint", "--schema", "schema.pg", "--query", "q.gq"],
-        vec!["snapshot"],
-        vec!["branch", "list"],
-        vec!["cluster", "status"],
-    ] {
-        let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
-        assert!(
-            resolve(&cli, dir.path(), &NoCredentialAccess, || {
-                panic!("bypassed command read operator routing")
-            })
-            .unwrap()
-            .is_none()
+    for malformed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::save_context(dir.path(), &context()).unwrap();
+        // An unreadable-as-context object makes an accidental context read fail;
+        // the ambient callback and store also fail if either is consulted.
+        if malformed {
+            std::fs::remove_file(dir.path().join(".omnigraph/context")).unwrap();
+            std::fs::create_dir(dir.path().join(".omnigraph/context")).unwrap();
+        }
+        for args in [
+            vec!["query", "q", "--server", "legacy"],
+            vec!["read", "q", "--profile", "legacy"],
+            vec!["mutate", "--store", "file:///scratch", "-e", "source"],
+            vec!["change", "m", "--cluster", "local"],
+            vec!["query", "q", "--direct"],
+            vec!["init", "--schema", "schema.pg", "file:///scratch"],
+            vec!["load", "--data", "data.jsonl", "--mode", "append"],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--direct",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "file:///scratch",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--store",
+                "file:///scratch",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--profile",
+                "legacy",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--server",
+                "legacy",
+            ],
+            vec!["schema", "plan", "--schema", "schema.pg"],
+            vec!["commit", "list", "file:///scratch"],
+            vec!["commit", "list"],
+            vec!["commit", "show", "commit-a"],
+            vec!["commit", "list", "--direct"],
+            vec!["commit", "list", "--server", "legacy"],
+            vec!["commit", "list", "--profile", "legacy"],
+            vec!["commit", "show", "commit-a", "--uri", "file:///scratch"],
+            vec!["commit", "show", "commit-a", "--store", "file:///scratch"],
+            vec!["commit", "changes", "commit-a"],
+            vec!["graphs", "list"],
+            vec!["alias", "people"],
+            vec!["queries", "list"],
+            vec!["queries", "validate"],
+            vec!["lint", "--schema", "schema.pg", "--query", "q.gq"],
+            vec!["snapshot"],
+            vec!["branch", "list"],
+            vec!["cluster", "status"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
+            assert!(
+                resolve(&cli, dir.path(), &NoCredentialAccess, || {
+                    panic!("bypassed command read operator routing")
+                })
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_commit_transport_uses_cached_read_authority() {
+    // Transport preparation only: this fixture supplies `read` manually and
+    // uses the cached endpoint. It does not qualify CLI action mapping or
+    // equality against an independently selected endpoint.
+    let context = context();
+    let store = MemoryStore::default();
+    let commit = json!({
+        "graph_commit_id":"commit-a", "graph_branch":null,
+        "graph_manifest_version":3, "parent_commit_id":"prior",
+        "merged_parent_commit_id":"imported-head", "actor_id":"principal:alice",
+        "created_at":123456,
+    });
+    let server = IntentApiFixture::new(vec![
+        IntentReply::json(200, json!({"commits":[commit.clone()]})),
+        IntentReply::json(200, commit.clone()),
+    ]);
+    for operation in ["list", "show"] {
+        assert_eq!(
+            load(&store, &context, "knowledge", &["read"])
+                .err()
+                .unwrap()
+                .body["type"],
+            "data_credential_required"
         );
+        let mut cached = credential(&context, &server.origin);
+        cached.grants[0].actions = vec!["change".into()];
+        save(&store, &context, &cached);
+        assert_eq!(
+            load(&store, &context, "knowledge", &["read"])
+                .err()
+                .unwrap()
+                .body["type"],
+            "data_scope_missing"
+        );
+        cached.grants[0].actions = vec!["read".into()];
+        save(&store, &context, &cached);
+        let client = load(&store, &context, "knowledge", &["read"]).unwrap();
+        if operation == "list" {
+            let output = client.list_commits(Some("main")).await.unwrap();
+            assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
+        } else {
+            let output = client.get_commit("commit-a").await.unwrap();
+            assert_eq!(serde_json::to_value(output).unwrap(), commit);
+        }
+        clear(&store, &context).unwrap();
+    }
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for (request, path) in requests.iter().zip([
+        "/graphs/knowledge/commits?branch=main",
+        "/graphs/knowledge/commits/commit-a",
+    ]) {
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, path);
+        assert_eq!(
+            request.headers["authorization"],
+            format!("Bearer {DATA_TOKEN}")
+        );
+    }
+    server.assert_complete();
+}
+
+#[test]
+fn managed_load_credential_helper_checks_explicit_graph_and_actions() {
+    // The caller supplies required actions; this does not qualify CLI action
+    // mapping or equality against an independently selected endpoint.
+    let context = context();
+    let store = MemoryStore::default();
+    assert_eq!(
+        load(&store, &context, "knowledge", &["change"])
+            .err()
+            .unwrap()
+            .body["type"],
+        "data_credential_required"
+    );
+    for (actions, graph, from, allowed) in [
+        (vec!["read"], "knowledge", false, false),
+        (vec!["change"], "other", false, false),
+        (vec!["change"], "knowledge", false, true),
+        (vec!["branch_create"], "knowledge", true, false),
+        (vec!["change"], "knowledge", true, false),
+        (vec!["change", "branch_create"], "knowledge", true, true),
+    ] {
+        let mut cached = credential(&context, "https://data.example");
+        cached.grants[0].graph_id = graph.into();
+        cached.grants[0].actions = actions.into_iter().map(str::to_string).collect();
+        save(&store, &context, &cached);
+        let required = if from {
+            vec!["change", "branch_create"]
+        } else {
+            vec!["change"]
+        };
+        let result = load(&store, &context, "knowledge", &required);
+        if allowed {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.err().unwrap().body["type"], "data_scope_missing");
+        }
     }
 }
 
@@ -513,6 +670,8 @@ fn managed_data_issue_633_ambiguity_and_invalid_context_precede_credentials() {
 #[tokio::test]
 async fn managed_data_transport_refuses_redirect_and_bounds_body() {
     let target = IntentApiFixture::new(vec![]);
+    let batch = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(batch.path(), "{}\n").unwrap();
     let mut chunked = format!("{:x}\r\n", 8 * 1024 * 1024 + 1).into_bytes();
     chunked.extend(vec![b' '; 8 * 1024 * 1024 + 1]);
     chunked.extend_from_slice(b"\r\n0\r\n\r\n");
@@ -542,19 +701,35 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
             "8 MiB",
         ),
     ] {
-        let server = IntentApiFixture::new(vec![reply]);
-        let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-        let error = client
-            .query(
-                ReadTarget::Branch("main".into()),
-                "query q() {}",
-                Some("q"),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains(expected), "{error}");
-        server.assert_complete();
+        for operation in ["query", "load", "commit-list", "commit-show"] {
+            let server = IntentApiFixture::new(vec![reply.clone()]);
+            let client =
+                GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+            let error = match operation {
+                "load" => client
+                    .load(
+                        "main",
+                        None,
+                        batch.path().to_str().unwrap(),
+                        crate::cli::CliLoadMode::Append,
+                    )
+                    .await
+                    .unwrap_err(),
+                "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+                "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                _ => client
+                    .query(
+                        ReadTarget::Branch("main".into()),
+                        "query q() {}",
+                        Some("q"),
+                        None,
+                    )
+                    .await
+                    .unwrap_err(),
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            server.assert_complete();
+        }
     }
     target.assert_complete();
 }
@@ -562,6 +737,8 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
 #[tokio::test]
 async fn managed_data_errors_redact_reflected_credentials_including_preconditions() {
     let encoded = DATA_TOKEN.replace('h', "\\u0068");
+    let batch = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(batch.path(), "{}\n").unwrap();
     for (status, body) in [
         (200, json!(DATA_TOKEN).to_string()),
         (401, format!("{{\"error\":\"rejected {encoded}\"}}")),
@@ -573,16 +750,17 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
             json!({"error":format!("rejected {DATA_TOKEN}"),"precondition_failure":{"expected":DATA_TOKEN,"actual":null}}).to_string(),
         ),
     ] {
-        let server = IntentApiFixture::new(vec![IntentReply {
-            status,
-            headers: vec![],
-            body: body.into_bytes(),
-        }]);
+      for operation in ["mutate", "load", "commit-list", "commit-show"] {
+        let server = IntentApiFixture::new(vec![IntentReply { status, headers: vec![], body: body.as_bytes().to_vec() }]);
         let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-        let error = client
+        let error = match operation {
+            "load" => client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append).await.unwrap_err(),
+            "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+            "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+            _ => client
             .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"))
             .await
-            .unwrap_err();
+            .unwrap_err(), };
         let rendered = if status == 412 {
             serde_json::to_string(
                 &error.downcast_ref::<crate::helpers::PreconditionFailedCli>().unwrap().output,
@@ -597,6 +775,126 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         } else {
             assert!(rendered.contains("[redacted]"), "{rendered}");
         }
+        server.assert_complete();
+      }
+    }
+}
+
+#[tokio::test]
+async fn managed_load_transport_sends_exact_ndjson_and_preserves_the_server_receipt() {
+    // Transport preparation with manually supplied actions and a cached
+    // endpoint; no managed CLI routing or selected-endpoint equality is implied.
+    let dir = tempfile::tempdir().unwrap();
+    let context = context();
+    let batch = dir.path().join("batch.jsonl");
+    let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
+    std::fs::write(&batch, ndjson).unwrap();
+    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
+    let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"actor_id":"principal:alice","commit":commit});
+    // A delayed response validates the prepared load transport's receipt.
+    // The request-construction owner separately pins load's 300-second ceiling.
+    let server = IntentApiFixture::with_response_delay(
+        vec![IntentReply::json(200, reply)],
+        std::time::Duration::from_millis(10_250),
+    );
+    let store = MemoryStore::default();
+    let mut cached = credential(&context, &server.origin);
+    cached.grants[0].actions = vec!["change".into(), "branch_create".into()];
+    save(&store, &context, &cached);
+    let client = load(&store, &context, "knowledge", &["change", "branch_create"]).unwrap();
+    let result = client
+        .load(
+            "review",
+            Some("main"),
+            batch.to_str().unwrap(),
+            crate::cli::CliLoadMode::Append,
+        )
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["commit"], commit);
+    assert_eq!(result["commit"]["actor_id"], "principal:alice");
+    assert_eq!(result["base_branch"], "main");
+    assert_eq!(result["branch_created"], true);
+    assert_eq!(result["total_entities"], 2);
+    assert_eq!(result["branch"], "review");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(
+        requests[0].path,
+        "/graphs/knowledge/load/ndjson?branch=review&mode=append&from=main"
+    );
+    assert_eq!(requests[0].headers["content-type"], "application/x-ndjson");
+    assert_eq!(
+        requests[0].headers["authorization"],
+        format!("Bearer {DATA_TOKEN}")
+    );
+    assert_eq!(requests[0].raw_body, ndjson.as_bytes());
+    assert!(!requests[0].headers.contains_key("x-actor-id"));
+    server.assert_complete();
+}
+
+#[tokio::test]
+async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_receipts() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let empty_server = IntentApiFixture::new(vec![]);
+    let client =
+        GraphClient::managed(&empty_server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    file.as_file().set_len(32 * 1024 * 1024 + 1).unwrap();
+    assert!(
+        client
+            .load(
+                "review",
+                Some("main"),
+                file.path().to_str().unwrap(),
+                crate::cli::CliLoadMode::Append
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("32 MiB")
+    );
+    std::fs::write(file.path(), [255]).unwrap();
+    assert!(
+        client
+            .load(
+                "review",
+                Some("main"),
+                file.path().to_str().unwrap(),
+                crate::cli::CliLoadMode::Append
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8")
+    );
+    empty_server.assert_complete();
+    std::fs::write(file.path(), "{}\n").unwrap();
+    for reply in [
+        IntentReply::json(500, json!({"error":"load failed"})),
+        IntentReply::json(429, json!({"error":"busy"})),
+        IntentReply::json(503, json!({"error":"recover first"})),
+        IntentReply {
+            status: 200,
+            headers: vec![("Content-Length".into(), "1000".into())],
+            body: b"{}".to_vec(),
+        },
+        IntentReply::json(200, json!({"not":"a receipt"})),
+    ] {
+        let server = IntentApiFixture::new(vec![reply]);
+        let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+        assert!(
+            client
+                .load(
+                    "review",
+                    Some("main"),
+                    file.path().to_str().unwrap(),
+                    crate::cli::CliLoadMode::Append
+                )
+                .await
+                .is_err()
+        );
         server.assert_complete();
     }
 }

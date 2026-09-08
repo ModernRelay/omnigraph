@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-08
 discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
@@ -254,10 +254,43 @@ An unambiguous managed request requires explicit `--graph`, rejects explicit
 `--as`, and uses the separately cached data endpoint/credential. Missing,
 malformed, expired, or under-scoped credentials never fall through to static
 credentials, a profile, or direct storage. Legacy token settings never supply
-managed authority. Managed requests refuse redirects and have a 10-second
-deadline and 8 MiB response bound. Cluster control dispatch and token issuance
-retain their existing scope requirements. New named managed connections are
-a separate change.
+managed authority. Managed requests refuse redirects and have a 30-second
+total deadline, including connection establishment and response-body reading,
+with at most 10 seconds to connect and an 8 MiB response bound. Requests are
+not automatically retried; a timed-out mutation can have an unknown outcome
+and requires independent reconciliation. Cluster control dispatch and token
+issuance retain their existing scope requirements. New named managed
+connections are a separate change.
+
+### Prepared transport extension; command activation deferred
+
+The bounded managed client has transport preparation for the existing NDJSON
+load endpoint and native commit list/show endpoints. This does not extend the
+managed CLI operation set: only query/mutate use the current managed data
+route. Load and commit commands keep ordinary resolution and do not read
+folder context or acquire its data credential.
+
+The prepared load transport checks at most 32 MiB of UTF-8 input before
+sending, bounds JSON responses to 8 MiB, and has a separate 300-second request
+deadline with at most 10 seconds to connect. Redirects and automatic retries
+remain disabled. This longer deadline belongs only to the prepared load
+request; managed queries and mutations use the 30-second total request
+deadline above. The engine still owns row/byte limits, branch creation,
+graph publication and uncertain-outcome recovery. Commit transport reads use
+the existing protocol, the same 30-second deadline and bounded JSON decoder.
+
+Command activation must use the shared selected-connection path proposed in
+[RFC 0059](https://github.com/ModernRelay/omnigraph/pull/675), not add another
+folder-context dispatcher. Its CC-06 and CC-14 exclude load and commit commands
+from context routing and the query/mutate migration guard. CC-05, CC-07,
+CC-10 and CC-17 require separately tested capability selection, exact selected
+API/cluster/endpoint equality before credential transmission, graph/action
+checks, and destination/effect evidence. Load requires `change` and, when
+`--from` is present, `branch_create` for the same graph; commit reads require
+`read`. Current server-side signed-grant and Cedar enforcement remains
+mandatory. Transport and authorization fixtures do not prove that future
+resolver or CLI action mapping. They neither implement the draft RFC nor
+activate its separately scoped served catalog extension.
 
 ## Invariants
 
@@ -361,6 +394,15 @@ None for the bounded wire and authorization contract. Implementation and
 qualification remain separate from acceptance.
 
 ## Decision log
+
+2026-09-08: Added bounded load and commit transport preparation without
+activating new managed commands or extending context routing. Extended the
+managed query/mutate total request deadline from 10 to 30 seconds, including
+response-body reading, while retaining the 10-second connection limit and
+no automatic retries. Draft RFC 0059 CC-11 carries the same bounds. This
+numeric amendment does not accept the broader draft. Named managed selection,
+exact endpoint binding and per-command activation remain separate review and
+test gates under draft RFC 0059.
 
 2026-09-06: The compatibility repair restores the three public struct shapes
 and isolates canonical-root validation in opt-in managed boot. This replaces
