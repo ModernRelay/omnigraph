@@ -742,9 +742,9 @@ jobs:
 
   rustfs_integration:
     name: RustFS S3 Integration (${{ matrix.shard }})
-    # This remains push-/tag-/dispatch-only, but no longer waits for the
-    # independent workspace job. Starting both cold compile graphs together
-    # removes that dependency from the workflow's critical path.
+    # Pull requests too, as a reporting context, same reason as the format
+    # fence: the configured S3 owners run nowhere else. Independent of the
+    # workspace job on purpose: both cold compile graphs start together.
     #
     # Two parallel feature graphs: the default graph compiles every selected
     # engine/server/cluster/CLI test binary in one Cargo invocation, while the
@@ -754,9 +754,11 @@ jobs:
     # times and maintained five target caches, pressuring GitHub's repository
     # cache cap. `fail-fast: false` lets both graphs report independently.
     needs: classify_changes
-    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    if: needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Same ceiling as `Test Workspace`: a pull request that bumps the substrate
+    # compiles this graph cold too, and a timeout red names no test.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -798,6 +800,8 @@ jobs:
           workspaces: |
             . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # A red `main` run still seeds the cache pull requests restore.
+          cache-on-failure: true
 
       - name: Start RustFS
         # Pinned to 1.0.0-beta.12 (2026-07-30). beta.8 carried hyper's short

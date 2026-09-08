@@ -30,9 +30,10 @@ may report as skipped.
 `Test Workspace` runs on pull requests as a reporting context and is
 deliberately not required: with strict checks every merge invalidates every
 other open pull request's required contexts, so a required 60-minute context
-would space merges an hour apart. The merger waits for `Test Workspace` and
-`V5 ↔ V6 Format Fence`, both reporting contexts, to report and reads a red
-result before merging. Both run again on
+would space merges an hour apart. The merger waits for `Test Workspace`,
+`V5 ↔ V7 Format Fence`, and both `RustFS S3 Integration` shards, all
+reporting contexts, to report and reads a red result before merging. All of
+them run again on
 every push to `main`, on tags, and by dispatch, where a red run makes `main`
 stop-the-line until fixed or reverted. See [ci.md](ci.md).
 

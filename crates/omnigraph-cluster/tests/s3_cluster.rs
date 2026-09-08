@@ -26,6 +26,7 @@ use omnigraph_cluster::{
 };
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 const SCHEMA_V1: &str = "node Person {\n  name: String @key\n}\n";
@@ -267,6 +268,10 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
     write_cluster_fixture(dir.path(), root, SCHEMA_V2);
     let evolve = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
     assert!(evolve.ok && evolve.converged, "{:?}", evolve.diagnostics);
+    let ledger_path = format!("{root}/__cluster/state.json");
+    let evolved: serde_json::Value =
+        serde_json::from_str(&adapter.read_text(&ledger_path).await.unwrap()).unwrap();
+    let evolved_revision = evolved["state_revision"].as_u64().unwrap();
 
     // Approved delete: drop the graph from the config; the plan demands an
     // approval, the approved apply prefix-deletes the graph root.
@@ -287,10 +292,30 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
     let delete = apply_config_dir_with_options(dir.path(), e2e_apply_options()).await;
     assert!(delete.ok && delete.converged, "{:?}", delete.diagnostics);
 
-    let after = read_serving_snapshot_from_storage(root).await;
-    assert!(
-        after.is_err(),
-        "an empty cluster must refuse to serve, got {after:?}"
-    );
+    let via_uri_after = read_serving_snapshot_from_storage(root)
+        .await
+        .expect("an applied empty revision serves with its exact witness");
+    let via_config_after = read_serving_snapshot(dir.path()).await.unwrap();
+    let ledger_text = adapter.read_text(&ledger_path).await.unwrap();
+    let ledger: serde_json::Value = serde_json::from_str(&ledger_text).unwrap();
+    let ledger_cas = format!("sha256:{:x}", Sha256::digest(ledger_text.as_bytes()));
+    for after in [&via_uri_after, &via_config_after] {
+        assert!(
+            after.graphs.is_empty()
+                && after.applied_graphs.is_empty()
+                && after.quarantined_graphs.is_empty(),
+            "an applied empty revision serves an empty inventory, got {after:?}"
+        );
+        assert_eq!(after.config_digest, delete.desired_revision.config_digest);
+        assert!(
+            after.state_revision > evolved_revision,
+            "the approved delete must publish a new ledger revision past {evolved_revision}, got {after:?}"
+        );
+        assert_eq!(
+            after.state_revision,
+            ledger["state_revision"].as_u64().unwrap()
+        );
+        assert_eq!(after.state_cas.as_deref(), Some(ledger_cas.as_str()));
+    }
     adapter.delete_prefix(root).await.unwrap();
 }
