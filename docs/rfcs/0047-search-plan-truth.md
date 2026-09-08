@@ -22,9 +22,9 @@ blocked_on:
 Ranked reads become honest about what they executed, and search constructs
 that silently do nothing become errors or warnings:
 
-1. A search filter or rank target on a traversal-introduced binding is a
-   stable `T26` compile diagnostic — today the predicate or ranking is
-   silently dropped and plausible rows come back in table order.
+1. A search filter or rank target on an unsupported traversal-introduced
+   binding is a stable `T26` compile diagnostic. The motivating failure
+   silently dropped the predicate or ranking and returned plausible rows.
 2. The executed retrieval is stated once in the lowered plan
    (`QueryIR::retrieval`) instead of being re-inferred from `order_by[0]` at
    execution.
@@ -49,10 +49,19 @@ were previously run-dependent).
 `fuzzy()` remains available in this slice. It has working exact and typo
 matches, but its analysis and matched set depend on index coverage. The
 single breaking replacement of `fuzzy`, `search`, and `match_text` with
-`match_terms(..., max_edits: ...)` belongs to
+typed lexical matching and ranked retrieval belongs to
 [RFC 0048](0048-search-contracts.md#user-and-operational-behavior), where the
 schema-owned analyzer and exact lexical contract are defined. This RFC does
 not introduce a `T25` retirement stage.
+
+This is the initial correctness slice. RFC 0048 owns the final staged query
+language: explicit ranking targets, graph-defined source populations, named
+arm metrics, and separate selection/output boundaries. `T26`, the single
+`QueryIR::retrieval` field, and structural repetition of ordering expressions
+are interim mechanisms, not permanent language requirements. The guarantees
+can be implemented directly in the staged model if both RFCs land together;
+there is no requirement to release an interim syntax first. RFC 0048 also
+owns the deliberate changes to selection and tie semantics at that cutover.
 
 ## Motivation
 
@@ -73,12 +82,15 @@ query returns unranked or unfiltered rows with no error. The flat-traversal
 form was fixed earlier; the traversal-introduced-binding form persists and is
 indistinguishable from correct output.
 
-**Rank is not data.** The compiler types rank expressions as `F64`, but the
-executor rejects them in projection; RRF computes a fused score, sorts by it,
-then discards it; equal-score orders depend on arrival order; retrieval is
-re-discovered from `order_by[0]` at execution, which is the root under both
-bug classes above. `docs/dev/invariants.md` already records the rank-carry
-gap, and the deny-list forbids discarding retrieval rank before projection.
+**Rank needs one plan identity.** The original baseline rejected ranking
+expressions in projection and discarded the fused score after sorting.
+Current code already carries some `_score`/`_distance` columns, as recorded
+in the appendix; implementation must first reconcile the remaining gaps
+against that baseline. Retrieval still needs one explicit lowered identity,
+instead of rediscovery from `order_by[0]`, and complete tie handling must be
+qualified before every candidate cut. The deny-list forbids discarding
+retrieval rank before projection. Existing column materialization alone does
+not establish source identity, arm membership, or the complete guarantees here.
 
 An issue-sized fix cannot close this: the failures span the compiler, the
 executor, and the public read contract, and the cure requires new observable
@@ -93,6 +105,9 @@ once, coherently.
   binding fails typecheck: "make the target the first-declared binding of
   its match component, or target the scan-rooted variable." The engine also
   refuses (rather than drops) the shape if reached with hand-built IR.
+  This diagnostic protects the interim executor. RFC 0048 replaces the
+  restriction for qualified graph-derived populations; unsupported shapes
+  must continue to fail explicitly.
 
 **Metric projection.**
 
@@ -105,9 +120,11 @@ limit 20
 projects the score the ordering used — one computation, observed twice. The
 projected rank expression must be structurally identical (source, target,
 query argument) to the executed retrieval; a mismatch is a loud error, never
-a NULL column. Projecting an `rrf()` yields the fused score; projecting an
-individual arm inside an `rrf()` query is deferred (see Unresolved
-questions).
+a NULL column. Projecting an `rrf()` yields the fused score. Named individual
+arm metrics belong to RFC 0048's stage model and RFC 0040's namespace rules.
+That model distinguishes an invalid metric reference from a valid arm metric
+that is absent because the target never entered that arm; the latter is
+ordinary missing membership, not a mismatched-projection error.
 
 **Determinism.** Ranked output order is total: score, then trailing `order`
 keys (which now apply *inside* fused-score ties on the `rrf()` path — they
@@ -124,6 +141,9 @@ The implementation must either apply the full required comparator at the
 cut or preserve the complete boundary for later comparison. An unqualified
 native path must use a complete fallback within the query budget or fail
 explicitly. This requirement is not established by the retained prototype.
+For approximate retrieval, deterministic ordering describes the candidates
+actually selected. It does not promise that rerunning ANN on the same snapshot
+discovers the same candidates; RFC 0048 keeps stable ranked pagination separate.
 
 **Response envelope (canonical `/query` and stored-query reads; additive).**
 
@@ -169,7 +189,9 @@ maintenance surface is added.
 - **Scan-rooted targets.** The lowering component-root computation (first
   declared binding of each traversal-connected component gets the scan) is
   extracted and shared with typecheck's `T26` pass, so the rule and the plan
-  cannot drift. Negation scopes check their own roots.
+  cannot drift. Negation scopes check their own roots. This implementation
+  guard does not establish a permanent first-declared-target rule for the
+  language; RFC 0048's stage target validation replaces it as shapes qualify.
 - **Advisories.** Execution threads one explicit notice sink (deduplicating,
   so the bounded-bm25 retry and fusion's forked arms cannot double-report);
   results carry notices, metric descriptors, and retrieval descriptors as
@@ -256,9 +278,11 @@ maintenance surface is added.
 ## Evidence and tests
 
 A prototype of the preceding design exists (closed PR #595, branch
-`search-contracts-p0-p1`, retained as evidence per the closure note): eleven
-staged commits, canonical workspace graph green (2,860 tests), both Clippy
-gates, OpenAPI regenerated, vocabulary-guard inventory classified. Test
+`search-contracts-p0-p1`, retained as evidence per the closure note). Its
+historical record reports eleven staged commits, a green canonical workspace
+graph (2,860 tests), both Clippy gates, regenerated OpenAPI, and a classified
+vocabulary-guard inventory. These are historical results, not a fresh run on
+the revised draft. Test
 owners extended, not forked: compiler typecheck/lowering suites (including
 the prototype's now-withdrawn T25 stage, T26, retrieval lowering, cap policy),
 engine `search.rs` (projection, determinism,
@@ -286,6 +310,14 @@ fragment/segment layouts. Verify complete winners and explicit resource
 failure, not just sorted returned rows. Coverage cost needs an instrument
 that measures rows examined as well as retained memory.
 
+The current source recheck also distinguishes BM25 from vector fusion arms:
+`extract_sub_search_mode` leaves BM25 arms uncapped, while nearest arms derive
+their candidate count from the query limit. `rrf_arms_scan_uncapped_in_one_pass`
+guards the BM25 behavior. Current nearest/BM25 projection is checked by `T33`,
+RRF projection is refused by `T37`, and the proposed `T26` target guard is not
+present. `T25` now names duplicate output-column diagnostics; the withdrawn
+prototype's retirement label must not be reused as a current-code fact.
+
 ## Rollout
 
 Ordered stages after acceptance. The retained prototype supplies starting
@@ -304,15 +336,16 @@ points; each stage must be checked against the revised scope:
 
 `implementation` advances to `in-progress` at the first landed stage and
 `complete` when stage 6 ships. Stages 2+ reference this RFC once accepted.
-The lexical replacement is sequenced by RFC 0048, not by a retirement commit
-in this rollout.
+The lexical replacement and staged language are sequenced by RFC 0048, not
+by a retirement commit in this rollout. Before porting prototype code, capture
+the current compiler/engine baseline and identify which guarantees already
+exist. If both designs are implemented together, build named stage IR and
+metadata directly, preserving this RFC's correctness gates without an interim
+language release or duplicate execution path.
 
 ## Unresolved questions
 
-1. Should arm-level metric projection inside an `rrf()` query ship here
-   (fused score currently owns the synthesized column) or wait for the
-   system-column namespace work (RFC 0040) to give arms distinct columns?
-2. Is `warnings`' human-format contract (stderr for every non-full-JSON CLI
+1. Is `warnings`' human-format contract (stderr for every non-full-JSON CLI
    format) acceptable, or should the JSONL metadata record grow a warnings
    field in the same change?
 
@@ -340,6 +373,17 @@ in this rollout.
 - 2026-09-08 — substrate revalidation made complete native tie handling an
   explicit gate; removed claims that post-sorting, finite tie width, or
   streaming counts alone prove the required result and resource bounds.
+- 2026-09-08 — aligned with RFC 0048's staged retrieval design. The scan-root
+  rule, single retrieval field, and repeated-expression projection are
+  interim mechanisms; graph-derived targets and named arm metrics belong
+  to the final algebra. Resolved arm-metric ownership in RFC 0048, distinguished
+  absent membership from invalid projection, and required reconciliation
+  against current metric-carrying code before porting the historical prototype.
+  Both slices may land directly in one pre-stable language cutover.
+- 2026-09-08 — rechecked current execution and diagnostics. Corrected the
+  blanket claim that all RRF arm windows follow the output limit: BM25 arms
+  are uncapped; vector arms inherit that limit. Distinguished historical
+  prototype results from current evidence and total ordering from ANN replay.
 
 ## Appendix: agent context (non-normative)
 
@@ -350,9 +394,9 @@ contract; the sections above are authoritative.
 PR #595). Its commit order includes the withdrawn T25 stage and must not be
 applied verbatim as the current rollout; the review-fix commit is
 `3e459aad`, the #587 port is `858ce066`. This RFC is the first slice of a
-larger search-contracts design program whose remaining scope — schema-owned
-analyzed search (`@analyzed`), schema-bound vector distance, and the
-SchemaIR boundary they require — is
+larger search-contracts design program whose remaining scope includes
+schema-owned analyzed search (`@analyzed`), vector-space identity, composable
+ranking and graph stages, named metrics, and the SchemaIR boundary. That scope is
 [RFC 0048](0048-search-contracts.md), blocked on this RFC (a Lance 11
 change-by-change impact analysis and a fourteen-system comparative survey
 back both slices).
@@ -386,10 +430,10 @@ the pin, not the GitHub tag; the two diverge).**
   of a component — pinned by a dedicated T26 test.
 - Fused-score ties are bit-identical (same rank arithmetic per entity), so
   exact `==` comparison for boundary-tie retention is sound.
-- RRF arm candidate windows follow the query limit (`k = limit`), so tests
-  constructing fused-score ties must build them limit-independently (a
-  fixture tie at limit 3 vanished at limit 2 — see
-  `rrf_boundary_tie_honors_secondary_key` for the robust construction).
+- Current RRF vector-arm candidate counts follow the query limit. BM25 arms
+  scan uncapped; `rrf_arms_scan_uncapped_in_one_pass` guards that distinct
+  behavior. The older prototype's limit-sensitive tie fixture is historical
+  evidence, not proof that current lexical arms have a bounded window.
 - Embedding-coverage predicates must reuse the scan's own `filter_expr`
   (coverage describes the *prefiltered* population) and must use
   DataFusion `ident()`, not `col()` — `col()` lowercases unquoted
@@ -410,12 +454,14 @@ the pin, not the GitHub tag; the two diverge).**
   the port asserts the diagnostic instead of the gate fallback. The gate's
   own expand-dst check stays as the engine backstop.
 - RFC 0040 (system columns): the `__` reserved namespace is where
-  engine-owned metric columns migrate; arm-level rrf projection (Unresolved
-  question 1) likely lands with it.
+  engine-owned metric columns migrate. RFC 0048 owns named stage/arm metrics
+  and must coordinate their public spelling with that namespace.
 - The remainder of the search-contracts program
   ([RFC 0048](0048-search-contracts.md)) depends on decisions not made
   here: analyzer/scorer schema surface, SchemaIR version-facet coordination
-  with RFCs 0040/0044, and the analyzed-search index posture.
+  with RFCs 0040/0044, analyzed-search index posture, target identity, stage
+  composition, and coherent follow-up reads. The dependency is on plan-truth
+  guarantees, not this slice's interim `Option<RetrievalIR>` shape.
 
 **Build/CI traps observed while producing the evidence.**
 
