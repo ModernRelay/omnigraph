@@ -516,12 +516,11 @@ pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwn
         bearer_token,
         expected_commit,
         None,
-        None,
     )
     .await
 }
 
-/// Same typed graph protocol with managed response and per-request deadline bounds.
+/// Same typed graph protocol with an optional response limit for managed data access.
 pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     client: &reqwest::Client,
     method: Method,
@@ -530,7 +529,6 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     bearer_token: Option<&str>,
     expected_commit: Option<&str>,
     response_limit: Option<usize>,
-    request_timeout: Option<std::time::Duration>,
 ) -> Result<T> {
     let request = apply_bearer_token(client.request(method, url), bearer_token);
     let request = if let Some(commit_id) = expected_commit {
@@ -543,11 +541,6 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     };
     let request = if let Some(body) = body {
         request.json(&body)
-    } else {
-        request
-    };
-    let request = if let Some(timeout) = request_timeout {
-        request.timeout(timeout)
     } else {
         request
     };

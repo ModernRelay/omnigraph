@@ -61,9 +61,9 @@ use crate::helpers::{
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
-// Writes can publish after the client loses its response. Allow the same
-// bounded receipt wait for mutations and loads; never retry either implicitly.
-const MANAGED_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// Managed load transport has its own longer bounded receipt wait.
+// Existing managed query/mutate requests retain their ten-second deadline.
+const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The engine owns parsed-table limits. This bound covers only the exact
 /// UTF-8 NDJSON body sent to the existing server route, before any request.
@@ -86,7 +86,7 @@ fn load_request(
     managed: bool,
 ) -> reqwest::RequestBuilder {
     let request = if managed {
-        request.timeout(MANAGED_WRITE_TIMEOUT)
+        request.timeout(MANAGED_LOAD_TIMEOUT)
     } else {
         request
     };
@@ -463,7 +463,6 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
-                    None,
                 )
                 .await
             }
@@ -496,7 +495,6 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
-                    None,
                 )
                 .await
             }
@@ -887,7 +885,6 @@ impl GraphClient {
                     token.as_deref(),
                     expected_head,
                     *response_limit,
-                    response_limit.map(|_| MANAGED_WRITE_TIMEOUT),
                 )
                 .await
             }
@@ -958,7 +955,6 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
-                    response_limit.map(|_| MANAGED_WRITE_TIMEOUT),
                 )
                 .await
             }
@@ -1040,7 +1036,6 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
-                    None,
                 )
                 .await
             }
@@ -1085,7 +1080,6 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
-                    None,
                 )
                 .await
             }
@@ -1148,7 +1142,6 @@ impl GraphClient {
                     token.as_deref(),
                     expected_head,
                     *response_limit,
-                    (response_limit.is_some() && expect_mutation).then_some(MANAGED_WRITE_TIMEOUT),
                 )
                 .await
             }
@@ -1679,9 +1672,10 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn managed_mutations_wait_past_read_deadline_without_retrying() {
-        // Exercise every mutation request owner through actual HTTP. A fast
-        // fixture would hide an inherited ten-second read deadline.
+    async fn managed_mutations_keep_the_short_deadline_without_retrying() {
+        // Exercise every mutation request owner through actual HTTP. Fast
+        // receipts remain intact; a response past the existing ten-second
+        // deadline fails without replaying an uncertain write.
         futures::future::join_all(
             [
                 "ad-hoc",
@@ -1691,7 +1685,13 @@ mod tests {
                 "stored-conditional",
             ]
             .into_iter()
-            .map(|form| async move {
+            .flat_map(|form| {
+                [
+                    (form, std::time::Duration::ZERO),
+                    (form, std::time::Duration::from_millis(10_250)),
+                ]
+            })
+            .map(|(form, delay)| async move {
                 let commit = json!({
                     "graph_commit_id": "head-after", "graph_branch": "main",
                     "graph_manifest_version": 7, "parent_commit_id": "head-before",
@@ -1712,7 +1712,7 @@ mod tests {
                 }
                 let server = IntentApiFixture::with_response_delay(
                     vec![IntentReply::json(200, reply)],
-                    std::time::Duration::from_millis(10_250),
+                    delay,
                 );
                 let client =
                     GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
@@ -1764,9 +1764,19 @@ mod tests {
                         },
                     ),
                 };
-                let result = result.unwrap_or_else(|error| panic!("{form}: {error}"));
-                assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
-                assert_eq!(result.actor_id.as_deref(), Some("principal:alice"));
+                if delay.is_zero() {
+                    let result = result.unwrap_or_else(|error| panic!("{form}: {error}"));
+                    assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
+                    assert_eq!(result.actor_id.as_deref(), Some("principal:alice"));
+                } else {
+                    let error = result.expect_err("mutation must keep its ten-second deadline");
+                    assert!(
+                        error
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(reqwest::Error::is_timeout),
+                        "{form}: {error}"
+                    );
+                }
                 let requests = server.requests();
                 assert_eq!(requests.len(), 1, "{form} must not retry");
                 assert_eq!(requests[0].path, path);
@@ -1791,38 +1801,66 @@ mod tests {
 
     #[tokio::test]
     async fn managed_reads_keep_the_short_deadline_without_retrying() {
-        futures::future::join_all([false, true].into_iter().map(|named| async move {
-            let server = IntentApiFixture::with_response_delay(
-                vec![IntentReply::json(
-                    200,
-                    json!({
-                        "query_name": "q", "target": {"branch":"main"},
-                        "row_count": 0, "columns": [], "rows": [], "graph_commit_id": "head"
-                    }),
-                )],
-                std::time::Duration::from_millis(10_250),
-            );
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
-                    .unwrap();
-            let result = if named {
-                client
-                    .invoke_named::<ReadOutput>("q", false, None, Some("main".into()), None, None)
-                    .await
-            } else {
-                client
-                    .query(ReadTarget::branch("main"), "query q() {}", Some("q"), None)
-                    .await
-            };
-            let error = result.unwrap_err();
-            assert!(
-                error
-                    .downcast_ref::<reqwest::Error>()
-                    .is_some_and(reqwest::Error::is_timeout)
-            );
-            assert_eq!(server.requests().len(), 1, "read timeout must not retry");
-            server.assert_complete();
-        }))
+        futures::future::join_all(
+            ["ad-hoc", "stored", "commit-list", "commit-show"]
+                .into_iter()
+                .map(|operation| async move {
+                    let server = IntentApiFixture::with_response_delay(
+                        vec![IntentReply::json(
+                            200,
+                            json!({
+                                "query_name": "q", "target": {"branch":"main"},
+                                "row_count": 0, "columns": [], "rows": [], "graph_commit_id": "head"
+                            }),
+                        )],
+                        std::time::Duration::from_millis(10_250),
+                    );
+                    let client =
+                        GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                            .unwrap();
+                    let (result, path) = match operation {
+                        "stored" => (
+                            client
+                                .invoke_named::<ReadOutput>(
+                                    "q",
+                                    false,
+                                    None,
+                                    Some("main".into()),
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .map(|_| ()),
+                            "/graphs/knowledge/queries/q",
+                        ),
+                        "commit-list" => (
+                            client.list_commits(Some("main")).await.map(|_| ()),
+                            "/graphs/knowledge/commits?branch=main",
+                        ),
+                        "commit-show" => (
+                            client.get_commit("commit-a").await.map(|_| ()),
+                            "/graphs/knowledge/commits/commit-a",
+                        ),
+                        _ => (
+                            client
+                                .query(ReadTarget::branch("main"), "query q() {}", Some("q"), None)
+                                .await
+                                .map(|_| ()),
+                            "/graphs/knowledge/query",
+                        ),
+                    };
+                    let error = result.unwrap_err();
+                    assert!(
+                        error
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(reqwest::Error::is_timeout)
+                    );
+                    let requests = server.requests();
+                    assert_eq!(requests.len(), 1, "read timeout must not retry");
+                    assert_eq!(requests[0].path, path);
+                    server.assert_complete();
+                }),
+        )
         .await;
     }
 

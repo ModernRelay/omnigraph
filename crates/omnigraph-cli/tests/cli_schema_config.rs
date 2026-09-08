@@ -44,7 +44,7 @@ fn help_groups_commands_by_capability() {
     );
 
     // Match command names in the Commands list, not words in descriptions or
-    // the legend (load's description also mentions a managed cluster).
+    // the capability legend.
     let commands: Vec<_> = stdout
         .split_once("Commands:\n")
         .and_then(|(_, tail)| tail.split_once("\n\n"))

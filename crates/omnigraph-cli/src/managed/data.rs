@@ -1,7 +1,7 @@
 //! RFC 0053: cached data authority has its own keychain namespace and transport.
 use super::auth::{self, Store};
 use super::{Api, Context, Failure, Method, Output, Result, canonical_origin, json};
-use crate::cli::{Cli, Command, CommitCommand};
+use crate::cli::{Cli, Command};
 use crate::client::GraphClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -317,16 +317,7 @@ fn load(
 
 fn skips_context(cli: &Cli) -> bool {
     cli.direct
-        || !matches!(
-            cli.command,
-            Command::Query { .. }
-                | Command::Mutate { .. }
-                | Command::Load { uri: None, .. }
-                | Command::Commit {
-                    command: CommitCommand::List { uri: None, .. }
-                        | CommitCommand::Show { uri: None, .. }
-                }
-        )
+        || !matches!(cli.command, Command::Query { .. } | Command::Mutate { .. })
         || cli.server.is_some()
         || cli.profile.is_some()
         || cli.store.is_some()
@@ -368,38 +359,18 @@ fn resolve(
             "folder context competes with OMNIGRAPH_PROFILE or an operator default target; select the intended ordinary target explicitly, use --direct for ordinary ambient resolution, or clear the competing ambient target to use this managed folder",
         ));
     }
-    let required = match &cli.command {
+    let (action, named) = match &cli.command {
         Command::Query {
             query,
             query_string,
             ..
-        } => {
-            if query.is_none() && query_string.is_none() {
-                vec!["read", "invoke_query"]
-            } else {
-                vec!["read"]
-            }
-        }
+        } => ("read", query.is_none() && query_string.is_none()),
         Command::Mutate {
             query,
             query_string,
             ..
-        } => {
-            if query.is_none() && query_string.is_none() {
-                vec!["change", "invoke_query"]
-            } else {
-                vec!["change"]
-            }
-        }
-        Command::Load { from, .. } => {
-            if from.is_some() {
-                vec!["change", "branch_create"]
-            } else {
-                vec!["change"]
-            }
-        }
-        Command::Commit { .. } => vec!["read"],
-        _ => unreachable!("only implicit query/mutate/load and commit reads consult data context"),
+        } => ("change", query.is_none() && query_string.is_none()),
+        _ => unreachable!("only implicit query/mutate consult data context"),
     };
     scope(cli)?;
     let graph = cli
@@ -407,6 +378,11 @@ fn resolve(
         .as_deref()
         .ok_or_else(|| Failure::refused("graph_required", "managed data requires --graph"))?;
     graph_id(graph)?;
+    let required = if named {
+        vec![action, "invoke_query"]
+    } else {
+        vec![action]
+    };
     load(store, &context, graph, &required).map(Some)
 }
 
@@ -418,10 +394,7 @@ pub(crate) fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Outp
         Command::Query { json, format, .. } => {
             *json || matches!(format, Some(crate::read_format::ReadOutputFormat::Json))
         }
-        Command::Mutate { json, .. } | Command::Load { json, .. } => *json,
-        Command::Commit {
-            command: CommitCommand::List { json, .. } | CommitCommand::Show { json, .. },
-        } => *json,
+        Command::Mutate { json, .. } => *json,
         _ => false,
     };
     let result = std::env::current_dir()

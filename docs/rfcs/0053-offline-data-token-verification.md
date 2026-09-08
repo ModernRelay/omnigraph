@@ -232,16 +232,15 @@ until expiry or trust retirement, and local clearing is not server revocation.
 Automation may use the explicit origin-bound control credential to mint into
 the same keychain; unattended raw-token consumers use the issuance API.
 
-Only implicitly addressed `query`, `mutate`, `load`, `commit list`, and
-`commit show` consult managed context in the exact current directory. An
-explicit `--server`, `--profile`, `--store`, or `--cluster` retains ordinary
-addressing and command-applicability validation, without reading that context;
-a positional load/commit-list URI or `commit show --uri` does the same. Every other
-graph, storage, alias, or local command retains its existing handler. This does
-not add managed transport support to those commands. Global `--direct` bypasses
-context as before, including for cluster commands.
+Only implicitly addressed `query` and `mutate` consult managed context in the
+exact current directory. An explicit `--server`, `--profile`, `--store`, or
+`--cluster` retains ordinary addressing and command-applicability validation,
+without reading that context. Every other graph, storage, alias, or local
+command likewise retains its existing handler. This does not add managed
+transport support to those commands. Global `--direct` bypasses context as
+before, including for cluster commands.
 
-For these implicit data commands, absent context leaves ordinary resolution
+For implicit `query`/`mutate`, absent context leaves ordinary resolution
 unchanged; malformed context refuses. Valid context plus a nonempty
 `OMNIGRAPH_PROFILE` or an operator `defaults.server`/`defaults.store` target
 refuses with `managed_target_ambiguous` before keychain access or requests.
@@ -255,26 +254,40 @@ An unambiguous managed request requires explicit `--graph`, rejects explicit
 `--as`, and uses the separately cached data endpoint/credential. Missing,
 malformed, expired, or under-scoped credentials never fall through to static
 credentials, a profile, or direct storage. Legacy token settings never supply
-managed authority. Managed reads refuse redirects and have a 10-second
-deadline and 8 MiB response bound. Managed `mutate`, including ad-hoc
-mutations, stored mutation invocations and branch-write statements, uses
-the existing 300-second write deadline with a 10-second connection bound
-and the same 8 MiB response bound. Managed `commit list` and `commit show`
-use the separately cached `read` grant and the existing native commit
-protocol, with the read deadline and response bound. They permit exact graph
-lineage inspection after an uncertain write without exposing a data
-credential or opening storage directly. Managed `load` uses the existing
-authenticated NDJSON endpoint with `change` authority, additionally requiring
-`branch_create` when `--from` is present; the server still intersects signed grants
-with Cedar and owns branch creation and graph publication. One managed load accepts at most
-32 MiB of UTF-8 input, retains the 8 MiB response bound, and uses a 300-second
-request deadline with a 10-second connection bound. The existing engine's keyed
-table row and parsed-byte limits remain unchanged. No load request is retried by
-the CLI: a timeout, interrupted response, or unverified receipt requires
-reconciliation of the target branch before a caller decides whether to retry.
-Ordinary direct and profile-based loading keep their existing transport.
-Cluster control dispatch and token issuance retain their existing scope
-requirements. New named managed connections are a separate change.
+managed authority. Managed requests refuse redirects and have a 10-second
+deadline and 8 MiB response bound. Cluster control dispatch and token issuance
+retain their existing scope requirements. New named managed connections are
+a separate change.
+
+### Prepared transport extension; command activation deferred
+
+The bounded managed client has transport preparation for the existing NDJSON
+load endpoint and native commit list/show endpoints. This does not extend the
+managed CLI operation set: only query/mutate use the current managed data
+route. Load and commit commands keep ordinary resolution and do not read
+folder context or acquire its data credential.
+
+The prepared load transport checks at most 32 MiB of UTF-8 input before
+sending, bounds JSON responses to 8 MiB, and has a separate 300-second request
+deadline with at most 10 seconds to connect. Redirects and automatic retries
+remain disabled. This longer deadline belongs only to the prepared load
+request; existing managed queries and mutations retain their 10-second
+request deadline. The engine still owns row/byte limits, branch creation,
+graph publication and uncertain-outcome recovery. Commit transport reads use
+the existing protocol, 10-second deadline and bounded JSON decoder.
+
+Command activation must use the shared selected-connection path proposed in
+[RFC 0059](https://github.com/ModernRelay/omnigraph/pull/675), not add another
+folder-context dispatcher. Its CC-06 and CC-14 exclude load and commit commands
+from context routing and the query/mutate migration guard. CC-05, CC-07,
+CC-10 and CC-17 require separately tested capability selection, exact selected
+API/cluster/endpoint equality before credential transmission, graph/action
+checks, and destination/effect evidence. Load requires `change` and, when
+`--from` is present, `branch_create` for the same graph; commit reads require
+`read`. Current server-side signed-grant and Cedar enforcement remains
+mandatory. Transport and authorization fixtures do not prove that future
+resolver or CLI action mapping. They neither implement the draft RFC nor
+activate its separately scoped served catalog extension.
 
 ## Invariants
 
@@ -379,20 +392,11 @@ qualification remain separate from acceptance.
 
 ## Decision log
 
-2026-09-08: Managed mutations share the bounded 300-second request deadline
-already used by loads. The 10-second read/connection deadlines, response
-limit, redirect refusal and disabled automatic retries remain unchanged.
-Managed commit list/show reads use cached `read` authority so callers can
-inspect native lineage when a write response is lost. This adds no new
-protocol, token export or automatic write reconciliation.
-
-2026-09-07: Extended managed CLI routing to implicit `load`, preserving explicit
-ordinary targets and the compatibility repair's ambiguity rules. The existing
-authenticated NDJSON protocol, graph publication, and server policy owners are
-unchanged. This adds a 32 MiB input bound and a separate 300-second load deadline
-while retaining the 8 MiB response bound and requiring branch creation authority
-for `--from`. Transport and authorization tests cover the CLI-to-server
-contract; engine publication and recovery semantics remain unchanged.
+2026-09-08: Added bounded load and commit transport preparation without
+activating new managed commands or extending context routing. Existing
+query/mutate deadlines remain 10 seconds. Named managed selection, exact
+endpoint binding and per-command activation remain separate review and test
+gates under draft RFC 0059.
 
 2026-09-06: The compatibility repair restores the three public struct shapes
 and isolates canonical-root validation in opt-in managed boot. This replaces
