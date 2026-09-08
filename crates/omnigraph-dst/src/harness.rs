@@ -19,10 +19,10 @@ use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
 use crate::detectors::{self, Channel, Detector, ObservationSource, Oracle};
 use crate::fixtures::{
-    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, knows_pairs, knows_pairs_bound_target,
-    knows_pairs_on, knows_pairs_target, knows_pairs_target_mode, mixed_params, mutate_on,
-    person_jsonl, person_rows, person_rows_on, person_rows_target, physical_view_on, query_main,
-    schema_with_extras,
+    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, fixture_knows, knows_pairs, knows_pairs_bound_target,
+    knows_pairs_on, knows_pairs_target, knows_pairs_target_mode, knows_rows_bound_target,
+    mixed_params, mutate_on, person_jsonl, person_rows, person_rows_on, person_rows_target,
+    physical_view_on, query_main, schema_with_extras,
 };
 use crate::rand::SplitMix64;
 
@@ -998,13 +998,7 @@ fn milestone_op(
                     .filter(|n| slot.state.persons.contains_key(*n))
             };
             let candidate = common()
-                .find(|n| {
-                    !slot
-                        .state
-                        .edges
-                        .iter()
-                        .any(|(from, to)| from == *n || to == *n)
-                })
+                .find(|n| !slot.state.has_edges_touching(n))
                 .or_else(|| common().next())
                 .cloned();
             match candidate {
@@ -1155,8 +1149,8 @@ pub struct UniverseReport {
     /// deliberately unasserted (lance-realm compositions are
     /// process-context-sensitive) —
     /// and channel is the observation surface the ruling rested on
-    /// ("query", or "query+physical" when the ghost tie-break consulted
-    /// the physical channel). The per-death RESULT the ledger records for
+    /// ("query", or "query+bound" when the tie-break consulted the
+    /// bound-edge rows). The per-death RESULT the ledger records for
     /// hits. Deterministic and replay-compared for adapter-realm one-op
     /// rows — an arbitration that flips between same-seed runs is itself
     /// a caught bug; the keep-serving rows carry the lance-realm envelope
@@ -1181,11 +1175,17 @@ pub struct UniverseReport {
 
 // ------------------------------------------------------------------- model --
 
+/// One physical `Knows` row, keyed the way the engine's merge walk keys it:
+/// minted at insert time, never reused, copied as-is by a fork.
+type EdgeRowId = u64;
+
 #[derive(Clone, Debug, Default)]
 struct Model {
     /// name → (age, ver); ver = -1 for rows written without one.
     persons: BTreeMap<String, (i64, i64)>,
-    edges: BTreeSet<(String, String)>,
+    /// Physical rows by id — the multiset default: re-inserting a pair is
+    /// a second row (`@key(src, dst)` opts a type out, RFC 0044).
+    edges: BTreeMap<EdgeRowId, (String, String)>,
     /// The physical-vs-logical edge delta — EMPTY by construction since
     /// the #474 fix made self-loops ordinary visible edges. Kept (with its
     /// vestigial cascade/remove/fork/merge carries) so the physical-channel
@@ -1201,17 +1201,39 @@ impl Model {
             .map(|(name, (age, ver))| (name.clone(), *age, *ver))
             .collect()
     }
-    /// The raw-channel expectation: logical edges ∪ ghosts, sorted (BTreeSet
-    /// union) — the one spelling of what `physical_view_on` must show.
+    /// Membership view: the distinct pairs with at least one live row. The
+    /// query channels dedupe rows (the gated traversal's visited set, the
+    /// bound reader's set), so their oracles compare at this level.
+    fn edge_pair_set(&self) -> BTreeSet<(String, String)> {
+        self.edges.values().cloned().collect()
+    }
+    /// The query-channel expectation at pair grain: logical edges ∪ ghosts,
+    /// sorted (BTreeSet union) — what the bound reader must show.
     fn edges_with_ghosts(&self) -> Vec<(String, String)> {
-        self.edges.union(&self.ghosts).cloned().collect()
+        let mut pairs = self.edge_pair_set();
+        pairs.extend(self.ghosts.iter().cloned());
+        pairs.into_iter().collect()
+    }
+    /// The physical-channel expectation at ROW grain: every row plus every
+    /// ghost, sorted with duplicates — what `export_jsonl` must show, the one
+    /// oracle that observes the multiset.
+    fn physical_rows(&self) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = self.edges.values().cloned().collect();
+        rows.extend(self.ghosts.iter().cloned());
+        rows.sort();
+        rows
+    }
+    /// The one minting site: a fresh id from the world-wide counter.
+    fn mint_edge_row(&mut self, rows: &mut EdgeRowId, pair: (String, String)) {
+        *rows += 1;
+        self.edges.insert(*rows, pair);
     }
     fn edge_pairs(&self) -> Vec<(String, String)> {
-        self.edges.iter().cloned().collect()
+        self.edge_pair_set().into_iter().collect()
     }
     fn has_edges_touching(&self, name: &str) -> bool {
         self.edges
-            .iter()
+            .values()
             .any(|(from, to)| from == name || to == name)
     }
 }
@@ -1281,11 +1303,34 @@ struct BranchSlot {
 struct WorldModel {
     main: Model,
     branches: BTreeMap<String, BranchSlot>,
+    /// Row-id counter shared by every branch, so a row minted on one side
+    /// of a fork never collides with one minted on the other.
+    edge_rows_minted: EdgeRowId,
 }
 
 impl WorldModel {
     fn state_of(&self, branch: &str) -> &Model {
         self.state_of_opt(branch).expect("live branch")
+    }
+    /// A branch's state together with the row-id counter, borrowed apart
+    /// so an op can mint a row into the branch it targets. Panics on an absent
+    /// branch: callers hold a live target; lagging state reads `state_of_opt`.
+    fn state_and_rows_mut(&mut self, branch: &str) -> (&mut Model, &mut EdgeRowId) {
+        let WorldModel {
+            main,
+            branches,
+            edge_rows_minted,
+        } = self;
+        let model = if branch == "main" {
+            main
+        } else {
+            &mut branches.get_mut(branch).expect("live branch").state
+        };
+        (model, edge_rows_minted)
+    }
+    fn add_edge_row(&mut self, branch: &str, pair: (String, String)) {
+        let (model, rows) = self.state_and_rows_mut(branch);
+        model.mint_edge_row(rows, pair);
     }
     /// Branch-absence-safe sibling of [`Self::state_of`]: `None` for a branch
     /// the model does not hold. Callers judging state that can lag or lead
@@ -1296,13 +1341,6 @@ impl WorldModel {
             Some(&self.main)
         } else {
             self.branches.get(branch).map(|slot| &slot.state)
-        }
-    }
-    fn state_of_mut(&mut self, branch: &str) -> &mut Model {
-        if branch == "main" {
-            &mut self.main
-        } else {
-            &mut self.branches.get_mut(branch).expect("live branch").state
         }
     }
     /// Deterministic observation order: main first, then branches by name.
@@ -1322,34 +1360,9 @@ impl WorldModel {
     }
 }
 
-/// Predict the engine's three-way merge (exec/merge.rs `CandidateTableState`
-/// cursor walk) at the LOGICAL-KEY level: per key compare base/source/target
-/// by content; the unchanged side yields to the changed one; both-changed-
-/// equal passes; both-changed-differently is a `MergeConflict` and the WHOLE
-/// merge is rejected (state untouched). `None` = rejection predicted.
-///
-/// One hypothesis layered on top (dual-hypothesis method, as with
-/// recorded engine discoveries — if the engine disagrees, an assert fails loudly and
-/// the real semantics get recorded with evidence):
-///   H-B: the merged state is RI-validated — an edge surviving the cursor
-///        walk whose endpoint the other side deleted rejects the merge.
-///
-/// H-A (reject edges born on both sides) is RETIRED: unkeyed born-on-both
-/// is the DOCUMENTED multiset default (the merge keeps both physical rows;
-/// `@key(src, dst)` opts a type into convergence instead). The model's
-/// edge reads are visited-gated membership, and the set model predicts the
-/// merged MEMBERSHIP for the multiset default in every sampled shape so
-/// far. Known gap: hidden multiplicity can split a delete-vs-readd fork —
-/// one side removes every row of a pair the other side has also re-added
-/// as a fresh second row; the set model sees an unchanged side and
-/// predicts absence while the engine keeps the fresh row. A pair-count
-/// edge model is the fix if the fleet ever trips it. Physical row counts
-/// are pinned by the targeted scenario
-/// `dst_merge_duplicates_born_on_both_edge` and its keyed twin. PERSON
-/// rows are `@key`-keyed: equal-content born-on-both CONVERGES to one row
-/// and divergent inserts are typed `MergeConflict{DivergentInsert}` —
-/// exactly the plain three-way arms (probed both cells,
-/// `dst_predict_born_on_both_person_probe`).
+/// The engine's three-way merge per row key (persons by name, `Knows` rows by
+/// [`EdgeRowId`]): the unchanged side yields, both-changed-differently is a
+/// `MergeConflict` (`None`); H-B then rejects a merged edge whose endpoint is gone.
 fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> {
     // Predict-triage aid (env-gated): DST_PREDICT_LOG=1
     // prints WHICH rule rejected and on what evidence, so a
@@ -1395,14 +1408,8 @@ fn predict_merge(base: &Model, source: &Model, target: &Model) -> Option<Model> 
     }
 
     let persons = three_way(&base.persons, &source.persons, &target.persons)?;
-    let to_map = |m: &Model| -> BTreeMap<(String, String), ()> {
-        m.edges.iter().cloned().map(|p| (p, ())).collect()
-    };
-    let edges: BTreeSet<(String, String)> =
-        three_way(&to_map(base), &to_map(source), &to_map(target))?
-            .into_keys()
-            .collect();
-    for (from, to) in &edges {
+    let edges = three_way(&base.edges, &source.edges, &target.edges)?;
+    for (from, to) in edges.values() {
         if !persons.contains_key(from) || !persons.contains_key(to) {
             reject_log("H-B referential", format!("edge=({from:?},{to:?})"));
             return None; // H-B: merged state referentially broken
@@ -1634,7 +1641,7 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
 /// the person (dual-hypothesis discovery: if the engine instead preserves or
 /// forbids, continuous verification fails loudly on first contact and the
 /// policy gets corrected with evidence in hand).
-fn apply_to_model(model: &mut Model, op: &Op) {
+fn apply_to_model(model: &mut Model, op: &Op, rows: &mut EdgeRowId) {
     match op {
         Op::InsertV { name, age, ver } => {
             model.persons.insert(name.clone(), (*age, *ver));
@@ -1646,7 +1653,9 @@ fn apply_to_model(model: &mut Model, op: &Op) {
         }
         Op::DeletePerson { name } => {
             model.persons.remove(name);
-            model.edges.retain(|(from, to)| from != name && to != name);
+            model
+                .edges
+                .retain(|_, (from, to)| from != name && to != name);
             // Vestigial post-#474 (ghosts is empty by construction):
             model.ghosts.retain(|(from, to)| from != name && to != name);
         }
@@ -1657,10 +1666,10 @@ fn apply_to_model(model: &mut Model, op: &Op) {
             // traversal — is dead; `ghosts` stays as the (now empty)
             // physical-vs-logical delta so the physical-channel oracle
             // still proves raw == logical by construction.
-            model.edges.insert((from.clone(), to.clone()));
+            model.mint_edge_row(rows, (from.clone(), to.clone()));
         }
         Op::RemoveFriendshipsFrom { from } => {
-            model.edges.retain(|(f, _)| f != from);
+            model.edges.retain(|_, (f, _)| f != from);
             // Vestigial post-#474 (ghosts is empty by construction):
             model.ghosts.retain(|(f, _)| f != from);
         }
@@ -2048,7 +2057,10 @@ async fn exec_world_op(db: &mut Omnigraph, wop: &WorldOp) -> OmniResult<()> {
 /// DID reject; see the success-path assert in `run_universe`).
 fn apply_world(world: &mut WorldModel, wop: &WorldOp) {
     match wop {
-        WorldOp::Data { branch, op } => apply_to_model(world.state_of_mut(branch), op),
+        WorldOp::Data { branch, op } => {
+            let (model, rows) = world.state_and_rows_mut(branch);
+            apply_to_model(model, op, rows)
+        }
         WorldOp::BranchCreate { name } => {
             world.branches.insert(
                 name.clone(),
@@ -2070,7 +2082,7 @@ fn apply_world(world: &mut WorldModel, wop: &WorldOp) {
             );
             if let Some(mut merged) = predict_merge(&slot.base, &slot.state, &world.main) {
                 // H: ghost rows ride merges like ordinary rows
-                // (set-level three-way; a bare (X,X) pair has no conflict
+                // (ghosts are set-level; a bare (X,X) pair has no conflict
                 // shape at set level). predict_merge builds the merged model
                 // from logical state only, so the ghost set is carried here.
                 merged.ghosts =
@@ -3365,14 +3377,9 @@ async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], whe
     }
 }
 
-/// the PHYSICAL-CHANNEL ORACLE (third audit channel): for every
-/// branch, the stored-row dump (`export_jsonl`, NO query machinery) must equal
-/// the model's PHYSICAL expectation — persons exactly, Knows = logical edges
-/// ∪ ghost self-loops. The claim, query, and physical channels are three
-/// independent reads of one store; any pairwise disagreement outside the
-/// modeled ghost delta is a bug (claim-vs-query found #474; query-vs-physical is
-/// the ghost-row detector by construction; claim-vs-physical catches silent lost
-/// writes on paths the query channel never touches).
+/// PHYSICAL-CHANNEL ORACLE (third audit channel, the one that counts rows): per
+/// branch, `export_jsonl` (no query machinery) must equal the model's physical
+/// expectation — persons exactly, Knows = every row ∪ ghosts, duplicates kept.
 async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
     for branch in world.branch_names() {
         let (persons, knows) = Box::pin(physical_view_on(db, &branch)).await;
@@ -3382,10 +3389,10 @@ async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &st
             m.person_rows(),
             "{where_}: EXPORT persons diverged from model on '{branch}'"
         );
-        let expected = m.edges_with_ghosts();
+        let expected = m.physical_rows();
         assert_eq!(
             knows, expected,
-            "{where_}: EXPORT Knows diverged from model (logical ∪ ghosts) on '{branch}'"
+            "{where_}: EXPORT Knows rows diverged from model (rows ∪ ghosts, duplicates kept) on '{branch}'"
         );
     }
 }
@@ -3777,10 +3784,11 @@ async fn reconcile_after_failure(
     // Which channel the ruling rests on — recorded so the run tables carry
     // observed provenance, never an assumption (canary lesson).
     let mut channel: &'static str = "query";
-    // GHOST TIE-BREAK (the physical-channel oracle's first catch,
+    // BOUND-ROW TIE-BREAK (the physical-channel oracle's first catch,
     // found in its first full-suite run, 2026-08-11): an op whose ONLY effect
     // is on ghost rows (a failed self-loop add_friend; a remove-from touching
-    // nothing but ghosts) is invisible to every query-channel read — the
+    // nothing but ghosts) or on row COUNT (a re-add of a pair the branch
+    // already holds, issue 681's shape) is invisible to every query-channel read — the
     // two hypotheses render identically, and the judgment above silently
     // guesses. Before the physical-channel oracle existed, that guess quietly
     // recorded ghosts that never landed (caught at final audit). The raw
@@ -3793,13 +3801,12 @@ async fn reconcile_after_failure(
             _ => None,
         };
         if let Some(branch) = touched {
-            let g_world = &world.state_of(branch).ghosts;
-            let g_with = &with.state_of(branch).ghosts;
-            if g_world != g_with {
-                channel = "query+physical";
-                let (_, knows) = Box::pin(physical_view_on(&db, branch)).await;
-                let expect_with = with.state_of(branch).edges_with_ghosts();
-                let expect_world = world.state_of(branch).edges_with_ghosts();
+            let expect_world = world.state_of(branch).physical_rows();
+            let expect_with = with.state_of(branch).physical_rows();
+            if expect_world != expect_with {
+                channel = "query+bound";
+                let knows =
+                    Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
                 outcome = if knows == expect_with {
                     ReconcileOutcome::Applied
                 } else if knows == expect_world {
@@ -3809,10 +3816,11 @@ async fn reconcile_after_failure(
                         DET_ARBITRATION_PHYSICAL,
                         at_op,
                         format!(
-                            "{label}: physical channel matches NEITHER ghost hypothesis \
-                             (op={wop:?}, physical={knows:?})"
+                            "{label}: bound rows match NEITHER hypothesis \
+                             (op={wop:?}, bound={knows:?}, applied={expect_with:?}, \
+                             not_applied={expect_world:?})"
                         ),
-                        "the export tie-break resolves ghost-only effects to one hypothesis",
+                        "the bound-row tie-break resolves query-invisible effects to one hypothesis",
                     )
                 };
             }
@@ -4640,7 +4648,7 @@ async fn reconcile_watch_resolution(
     }
     assert_no_recovery_residue(&storage, root, label, at_op).await;
     // Ambiguity: several compositions can render identically while their
-    // MODELS differ in ghost content. Resolve through the physical channel
+    // MODELS differ in ghost content or row count. Resolve through the bound-edge rows
     // per touched branch; a raw read matching NO tied composition is its
     // own violation. Runs BEFORE the monotonicity checks so they judge the
     // narrowed set — quantifying over pre-narrowing ties could let the
@@ -4665,7 +4673,7 @@ async fn reconcile_watch_resolution(
             touched.push(branch);
         }
         for branch in touched {
-            // The raw expectation per tied composition: edges ∪ ghosts on
+            // The raw expectation per tied composition: rows ∪ ghosts on
             // the touched branch (None = branch absent in that model —
             // uniform across ties, since the shared render lists branches).
             let expectations: Vec<Option<Vec<(String, String)>>> = after_matches
@@ -4674,15 +4682,15 @@ async fn reconcile_watch_resolution(
                     hyps[idx]
                         .world
                         .state_of_opt(branch)
-                        .map(Model::edges_with_ghosts)
+                        .map(Model::physical_rows)
                 })
                 .collect();
             let first = &expectations[0];
             if first.is_none() || expectations.iter().all(|e| e == first) {
                 continue;
             }
-            channel = "query+physical";
-            let (_, knows) = Box::pin(physical_view_on(&db, branch)).await;
+            channel = "query+bound";
+            let knows = Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
             let keep: Vec<usize> = after_matches
                 .iter()
                 .zip(&expectations)
@@ -4694,11 +4702,11 @@ async fn reconcile_watch_resolution(
                     DET_ARBITRATION_PHYSICAL,
                     at_op,
                     format!(
-                        "{label}: physical channel matches NO tied composition on \
-                         '{branch}' (physical={knows:?}; tied expectations: {:?})",
+                        "{label}: bound rows match NO tied composition on \
+                         '{branch}' (bound={knows:?}; tied expectations: {:?})",
                         expectations
                     ),
-                    "the export tie-break resolves ghost-only differences to one composition",
+                    "the bound-row tie-break resolves query-invisible differences to one composition",
                 );
             }
             after_matches = keep;
@@ -5046,8 +5054,14 @@ pub fn run_universe_caught(
         for (name, age, ver) in person_rows(&db).await {
             world.main.persons.insert(name, (age, ver));
         }
-        for pair in knows_pairs(&db).await {
-            world.main.edges.insert(pair);
+        let seeded = knows_pairs(&db).await;
+        debug_assert_eq!(
+            seeded.len(),
+            fixture_knows().len(),
+            "fixture Knows rows must be distinct pairs: the seed reads the gated (deduped) channel"
+        );
+        for pair in seeded {
+            world.add_edge_row("main", pair);
         }
         // history baseline (the fixture-load commit) — captured
         // before fault injection enables so the baseline read is clean.
