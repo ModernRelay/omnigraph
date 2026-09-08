@@ -254,10 +254,13 @@ An unambiguous managed request requires explicit `--graph`, rejects explicit
 `--as`, and uses the separately cached data endpoint/credential. Missing,
 malformed, expired, or under-scoped credentials never fall through to static
 credentials, a profile, or direct storage. Legacy token settings never supply
-managed authority. Managed requests refuse redirects and have a 10-second
-deadline and 8 MiB response bound. Cluster control dispatch and token issuance
-retain their existing scope requirements. New named managed connections are
-a separate change.
+managed authority. Managed requests refuse redirects and have a 30-second
+total deadline, including connection establishment and response-body reading,
+with at most 10 seconds to connect and an 8 MiB response bound. Requests are
+not automatically retried; a timed-out mutation can have an unknown outcome
+and requires independent reconciliation. Cluster control dispatch and token
+issuance retain their existing scope requirements. New named managed
+connections are a separate change.
 
 ### Prepared transport extension; command activation deferred
 
@@ -271,10 +274,10 @@ The prepared load transport checks at most 32 MiB of UTF-8 input before
 sending, bounds JSON responses to 8 MiB, and has a separate 300-second request
 deadline with at most 10 seconds to connect. Redirects and automatic retries
 remain disabled. This longer deadline belongs only to the prepared load
-request; existing managed queries and mutations retain their 10-second
-request deadline. The engine still owns row/byte limits, branch creation,
+request; managed queries and mutations use the 30-second total request
+deadline above. The engine still owns row/byte limits, branch creation,
 graph publication and uncertain-outcome recovery. Commit transport reads use
-the existing protocol, 10-second deadline and bounded JSON decoder.
+the existing protocol, the same 30-second deadline and bounded JSON decoder.
 
 Command activation must use the shared selected-connection path proposed in
 [RFC 0059](https://github.com/ModernRelay/omnigraph/pull/675), not add another
@@ -393,10 +396,13 @@ qualification remain separate from acceptance.
 ## Decision log
 
 2026-09-08: Added bounded load and commit transport preparation without
-activating new managed commands or extending context routing. Existing
-query/mutate deadlines remain 10 seconds. Named managed selection, exact
-endpoint binding and per-command activation remain separate review and test
-gates under draft RFC 0059.
+activating new managed commands or extending context routing. Extended the
+managed query/mutate total request deadline from 10 to 30 seconds, including
+response-body reading, while retaining the 10-second connection limit and
+no automatic retries. Draft RFC 0059 CC-11 carries the same bounds. This
+numeric amendment does not accept the broader draft. Named managed selection,
+exact endpoint binding and per-command activation remain separate review and
+test gates under draft RFC 0059.
 
 2026-09-06: The compatibility repair restores the three public struct shapes
 and isolates canonical-root validation in opt-in managed boot. This replaces

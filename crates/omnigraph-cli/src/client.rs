@@ -62,7 +62,7 @@ use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_r
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
 // Managed load transport has its own longer bounded receipt wait.
-// Existing managed query/mutate requests retain their ten-second deadline.
+// Managed queries and mutations share a thirty-second total request deadline.
 const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The engine owns parsed-table limits. This bound covers only the exact
@@ -159,7 +159,7 @@ impl GraphClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             base_url: remote_url(endpoint, &["graphs", graph], &[])?,
             token: Some(token),
@@ -1672,10 +1672,10 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn managed_mutations_keep_the_short_deadline_without_retrying() {
-        // Exercise every mutation request owner through actual HTTP. Fast
-        // receipts remain intact; a response past the existing ten-second
-        // deadline fails without replaying an uncertain write.
+    async fn managed_mutations_use_thirty_second_deadline_without_retrying() {
+        // Exercise every mutation request owner through actual HTTP. Receipts
+        // can arrive after ten seconds, but the total thirty-second deadline
+        // still bounds uncertain writes without replaying them.
         futures::future::join_all(
             [
                 "ad-hoc",
@@ -1687,11 +1687,11 @@ mod tests {
             .into_iter()
             .flat_map(|form| {
                 [
-                    (form, std::time::Duration::ZERO),
-                    (form, std::time::Duration::from_millis(10_250)),
+                    (form, std::time::Duration::from_millis(10_250), false),
+                    (form, std::time::Duration::from_millis(30_250), true),
                 ]
             })
-            .map(|(form, delay)| async move {
+            .map(|(form, delay, expect_timeout)| {
                 let commit = json!({
                     "graph_commit_id": "head-after", "graph_branch": "main",
                     "graph_manifest_version": 7, "parent_commit_id": "head-before",
@@ -1717,148 +1717,199 @@ mod tests {
                 let client =
                     GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
                         .unwrap();
-                let (result, path) = match form {
-                    "branch" => (
-                        client
-                            .branch_write_statement(
-                                "branch merge review into main",
-                                BranchWrite::Merge {
-                                    source: "review".into(),
-                                    into: Some("main".into()),
-                                },
-                            )
-                            .await,
-                        "/graphs/knowledge/mutate",
-                    ),
-                    "stored" | "stored-conditional" => (
-                        client
-                            .invoke_named::<ChangeOutput>(
-                                "m",
-                                true,
-                                None,
-                                Some("main".into()),
-                                None,
-                                (form == "stored-conditional").then_some("head-before"),
-                            )
-                            .await,
-                        if form == "stored-conditional" {
-                            "/graphs/knowledge/queries/m/if-graph-commit"
-                        } else {
-                            "/graphs/knowledge/queries/m"
-                        },
-                    ),
-                    _ => (
-                        client
-                            .mutate(
-                                "main",
-                                "mutation m() {}",
-                                Some("m"),
-                                None,
-                                (form == "conditional").then_some("head-before"),
-                            )
-                            .await,
-                        if form == "conditional" {
-                            "/graphs/knowledge/mutate/if-graph-commit"
-                        } else {
-                            "/graphs/knowledge/change"
-                        },
-                    ),
-                };
-                if delay.is_zero() {
-                    let result = result.unwrap_or_else(|error| panic!("{form}: {error}"));
-                    assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
-                    assert_eq!(result.actor_id.as_deref(), Some("principal:alice"));
-                } else {
-                    let error = result.expect_err("mutation must keep its ten-second deadline");
-                    assert!(
-                        error
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(reqwest::Error::is_timeout),
-                        "{form}: {error}"
-                    );
-                }
-                let requests = server.requests();
-                assert_eq!(requests.len(), 1, "{form} must not retry");
-                assert_eq!(requests[0].path, path);
-                assert_eq!(
-                    requests[0].headers["authorization"],
-                    "Bearer data-credential"
-                );
-                if form.ends_with("conditional") {
+                // Finish synchronous client setup before join_all polls requests.
+                async move {
+                    let started = std::time::Instant::now();
+                    let (result, path) = match form {
+                        "branch" => (
+                            client
+                                .branch_write_statement(
+                                    "branch merge review into main",
+                                    BranchWrite::Merge {
+                                        source: "review".into(),
+                                        into: Some("main".into()),
+                                    },
+                                )
+                                .await,
+                            "/graphs/knowledge/mutate",
+                        ),
+                        "stored" | "stored-conditional" => (
+                            client
+                                .invoke_named::<ChangeOutput>(
+                                    "m",
+                                    true,
+                                    None,
+                                    Some("main".into()),
+                                    None,
+                                    (form == "stored-conditional").then_some("head-before"),
+                                )
+                                .await,
+                            if form == "stored-conditional" {
+                                "/graphs/knowledge/queries/m/if-graph-commit"
+                            } else {
+                                "/graphs/knowledge/queries/m"
+                            },
+                        ),
+                        _ => (
+                            client
+                                .mutate(
+                                    "main",
+                                    "mutation m() {}",
+                                    Some("m"),
+                                    None,
+                                    (form == "conditional").then_some("head-before"),
+                                )
+                                .await,
+                            if form == "conditional" {
+                                "/graphs/knowledge/mutate/if-graph-commit"
+                            } else {
+                                "/graphs/knowledge/change"
+                            },
+                        ),
+                    };
+                    if !expect_timeout {
+                        let result = result.unwrap_or_else(|error| panic!("{form}: {error}"));
+                        assert!(started.elapsed() >= std::time::Duration::from_secs(10));
+                        assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
+                        assert_eq!(result.actor_id.as_deref(), Some("principal:alice"));
+                    } else {
+                        let error =
+                            result.expect_err("mutation must stop at its thirty-second deadline");
+                        assert!(
+                            error
+                                .downcast_ref::<reqwest::Error>()
+                                .is_some_and(reqwest::Error::is_timeout),
+                            "{form}: {error}"
+                        );
+                        assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+                    }
+                    let requests = server.requests();
+                    assert_eq!(requests.len(), 1, "{form} must not retry");
+                    assert_eq!(requests[0].path, path);
                     assert_eq!(
-                        requests[0].headers["omnigraph-if-graph-commit"],
-                        "head-before"
+                        requests[0].headers["authorization"],
+                        "Bearer data-credential"
                     );
+                    if form.ends_with("conditional") {
+                        assert_eq!(
+                            requests[0].headers["omnigraph-if-graph-commit"],
+                            "head-before"
+                        );
+                    }
+                    if form.starts_with("stored") {
+                        assert_eq!(requests[0].body["expect_mutation"], true);
+                    }
+                    server.assert_complete();
                 }
-                if form.starts_with("stored") {
-                    assert_eq!(requests[0].body["expect_mutation"], true);
-                }
-                server.assert_complete();
             }),
         )
         .await;
     }
 
     #[tokio::test]
-    async fn managed_reads_keep_the_short_deadline_without_retrying() {
+    async fn managed_reads_use_thirty_second_deadline_without_retrying() {
         futures::future::join_all(
             ["ad-hoc", "stored", "commit-list", "commit-show"]
                 .into_iter()
-                .map(|operation| async move {
+                .flat_map(|operation| {
+                    [
+                        (operation, std::time::Duration::from_millis(10_250), false),
+                        (operation, std::time::Duration::from_millis(30_250), true),
+                    ]
+                })
+                .map(|(operation, delay, expect_timeout)| {
+                    let commit = json!({
+                        "graph_commit_id": "commit-a", "graph_branch": "main",
+                        "graph_manifest_version": 7, "parent_commit_id": "prior",
+                        "merged_parent_commit_id": null, "actor_id": "principal:alice",
+                        "created_at": 12345
+                    });
+                    let reply = match operation {
+                        "commit-list" => json!({"commits": [commit]}),
+                        "commit-show" => commit,
+                        _ => json!({
+                            "query_name": "q", "target": {"branch":"main", "snapshot":null},
+                            "row_count": 1, "columns": ["value"], "rows": [{"value":42}],
+                            "graph_commit_id": "head"
+                        }),
+                    };
                     let server = IntentApiFixture::with_response_delay(
-                        vec![IntentReply::json(
-                            200,
-                            json!({
-                                "query_name": "q", "target": {"branch":"main"},
-                                "row_count": 0, "columns": [], "rows": [], "graph_commit_id": "head"
-                            }),
-                        )],
-                        std::time::Duration::from_millis(10_250),
+                        vec![IntentReply::json(200, reply.clone())],
+                        delay,
                     );
                     let client =
                         GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
                             .unwrap();
-                    let (result, path) = match operation {
-                        "stored" => (
-                            client
-                                .invoke_named::<ReadOutput>(
-                                    "q",
-                                    false,
-                                    None,
-                                    Some("main".into()),
-                                    None,
-                                    None,
-                                )
-                                .await
-                                .map(|_| ()),
-                            "/graphs/knowledge/queries/q",
-                        ),
-                        "commit-list" => (
-                            client.list_commits(Some("main")).await.map(|_| ()),
-                            "/graphs/knowledge/commits?branch=main",
-                        ),
-                        "commit-show" => (
-                            client.get_commit("commit-a").await.map(|_| ()),
-                            "/graphs/knowledge/commits/commit-a",
-                        ),
-                        _ => (
-                            client
-                                .query(ReadTarget::branch("main"), "query q() {}", Some("q"), None)
-                                .await
-                                .map(|_| ()),
-                            "/graphs/knowledge/query",
-                        ),
-                    };
-                    let error = result.unwrap_err();
-                    assert!(
-                        error
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(reqwest::Error::is_timeout)
-                    );
-                    let requests = server.requests();
-                    assert_eq!(requests.len(), 1, "read timeout must not retry");
-                    assert_eq!(requests[0].path, path);
-                    server.assert_complete();
+                    // Finish synchronous client setup before join_all polls requests.
+                    async move {
+                        let started = std::time::Instant::now();
+                        let (result, path) = match operation {
+                            "stored" => (
+                                client
+                                    .invoke_named::<ReadOutput>(
+                                        "q",
+                                        false,
+                                        None,
+                                        Some("main".into()),
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/queries/q",
+                            ),
+                            "commit-list" => (
+                                client
+                                    .list_commits(Some("main"))
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/commits?branch=main",
+                            ),
+                            "commit-show" => (
+                                client
+                                    .get_commit("commit-a")
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/commits/commit-a",
+                            ),
+                            _ => (
+                                client
+                                    .query(
+                                        ReadTarget::branch("main"),
+                                        "query q() {}",
+                                        Some("q"),
+                                        None,
+                                    )
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/query",
+                            ),
+                        };
+                        if expect_timeout {
+                            let error =
+                                result.expect_err("read must stop at its thirty-second deadline");
+                            assert!(
+                                error
+                                    .downcast_ref::<reqwest::Error>()
+                                    .is_some_and(reqwest::Error::is_timeout),
+                                "{operation}: {error}"
+                            );
+                            assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+                        } else {
+                            let output =
+                                result.unwrap_or_else(|error| panic!("{operation}: {error}"));
+                            assert!(started.elapsed() >= std::time::Duration::from_secs(10));
+                            assert_eq!(output, reply);
+                        }
+                        let requests = server.requests();
+                        assert_eq!(requests.len(), 1, "read must not retry");
+                        assert_eq!(requests[0].path, path);
+                        assert_eq!(
+                            requests[0].headers["authorization"],
+                            "Bearer data-credential"
+                        );
+                        server.assert_complete();
+                    }
                 }),
         )
         .await;
@@ -1882,7 +1933,7 @@ mod tests {
                 .contains("32 MiB")
         );
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap();
         for (managed, expected) in [
