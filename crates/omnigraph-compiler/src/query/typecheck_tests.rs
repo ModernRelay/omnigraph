@@ -745,7 +745,7 @@ fn test_bm25_string_param_ok() {
         r#"
 query q($q: String) {
 match { $p: Person }
-return { $p.name, bm25($p.name, $q) as score }
+return { $p.name }
 order { bm25($p.name, $q) desc }
 }
 "#,
@@ -762,7 +762,8 @@ fn test_bm25_rejects_non_string_query() {
         r#"
 query q($q: I64) {
 match { $p: Person }
-return { bm25($p.name, $q) as score }
+return { $p.name }
+order { bm25($p.name, $q) desc }
 }
 "#,
     )
@@ -815,71 +816,6 @@ query q($vq: String, $tq: String) {
 match { $d: Doc }
 return { $d.id_str }
 order { rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc }
-limit 5
-}
-"#,
-    )
-    .unwrap();
-    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("d"));
-}
-
-#[test]
-fn test_rrf_with_nearest_allows_alias_ordering() {
-    let catalog = setup_vector();
-    let qf = parse_query(
-        r#"
-query q($vq: Vector(3), $tq: String) {
-match { $d: Doc }
-return {
-    $d.id_str,
-    rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) as score
-}
-order {
-    rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc,
-    score desc
-}
-limit 5
-}
-"#,
-    )
-    .unwrap();
-    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("d"));
-}
-
-#[test]
-fn test_rrf_alias_ordering_requires_limit() {
-    let catalog = setup_vector();
-    let qf = parse_query(
-        r#"
-query q($vq: Vector(3), $tq: String) {
-match { $d: Doc }
-return {
-    $d.id_str,
-    rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) as score
-}
-order { score desc }
-}
-"#,
-    )
-    .unwrap();
-    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
-    assert!(err.to_string().contains("T21"));
-}
-
-#[test]
-fn test_rrf_alias_ordering_with_limit_is_valid() {
-    let catalog = setup_vector();
-    let qf = parse_query(
-        r#"
-query q($vq: Vector(3), $tq: String) {
-match { $d: Doc }
-return {
-    $d.id_str,
-    rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) as score
-}
-order { score desc }
 limit 5
 }
 "#,

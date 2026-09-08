@@ -1,0 +1,68 @@
+# issue: none
+# notes: companion of issue_639_shared_merged_parent_base: the ordinary flow around a deleted branch: s forks main; x forks main,
+# notes: writes, is merged into main and deleted; s merges into main. Only main's
+# notes: walk reaches x's commit before shared history, so it is not a base
+# notes: candidate and the merge proceeds on the fork point (RFC 0063 step 1).
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
+
+--- mutate
+branch create s
+
+--- expect ok
+
+--- mutate
+branch create x
+
+--- expect ok
+
+--- mutate branch: x
+query set_a_on_x() {
+    update Person set { age: 1 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge x
+
+--- expect outcome: fast_forward
+
+--- mutate
+branch delete x
+
+--- expect ok
+
+--- mutate branch: s
+query set_b_on_s() {
+    update Person set { age: 1 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s
+
+--- expect outcome: merged
+
+--- query
+query values_on_main() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "a", "p.age": 1}
+{"p.name": "b", "p.age": 1}
+
+--- expect shape
+p.name: String
+p.age: I32

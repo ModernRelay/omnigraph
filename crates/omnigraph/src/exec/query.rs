@@ -954,11 +954,9 @@ async fn execute_query_once(
         };
     } else if !has_aggregates {
         if let Some(mut orderings) = search_score_orderings(search_mode) {
-            // Guard on the invariant itself (score column present), not row
-            // count: an empty scan's fallback schema legitimately lacks the
-            // column (zero rows, nothing to order); rows WITHOUT the column
-            // would mean the ranking is unrecoverable, and returning them
-            // unranked would be a silent wrong answer — refuse instead.
+            // Guard on the column, not the row count: the pre-search wide
+            // fallback (`Schema::empty()`) lacks it legitimately; rows WITHOUT
+            // it would be an unranked, silently wrong answer — refuse.
             let score_col = match &orderings[0].expr {
                 IRExpr::PropAccess { variable, property } => format!("{variable}.{property}"),
                 _ => String::new(),
@@ -4548,7 +4546,7 @@ async fn execute_node_scan(
     }
 
     let scan_result = if batches.is_empty() {
-        let fields: Vec<_> = node_type
+        let mut fields: Vec<_> = node_type
             .arrow_schema
             .fields()
             .iter()
@@ -4558,6 +4556,11 @@ async fn execute_node_scan(
             })
             .map(|f| f.as_ref().clone())
             .collect();
+        fields.extend(
+            search_cols
+                .iter()
+                .map(|col| Field::new(*col, DataType::Float32, false)),
+        );
         RecordBatch::new_empty(Arc::new(Schema::new(fields)))
     } else if batches.len() == 1 {
         batches.into_iter().next().unwrap()

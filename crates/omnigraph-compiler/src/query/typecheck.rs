@@ -129,6 +129,7 @@ pub fn infer_query_result_schema(
             catalog,
             &projection.expr,
             projection.alias.as_deref(),
+            &query.order_clause,
             ctx,
             &params,
         )?;
@@ -196,8 +197,6 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         aliases: HashMap::new(),
         traversals: Vec::new(),
     };
-    let mut alias_exprs: HashMap<String, &Expr> = HashMap::new();
-
     let params = parse_declared_param_types(&query.params)?;
 
     refuse_reserved_variable_names(&query.match_clause)?;
@@ -210,6 +209,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     for proj in &query.return_clause {
         let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
         reject_blob_read_value(&resolved, &proj.expr)?;
+        check_projection(&proj.expr, &query.order_clause)?;
         // T25: one result column per name. The executor emits a batch with
         // every projection's column under its executed name; two columns of
         // one name survive the batch (Arrow allows it) and every reader that
@@ -223,7 +223,6 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         }
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
-            alias_exprs.insert(alias.clone(), &proj.expr);
         }
     }
 
@@ -236,11 +235,11 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     let has_standalone_nearest = query
         .order_clause
         .iter()
-        .any(|ord| expr_contains_standalone_nearest_with_aliases(&ord.expr, &alias_exprs));
+        .any(|ord| expr_contains_standalone_nearest(&ord.expr));
     let has_rrf = query
         .order_clause
         .iter()
-        .any(|ord| expr_contains_rrf_with_aliases(&ord.expr, &alias_exprs));
+        .any(|ord| expr_contains_rrf(&ord.expr));
     if has_rrf && query.limit.is_none() {
         return Err(CompilerError::Type(
             "T21: rrf ordering requires a limit clause".to_string(),
@@ -1260,7 +1259,7 @@ fn resolve_expr_type(
                     )));
                 }
                 return Ok(ResolvedType::Scalar(PropType::scalar(
-                    ScalarType::F64,
+                    ScalarType::F32,
                     false,
                 )));
             }
@@ -1297,7 +1296,7 @@ fn resolve_expr_type(
             }
 
             Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::F64,
+                ScalarType::F32,
                 false,
             )))
         }
@@ -1483,7 +1482,7 @@ fn resolve_expr_type(
             }
 
             Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::F64,
+                ScalarType::F32,
                 false,
             )))
         }
@@ -1508,10 +1507,10 @@ fn resolve_expr_type(
 
             for ty in [primary_ty, secondary_ty] {
                 match ty {
-                    ResolvedType::Scalar(s) if s.scalar == ScalarType::F64 && !s.list => {}
+                    ResolvedType::Scalar(s) if s.scalar == ScalarType::F32 && !s.list => {}
                     ResolvedType::Scalar(s) => {
                         return Err(CompilerError::Type(format!(
-                            "T21: rrf rank expressions must evaluate to F64, got {}",
+                            "T21: rrf rank expressions must evaluate to F32, got {}",
                             s.display_name()
                         )));
                     }
@@ -1621,10 +1620,75 @@ fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
     Ok(())
 }
 
+/// Exhaustive over `Expr`, so a new variant fails to compile here instead of
+/// reaching the executor's catch-all arm; a rank expression is projectable when
+/// it repeats the retrieval `order` executes (T33, `Expr::score_column`).
+fn check_projection(expr: &Expr, order_clause: &[Ordering]) -> Result<()> {
+    match expr {
+        Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::Literal(_) => Ok(()),
+        Expr::Aggregate { func, arg } => match arg.as_ref() {
+            Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => {
+                Err(CompilerError::Type(format!(
+                    "T32: `{}` under `{func}` in `return`: a retrieval selects the rows an aggregate counts; state the filter instead",
+                    rank_keyword(arg)
+                )))
+            }
+            inner => check_projection(inner, order_clause),
+        },
+        Expr::Nearest { .. } | Expr::Bm25 { .. } => {
+            let executed = order_clause.first().is_some_and(|lead| &lead.expr == expr);
+            if !executed {
+                return Err(CompilerError::Type(format!(
+                    "T33: `{}` in `return` must repeat the retrieval stated as the leading `order` key; the projection reads the score that ordering computed",
+                    rank_keyword(expr)
+                )));
+            }
+            if expr.score_column().is_none() {
+                return Err(CompilerError::Type(format!(
+                    "T33: `{}` projects its score only over a property field; name the property the retrieval ranks",
+                    rank_keyword(expr)
+                )));
+            }
+            Ok(())
+        }
+        Expr::Rrf { .. } => Err(CompilerError::Type(
+            "T37: `rrf` cannot be projected in `return`; order by `rrf(...)` and project plain columns"
+                .to_string(),
+        )),
+        Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. } => {
+            Err(CompilerError::Type(format!(
+                "T35: `{}` cannot be projected in `return`; a search predicate belongs in `match`",
+                rank_keyword(expr)
+            )))
+        }
+        Expr::AliasRef(name) => Err(CompilerError::Type(format!(
+            "T36: `{name}` cannot be projected in `return`; an alias is resolved in `order`, not projected again"
+        ))),
+    }
+}
+
+fn rank_keyword(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Nearest { .. } => "nearest",
+        Expr::Bm25 { .. } => "bm25",
+        Expr::Rrf { .. } => "rrf",
+        Expr::Search { .. } => "search",
+        Expr::Fuzzy { .. } => "fuzzy",
+        Expr::MatchText { .. } => "match_text",
+        Expr::Now
+        | Expr::PropAccess { .. }
+        | Expr::Variable(_)
+        | Expr::Literal(_)
+        | Expr::Aggregate { .. }
+        | Expr::AliasRef(_) => "expression",
+    }
+}
+
 fn infer_projection_field(
     catalog: &Catalog,
     expr: &Expr,
     alias: Option<&str>,
+    order_clause: &[Ordering],
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
 ) -> Result<Field> {
@@ -1638,6 +1702,7 @@ fn infer_projection_field(
             let resolved_arg = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&resolved_arg, arg)?;
             check_aggregate_argument(func, arg, &resolved_arg)?;
+            check_projection(expr, order_clause)?;
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
                 AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
@@ -1648,9 +1713,15 @@ fn infer_projection_field(
             };
             Ok(Field::new(name, data_type, nullable))
         }
+        Expr::Nearest { .. } | Expr::Bm25 { .. } => {
+            resolve_expr_type(catalog, expr, ctx, params)?;
+            check_projection(expr, order_clause)?;
+            Ok(Field::new(name, DataType::Float32, false))
+        }
         _ => {
             let resolved = resolve_expr_type(catalog, expr, ctx, params)?;
             reject_blob_read_value(&resolved, expr)?;
+            check_projection(expr, order_clause)?;
             let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
             Ok(Field::new(name, data_type, nullable))
         }
@@ -1691,12 +1762,13 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
         Expr::PropAccess { property, .. } => property.clone(),
         Expr::Variable(variable) => variable.clone(),
         Expr::Literal(_) => "literal".to_string(),
-        Expr::Nearest { .. } => "nearest".to_string(),
-        Expr::Search { .. } => "search".to_string(),
-        Expr::Fuzzy { .. } => "fuzzy".to_string(),
-        Expr::MatchText { .. } => "match_text".to_string(),
-        Expr::Bm25 { .. } => "bm25".to_string(),
-        Expr::Rrf { .. } => "rrf".to_string(),
+        Expr::Nearest { .. } | Expr::Bm25 { .. } => match expr.score_column() {
+            Some((variable, column)) => format!("{variable}.{column}"),
+            None => rank_keyword(expr).to_string(),
+        },
+        Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. } | Expr::Rrf { .. } => {
+            rank_keyword(expr).to_string()
+        }
         Expr::Aggregate { func, .. } => func.to_string(),
         Expr::AliasRef(name) => name.clone(),
     }
@@ -1943,49 +2015,28 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
     }
 }
 
-fn expr_contains_standalone_nearest_with_aliases(
-    expr: &Expr,
-    alias_exprs: &HashMap<String, &Expr>,
-) -> bool {
-    expr_contains_standalone_nearest_inner(expr, alias_exprs, &mut HashSet::new())
-}
-
-fn expr_contains_standalone_nearest_inner(
-    expr: &Expr,
-    alias_exprs: &HashMap<String, &Expr>,
-    seen_aliases: &mut HashSet<String>,
-) -> bool {
+/// T33 admits a projected rank expression only as a repeat of the leading
+/// `order` key, so an alias never leads the order and the walk stops at
+/// `AliasRef` (T18 refuses an alias key beside `nearest`).
+fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
     match expr {
         Expr::Nearest { .. } => true,
-        Expr::Aggregate { arg, .. } => {
-            expr_contains_standalone_nearest_inner(arg, alias_exprs, seen_aliases)
-        }
+        Expr::Aggregate { arg, .. } => expr_contains_standalone_nearest(arg),
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
         | Expr::Bm25 { field, query } => {
-            expr_contains_standalone_nearest_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_standalone_nearest_inner(query, alias_exprs, seen_aliases)
+            expr_contains_standalone_nearest(field) || expr_contains_standalone_nearest(query)
         }
         Expr::Fuzzy {
             field,
             query,
             max_edits,
         } => {
-            expr_contains_standalone_nearest_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_standalone_nearest_inner(query, alias_exprs, seen_aliases)
-                || max_edits.as_deref().is_some_and(|expr| {
-                    expr_contains_standalone_nearest_inner(expr, alias_exprs, seen_aliases)
-                })
-        }
-        Expr::AliasRef(name) => {
-            if !seen_aliases.insert(name.clone()) {
-                return false;
-            }
-            let found = alias_exprs.get(name).is_some_and(|expr| {
-                expr_contains_standalone_nearest_inner(expr, alias_exprs, seen_aliases)
-            });
-            seen_aliases.remove(name);
-            found
+            expr_contains_standalone_nearest(field)
+                || expr_contains_standalone_nearest(query)
+                || max_edits
+                    .as_deref()
+                    .is_some_and(expr_contains_standalone_nearest)
         }
         // nearest() nested under rrf() is handled by T21 and should not trigger T17/T18 checks.
         Expr::Rrf { .. } => false,
@@ -1993,44 +2044,21 @@ fn expr_contains_standalone_nearest_inner(
     }
 }
 
-fn expr_contains_rrf_with_aliases(expr: &Expr, alias_exprs: &HashMap<String, &Expr>) -> bool {
-    expr_contains_rrf_inner(expr, alias_exprs, &mut HashSet::new())
-}
-
-fn expr_contains_rrf_inner(
-    expr: &Expr,
-    alias_exprs: &HashMap<String, &Expr>,
-    seen_aliases: &mut HashSet<String>,
-) -> bool {
+fn expr_contains_rrf(expr: &Expr) -> bool {
     match expr {
         Expr::Rrf { .. } => true,
-        Expr::Aggregate { arg, .. } => expr_contains_rrf_inner(arg, alias_exprs, seen_aliases),
+        Expr::Aggregate { arg, .. } => expr_contains_rrf(arg),
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
-        | Expr::Bm25 { field, query } => {
-            expr_contains_rrf_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_rrf_inner(query, alias_exprs, seen_aliases)
-        }
+        | Expr::Bm25 { field, query } => expr_contains_rrf(field) || expr_contains_rrf(query),
         Expr::Fuzzy {
             field,
             query,
             max_edits,
         } => {
-            expr_contains_rrf_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_rrf_inner(query, alias_exprs, seen_aliases)
-                || max_edits
-                    .as_deref()
-                    .is_some_and(|expr| expr_contains_rrf_inner(expr, alias_exprs, seen_aliases))
-        }
-        Expr::AliasRef(name) => {
-            if !seen_aliases.insert(name.clone()) {
-                return false;
-            }
-            let found = alias_exprs
-                .get(name)
-                .is_some_and(|expr| expr_contains_rrf_inner(expr, alias_exprs, seen_aliases));
-            seen_aliases.remove(name);
-            found
+            expr_contains_rrf(field)
+                || expr_contains_rrf(query)
+                || max_edits.as_deref().is_some_and(expr_contains_rrf)
         }
         _ => false,
     }

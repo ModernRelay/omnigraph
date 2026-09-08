@@ -1,0 +1,221 @@
+# issue: 640
+# red_on: 2026-09-07, upstream ad425c68 plus task 0150's patch: steps 1-4 refused with T26 (before 0150: `unsupported projection expression: Nearest { … }` at execution); the refusal steps carried T26 instead of their own codes; the control step green throughout; the no-match step then stayed red at execution (`column '<var>._distance' not found`) until `execute_node_scan`'s zero-row fallback carried the score columns.
+# notes: a projected `nearest`/`bm25` reads the score column the retrieval appended (`{var}._distance` /
+# notes: `{var}._score`) and must repeat the leading `order` key (T33); `_distance` is the squared L2 distance.
+# notes: the bm25 values pin Lance 11's BM25 (k1 1.2, b 0.75, default tokenizer) on this corpus; a Lance bump that changes scoring reds that step by design.
+
+--- schema
+node Person {
+    name: String @key
+    bio: String @index
+    embedding: Vector(2)?
+}
+
+edge Knows: Person -> Person {
+}
+
+--- seed
+{"type":"Person","data":{"name":"A","bio":"needle","embedding":[1.0,0.0]}}
+{"type":"Person","data":{"name":"B","bio":"needle needle filler","embedding":[0.0,1.0]}}
+{"edge":"Knows","from":"A","to":"B","data":{}}
+{"edge":"Knows","from":"B","to":"A","data":{}}
+
+--- query
+query nearest_projected($v: Vector(2)) {
+    match { $p: Person }
+    return { $p.name, nearest($p.embedding, $v) as score }
+    order { nearest($p.embedding, $v) }
+    limit 2
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect ordered
+{"p.name": "A", "score": 0}
+{"p.name": "B", "score": 2}
+
+--- expect shape
+p.name: String
+score: F32
+
+--- query
+query nearest_projected_default_name($v: Vector(2)) {
+    match { $p: Person }
+    return { $p.name, nearest($p.embedding, $v) }
+    order { nearest($p.embedding, $v) }
+    limit 1
+}
+
+--- params
+{"v": [0.0, 1.0]}
+
+--- expect ordered
+{"p.name": "B", "p._distance": 0}
+
+--- expect shape
+p.name: String
+p._distance: F32
+
+--- query
+query bm25_projected($q: String) {
+    match { $p: Person }
+    return { $p.name, bm25($p.bio, $q) }
+    order { bm25($p.bio, $q) desc }
+    limit 3
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"p.name": "A", "p._score": 0.2292043}
+{"p.name": "B", "p._score": 0.21978495}
+
+--- expect shape
+p.name: String
+p._score: F32
+
+--- query
+query nearest_projected_no_match($v: Vector(2)) {
+    match { $p: Person { name: "absent" } }
+    return { $p.name, nearest($p.embedding, $v) as score }
+    order { nearest($p.embedding, $v) }
+    limit 2
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect unordered
+
+--- expect shape
+p.name: String
+score: F32
+
+--- query
+query bm25_projected_no_match($q: String) {
+    match { $p: Person { name: "absent" } }
+    return { $p.name, bm25($p.bio, $q) as score }
+    order { bm25($p.bio, $q) desc }
+    limit 3
+}
+
+--- params
+{"q": "needle"}
+
+--- expect unordered
+
+--- expect shape
+p.name: String
+score: F32
+
+--- query
+query nearest_projected_without_retrieval($v: Vector(2)) {
+    match { $p: Person }
+    return { $p.name, nearest($p.embedding, $v) as score }
+    order { $p.name }
+    limit 2
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect error: T33: `nearest` in `return` must repeat the retrieval stated as the leading `order` key
+
+--- query
+query nearest_projected_other_query($v: Vector(2)) {
+    match { $p: Person }
+    return { $p.name, nearest($p.embedding, [0.0, 1.0]) as score }
+    order { nearest($p.embedding, $v) }
+    limit 2
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect error: T33: `nearest` in `return` must repeat the retrieval stated as the leading `order` key
+
+--- query
+query nearest_projected_under_aggregate($v: Vector(2)) {
+    match { $p: Person }
+    return { max(nearest($p.embedding, $v)) as best }
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect error: T32: `nearest` under `max` in `return`
+
+--- query
+query rrf_projected($q: String, $v: Vector(2)) {
+    match { $p: Person }
+    return { $p.name, rrf(nearest($p.embedding, $v), bm25($p.bio, $q)) as fused }
+    order { rrf(nearest($p.embedding, $v), bm25($p.bio, $q)) }
+    limit 3
+}
+
+--- params
+{"q": "needle", "v": [1.0, 0.0]}
+
+--- expect error: T37: `rrf` cannot be projected in `return`
+
+--- query
+query search_projected($q: String) {
+    match { $p: Person }
+    return { $p.name, search($p.bio, $q) as hit }
+}
+
+--- params
+{"q": "needle"}
+
+--- expect error: T35: `search` cannot be projected in `return`
+
+--- query
+query alias_projected_again() {
+    match { $p: Person }
+    return { $p.name as s, s as t }
+    limit 1
+}
+
+--- expect error: T36: `s` cannot be projected in `return`
+
+--- query
+query nearest_projected_through_traversal($v: Vector(2)) {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { $f.name, nearest($p.embedding, $v) as score }
+    order { nearest($p.embedding, $v), $f.name }
+    limit 3
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect ordered
+{"f.name": "B", "score": 0}
+{"f.name": "A", "score": 2}
+
+--- expect shape
+f.name: String
+score: F32
+
+--- query
+query nearest_ordered_plain_projection($v: Vector(2)) {
+    match { $p: Person }
+    return { $p.name }
+    order { nearest($p.embedding, $v) }
+    limit 2
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect ordered
+{"p.name": "A"}
+{"p.name": "B"}
+
+--- expect shape
+p.name: String
