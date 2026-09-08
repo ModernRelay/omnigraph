@@ -16,6 +16,8 @@ blocked_on:
   - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
   - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
   - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
+  - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
+  - "NFC preprocessing implementation and Unicode identity, with query/scan/index parity and bounded normalization"
   - "Vector arithmetic, normalization, invalid-value handling, exact-rescore precision, and checked fusion/effort arithmetic"
   - "Exact lexical evaluator, complete fuzzy ranked scoring specification, and scan/index membership, score, and boundary-order qualification"
   - "Snapshot-visible BM25 statistics population, term accounting, numeric contract, and full boundary-tie handling"
@@ -48,6 +50,11 @@ The proposal has three layers:
 | Representation in accepted schema | Analyzer and scoring-family identity, vector geometry and space, source-property mapping, and encoding recipes |
 | Typed query plan | Eligibility, ranking target, lexical query, named sources, candidate windows, fusion, selection, and graph-stage placement |
 | Physical execution | Qualified Lance scans/indexes, DataFusion operators where they fit, existing graph traversal, and shared resource accounting |
+
+Schema authoring has concise defaults: bare `@analyzed` enables matching and
+BM25-family ranking, and embedding fields may inherit a schema-owned encoding
+recipe. Accepted SchemaIR stores every resolved choice; runtime provider
+defaults cannot change an existing field's meaning.
 
 Ranked relations are first-class internally. Public composition extends the
 existing `.gq` clause language; it does not require general relation-valued
@@ -130,8 +137,8 @@ graphs still cross the storage-format upgrade described below.
 | `fuzzy`, `search`, or `match_text` | These spellings are removed without compatibility aliases. Boolean matching and ranked lexical retrieval consume the same typed `terms` query. | Choose `match_terms` for filtering or `lexical` for retrieval; set term combination and edit tolerance deliberately. |
 | `nearest`, retrieval expressions inside `order`, or positional RRF | Retrieval moves into explicit `rank` stages. Vector retrieval distinguishes exact `knn` from approximate `ann`; fusion names its inputs. | Rewrite inline and stored queries, choose exact versus approximate retrieval, and project named metrics instead of repeating retrieval expressions. |
 | Vector candidate depth inherited from final `limit`, while BM25 fusion arms scan uncapped | Each source and fusion stage has its own candidate window. Final `limit` counts output rows; graph fan-out can produce several rows per selected target. Stage comparators determine selection before final ordering. | Choose source/fusion windows explicitly and review tie keys and expected row counts. A migration cannot infer the intended recall/cost tradeoff from the old limit. |
-| `@index` or `@key` implicitly makes a String searchable by analyzed text | Analyzed matching requires `@analyzed`; lexical ranking also requires a compatible scoring declaration. Exact key/index annotations keep their separate meaning. | Review which fields need analyzed matching or ranking and add those declarations. An exact-only slug does not need an analyzer. |
-| Implicit vector geometry or an unresolved `@embed` model | Geometry and compatible encoding recipes become declared representation semantics. Bare `@embed` and model labels without recoverable revision identity require resolution. | Declare the geometry and resolve the encoding identity. Reuse old vectors only when compatible; regenerate them when the encoding recipe changes. |
+| `@index` or `@key` implicitly makes a String searchable by analyzed text | Analyzed matching requires `@analyzed`, which enables BM25-family ranking by default. Exact key/index annotations keep their separate meaning. | Declare `@analyzed` on searchable text, choose another analyzer when needed, or explicitly opt out of ranking with `scorer="none"`. An exact-only slug does not need an analyzer. |
+| Implicit vector geometry or an unresolved `@embed` model | A field's encoding recipe and geometry must resolve at schema acceptance. The model may inherit a schema-owned default recipe; distance may inherit that recipe's declared default. Raw vectors require explicit distance. | Declare the source and dimensions, then resolve a compatible recipe and geometry. A new default cannot identify how old vectors were produced; unresolved legacy vectors still need operator resolution or regeneration. |
 | Existing search rows, scores, or ordering survive a spelling-only rewrite | `terms` defaults to all terms and zero edits. Schema-owned analysis, complete fuzzy matching, long-token handling, scoring policies, and explicit selection boundaries can change results. | Review analyzer choices, fuzzy scoring, relevance expectations, score thresholds, and tie fixtures. The rewrite does not promise equivalent results to legacy search. |
 | Queries relying on silently ignored search constructs or permissive parameter handling | Invalid shapes, incompatible representations, token-empty queries, and exhausted budgets produce typed failures. A successful partial candidate set cannot stand in for an exact result. | Handle the declared errors and size queries explicitly; do not interpret a failure as an empty successful search. |
 | Existing graph files open directly after the upgrade | The accepted-schema change requires an export/init/load rebuild. Compatible values and logical graph content are carried over; commit history, branches, and physical indexes are not preserved by that rebuild. | Plan the data upgrade even if no query uses search. Retain the predecessor graph if its history is needed, rebuild indexes explicitly, and obtain fresh snapshot references from the rebuilt graph. |
@@ -143,6 +150,9 @@ queries to adopt ranking. Existing search queries still need the rewrites above.
 
 - Explicit exact vector retrieval and fuzzy lexical ranking, with the same
   lexical matching definition available as a Boolean predicate.
+- Short schema declarations with fully resolved semantics: bare `@analyzed`
+  enables ranking, and embedding fields can inherit one schema-owned default
+  recipe without repeating its model on each field.
 - Named lexical/vector sources and weighted fusion, with each source's rank,
   score or distance available for projection. Missing arm membership remains
   distinguishable from a computed score.
@@ -198,17 +208,64 @@ acceptance gates follow; the migration tools must not guess unresolved choices.
 
 The annotations below are proposed syntax. The representation identity
 requirements in Design also apply; a provider/model label alone is not a
-complete embedding-space declaration.
+complete embedding-space declaration. This example assumes the schema
+declares a qualified default embedding recipe compatible with 1536 dimensions:
 
 ```pg
 node Organization {
   slug: String @key                                     // exact only
-  name: String @index @analyzed(analyzer="standard_folded_v1", scorer="bm25_v1")
-  notes: String? @analyzed                              // filterable, not rankable
+  name: String @analyzed @index                         // matching and ranking
+  notes: String? @analyzed                              // matching and ranking
   embedding: Vector(1536, distance="cosine")?
-    @embed("name", model="openai/text-embedding-3-small") @index
+    @embed("name") @index                               // inherits the recipe
 }
 ```
+
+#### Directive defaults and omission rules
+
+Defaults shorten the authored schema. They are resolved before acceptance
+and persisted as field semantics, never looked up afresh during a read or
+content write. Unknown arguments and unresolved required choices are errors.
+
+| Surface | Omitted value | Explicit choice or failure |
+|---|---|---|
+| `@analyzed` | No annotation means no analyzed capability; `@index` and `@key` do not supply it. | Exact predicates remain available without it. |
+| `@analyzed.analyzer` | `standard_v1` | A named immutable profile such as `standard_folded_v1` or `english_v1`. |
+| `@analyzed.scorer` | `bm25_v1` family capability | `scorer="none"` permits analyzed filtering only; a lexical ranking source on that field is a typed error. |
+| `@embed` source | No default | The source property is mandatory and resolves to its stable identity. |
+| `Vector` dimensions | No default | A positive dimension is mandatory and must be compatible with the resolved encoding recipe when present. |
+| `@embed.model` | The schema's declared default embedding recipe | Without that default, require an explicit model that resolves to a complete qualified recipe. A model label alone is insufficient. |
+| `Vector.distance` on an `@embed` field | The selected recipe's declared default distance | An explicit field distance takes precedence. If neither provides one, schema acceptance fails. Persist and validate the resulting geometry. |
+| `Vector.distance` without `@embed` | No default | Require explicit `l2`, `cosine`, or `dot`; the graph's embedding default does not assign geometry to raw vectors. |
+| Embedding normalization and query/document roles | The selected recipe's resolved choices | There is no global normalization fallback. An incomplete recipe fails acceptance. |
+
+Thus bare `@analyzed` expands to
+`@analyzed(analyzer="standard_v1", scorer="bm25_v1")`.
+The schema's `scorer` argument declares an allowed family; the query still
+chooses an explicit versioned scoring policy, including exact versus fuzzy
+BM25. It does not implicitly enable edit tolerance, execute ranking, create
+an index, or remove the need for that policy's qualification. An explicit
+`@analyzed(scorer="none")` retains the former matching-only use case.
+
+The graph schema may declare one default embedding recipe in its accepted
+metadata. The recipe identifies the model revision, compatible query/record
+encoding behavior, dimension constraints, and any default distance. Its exact
+top-level `.pg` declaration is a parser/typechecker acceptance gate; the
+inheritance rules above do not depend on the final spelling. It is not a
+deployment setting or a separately managed retrieval-profile registry.
+An explicit field model selects its own complete qualified recipe; it cannot
+borrow unrelated normalization or role settings from the schema default.
+
+`schema plan` must show each field's resolved analyzer, scoring capability,
+model/recipe identity, normalization, and geometry, including inherited values.
+Exports must carry the schema default and enough resolved field information
+to reproduce those bindings without the original deployment's defaults.
+Changes to a schema default must
+expose any proposed field rebinding as a semantic migration, subject to the
+existing refusal/rebuild rules. A changed runtime provider configuration or a
+no-op reapplication cannot silently rebind an accepted field.
+
+#### Analyzer profiles
 
 Initial immutable analyzer profiles resolve these settings explicitly;
 unspecified Lance defaults are never part of the schema contract:
@@ -221,31 +278,45 @@ unspecified Lance defaults are never part of the schema contract:
 | Stemming / stop words | Neither | Neither | English stemmer, then built-in English stop words |
 | ASCII folding | No | Yes | Yes, after stemming and stop words |
 | Token-length filter | Disabled (`max_token_length: None`) | Disabled | Disabled |
-| Unicode normalization | No additional NFC/NFKC normalization | Same | Same |
+| Unicode normalization | NFC before tokenization; no NFKC | Same | Same |
 
-Filters execute in Lance's order: lowercase, optional stemmer, optional stop
-words, optional ASCII folding. Scalar String fields use row document
-granularity; positions do not affect membership. These profiles use no
-custom stop words, external dictionaries, n-grams, or code-tokenizer flags.
+All three profiles first apply NFC to lexical analysis input, then run the
+pinned `simple` tokenizer and Lance's filter order: lowercase, optional
+stemmer, optional stop words, optional ASCII folding. Scalar String fields use
+row document granularity; positions do not affect membership. These profiles
+use no custom stop words, external dictionaries, n-grams, or code-tokenizer flags.
 Posting positions and block layout remain derived index settings.
+
+NFC makes canonically equivalent spellings reach tokenization as the same
+string while retaining distinctions that compatibility normalization can
+erase. See the [Unicode normalization specification](https://www.unicode.org/reports/tr15/).
+This preprocessing is part of the proposed analyzer, not a claim about the
+unmodified Lance tokenizer. Query, scan, and index construction must use the
+same qualified pipeline, with normalization work charged to the query/build
+budget. A native path without that proof stays disabled. Stored String values
+and exact predicates are unchanged; embedding input preprocessing remains
+owned by its encoding recipe and does not inherit lexical normalization.
 
 Disabling the token-length filter is deliberate. Pinned Lance defaults to
 `Some(40)`, whose filter retains only tokens shorter than 40 **UTF-8 bytes**,
 before lowercasing or folding. Resource limits must reject excessive work,
-not silently erase a long name or query term. Thus `english_v1` preserves
-the default linguistic pipeline, but intentionally changes long-token
-matching at this breaking boundary.
+not silently erase a long name or query term. Thus `english_v1` retains
+the pinned linguistic filter choices but intentionally changes normalization
+and long-token matching at this breaking boundary.
 
 `simple` splits at non-alphanumeric Unicode scalar values. Lowercasing is
-not full case folding, and ASCII folding after tokenization is not Unicode
-normalization: composed `résumé` and its decomposed spelling can tokenize
-differently. With `english_v1`, `résumé` and `resume` become `resume` and
+not full case folding, and ASCII folding is distinct from Unicode
+normalization. NFC preprocessing makes composed `résumé` and its canonically
+equivalent decomposed spelling analyze identically. Accent removal is still
+opt-in: with `english_v1`, `résumé` and `resume` become `resume` and
 `resum`, respectively, because stemming precedes folding. These limitations
 are explicit profile behavior, not promises of language-independent typo
-equivalence. Changing segmentation, normalization, or filter order requires
-a new profile. Fingerprints include the implementation and Unicode data
-identity, including the Rust Unicode behavior used by `simple` and lowercase.
-Adding a profile or scorer version requires an RFC; none is ever mutated.
+equivalence. Once a profile is accepted, changing segmentation, normalization,
+or filter order requires a new profile. Fingerprints include the normalizer
+implementation and Unicode data identity as well as the Rust Unicode behavior
+used by `simple` and lowercase. These are revised, unshipped `v1` definitions;
+the earlier no-NFC probe does not qualify them. Adding a profile or scorer
+version requires an RFC; accepted identities are never mutated.
 Query-time analyzer or vector-distance overrides do not exist. A lexical
 source selects an explicit, versioned scoring policy compatible with the
 field's declared scoring family; that selection does not change analysis.
@@ -393,7 +464,10 @@ an explicitly tolerant query and compatible fuzzy scoring policy.
 A String argument to `knn` or `ann` uses the field's resolved compatible query
 encoder. A raw vector is an explicit assertion that the caller supplied the
 correct space; dimension checks cannot verify its provenance. Geometry comes
-from `Vector(dim, distance="l2"|"cosine"|"dot")`, never a query override.
+from the accepted field's resolved `Vector` declaration, never a query
+override. An omitted authoring-time distance follows the
+[directive defaults](#directive-defaults-and-omission-rules); execution always
+sees an explicit `l2`, `cosine`, or `dot` value.
 
 The proposed scalar distance values follow the pinned Lance kernels, all
 ordered ascending:
@@ -456,10 +530,10 @@ population contains no relevant fact.
 
 ### Errors and operational changes
 
-Typed errors include missing analyzed/scoring declarations, token-empty
-queries, invalid edit/window/weight/effort parameters, incompatible encoding
-spaces, invalid stage references, ambiguous target mappings or inherited
-metrics, and exhausted resources. Unsupported plan shapes are refused before
+Typed errors include missing analyzed capability, disabled or incompatible
+scoring, token-empty queries, invalid edit/window/weight/effort parameters,
+incompatible encoding spaces, invalid stage references, ambiguous target
+mappings or inherited metrics, and exhausted resources. Unsupported plan shapes are refused before
 results are presented as complete. Ordinary absence of a hit in one fusion
 arm is represented as missing membership, not a query failure.
 
@@ -473,11 +547,14 @@ and semantic windows when the old query never specified them.
 
 The accepted-schema boundary uses the existing export/init/load rebuild.
 An offline rewrite makes implicit analyzer and L2 choices explicit and
-preserves exact key/index annotations. Bare `@embed` and mutable model labels
-without recoverable revision/recipe identity require operator resolution;
-historical coordinate spaces cannot be inferred. The generated schema is
-reviewed before init. Rebuilt vectors are needed when the chosen encoding
-recipe differs from that which produced existing values.
+preserves exact key/index annotations. Legacy embeddings without recoverable
+revision/recipe identity require operator resolution; a newly declared default
+cannot establish historical coordinate spaces. For new or regenerated values,
+`@embed("source")` may omit its model when the schema default resolves it.
+The generated schema and every expanded default are reviewed before init.
+Rebuilt vectors are needed when the chosen encoding recipe differs from that
+which produced existing values. The NFC/profile change also requires index
+rebuild or proven parity; an old certificate does not establish new analysis.
 
 Index reconciliation remains explicit and schema-profile-targeted, with
 property selectors and RFC 0043's certification/publication discipline.
@@ -713,6 +790,13 @@ property references, and encoding compatibility. Physical indexes remain
 derived artifacts checked against that authority through RFC 0043's proofs.
 The version/stamp assignment must coordinate with RFCs 0040 and 0044.
 
+Schema-owned authoring defaults are resolved into those field bindings before
+publication. Equivalent shorthand and fully explicit declarations have the
+same field semantics and representation fingerprint; whether a value was
+inherited can be shown as provenance without changing its meaning. Persisted
+execution bindings never depend on a mutable default name. Schema export and
+reapplication must preserve them, including on another deployment.
+
 Embedding space identity includes immutable model revision and the compatible
 record/query encoding recipes: source mapping, preprocessing, prompts or role
 selection, pooling/normalization, and representation shape where applicable.
@@ -727,7 +811,8 @@ Gemini query/document roles, but they do not prove an immutable hosted-model
 revision. An operator-declared recipe fingerprint is not proof of a remote
 provider's model contents. Qualification must say which providers can satisfy
 the proposed identity contract and how unverifiable aliases are refused;
-the provider/model label in the schema sketch is not itself that proof.
+neither an explicit provider/model label nor an inherited schema recipe is
+itself that proof. Default inheritance does not weaken this qualification.
 
 Initial representations are scalar analyzed String fields and single dense
 vectors. Multiple fields can provide different views. Future sparse vectors,
@@ -803,8 +888,11 @@ are deferred, with encoding/source attribution requirements retained.
 accepted SchemaIR, even when no FTS artifact exists. Eager empty indexes are
 not the analyzer carrier: overwrite, index removal, or an incomplete rebuild
 must not erase logical semantics. Use the pinned substrate tokenizer
-implementation through one analyzer binding; do not reimplement its filters
-or pre-normalize a string only to analyze it again through another path.
+implementation through one analyzer binding that includes the declared NFC
+preprocessing step. Do not reimplement its filters or pass already analyzed
+tokens into another path that analyzes them again. Normalization must precede
+tokenization consistently in the query, scan, and index-builder paths;
+normalizing only a query does not qualify an index built from raw spellings.
 Creating or changing an analyzer profile continues to require the existing
 schema publication and compatibility protocol; ordinary content writes do
 not build indexes inline.
@@ -822,9 +910,11 @@ losing the predicate.
 This is a new typed Boolean evaluator, not a wrapper around Lance's flat
 BM25 scanner. `InvertedIndexParams::build()` already exposes the analyzer
 without a dataset or index; its Text tokenizer shares query/document
-tokenization. Lance's flat BM25 helper accepts a tokenizer but collects
-per-row scoring counts, does not implement edit matching, and its fuzzy
-post-filter path rejects execution. Reuse the public analyzer in a typed
+tokenization. That construction alone does not supply the newly specified NFC
+pipeline; its integration is an explicit qualification gate. Lance's flat
+BM25 helper accepts a tokenizer but collects per-row scoring counts, does not
+implement edit matching, and its fuzzy post-filter path rejects execution.
+Reuse the public analyzer in a typed
 engine/DataFusion filter over the sealed scan stream. Native index
 acceleration additionally needs an analyzer-consistent query path and a
 complete-expansion outcome; those scanner capabilities are not supplied by
@@ -832,8 +922,9 @@ the pin. Boolean evaluation introduces no dictionary or posting storage.
 
 The implementation must bound query bytes, distinct terms, individual
 materialized values, matching state, and execution work. Enforce admission
-before allocations that can exceed the budget, including token construction;
-checking only between returned tokens is insufficient for one huge token.
+before allocations that can exceed the budget, including Unicode normalization
+and token construction. Checking only between returned tokens is insufficient
+for one huge token or combining-mark sequence.
 Use a bounded exact edit matcher, with cancellation checkpoints. The pinned
 `fst` Levenshtein automaton agrees with the declared scalar-value distance,
 but construction can consume substantial memory and hit its state limit.
@@ -844,7 +935,8 @@ qualified before shipping this evaluator.
 **Qualified index acceleration.** Lance continues to own dictionaries,
 postings, and physical index state. A native path is eligible only when its
 artifact passes RFC 0043's proof checks against the accepted profile and its
-matching behavior is qualified for the requested mode and edit budget.
+complete normalization/tokenization/filter pipeline is qualified for the
+requested mode and edit budget.
 Covered rows use complete term expansion and posting evaluation; uncovered
 or rewritten rows use the same exact predicate on their accepted values.
 Combine them at one snapshot with the existing visibility and row-identity
@@ -887,7 +979,7 @@ plan. The design reuses the right owner for each operation:
 | Property eligibility | Structured DataFusion expressions and qualified Lance filter pushdown | Preserve binding identity, policy, and stage boundaries |
 | Graph-defined candidate population | Existing traversal, typed semi-join or Lance external row mask | Map graph identities into the pinned target dataset's native row-ID domain |
 | Vector candidates | Qualified Lance nearest scanner and exact scan paths | Geometry/space, tail coverage, raw-vector scoring, ties, and effort bounds |
-| Analyzed matching | Public Lance tokenizer plus typed Boolean evaluation | Accepted analyzer binding, complete edit matching, admission and cancellation |
+| Analyzed matching | Qualified NFC preprocessing, public Lance tokenizer, and typed Boolean evaluation | One accepted pipeline through query/scan/index construction, complete edit matching, admission and cancellation |
 | Lexical ranking | Structured Lance FTS where qualified; exact scoring fallback | Declared corpus statistics, fuzzy formula, numeric parity, complete boundaries |
 | Fusion | Explicit arm ranks, union, aggregate and sort | Common identity, missing-arm semantics, one snapshot, shared budgets |
 | Selection per group | DataFusion `row_number` window, filter, ordered merge | Correct partitioning, total comparator, distinct target and group semantics |
@@ -1009,13 +1101,15 @@ A second audit checked the current full Lance FTS, tokenizer, index lifecycle,
 vector, and DataFusion guides against those exact crate archives. The FTS
 format guide's defaults disagree with both its quick start and the pinned
 Rust constructor; the explicit profile table above follows source-verified
-filter behavior and records deliberate deviations. A library-level probe
+tokenizer/filter choices where it reuses Lance. NFC preprocessing and schema
+default resolution are additional proposed behavior, not qualified by that
+source audit. A library-level probe
 using `lance-tokenizer 11.0.0`, `frostem 1.20260821.3`, and `fst 0.4.7`
 passed 73,008 comparisons between the Unicode automaton and an independent
 scalar-value edit-distance calculation at budgets zero through two. It also
 checked the byte-length boundary, composed/decomposed text, folding after
 stemming, and explicit automaton-construction failure. This validates the
-distance primitive and analyzer behavior, not an engine implementation,
+distance primitive and pinned tokenizer behavior, not an engine implementation,
 index completeness, cancellation, or a query-level memory bound.
 
 A grammar/execution audit additionally inspected the
@@ -1044,7 +1138,8 @@ does not make the proposed operators implemented behavior.
 | Grammar and IR | Current `.gq` has one match block and fixed expression variants. The proposed rank/lexical/metric syntax still requires parser/typechecker and lowered-plan fixtures. |
 | Current fusion windows | Corrected: vector arms inherit the final limit; BM25 arms scan uncapped. Named windows are a new semantic contract. |
 | BM25 statistics | The covered-index prefilter guard passes with unchanged corpus scores. Eligibility and scoring corpus are distinct; choosing graph-scoped statistics requires separate implementation and cost evidence. |
-| Fuzzy matching | The pin still has the nonzero-edit analyzer bypass, per-segment query-wide expansion cap and incomplete flat behavior. The tokenizer/edit-distance probe passed 73,008 comparisons again; scanner and query-budget parity remain unqualified. |
+| Fuzzy matching | The pin still has the nonzero-edit analyzer bypass, per-segment query-wide expansion cap and incomplete flat behavior. The tokenizer/edit-distance probe passed 73,008 comparisons again; it does not qualify the revised NFC pipeline, scanner parity, or query budgets. |
+| Schema defaults | Bare analyzed fields now propose BM25-family capability; embedding model/distance omissions resolve through accepted schema metadata. The current grammar has no schema-wide recipe declaration. Its syntax, persistence, reapplication, and no-drift behavior require new fixtures. |
 | Vector arithmetic and encoding | Verified squared L2, cosine and shifted-dot kernels, current generated-vector normalization, and Gemini query/document roles. Added explicit formulas and requirements for invalid values, numeric parity and revision identity. |
 | Fusion arithmetic | Reproduced overflow with 16 finite maximum weights and `k=1`. Added checked arithmetic and explicit failure requirements. |
 | Graph scope through native masks | The public mask uses the same dataset's `_rowid` space. A graph-ID mapping and adapter qualification are still required. |
@@ -1066,7 +1161,7 @@ ignored tests. These include
 `fts_prefilter_does_not_change_covered_fragment_scores` and
 `rrf_arms_scan_uncapped_in_one_pass`. These results qualify the tested current
 boundaries, not fuzzy ranked scoring, staged execution, new encoding identities
-or end-to-end resource bounds.
+or defaults, NFC pipeline parity, or end-to-end resource bounds.
 
 ### Research context and required qualification
 
@@ -1089,13 +1184,28 @@ Extend existing test owners rather than creating a parallel search harness:
 
 | Boundary | Required evidence and owner |
 |---|---|
-| Grammar / types / lowering | Compiler parser/typecheck/IR fixtures for rank blocks, typed lexical queries, named metrics, invalid references, parameter bounds, removed syntax, and aggregate scope |
+| Grammar / types / lowering | Compiler parser/typecheck/IR fixtures for schema default declarations and resolution, rank blocks, typed lexical queries, named metrics, invalid references, parameter bounds, removed syntax, and aggregate scope |
 | Query semantics | `.gqt` cases for filter-before/after-rank, traversal-introduced targets, distinct target versus binding-row counts, per-group selection, final limit independence, and exact verification |
 | Search mechanisms | `search.rs`, `rrf_prefilter_gate.rs`, `ordering.rs`, `aggregation.rs`, and traversal owners for arm ranks through fan-out, missing arm versus rescore, common-identity deduplication, and graph populations |
-| Substrate qualification | `lance_surface_guards.rs` and search owners for analyzer/index parity, native row-mask mapping, score statistics, vector metric/precision, tail coverage, complete boundaries and different partition layouts |
+| Substrate qualification | `lance_surface_guards.rs` and search owners for NFC/analyzer/index parity, native row-mask mapping, score statistics, vector metric/precision, tail coverage, complete boundaries and different partition layouts |
 | Snapshot / policy / transport | `point_in_time.rs`, policy owners, server `data_routes`/`stored_queries`/`openapi`, and CLI parity for coherent follow-up, expiry/refusal, metadata, policy-safe counts and resolved query identity |
-| Format | Existing schema/rebuild and cross-version owners for stamp refusal, rewrite idempotence, unresolved encoding refusal, and representation compatibility |
-| Resource bounds | Checked-in cost instruments for token construction, matching/scoring, coverage/statistics scans, graph fan-out, sort/spill, output bytes, cancellation, and shared fallback accounting |
+| Format | Existing schema/rebuild and cross-version owners for resolved-default persistence/export/reapplication, stamp refusal, rewrite idempotence, unresolved encoding refusal, and representation compatibility |
+| Resource bounds | Checked-in cost instruments for NFC normalization, token construction, matching/scoring, coverage/statistics scans, graph fan-out, sort/spill, output bytes, cancellation, and shared fallback accounting |
+
+Default resolution requires its own compiler/schema and query fixtures:
+
+- Bare `@analyzed` and its explicit expansion resolve to the same field
+  fingerprint and permit matching and ranking. `scorer="none"` permits matching
+  while refusing a lexical ranking source.
+- Missing source/dimension, omitted model without a default, unresolved explicit model,
+  incompatible dimensions, and distance omitted without a supplying recipe
+  all fail before publication. Explicit model overrides select a whole recipe;
+  explicit distance overrides take precedence and remain validated. A qualified
+  explicit model works without any schema default.
+- Export/reload and no-op reapplication preserve resolved field bindings across
+  deployments and runtime provider/default changes. Changed schema defaults
+  expose affected field rebindings and required rebuilds in `schema plan`;
+  shorthand does not bypass existing migration refusals or rename identity.
 
 The exact lexical qualification matrix retains all preceding requirements:
 
@@ -1106,6 +1216,11 @@ The exact lexical qualification matrix retains all preceding requirements:
 - Case, stemming, folding, composed/decomposed text, multibyte characters,
   and lengths around 40 UTF-8 bytes. Zero-edit equivalence, inclusion at
   budgets 0/1/2, and transpositions costing two.
+- NFC conformance for the pinned normalizer/Unicode version; canonically
+  equivalent inputs on both sides of matching and ranking through scan/index
+  paths; and long combining-mark sequences under bounded cancellation.
+  Preserve original stored values and exact String predicate behavior.
+  Reject or bypass artifacts that lack proof of the revised pipeline.
 - Absent, empty, complete, partial, removed, and rebuilt indexes through
   append/update/delete/overwrite/compaction. Identical values must match
   identically under graph filters and supported negation.
@@ -1172,6 +1287,9 @@ semantics, complete tie comparators, and the relationship to RFC 0047. Freeze
 the exact and fuzzy scoring specifications, statistics population, vector
 numeric rules, and checked fusion arithmetic. Resolve encoding/provider
 identity and the shared schema-version decisions with RFCs 0040/0043/0044.
+Prototype the schema-wide default-recipe declaration and its omission/override
+rules; qualify the NFC implementation and profile fingerprint before fixing
+the analyzer definitions.
 Specify resource units and admission limits, follow-up/retention behavior,
 and the proposed response changes before their implementations diverge.
 
@@ -1186,21 +1304,25 @@ evidence. Compiler, search, schema, and read-contract owners supply these proofs
 
 Implement accepted representation identities and validation, typed lexical
 queries, named stage IR, target/metric binding, and plan fingerprints. Resolve
-query inputs and encoders once per execution. Introduce the shared snapshot,
-admission, cancellation, and resource-accounting context that every later
+schema defaults into persisted per-field bindings and expose them through
+schema plans and exports; resolve query inputs and encoders once per execution.
+Introduce the shared snapshot, admission, cancellation, and resource-accounting
+context that every later
 operator must use. Extend the sealed storage interfaces and existing
 schema/rebuild tooling; coordinate one format boundary for the final release.
 
 Completion requires compiler/schema fixtures for serialization, parameter
 bounds, invalid references, rename versus drop/re-add identity, incompatible
-encoding refusal, and migration rewrite idempotence. Tests must show that
+encoding refusal, default/override resolution, export/reapplication stability,
+and migration rewrite idempotence. Tests must show that
 operators and fallbacks share a budget rather than resetting it. Schema and
 plan types must not depend on index presence or a second semantic registry.
 
 #### Phase 2: implement complete lexical and vector retrieval
 
-Build the exact scan evaluator for the declared analyzers and `Terms` relation,
-then exact and fuzzy lexical scoring against the Phase 0 oracle. Add exact
+Build one bounded NFC/analyzer pipeline and the exact scan evaluator for the
+`Terms` relation, then exact and fuzzy lexical scoring against the Phase 0
+oracle. Add exact
 `knn` with the accepted geometry, normalization, invalid-value handling, and
 total comparator. Establish the ANN source contract and its qualified exact
 fallback before enabling indexed approximation. Charge analysis, statistics,
@@ -1251,8 +1373,8 @@ durable search-result store are not part of this phase.
 
 Compare each proposed Lance/index path against the Phase 2 exact evaluator
 and the Phase 3 composition rules. Qualify graph-ID/native-row-mask mapping,
-analyzer certificates, complete expansion, scoring/statistics, ties, uncovered
-tails, raw-vector rescoring, and physical partition behavior. Native ANN is
+NFC/analyzer certificates, complete expansion, scoring/statistics, ties,
+uncovered tails, raw-vector rescoring, and physical partition behavior. Native ANN is
 evaluated against exact `knn` for recall and bounded effort; it is not required
 to discover the exact candidate set. Preserve rebuild/recovery ownership.
 
@@ -1321,8 +1443,11 @@ release. Each extension retains its stated semantic and qualification boundary.
    and approval of the proposed eligible-population statistics definition.
    These are acceptance gates, not optional future enhancements.
 3. Resolved representation serialization and immutable encoding revisions,
-   analyzer/artifact fingerprint mapping, and shared SchemaIR version
-   assignment with RFCs 0040/0043/0044.
+   schema-wide default declaration syntax and migration integration,
+   normalizer/Unicode identity and analyzer/artifact fingerprint mapping, and
+   shared SchemaIR version assignment with RFCs 0040/0043/0044. Omission and
+   override semantics are specified above; their implementation must prove
+   that accepted bindings cannot drift with deployment defaults.
 4. Concrete resource units/limits and sealed adapter interfaces for graph
    masks, exact scoring, coverage, sort/spill, and output accounting.
 5. Read-envelope and stored-query definition fingerprints, snapshot-bound
@@ -1385,6 +1510,16 @@ release. Each extension retains its stated semantic and qualification boundary.
   counterexample. The assumption audit separates verified mechanisms from
   proposed semantics and unqualified runtime/quality claims.
 
+- 2026-09-08 — revised the unshipped schema defaults. Bare `@analyzed` now
+  enables BM25-family ranking; `scorer="none"` explicitly retains matching-only
+  fields. Replaced mandatory per-field model repetition with a schema-owned
+  default recipe and defined model/distance omission and override rules, while
+  preserving mandatory source/dimensions and fully resolved accepted bindings.
+  Replaced the no-NFC profile definitions with NFC before tokenization; query,
+  scan, index, fingerprint and budget qualification remain required. Updated
+  migration, evidence and implementation phases so earlier tokenizer probes
+  do not claim qualification of the revised defaults or normalization pipeline.
+
 ## Appendix: implementation evidence (non-normative)
 
 The main sections own the contract. RFC 0047 contributes plan truth,
@@ -1418,6 +1553,8 @@ Later Lance versions require renewed qualification.
   The [tokenizer guide](https://lance.org/guide/tokenizer/) also documents
   index-free inspection. Unicode and length behavior remain part of the
   accepted profile; the query's resource limits are a separate contract.
+  The revised profiles additionally require qualified NFC preprocessing;
+  constructing the public tokenizer alone is not proof of that pipeline.
 - *Fuzzy query path:* `tokenizer_for_match_query` uses bare tokenization for
   nonzero edit budgets, while `FlatMatchQueryExec` does not apply fuzzy
   expansion. `expand_fuzzy_tokens` caps expansions within each segment and
