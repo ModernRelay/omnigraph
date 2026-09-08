@@ -61,7 +61,9 @@ use crate::helpers::{
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
-const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// Writes can publish after the client loses its response. Allow the same
+// bounded receipt wait for mutations and loads; never retry either implicitly.
+const MANAGED_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The engine owns parsed-table limits. This bound covers only the exact
 /// UTF-8 NDJSON body sent to the existing server route, before any request.
@@ -84,7 +86,7 @@ fn load_request(
     managed: bool,
 ) -> reqwest::RequestBuilder {
     let request = if managed {
-        request.timeout(MANAGED_LOAD_TIMEOUT)
+        request.timeout(MANAGED_WRITE_TIMEOUT)
     } else {
         request
     };
@@ -447,13 +449,23 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
-                ..
+                response_limit,
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(base_url, &["commits"], &[("branch", branch)])?,
                     None => remote_url(base_url, &["commits"], &[])?,
                 };
-                remote_json(http, Method::GET, url, None, token.as_deref()).await
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    url,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                    None,
+                )
+                .await
             }
             GraphClient::Embedded { uri, .. } => {
                 let db = Omnigraph::open(uri).await?;
@@ -474,14 +486,17 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
-                ..
+                response_limit,
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["commits", commit_id], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
+                    None,
                 )
                 .await
             }
@@ -872,6 +887,7 @@ impl GraphClient {
                     token.as_deref(),
                     expected_head,
                     *response_limit,
+                    response_limit.map(|_| MANAGED_WRITE_TIMEOUT),
                 )
                 .await
             }
@@ -942,6 +958,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    response_limit.map(|_| MANAGED_WRITE_TIMEOUT),
                 )
                 .await
             }
@@ -1023,6 +1040,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    None,
                 )
                 .await
             }
@@ -1067,6 +1085,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    None,
                 )
                 .await
             }
@@ -1129,6 +1148,7 @@ impl GraphClient {
                     token.as_deref(),
                     expected_head,
                     *response_limit,
+                    (response_limit.is_some() && expect_mutation).then_some(MANAGED_WRITE_TIMEOUT),
                 )
                 .await
             }
@@ -1655,6 +1675,156 @@ fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeed
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn managed_mutations_wait_past_read_deadline_without_retrying() {
+        // Exercise every mutation request owner through actual HTTP. A fast
+        // fixture would hide an inherited ten-second read deadline.
+        futures::future::join_all(
+            [
+                "ad-hoc",
+                "conditional",
+                "branch",
+                "stored",
+                "stored-conditional",
+            ]
+            .into_iter()
+            .map(|form| async move {
+                let commit = json!({
+                    "graph_commit_id": "head-after", "graph_branch": "main",
+                    "graph_manifest_version": 7, "parent_commit_id": "head-before",
+                    "merged_parent_commit_id": "head-source",
+                    "actor_id": "principal:alice", "created_at": 12345
+                });
+                let mut reply = json!({
+                    "branch": "main", "query_name": "m", "affected_nodes": 1,
+                    "affected_edges": 0, "actor_id": "principal:alice", "commit": commit
+                });
+                if form == "branch" {
+                    reply["query_name"] = json!("branch merge");
+                    reply["affected_nodes"] = json!(0);
+                    reply["outcome"] = json!({
+                        "kind": "merged", "source": "review", "target": "main",
+                        "merge": "fast_forward"
+                    });
+                }
+                let server = IntentApiFixture::with_response_delay(
+                    vec![IntentReply::json(200, reply)],
+                    std::time::Duration::from_millis(10_250),
+                );
+                let client =
+                    GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                        .unwrap();
+                let (result, path) = match form {
+                    "branch" => (
+                        client
+                            .branch_write_statement(
+                                "branch merge review into main",
+                                BranchWrite::Merge {
+                                    source: "review".into(),
+                                    into: Some("main".into()),
+                                },
+                            )
+                            .await,
+                        "/graphs/knowledge/mutate",
+                    ),
+                    "stored" | "stored-conditional" => (
+                        client
+                            .invoke_named::<ChangeOutput>(
+                                "m",
+                                true,
+                                None,
+                                Some("main".into()),
+                                None,
+                                (form == "stored-conditional").then_some("head-before"),
+                            )
+                            .await,
+                        if form == "stored-conditional" {
+                            "/graphs/knowledge/queries/m/if-graph-commit"
+                        } else {
+                            "/graphs/knowledge/queries/m"
+                        },
+                    ),
+                    _ => (
+                        client
+                            .mutate(
+                                "main",
+                                "mutation m() {}",
+                                Some("m"),
+                                None,
+                                (form == "conditional").then_some("head-before"),
+                            )
+                            .await,
+                        if form == "conditional" {
+                            "/graphs/knowledge/mutate/if-graph-commit"
+                        } else {
+                            "/graphs/knowledge/change"
+                        },
+                    ),
+                };
+                let result = result.unwrap_or_else(|error| panic!("{form}: {error}"));
+                assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
+                assert_eq!(result.actor_id.as_deref(), Some("principal:alice"));
+                let requests = server.requests();
+                assert_eq!(requests.len(), 1, "{form} must not retry");
+                assert_eq!(requests[0].path, path);
+                assert_eq!(
+                    requests[0].headers["authorization"],
+                    "Bearer data-credential"
+                );
+                if form.ends_with("conditional") {
+                    assert_eq!(
+                        requests[0].headers["omnigraph-if-graph-commit"],
+                        "head-before"
+                    );
+                }
+                if form.starts_with("stored") {
+                    assert_eq!(requests[0].body["expect_mutation"], true);
+                }
+                server.assert_complete();
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn managed_reads_keep_the_short_deadline_without_retrying() {
+        futures::future::join_all([false, true].into_iter().map(|named| async move {
+            let server = IntentApiFixture::with_response_delay(
+                vec![IntentReply::json(
+                    200,
+                    json!({
+                        "query_name": "q", "target": {"branch":"main"},
+                        "row_count": 0, "columns": [], "rows": [], "graph_commit_id": "head"
+                    }),
+                )],
+                std::time::Duration::from_millis(10_250),
+            );
+            let client =
+                GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                    .unwrap();
+            let result = if named {
+                client
+                    .invoke_named::<ReadOutput>("q", false, None, Some("main".into()), None, None)
+                    .await
+            } else {
+                client
+                    .query(ReadTarget::branch("main"), "query q() {}", Some("q"), None)
+                    .await
+            };
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+            );
+            assert_eq!(server.requests().len(), 1, "read timeout must not retry");
+            server.assert_complete();
+        }))
+        .await;
+    }
 
     #[test]
     fn managed_load_request_has_its_own_deadline_and_exact_input_bound() {

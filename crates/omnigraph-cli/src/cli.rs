@@ -23,7 +23,7 @@ control — manage or inspect a cluster (cluster via --config; policy & queries 
 --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
 MANAGED FOLDERS: cluster commands use .omnigraph/context; cluster token caches data access.\n\
-Implicit query and mutate use folder context and require --graph plus a cached data credential.\n\
+Implicit query, mutate, load and commit list/show use folder context and require --graph plus a cached data credential.\n\
 Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
 --direct selects ordinary addressing, including operator profiles and defaults.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
@@ -49,7 +49,7 @@ pub(crate) struct Cli {
     /// Select a graph within a multi-graph scope: on a `--server` it appends
     /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
     /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`). Required for managed data queries, mutations, loads, and token issuance.
+    /// `--store`). Required for managed data queries, mutations, loads, commit reads, and token issuance.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 

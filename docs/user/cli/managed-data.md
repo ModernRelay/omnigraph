@@ -37,25 +37,35 @@ token. Automation can use the origin-bound control credential to run this
 command with an available keychain; unattended clients needing a raw token
 use the issuance API directly.
 
-Managed `query`, `mutate`, and `load` read `.omnigraph/context` only in the
-current directory and always require `--graph`. After `cluster token --config DIR`,
-run data commands from `DIR`; no parent directory is searched. Ordinary data
+Managed `query`, `mutate`, `load`, and `commit list`/`show` read
+`.omnigraph/context` only in the current directory and always require
+`--graph`. After `cluster token --config DIR`, run data commands from `DIR`;
+no parent directory is searched. Ordinary data
 requests go directly to the cached endpoint without contacting the control
 API. They keep working during an API outage until the token expires or its
 signing trust is retired. Each request refuses redirects and accepts at most
-8 MiB of response data. Queries and mutations have a 10-second deadline;
-managed loads have the separate bounds described below.
+8 MiB of response data. Reads have a 10-second deadline. Mutations, including
+stored mutations and branch create/delete/merge statements, have a
+300-second deadline with at most 10 seconds to connect. A lost write response
+never triggers an automatic retry. Managed loads have the bounds described below.
+
+Use `commit list --branch main --graph GRAPH --json` and
+`commit show COMMIT_ID --graph GRAPH --json` with a cached `read` grant to
+inspect native graph lineage after an uncertain write. Commit identity,
+parents and actor attribution are evidence to reconcile; a timeout alone
+never proves that a mutation failed to commit.
 
 Missing, malformed, expired, or insufficient cached authority refuses before
 a request. An explicit `--server`, `--profile`, `--store`, or `--cluster`
 selects ordinary addressing and follows that command's existing support
 rules, even in a managed folder or beside malformed context. A positional
-load URI also selects ordinary addressing. Other data commands, aliases, and
+load/commit-list URI or `commit show --uri` also selects ordinary addressing.
+Other data commands, aliases, and
 storage maintenance also keep their ordinary behavior;
 this does not give them managed credentials. Explicit `--as` alone is not a
 target and remains prohibited on managed requests.
 
-Implicit `query`/`mutate`/`load` refuses with `managed_target_ambiguous` when valid
+These implicit data commands refuse with `managed_target_ambiguous` when valid
 folder context competes with `OMNIGRAPH_PROFILE` or an operator default server
 or store. No credential is read and neither destination is contacted. Choose
 the ordinary target explicitly, or use `--direct` to select ordinary ambient

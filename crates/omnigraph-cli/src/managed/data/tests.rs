@@ -495,7 +495,13 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
             "legacy",
         ],
         vec!["schema", "plan", "--schema", "schema.pg"],
-        vec!["commit", "list"],
+        vec!["commit", "list", "file:///scratch"],
+        vec!["commit", "list", "--direct"],
+        vec!["commit", "list", "--server", "legacy"],
+        vec!["commit", "list", "--profile", "legacy"],
+        vec!["commit", "show", "commit-a", "--uri", "file:///scratch"],
+        vec!["commit", "show", "commit-a", "--store", "file:///scratch"],
+        vec!["commit", "changes", "commit-a"],
         vec!["graphs", "list"],
         vec!["alias", "people"],
         vec!["queries", "list"],
@@ -514,6 +520,91 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
             .is_none()
         );
     }
+}
+
+#[tokio::test]
+async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let context = context();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let store = MemoryStore::default();
+    let commit = json!({
+        "graph_commit_id":"commit-a", "graph_branch":null,
+        "graph_manifest_version":3, "parent_commit_id":"prior",
+        "merged_parent_commit_id":"imported-head", "actor_id":"principal:alice",
+        "created_at":123456,
+    });
+    let server = IntentApiFixture::new(vec![
+        IntentReply::json(200, json!({"commits":[commit.clone()]})),
+        IntentReply::json(200, commit.clone()),
+    ]);
+    for command in [vec!["commit", "list"], vec!["commit", "show", "commit-a"]] {
+        let cli = Cli::try_parse_from(
+            ["omnigraph", "--graph", "knowledge"]
+                .into_iter()
+                .chain(command.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
+                .err()
+                .unwrap()
+                .body["type"],
+            "managed_target_ambiguous"
+        );
+        assert_eq!(
+            resolve(&cli, dir.path(), &store, || Ok(false))
+                .err()
+                .unwrap()
+                .body["type"],
+            "data_credential_required"
+        );
+        let mut cached = credential(&context, &server.origin);
+        cached.grants[0].actions = vec!["change".into()];
+        save(&store, &context, &cached);
+        assert_eq!(
+            resolve(&cli, dir.path(), &store, || Ok(false))
+                .err()
+                .unwrap()
+                .body["type"],
+            "data_scope_missing"
+        );
+        cached.grants[0].actions = vec!["read".into()];
+        save(&store, &context, &cached);
+        let client = resolve(&cli, dir.path(), &store, || Ok(false))
+            .unwrap()
+            .unwrap();
+        if command[1] == "list" {
+            let output = client.list_commits(Some("main")).await.unwrap();
+            assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
+        } else {
+            let output = client.get_commit("commit-a").await.unwrap();
+            assert_eq!(serde_json::to_value(output).unwrap(), commit);
+        }
+        clear(&store, &context).unwrap();
+        let no_graph = Cli::try_parse_from(std::iter::once("omnigraph").chain(command)).unwrap();
+        assert_eq!(
+            resolve(&no_graph, dir.path(), &NoCredentialAccess, || Ok(false))
+                .err()
+                .unwrap()
+                .body["type"],
+            "graph_required"
+        );
+    }
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for (request, path) in requests.iter().zip([
+        "/graphs/knowledge/commits?branch=main",
+        "/graphs/knowledge/commits/commit-a",
+    ]) {
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, path);
+        assert_eq!(
+            request.headers["authorization"],
+            format!("Bearer {DATA_TOKEN}")
+        );
+    }
+    server.assert_complete();
 }
 
 #[test]
@@ -671,12 +762,12 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
             "8 MiB",
         ),
     ] {
-        for loading in [false, true] {
+        for operation in ["query", "load", "commit-list", "commit-show"] {
             let server = IntentApiFixture::new(vec![reply.clone()]);
             let client =
                 GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-            let error = if loading {
-                client
+            let error = match operation {
+                "load" => client
                     .load(
                         "main",
                         None,
@@ -684,9 +775,10 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                         crate::cli::CliLoadMode::Append,
                     )
                     .await
-                    .unwrap_err()
-            } else {
-                client
+                    .unwrap_err(),
+                "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+                "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                _ => client
                     .query(
                         ReadTarget::Branch("main".into()),
                         "query q() {}",
@@ -694,7 +786,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                         None,
                     )
                     .await
-                    .unwrap_err()
+                    .unwrap_err(),
             };
             assert!(error.to_string().contains(expected), "{error}");
             server.assert_complete();
@@ -719,15 +811,17 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
             json!({"error":format!("rejected {DATA_TOKEN}"),"precondition_failure":{"expected":DATA_TOKEN,"actual":null}}).to_string(),
         ),
     ] {
-      for loading in [false, true] {
+      for operation in ["mutate", "load", "commit-list", "commit-show"] {
         let server = IntentApiFixture::new(vec![IntentReply { status, headers: vec![], body: body.as_bytes().to_vec() }]);
         let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-        let error = if loading {
-            client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append).await.unwrap_err()
-        } else { client
+        let error = match operation {
+            "load" => client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append).await.unwrap_err(),
+            "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+            "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+            _ => client
             .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"))
             .await
-            .unwrap_err() };
+            .unwrap_err(), };
         let rendered = if status == 412 {
             serde_json::to_string(
                 &error.downcast_ref::<crate::helpers::PreconditionFailedCli>().unwrap().output,

@@ -1,7 +1,7 @@
 //! RFC 0053: cached data authority has its own keychain namespace and transport.
 use super::auth::{self, Store};
 use super::{Api, Context, Failure, Method, Output, Result, canonical_origin, json};
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, CommitCommand};
 use crate::client::GraphClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -319,7 +319,13 @@ fn skips_context(cli: &Cli) -> bool {
     cli.direct
         || !matches!(
             cli.command,
-            Command::Query { .. } | Command::Mutate { .. } | Command::Load { uri: None, .. }
+            Command::Query { .. }
+                | Command::Mutate { .. }
+                | Command::Load { uri: None, .. }
+                | Command::Commit {
+                    command: CommitCommand::List { uri: None, .. }
+                        | CommitCommand::Show { uri: None, .. }
+                }
         )
         || cli.server.is_some()
         || cli.profile.is_some()
@@ -392,7 +398,8 @@ fn resolve(
                 vec!["change"]
             }
         }
-        _ => unreachable!("only implicit query/mutate/load consult data context"),
+        Command::Commit { .. } => vec!["read"],
+        _ => unreachable!("only implicit query/mutate/load and commit reads consult data context"),
     };
     scope(cli)?;
     let graph = cli
@@ -412,6 +419,9 @@ pub(crate) fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Outp
             *json || matches!(format, Some(crate::read_format::ReadOutputFormat::Json))
         }
         Command::Mutate { json, .. } | Command::Load { json, .. } => *json,
+        Command::Commit {
+            command: CommitCommand::List { json, .. } | CommitCommand::Show { json, .. },
+        } => *json,
         _ => false,
     };
     let result = std::env::current_dir()

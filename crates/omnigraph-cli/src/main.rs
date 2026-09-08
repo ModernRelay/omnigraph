@@ -558,15 +558,20 @@ async fn main() -> Result<()> {
         },
         Command::Commit { command } => match command {
             CommitCommand::List { uri, branch, json } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
+                let client = match managed_data {
+                    Some(client) => client,
+                    None => {
+                        client::GraphClient::resolve(
+                            capability,
+                            cli.server.as_deref(),
+                            cli.graph.as_deref(),
+                            uri,
+                            cli.profile.as_deref(),
+                            cli.store.as_deref(),
+                        )
+                        .await?
+                    }
+                };
                 let payload = client.list_commits(branch.as_deref()).await?;
                 if json {
                     print_json(&payload)?;
@@ -579,15 +584,20 @@ async fn main() -> Result<()> {
                 commit_id,
                 json,
             } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
+                let client = match managed_data {
+                    Some(client) => client,
+                    None => {
+                        client::GraphClient::resolve(
+                            capability,
+                            cli.server.as_deref(),
+                            cli.graph.as_deref(),
+                            uri,
+                            cli.profile.as_deref(),
+                            cli.store.as_deref(),
+                        )
+                        .await?
+                    }
+                };
                 let commit = client.get_commit(&commit_id).await?;
                 if json {
                     print_json(&commit)?;
