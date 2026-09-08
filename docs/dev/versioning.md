@@ -16,9 +16,9 @@ version axes. Never derive one axis from another.
 
 ## Current storage contract
 
-The current binary reads and writes exactly **internal manifest schema v6**.
+The current binary reads and writes exactly **internal manifest schema v7**.
 `INTERNAL_MANIFEST_SCHEMA_VERSION` and `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`
-are both 6.
+are both 7.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -26,8 +26,17 @@ are both 6.
   identity-derived paths.
 - v6 preserves v5 and adds exact non-null physical `id` fencing through
   Lance's unenforced primary-key metadata. It is the 0.9.x/0.10.x format.
-- unreleased v7–v19 belonged to the rejected MemWAL experiment. They are
-  abandoned future stamps, not migration inputs for a v6 binary.
+- v7 preserves v6's columns and re-keys `__manifest` registration and
+  tombstone rows ([RFC 0062](../rfcs/0062-manifest-version-clock.md)): the
+  trailing segment of a `table_version:` / `table_tombstone:` `object_id` is
+  the `__manifest` version that wrote the row, and a table's current
+  registration is the one with the greatest manifest version, not the greatest
+  per-native-ref Lance version.
+- the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
+  and were never migration inputs; v7 is reused by RFC 0062. A graph stamped
+  v8–v19 by that experiment is refused as a future stamp; the refusal's
+  "upgrade omnigraph" advice cannot be satisfied for it, and such a graph is
+  rebuilt from an export taken with the build that wrote it.
 
 A lower stamp is refused with export/rebuild guidance. A higher stamp is
 refused before recovery or table decoding. There is no in-place migration

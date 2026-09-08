@@ -8,7 +8,7 @@ use lance::Dataset;
 
 use crate::error::{OmniError, Result};
 
-use super::layout::{table_object_id, version_object_id};
+use super::layout::{manifest_version_from_object_id, table_object_id, version_object_id};
 use super::metadata::TableVersionMetadata;
 use super::{
     MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
@@ -24,6 +24,9 @@ pub struct DatasetEntry {
     pub native_dataset_branch: Option<String>,
     pub entity_count: u64,
     pub(crate) version_metadata: TableVersionMetadata,
+    /// The `__manifest` version whose publish wrote this registration: the
+    /// clock the projection orders registrations by (RFC 0062).
+    pub(crate) manifest_version: u64,
 }
 
 impl DatasetEntry {
@@ -36,6 +39,7 @@ impl DatasetEntry {
             && self.native_dataset_branch == other.native_dataset_branch
             && self.entity_count == other.entity_count
             && self.version_metadata == other.version_metadata
+            && self.manifest_version == other.manifest_version
     }
 }
 
@@ -55,6 +59,7 @@ struct TableTombstoneEntry {
     identity: TableIdentity,
     table_key: String,
     tombstone_version: u64,
+    manifest_version: u64,
 }
 
 /// A graph-lineage commit projected out of the `__manifest` `graph_commit`
@@ -187,7 +192,7 @@ pub(super) async fn read_manifest_state_and_lineage(
         version_entries,
         tombstones
             .into_iter()
-            .map(|t| (t.identity, t.tombstone_version)),
+            .map(|t| (t.identity, t.manifest_version)),
         graph_heads,
     )?;
     Ok((state, lineage_rows))
@@ -200,7 +205,7 @@ fn manifest_state_from_scan(version: u64, scan: ManifestScan) -> Result<Manifest
         scan.version_entries,
         scan.tombstones
             .into_iter()
-            .map(|t| (t.identity, t.tombstone_version)),
+            .map(|t| (t.identity, t.manifest_version)),
         scan.graph_heads,
     )
 }
@@ -256,18 +261,28 @@ impl ProjectionAccumulator {
         }
         for entry in version_entries {
             match self.latest_versions.get(&entry.identity) {
-                Some(existing)
-                    if existing.published_dataset_version >= entry.published_dataset_version => {}
+                Some(existing) if existing.manifest_version == entry.manifest_version => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "manifest has two rows for identity {} at manifest version {}",
+                        entry.identity, entry.manifest_version
+                    )));
+                }
+                Some(existing) if existing.manifest_version > entry.manifest_version => {}
                 _ => {
                     self.latest_versions.insert(entry.identity, entry);
                 }
             }
         }
-        for (identity, tombstone_version) in tombstones {
+        for (identity, tombstone_clock) in tombstones {
             match self.tombstone_map.get(&identity) {
-                Some(existing) if *existing >= tombstone_version => {}
+                Some(existing) if *existing == tombstone_clock => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "manifest has two rows for identity {identity} at manifest version {tombstone_clock}"
+                    )));
+                }
+                Some(existing) if *existing > tombstone_clock => {}
                 _ => {
-                    self.tombstone_map.insert(identity, tombstone_version);
+                    self.tombstone_map.insert(identity, tombstone_clock);
                 }
             }
         }
@@ -302,7 +317,7 @@ impl ProjectionAccumulator {
             scan.version_entries,
             scan.tombstones
                 .into_iter()
-                .map(|t| (t.identity, t.tombstone_version)),
+                .map(|t| (t.identity, t.manifest_version)),
             scan.graph_heads,
         )
     }
@@ -423,15 +438,15 @@ pub(super) async fn read_object_identities_at_offsets(
     Ok(identities)
 }
 
-/// Reduce raw manifest rows to the visible per-table state: keep the latest
-/// `table_version` per immutable table identity, drop any whose latest version
-/// is sealed by a
-/// tombstone (`tombstone_version >= table_version`), then sort by `table_key` for
-/// deterministic output. Shared by the scan path (`read_manifest_state`) and the
-/// in-memory post-publish fold in the publisher (RFC-013 PR2 #1b), so the two
-/// CANNOT diverge in the dedup/filter/sort — the byte-identity the fold relies on.
-/// Tombstones are passed as `(identity, tombstone_version)` tuples so callers
-/// outside this module need not name the private `TableTombstoneEntry`.
+/// Reduce raw manifest rows to the visible per-table state: keep the
+/// registration with the greatest `manifest_version` per immutable table
+/// identity, drop any sealed by a tombstone with a greater `manifest_version`,
+/// then sort by `table_key` for deterministic output. Shared by the scan path
+/// (`read_manifest_state`) and the in-memory post-publish fold in the publisher
+/// (RFC-013 PR2 #1b), so the two CANNOT diverge in the dedup/filter/sort — the
+/// byte-identity the fold relies on. Tombstones are passed as
+/// `(identity, manifest_version)` tuples so callers outside this module need
+/// not name the private `TableTombstoneEntry`.
 pub(super) fn assemble_manifest_state(
     version: u64,
     registrations: HashMap<TableIdentity, TableRegistration>,
@@ -458,7 +473,7 @@ fn finish_manifest_state(
         .filter(|entry| {
             tombstone_map
                 .get(&entry.identity)
-                .map(|tombstone_version| *tombstone_version < entry.published_dataset_version)
+                .map(|tombstone_clock| *tombstone_clock < entry.manifest_version)
                 .unwrap_or(true)
         })
         .map(|mut entry| {
@@ -528,7 +543,9 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<Datas
 pub(super) struct PublishScan {
     pub(super) table_registrations: HashMap<TableIdentity, TableRegistration>,
     pub(super) version_entries: Vec<DatasetEntry>,
-    pub(super) tombstones: Vec<((TableIdentity, u64), ())>,
+    /// `(identity, manifest_version)` of each tombstone, mapped to the sealed
+    /// Lance data version the tombstone row records.
+    pub(super) tombstones: Vec<((TableIdentity, u64), u64)>,
     pub(super) lineage_rows: Vec<GraphLineageRow>,
     /// Exact `graph_head:<branch>` rows keyed by the branch suffix (`main` for
     /// main). Absence is meaningful and is preserved by a missing map entry.
@@ -546,7 +563,12 @@ pub(super) async fn read_publish_scan(dataset: &Dataset) -> Result<PublishScan> 
         tombstones: scan
             .tombstones
             .into_iter()
-            .map(|tombstone| ((tombstone.identity, tombstone.tombstone_version), ()))
+            .map(|tombstone| {
+                (
+                    (tombstone.identity, tombstone.manifest_version),
+                    tombstone.tombstone_version,
+                )
+            })
             .collect(),
         lineage_rows: scan.lineage_rows,
         graph_heads: scan.graph_heads,
@@ -618,6 +640,17 @@ fn decode_graph_head_row(
         })?
         .to_string();
     Ok((branch_key, head_meta.head_commit_id))
+}
+
+fn require_clock_at_or_below(clock: u64, dataset: &Dataset, table_key: &str) -> Result<()> {
+    let version = dataset.version().version;
+    if clock > version {
+        return Err(OmniError::manifest_internal(format!(
+            "manifest row for {table_key} carries manifest version {clock} above the scanned \
+             dataset version {version}"
+        )));
+    }
+    Ok(())
 }
 
 async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
@@ -742,12 +775,12 @@ async fn read_manifest_scan_fragments(
                         OBJECT_TYPE_TABLE_VERSION,
                     )?;
                     let table_version = required_u64(versions, row, "table_version")?;
-                    require_object_id(
-                        object_ids,
-                        row,
-                        &version_object_id(identity, table_version),
+                    let manifest_version = manifest_version_from_object_id(
+                        object_ids.value(row),
+                        identity,
                         OBJECT_TYPE_TABLE_VERSION,
                     )?;
+                    require_clock_at_or_below(manifest_version, dataset, &table_key)?;
                     let row_count = required_u64(row_counts, row, "row_count")?;
                     if metadata.is_null(row) {
                         return Err(OmniError::manifest_internal(format!(
@@ -768,6 +801,7 @@ async fn read_manifest_scan_fragments(
                         native_dataset_branch: table_branch,
                         entity_count: row_count,
                         version_metadata: TableVersionMetadata::from_json_str(metadata.value(row))?,
+                        manifest_version,
                     });
                 }
                 OBJECT_TYPE_TABLE_TOMBSTONE => {
@@ -778,16 +812,17 @@ async fn read_manifest_scan_fragments(
                         OBJECT_TYPE_TABLE_TOMBSTONE,
                     )?;
                     let tombstone_version = required_u64(versions, row, "table_version")?;
-                    require_object_id(
-                        object_ids,
-                        row,
-                        &super::layout::tombstone_object_id(identity, tombstone_version),
+                    let manifest_version = manifest_version_from_object_id(
+                        object_ids.value(row),
+                        identity,
                         OBJECT_TYPE_TABLE_TOMBSTONE,
                     )?;
+                    require_clock_at_or_below(manifest_version, dataset, &table_key)?;
                     tombstones.push(TableTombstoneEntry {
                         identity,
                         table_key,
                         tombstone_version,
+                        manifest_version,
                     });
                 }
                 // `graph_commit` rows (RFC-013) are decoded ONLY for the publish
@@ -826,16 +861,31 @@ async fn read_manifest_scan_fragments(
     }
 
     version_entries.sort_by(|a, b| {
-        a.identity.cmp(&b.identity).then(
-            a.published_dataset_version
-                .cmp(&b.published_dataset_version),
-        )
+        a.identity
+            .cmp(&b.identity)
+            .then(a.manifest_version.cmp(&b.manifest_version))
     });
     // Whole-catalog invariant only: a delta scan's tombstone can reference a
     // registration living in an unread older fragment (a table drop in the
     // refresh window), so the join check would misfire there — the fold's
     // `finish` joins against the ACCUMULATED registration map instead.
     if !is_delta_scan {
+        let mut clocks = std::collections::HashSet::new();
+        for (identity, clock) in version_entries
+            .iter()
+            .map(|entry| (entry.identity, entry.manifest_version))
+            .chain(
+                tombstones
+                    .iter()
+                    .map(|tombstone| (tombstone.identity, tombstone.manifest_version)),
+            )
+        {
+            if !clocks.insert((identity, clock)) {
+                return Err(OmniError::manifest_internal(format!(
+                    "manifest has two rows for identity {identity} at manifest version {clock}"
+                )));
+            }
+        }
         for tombstone in &tombstones {
             let registration = table_registrations
                 .get(&tombstone.identity)
@@ -1031,10 +1081,7 @@ pub(super) fn entries_to_batch(
         table_branches.push(None);
         row_counts.push(None);
 
-        object_ids.push(version_object_id(
-            entry.identity,
-            entry.published_dataset_version,
-        ));
+        object_ids.push(version_object_id(entry.identity, entry.manifest_version));
         object_types.push(OBJECT_TYPE_TABLE_VERSION.to_string());
         locations.push(None);
         metadata.push(Some(
@@ -1115,32 +1162,28 @@ pub(super) fn manifest_rows_batch(
                     ))
                 })?;
                 identity.validate()?;
-                let expected_object_id = match object_type.as_str() {
-                    OBJECT_TYPE_TABLE => table_object_id(identity),
-                    OBJECT_TYPE_TABLE_VERSION => {
-                        let version = table_versions.get(row).copied().flatten().ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "manifest table_version row at index {row} is missing table_version"
-                            ))
-                        })?;
-                        version_object_id(identity, version)
+                let object_id = object_ids.get(row).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "manifest {object_type} row at index {row} is missing object_id"
+                    ))
+                })?;
+                match object_type.as_str() {
+                    OBJECT_TYPE_TABLE => {
+                        let expected_object_id = table_object_id(identity);
+                        if object_id != &expected_object_id {
+                            return Err(OmniError::manifest_internal(format!(
+                                "manifest {object_type} row at index {row} has object_id {object_id:?}, expected '{expected_object_id}'"
+                            )));
+                        }
                     }
-                    OBJECT_TYPE_TABLE_TOMBSTONE => {
-                        let version = table_versions.get(row).copied().flatten().ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "manifest table_tombstone row at index {row} is missing table_version"
-                            ))
-                        })?;
-                        super::layout::tombstone_object_id(identity, version)
+                    _ => {
+                        if table_versions.get(row).copied().flatten().is_none() {
+                            return Err(OmniError::manifest_internal(format!(
+                                "manifest {object_type} row at index {row} is missing table_version"
+                            )));
+                        }
+                        manifest_version_from_object_id(object_id, identity, object_type)?;
                     }
-                    _ => unreachable!("outer match restricts object type"),
-                };
-                if object_ids.get(row) != Some(&expected_object_id) {
-                    return Err(OmniError::manifest_internal(format!(
-                        "manifest {object_type} row at index {row} has object_id {:?}, expected '{}'",
-                        object_ids.get(row),
-                        expected_object_id
-                    )));
                 }
             }
             OBJECT_TYPE_GRAPH_COMMIT | OBJECT_TYPE_GRAPH_HEAD if identity.is_some() => {

@@ -1459,7 +1459,7 @@ query set_note($title: String, $note: String) {
         let source_data = [
             serde_json::json!({
                 "type": "Document",
-                "data": {"title": "changed", "content": external_uri, "note": "source"},
+                "data": {"title": "changed", "content": external_uri.clone(), "note": "source"},
             }),
             serde_json::json!({
                 "type": "Document",
@@ -1510,7 +1510,7 @@ query set_note($title: String, $note: String) {
                         .dataset("node:Document")
                         .unwrap()
                         .published_dataset_version,
-                "source-main fixture must require target-lineage adoption"
+                "source-main fixture must exercise a lower source version"
             );
         }
 
@@ -1524,8 +1524,13 @@ query set_note($title: String, $note: String) {
             .await
             .unwrap();
         assert_eq!(outcome, MergeOutcome::FastForward);
-        assert_eq!(probes.stage_known_present_update_calls(), 1);
-        assert_eq!(probes.stage_known_present_update_rows(), 1);
+        let delta_rows = u64::from(!source_main);
+        assert_eq!(
+            probes.stage_known_present_update_calls(),
+            delta_rows,
+            "a lower-versioned source on main is a pointer switch and stages nothing (RFC 0062)"
+        );
+        assert_eq!(probes.stage_known_present_update_rows(), delta_rows);
         assert_eq!(probes.stage_merge_insert_calls(), 0);
         assert_eq!(probes.stage_fenced_insert_calls(), 0);
         assert_eq!(probes.strict_insert_preflight_calls(), 0);
@@ -1536,20 +1541,34 @@ query set_note($title: String, $note: String) {
         );
         assert_eq!(
             probes.external_blob_probe_inputs(),
-            1,
-            "only the changed external descriptor belongs to the adopt delta"
+            delta_rows,
+            "only the changed external descriptor belongs to the adopt delta; a pointer switch probes nothing"
         );
-        assert_eq!(probes.external_blob_probe_calls(), 1);
-        assert_eq!(probes.external_blob_payload_read_calls(), 1);
+        assert_eq!(probes.external_blob_probe_calls(), delta_rows);
+        assert_eq!(probes.external_blob_payload_read_calls(), delta_rows);
 
         assert_eq!(count_rows_branch(&merger, target, "node:Document").await, 3);
-        let changed = read_managed_blob_bytes(
-            &merger,
-            ReadTarget::branch(target),
-            node_blob_cell("Document", "changed", "content"),
-        )
-        .await;
-        assert_eq!(&changed[..], b"Changed externally");
+        if source_main {
+            let changed = merger
+                .read_blob_at(
+                    ReadTarget::branch(target),
+                    node_blob_cell("Document", "changed", "content"),
+                )
+                .await
+                .unwrap();
+            let BlobContent::External(changed) = changed.content else {
+                panic!("a pointer switch shows the source's external descriptor as stored");
+            };
+            assert_eq!(changed.uri, external_uri);
+        } else {
+            let changed = read_managed_blob_bytes(
+                &merger,
+                ReadTarget::branch(target),
+                node_blob_cell("Document", "changed", "content"),
+            )
+            .await;
+            assert_eq!(&changed[..], b"Changed externally");
+        }
 
         let empty = merger
             .read_blob_at(

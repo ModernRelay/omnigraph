@@ -896,6 +896,9 @@ async fn publish_optimize_batch_monotonic(
                     crate::db::manifest::TableVersionExpectation {
                         table_key: target.type_key.clone(),
                         table_version: entry.published_dataset_version,
+                        native_ref: crate::db::manifest::NativeRefPin::Exact(
+                            entry.native_dataset_branch.clone(),
+                        ),
                     },
                 );
                 updates.push(target.clone());

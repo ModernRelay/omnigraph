@@ -177,22 +177,47 @@ pub(super) fn table_object_id(identity: TableIdentity) -> String {
     )
 }
 
-pub(super) fn version_object_id(identity: TableIdentity, version: u64) -> String {
+/// Row key of a registration: the identity plus the `__manifest` version that
+/// wrote it (RFC 0062 amends RFC 0028 §4.5's trailing Lance data version).
+pub(super) fn version_object_id(identity: TableIdentity, manifest_version: u64) -> String {
     format!(
         "table_version:{:016x}:{:016x}:{}",
         identity.stable_table_id,
         identity.table_incarnation_id,
-        format_table_version(version)
+        format_table_version(manifest_version)
     )
 }
 
-pub(super) fn tombstone_object_id(identity: TableIdentity, version: u64) -> String {
+pub(super) fn tombstone_object_id(identity: TableIdentity, manifest_version: u64) -> String {
     format!(
         "table_tombstone:{:016x}:{:016x}:{}",
         identity.stable_table_id,
         identity.table_incarnation_id,
-        format_table_version(version)
+        format_table_version(manifest_version)
     )
+}
+
+/// The manifest version a registration or tombstone row key carries: the
+/// trailing segment of `version_object_id` / `tombstone_object_id`, so the
+/// clock is read from the already-projected `object_id` and no column is added.
+pub(super) fn manifest_version_from_object_id(
+    object_id: &str,
+    identity: TableIdentity,
+    object_type: &str,
+) -> Result<u64> {
+    let prefix = format!(
+        "{object_type}:{:016x}:{:016x}:",
+        identity.stable_table_id, identity.table_incarnation_id
+    );
+    object_id
+        .strip_prefix(&prefix)
+        .filter(|suffix| suffix.len() == 20 && suffix.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "manifest {object_type} row has object_id '{object_id}', expected '{prefix}<manifest version>'"
+            ))
+        })
 }
 
 pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {

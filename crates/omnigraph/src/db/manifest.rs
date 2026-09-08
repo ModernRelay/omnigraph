@@ -766,6 +766,24 @@ pub(crate) enum ManifestChange {
 pub(crate) struct TableVersionExpectation {
     pub(crate) table_key: String,
     pub(crate) table_version: u64,
+    pub(crate) native_ref: NativeRefPin,
+}
+
+/// The native ref a pinned data version was read on. `Exact` pins the
+/// registration itself, `Exact(None)` is the root lineage; `Unchecked` is for a
+/// producer that pins a data version without a registration in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeRefPin {
+    Unchecked,
+    Exact(Option<String>),
+}
+
+/// The native ref of an identity's newest row: a registration's ref, `None`
+/// being the root lineage, or a tombstone, which carries no ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WinnerRef {
+    Registration(Option<String>),
+    Tombstone,
 }
 
 pub(crate) type ExpectedTableVersions = HashMap<TableIdentity, TableVersionExpectation>;

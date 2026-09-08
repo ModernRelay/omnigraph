@@ -14,8 +14,12 @@
 //! `OMNIGRAPH_V5_BIN` (built from the final internal-v5 commit) and proves both
 //! directions of the v5/v6 format fence. Each case skips only when its variable
 //! is unset; a set but invalid path fails loudly.
-//! `OMNIGRAPH_V09_BIN` selects the released v0.9 CLI for the in-place v6
-//! upgrade journey, including full-text rebuilding and current HTTP serving.
+//! `OMNIGRAPH_V09_BIN` selects the released v0.9 CLI for the end-to-end
+//! journey of a fully exercised v6 graph — branches, edges, vectors,
+//! full-text and blobs — which the current binary refuses and which is
+//! rebuilt from a 0.9 export.
+//! `OMNIGRAPH_V6_BIN` (the released 0.10.x CLI) proves both directions of the
+//! v6/v7 fence (RFC 0062).
 
 mod support;
 
@@ -63,6 +67,26 @@ fn v5_bin() -> Option<PathBuf> {
         "OMNIGRAPH_V5_BIN is set but is not a binary file: {} \
          (unset it to skip, or point it at the omnigraph binary built from the final internal-v5 commit)",
         path.display(),
+    );
+    Some(path)
+}
+
+/// Resolve the final internal-v6 binary: the last release that wrote internal
+/// schema v6.
+fn v6_bin() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_V6_BIN")?);
+    assert!(
+        path.exists() && path.is_file(),
+        "OMNIGRAPH_V6_BIN is set but is not a binary file: {} \
+         (unset it to skip, or point it at the released 0.10.x omnigraph binary (the last internal-v6 writer))",
+        path.display(),
+    );
+    let version = run_old(&path, &["version"]);
+    assert_ok("v6 version", &version);
+    let reported = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        reported.contains("omnigraph 0.10."),
+        "OMNIGRAPH_V6_BIN must be a released 0.10.x binary (the last internal-v6 writer), got: {reported}",
     );
     Some(path)
 }
@@ -166,7 +190,7 @@ fn assert_exported_blob_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {
 
 /// Format v6 activates RFC-023 by installing exactly `id` as the unenforced
 /// Lance primary key on every graph dataset. Assert the rebuilt image crossed
-/// that physical boundary, not only that its stamp changed.
+/// that physical boundary, not only that its stamp changed; v7 (RFC 0062) preserves it.
 fn assert_v6_graph_datasets_use_exact_id_pk(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
@@ -355,7 +379,7 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
 }
 
 #[test]
-fn current_v6_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v6() {
+fn current_v7_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v7() {
     let Some(previous) = previous_bin() else {
         eprintln!(
             "skipping immediate-predecessor upgrade test: OMNIGRAPH_PREVIOUS_BIN is not set to a 0.8.1 binary"
@@ -441,7 +465,7 @@ fn current_v6_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v6() {
 }
 
 #[test]
-fn current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6() {
+fn current_v7_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v7() {
     let Some(v5) = v5_bin() else {
         eprintln!(
             "skipping immediate-predecessor v5 upgrade test: OMNIGRAPH_V5_BIN is not set to a final internal-v5 binary"
@@ -507,8 +531,6 @@ fn current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6() {
     let jsonl = temp.path().join("v5.jsonl");
     std::fs::write(&jsonl, &export.stdout).unwrap();
 
-    // The current v6 binary refuses before reading the predecessor image as if
-    // it already had RFC-023's physical PK contract.
     let refusal = output_failure(cli().arg("snapshot").arg(&v5_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(
@@ -614,11 +636,119 @@ fn current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6() {
 }
 
 #[test]
-fn current_v010_upgrades_genuine_v09_graph_end_to_end() {
-    use reqwest::blocking::Client;
-    use serde_json::{Value, json};
+fn current_v7_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v7() {
+    let Some(v6) = v6_bin() else {
+        eprintln!(
+            "skipping immediate-predecessor v6 upgrade test: OMNIGRAPH_V6_BIN is not set to a released 0.10.x binary"
+        );
+        return;
+    };
+
+    let temp = tempdir().unwrap();
+    let v6_graph = temp.path().join("old-v6.omni");
+    let schema = temp.path().join("v6-vector-blob.pg");
+    let data = temp.path().join("v6-vector-blob.jsonl");
+    let search_schema = std::fs::read_to_string(fixture("search.pg")).unwrap();
+    std::fs::write(
+        &schema,
+        format!(
+            "{search_schema}\n\nnode BinaryAsset {{\n    name: String @key\n    payload: Blob\n}}\n"
+        ),
+    )
+    .unwrap();
+    let mut search_data = std::fs::read_to_string(fixture("search.jsonl")).unwrap();
+    if !search_data.ends_with('\n') {
+        search_data.push('\n');
+    }
+    search_data.push_str(
+        r#"{"type":"BinaryAsset","data":{"name":"blob-sentinel","payload":"base64:AAECA/8="}}
+"#,
+    );
+    std::fs::write(&data, search_data).unwrap();
+    let v6_uri = v6_graph.to_str().unwrap();
+
+    assert_ok(
+        "v6 init",
+        &run_old(&v6, &["init", "--schema", schema.to_str().unwrap(), v6_uri]),
+    );
+    assert_ok(
+        "v6 load",
+        &run_old(
+            &v6,
+            &[
+                "load",
+                "--mode",
+                "overwrite",
+                "--data",
+                data.to_str().unwrap(),
+                v6_uri,
+            ],
+        ),
+    );
+    assert!(
+        v6_graph.join("_schema.ir.json").exists(),
+        "a genuine v6 graph must carry accepted SchemaIR v2 identity state",
+    );
+
+    let export = run_old(&v6, &["export", v6_uri]);
+    assert_ok("v6 export", &export);
+    assert!(!export.stdout.is_empty(), "v6 export produced no rows");
+    let jsonl = temp.path().join("v6.jsonl");
+    std::fs::write(&jsonl, &export.stdout).unwrap();
+
+    let refusal = output_failure(cli().arg("snapshot").arg(&v6_graph));
+    let stderr = String::from_utf8_lossy(&refusal.stderr);
+    assert!(
+        stderr.contains("0.9.x or 0.10.x"),
+        "v6 refusal must name the release range that wrote internal schema v6, got: {stderr}",
+    );
+    assert!(
+        stderr.contains("export"),
+        "v6 refusal must direct the operator to export/import rebuild, got: {stderr}",
+    );
+
+    let v7_graph = temp.path().join("new-v7-from-v6.omni");
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(&v7_graph),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&jsonl)
+            .arg(&v7_graph),
+    );
+    let reexport = output_success(cli().arg("export").arg(&v7_graph));
+    assert_export_fidelity("v6 → v7", &export.stdout, &reexport.stdout);
+    assert_exported_blob_fidelity("v6 → v7", &export.stdout, &reexport.stdout);
+    assert_v6_graph_datasets_use_exact_id_pk(&v7_graph);
+    assert_v6_blob_bytes(&v7_graph, &[0, 1, 2, 3, 255]);
+
+    let reverse = run_old(&v6, &["snapshot", v7_graph.to_str().unwrap()]);
+    assert!(
+        !reverse.status.success(),
+        "a v6 binary must refuse a genuine v7 graph",
+    );
+    let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
+    assert!(
+        reverse_stderr.contains("upgrade omnigraph")
+            || reverse_stderr.contains("newer")
+            || reverse_stderr.contains("expects v6"),
+        "unexpected v6→v7 reverse-refusal message: {reverse_stderr}",
+    );
+}
+
+#[test]
+fn current_v7_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
+    use serde_json::json;
     use std::fs;
-    use support::{copy_dir, parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
+    use support::{parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
 
     let Some(old) = std::env::var_os("OMNIGRAPH_V09_BIN").map(PathBuf::from) else {
         eprintln!("skipping v0.9 upgrade e2e: OMNIGRAPH_V09_BIN is unset");
@@ -805,8 +935,6 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             out.stdout
         })
         .collect();
-    let backup = temp.path().join("backup");
-    copy_dir(&cluster, &backup);
     let original_heads: Vec<_> = ["main", "review"]
         .into_iter()
         .map(|branch| {
@@ -819,7 +947,17 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         })
         .collect();
 
-    // The current binary opens v6 directly: no export/import or schema migration.
+    let refusal = output_failure(cli().arg("snapshot").arg(&graph));
+    let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);
+    assert!(
+        refusal_stderr.contains("0.9.x or 0.10.x"),
+        "the v6 refusal must name the release range that wrote internal schema v6, got: {refusal_stderr}",
+    );
+    assert!(
+        refusal_stderr.contains("export"),
+        "the v6 refusal must direct the operator to export/import rebuild, got: {refusal_stderr}",
+    );
+
     output_success(
         cli()
             .args(["lint", "--schema"])
@@ -827,9 +965,34 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .arg("--query")
             .arg(&queries),
     );
-    for (i, branch) in ["main", "review"].into_iter().enumerate() {
-        assert_eq!(resolved_snapshot_id(&graph, branch), original_heads[i]);
+
+    let rebuilt_cluster = temp.path().join("rebuilt-cluster");
+    fs::create_dir(&rebuilt_cluster).unwrap();
+    for name in ["graph.pg", "queries.gq", "cluster.yaml"] {
+        fs::copy(cluster.join(name), rebuilt_cluster.join(name)).unwrap();
     }
+    for operation in ["import", "plan", "apply"] {
+        output_success(
+            cli()
+                .args(["cluster", operation, "--config"])
+                .arg(&rebuilt_cluster),
+        );
+    }
+    let rebuilt = rebuilt_cluster.join("graphs/knowledge.omni");
+    let rebuilt_uri = rebuilt.to_str().unwrap();
+    for (i, branch) in ["main", "review"].into_iter().enumerate() {
+        let jsonl = temp.path().join(format!("v09-{branch}.jsonl"));
+        fs::write(&jsonl, &exports[i]).unwrap();
+        let mut load = cli();
+        load.args(["load", "--mode", "overwrite", "--data"])
+            .arg(&jsonl)
+            .args(["--branch", branch]);
+        if branch != "main" {
+            load.args(["--from", "main"]);
+        }
+        output_success(load.arg(&rebuilt));
+    }
+
     let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
         let mut command = cli();
         command
@@ -840,11 +1003,12 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .args(target);
         command
     };
-    let direct = ["--store", uri];
+    let direct = ["--store", rebuilt_uri];
     let vector_params = r#"{"q":[0.1,0.2,0.3,0.4]}"#;
     let term_params = r#"{"term":"organism"}"#;
+
     for (i, branch) in ["main", "review"].into_iter().enumerate() {
-        let exported = output_success(cli().args(["export", uri, "--branch", branch]));
+        let exported = output_success(cli().args(["export", rebuilt_uri, "--branch", branch]));
         assert_eq!(
             canonical_export_rows(&exported.stdout),
             canonical_export_rows(&exports[i])
@@ -860,90 +1024,23 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             edges["rows"],
             json!([{ "a.slug":"ml-intro", "b.slug":"dl-basics", "c.note":"organism citation" }])
         );
-        let nearest = parse_stdout_json(&output_success(&mut query_command(
-            &direct,
-            branch,
-            "vectors",
-            vector_params,
-        )));
-        assert_eq!(nearest["rows"], json!([{ "d.slug":"ml-intro" }]));
-        for name in ["terms", "ranked"] {
-            let failure = output_failure(&mut query_command(&direct, branch, name, term_params));
-            assert!(String::from_utf8_lossy(&failure.stderr).contains("rebuild-full-text-indexes"));
+        for (name, params) in [
+            ("vectors", vector_params),
+            ("terms", term_params),
+            ("ranked", term_params),
+        ] {
+            let rows = parse_stdout_json(&output_success(&mut query_command(
+                &direct, branch, name, params,
+            )));
+            assert_eq!(
+                rows["rows"],
+                json!([{ "d.slug":"ml-intro" }]),
+                "the load built {branch}'s full-text and vector indexes for {name}"
+            );
         }
-        assert_eq!(resolved_snapshot_id(&graph, branch), original_heads[i]);
     }
 
-    // Boot the new server on the old cluster catalog. A refusal is a typed
-    // 409, not a plausible empty result, and must leave both heads unchanged.
-    let client = Client::new();
-    let server = spawn_server_with_cluster(&cluster);
-    for branch in ["main", "review"] {
-        let response = client.post(format!("{}/graphs/knowledge/query", server.base_url))
-            .json(&json!({"query":query_source,"name":"terms","params":{"term":"organism"},"branch":branch})).send().unwrap();
-        assert_eq!(response.status(), 409);
-        let error: Value = response.json().unwrap();
-        assert!(
-            error["full_text_index_rebuild_required"].is_object(),
-            "{error}"
-        );
-    }
-    drop(server);
-    for (i, branch) in ["main", "review"].into_iter().enumerate() {
-        assert_eq!(resolved_snapshot_id(&graph, branch), original_heads[i]);
-    }
-
-    // Maintenance runs with serving stopped. Rebuilding main cannot certify
-    // its old snapshot or the independently written branch's old segments.
-    for (i, branch) in ["main", "review"].into_iter().enumerate() {
-        let rebuilt = parse_stdout_json(&output_success(cli().args([
-            "rebuild-full-text-indexes",
-            uri,
-            "--branch",
-            branch,
-            "--json",
-        ])));
-        assert_eq!(
-            rebuilt["rebuilt_indexes"],
-            json!([
-                {"type_key":"node:BinaryAsset", "property":"name"},
-                {"type_key":"node:Doc", "property":"body"},
-                {"type_key":"node:Doc", "property":"slug"},
-                {"type_key":"node:Doc", "property":"title"},
-            ])
-        );
-        assert_eq!(rebuilt["branch"], branch);
-        assert_eq!(
-            rebuilt["graph_commit_id"],
-            resolved_snapshot_id(&graph, branch)
-        );
-        assert_ne!(rebuilt["graph_commit_id"], original_heads[i]);
-        assert_eq!(
-            canonical_export_rows(
-                &output_success(cli().args(["export", uri, "--branch", branch])).stdout
-            ),
-            canonical_export_rows(&exports[i])
-        );
-        if branch == "main" {
-            assert_eq!(resolved_snapshot_id(&graph, "review"), original_heads[1]);
-            output_failure(&mut query_command(&direct, "review", "terms", term_params));
-        }
-        let old_search = output_failure(cli().args([
-            "query",
-            "terms",
-            "--query",
-            query_path,
-            "--store",
-            uri,
-            "--snapshot",
-            &original_heads[i],
-            "--params",
-            term_params,
-        ]));
-        assert!(String::from_utf8_lossy(&old_search.stderr).contains("rebuild-full-text-indexes"));
-    }
-
-    let server = spawn_server_with_cluster(&cluster);
+    let server = spawn_server_with_cluster(&rebuilt_cluster);
     let remote = ["--server", server.base_url.as_str(), "--graph", "knowledge"];
     for branch in ["main", "review"] {
         for (name, params) in [
@@ -982,8 +1079,8 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             assert_eq!(blob.stdout, [0, 1, 2, 3, 255]);
         }
     }
-    // Exercise new writes and graph merge through HTTP, then reopen the server.
-    let before = resolved_snapshot_id(&graph, "review");
+
+    let before = resolved_snapshot_id(&rebuilt, "review");
     let change = parse_stdout_json(&output_success(
         cli()
             .args([
@@ -994,13 +1091,13 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 "--branch",
                 "review",
                 "--params",
-                r#"{"body":"verified after upgrade"}"#,
+                r#"{"body":"verified after rebuild"}"#,
                 "--json",
             ])
             .args(remote),
     ));
     assert_eq!(change["affected_nodes"], 1);
-    assert_ne!(resolved_snapshot_id(&graph, "review"), before);
+    assert_ne!(resolved_snapshot_id(&rebuilt, "review"), before);
     output_success(
         cli()
             .args(["branch", "merge", "review", "--into", "main", "--json"])
@@ -1015,7 +1112,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| row["d.slug"] == "dl-basics" && row["d.body"] == "verified after upgrade")
+            .any(|row| row["d.slug"] == "dl-basics" && row["d.body"] == "verified after rebuild")
     );
     assert!(
         expected
@@ -1025,7 +1122,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .any(|row| row["d.slug"] == "ml-intro" && row["d.title"] == "organism branch")
     );
     drop(server);
-    let reopened = spawn_server_with_cluster(&cluster);
+    let reopened = spawn_server_with_cluster(&rebuilt_cluster);
     let remote = [
         "--server",
         reopened.base_url.as_str(),
@@ -1049,38 +1146,34 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     );
     drop(reopened);
 
-    // Rollback means restoring the quiescent backup at its original path,
-    // never asking the old binary to interpret newly rebuilt postings.
-    fs::rename(&cluster, temp.path().join("upgraded")).unwrap();
-    copy_dir(&backup, &cluster);
     for (i, branch) in ["main", "review"].into_iter().enumerate() {
         let restored = run_old(&old, &["export", uri, "--branch", branch]);
-        assert_ok("restored old export", &restored);
+        assert_ok("old export after the rebuild", &restored);
         assert_eq!(
             canonical_export_rows(&restored.stdout),
-            canonical_export_rows(&exports[i])
+            canonical_export_rows(&exports[i]),
+            "the rebuild must leave the refused root unchanged on {branch}"
         );
-        let search = run_old(
-            &old,
-            &[
-                "query",
-                "terms",
-                "--query",
-                query_path,
-                "--store",
-                uri,
-                "--branch",
-                branch,
-                "--params",
-                term_params,
-                "--json",
-            ],
-        );
-        assert_ok("restored old search", &search);
+        let commits = run_old(&old, &["commit", "list", uri, "--branch", branch, "--json"]);
+        assert_ok("old commit history after the rebuild", &commits);
         assert_eq!(
-            parse_stdout_json(&search)["rows"],
-            json!([{ "d.slug":"ml-intro" }])
+            parse_stdout_json(&commits)["commits"][0]["graph_commit_id"],
+            json!(original_heads[i]),
+            "the refused root's {branch} head must not move"
         );
     }
-    eprintln!("v0.9 -> v0.10 upgrade e2e completed");
+
+    let reverse = run_old(&old, &["snapshot", rebuilt_uri]);
+    assert!(
+        !reverse.status.success(),
+        "a 0.9 binary must refuse a genuine v7 graph",
+    );
+    let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
+    assert!(
+        reverse_stderr.contains("upgrade omnigraph")
+            || reverse_stderr.contains("newer")
+            || reverse_stderr.contains("expects v6"),
+        "unexpected v0.9 reverse-refusal message: {reverse_stderr}",
+    );
+    eprintln!("v0.9 refusal and export/import rebuild completed");
 }

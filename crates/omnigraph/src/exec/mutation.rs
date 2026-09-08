@@ -547,6 +547,7 @@ async fn open_table_for_mutation(
         opened.identity,
         opened.full_path.clone(),
         opened.table_branch.clone(),
+        opened.pinned_native_ref.clone(),
         opened.deferred_fork.clone(),
         opened.expected_version,
         op_kind,

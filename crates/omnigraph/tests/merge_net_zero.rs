@@ -6,10 +6,10 @@
 //! caught by the manifest-equality gate that skips untouched tables, and it
 //! reaches adopt classification.
 //!
-//! Publishing that adopt re-registers the entry `__manifest` already holds,
-//! which the publisher's registry guard rejects. The failure is deterministic:
-//! a retry recomputes the same publish and fails identically, so the branch is
-//! permanently unmergeable.
+//! Publishing that adopt would re-register the entry `__manifest` already
+//! holds. The publisher has no registry collision guard, so classification
+//! owns the outcome: `reregisters_current_entry` plans `AdoptPublish::Nothing`
+//! and the merge publishes no registration for the table.
 //!
 //! These tests pin the whole contract rather than "the merge stops erroring";
 //! each one names the half it owns.

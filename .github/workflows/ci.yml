@@ -560,6 +560,18 @@ jobs:
             || { echo "::error::upgrade regression requires the genuine v0.9.0 CLI"; exit 1; }
           echo "OMNIGRAPH_V09_BIN=$v09_dir/omnigraph" >> "$GITHUB_ENV"
 
+      - name: Install genuine v0.10 release for the v6 format fence
+        run: |
+          set -euo pipefail
+          v6_dir="$RUNNER_TEMP/omnigraph-v010"
+          # 0.10.0, the last release that writes internal schema v6
+          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.10.0 INSTALL_DIR="$v6_dir" \
+            bash scripts/install.sh
+          test -x "$v6_dir/omnigraph"
+          [[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \
+            || { echo "::error::the v6 format fence requires the genuine v0.10.0 CLI"; exit 1; }
+          echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
+
       - name: Run workspace and failpoint tests once
         run: |
           set -euo pipefail
@@ -578,14 +590,20 @@ jobs:
             echo "::error::v0.9 upgrade regression skipped despite a configured release binary"
             exit 1
           fi
-          grep -Fq "v0.9 -> v0.10 upgrade e2e completed" "$test_log" \
+          grep -Fq "v0.9 refusal and export/import rebuild completed" "$test_log" \
             || { echo "::error::v0.9 upgrade regression did not complete"; exit 1; }
-          grep -Eq "test current_v010_upgrades_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
-            || { echo "::error::exact v0.9 upgrade regression did not pass"; exit 1; }
+          grep -Eq "test current_v7_refuses_and_rebuilds_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
+            || { echo "::error::exact v0.9 refusal and rebuild regression did not pass"; exit 1; }
+          if grep -Fq "skipping immediate-predecessor v6 upgrade test" "$test_log"; then
+            echo "::error::v6 format fence skipped despite a configured 0.10 release binary"
+            exit 1
+          fi
+          grep -Eq "test current_v7_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v7 \\.\\.\\. ok" "$test_log" \
+            || { echo "::error::exact v6 format fence did not pass"; exit 1; }
 
 
-  v5_v6_format_fence:
-    name: V5 ↔ V6 Format Fence
+  v5_v7_format_fence:
+    name: V5 ↔ V7 Format Fence
     needs: classify_changes
     # Pull requests too, as a reporting context like `Test Workspace`: a
     # fence red reports on the pull request instead of first appearing on `main`.
@@ -618,7 +636,7 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: crossversion-v5-v6
+          key: crossversion-v5-v7
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
@@ -654,21 +672,21 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           echo "OMNIGRAPH_V5_BIN=$v5_bin" >> "$GITHUB_ENV"
 
-      - name: Run exact v5↔v6 refusal and rebuild fence
+      - name: Run exact v5↔v7 refusal and rebuild fence
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/v5-v6-format-fence.log"
+          test_log="$RUNNER_TEMP/v5-v7-format-fence.log"
           cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
-            current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6 \
+            current_v7_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v7 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
           if grep -Fq "skipping immediate-predecessor v5 upgrade test" "$test_log"; then
-            echo "::error::v5↔v6 format fence skipped despite a configured predecessor binary"
+            echo "::error::v5↔v7 format fence skipped despite a configured predecessor binary"
             exit 1
           fi
-          grep -Eq "test current_v6_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v6 \.\.\. ok" "$test_log" \
-            || { echo "::error::exact v5↔v6 format fence did not execute normally"; exit 1; }
+          grep -Eq "test current_v7_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v7 \.\.\. ok" "$test_log" \
+            || { echo "::error::exact v5↔v7 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
-            || { echo "::error::v5↔v6 format fence matched the wrong test set"; exit 1; }
+            || { echo "::error::v5↔v7 format fence matched the wrong test set"; exit 1; }
 
   test_aws_feature:
     name: Test omnigraph-server --features aws
