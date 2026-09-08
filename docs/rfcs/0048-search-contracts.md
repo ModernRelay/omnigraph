@@ -16,6 +16,8 @@ blocked_on:
   - "SchemaIR version-assignment decision shared with RFCs 0040 and 0044 (facets vs. one linear scalar)"
   - "Mapping between this RFC's per-profile analyzer fingerprints and RFC 0043's artifact-level analyzer generations"
   - "Schema-authoritative analyzer binding for index-free lexical evaluation and exact matcher qualification against the pinned Lance surfaces"
+  - "Lexical resource admission and accounting limits, including token construction and shared scan/expansion fallback budgets"
+  - "Snapshot-correct BM25 corpus statistics and complete ranking-boundary tie handling; native constants and post-sorting alone do not qualify these contracts"
   - "A checked-in relevance-judgment corpus for the NDCG/MRR/Recall baseline"
   - "Recall/latency evaluation naming a bounded ann_default_v1 profile per index family"
 ---
@@ -33,7 +35,7 @@ Search becomes three separate, composable contracts:
    semantics. Defaults are `mode: all` and `max_edits: 0`; edit tolerance is
    explicit and membership remains exact under every index state.
 3. **Ranked retrieval** — `bm25` (lexical, any-term, positive score), exact
-   `knn`, approximate `ann` (with one typed, family-agnostic recall dial,
+   `knn`, approximate `ann` (with one typed, family-agnostic effort parameter,
    `oversample: N`), fused by N-arm weighted
    `rrf(arm(source, candidates: N [, weight: W]), …, k: K)`.
 
@@ -42,9 +44,9 @@ The semantics move into schema, versioned and immutable:
 - `@analyzed(analyzer="standard_v1" [, scorer="bm25_v1"])` declares analyzed
   matching; the scorer is optional — a field can be filterable without being
   rankable. Resolved profiles persist their full parameter tables **and the
-  substrate implementation identity** (tokenizer/stemmer versions) in their
-  compatibility fingerprint, so a dependency bump that changes analysis is a
-  schema event, never silent drift.
+  substrate implementation identity** (tokenizer/stemmer and Unicode
+  behavior) in their compatibility fingerprint, so a dependency bump that
+  changes analysis is a schema event, never silent drift.
 - `Vector(dim, distance="l2"|"cosine"|"dot")` makes geometry schema; there is
   no query-time distance argument anywhere.
 - `@embed("source", model="provider/model")` requires an explicit embedding-
@@ -125,12 +127,43 @@ node Organization {
 }
 ```
 
-Initial immutable analyzer profiles: `standard_v1` (lowercase, no stemming —
-the safe default, immune to stemmer drift), `standard_folded_v1` (adds ASCII
-folding), `english_v1` (adds English stemming and stop words, matching
-today's substrate defaults). Adding a profile or scorer version requires an
-RFC; none is ever mutated. Query-time analyzer, scorer, or vector-distance
-overrides do not exist.
+Initial immutable analyzer profiles resolve these settings explicitly;
+unspecified Lance defaults are never part of the schema contract:
+
+| Setting | `standard_v1` (default) | `standard_folded_v1` | `english_v1` |
+|---|---|---|---|
+| Document / base tokenizer | Text / `simple` | Text / `simple` | Text / `simple` |
+| Language setting | English (inactive) | English (inactive) | English |
+| Lowercase | Yes | Yes | Yes |
+| Stemming / stop words | Neither | Neither | English stemmer, then built-in English stop words |
+| ASCII folding | No | Yes | Yes, after stemming and stop words |
+| Token-length filter | Disabled (`max_token_length: None`) | Disabled | Disabled |
+| Unicode normalization | No additional NFC/NFKC normalization | Same | Same |
+
+Filters execute in Lance's order: lowercase, optional stemmer, optional stop
+words, optional ASCII folding. Scalar String fields use row document
+granularity; positions do not affect membership. These profiles use no
+custom stop words, external dictionaries, n-grams, or code-tokenizer flags.
+Posting positions and block layout remain derived index settings.
+
+Disabling the token-length filter is deliberate. Pinned Lance defaults to
+`Some(40)`, whose filter retains only tokens shorter than 40 **UTF-8 bytes**,
+before lowercasing or folding. Resource limits must reject excessive work,
+not silently erase a long name or query term. Thus `english_v1` preserves
+the default linguistic pipeline, but intentionally changes long-token
+matching at this breaking boundary.
+
+`simple` splits at non-alphanumeric Unicode scalar values. Lowercasing is
+not full case folding, and ASCII folding after tokenization is not Unicode
+normalization: composed `résumé` and its decomposed spelling can tokenize
+differently. With `english_v1`, `résumé` and `resume` become `resume` and
+`resum`, respectively, because stemming precedes folding. These limitations
+are explicit profile behavior, not promises of language-independent typo
+equivalence. Changing segmentation, normalization, or filter order requires
+a new profile. Fingerprints include the implementation and Unicode data
+identity, including the Rust Unicode behavior used by `simple` and lowercase.
+Adding a profile or scorer version requires an RFC; none is ever mutated.
+Query-time analyzer, scorer, or vector-distance overrides do not exist.
 
 For spelling tolerance on names and titles, the non-stemming profiles keep
 edit distance close to the spelling the user supplied. Under `english_v1`,
@@ -144,11 +177,12 @@ window, or implicit retrieval. Its contract is:
 
 | Aspect | Rule |
 |---|---|
+| Query text | A non-null String literal or query parameter, constant for one execution; row-dependent query text is rejected. |
 | Analysis | Apply the same resolved field analyzer to document and query text, at every edit budget including zero. |
 | Distance | Minimum insertions, deletions, and substitutions over analyzed Unicode scalar values; each costs one. An adjacent transposition costs two. There is no implicit prefix restriction or length-based automatic tolerance. |
 | `max_edits` | Optional integer literal or query parameter in `0..=2`, default `0`. Check literals at compile time and bound parameters before execution; reject negative, oversized, and non-integer values without narrowing casts. |
 | `mode` | `all` by default: every analyzed query term has a document term within the budget. `any`: at least one does. |
-| Term identity | Repeated query terms do not require repeated occurrences; a document term can satisfy multiple query terms. Matching is neither phrase matching nor distance over the whole field value. |
+| Term identity | Repeated query terms do not require repeated occurrences; a document term can satisfy multiple query terms. Reordering analyzed terms cannot change membership. Matching is neither phrase matching nor distance over the whole field value. |
 | Empty text | A query yielding no searchable terms is a typed error. A null or token-empty document does not match. |
 | Completeness | Every successful result satisfies the predicate exactly; an edit-tolerant predicate does not advertise approximate recall. |
 
@@ -200,14 +234,17 @@ query hybrid($q: String) {
 - A String query argument to `knn`/`ann` is legal only when the field's
   `@embed` records a model and the resolved query embedder matches it
   exactly; a raw Vector argument is an explicit same-space assertion.
-- `oversample` is monotone and semantics-free: it can only widen the exactly
-  re-scored candidate window, validated against the resolved profile's
-  bounds. Substrate knobs (`ef`, `nprobes`, quantizer choices) never appear
-  in the query language.
+- `oversample` raises the candidate and search-work budgets within the
+  resolved profile's bounds; a larger value cannot lower those configured
+  budgets. It does not promise nested candidate sets or monotone recall for
+  each approximate query. Every returned distance is exactly re-scored.
+  Substrate knobs (`ef`, `nprobes`, quantizer choices) never appear in the
+  query language.
 - `knn` is exact under every index state; `ann` reports `approximate` as its
   contract even when the plan happened to run exactly, and falls back to
   exact evaluation for any population segment not safely covered by a
-  compatible artifact — never failing, never building an index inline.
+  compatible artifact. Missing coverage alone is not an error; integrity or
+  resource failures remain errors. Reads never build an index inline.
 - For `@embed` fields, ready/pending representation coverage (RFC 0047's
   mechanism) is reported per source; pending rows are missing data, never an
   approximation.
@@ -287,8 +324,9 @@ certified-rebuild pattern RFC 0043 established.
    coverage, pruning health, and bounded budget ranges come from a typed
    capability probe derived from observable substrate state; missing facts
    cause safe fallback or loud failure, never a heuristic semantic downgrade.
-9. Recall dials are typed, family-agnostic, and monotone (`oversample`
-   only). `max_edits` changes logical membership; it is not a recall dial.
+9. Search-effort dials are typed and family-agnostic (`oversample` only),
+   with nondecreasing configured budgets, not guaranteed monotone ANN
+   recall. `max_edits` changes logical membership; it is not an effort dial.
 10. Profile identity includes substrate behavior identity; a substrate
     change that alters analysis requires reindex-or-parity evidence.
 
@@ -313,9 +351,11 @@ containing the rename-stable field identity, accepted analyzer fingerprint,
 query expression, term-combination mode, and checked edit-budget expression.
 Resolve query parameters and analyze the query once per execution against
 the accepted snapshot; reuse that resolved token representation across scan
-and indexed paths. Parameterized compiled plans remain reusable. Plan and
-execution fingerprints include the matching semantics rather than inferring
-them from the presence of an FTS index. Removed lexical spellings have no IR
+and indexed paths. Validate parameters and reject token-empty queries before
+population scans, including on empty graphs. Parameterized compiled plans
+remain reusable. Plan and execution fingerprints include the matching
+semantics rather than inferring them from the presence of an FTS index.
+Removed lexical spellings have no IR
 variants, runtime compatibility branches, or separate matcher implementations.
 
 **Analyzer parity without index coupling.** Instantiate the analyzer from
@@ -337,6 +377,28 @@ with typed graph/property filters before ranking and with the existing
 target-validation rules. Unsupported placement must fail validation rather
 than lose the predicate.
 
+This is a new typed Boolean evaluator, not a wrapper around Lance's flat
+BM25 scanner. `InvertedIndexParams::build()` already exposes the analyzer
+without a dataset or index; its Text tokenizer shares query/document
+tokenization. Lance's flat BM25 helper accepts a tokenizer but collects
+per-row scoring counts, does not implement edit matching, and its fuzzy
+post-filter path rejects execution. Reuse the public analyzer in a typed
+engine/DataFusion filter over the sealed scan stream. Native index
+acceleration additionally needs an analyzer-consistent query path and a
+complete-expansion outcome; those scanner capabilities are not supplied by
+the pin. Boolean evaluation introduces no dictionary or posting storage.
+
+The implementation must bound query bytes, distinct terms, individual
+materialized values, matching state, and execution work. Enforce admission
+before allocations that can exceed the budget, including token construction;
+checking only between returned tokens is insufficient for one huge token.
+Use a bounded exact edit matcher, with cancellation checkpoints. The pinned
+`fst` Levenshtein automaton agrees with the declared scalar-value distance,
+but construction can consume substantial memory and hit its state limit.
+Its default per-automaton cap is not a whole-query resource protocol. Numeric
+limits, accounting units, and fallback charging must be specified and
+qualified before shipping this evaluator.
+
 **Qualified index acceleration.** Lance continues to own dictionaries,
 postings, and physical index state. A native path is eligible only when its
 artifact passes RFC 0043's proof checks against the accepted profile and its
@@ -350,8 +412,12 @@ query plan proves the requested result complete. Post-verifying a truncated
 candidate set cannot repair omitted matches.
 
 An indexed expansion must distinguish **complete** from **overflow**. The
-current substrate's lexical prefix of 50 expansions is not an exact
-membership contract, and increasing that cap is not a completeness proof.
+current substrate shares a default budget of 50 expansions across query
+terms within each segment, selecting lexically across that segment's
+partitions. It returns tokens without a completeness flag. Earlier terms
+can exhaust the budget before later terms are considered; changing the
+vocabulary or segment layout can change the selected terms. This is not an
+exact membership contract, and increasing the cap is not a completeness proof.
 When complete acceleration cannot be established, use the exact scan within
 the remaining query budget. If that budget is exhausted, fail the whole
 query with a typed resource outcome; do not return partial success. Bound
@@ -442,7 +508,7 @@ counterexamples recorded below:
   substrate upgrade silently re-meant deployed thresholds in the largest
   surveyed system. A future construct must be typed and calibration-aware.
 - **Per-query substrate knobs (`ef`, `nprobes`)** — couples stored queries
-  to one index family; the concession is the typed monotone `oversample`.
+  to one index family; the concession is the typed `oversample` effort budget.
 - **Keeping bare `@embed`** — equal-dimension incompatible models remain
   silently comparable; the observed cost is wrong similarity results, not
   errors.
@@ -473,6 +539,19 @@ baseline observations, not tests of the proposed replacement or a newly
 compiled engine. The inspected Lance 11.0.0 crate archives matched the
 workspace lockfile checksums.
 
+A second audit checked the current full Lance FTS, tokenizer, index lifecycle,
+vector, and DataFusion guides against those exact crate archives. The FTS
+format guide's defaults disagree with both its quick start and the pinned
+Rust constructor; the explicit profile table above follows source-verified
+filter behavior and records deliberate deviations. A library-level probe
+using `lance-tokenizer 11.0.0`, `frostem 1.20260821.3`, and `fst 0.4.7`
+passed 73,008 comparisons between the Unicode automaton and an independent
+scalar-value edit-distance calculation at budgets zero through two. It also
+checked the byte-length boundary, composed/decomposed text, folding after
+stemming, and explicit automaton-construction failure. This validates the
+distance primitive and analyzer behavior, not an engine implementation,
+index completeness, cancellation, or a query-level memory bound.
+
 Planned test evidence, extending existing owners: compiler suites for the
 new annotations, named arguments, typed metric domains, removed lexical
 spellings, and the separate nearest deprecation; the `.gqt` query corpus for
@@ -496,17 +575,22 @@ scan over the same accepted snapshot. Extend the existing owners to cover:
   empty/stop-word-only queries.
 - Case, folding, stemming, and multibyte Unicode; distance-zero equivalence
   and matched-set inclusion for budgets zero, one, and two; transpositions
-  count as two. Validate literal and parameter bounds, including negative
-  values, non-integers, and integers exceeding `u32`.
+  count as two. Include composed/decomposed spellings, token lengths around
+  40 UTF-8 bytes, and repeated/reordered analyzed terms. Validate literal
+  and parameter bounds, including negative values, non-integers, integers
+  exceeding `u32`, null query arguments, and validation on empty populations.
 - Absent, empty, complete, and partial indexes; append, update, delete,
   overwrite, compaction, removal, and rebuild. Identical values must match
   identically, including through eligible graph/property filters and
   supported negation. Growing the vocabulary cannot remove earlier matches.
 - More than 50 qualifying expansion terms and different segment/partition
   layouts; prove complete results or an explicit overflow-to-scan path.
+  Include an exact term crowded out by fuzzy expansions and an early query
+  term exhausting the budget before a later term.
   Forced resource exhaustion must produce a typed error with no partial
-  successful result. Run a checked-in cost instrument to qualify bounded
-  memory, cancellation, and fallback work.
+  successful result, including one large token and automaton-construction
+  failure. Run a checked-in cost instrument to qualify admission, bounded
+  memory, cancellation, and shared scan/expansion fallback work.
 - Predicate/ranking composition: a fuzzy predicate must not change BM25's
   analyzed terms, scoring identity, or retrieval window, nor disappear when
   ranking is added. Score/order parity remains a separate retrieval gate.
@@ -548,9 +632,9 @@ accepted.
 2. How per-profile analyzer fingerprints map onto RFC 0043's artifact-level
    analyzer generations (one authority, one derived proof — the exact join
    is open).
-3. Whether `standard_v1` remains permanently on the substrate's simple
-   tokenizer or waits for a pinned ICU word-break profile, decided on
-   multilingual matched-set fixtures.
+3. Which additional multilingual/normalizing profiles are needed, decided
+   on matched-set fixtures. The initial `standard_v1` is fixed to `simple`;
+   switching it to ICU or adding normalization requires a new profile name.
 4. Which provider-qualified model identifiers are immutable enough for
    embedding-space identity, and whether mutable aliases need a revision
    suffix.
@@ -582,6 +666,12 @@ accepted.
   fuzzy ranking remains outside this predicate contract. Added the
   counterexamples that invalidate RFC 0047's former universal-failure claim
   and the qualification matrix required before implementation can complete.
+- 2026-09-08 — revalidated against checksum-matched Lance source and full
+  upstream guides. Made analyzer settings and Unicode limitations explicit,
+  disabled silent length filtering in the new profiles, and distinguished
+  public primitives from the new evaluator and resource protocol. Narrowed
+  ANN monotonicity to configured budgets and retained score/tie qualification
+  as separate implementation gates.
 
 ## Appendix: agent context (non-normative)
 
@@ -595,9 +685,10 @@ source variants and per-arm structures), projectable metric columns (typed
 metadata envelope (domains and coverage slot into the existing arrays), and
 the T26 scan-rooted-target rule (new retrievers inherit it).
 
-**Substrate dependencies and validated assumptions (Lance ≥ 11, crates.io
-pin — the pin and the GitHub tag have diverged before; validate against the
-pin).**
+**Substrate audit (Lance 11.0.0, exact crates.io pin).** Source links below
+use the archives' recorded commit, `ab6b5bbe46009ed78746b444df8db59a8bc5d842`;
+they do not substitute a release tag or latest branch for the lockfile.
+Later Lance versions require renewed qualification.
 
 - *Stemmer drift is real, measured:* the 10→11 stemmer replacement changed
   stems for identical parameters (e.g. common English words), silently
@@ -609,29 +700,59 @@ pin).**
   analyzer. Neither behavior makes the analyzer schema-authoritative.
   The Design section requires explicit analyzer binding and an exact scan
   baseline rather than relying on an empty artifact to survive every write.
+  See [the scanner implementations](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/io/exec/fts.rs#L1387).
+- *Analyzer construction is public:* `InvertedIndexParams::build` returns a
+  tokenizer without opening an index. Its defaults and filter order are
+  [defined in Rust](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/tokenizer.rs#L1013),
+  not by the inconsistent default table in the
+  [FTS format guide](https://lance.org/format/index/scalar/fts/).
+  The [tokenizer guide](https://lance.org/guide/tokenizer/) also documents
+  index-free inspection. Unicode and length behavior remain part of the
+  accepted profile; the query's resource limits are a separate contract.
 - *Fuzzy query path:* `tokenizer_for_match_query` uses bare tokenization for
   nonzero edit budgets, while `FlatMatchQueryExec` does not apply fuzzy
   expansion. `expand_fuzzy_tokens` caps expansions within each segment and
-  selects them lexically. These native paths are not qualified for the
-  exact lexical contract as pinned. Both analyzer and completeness behavior
-  need parity evidence before acceleration is enabled.
-- *Exact rescore exists and is family-agnostic:* the scanner's refine path
-  drops quantizer distances, recomputes exactly from raw vectors, and sorts
-  `(distance, rowid)`; `oversample` maps onto it plus probe budgets inside
-  the resolved profile. Partial coverage already merges indexed and flat
-  candidates before an exact finish.
+  selects them lexically, with no overflow indicator in its
+  [return type or loop](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/index/search.rs#L133).
+  Disabling a result limit does not disable this cap. Both analyzer and
+  completeness behavior need parity evidence before acceleration is enabled.
+- *Flat search is not the proposed evaluator:* the
+  [flat BM25 helper](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/index/flat_search.rs#L857)
+  counts exact terms, collects per-row counts, and returns empty success for
+  token-empty queries. `FlatMatchFilterExec` rejects nonzero fuzzy budgets.
+  Streaming Boolean evaluation and typed empty-query/resource errors are
+  new OmniGraph requirements, not existing Lance guarantees.
+- *Distance is compatible; resource handling is not supplied:* the pinned
+  [Levenshtein automaton](https://docs.rs/fst/0.4.7/fst/automaton/struct.Levenshtein.html)
+  uses Unicode scalar insertions, deletions, and substitutions. Its 10,000-
+  state default limit can still consume tens of megabytes during construction.
+  The public contract's `0..=2` range and explicit failure protocol are
+  OmniGraph choices, not a claim that Lance enforces those bounds.
+- *Exact rescore exists for retrieved candidates:* the
+  [scalar-vector scanner](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/dataset/scanner.rs#L5195)
+  can recompute raw-vector distances and sort `(distance, rowid)`; partial
+  coverage combines ANN and flat candidates. This cannot recover candidates
+  omitted by ANN or prove nested results when budgets change. Family-specific
+  qualification remains required; `knn` needs an exhaustive candidate path.
 - *Distance-compatibility enforcement is ours:* the substrate silently
   brute-forces (auto path) or errors (explicit path) on a mismatched caller
   metric — the capability probe must fail loudly before planning.
-- *Lexical ties:* the plain match path compares score alone and drops
-  equal-score boundary candidates by arrival order; the adapter's bounded
-  top-k on `(score desc, entity_id asc)` with over-fetch remains necessary
-  (compound paths tie-break on row id, which is not the logical entity id).
+- *Lexical ties:* the plain match path compares score alone and can discard
+  equal-score boundary candidates before OmniGraph sees them. Sorting an
+  over-fetched subset by entity ID cannot prove the declared final top-k;
+  every earlier cut must preserve the full boundary or use the required
+  comparator. See [the collector](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/io/exec/fts.rs#L310)
+  and RFC 0047's qualification gate. Native row IDs are not entity IDs.
 - *Fusion arm windows follow the query limit* in the current engine; tests
   constructing fused-score ties must build them limit-independently.
 - *BM25 constants* (`k1`, `b`, IDF) are pinned upstream implementation
-  facts; `bm25_v1` freezes them. A future upstream change requires a new
-  scorer version, not a fork.
+  facts in [the scorer](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/scorer.rs#L73).
+  They do not prove index-independent scores. Global indexed statistics
+  aggregate immutable segments, while the scalar String flat leg adds its
+  scanned rows to a base scorer; deletion/overlay masks do not themselves
+  recompute corpus statistics. Snapshot-visible corpus definition, query
+  term multiplicity, document-length treatment, and numeric parity must be
+  fixed before `bm25_v1` qualifies. Fuzzy membership supplies none of them.
 
 **Cross-RFC composition contracts.**
 

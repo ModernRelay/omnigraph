@@ -11,7 +11,8 @@ updated: 2026-09-08
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
-blocked_on: []
+blocked_on:
+  - "Complete boundary-tie handling at every native candidate cut, with bounded retention or explicit resource failure"
 ---
 
 # RFC 0047: Search plan truth: projectable ranking, deterministic order, and loud search failures
@@ -116,6 +117,14 @@ decide the cut. A search-ordered *aggregate* query applies its trailing keys
 and carries a warning that the rank itself cannot order grouped rows
 (previously the whole order clause was silently ignored).
 
+This guarantee requires complete boundary handling before every candidate
+cut, including native FTS collectors and fusion arms. Sorting a bounded
+over-fetched subset does not recover tied rows already discarded upstream.
+The implementation must either apply the full required comparator at the
+cut or preserve the complete boundary for later comparison. An unqualified
+native path must use a complete fallback within the query budget or fail
+explicitly. This requirement is not established by the retained prototype.
+
 **Response envelope (canonical `/query` and stored-query reads; additive).**
 
 ```json
@@ -168,11 +177,16 @@ maintenance surface is added.
 - **Fusion.** The fused score is materialized as a real column on the fused
   rows before projection; winner selection is deterministic (score, then
   entity id) and retains the boundary tie plateau; ordering then applies
-  score, trailing keys, and id tie-breaks over fanout rows.
+  score, trailing keys, and id tie-breaks over fanout rows. A tie plateau can
+  span the entire candidate population; retention must stay within explicit
+  memory/work budgets, with spill or a typed failure if necessary. Its width
+  is not itself a fixed resource bound.
 - **Coverage.** Ready/pending counts reuse the scan's own structured
   predicate through a sealed, streaming count on the storage boundary — no
   SQL strings, no retained batches, computed only for `@embed`-backed vector
-  retrievals.
+  retrievals. Streaming bounds retained batches, not rows examined: exact
+  coverage may still scan the whole prefiltered population and must be
+  charged to the query's work budget.
 
 ## Invariants
 
@@ -189,9 +203,11 @@ maintenance surface is added.
   analysis and exact evaluation across index states. This RFC's notices are
   transitional visibility, not an exception to the invariant. Recall
   reporting is contractual, not plan-derived.
-- **Bounded, observable resource use (11):** coverage counts stream; the
-  bounded-bm25 retry and fusion candidate handling keep their existing
-  bounds; the boundary-tie extension is bounded by the tie plateau width.
+- **Bounded, observable resource use (11):** coverage counts stream; retries,
+  complete tie handling, and exact coverage share explicit query budgets.
+  Streaming and finite tie plateaus alone do not prove bounded work or a
+  bounded memory footprint. Their qualification remains an implementation
+  requirement.
 - Deny-list: no side channel for discarded rank remains; no new endpoint; no
   string-built predicates (coverage uses structured expressions); no
   logical precondition on index coverage is introduced.
@@ -229,8 +245,8 @@ maintenance surface is added.
   projection an observation of the executed retrieval.
 - **Trailing keys before fusion winner selection at entity level** —
   rejected as ill-defined (trailing keys order fanout rows, not entities);
-  retaining the boundary tie plateau achieves the stated semantics with a
-  bounded extension.
+  retaining the complete boundary tie plateau lets fanout rows determine
+  the cut, subject to the explicit resource policy above.
 - **A separate search/rank response endpoint** — rejected: one GQ surface,
   additive metadata on the existing envelope.
 - **Doing nothing** — the two bug classes continue to produce confident
@@ -261,6 +277,14 @@ one capitalized query at one edit budget. The counterexamples in
 [RFC 0048's evidence](0048-search-contracts.md#evidence-and-tests) disprove
 the universal-failure premise. That RFC owns the matching and index-lifecycle
 qualification required for the replacement.
+
+Revalidation against the pinned Lance source also leaves a separate
+determinism gate: its plain FTS collector can drop equal-score boundary rows
+before engine sorting. Extend `search.rs` with more tied rows than the native
+candidate budget, reversed entity-ID/secondary-key order, and different
+fragment/segment layouts. Verify complete winners and explicit resource
+failure, not just sorted returned rows. Coverage cost needs an instrument
+that measures rows examined as well as retained memory.
 
 ## Rollout
 
@@ -313,6 +337,9 @@ in this rollout.
   disproved universal fuzzy failure. RFC 0048 now owns a breaking lexical
   replacement with explicit edit distance and exact scan/index parity;
   warnings in this RFC do not claim to repair the existing analyzer cliff.
+- 2026-09-08 — substrate revalidation made complete native tie handling an
+  explicit gate; removed claims that post-sorting, finite tie width, or
+  streaming counts alone prove the required result and resource bounds.
 
 ## Appendix: agent context (non-normative)
 
@@ -339,8 +366,10 @@ the pin, not the GitHub tag; the two diverge).**
   warning detects per-column via `TableStore::has_fts_index_on`.
 - The plain Match FTS path still compares score alone and leaf merges drop
   equal-score boundary candidates by arrival order; the adapter's own
-  `.id`-column tie-breaks (every binding's id, name-sorted) are what make
-  ranked output total. Do not assume Lance's compound-path
+  `.id`-column tie-breaks make the returned subset total, but cannot establish
+  that the subset contains the correct boundary winners. See the
+  [pinned collector](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/io/exec/fts.rs#L310).
+  Do not assume Lance's compound-path
   `(score, row_id)` ordering applies — row id is not the logical entity id.
 - RFC 0043's fail-closed FTS certification is orthogonal: it gates
   *uncertified indexes*; this RFC's warning covers *absent* indexes. Both
