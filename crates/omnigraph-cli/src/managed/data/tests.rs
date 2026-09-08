@@ -438,95 +438,103 @@ impl Store for NoCredentialAccess {
 
 #[test]
 fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
-    let dir = tempfile::tempdir().unwrap();
-    super::super::save_context(dir.path(), &context()).unwrap();
-    // An unreadable-as-context object makes an accidental context read fail;
-    // the ambient callback and store also fail if either is consulted.
-    std::fs::remove_file(dir.path().join(".omnigraph/context")).unwrap();
-    std::fs::create_dir(dir.path().join(".omnigraph/context")).unwrap();
-    for args in [
-        vec!["query", "q", "--server", "legacy"],
-        vec!["read", "q", "--profile", "legacy"],
-        vec!["mutate", "--store", "file:///scratch", "-e", "source"],
-        vec!["change", "m", "--cluster", "local"],
-        vec!["query", "q", "--direct"],
-        vec!["init", "--schema", "schema.pg", "file:///scratch"],
-        vec![
-            "load",
-            "--data",
-            "data.jsonl",
-            "--mode",
-            "append",
-            "--direct",
-        ],
-        vec![
-            "load",
-            "--data",
-            "data.jsonl",
-            "--mode",
-            "append",
-            "file:///scratch",
-        ],
-        vec![
-            "load",
-            "--data",
-            "data.jsonl",
-            "--mode",
-            "append",
-            "--store",
-            "file:///scratch",
-        ],
-        vec![
-            "load",
-            "--data",
-            "data.jsonl",
-            "--mode",
-            "append",
-            "--profile",
-            "legacy",
-        ],
-        vec![
-            "load",
-            "--data",
-            "data.jsonl",
-            "--mode",
-            "append",
-            "--server",
-            "legacy",
-        ],
-        vec!["schema", "plan", "--schema", "schema.pg"],
-        vec!["commit", "list", "file:///scratch"],
-        vec!["commit", "list", "--direct"],
-        vec!["commit", "list", "--server", "legacy"],
-        vec!["commit", "list", "--profile", "legacy"],
-        vec!["commit", "show", "commit-a", "--uri", "file:///scratch"],
-        vec!["commit", "show", "commit-a", "--store", "file:///scratch"],
-        vec!["commit", "changes", "commit-a"],
-        vec!["graphs", "list"],
-        vec!["alias", "people"],
-        vec!["queries", "list"],
-        vec!["queries", "validate"],
-        vec!["lint", "--schema", "schema.pg", "--query", "q.gq"],
-        vec!["snapshot"],
-        vec!["branch", "list"],
-        vec!["cluster", "status"],
-    ] {
-        let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
-        assert!(
-            resolve(&cli, dir.path(), &NoCredentialAccess, || {
-                panic!("bypassed command read operator routing")
-            })
-            .unwrap()
-            .is_none()
-        );
+    for malformed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::save_context(dir.path(), &context()).unwrap();
+        // An unreadable-as-context object makes an accidental context read fail;
+        // the ambient callback and store also fail if either is consulted.
+        if malformed {
+            std::fs::remove_file(dir.path().join(".omnigraph/context")).unwrap();
+            std::fs::create_dir(dir.path().join(".omnigraph/context")).unwrap();
+        }
+        for args in [
+            vec!["query", "q", "--server", "legacy"],
+            vec!["read", "q", "--profile", "legacy"],
+            vec!["mutate", "--store", "file:///scratch", "-e", "source"],
+            vec!["change", "m", "--cluster", "local"],
+            vec!["query", "q", "--direct"],
+            vec!["init", "--schema", "schema.pg", "file:///scratch"],
+            vec!["load", "--data", "data.jsonl", "--mode", "append"],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--direct",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "file:///scratch",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--store",
+                "file:///scratch",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--profile",
+                "legacy",
+            ],
+            vec![
+                "load",
+                "--data",
+                "data.jsonl",
+                "--mode",
+                "append",
+                "--server",
+                "legacy",
+            ],
+            vec!["schema", "plan", "--schema", "schema.pg"],
+            vec!["commit", "list", "file:///scratch"],
+            vec!["commit", "list"],
+            vec!["commit", "show", "commit-a"],
+            vec!["commit", "list", "--direct"],
+            vec!["commit", "list", "--server", "legacy"],
+            vec!["commit", "list", "--profile", "legacy"],
+            vec!["commit", "show", "commit-a", "--uri", "file:///scratch"],
+            vec!["commit", "show", "commit-a", "--store", "file:///scratch"],
+            vec!["commit", "changes", "commit-a"],
+            vec!["graphs", "list"],
+            vec!["alias", "people"],
+            vec!["queries", "list"],
+            vec!["queries", "validate"],
+            vec!["lint", "--schema", "schema.pg", "--query", "q.gq"],
+            vec!["snapshot"],
+            vec!["branch", "list"],
+            vec!["cluster", "status"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
+            assert!(
+                resolve(&cli, dir.path(), &NoCredentialAccess, || {
+                    panic!("bypassed command read operator routing")
+                })
+                .unwrap()
+                .is_none()
+            );
+        }
     }
 }
 
 #[tokio::test]
-async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fallback() {
-    let dir = tempfile::tempdir().unwrap();
+async fn managed_commit_transport_uses_cached_read_authority() {
+    // Transport preparation only: this fixture supplies `read` manually and
+    // uses the cached endpoint. It does not qualify CLI action mapping or
+    // equality against an independently selected endpoint.
     let context = context();
-    super::super::save_context(dir.path(), &context).unwrap();
     let store = MemoryStore::default();
     let commit = json!({
         "graph_commit_id":"commit-a", "graph_branch":null,
@@ -538,22 +546,9 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
         IntentReply::json(200, commit.clone()),
     ]);
-    for command in [vec!["commit", "list"], vec!["commit", "show", "commit-a"]] {
-        let cli = Cli::try_parse_from(
-            ["omnigraph", "--graph", "knowledge"]
-                .into_iter()
-                .chain(command.clone()),
-        )
-        .unwrap();
+    for operation in ["list", "show"] {
         assert_eq!(
-            resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
-                .err()
-                .unwrap()
-                .body["type"],
-            "managed_target_ambiguous"
-        );
-        assert_eq!(
-            resolve(&cli, dir.path(), &store, || Ok(false))
+            load(&store, &context, "knowledge", &["read"])
                 .err()
                 .unwrap()
                 .body["type"],
@@ -563,7 +558,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         cached.grants[0].actions = vec!["change".into()];
         save(&store, &context, &cached);
         assert_eq!(
-            resolve(&cli, dir.path(), &store, || Ok(false))
+            load(&store, &context, "knowledge", &["read"])
                 .err()
                 .unwrap()
                 .body["type"],
@@ -571,10 +566,8 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         );
         cached.grants[0].actions = vec!["read".into()];
         save(&store, &context, &cached);
-        let client = resolve(&cli, dir.path(), &store, || Ok(false))
-            .unwrap()
-            .unwrap();
-        if command[1] == "list" {
+        let client = load(&store, &context, "knowledge", &["read"]).unwrap();
+        if operation == "list" {
             let output = client.list_commits(Some("main")).await.unwrap();
             assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
         } else {
@@ -582,14 +575,6 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
             assert_eq!(serde_json::to_value(output).unwrap(), commit);
         }
         clear(&store, &context).unwrap();
-        let no_graph = Cli::try_parse_from(std::iter::once("omnigraph").chain(command)).unwrap();
-        assert_eq!(
-            resolve(&no_graph, dir.path(), &NoCredentialAccess, || Ok(false))
-                .err()
-                .unwrap()
-                .body["type"],
-            "graph_required"
-        );
     }
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
@@ -608,35 +593,17 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
 }
 
 #[test]
-fn managed_load_requires_exact_graph_change_and_explicit_fork_authority() {
-    let dir = tempfile::tempdir().unwrap();
+fn managed_load_credential_helper_checks_explicit_graph_and_actions() {
+    // The caller supplies required actions; this does not qualify CLI action
+    // mapping or equality against an independently selected endpoint.
     let context = context();
-    super::super::save_context(dir.path(), &context).unwrap();
     let store = MemoryStore::default();
-    let args = [
-        "omnigraph",
-        "load",
-        "--data",
-        "batch.jsonl",
-        "--mode",
-        "append",
-        "--graph",
-        "knowledge",
-    ];
-    let cli = Cli::try_parse_from(args).unwrap();
     assert_eq!(
-        resolve(&cli, dir.path(), &store, || Ok(false))
+        load(&store, &context, "knowledge", &["change"])
             .err()
             .unwrap()
             .body["type"],
         "data_credential_required"
-    );
-    assert_eq!(
-        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
-            .err()
-            .unwrap()
-            .body["type"],
-        "managed_target_ambiguous"
     );
     for (actions, graph, from, allowed) in [
         (vec!["read"], "knowledge", false, false),
@@ -650,46 +617,18 @@ fn managed_load_requires_exact_graph_change_and_explicit_fork_authority() {
         cached.grants[0].graph_id = graph.into();
         cached.grants[0].actions = actions.into_iter().map(str::to_string).collect();
         save(&store, &context, &cached);
-        let extra = if from {
-            vec!["--branch", "review", "--from", "main"]
+        let required = if from {
+            vec!["change", "branch_create"]
         } else {
-            vec![]
+            vec!["change"]
         };
-        let cli = Cli::try_parse_from(args.into_iter().chain(extra)).unwrap();
-        let result = resolve(&cli, dir.path(), &store, || Ok(false));
+        let result = load(&store, &context, "knowledge", &required);
         if allowed {
-            assert!(result.unwrap().is_some());
+            assert!(result.is_ok());
         } else {
             assert_eq!(result.err().unwrap().body["type"], "data_scope_missing");
         }
     }
-    let cli = Cli::try_parse_from(args.into_iter().chain(["--as", "fake"])).unwrap();
-    assert_eq!(
-        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(false))
-            .err()
-            .unwrap()
-            .body["type"],
-        "managed_scope_conflict"
-    );
-    let child = dir.path().join("child");
-    std::fs::create_dir(&child).unwrap();
-    assert!(
-        resolve(&cli, &child, &NoCredentialAccess, || panic!(
-            "parent context was read"
-        ))
-        .unwrap()
-        .is_none()
-    );
-    std::fs::write(dir.path().join(".omnigraph/context"), "invalid").unwrap();
-    assert_eq!(
-        resolve(&cli, dir.path(), &NoCredentialAccess, || panic!(
-            "invalid context consulted defaults"
-        ))
-        .err()
-        .unwrap()
-        .body["type"],
-        "context_invalid"
-    );
 }
 
 #[test]
@@ -842,10 +781,11 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
 }
 
 #[tokio::test]
-async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
+async fn managed_load_transport_sends_exact_ndjson_and_preserves_the_server_receipt() {
+    // Transport preparation with manually supplied actions and a cached
+    // endpoint; no managed CLI routing or selected-endpoint equality is implied.
     let dir = tempfile::tempdir().unwrap();
     let context = context();
-    super::super::save_context(dir.path(), &context).unwrap();
     let batch = dir.path().join("batch.jsonl");
     let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
     std::fs::write(&batch, ndjson).unwrap();
@@ -861,24 +801,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let mut cached = credential(&context, &server.origin);
     cached.grants[0].actions = vec!["change".into(), "branch_create".into()];
     save(&store, &context, &cached);
-    let cli = Cli::try_parse_from([
-        "omnigraph",
-        "load",
-        "--data",
-        batch.to_str().unwrap(),
-        "--graph",
-        "knowledge",
-        "--mode",
-        "append",
-        "--branch",
-        "review",
-        "--from",
-        "main",
-    ])
-    .unwrap();
-    let client = resolve(&cli, dir.path(), &store, || Ok(false))
-        .unwrap()
-        .unwrap();
+    let client = load(&store, &context, "knowledge", &["change", "branch_create"]).unwrap();
     let result = client
         .load(
             "review",
