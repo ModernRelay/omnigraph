@@ -3377,15 +3377,9 @@ async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], whe
     }
 }
 
-/// the PHYSICAL-CHANNEL ORACLE (third audit channel): for every
-/// branch, the stored-row dump (`export_jsonl`, NO query machinery) must equal
-/// the model's PHYSICAL expectation — persons exactly, Knows = every row ∪
-/// ghost self-loops, duplicates kept (the multiset's only count oracle). The
-/// claim, query, and physical channels are three
-/// independent reads of one store; any pairwise disagreement outside the
-/// modeled ghost delta is a bug (claim-vs-query found #474; query-vs-physical is
-/// the ghost-row detector by construction; claim-vs-physical catches silent lost
-/// writes on paths the query channel never touches).
+/// PHYSICAL-CHANNEL ORACLE (third audit channel, the one that counts rows): per
+/// branch, `export_jsonl` (no query machinery) must equal the model's physical
+/// expectation — persons exactly, Knows = every row ∪ ghosts, duplicates kept.
 async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
     for branch in world.branch_names() {
         let (persons, knows) = Box::pin(physical_view_on(db, &branch)).await;

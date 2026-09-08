@@ -385,16 +385,17 @@ Owners to extend, per the testing map:
   from "tracked separately" to naming this RFC as the resolution.
 - `omnigraph-dst`: the model's H-A born-on-both carve-out retires, since
   unkeyed keep-both is documented contract rather than an illegal state.
-  The model's edge reads are visited-gated membership, so the set
-  representation (`Model.edges` as `BTreeSet<(String, String)>`) predicts
-  the merged MEMBERSHIP correctly for keyed and unkeyed types alike;
-  physical row counts, which membership cannot see, are pinned by the
-  targeted scenarios: `dst_merge_duplicates_born_on_both_edge`
-  (reclassified from bug pin to multiset-contract pin, still asserting two
-  physical rows) and its keyed twin
-  `dst_keyed_born_on_both_edge_converges` (one row). Count-level fleet
-  modeling for unkeyed edges (a multiset `Model.edges`) is deliberately
-  out of scope.
+  The model keys `Knows` rows the way the engine's merge walk does, by a
+  per-row id minted at insert and copied by a fork (`Model.edges` as
+  `BTreeMap<EdgeRowId, (String, String)>`, decision log 2026-09-08): a
+  set of pairs predicted membership for every sampled shape until the
+  delete-vs-readd fork (seed 221206, #681), where one side deletes every
+  row of a pair the other side re-adds as a fresh row and the set sees an
+  unchanged side. Physical row counts are observed by the export channel
+  at the final reopen and pinned by the targeted scenarios
+  `dst_merge_duplicates_born_on_both_edge` (reclassified from bug pin to
+  multiset-contract pin, still asserting two physical rows) and its keyed
+  twin `dst_keyed_born_on_both_edge_converges` (one row).
 - The `ir_version` acceptance and refusal owner is the compiler's schema-IR
   validation tests beside `validate_schema_ir` (`schema_ir.rs`); the CLI
   cross-version harness
@@ -463,3 +464,11 @@ unresolved question 1 tracks it.
   refused before recovery and never reinterpreted; `lifecycle.rs` pins
   that refusal. A shared number would reinterpret those graphs as keyed
   schemas. The number is still fixed here, not at implementation time.
+- 2026-09-08, from the DST model fix for
+  [#681](https://github.com/ModernRelay/omnigraph/issues/681): the
+  nightly's seed-221206 delete-vs-readd fork falsified "the set
+  representation predicts the merged MEMBERSHIP correctly for keyed and
+  unkeyed types alike", and the "deliberately out of scope" multiset
+  `Model.edges` is now the model: rows keyed by a minted id, the engine's
+  own key, with the export channel comparing row counts at the final
+  reopen. This supersedes both sentences in Evidence, `omnigraph-dst`.
