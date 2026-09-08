@@ -7,14 +7,15 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-03
-discussion: "https://github.com/ModernRelay/omnigraph/pull/595"
+updated: 2026-09-08
+discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
 blocked_on:
   - "RFC 0047 (search plan truth) acceptance — this RFC builds on its metric columns, retrieval IR, and response metadata"
   - "SchemaIR version-assignment decision shared with RFCs 0040 and 0044 (facets vs. one linear scalar)"
   - "Mapping between this RFC's per-profile analyzer fingerprints and RFC 0043's artifact-level analyzer generations"
+  - "Schema-authoritative analyzer binding for index-free lexical evaluation and exact matcher qualification against the pinned Lance surfaces"
   - "A checked-in relevance-judgment corpus for the NDCG/MRR/Recall baseline"
   - "Recall/latency evaluation naming a bounded ann_default_v1 profile per index family"
 ---
@@ -28,9 +29,9 @@ Search becomes three separate, composable contracts:
 1. **Exact value predicates** — `=`, `starts_with`, String `contains`:
    case-sensitive, never analyzed, on any field.
 2. **Analyzed lexical membership** — `match_terms(field, query [, mode:
-   all|any])`, legal only on fields that declare analyzed semantics;
-   `mode: all` is the default, so adding a term can only narrow a factual
-   filter.
+   all|any] [, max_edits: 0|1|2])`, legal only on fields that declare analyzed
+   semantics. Defaults are `mode: all` and `max_edits: 0`; edit tolerance is
+   explicit and membership remains exact under every index state.
 3. **Ranked retrieval** — `bm25` (lexical, any-term, positive score), exact
    `knn`, approximate `ann` (with one typed, family-agnostic recall dial,
    `oversample: N`), fused by N-arm weighted
@@ -56,18 +57,20 @@ crossed by the existing export/init/load rebuild (no in-place migration), with
 a reviewable offline schema rewrite that makes today's implicit intent
 explicit.
 
-The ambiguous surfaces retire: `search`/`match_text` get one deprecation
-release as `match_terms(..., mode: any)`; `nearest` becomes an alias of
+The lexical surface changes once: `fuzzy`, `search`, and `match_text` are
+removed when `match_terms` ships, without compatibility aliases or a
+deprecation window. Callers choose term combination and edit tolerance
+explicitly when rewriting queries. Separately, `nearest` becomes an alias of
 `ann`; positional `rrf(a, b, k)` is rejected with a diagnostic requiring
 explicit per-arm candidate windows (no defensible implicit window exists).
 Projected metrics gain typed domains (`Score` vs `Distance`) that refuse
 cross-domain arithmetic and raw-score thresholds.
 
-Boundaries that do not change: BM25 math stays pinned to the substrate's
-`k1=1.2`, `b=0.75`, IDF formula; one `/query` surface (no search endpoint);
-lexical membership, BM25 scores, and `knn` results stay identical across
-every physical index state; graph publication, branches, and recovery are
-untouched.
+BM25 math stays pinned to the substrate's `k1=1.2`, `b=0.75`, and IDF formula.
+Lexical membership (including edit-tolerant matching), BM25 scores, and
+`knn` results must be identical across every physical index state. The
+single `/query` surface, graph publication, branches, and recovery remain
+unchanged.
 
 ## Motivation
 
@@ -82,6 +85,12 @@ semantics:
   sets for identical parameters, proving resolved parameters alone
   under-specify behavior; RFC 0043 closed that at the artifact level, and
   this RFC gives the same identity a schema home.
+- **Fuzzy matching works inconsistently.** Indexed `beto` can match `beta`,
+  while an identical unindexed row is missed. Conversely, `running` can
+  match an unindexed row and disappear after indexing because the index
+  stores `run`. Nonzero-distance indexed queries bypass the normal analyzer,
+  and the flat fallback does not perform fuzzy expansion. Replacing the
+  spelling alone, or lowercasing only the query, cannot fix both defects.
 - **Recall is not in the contract.** `nearest` does not say whether
   approximate recall is permitted; vector geometry is a hard-coded engine
   constant (L2) rather than a declaration; a caller cannot ask for exact
@@ -91,8 +100,8 @@ semantics:
   exact predicates; factual filters want all-term analyzed membership;
   candidate retrieval wants any-term ranking; fusion wants explicit windows
   and weights. One overloaded function cannot mean all four; the current
-  names (`search`, `match_text`, `fuzzy`, `nearest`) each conflate at least
-  two.
+  names (`search`, `match_text`, `fuzzy`, `nearest`) obscure those
+  distinctions.
 - **Fusion is under-specified.** Two unweighted arms, a caller-overridable
   constant, and arm depths inherited implicitly from the final limit make
   recall and cost unreviewable; every serious system converged on explicit
@@ -120,10 +129,52 @@ Initial immutable analyzer profiles: `standard_v1` (lowercase, no stemming —
 the safe default, immune to stemmer drift), `standard_folded_v1` (adds ASCII
 folding), `english_v1` (adds English stemming and stop words, matching
 today's substrate defaults). Adding a profile or scorer version requires an
-RFC; none is ever mutated. Query-time analyzer, scorer, or distance overrides
-do not exist.
+RFC; none is ever mutated. Query-time analyzer, scorer, or vector-distance
+overrides do not exist.
+
+For spelling tolerance on names and titles, the non-stemming profiles keep
+edit distance close to the spelling the user supplied. Under `english_v1`,
+distance is measured after stemming; a one-character typo in the original
+word need not remain one edit after analysis. The field's declared profile
+decides this for every query and execution path.
+
+**Lexical membership.** `match_terms` is a Boolean predicate on a scalar
+String property with `@analyzed`. It introduces no score, ranking, candidate
+window, or implicit retrieval. Its contract is:
+
+| Aspect | Rule |
+|---|---|
+| Analysis | Apply the same resolved field analyzer to document and query text, at every edit budget including zero. |
+| Distance | Minimum insertions, deletions, and substitutions over analyzed Unicode scalar values; each costs one. An adjacent transposition costs two. There is no implicit prefix restriction or length-based automatic tolerance. |
+| `max_edits` | Optional integer literal or query parameter in `0..=2`, default `0`. Check literals at compile time and bound parameters before execution; reject negative, oversized, and non-integer values without narrowing casts. |
+| `mode` | `all` by default: every analyzed query term has a document term within the budget. `any`: at least one does. |
+| Term identity | Repeated query terms do not require repeated occurrences; a document term can satisfy multiple query terms. Matching is neither phrase matching nor distance over the whole field value. |
+| Empty text | A query yielding no searchable terms is a typed error. A null or token-empty document does not match. |
+| Completeness | Every successful result satisfies the predicate exactly; an edit-tolerant predicate does not advertise approximate recall. |
+
+For a fixed schema, query, and document population, these are normative laws:
+
+```text
+matches(edits=0) ⊆ matches(edits=1) ⊆ matches(edits=2)
+matches(indexed) = matches(unindexed) = matches(partially indexed)
+```
+
+Adding an analyzed query term cannot widen `mode: all`. Appending unrelated
+documents cannot remove existing predicate matches. A resource failure is a
+typed query failure, not an empty or truncated successful matched set.
 
 **Queries.**
+
+```gq
+query organization_names($q: String) {
+  match {
+    $o: Organization
+    match_terms($o.name, $q, mode: all, max_edits: 1)
+  }
+  return { $o.slug, $o.name }
+  order { $o.slug asc }
+}
+```
 
 ```gq
 query hybrid($q: String) {
@@ -144,8 +195,8 @@ query hybrid($q: String) {
 }
 ```
 
-- Named arguments (`mode:`, `candidates:`, `weight:`, `k:`, `oversample:`)
-  are one grammar convention shared by all future operations.
+- Named arguments (`mode:`, `max_edits:`, `candidates:`, `weight:`, `k:`,
+  `oversample:`) are one grammar convention shared by all future operations.
 - A String query argument to `knn`/`ann` is legal only when the field's
   `@embed` records a model and the resolved query embedder matches it
   exactly; a raw Vector argument is an explicit same-space assertion.
@@ -161,17 +212,40 @@ query hybrid($q: String) {
   mechanism) is reported per source; pending rows are missing data, never an
   approximation.
 
+**Ranking remains explicit.** `max_edits` belongs to lexical membership in
+this RFC; `bm25` continues to score exact analyzed query terms and accepts
+no edit-distance argument. An edit-tolerant predicate does not rewrite a
+neighboring retriever. For example, filtering with
+`match_terms($d.body, "beto", max_edits: 1)` may admit a `beta` document that
+`bm25($d.body, "beto")` then excludes under its any-term, positive-score
+contract. Ordinary ordering and vector retrieval can rank the qualifying
+population. A future fuzzy lexical retriever must explicitly define
+expansion deduplication, score contributions, corpus statistics, and
+index-state score/order parity before it joins the retrieval algebra.
+
 **Errors, loudly** (never empty success): a text function on a field without
 `@analyzed`; `bm25` on a field without a BM25-family scorer; analysis
-yielding zero searchable terms; a String vector query against an absent or
+yielding zero searchable terms; an invalid edit budget; exhausted lexical
+execution resources; a String vector query against an absent or
 mismatched embedding model; invalid fusion arms/windows/weights; an
 `oversample` outside profile bounds; a distance-incompatible ANN artifact.
 
-**Deprecation timeline.** One release of stable warnings
-(`search`/`match_text` → `match_terms(..., mode: any)`; `nearest` → `ann`),
-then removal in an advertised breaking release. Positional `rrf(a, b, k)` is
-rejected at that boundary — the compiler never guesses a recall/cost policy
-to preserve syntax.
+**Lexical cutover.** The first release of this contract removes `fuzzy`,
+`search`, and `match_text` together. There is no transitional alias,
+deprecation warning period, or preserved legacy default. Removed spellings
+produce a compile diagnostic pointing to `match_terms` and its named
+arguments; lint and stored-query validation use the same rule. Callers
+rewrite application and stored-query sources, selecting `mode` and
+`max_edits` deliberately. This is an intentional pre-stable breaking change,
+including for queries that previously returned useful results. Fixtures and
+user documentation change with the implementation; removed IR variants are
+not retained as a second execution path.
+
+**Other query changes.** `nearest` gets one release of warnings as an alias
+of `ann`, then removal in an advertised breaking release. Positional
+`rrf(a, b, k)` is rejected at the format boundary — the compiler never
+guesses a recall/cost policy to preserve syntax. These retrieval changes do
+not delay or add aliases to the lexical cutover.
 
 **Operators** cross the format boundary once, via the existing
 export/init/load rebuild: the offline rewrite maps every free String
@@ -201,9 +275,10 @@ certified-rebuild pattern RFC 0043 established.
    with typed domains): `Score<bm25_v1>`, `Distance<l2|cosine|dot>`,
    `Score<rrf_v1>` refuse cross-domain arithmetic, aggregates, and raw
    threshold predicates; fusion consumes ranks, not floats.
-5. Physical state cannot weaken an exact contract: lexical membership, BM25,
-   and `knn` are index-independent; only `ann` advertises approximation, and
-   artifact absence improves it to exact.
+5. Physical state cannot weaken an exact contract: lexical membership,
+   including nonzero edit tolerance, BM25, and `knn` are index-independent;
+   only `ann` advertises approximation, and artifact absence improves it to
+   exact. Expansion work limits cannot become predicate membership limits.
 6. Defaults are immutable contracts: profiles, directions, tie rules,
    `rrf_v1`'s bounds (2–16 arms, `candidates ≤ 10000`, `k` default 60)
    change only under a new versioned name.
@@ -213,15 +288,17 @@ certified-rebuild pattern RFC 0043 established.
    capability probe derived from observable substrate state; missing facts
    cause safe fallback or loud failure, never a heuristic semantic downgrade.
 9. Recall dials are typed, family-agnostic, and monotone (`oversample`
-   only).
+   only). `max_edits` changes logical membership; it is not a recall dial.
 10. Profile identity includes substrate behavior identity; a substrate
     change that alters analysis requires reindex-or-parity evidence.
 
 **Extension model.** A new retriever is a `RetrievalIR` source variant that
 participates in fusion through the shared arm production; a new fusion
 method consumes the same ranked-stream shape; a reranker is a
-stream-to-stream stage. New behavior never arrives as a mode flag on an
-unrelated function.
+stream-to-stream stage. `max_edits` changes the term-matching relation inside
+the lexical predicate, not its role. It does not add a retrieval source or
+alter BM25. New behavior never arrives as a mode flag on an unrelated
+function.
 
 **Accepted SchemaIR** gains logical search semantics only — never physical
 index state: resolved analyzer/scorer profiles with substrate identity in
@@ -231,10 +308,64 @@ FTS artifacts are checked against the accepted fingerprint (composing with
 RFC 0043's artifact certificates, which remain the physical proof); vector
 artifacts are checked against the accepted distance and space.
 
-**Analyzer parity without index coupling.** Accepting `@analyzed` eagerly
-materializes an empty FTS index carrying the resolved analyzer, so the flat
-path can never fall back to a substrate default tokenizer; index *coverage*
-remains derived state that lags without changing meaning.
+**One typed lexical predicate.** Lower `match_terms` into one representation
+containing the rename-stable field identity, accepted analyzer fingerprint,
+query expression, term-combination mode, and checked edit-budget expression.
+Resolve query parameters and analyze the query once per execution against
+the accepted snapshot; reuse that resolved token representation across scan
+and indexed paths. Parameterized compiled plans remain reusable. Plan and
+execution fingerprints include the matching semantics rather than inferring
+them from the presence of an FTS index. Removed lexical spellings have no IR
+variants, runtime compatibility branches, or separate matcher implementations.
+
+**Analyzer parity without index coupling.** Instantiate the analyzer from
+accepted SchemaIR, even when no FTS artifact exists. Eager empty indexes are
+not the analyzer carrier: overwrite, index removal, or an incomplete rebuild
+must not erase logical semantics. Use the pinned substrate tokenizer
+implementation through one analyzer binding; do not reimplement its filters
+or pre-normalize a string only to analyze it again through another path.
+Creating or changing an analyzer profile continues to require the existing
+schema publication and compatibility protocol; ordinary content writes do
+not build indexes inline.
+
+**Exact scan baseline.** Evaluate the typed predicate over streamed document
+tokens using that analyzer and the declared edit relation. Build bounded
+query matching state once; honor cancellation and the query's execution
+budgets while processing batches. This path is the correctness oracle and
+remains available with full, partial, or absent index coverage. It composes
+with typed graph/property filters before ranking and with the existing
+target-validation rules. Unsupported placement must fail validation rather
+than lose the predicate.
+
+**Qualified index acceleration.** Lance continues to own dictionaries,
+postings, and physical index state. A native path is eligible only when its
+artifact passes RFC 0043's proof checks against the accepted profile and its
+matching behavior is qualified for the requested mode and edit budget.
+Covered rows use complete term expansion and posting evaluation; uncovered
+or rewritten rows use the same exact predicate on their accepted values.
+Combine them at one snapshot with the existing visibility and row-identity
+rules. Final limits and retrieval arm windows cannot change which terms or
+rows satisfy the predicate; ordinary early termination is allowed when the
+query plan proves the requested result complete. Post-verifying a truncated
+candidate set cannot repair omitted matches.
+
+An indexed expansion must distinguish **complete** from **overflow**. The
+current substrate's lexical prefix of 50 expansions is not an exact
+membership contract, and increasing that cap is not a completeness proof.
+When complete acceleration cannot be established, use the exact scan within
+the remaining query budget. If that budget is exhausted, fail the whole
+query with a typed resource outcome; do not return partial success. Bound
+token/automaton construction, memory, and execution work without silently
+discarding analyzed terms or increasing budgets on fallback. This introduces
+no query-level `max_expansions` knob or separate approximate predicate.
+
+The pinned Lance fuzzy scanner does not yet satisfy these requirements.
+Until an upstream implementation and adapter pass the qualification matrix,
+use the exact baseline for the affected shapes even when an index exists.
+Keep native matching changes upstream where possible; do not build a second
+index subsystem or a persistent shadow vocabulary in OmniGraph. BM25's
+separate analyzer and corpus-statistics parity gate remains required; a
+membership matcher alone does not qualify ranked scores.
 
 ## Invariants
 
@@ -260,9 +391,12 @@ source; certificates are derived proof).
   accepted semantics).
 - **Wire:** additive only — the RFC 0047 metadata gains domain identifiers;
   request shapes are unchanged.
-- **Query language:** staged deprecations as above; scripts and stored
-  queries surface every deprecated spelling via lint and registry validation
-  before grammar removal.
+- **Query language:** one breaking lexical replacement, with no aliases for
+  `fuzzy`, `search`, or `match_text`. Rewritten application and stored queries
+  must validate against the new schema and compiler before they are used.
+  Matching corrections and the new all-term/zero-edit defaults are observable
+  changes, not equivalence claims about the old functions. The separate
+  `nearest` deprecation follows the timeline above.
 - **Reversibility:** grammar and annotations are reversible before 1.0, but
   profile parameters, distance formulas, and exact/approximate meanings are
   deliberate near-permanent commitments — versioned names and fully resolved
@@ -272,9 +406,8 @@ source; certificates are derived proof).
 
 ## Alternatives
 
-Each rejected alternative has a documented failure mode in a surveyed
-production system (fourteen systems surveyed; citations in the evidence
-record):
+The alternatives draw on the comparative survey and the pinned-substrate
+counterexamples recorded below:
 
 - **Let index presence decide recall** — produces silent result changes when
   an index appears (the documented pgvector/dynamic-index bug class).
@@ -283,7 +416,22 @@ record):
   query-time analysis config documents the drift footgun and steers users
   back to schema.
 - **A single overloaded search function with option flags** — reproduces the
-  ambiguity this RFC exists to remove.
+  ambiguity this RFC exists to remove. Term combination and edit distance
+  are well-defined parameters of Boolean membership; they do not select
+  between filtering, scoring, vector retrieval, and fusion.
+- **A separate legacy fuzzy implementation or retirement-first release** —
+  rejected: pre-stable query compatibility does not justify duplicate
+  semantic paths or removing typo matching before its replacement exists.
+- **A special fuzzy analyzer or raw-query bypass** — rejected: zero and
+  nonzero distance must use the same schema-owned analysis. Different
+  spelling behavior needs a deliberately chosen field profile.
+- **Empty indexes as analyzer authority** — rejected: losing a physical
+  artifact cannot change the logical analyzer. Explicit schema binding is
+  required on index-free reads as well.
+- **Truncate fuzzy expansion and label the predicate approximate** —
+  rejected: missing candidates change filtering and negation. Use complete
+  matching or a typed resource failure; a future approximate retriever
+  would need its own explicit source contract.
 - **Any-term default for the analyzed predicate** — optimizes recall on a
   predicate consumed as fact; violates subset monotonicity.
 - **Raw score blending for fusion** — BM25 and distance scales are not
@@ -308,12 +456,28 @@ the empirically confirmed stemmer drift: identical parameters, different
 matched sets, restored only by rebuild); a line-level source validation of
 the engine baseline this design corrects; a fourteen-system
 constraint-placement survey with documented failure modes for each rejected
-placement; and the accepted prototype record of RFC 0047's slice.
+placement; and the historical prototype record of RFC 0047's preceding
+design. That prototype does not qualify the revised lexical contract.
+
+The fuzzy evidence was narrowed during review. With the existing
+[search fixture](../../crates/omnigraph/tests/fixtures/search.gq), distance
+two yields no rows for `Introductio`, both introduction documents for
+`introductio`, and `dl-basics` for `depe`. A disposable local-graph probe
+with the installed OmniGraph 0.10.0 binary reproduced index-state divergence:
+`beto` at distance one finds indexed `beta` rows but misses identical
+appended rows until rebuild; `running` at distance one finds an unindexed
+row but loses it after indexing. A standalone pinned-tokenizer probe
+confirmed `Introduction` → `introduct` and `running` → `run`. These are
+baseline observations, not tests of the proposed replacement or a newly
+compiled engine. The inspected Lance 11.0.0 crate archives matched the
+workspace lockfile checksums.
 
 Planned test evidence, extending existing owners: compiler suites for the
-new annotations, named arguments, typed metric domains, and deprecation
-lowerings; engine `search.rs` for membership monotonicity, profile behavior
-(case/folding/stemming matrices), `knn` index-state parity, `ann`
+new annotations, named arguments, typed metric domains, removed lexical
+spellings, and the separate nearest deprecation; the `.gqt` query corpus for
+pure matched-set/error cases; engine `search.rs` for physical membership
+parity, profile behavior (case/folding/stemming matrices), `knn` index-state
+parity, `ann`
 fallback/refinement witnesses, coverage under prefilters, and N-arm fusion
 arithmetic; new substrate guards for analyzer parity (indexed vs. flat),
 BM25 constants, and distance parity across flat and indexed paths; format
@@ -323,23 +487,54 @@ live recall probe (`ann` vs `knn` on one filtered population) as a
 maintenance operation. Profile qualification (`ann_default_v1`) requires the
 recall/latency evaluation on artifacts rebuilt under this boundary.
 
+The lexical implementation gate compares each native path with the exact
+scan over the same accepted snapshot. Extend the existing owners to cover:
+
+- Positive matches and unrelated exclusions, including the original fixture
+  counterexamples; `all`/`any`, repeated terms, null/empty documents, and
+  empty/stop-word-only queries.
+- Case, folding, stemming, and multibyte Unicode; distance-zero equivalence
+  and matched-set inclusion for budgets zero, one, and two; transpositions
+  count as two. Validate literal and parameter bounds, including negative
+  values, non-integers, and integers exceeding `u32`.
+- Absent, empty, complete, and partial indexes; append, update, delete,
+  overwrite, compaction, removal, and rebuild. Identical values must match
+  identically, including through eligible graph/property filters and
+  supported negation. Growing the vocabulary cannot remove earlier matches.
+- More than 50 qualifying expansion terms and different segment/partition
+  layouts; prove complete results or an explicit overflow-to-scan path.
+  Forced resource exhaustion must produce a typed error with no partial
+  successful result. Run a checked-in cost instrument to qualify bounded
+  memory, cancellation, and fallback work.
+- Predicate/ranking composition: a fuzzy predicate must not change BM25's
+  analyzed terms, scoring identity, or retrieval window, nor disappear when
+  ranking is added. Score/order parity remains a separate retrieval gate.
+
 ## Rollout
 
-Ordered stages, each independently shippable after acceptance:
+Ordered implementation stages after acceptance. The lexical replacement
+ships as one contract after its scan baseline is qualified; stages 1–2
+share one format release so operators rebuild once:
 
 1. **Format + lexical contract:** SchemaIR vNext and internal stamp; offline
    rewrite; `@analyzed` profiles with substrate-identity fingerprints;
-   `match_terms`; eager-empty-index parity; the `rebuild-indexes`
-   generalization; deprecation warnings for `search`/`match_text`.
+   `match_terms(mode:, max_edits:)` with the exact scan baseline and explicit
+   schema-analyzer binding; the `rebuild-indexes` generalization; removal of
+   `fuzzy`, `search`, and `match_text`. Rewrite application examples,
+   fixtures, stored-query definitions, and user documentation in the same
+   change, without transitional aliases.
 2. **Ranked contract:** `Vector(distance=)` enforcement, mandatory `@embed`
    model, `knn`/`ann(oversample:)`, N-arm weighted `rrf`, typed metric
-   domains, `nearest` deprecation. Stages 1–2 land in one release so
-   operators rebuild exactly once.
-3. **Qualification:** relevance corpus and baseline, `ann_default_v1`
-   naming, capability-probe health surfacing (building on the read-only
+   domains, `nearest` deprecation. This stage does not add fuzzy BM25 or infer
+   fuzzy scoring from a predicate.
+3. **Acceleration and qualification:** enable native lexical paths only
+   after scan-equivalence and resource-budget qualification. Relevance
+   corpus and baseline, `ann_default_v1` naming, capability-probe health
+   surfacing (building on the read-only
    index-status work), vector-artifact certification extending RFC 0043's
    pattern.
-4. **Breaking release:** deprecated grammar removed.
+4. **Later breaking release:** remove the deprecated `nearest` grammar;
+   lexical spellings were already replaced in stage 1.
 
 `implementation` advances per stage; stages reference this RFC once
 accepted.
@@ -378,6 +573,14 @@ accepted.
   remaining schema-surface and format-boundary program, blocked on 0047.
 - 2026-09-03 — published as public draft RFC 0048 alongside RFC 0047 for
   review under the RFC-first process.
+- 2026-09-08 — made the lexical cutover a single pre-stable breaking change:
+  `match_terms(mode:, max_edits:)` replaces all three legacy spellings.
+  Defined exact edit-tolerant membership and schema-driven scan evaluation;
+  replaced eager-empty-index analyzer carriage with explicit binding and
+  qualified acceleration. Expansion overflow scans or fails explicitly;
+  fuzzy ranking remains outside this predicate contract. Added the
+  counterexamples that invalidate RFC 0047's former universal-failure claim
+  and the qualification matrix required before implementation can complete.
 
 ## Appendix: agent context (non-normative)
 
@@ -401,11 +604,16 @@ pin).**
   profile fingerprints include tokenizer/stemmer implementation identity and
   why `standard_v1` (no stemming) is the default.
 - *Flat-path analyzer:* with no FTS segments the substrate flat-scans with a
-  bare case-sensitive tokenizer; with segments present (even empty — v11
-  persists canonical analyzer metadata on empty segments) the declared
-  analyzer resolves. Eager empty-index materialization at `@analyzed`
-  acceptance is what makes the index-independence law true; it is v11-
-  dependent.
+  bare case-sensitive tokenizer; with segments present it uses the index's
+  analyzer. Neither behavior makes the analyzer schema-authoritative.
+  The Design section requires explicit analyzer binding and an exact scan
+  baseline rather than relying on an empty artifact to survive every write.
+- *Fuzzy query path:* `tokenizer_for_match_query` uses bare tokenization for
+  nonzero edit budgets, while `FlatMatchQueryExec` does not apply fuzzy
+  expansion. `expand_fuzzy_tokens` caps expansions within each segment and
+  selects them lexically. These native paths are not qualified for the
+  exact lexical contract as pinned. Both analyzer and completeness behavior
+  need parity evidence before acceleration is enabled.
 - *Exact rescore exists and is family-agnostic:* the scanner's refine path
   drops quantizer distances, recomputes exactly from raw vectors, and sorts
   `(distance, rowid)`; `oversample` maps onto it plus probe budgets inside

@@ -7,8 +7,8 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-03
-discussion: "https://github.com/ModernRelay/omnigraph/pull/595"
+updated: 2026-09-08
+discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
 blocked_on: []
@@ -21,22 +21,19 @@ blocked_on: []
 Ranked reads become honest about what they executed, and search constructs
 that silently do nothing become errors or warnings:
 
-1. `fuzzy()` is retired with a stable `T25` compile diagnostic — it provably
-   never matched under the supported tokenizer, so every use was a confident
-   empty answer.
-2. A search filter or rank target on a traversal-introduced binding is a
+1. A search filter or rank target on a traversal-introduced binding is a
    stable `T26` compile diagnostic — today the predicate or ranking is
    silently dropped and plausible rows come back in table order.
-3. The executed retrieval is stated once in the lowered plan
+2. The executed retrieval is stated once in the lowered plan
    (`QueryIR::retrieval`) instead of being re-inferred from `order_by[0]` at
    execution.
-4. `bm25(...)`, `nearest(...)`, and `rrf(...)` become projectable in `return`,
+3. `bm25(...)`, `nearest(...)`, and `rrf(...)` become projectable in `return`,
    observing the exact value the ordering used; a projected rank expression
    that is not structurally identical to the executed retrieval is an error.
-5. Every ranked result has a total, deterministic order — including `rrf()`
+4. Every ranked result has a total, deterministic order — including `rrf()`
    fusion (score, then trailing user keys applied inside score ties, then
    stable ids) and aggregated orderings.
-6. The canonical read envelope gains three additive arrays: `warnings`
+5. The canonical read envelope gains three additive arrays: `warnings`
    (first use: full-text search on a column with no FTS index serves through
    the case-sensitive flat fallback — now loud), `metrics` (descriptors for
    projected rank columns), and `retrievals` (every executed source, with
@@ -47,6 +44,14 @@ Boundaries that do not change: no schema surface or storage-format change, no
 change to BM25/vector scoring math, the deprecated `POST /read` envelope stays
 byte-stable, and observable order changes only where scores tie (those orders
 were previously run-dependent).
+
+`fuzzy()` remains available in this slice. It has working exact and typo
+matches, but its analysis and matched set depend on index coverage. The
+single breaking replacement of `fuzzy`, `search`, and `match_text` with
+`match_terms(..., max_edits: ...)` belongs to
+[RFC 0048](0048-search-contracts.md#user-and-operational-behavior), where the
+schema-owned analyzer and exact lexical contract are defined. This RFC does
+not introduce a `T25` retirement stage.
 
 ## Motivation
 
@@ -83,10 +88,6 @@ once, coherently.
 
 **Compile diagnostics.**
 
-- `T25`: any `fuzzy(...)` use fails typecheck with a retirement message
-  naming `search()`/`match_text()` as replacements. The grammar still parses
-  the form, so the error is `T25`, not a parse error; stored queries using
-  `fuzzy()` fail registry validation and lint.
 - `T26`: a search filter or rank expression targeting a non-scan-rooted
   binding fails typecheck: "make the target the first-declared binding of
   its match component, or target the scan-rooted variable." The engine also
@@ -175,16 +176,19 @@ maintenance surface is added.
 
 ## Invariants
 
-- **Loud integrity failures (8):** strengthened — the motivating silent
-  false negatives and silent drops become diagnostics or warnings; unranked
-  or unfiltered plausible output is no longer producible.
+- **Loud integrity failures (8):** strengthened for dropped search shapes:
+  `T26` refuses a predicate or ranking that cannot be attached to its target.
+  Warnings expose the absent-index fallback; they do not repair its matched
+  set. Exact lexical behavior, including typo tolerance, is RFC 0048's scope.
 - **Query semantics are typed structures (9):** strengthened — retrieval
   moves from execution-time re-inference into the typed lowered plan; rank
   becomes an ordinary projected column, closing the recorded rank-carry gap.
-- **Physical acceleration is derived (7):** preserved — the unindexed-column
-  condition warns, it does not fail; index absence changes cost and (on the
-  flat fallback) analysis behavior, which is exactly what the warning makes
-  visible. Recall reporting is contractual, not plan-derived.
+- **Physical acceleration is derived (7):** the existing text-search
+  violation remains open in this slice: a warning does not make
+  index-dependent analysis correct. RFC 0048 closes it with schema-owned
+  analysis and exact evaluation across index states. This RFC's notices are
+  transitional visibility, not an exception to the invariant. Recall
+  reporting is contractual, not plan-derived.
 - **Bounded, observable resource use (11):** coverage counts stream; the
   bounded-bm25 retry and fusion candidate handling keep their existing
   bounds; the boundary-tie extension is bounded by the tie plateau width.
@@ -198,11 +202,11 @@ maintenance surface is added.
   unknown-string tolerance is specified for `kind`/`source`/`recall`. The
   legacy `/read` envelope is untouched. OpenAPI regenerates with the new
   schemas.
-- **Language:** `T25` and `T26` reject queries that previously "succeeded"
-  by silently returning wrong results — breaking only for provably broken
-  usage. The `fuzzy` grammar form is retained through the deprecation window
-  so the diagnostic is a typecheck error, not a parse error; grammar removal
-  follows in a later advertised breaking release.
+- **Language:** `T26` rejects queries whose search predicate or ranking was
+  previously dropped. Existing lexical spellings remain available until
+  RFC 0048 replaces them together at its breaking release boundary. No
+  compatibility alias or deprecation window is required for that lexical
+  replacement while the language is pre-stable.
 - **Order:** observable order changes only where scores tie; those orders
   were run-dependent before, so nothing reproducible is broken.
 - **Reverting** requires no storage or format work: the response fields are
@@ -211,9 +215,11 @@ maintenance surface is added.
 
 ## Alternatives
 
-- **Keep `fuzzy()` inert** — rejected: a search form that always returns
-  empty violates the no-silent-failure invariant; retirement with a stable
-  diagnostic beats a permanently misleading surface.
+- **Retire `fuzzy()` before defining its replacement** — rejected: indexed
+  typo queries do match, while scan and indexed execution disagree. The
+  repair requires an explicit analyzer and matching contract. RFC 0048
+  replaces the lexical surface in one breaking change; a standalone
+  retirement neither defines that contract nor supplies typo tolerance.
 - **Fail closed on unindexed text search** — deferred, not chosen now: the
   flat fallback serves correct exact-token matches; warning preserves
   service while removing silence. A future schema-owned analyzed-search
@@ -233,12 +239,13 @@ maintenance surface is added.
 
 ## Evidence and tests
 
-A complete prototype exists (closed PR #595, branch
+A prototype of the preceding design exists (closed PR #595, branch
 `search-contracts-p0-p1`, retained as evidence per the closure note): eleven
 staged commits, canonical workspace graph green (2,860 tests), both Clippy
 gates, OpenAPI regenerated, vocabulary-guard inventory classified. Test
-owners extended, not forked: compiler typecheck/lowering suites (T25, T26,
-retrieval lowering, cap policy), engine `search.rs` (projection, determinism,
+owners extended, not forked: compiler typecheck/lowering suites (including
+the prototype's now-withdrawn T25 stage, T26, retrieval lowering, cap policy),
+engine `search.rs` (projection, determinism,
 fusion ties, coverage, warnings — including characterization goldens captured
 *before* the executor refactor as the equivalence baseline),
 `rrf_prefilter_gate.rs` (one fixture ported: the expand-dst shape now asserts
@@ -247,25 +254,34 @@ fusion ties, coverage, warnings — including characterization goldens captured
 review passes ran on the prototype; all six confirmed findings are fixed and
 pinned by tests (see Decision log).
 
+The prototype is historical evidence, not qualification of this revised
+proposal. The `fuzzy_does_not_match_under_default_tokenizer` characterization
+in [the existing search owner](../../crates/omnigraph/tests/search.rs) tests
+one capitalized query at one edit budget. The counterexamples in
+[RFC 0048's evidence](0048-search-contracts.md#evidence-and-tests) disprove
+the universal-failure premise. That RFC owns the matching and index-lifecycle
+qualification required for the replacement.
+
 ## Rollout
 
-Ordered, independently safe stages (each was a green standalone commit in the
-prototype):
+Ordered stages after acceptance. The retained prototype supplies starting
+points; each stage must be checked against the revised scope:
 
 1. Substrate fences for the Lance 11 update→optimize stale-vector window
    (test-only; can land before acceptance as an ordinary change).
-2. `T25` fuzzy retirement (compiler + docs).
-3. Warning carrier + `full_text_search_unindexed` (engine → API → CLI →
+2. Warning carrier + `full_text_search_unindexed` (engine → API → CLI →
    OpenAPI).
-4. Characterization goldens, then the retrieval-IR refactor (behavior-
+3. Characterization goldens, then the retrieval-IR refactor (behavior-
    equivalent by construction; goldens prove it).
-5. `T26` scan-rooted targets (compiler pass + engine backstops).
-6. Projectable metrics and deterministic ties (single-search, fusion,
+4. `T26` scan-rooted targets (compiler pass + engine backstops).
+5. Projectable metrics and deterministic ties (single-search, fusion,
    aggregated).
-7. `metrics`/`retrievals` metadata with embedding coverage.
+6. `metrics`/`retrievals` metadata with embedding coverage.
 
 `implementation` advances to `in-progress` at the first landed stage and
-`complete` when stage 7 ships. Stages 2+ reference this RFC once accepted.
+`complete` when stage 6 ships. Stages 2+ reference this RFC once accepted.
+The lexical replacement is sequenced by RFC 0048, not by a retirement commit
+in this rollout.
 
 ## Unresolved questions
 
@@ -293,6 +309,10 @@ prototype):
   evidence. PR closed the same day under the governance process (size-L
   requires an accepted RFC first); branch retained as evidence.
 - 2026-09-01 — this RFC opened as the required public proposal.
+- 2026-09-08 — withdrew standalone T25 retirement after matched-set probes
+  disproved universal fuzzy failure. RFC 0048 now owns a breaking lexical
+  replacement with explicit edit distance and exact scan/index parity;
+  warnings in this RFC do not claim to repair the existing analyzer cliff.
 
 ## Appendix: agent context (non-normative)
 
@@ -300,7 +320,8 @@ Supporting context for implementers and coding agents. Nothing here is a
 contract; the sections above are authoritative.
 
 **Prototype map.** Branch `search-contracts-p0-p1` @ `3e459aad` (closed
-PR #595). Commit order = Rollout stages; the review-fix commit is
+PR #595). Its commit order includes the withdrawn T25 stage and must not be
+applied verbatim as the current rollout; the review-fix commit is
 `3e459aad`, the #587 port is `858ce066`. This RFC is the first slice of a
 larger search-contracts design program whose remaining scope — schema-owned
 analyzed search (`@analyzed`), schema-bound vector distance, and the
