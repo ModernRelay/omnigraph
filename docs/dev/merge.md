@@ -37,10 +37,16 @@ An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
 
-A named target that already owns a table ref keeps that write lineage, even
-when the source has a greater numeric version. Lazy children can still pin
-older versions of the owned ref. Detaching it would make later first-touch
-reclamation unsafe. An empty delta keeps the complete target entry.
+On the adopt route a source on main is adopted as a pointer switch onto main's
+lineage, even when the target branch owns a table ref and whatever the numeric
+versions say: the route is chosen by ownership shape, and the registration
+carries the manifest version (RFC 0062). The owned ref is detached, not
+written to. Children that pinned it keep reading it, because
+reclamation counts every live branch's pins; the former owner's next
+first-touch write on that table reports `detached native lineage` instead of
+recreating the ref. A source on a branch merging into a target that owns the
+table applies its delta onto the target's ref; an empty delta keeps the
+complete target entry.
 
 ## Proven insertion route
 
@@ -146,7 +152,7 @@ chunks publish sequentially inside the one recovery envelope, and all routes
 defer index construction to reconciliation.
 
 Cost tests cap common fast-forward manifest opens/scans at three and diverged
-merges at four. Each scan still folds the surviving append-only `__manifest`
+merges at four, five for a non-bound target. Each scan still folds the surviving append-only `__manifest`
 history. `optimize` can reduce fragment overhead but does not make journal
 decoding independent of retained history. The decoder reduces one Arrow batch
 at a time rather than retaining the complete batch collection.

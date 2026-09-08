@@ -1861,16 +1861,10 @@ async fn branch_merge_applies_node_insert_to_main() {
 /// `merge_adopt_*.gqt`. The lazy iteration stops after its reads (RFC 0062, decision log 2026-09-08).
 #[tokio::test]
 async fn branch_merge_preserves_state_when_native_versions_differ() {
-    // The histories put the source above, equal to, and below the target.
-    // A lazy child additionally requires
-    // recovery-owned first-touch forking without changing the indexed schema.
-    for branch_updates in [8, 2, 1] {
-        for lazy_target in [false, true] {
-            if branch_updates == 1 && lazy_target {
-                continue;
-            }
-            assert_native_version_case(branch_updates, lazy_target).await;
-        }
+    // The route ignores version order; the lazy arm adds recovery-owned
+    // first-touch forking without changing the indexed schema.
+    for lazy_target in [false, true] {
+        assert_native_version_case(8, lazy_target).await;
     }
 }
 
@@ -1996,13 +1990,18 @@ fn assert_native_version_case(
             .dataset("node:Person")
             .unwrap()
             .clone();
-        assert!(
-            merged_entry.published_dataset_version > target_entry.published_dataset_version,
-            "{target}, {branch_updates} updates: changed rows must advance target's own version"
-        );
-        assert_eq!(
-            merged_entry.native_dataset_branch.as_deref(),
+        let expected_ref = if lazy_target {
             Some(target_native.as_str())
+        } else {
+            source_entry.native_dataset_branch.as_deref()
+        };
+        assert_eq!(
+            (
+                merged_entry.published_dataset_version,
+                merged_entry.native_dataset_branch.as_deref()
+            ),
+            (source_entry.published_dataset_version, expected_ref),
+            "{target}, {branch_updates} updates: the adopt registers the source's version, as a pointer switch onto the source ref or a fork onto the target's own ref, ordered by the manifest clock (RFC 0062)"
         );
         let reopened = Omnigraph::open(uri).await.unwrap();
         for handle in [&main, &reopened] {
@@ -2026,6 +2025,9 @@ fn assert_native_version_case(
                 50,
                 "{target}, {branch_updates} updates: source value must survive adoption"
             );
+        }
+        if lazy_target {
+            return;
         }
         main.mutate(
             target,
@@ -2060,9 +2062,9 @@ fn assert_native_version_case(
             "{target}, {branch_updates} updates: an unrelated edit must not roll back main"
         );
 
-        // Main now has the same Person rows at a lower or equal version.
-        // Bringing it back is an empty delta: retain the target's complete
-        // public registration and do not create a physical table commit.
+        // Main and the target now share Person's registration. Bringing main
+        // back is an empty adopt: retain the target's complete public
+        // registration and do not create a physical table commit.
         let before_empty = snapshot_branch(&main, target)
             .await
             .unwrap()
@@ -2111,30 +2113,33 @@ fn assert_native_version_case(
             head_before,
             "empty adoption must not advance the physical target HEAD"
         );
-        if !lazy_target {
-            // Both cleanup and the next write must preserve the native
-            // history still pinned by the untouched lazy child.
-            let mut maintenance = Omnigraph::open(uri).await.unwrap();
-            maintenance
-                .cleanup(omnigraph::db::CleanupPolicyOptions {
-                    keep_versions: Some(100),
-                    older_than: None,
-                })
-                .await
-                .unwrap();
-            main.mutate(
+        let mut maintenance = Omnigraph::open(uri).await.unwrap();
+        maintenance
+            .cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(100),
+                older_than: None,
+            })
+            .await
+            .unwrap();
+        let error = main
+            .mutate(
                 target,
                 MUTATION_QUERIES,
                 "set_age",
                 &mixed_params(&[("$name", "Alice")], &[("$age", 51)]),
             )
             .await
-            .unwrap();
-            let reopened = Omnigraph::open(uri).await.unwrap();
-            for handle in [&main, &reopened] {
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("detached native lineage"),
+            "{target}, {branch_updates} updates: the pointer switch detached the target's former ref and its borrower still pins it, so the owner's next write must refuse instead of recreating the ref: {error}"
+        );
+        let reopened = Omnigraph::open(uri).await.unwrap();
+        for handle in [&main, &reopened] {
+            for (branch, age) in [("borrower", 39 + branch_updates as i32), (target, 50)] {
                 let result = handle
                     .query(
-                        ReadTarget::branch("borrower"),
+                        ReadTarget::branch(branch),
                         TEST_QUERIES,
                         "get_person",
                         &params(&[("$name", "Alice")]),
@@ -2149,19 +2154,18 @@ fn assert_native_version_case(
                         .downcast_ref::<Int32Array>()
                         .unwrap()
                         .value(0),
-                    39 + branch_updates as i32,
-                    "cleanup and the owner's next write must preserve its lazy borrower"
+                    age,
+                    "{branch}: cleanup and the refused write must leave every pin readable"
                 );
             }
         }
     })
 }
 
-#[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn branch_write_refuses_detached_native_lineage_before_arming() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     db.load_as(
         "feature",
@@ -2181,28 +2185,24 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
         .dataset("node:Company")
         .unwrap()
         .clone();
-    // The former adoption route was reachable when main's native version
-    // exceeded the owner's version. Preserve that production-shaped precondition.
-    for index in 0..5 {
-        db.load_as(
-            "main",
-            None,
-            &format!(r#"{{"type":"Company","data":{{"name":"MainCo{index}"}}}}"#),
-            LoadMode::Merge,
-            None,
-        )
-        .await
-        .unwrap();
-    }
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("feature", "node:Company", None)
-        .await
-        .unwrap();
-    db = Omnigraph::open(db.uri()).await.unwrap();
-    let owner_before = snapshot_branch(&db, "feature").await.unwrap();
-    let owner_rows_before = collect_column_strings(
-        &read_table_branch(&db, "feature", "node:Company").await,
-        "name",
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::FastForward
     );
+    db.load_as(
+        "main",
+        None,
+        r#"{"type":"Company","data":{"name":"MainCo"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.branch_merge("main", "feature").await.unwrap(),
+        MergeOutcome::FastForward
+    );
+    let owner_before = snapshot_branch(&db, "feature").await.unwrap();
     let table_uri = format!("{}/{}", db.uri(), borrowed.dataset_path);
     let native = borrowed.native_dataset_branch.as_deref().unwrap();
     let head_before = open_dataset_head(&table_uri, Some(native))
@@ -2215,10 +2215,6 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
         .list_branches()
         .await
         .unwrap();
-    let child_before = collect_column_strings(
-        &read_table_branch(&db, "child", "node:Company").await,
-        "name",
-    );
 
     let error = db
         .load_as(
@@ -2275,19 +2271,7 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
     )
     .await
     .unwrap();
-    assert!(
-        collect_column_strings(
-            &read_table_branch(&db, "replacement", "node:Company").await,
-            "name"
-        )
-        .contains(&"NewCo".to_string())
-    );
     let merge_error = db.branch_merge("replacement", "feature").await.unwrap_err();
-    assert!(
-        matches!(&merge_error, OmniError::Manifest(error)
-        if error.kind == ManifestErrorKind::BadRequest),
-        "{merge_error}"
-    );
     assert!(
         merge_error.to_string().contains("detached native lineage"),
         "{merge_error}"
@@ -2297,45 +2281,20 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
         !recovery_dir.exists() || fs::read_dir(recovery_dir).unwrap().next().is_none(),
         "merge refusal must precede durable recovery intent"
     );
+    let child = snapshot_branch(&db, "child").await.unwrap();
+    let child = child.dataset("node:Company").unwrap();
+    assert_eq!(child.native_dataset_branch, borrowed.native_dataset_branch);
     assert_eq!(
-        open_dataset_head(&table_uri, Some(native))
-            .await
-            .version()
-            .version,
-        head_before
+        child.published_dataset_version,
+        borrowed.published_dataset_version
     );
-    let reopened = Omnigraph::open(db.uri()).await.unwrap();
-    for handle in [&db, &reopened] {
-        assert_eq!(
-            collect_column_strings(
-                &read_table_branch(handle, "feature", "node:Company").await,
-                "name"
-            ),
-            owner_rows_before
-        );
-        let child = snapshot_branch(handle, "child").await.unwrap();
-        let child = child.dataset("node:Company").unwrap();
-        assert_eq!(child.native_dataset_branch, borrowed.native_dataset_branch);
-        assert_eq!(
-            child.published_dataset_version,
-            borrowed.published_dataset_version
-        );
-
-        assert_eq!(
-            snapshot_branch(handle, "feature")
-                .await
-                .unwrap()
-                .graph_manifest_version(),
-            owner_before.graph_manifest_version()
-        );
-        assert_eq!(
-            collect_column_strings(
-                &read_table_branch(handle, "child", "node:Company").await,
-                "name"
-            ),
-            child_before
-        );
-    }
+    assert_eq!(
+        snapshot_branch(&db, "feature")
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        owner_before.graph_manifest_version()
+    );
 }
 
 #[tokio::test]

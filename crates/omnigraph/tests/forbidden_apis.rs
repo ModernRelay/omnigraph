@@ -844,6 +844,8 @@ durable_calls! {
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     // First-touch merge: enumerate native refs before arming recovery; no mutation.
     ("exec/merge.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // First-touch write: enumerate native refs before arming recovery; no mutation.
+    ("exec/staging.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),

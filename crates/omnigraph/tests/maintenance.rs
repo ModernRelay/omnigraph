@@ -14,8 +14,8 @@ use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance_core::datatypes::BlobHandling;
 use omnigraph::IndexCoverage;
 use omnigraph::db::{
-    CleanupPolicyOptions, Omnigraph, ReadTarget, RepairAction, RepairClassification, RepairOptions,
-    SkipReason,
+    CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
+    RepairOptions, SkipReason,
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -2122,7 +2122,6 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     assert_eq!(count_rows(&db, "node:Company").await, main_companies);
 }
 
-#[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
     let dir = tempfile::tempdir().unwrap();
@@ -2144,28 +2143,35 @@ async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
     let before = db.snapshot_of(ReadTarget::branch("child")).await.unwrap();
     let borrowed = before.dataset("node:Company").unwrap().clone();
 
-    // The former adoption route was reachable when main's native version
-    // exceeded the owner's version. Preserve that production-shaped precondition.
-    for index in 0..5 {
-        db.load_as(
-            "main",
-            None,
-            &format!(r#"{{"type":"Company","data":{{"name":"MainCo{index}"}}}}"#),
-            LoadMode::Merge,
-            None,
-        )
-        .await
-        .unwrap();
-    }
-    // Recreate a snapshot written by the former pointer-adoption path: the
-    // owner points at main, while its lazy child still pins the old native ref.
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("feature", "node:Company", None)
-        .await
-        .unwrap();
-    db = Omnigraph::open(db.uri()).await.unwrap();
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap(),
+        MergeOutcome::FastForward
+    );
+    db.load_as(
+        "main",
+        None,
+        r#"{"type":"Company","data":{"name":"MainCo"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.branch_merge("main", "feature").await.unwrap(),
+        MergeOutcome::FastForward
+    );
+    let switched = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    assert_eq!(
+        switched
+            .dataset("node:Company")
+            .unwrap()
+            .native_dataset_branch,
+        None,
+        "the merge from main must switch feature's Company to main's lineage, detaching its fork"
+    );
     assert_eq!(
         count_rows_branch(&db, "feature", "node:Company").await,
-        main_companies + 5
+        main_companies + 2
     );
     assert_eq!(
         count_rows_branch(&db, "child", "node:Company").await,
@@ -2192,7 +2198,7 @@ async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
         );
         assert_eq!(
             count_rows_branch(handle, "feature", "node:Company").await,
-            main_companies + 5
+            main_companies + 2
         );
     }
 }

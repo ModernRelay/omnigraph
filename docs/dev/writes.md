@@ -62,8 +62,9 @@ native branch lifetime; a stale or missing view takes the existing refresh/open
 path. Captures share immutable lineage and the Lance session, copy current
 table state, and leave the handle's active branch unchanged.
 
-After a content publication, the publisher returns the projection it already
-folded from the successful attempt's freshly read base. The coordinator retains
+After a content publication, the publisher returns the projection (the
+in-memory `__manifest` state folded from the journal) it already built from the
+successful attempt's freshly read base. The coordinator retains
 it only when that exact base matches its previously coherent view and its graph
 cache has adopted the published lineage. A foreign advance, unsupported base,
 or failure before lineage adoption leaves the full-refresh fallback armed.
@@ -165,11 +166,15 @@ Reclamation checks the current table pins of every live graph branch, not just
 the fork's original owner. A detached native ref can still hold a child's
 accepted snapshot. Cleanup and recovery retain such refs, and a first-touch
 writer refuses to recreate them before arming recovery. A first-touch merge
-also requires its target native ref to be absent before arming: an unregistered
-pre-existing ref could have a different fork point and cannot become this
-attempt's recovery effect. It returns a conflict naming cleanup as the remedy.
-This liveness view is
-derived under the control gates and is not persisted as another authority.
+classifies a pre-existing target native ref the same way: a ref another branch
+pins is refused as detached lineage, a ref a pending operation claims or whose
+liveness cannot be verified is refused as a conflict, and an orphan is deleted
+before the operation arms, on the write path as on the merge path, so the
+armed fork starts from a clean name and a crash between arming and forking
+leaves nothing recovery must explain. The deletes run table by table before
+the refusal check of the next table, so a refusal may follow a completed
+delete; nothing referenced the deleted ref, so no state is lost. This liveness view is derived under the
+control gates and is not persisted as another authority.
 Deletion derives native refs and descendants from one registry listing. It
 reuses already loaded borrower snapshots only when their native ref matches
 that listing and their manifest incarnation matches a fresh probe; other

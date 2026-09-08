@@ -1568,16 +1568,29 @@ mod pure_insert_certificate_tests {
         assert_eq!(accepted(&append), None);
     }
 
+    fn key_bytes() -> u64 {
+        "key".len() as u64 + 2 * std::mem::size_of::<String>() as u64
+    }
+
+    fn deletion_vectors() -> (
+        lance_core::utils::deletion::DeletionVector,
+        lance_core::utils::deletion::DeletionVector,
+    ) {
+        (
+            lance_core::utils::deletion::DeletionVector::from_iter(0..10_000),
+            lance_core::utils::deletion::DeletionVector::from_iter(0..20_000),
+        )
+    }
+
+    /// Byte accounting is invisible to a `.gqt` case; `merge_cost.rs` owns the
+    /// row-level result.
     #[test]
-    fn lineage_candidates_check_working_budget_before_copying_keys_or_expanding_offsets() {
-        use lance_core::utils::deletion::DeletionVector;
+    fn lineage_candidate_ids_are_retained_only_within_the_budget() {
         use std::collections::BTreeSet;
 
-        // Mechanism assertions own the retained-memory boundary; the public
-        // merge_cost owner proves exact-offset reads and logical merge results.
         let mut candidates = BTreeSet::new();
         let mut retained = 0;
-        let key_bytes = "key".len() as u64 + 2 * std::mem::size_of::<String>() as u64;
+        let key_bytes = key_bytes();
         assert!(
             !super::retain_candidate_id("key", &mut candidates, &mut retained, key_bytes - 1)
                 .unwrap()
@@ -1592,9 +1605,13 @@ mod pure_insert_certificate_tests {
         );
         assert_eq!(candidates.len(), 1);
         assert_eq!(retained, key_bytes);
+    }
 
-        let base = DeletionVector::from_iter(0..10_000);
-        let side = DeletionVector::from_iter(0..20_000);
+    /// The reserved working bytes are a budget split, not a row-visible fact.
+    #[test]
+    fn deletion_candidate_key_limit_reserves_the_working_bytes() {
+        let key_bytes = key_bytes();
+        let (base, side) = deletion_vectors();
         let limit = super::LINEAGE_CANDIDATE_MAX_BYTES;
         let key_limit = super::deletion_candidate_key_limit(&base, &side, 0, limit).unwrap();
         let working_bytes = limit - key_limit;
@@ -1612,7 +1629,12 @@ mod pure_insert_certificate_tests {
             super::deletion_candidate_key_limit(&base, &side, key_bytes, working_bytes + key_bytes),
             Some(key_bytes),
         );
+    }
 
+    /// Chunk boundaries never reach a row result; only the mechanism sees them.
+    #[test]
+    fn candidate_offset_chunks_are_bounded_sorted_and_exhaustive() {
+        let (base, side) = deletion_vectors();
         let visited = std::cell::Cell::new(0);
         let mut offsets = side
             .iter()
@@ -1636,7 +1658,7 @@ mod pure_insert_certificate_tests {
         }
         assert_eq!(total, 10_000);
 
-        let sparse = DeletionVector::from_iter([8, 2, 9, 1]);
+        let sparse = lance_core::utils::deletion::DeletionVector::from_iter([8, 2, 9, 1]);
         super::fill_candidate_offset_chunk(&mut sparse.iter(), &mut chunk);
         assert_eq!(chunk, [1, 2, 8, 9]);
     }
@@ -3836,11 +3858,8 @@ fn adopt_advances_head(
     match (target_active, source_entry.native_dataset_branch.as_deref()) {
         // Source on a branch, target on main — delta applied onto main's lineage.
         (None, Some(_)) => true,
-        // An owned target ref remains the target's write lineage, including
-        // when main has a greater numeric version. Lazy child branches may
-        // still pin its older versions; detaching it would make a later
-        // first-touch write collide with a ref that cannot be reclaimed.
-        (Some(target_branch), _) => {
+        // Both on branches, target owns this table — delta applied onto it.
+        (Some(target_branch), Some(_)) => {
             target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
                 == Some(target_branch)
         }
@@ -3971,15 +3990,6 @@ fn plan_adopted_source_state(
     table_key: &str,
 ) -> AdoptPublish {
     let identity = source_entry.identity;
-    // A nonempty owned-target delta was classified as AdoptWithDelta. With
-    // equal rows, retain the exact registration, including version metadata;
-    // changing it to the source ref would strand lazy borrowers even though
-    // this table has no logical change to publish.
-    if target_active.is_some_and(|target| {
-        target_entry.is_some_and(|entry| entry.native_dataset_branch.as_deref() == Some(target))
-    }) {
-        return AdoptPublish::Nothing;
-    }
     let planned = match (target_active, source_entry.native_dataset_branch.as_deref()) {
         // Source on main — pointer switch to its version. The target reads the
         // same lineage whether it sits on main or on a branch.
@@ -4006,11 +4016,24 @@ fn plan_adopted_source_state(
                 .unwrap_or_else(|| source_entry.version_metadata.clone()),
         },
         (Some(target_branch), Some(source_branch)) => {
-            // Owned targets returned above. This target lacks its own ref.
-            return AdoptPublish::Fork {
-                source_branch: source_branch.to_string(),
-                target_branch: target_branch.to_string(),
+            let Some(owned) = target_entry
+                .filter(|entry| entry.native_dataset_branch.as_deref() == Some(target_branch))
+            else {
+                // A fork registers a ref the target lacks, so it is never a
+                // no-op.
+                return AdoptPublish::Fork {
+                    source_branch: source_branch.to_string(),
+                    target_branch: target_branch.to_string(),
+                };
             };
+            crate::db::DatasetUpdate {
+                identity,
+                type_key: table_key.to_string(),
+                published_dataset_version: owned.published_dataset_version,
+                native_dataset_branch: Some(target_branch.to_string()),
+                entity_count: source_entry.entity_count,
+                version_metadata: owned.version_metadata.clone(),
+            }
         }
     };
 
@@ -4123,12 +4146,26 @@ mod adopt_plan_tests {
     #[test]
     fn target_owned_branch_table_with_equal_rows_plans_nothing() {
         let target = entry(5, Some("target"), 3, "manifest-v5");
-        for source_ref in [None, Some("source")] {
-            let source = entry(7, source_ref, 3, "manifest-v7");
-            assert!(adopt_advances_head(Some("target"), &source, Some(&target)));
+        let source = entry(7, Some("source"), 3, "manifest-v7");
+        assert!(adopt_advances_head(Some("target"), &source, Some(&target)));
+        assert!(matches!(
+            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+            AdoptPublish::Nothing
+        ));
+    }
+
+    /// Source on main into a branch that owns the table: a pointer switch onto
+    /// main's lineage whichever numeric version is greater.
+    #[test]
+    fn source_on_main_into_an_owning_branch_target_plans_a_pointer() {
+        let target = entry(5, Some("target"), 3, "manifest-v5");
+        for source_version in [3, 5, 7] {
+            let source = entry(source_version, None, 3, "manifest-main");
+            assert!(!adopt_advances_head(Some("target"), &source, Some(&target)));
             assert!(matches!(
                 plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
-                AdoptPublish::Nothing
+                AdoptPublish::Pointer(update) if update.native_dataset_branch.is_none()
+                    && update.published_dataset_version == source_version
             ));
         }
     }
@@ -4200,18 +4237,16 @@ mod adopt_plan_tests {
     }
 }
 
-/// Adopt the source's table state without applying a row delta: a pointer
-/// switch (source/target share lineage) or a branch fork, as planned by
-/// [`plan_adopted_source_state`].
-///
-/// `target_active` is the native ref from the captured target transaction;
-/// physical adoption never consults the handle's active branch.
+/// Adopt the source's table state without a row delta, as planned by
+/// [`plan_adopted_source_state`]: a pointer switch, or a fork under
+/// `recovery_operation_id` so its reclaim never mistakes the merge's own pin.
 async fn publish_adopted_source_state(
     target_db: &Omnigraph,
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     table_key: &str,
     target_active: Option<&str>,
+    recovery_operation_id: Option<&str>,
 ) -> Result<crate::db::DatasetUpdate> {
     let source_entry = source_snapshot
         .dataset(table_key)
@@ -4230,15 +4265,19 @@ async fn publish_adopted_source_state(
             source_branch,
             target_branch,
         } => {
+            let operation_id = recovery_operation_id.ok_or_else(|| {
+                OmniError::manifest_internal("first-touch adopt fork has no armed recovery intent")
+            })?;
             let full_path = format!("{}/{}", target_db.uri(), source_entry.dataset_path);
             let ds = target_db
-                .fork_dataset_from_entry_state(
+                .fork_dataset_from_entry_state_under_intent(
                     table_key,
                     source_entry.identity,
                     &full_path,
                     Some(&source_branch),
                     source_entry.published_dataset_version,
                     &target_branch,
+                    Some(operation_id),
                 )
                 .await?;
             let state = target_db.storage().table_state(&full_path, &ds).await?;
@@ -6092,19 +6131,36 @@ impl Omnigraph {
                         table_key, native,
                     ));
                 }
-                // First-touch recovery can only own a ref created after its
-                // intent is armed. A pre-existing unregistered ref may have a
-                // different fork point; arming over it would make a crash
-                // before replacement indistinguishable from our own effect.
                 let inherited = self.storage().open_snapshot_at_entry(entry).await?;
                 let branches =
                     crate::branch_control::list_branch_contents(inherited.dataset()).await?;
-                if branches.contains_key(native) {
-                    return Err(OmniError::manifest_conflict(format!(
-                        "merge target ref '{table_key}:{native}' already exists while the graph \
-                         manifest inherits the table from another branch; refusing to claim \
-                         unowned physical state — run cleanup and retry"
-                    )));
+                if !branches.contains_key(native) {
+                    continue;
+                }
+                match crate::db::classify_fork_ref_with_references(
+                    self,
+                    entry.identity,
+                    native,
+                    None,
+                    &references,
+                )
+                .await
+                {
+                    crate::db::ForkRefStatus::Orphan => {
+                        let full_path = self.storage().dataset_uri(&entry.dataset_path);
+                        crate::db::force_delete_orphan_ref(self, table_key, &full_path, native)
+                            .await?;
+                    }
+                    crate::db::ForkRefStatus::Borrowed
+                    | crate::db::ForkRefStatus::Legitimate
+                    | crate::db::ForkRefStatus::Indeterminate => {
+                        return Err(OmniError::manifest_conflict(format!(
+                            "merge target ref '{table_key}:{native}' already exists while the \
+                             graph manifest inherits the table from another branch, and a \
+                             pending operation still claims it or its liveness could not be \
+                             verified; refusing to claim unowned physical state; retry"
+                        )));
+                    }
                 }
             }
         }
@@ -6217,6 +6273,7 @@ impl Omnigraph {
                             target_snapshot,
                             table_key,
                             target_active.as_deref(),
+                            recovery_operation_id.as_deref(),
                         )
                         .await?
                     }

@@ -48,7 +48,10 @@ pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
-pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
+pub(crate) use table_ops::{
+    DeferredTableFork, ForkRefStatus, OpenedForMutation, classify_fork_ref_with_references,
+    force_delete_orphan_ref,
+};
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
 use super::commit_graph::GraphCommit;
@@ -3505,21 +3508,9 @@ impl Omnigraph {
         validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
         let branches = source_coord.all_branches().await?;
         Self::ensure_branch_create_namespace_safe(&target_branch, &branches)?;
-        // Operate on a freshly verified source coordinator that's owned locally.
-        // The pre-fix implementation used
-        // `swap_coordinator_for_branch` + operate + `restore_coordinator` as
-        // three separate `coordinator.write().await` acquisitions; under
-        // `&self` concurrency, a second `branch_create_from` could swap
-        // self.coordinator between this caller's swap and operate steps,
-        // making the operate run against the wrong source branch and
-        // forking off the wrong HEAD. Pinned by
-        // the distinct-parent create pair in
-        // `crates/omnigraph-server/tests/multi_graph.rs`.
-        //
-        // The manifest ref write is durable regardless of which coordinator
-        // handle issued it. Discarding `source_coord` after the call is the
-        // right shape — the new branch is reachable from any subsequent
-        // coordinator open.
+        // A locally owned source coordinator cannot be swapped by a concurrent
+        // `branch_create_from`; the ref write is durable whichever handle
+        // issued it.
         source_coord.branch_create(&target_branch).await?;
         self.invalidate_read_caches().await;
         Ok(())

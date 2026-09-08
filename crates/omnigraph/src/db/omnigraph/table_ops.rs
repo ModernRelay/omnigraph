@@ -1489,6 +1489,34 @@ pub(crate) async fn classify_fork_ref_with_references(
 /// process writer recreated the ref — the documented one-winner-CAS gap), it
 /// surfaces a retryable conflict; on retry the winner's fork is visible and
 /// the no-fork path runs.
+/// Drop a ref fresh authority classified `Orphan` (idempotent). The merge
+/// pre-arm calls this before any intent exists, so an armed first touch never
+/// meets a leftover ref forked at a version its sidecar did not name.
+pub(crate) async fn force_delete_orphan_ref(
+    db: &Omnigraph,
+    table_key: &str,
+    full_path: &str,
+    native: &str,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_RECLAIM)?;
+    db.storage()
+        .force_delete_branch(full_path, native)
+        .await
+        .map_err(|e| {
+            // Lance's RefConflict prose is not an API contract; a typed variant
+            // through `force_delete_branch` is the follow-up.
+            if e.to_string().contains("referenc") {
+                OmniError::manifest_conflict(format!(
+                    "branch '{native}' cannot reclaim the leftover fork for \
+                     table '{table_key}' because it has dependent child branches; \
+                     delete the child branches first"
+                ))
+            } else {
+                e
+            }
+        })
+}
+
 pub(super) async fn reclaim_orphaned_fork_and_refork(
     db: &Omnigraph,
     table_key: &str,
@@ -1581,28 +1609,7 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
         }
     }
 
-    crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_RECLAIM)?;
-    db.storage()
-        .force_delete_branch(full_path, active_branch)
-        .await
-        .map_err(|e| {
-            // Lance refuses to delete a branch with dependent child branches
-            // even under force (RefConflict). Unreachable for a leaf first-write
-            // fork (the cleanup reconciler also drops children before parents),
-            // but surface it actionably if it ever happens. We match loosely on
-            // "referenc" rather than the exact prose, which is not a Lance API
-            // contract; a typed RefConflict variant through `force_delete_branch`
-            // is the durable follow-up.
-            if e.to_string().contains("referenc") {
-                OmniError::manifest_conflict(format!(
-                    "branch '{active_branch}' cannot reclaim the leftover fork for \
-                     table '{table_key}' because it has dependent child branches; \
-                     delete the child branches (or run `omnigraph cleanup`) first"
-                ))
-            } else {
-                e
-            }
-        })?;
+    force_delete_orphan_ref(db, table_key, full_path, active_branch).await?;
 
     match fork_dataset_from_entry_state(
         db,

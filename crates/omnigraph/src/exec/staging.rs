@@ -1161,10 +1161,10 @@ impl StagedMutation {
         // the target branch fresh on any mismatch, returning the snapshot from
         // that same authority view. No prepared table pin is patched forward.
         let snapshot = db.revalidate_write_txn(txn).await?;
-        // An older pointer-adopting merge may have detached a target ref that
-        // a lazy child still pins. A new first-touch fork must not reclaim that
-        // history. Prove this before arming: the existing recovery envelope
-        // cannot represent reseeding an unrelated, already-existing lineage.
+        // A merge from main detaches the target's former ref while a child may
+        // still pin it; a first-touch fork must not reclaim that history, and
+        // the recovery envelope cannot represent reseeding an existing lineage,
+        // so the proof runs before arming.
         let fork_references = if staged
             .iter()
             .any(|entry| entry.path.deferred_fork.is_some())
@@ -1221,6 +1221,34 @@ impl StagedMutation {
                         Some(current.to_string()),
                         Some(entry.dataset.version().to_string()),
                     ));
+                }
+                let branches =
+                    crate::branch_control::list_branch_contents(entry.dataset.dataset()).await?;
+                if branches.contains_key(&fork.target_branch) {
+                    match crate::db::classify_fork_ref_with_references(
+                        db,
+                        entry.path.identity,
+                        &fork.target_branch,
+                        None,
+                        fork_references
+                            .as_ref()
+                            .expect("deferred-fork liveness proof"),
+                    )
+                    .await
+                    {
+                        crate::db::ForkRefStatus::Orphan => {
+                            crate::db::force_delete_orphan_ref(
+                                db,
+                                &entry.table_key,
+                                &entry.path.full_path,
+                                &fork.target_branch,
+                            )
+                            .await?;
+                        }
+                        crate::db::ForkRefStatus::Borrowed
+                        | crate::db::ForkRefStatus::Legitimate
+                        | crate::db::ForkRefStatus::Indeterminate => {}
+                    }
                 }
                 continue;
             }

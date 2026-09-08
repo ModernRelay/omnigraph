@@ -40,15 +40,24 @@ it with a `table version … already exists` error.
 - **Merged**: both branches changed, so OmniGraph performs a three-way,
   entity-level merge and creates a commit with two parents.
 
-When a target already owns a table history, merges keep writing that history.
-A child that inherited an older table snapshot keeps reading its original
-values through a parent merge, later parent writes, and cleanup.
+Merging main into a branch points each table that only main changed since the
+branch last shared it at main's history and leaves the branch's own table
+history in place; a table both sides changed is merged onto the branch's own
+history as usual. A child that inherited an
+older table snapshot from that branch keeps reading its original values
+through the merge, later writes, and cleanup.
 
-If an older build already detached a table history that a child still uses,
-a write can report `detached native lineage`. Create a replacement branch from
-the affected branch and continue writes there. Existing children retain their
-original snapshots; retrying the same write on the affected branch cannot
-repair its detached history.
+While a child still uses the branch's former table history, a write on the
+branch to that table reports `detached native lineage`. Create a replacement
+branch from the affected branch and continue writes there. Existing children
+retain their original snapshots; retrying the same write on the affected
+branch cannot repair its detached history, and merging the replacement back
+into the affected branch reports the same error for as long as a child still
+uses that history. The affected branch accepts writes and merges to that
+table again once every such child has been deleted. A child that has written
+the table itself no longer uses the former history directly, but its own
+history descends from it, so until that child is deleted the affected
+branch's write reports `dependent child branches` instead.
 
 The source branch is unchanged by the merge. Use `--delete-branch` for the
 normal review-branch lifecycle:
@@ -135,9 +144,12 @@ default, used for validation; it costs both paths). A merge that succeeds
 produces the same result in every mode; only cost differs. An unrecognized
 value logs a warning and behaves as `off`.
 
-If merge reports an unowned target ref and asks for cleanup, it has refused
-before creating recovery state. Run the supported cleanup operation, then retry
-the merge. Cleanup preserves refs still used by another branch or pending write.
+A merge into a branch whose former table history no other branch uses drops
+that history before it starts and forks afresh, the same as the branch's own
+next write would.
+If merge reports that a pending operation still claims the target ref or that
+its liveness could not be verified, it has refused before creating recovery
+state; retry.
 
 ## After a large merge
 

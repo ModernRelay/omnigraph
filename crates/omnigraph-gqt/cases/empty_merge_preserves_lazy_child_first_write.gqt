@@ -1,10 +1,11 @@
 # issue: none
-# notes: Already passes on PR 630 at 47cb4c02; guards the empty-delta behavior through the refactor.
-# notes: Main and parent have equal rows after a merge. Merging main back must
-# notes: preserve the parent's owned history, still borrowed by child. After
-# notes: parent changes and restarts, child's first write starts from its pin.
-# notes: Reduced from branching.rs::branch_merge_preserves_state_when_native_versions_differ;
-# notes: that Rust owner also checks exact registration and no physical empty-delta commit.
+# notes: Main and parent have equal rows after a merge. Merging main back is an
+# notes: empty delta that still points the parent at main's lineage; the
+# notes: parent's former ref stays with child. The parent's next write must
+# notes: refuse (detached native lineage) rather than recreate that ref, and
+# notes: after a restart child's first write starts from its pin. The Rust owner
+# notes: branching.rs::branch_merge_preserves_state_when_native_versions_differ keeps the
+# notes: registration-level assertions (the pointer's native ref and version, no sidecar).
 
 --- schema
 node Person {
@@ -47,7 +48,7 @@ query owner_next_write() {
     update Person set { age: 32 } where name = "alice"
 }
 
---- expect affected: nodes=1 edges=0
+--- expect error: detached native lineage
 
 --- restart
 
@@ -89,19 +90,6 @@ p.age: I32
 
 --- query branch: parent
 query child_write_left_parent_unchanged() {
-    match { $p: Person }
-    return { $p.name, $p.age }
-}
-
---- expect unordered
-{"p.name":"alice","p.age":32}
-
---- expect shape
-p.name: String
-p.age: I32
-
---- query
-query main_kept_merged_rows() {
     match { $p: Person }
     return { $p.name, $p.age }
 }

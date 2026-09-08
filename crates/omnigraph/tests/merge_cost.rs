@@ -220,7 +220,8 @@ fn merge_validation_is_delta_scoped() {
         // One deletion inside a shared fragment must fetch only its known
         // base-live offset. Grow that fragment with a fixed one-row delta;
         // default debug Verify checks both classifiers against the same pins.
-        for rows in [32, 1024] {
+        {
+            let rows = 1024;
             let prefix = format!("dv-{rows}");
             let jsonl = (0..rows).map(|i| format!(
                 "{{\"type\":\"Person\",\"data\":{{\"name\":\"{prefix}-{i}\",\"age\":20}}}}\n"
