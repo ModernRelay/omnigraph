@@ -8,12 +8,28 @@ graph changes durably.
 Read query JSON includes the `graph_commit_id` pinned with the returned rows
 when the read snapshot has an effective graph head; a fresh pre-commit graph can
 omit it. A conditional mutation requires an ID returned by the read.
-An effectful `mutate --json` or `load --json` returns `commit` with the exact
-commit published by that attempt; a no-op mutation returns `"commit": null`.
+An effectful data mutation (`mutate --json` with a query declaration) or
+`load --json` returns `commit` with the exact commit published by that attempt;
+a no-op data mutation returns `"commit": null`.
 
 Protect a mutation derived from a read with `--if-commit <graph_commit_id>`.
 Any intervening branch commit fails without effects (CLI exit `4`, HTTP `412`).
 Re-read and decide again rather than retrying the stale mutation.
+
+### Branch statement receipts
+
+`mutate -e 'branch ...'` returns `outcome.kind` (`created`, `deleted`, or
+`merged`), with `outcome.merge` for a merge. Create/delete return `commit: null`
+even when they change branch state. An `already_up_to_date` merge also returns
+null. A publishing merge reads the target head after publication: its `commit`
+can name a later concurrent write, or be null if that read fails. The merge is
+already durable in either case. This applies to direct and served statements.
+
+Do not treat a branch-statement commit as an exact publication receipt, or null
+as proof that nothing happened. After a lost response, verify the intended
+branch/entity state before retrying. Branch statements refuse `--if-commit`;
+there is no conditional merge. For a later conditional data mutation, obtain
+the commit pinned to a fresh read of the data it will change.
 
 ## Inspect one commit
 
@@ -24,6 +40,11 @@ omnigraph commit changes <commit-id> --store graph.omni --json
 The commit is compared with its first parent. Inserts contain `after`, updates
 contain `before` and `after`, and deletes contain `before`; edge images also
 carry endpoints. Filter with repeatable `--kind`, `--type`, and `--op`.
+
+Change images use the query/export date and float spellings, but **retain
+explicit null values**: an absent property key means that property was not in
+the commit's schema. Do not apply the omitted-null rule for query rows or
+exports to `before`/`after` images.
 
 Large results use `next_page_token`. The CLI normally follows every page;
 `--page-token` fetches exactly one. A page token continues one commit result and

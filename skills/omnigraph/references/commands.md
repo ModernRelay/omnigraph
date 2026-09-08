@@ -43,6 +43,9 @@ omnigraph export $REPO --branch main --type Signal > signals.jsonl
 
 Use repeatable `--type` to filter node or edge types.
 
+Export preserves entity IDs and uses Arrow JSON date/float spelling, omitting
+null properties. See [export and date spelling](data.md#export-and-date-spelling).
+
 ## Blob Reads
 
 ```bash
@@ -67,6 +70,9 @@ omnigraph branch delete <branch-name> --store $REPO
 All support `--json`. `--delete-branch` removes the source only after a
 successful merge publication.
 
+Retain shared imported lineage until dependent branch merges finish; see
+[branch lifetime](data.md#keep-branches-short-lived).
+
 Each operation is also a GQ statement through the data verbs. Wrong-door rule:
 `branch create`, `branch delete`, and `branch merge` are control writes and go
 through `mutate`; `branch list` is a read and goes through `query`. A statement
@@ -81,6 +87,9 @@ omnigraph mutate -e 'branch delete "<branch-name>"' --store $REPO   # --yes or a
 
 A name outside the identifier alphabet `[a-z_][a-z0-9_]*` is quoted (see
 [`data.md`](data.md)); quoting a name that needs no quotes is always allowed.
+
+Control statements return `outcome`; their `commit` is not an exact write
+receipt. See [branch statement receipts](changes.md#branch-statement-receipts).
 
 ## Commits (History)
 
@@ -121,7 +130,9 @@ omnigraph lint --schema schema.pg --query queries/foo.gq --json
 omnigraph lint --query queries/foo.gq $REPO --json
 ```
 
-`lint` is the single query-validation command. See `references/queries.md`.
+`lint` validates query declarations against schema. A file containing one
+branch statement is intentionally refused and must stay outside the registered
+query directory. See [queries](queries.md).
 
 ## Embed
 
@@ -241,13 +252,17 @@ echo "$TOKEN" | omnigraph login <server>   # store a bearer token in ~/.omnigrap
 omnigraph logout <server>                  # remove it (idempotent)
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. Only `cluster` subcommands accept `--config`.
+The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `cluster` subcommands and managed `use` accept `--config`; data commands do not.
 
 ## Addressing a Graph
 
 How the CLI resolves which graph a data command (`query`, `mutate`, `load`, `branch`, …) runs against. A remote is addressed with `--server` (a bare `http(s)://` URL is not a graph address).
 
-Precedence (highest first):
+For implicit `query`/`mutate`, first check the current directory for managed
+context and follow [managed target selection](managed.md#target-selection).
+An explicit target or `--direct` selects the ordinary resolution below.
+
+Ordinary precedence (highest first):
 
 1. **`--store <uri>`** or a **positional `file://`/`s3://`/`az://` URI** — direct storage access (bypasses any server; no catalog, so stored-query *names* don't resolve). `--store` is exclusive with a positional URI and with `--server`. Azure is a qualification preview and writes require `omnigraph-azure-admission`.
 2. **`--server <name|url>`** (+ `--graph <id>` for a multi-graph server) — served/remote. A name resolves from `servers:` in `~/.omnigraph/config.yaml`; a literal `http(s)://` URL also works.
@@ -280,9 +295,13 @@ For params:
 - `jsonl` — NDJSON, one per line, with metadata line first
 - `json` — pretty `ReadOutput` envelope (metadata, columns, and rows)
 
-Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
-`load --json` include the exact published `commit` (`null` for a no-op
-mutation). `query --json` includes `graph_commit_id` when the read snapshot has
+The current CLI accepts `--format arrow` but its output path errors; use one
+of the working formats above. Do not treat it as a functioning IPC export.
+
+Mutations do not take `--format`; use `--json`. Successful data mutations and
+loads include the exact published `commit` (`null` for a no-op data mutation).
+Branch statements have [different receipts](changes.md#branch-statement-receipts).
+`query --json` includes `graph_commit_id` when the read snapshot has
 an effective graph head (a fresh pre-commit graph can omit it). When returned,
 use that position with `mutate --if-commit`; see [`changes.md`](changes.md).
 
@@ -297,7 +316,15 @@ curl http://127.0.0.1:8080/healthz
 
 Returns `200 OK` if the server is up.
 
+For readiness and rollout verification, inspect `/readyz` and its booted
+revision instead. It returns 503 while draining; see
+[readiness and shutdown](server-policy.md#readiness-and-shutdown).
+
 ## Cluster Control Plane
+
+These commands use direct storage when there is no managed context, or with
+explicit `--direct`. Managed saved-plan apply, config push, lifecycle, and
+separate data tokens are covered in [managed operations](managed.md).
 
 ```bash
 omnigraph cluster validate     --config <dir>          # parse + typecheck the declaration
@@ -306,6 +333,8 @@ omnigraph cluster plan         --config <dir> [--json] # preview (schema changes
 omnigraph cluster apply        --config <dir> --as <actor>   # converge; idempotent
 omnigraph cluster approve <resource> --config <dir> --as <actor>  # gate destructive changes (graph deletes)
 omnigraph cluster status       --config <dir> [--json] # read the ledger (read-only)
+omnigraph cluster observe      --config <dir> [--json] # live observations without lock/sweep/writes
+omnigraph cluster plan --observe --config <dir> [--json] # plan from observations without locking
 omnigraph cluster refresh      --config <dir>          # re-observe live graphs; flags drift
 omnigraph cluster force-unlock <LOCK_ID> --config <dir>  # clear a crashed run's lock (exact id from status)
 ```

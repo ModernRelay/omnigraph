@@ -38,7 +38,9 @@ Lint returns:
 - `"errors": N` — count of type errors (exit 1 when nonzero)
 - `"warnings": N` — count of drift warnings
 
-Run lint after every `.gq` or `.pg` edit. Wire into precommit.
+Run lint after editing query declarations or their schema. A file containing
+one branch statement is a separate form that lint intentionally refuses; keep
+it outside registered query directories.
 
 ## Parameterization
 
@@ -256,7 +258,16 @@ query friend_counts() {
 }
 ```
 
-Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
+Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on
+non-aggregated return fields. `min`/`max` accept numeric, String, Bool, Date,
+and DateTime properties and retain the property's type. Bool orders false
+before true; dates order chronologically. `sum`/`avg` remain numeric and
+return F64. Lists, vectors, and Blobs are not min/max inputs.
+
+With no matching rows, an all-aggregate query returns one row: count is 0 and
+the other aggregates are null (omitted in JSON). A query that also projects a
+group value returns no rows. A bare node binding is accepted only by count;
+the other aggregates need a property.
 
 ## Filter Operators
 
@@ -277,7 +288,13 @@ match {
 
 ## Mutations
 
-> **No top-level `mutation { ... }` wrapper.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` — that fails the parser at character 1 with `parse error: expected query_file`. Every executable block in a `.gq` file is a named `query`; the body's verb (`insert` / `update` / `delete`) determines whether it's a write. Dispatch via `omnigraph mutate` (not `query`).
+> **No top-level `mutation { ... }` wrapper.** A data mutation is a named
+> `query`; the body's verb (`insert` / `update` / `delete`) determines that it
+> is a write. Dispatch via `omnigraph mutate`. A file may instead contain
+> exactly one [branch statement](data.md#branch-commands-quick-reference),
+> never alongside query declarations. `lint` and the stored-query registry
+> deliberately reject that statement form with Q000; keep it outside registered
+> query directories.
 
 ### Insert
 

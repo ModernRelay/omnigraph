@@ -54,6 +54,36 @@ edge PartOfArtifact: Chunk -> InformationArtifact @card(1..1) {
 }
 ```
 
+### Edge keys
+
+An edge may declare identity in its body:
+
+```pg
+edge MemberOf: Person -> Group {
+    role: String
+    @key(src, dst, role)
+}
+```
+
+Every edge key includes both `src` and `dst`; additional members must be
+non-null scalars. The catalog orders endpoints first (`src`, then `dst`),
+followed by scalar members in stable property-ID order. Omit `data.id` on keyed
+JSONL input to derive it; a supplied ID must match exactly. With `@key(src, dst)`,
+the ID encodes the two endpoint IDs as a JSON array string, such as
+`["alice","team"]`.
+
+Keyed insert upserts by that identity. The same keyed edge inserted on two
+branches converges if its properties agree; differing non-key properties
+produce `divergent_insert`. Unkeyed edges keep generated/supplied IDs and allow
+parallel rows; `@unique(src, dst)` detects duplicates but does not make them
+converge. Edge `update` is unsupported: reinsert a keyed edge to change its
+values, or delete/reinsert an unkeyed edge.
+
+Declare a key when creating the type. Adding a key to an existing edge type is
+an unsupported migration. Edge property names `id`, `src`, `dst`, `from`, and
+`to` are reserved. On all new type declarations, `_distance` and `_score` are
+reserved search output names.
+
 ### Lint after every edit
 
 ```bash
@@ -161,7 +191,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@rename_from("OldName")` — migration-aware rename
 
 **Group-level (inside body block):**
-- `@key(prop1, prop2)` — ordered node identity tuple
+- `@key(prop1, prop2)` — node identity tuple; on edges use `@key(src, dst, ...)` (see [edge keys](#edge-keys))
 - `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(src, dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
 - `@range(prop, min..max)` — node-only numeric bounds; either bound may be omitted
@@ -198,12 +228,18 @@ Most schemas are fine without interfaces. Reach for them only when 3+ node types
 In a cluster deployment there is **no direct `omnigraph schema apply`** — the
 schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
+For a direct cluster (no managed context):
+
 ```bash
 $EDITOR schema.pg
 omnigraph cluster plan  --config .   # shows the engine's migration steps
 omnigraph cluster apply --config . --as <you>
 # restart the --cluster server to serve the new shape
 ```
+
+For a managed cluster, prepare the edited bundle with `cluster push`, then
+plan the returned revision and apply its saved plan. See [managed
+operations](managed.md#prepare-configuration-and-apply-a-saved-plan).
 
 Differences from direct `schema apply` (on a non-cluster store): **soft drops
 only** (`--allow-data-loss` is not reachable from cluster apply — prior versions

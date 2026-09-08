@@ -19,6 +19,10 @@ graphs:
 
 `queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed (per-query `mcp:`/expose flags are a planned phase).
 
+A branch statement file is not a query declaration: `lint`, bundle validation,
+and stored-query loading intentionally refuse it. Keep branch scripts outside
+the registered query paths and dispatch them directly with `query`/`mutate`.
+
 ## CLI
 
 ```bash
@@ -31,8 +35,9 @@ omnigraph queries list --cluster . --graph dev     # names and typed params
   `queries validate` instead audits the **applied** registry against each
   applied schema without restarting the server; it cannot see unapplied source
   edits. Registry drift or duplicate names quarantine the affected graph by
-  default while healthy graphs serve; startup is fatal when no healthy graph
-  remains or `--require-all-graphs` is set.
+  default while healthy graphs serve; startup is fatal when a nonempty cluster
+  has no healthy graph or `--require-all-graphs` is set and any graph fails.
+  An applied empty cluster may serve its readiness witness and empty inventory.
 - Both commands take `--cluster <dir|uri>`; `--graph` narrows the operation to
   one declared graph.
 - `queries` is distinct from `lint` — `lint` validates a single `.gq` file you point it at; `queries validate` validates the registry the server will actually serve.
