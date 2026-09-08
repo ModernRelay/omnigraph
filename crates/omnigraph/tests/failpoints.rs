@@ -10754,6 +10754,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target_inner() {
             .unwrap();
         drop(db);
 
+        let pointer_switch = !lazy_target && target_updates > 0;
         let operation_id = {
             let db = Omnigraph::open(&uri).await.unwrap();
             let _failpoint = ScopedFailPoint::new(
@@ -10770,24 +10771,64 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target_inner() {
                 ),
                 "{case}: unexpected error: {err}"
             );
-            single_sidecar_operation_id(dir.path())
+            if pointer_switch {
+                assert!(
+                    helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+                    "{case}: a pointer switch has no phase-B effect and arms no sidecar (RFC 0062)"
+                );
+                None
+            } else {
+                Some(single_sidecar_operation_id(dir.path()))
+            }
         };
 
         let db = Omnigraph::open(&uri).await.unwrap();
         drop(db);
-        assert_post_recovery_invariants(
-            dir.path(),
-            &operation_id,
-            RecoveryExpectation::RolledForwardOriginalLineage {
-                tables: vec![
-                    TableExpectation::branch("node:Person", "target_branch")
-                        .expected_main_manifest_pin(main_person_pin)
-                        .expected_recovery_parent_commit_id(target_parent_commit_id),
-                ],
-            },
-        )
-        .await
-        .unwrap();
+        match operation_id {
+            Some(operation_id) => assert_post_recovery_invariants(
+                dir.path(),
+                &operation_id,
+                RecoveryExpectation::RolledForwardOriginalLineage {
+                    tables: vec![
+                        TableExpectation::branch("node:Person", "target_branch")
+                            .expected_main_manifest_pin(main_person_pin)
+                            .expected_recovery_parent_commit_id(target_parent_commit_id),
+                    ],
+                },
+            )
+            .await
+            .unwrap(),
+            None => {
+                let db = Omnigraph::open(&uri).await.unwrap();
+                let result = db
+                    .query(
+                        ReadTarget::branch("target_branch"),
+                        TEST_QUERIES,
+                        "get_person",
+                        &params(&[("$name", "alice")]),
+                    )
+                    .await
+                    .unwrap();
+                let batch = result.concat_batches().unwrap();
+                assert_eq!(
+                    batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    i32::try_from(39 + target_updates).unwrap(),
+                    "{case}: a failed pointer switch leaves the target untouched"
+                );
+                assert_eq!(
+                    db.branch_merge(source_branch, "target_branch")
+                        .await
+                        .unwrap(),
+                    omnigraph::db::MergeOutcome::FastForward,
+                    "{case}: the retry completes the pointer switch"
+                );
+            }
+        }
 
         let db = Omnigraph::open(&uri).await.unwrap();
         let recovered_source = db

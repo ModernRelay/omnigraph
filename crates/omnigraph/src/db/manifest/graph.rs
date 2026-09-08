@@ -340,6 +340,7 @@ async fn build_initial_entries(
             native_dataset_branch: None,
             entity_count: 0,
             version_metadata: metadata.clone(),
+            manifest_version: GENESIS_MANIFEST_VERSION,
         });
         version_metadata.insert(identity, metadata.to_json_string()?);
     }
@@ -373,6 +374,7 @@ async fn build_initial_entries(
             native_dataset_branch: None,
             entity_count: 0,
             version_metadata: metadata.clone(),
+            manifest_version: GENESIS_MANIFEST_VERSION,
         });
         version_metadata.insert(identity, metadata.to_json_string()?);
     }

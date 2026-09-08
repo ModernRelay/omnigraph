@@ -495,7 +495,8 @@ where
         BTreeMap::<String, (crate::db::manifest::TableIdentity, String)>::new();
     let mut table_updates =
         BTreeMap::<crate::db::manifest::TableIdentity, crate::db::DatasetUpdate>::new();
-    let mut table_tombstones = BTreeMap::<crate::db::manifest::TableIdentity, (String, u64)>::new();
+    let mut table_tombstones =
+        BTreeMap::<crate::db::manifest::TableIdentity, (String, u64, Option<String>)>::new();
 
     // Pre-mint every table transaction before recovery is armed. Existing
     // rewrites are exact Overwrite transactions at their manifest pins;
@@ -668,7 +669,11 @@ where
         });
         table_tombstones.insert(
             entry.identity,
-            (dropped_table_key.clone(), tombstone_version),
+            (
+                dropped_table_key.clone(),
+                tombstone_version,
+                entry.native_dataset_branch.clone(),
+            ),
         );
     }
 
@@ -999,6 +1004,7 @@ where
                 crate::db::manifest::TableVersionExpectation {
                     table_key: table_key.clone(),
                     table_version: 0,
+                    native_ref: crate::db::manifest::NativeRefPin::Unchecked,
                 },
             );
             manifest_changes.push(ManifestChange::RegisterTable(TableRegistration {
@@ -1019,6 +1025,9 @@ where
                 crate::db::manifest::TableVersionExpectation {
                     table_key: source_table_key.clone(),
                     table_version: source_entry.published_dataset_version,
+                    native_ref: crate::db::manifest::NativeRefPin::Exact(
+                        source_entry.native_dataset_branch.clone(),
+                    ),
                 },
             );
             manifest_changes.push(ManifestChange::RenameTable(
@@ -1045,21 +1054,29 @@ where
                 .get(&update.type_key)
                 .cloned()
                 .unwrap_or_else(|| update.type_key.clone());
+            let native_ref = snapshot
+                .dataset(&expected_table_key)
+                .map(|entry| {
+                    crate::db::manifest::NativeRefPin::Exact(entry.native_dataset_branch.clone())
+                })
+                .unwrap_or(crate::db::manifest::NativeRefPin::Unchecked);
             expected_versions.insert(
                 update.identity,
                 crate::db::manifest::TableVersionExpectation {
                     table_key: expected_table_key,
                     table_version: expected,
+                    native_ref,
                 },
             );
             manifest_changes.push(ManifestChange::Update(update.clone()));
         }
-        for (identity, (table_key, tombstone_version)) in table_tombstones {
+        for (identity, (table_key, tombstone_version, native_ref)) in table_tombstones {
             expected_versions.insert(
                 identity,
                 crate::db::manifest::TableVersionExpectation {
                     table_key: table_key.clone(),
                     table_version: tombstone_version.saturating_sub(1),
+                    native_ref: crate::db::manifest::NativeRefPin::Exact(native_ref),
                 },
             );
             manifest_changes.push(ManifestChange::Tombstone(TableTombstone {

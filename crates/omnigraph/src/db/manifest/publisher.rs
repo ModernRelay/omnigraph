@@ -42,9 +42,9 @@ use super::state::{
     manifest_schema, read_manifest_state, read_publish_scan,
 };
 use super::{
-    DatasetEntry, ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, OBJECT_TYPE_TABLE,
-    OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, TableIdentity, TableRegistration,
-    TableRename, TableTombstone,
+    DatasetEntry, ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, NativeRefPin,
+    OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, TableIdentity,
+    TableRegistration, TableRename, TableTombstone, WinnerRef,
 };
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
@@ -197,15 +197,17 @@ struct PendingVersionRow {
 struct LoadedPublishState {
     dataset: Dataset,
     registered_tables: HashMap<TableIdentity, TableRegistration>,
+    /// Registrations keyed by `(identity, manifest_version)` (RFC 0062).
     existing_versions: HashMap<(TableIdentity, u64), DatasetEntry>,
-    existing_tombstones: HashMap<(TableIdentity, u64), ()>,
+    /// Tombstones keyed the same way, see [`PublishScan::tombstones`].
+    existing_tombstones: HashMap<(TableIdentity, u64), u64>,
     lineage_rows: Vec<GraphLineageRow>,
     graph_heads: HashMap<String, String>,
 }
 
 /// What `fold_inputs` folds a publish batch down to: the alias/path
 /// registrations after the batch, the surviving version entries, and the
-/// `(identity, version)` pairs the batch tombstoned.
+/// `(identity, manifest_version)` pairs of every tombstone after the batch.
 type FoldedPublishInputs = (
     HashMap<TableIdentity, TableRegistration>,
     Vec<DatasetEntry>,
@@ -265,12 +267,7 @@ impl GraphNamespacePublisher {
         let existing_versions = scan
             .version_entries
             .iter()
-            .map(|entry| {
-                (
-                    (entry.identity, entry.published_dataset_version),
-                    entry.clone(),
-                )
-            })
+            .map(|entry| ((entry.identity, entry.manifest_version), entry.clone()))
             .collect();
         let existing_tombstones = scan.tombstones.into_iter().collect();
         Ok(LoadedPublishState {
@@ -287,9 +284,10 @@ impl GraphNamespacePublisher {
         changes: &[ManifestChange],
         known_tables: &HashMap<TableIdentity, TableRegistration>,
         existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
+        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
+        new_manifest_version: u64,
     ) -> Result<Vec<PendingVersionRow>> {
-        let mut request_versions = HashMap::<(TableIdentity, u64), ()>::new();
+        let mut claimed_identities = std::collections::HashSet::<TableIdentity>::new();
         let mut binding_changes = HashMap::<TableIdentity, ()>::new();
         let mut known_tables = known_tables.clone();
         let mut rows = Vec::with_capacity(changes.len());
@@ -439,44 +437,30 @@ impl GraphNamespacePublisher {
                             },
                         ));
                     }
-                    if request_versions
-                        .insert((update.identity, table_version), ())
-                        .is_some()
-                    {
-                        return Err(OmniError::storage_namespace(
-                            NamespaceError::ConcurrentModification {
-                                message: format!(
-                                    "table version {} is claimed twice in one publish request for identity {} ({})",
-                                    table_version, update.identity, table_key
-                                ),
-                            },
-                        ));
+                    if !claimed_identities.insert(update.identity) {
+                        return Err(OmniError::manifest(format!(
+                            "table identity {} ({}) is claimed twice in one publish request",
+                            update.identity, table_key
+                        )));
                     }
-                    if let Some(existing) = existing_versions.get(&(update.identity, table_version))
+                    if existing_tombstones
+                        .keys()
+                        .any(|(candidate, _)| *candidate == update.identity)
+                        && !Self::is_live_identity(
+                            update.identity,
+                            existing_versions,
+                            existing_tombstones,
+                        )
                     {
-                        let is_owner_branch_handoff = existing.entity_count == row_count
-                            && existing.native_dataset_branch != table_branch;
-                        // Re-registering the row already stored is not a
-                        // collision: the post-publish fold reaches the same
-                        // state either way. Only a DIFFERENT row at an
-                        // occupied (identity, version) is what this guards.
-                        let reregisters_stored_row = existing.entity_count == row_count
-                            && existing.native_dataset_branch == table_branch
-                            && existing.version_metadata == version_metadata;
-                        if !(is_owner_branch_handoff || reregisters_stored_row) {
-                            return Err(OmniError::storage_namespace(
-                                NamespaceError::ConcurrentModification {
-                                    message: format!(
-                                        "table version {} already exists for identity {} ({}) with different state",
-                                        table_version, update.identity, table_key
-                                    ),
-                                },
-                            ));
-                        }
+                        return Err(OmniError::manifest(format!(
+                            "table identity {} ({}) is tombstoned; a dropped table is never \
+                             re-registered (re-adding a type mints a new incarnation)",
+                            update.identity, table_key
+                        )));
                     }
 
                     rows.push(PendingVersionRow {
-                        object_id: version_object_id(update.identity, table_version),
+                        object_id: version_object_id(update.identity, new_manifest_version),
                         object_type: OBJECT_TYPE_TABLE_VERSION.to_string(),
                         location: None,
                         metadata: Some(version_metadata.to_json_string()?),
@@ -508,18 +492,27 @@ impl GraphNamespacePublisher {
                             },
                         ));
                     }
-                    if existing_tombstones.contains_key(&(*identity, *tombstone_version)) {
-                        return Err(OmniError::storage_namespace(
-                            NamespaceError::ConcurrentModification {
-                                message: format!(
-                                    "table tombstone {} already exists for identity {} ({})",
-                                    tombstone_version, identity, table_key
-                                ),
-                            },
-                        ));
+                    if !claimed_identities.insert(*identity) {
+                        return Err(OmniError::manifest(format!(
+                            "table identity {} ({}) is claimed twice in one publish request",
+                            identity, table_key
+                        )));
+                    }
+                    if existing_tombstones
+                        .keys()
+                        .any(|(candidate, _)| *candidate == *identity)
+                        && !Self::is_live_identity(
+                            *identity,
+                            existing_versions,
+                            existing_tombstones,
+                        )
+                    {
+                        return Err(OmniError::manifest(format!(
+                            "table identity {identity} ({table_key}) is already tombstoned"
+                        )));
                     }
                     rows.push(PendingVersionRow {
-                        object_id: tombstone_object_id(*identity, *tombstone_version),
+                        object_id: tombstone_object_id(*identity, new_manifest_version),
                         object_type: OBJECT_TYPE_TABLE_TOMBSTONE.to_string(),
                         location: None,
                         metadata: None,
@@ -616,77 +609,67 @@ impl GraphNamespacePublisher {
         )
     }
 
-    /// Reduce the loaded `(identity, table_version) → entry` map and the
-    /// tombstone set to "latest non-tombstoned version per identity" — the same
-    /// reduction performed by `read_manifest_state` on the visible snapshot.
-    /// Tombstoned tables fall back to their highest tombstone version so that
-    /// the resulting `actual` reported in `PublishedDatasetVersionMismatch` is
-    /// meaningful even when the caller's expected table no longer exists.
+    /// Data version of the greatest-clock row per identity: what the caller's
+    /// `expected_table_versions` pin is compared against. A tombstone that wins
+    /// reports its sealed data version, so `actual` stays meaningful.
     fn latest_visible_per_identity(
         existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
-    ) -> HashMap<TableIdentity, u64> {
-        let mut max_tombstones = HashMap::<TableIdentity, u64>::new();
-        let mut __dst_tk: Vec<_> = existing_tombstones.keys().collect();
-        __dst_tk.sort();
-        for (identity, version) in __dst_tk {
-            max_tombstones
-                .entry(*identity)
-                .and_modify(|v| {
-                    if *version > *v {
-                        *v = *version;
-                    }
-                })
-                .or_insert(*version);
-        }
+        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
+    ) -> HashMap<TableIdentity, (u64, WinnerRef)> {
+        let mut rows: Vec<(TableIdentity, u64, bool, u64, Option<String>)> = existing_versions
+            .iter()
+            .map(|((identity, clock), entry)| {
+                (
+                    *identity,
+                    *clock,
+                    false,
+                    entry.published_dataset_version,
+                    entry.native_dataset_branch.clone(),
+                )
+            })
+            .chain(
+                existing_tombstones
+                    .iter()
+                    .map(|((identity, clock), sealed)| (*identity, *clock, true, *sealed, None)),
+            )
+            .collect();
+        rows.sort_unstable();
 
-        let mut latest = HashMap::<TableIdentity, u64>::new();
-        let mut __dst_vk: Vec<_> = existing_versions.keys().collect();
-        __dst_vk.sort();
-        for (identity, version) in __dst_vk {
-            let tombstoned = max_tombstones
-                .get(identity)
-                .map(|t| *t >= *version)
-                .unwrap_or(false);
-            if tombstoned {
-                continue;
+        let mut latest = HashMap::<TableIdentity, (u64, u64, WinnerRef)>::new();
+        for (identity, clock, is_tombstone, data_version, native_ref) in rows {
+            match latest.get(&identity) {
+                Some((existing_clock, _, _)) if *existing_clock > clock => {}
+                _ => {
+                    let winner_ref = if is_tombstone {
+                        WinnerRef::Tombstone
+                    } else {
+                        WinnerRef::Registration(native_ref)
+                    };
+                    latest.insert(identity, (clock, data_version, winner_ref));
+                }
             }
-            latest
-                .entry(*identity)
-                .and_modify(|v| {
-                    if *version > *v {
-                        *v = *version;
-                    }
-                })
-                .or_insert(*version);
         }
-
-        // For tables that have only tombstones (no visible entry), surface the
-        // tombstone version so callers see a non-zero `actual`.
-        let mut __dst_mt: Vec<_> = max_tombstones.iter().collect();
-        __dst_mt.sort_by(|a, b| a.0.cmp(b.0));
-        for (identity, tombstone) in __dst_mt {
-            latest.entry(*identity).or_insert(*tombstone);
-        }
-
         latest
+            .into_iter()
+            .map(|(identity, (_, data_version, native_ref))| (identity, (data_version, native_ref)))
+            .collect()
     }
 
     fn is_live_identity(
         identity: TableIdentity,
         existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
+        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
     ) -> bool {
-        let latest_version = existing_versions
+        let latest_registration = existing_versions
             .keys()
-            .filter_map(|(candidate, version)| (*candidate == identity).then_some(*version))
+            .filter_map(|(candidate, clock)| (*candidate == identity).then_some(*clock))
             .max();
         let latest_tombstone = existing_tombstones
             .keys()
-            .filter_map(|(candidate, version)| (*candidate == identity).then_some(*version))
+            .filter_map(|(candidate, clock)| (*candidate == identity).then_some(*clock))
             .max();
-        latest_version
-            .map(|version| latest_tombstone.map(|t| t < version).unwrap_or(true))
+        latest_registration
+            .map(|clock| latest_tombstone.map(|t| t < clock).unwrap_or(true))
             .unwrap_or(false)
     }
 
@@ -702,9 +685,10 @@ impl GraphNamespacePublisher {
     /// (`graph_commit`/`graph_head`) are not manifest-state entries.
     fn fold_inputs(
         existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
+        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
         rows: &[PendingVersionRow],
         registered_tables: &HashMap<TableIdentity, TableRegistration>,
+        new_manifest_version: u64,
     ) -> Result<FoldedPublishInputs> {
         let mut registrations = registered_tables.clone();
         for row in rows {
@@ -732,20 +716,11 @@ impl GraphNamespacePublisher {
             }
         }
 
-        // Key version entries by `(identity, table_version)` so a pending row at
-        // the SAME version REPLACES the pre-publish entry — modelling merge-insert
-        // `UpdateAll` on the shared, deterministic `version_object_id(identity,
-        // version)`. Load-bearing for the owner-branch handoff
-        // (`is_owner_branch_handoff`): a handoff updates a `table_version` row in
-        // place at the same version with a new `table_branch`, so `__manifest` ends
-        // with ONE row carrying the new branch and a re-scan reflects it; appending
-        // the pending row instead (and letting `assemble_manifest_state` keep the
-        // first equal-version entry) would leave `known_state` on the stale fork.
         let mut version_map: HashMap<(TableIdentity, u64), DatasetEntry> =
             existing_versions.clone();
         let mut tombstones: Vec<(TableIdentity, u64)> = existing_tombstones
             .keys()
-            .map(|(identity, version)| (*identity, *version))
+            .map(|(identity, clock)| (*identity, *clock))
             .collect();
 
         for row in rows {
@@ -770,7 +745,7 @@ impl GraphNamespacePublisher {
                         ))
                     })?;
                     version_map.insert(
-                        (identity, table_version),
+                        (identity, new_manifest_version),
                         DatasetEntry {
                             identity,
                             type_key: row.table_key.clone(),
@@ -784,6 +759,7 @@ impl GraphNamespacePublisher {
                                 ))
                             })?,
                             version_metadata: TableVersionMetadata::from_json_str(metadata_json)?,
+                            manifest_version: new_manifest_version,
                         },
                     );
                 }
@@ -794,13 +770,7 @@ impl GraphNamespacePublisher {
                             row.table_key
                         ))
                     })?;
-                    let tombstone_version = row.table_version.ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "post-publish fold: tombstone row missing version for {}",
-                            row.table_key
-                        ))
-                    })?;
-                    tombstones.push((identity, tombstone_version));
+                    tombstones.push((identity, new_manifest_version));
                 }
                 _ => {}
             }
@@ -819,12 +789,11 @@ impl GraphNamespacePublisher {
         ))
     }
 
-    /// Compare each caller-supplied expectation against the manifest's current
-    /// latest visible version per table. The first mismatch is returned as a
-    /// typed `PublishedDatasetVersionMismatch` (`actual = 0` if the table isn't in the
-    /// manifest at all).
+    /// Check each expectation against the newest visible row per table: the
+    /// version first (`PublishedDatasetVersionMismatch`, `actual = 0` when the
+    /// table is absent), then an `Exact` pin's ref (`ReadSetChanged`).
     fn check_expected_table_versions(
-        latest_per_table: &HashMap<TableIdentity, u64>,
+        latest_per_table: &HashMap<TableIdentity, (u64, WinnerRef)>,
         registrations: &HashMap<TableIdentity, TableRegistration>,
         expected: &ExpectedTableVersions,
     ) -> Result<()> {
@@ -841,12 +810,23 @@ impl GraphNamespacePublisher {
                     ));
                 }
             }
-            let actual = latest_per_table.get(identity).copied().unwrap_or(0);
+            let latest = latest_per_table.get(identity);
+            let actual = latest.map(|(version, _)| *version).unwrap_or(0);
             if actual != expectation.table_version {
                 return Err(OmniError::published_dataset_version_mismatch(
                     expectation.table_key.clone(),
                     expectation.table_version,
                     actual,
+                ));
+            }
+            if let NativeRefPin::Exact(pinned) = &expectation.native_ref
+                && let Some((_, WinnerRef::Registration(winner_ref))) = latest
+                && winner_ref != pinned
+            {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("native_ref:{}", expectation.table_key),
+                    Some(format!("{pinned:?}")),
+                    Some(format!("{winner_ref:?}")),
                 ));
             }
         }
@@ -1100,24 +1080,17 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 expected_table_versions,
             )?;
 
+            let new_manifest_version = dataset.version().version + 1;
             let mut rows = Self::build_pending_rows(
                 changes,
                 &known_tables,
                 &existing_versions,
                 &existing_tombstones,
+                new_manifest_version,
             )?;
 
-            // Fold the graph commit into the SAME batch so table-version rows
-            // and lineage rows land in one merge-insert (one Lance commit, one
-            // manifest version) — no separate write, no manifest→commit-graph
-            // atomicity gap. The merge-insert advances exactly one version on
-            // top of the loaded dataset, so the commit pins
-            // `current + 1`. The parent is resolved here, per attempt, from the
-            // lineage rows THIS attempt's scan loaded (TOCTOU closed on a CAS
-            // retry — a retry re-runs `load_publish_state` → fresh lineage).
             let parent_commit_id = match lineage {
                 Some(intent) => {
-                    let new_manifest_version = dataset.version().version + 1;
                     let (commit_rows, parent) =
                         Self::resolve_lineage_rows(&lineage_rows, intent, new_manifest_version)?;
                     rows.extend(commit_rows);
@@ -1154,6 +1127,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 &existing_tombstones,
                 &rows,
                 &known_tables,
+                new_manifest_version,
             )?;
             let mut fold_graph_heads = graph_heads;
             if let Some(intent) = lineage {
@@ -1171,7 +1145,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // `__manifest`; discovering one after `merge_rows` would be an
             // acknowledged-but-unreadable manifest commit.
             let mut known_state = assemble_manifest_state(
-                dataset.version().version + 1,
+                new_manifest_version,
                 fold_registrations,
                 fold_entries,
                 fold_tombstones,
@@ -1180,6 +1154,14 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
 
             match self.merge_rows(dataset, rows).await {
                 Ok(new_dataset) => {
+                    if new_dataset.version().version != new_manifest_version {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest commit at version {} is durable but its rows carry manifest \
+                             version {}; the coordinator's view is stale, reopen the graph",
+                            new_dataset.version().version,
+                            new_manifest_version
+                        )));
+                    }
                     known_state.version = new_dataset.version().version;
                     return Ok(PublishOutcome {
                         dataset: new_dataset,

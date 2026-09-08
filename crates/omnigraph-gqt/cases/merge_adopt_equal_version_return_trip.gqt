@@ -1,0 +1,89 @@
+# issue: none
+# notes: The return trip of the equal-number round trip. The first eight steps
+# notes: match merge_adopt_equal_source_version_collides.gqt: two edge writes on
+# notes: `feature`, so both edge tables reach Lance v4 on different native refs.
+# notes: After `main` is adopted into `feature`, only a node is edited on
+# notes: `feature` and the branch merges back; `main` must keep all four edges
+# notes: across a restart.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query add_b_c() {
+    insert Knows { from: "b", to: "c" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: feature
+query add_c_a() {
+    insert Knows { from: "c", to: "a" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query add_a_c_on_main() {
+    insert Knows { from: "a", to: "c" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- mutate branch: feature
+query add_d_on_feature() {
+    insert Person { name: "d" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- restart
+
+--- query
+query edges_on_main() {
+    match {
+        $x: Person
+        $x knows $y
+    }
+    return { $x.name, $y.name }
+}
+
+--- expect unordered
+{"x.name": "a", "y.name": "b"}
+{"x.name": "b", "y.name": "c"}
+{"x.name": "c", "y.name": "a"}
+{"x.name": "a", "y.name": "c"}
+
+--- expect shape
+x.name: String
+y.name: String

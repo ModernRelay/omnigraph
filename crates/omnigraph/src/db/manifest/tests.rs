@@ -375,6 +375,61 @@ async fn test_drop_and_same_name_readd_uses_new_identity_and_path() {
     assert_eq!(historical_person.dataset_path, person_entry.dataset_path);
 }
 
+/// RFC 0062: a dropped identity is never re-registered. A later registration
+/// would win the clock-ordered fold and resurrect the table, so the publisher
+/// refuses it before the merge-insert.
+#[tokio::test]
+async fn test_publish_refuses_registration_of_a_tombstoned_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
+    mc.commit_changes(&[ManifestChange::Tombstone(TableTombstone {
+        identity: person_entry.identity,
+        table_key: "node:Person".to_string(),
+        tombstone_version: person_entry.published_dataset_version + 1,
+    })])
+    .await
+    .unwrap();
+    let dropped_version = mc.version();
+    assert!(mc.snapshot().dataset("node:Person").is_none());
+
+    let err = mc
+        .commit_changes(&[ManifestChange::Update(DatasetUpdate {
+            identity: person_entry.identity,
+            type_key: "node:Person".to_string(),
+            published_dataset_version: person_entry.published_dataset_version,
+            native_dataset_branch: None,
+            entity_count: person_entry.entity_count,
+            version_metadata: person_entry.version_metadata.clone(),
+        })])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("is tombstoned"),
+        "unexpected: {err}"
+    );
+
+    let err = mc
+        .commit_changes(&[ManifestChange::Tombstone(TableTombstone {
+            identity: person_entry.identity,
+            table_key: "node:Person".to_string(),
+            tombstone_version: person_entry.published_dataset_version + 1,
+        })])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already tombstoned"),
+        "unexpected: {err}"
+    );
+
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(reopened.version(), dropped_version);
+    assert!(reopened.snapshot().dataset("node:Person").is_none());
+}
+
 #[tokio::test]
 async fn metadata_only_rename_preserves_identity_path_and_table_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -426,6 +481,7 @@ async fn metadata_only_rename_preserves_identity_path_and_table_version() {
         TableVersionExpectation {
             table_key: "node:Person".to_string(),
             table_version: before.published_dataset_version,
+            native_ref: NativeRefPin::Unchecked,
         },
     )]);
     let stale_error = mc
@@ -1120,11 +1176,13 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
         None,
     );
 
-    // A genuine registry collision: the stored `(identity, version)` is
-    // occupied by a row carrying a DIFFERENT state. Re-registering the stored
-    // row byte-for-byte is not a conflict and is pinned separately by
-    // `test_batch_create_table_versions_allows_identical_reregistration`.
-    let conflicting_company_request = company_version_metadata.to_create_table_version_request(
+    let company_request = company_version_metadata.to_create_table_version_request(
+        "node:Company",
+        company_entry.published_dataset_version,
+        company_entry.entity_count,
+        None,
+    );
+    let duplicate_company_request = company_version_metadata.to_create_table_version_request(
         "node:Company",
         company_entry.published_dataset_version,
         company_entry.entity_count + 1,
@@ -1132,11 +1190,12 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
     );
 
     let err = GraphNamespacePublisher::new(uri, None)
-        .publish_requests(&[person_request, conflicting_company_request])
+        .publish_requests(&[person_request, company_request, duplicate_company_request])
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("with different state"),
+        err.to_string()
+            .contains("is claimed twice in one publish request"),
         "unexpected refusal: {err}"
     );
 
@@ -1269,11 +1328,11 @@ async fn test_batch_create_table_versions_allows_identical_reregistration() {
     assert_eq!(entry.entity_count, person_entry.entity_count);
 }
 
-/// The widened exemption stays narrow: a row that DIFFERS at an occupied
-/// `(identity, version)` on the same branch is still the collision the guard
-/// is there to catch.
+/// RFC 0062: a row that differs at an occupied Lance version is an ordinary
+/// later registration. Its greater manifest version wins the fold and the
+/// earlier row survives beside it.
 #[tokio::test]
-async fn test_batch_create_table_versions_rejects_differing_row_at_same_version() {
+async fn test_batch_create_table_versions_later_clock_wins_at_same_lance_version() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
@@ -1298,23 +1357,186 @@ async fn test_batch_create_table_versions_rejects_differing_row_at_same_version(
         None,
     );
 
-    let err = GraphNamespacePublisher::new(uri, None)
+    GraphNamespacePublisher::new(uri, None)
         .publish_requests(&[request])
+        .await
+        .expect("a differing row at an occupied Lance version is a later registration");
+
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    let entry = reopened.snapshot().dataset("node:Person").unwrap().clone();
+    assert_eq!(entry.entity_count, person_entry.entity_count + 1);
+    assert_eq!(
+        entry.published_dataset_version,
+        person_entry.published_dataset_version
+    );
+    assert_eq!(entry.manifest_version, reopened.version());
+    assert!(entry.manifest_version > person_entry.manifest_version);
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    let rows = super::state::read_publish_scan(&ds)
+        .await
+        .unwrap()
+        .version_entries;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.type_key == "node:Person")
+            .count(),
+        2,
+        "the earlier registration must survive beside the later one: {rows:?}"
+    );
+}
+
+/// RFC 0062: a registration with a LOWER Lance version number on another
+/// native ref wins the fold when it was published later; the pre-v7 fold
+/// picked the greater number and never showed it.
+#[tokio::test]
+async fn test_later_registration_with_lower_lance_version_wins_the_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
+        .await
+        .unwrap();
+    person_ds
+        .create_branch("feature", person_entry.published_dataset_version, None)
+        .await
+        .unwrap();
+    let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
+    let person_schema = Arc::new(feature_ds.schema().into());
+    for name in ["Alice", "Bob"] {
+        let batch = entity_batch(
+            Arc::clone(&person_schema),
+            format!("person-{name}"),
+            name,
+            Some(30),
+        );
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], Arc::clone(&person_schema));
+        feature_ds.append(reader, None).await.unwrap();
+    }
+    let feature_version = feature_ds.version().version;
+    let feature_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.dataset_path,
+        Some("feature"),
+        feature_version,
+    )
+    .await
+    .unwrap();
+    GraphNamespacePublisher::new(uri, None)
+        .publish_requests(&[feature_metadata.to_create_table_version_request(
+            "node:Person",
+            feature_version,
+            2,
+            Some("feature"),
+        )])
+        .await
+        .unwrap();
+
+    let batch = entity_batch(
+        Arc::clone(&person_schema),
+        "person-carol",
+        "Carol",
+        Some(30),
+    );
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], Arc::clone(&person_schema));
+    person_ds.append(reader, None).await.unwrap();
+    let main_version = person_ds.version().version;
+    assert!(main_version < feature_version);
+    let main_metadata =
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, main_version)
+            .await
+            .unwrap();
+    let mut warm = ManifestCoordinator::open(uri).await.unwrap();
+    warm.commit(&[DatasetUpdate {
+        identity: person_entry.identity,
+        type_key: "node:Person".to_string(),
+        published_dataset_version: main_version,
+        native_dataset_branch: None,
+        entity_count: 1,
+        version_metadata: main_metadata,
+    }])
+    .await
+    .unwrap();
+    let folded = warm.snapshot().dataset("node:Person").unwrap().clone();
+
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    let entry = reopened.snapshot().dataset("node:Person").unwrap().clone();
+    assert_eq!(entry.published_dataset_version, main_version);
+    assert_eq!(entry.native_dataset_branch, None);
+    assert_eq!(entry.entity_count, 1);
+    assert_eq!(entry.manifest_version, reopened.version());
+    assert_eq!(
+        folded.published_dataset_version,
+        entry.published_dataset_version
+    );
+    assert_eq!(folded.native_dataset_branch, entry.native_dataset_branch);
+    assert_eq!(folded.entity_count, entry.entity_count);
+    assert_eq!(folded.manifest_version, entry.manifest_version);
+}
+
+/// RFC 0062: one publish lands at one manifest version, which is the row
+/// key, so a second registration of one identity in the same batch is refused
+/// before the merge-insert, whatever its Lance version number.
+#[tokio::test]
+async fn test_publish_refuses_two_registrations_of_one_identity_in_one_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let manifest_version = mc.version();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
+        .await
+        .unwrap();
+    let person_schema = Arc::new(person_ds.schema().into());
+    let mut versions = Vec::new();
+    for name in ["Alice", "Bob"] {
+        let batch = entity_batch(
+            Arc::clone(&person_schema),
+            format!("person-{name}"),
+            name,
+            Some(30),
+        );
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], Arc::clone(&person_schema));
+        person_ds.append(reader, None).await.unwrap();
+        versions.push(person_ds.version().version);
+    }
+    let mut requests = Vec::new();
+    for (rows, version) in versions.iter().enumerate() {
+        let metadata =
+            table_version_metadata_for_state(uri, &person_entry.dataset_path, None, *version)
+                .await
+                .unwrap();
+        requests.push(metadata.to_create_table_version_request(
+            "node:Person",
+            *version,
+            rows as u64 + 1,
+            None,
+        ));
+    }
+
+    let err = GraphNamespacePublisher::new(uri, None)
+        .publish_requests(&requests)
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("with different state"),
+        err.to_string()
+            .contains("is claimed twice in one publish request"),
         "unexpected refusal: {err}"
     );
 
     let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(reopened.version(), manifest_version);
     assert_eq!(
         reopened
             .snapshot()
             .dataset("node:Person")
             .unwrap()
-            .entity_count,
-        person_entry.entity_count,
+            .published_dataset_version,
+        person_entry.published_dataset_version
     );
 }
 
@@ -1400,18 +1622,9 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
     );
 }
 
-/// Regression (PR #307 review — Cursor Bugbot High + Codex P2): the post-publish
-/// fold (`#1b`) must reflect an owner-branch handoff. A handoff updates a
-/// `table_version` row IN PLACE at the SAME Lance version with a new
-/// `table_branch` — merge-insert `UpdateAll` on the deterministic
-/// `version_object_id(table_key, version)`, so `__manifest` ends with one row
-/// carrying the new branch. The buggy fold appended the pending row after
-/// `existing_versions`, and `assemble_manifest_state` keeps the FIRST entry at
-/// equal `table_version`, so the WARM coordinator retained the stale
-/// `table_branch` ("feature") while a fresh `read_manifest_state` reopen reflected
-/// the handoff ("experiment"). Unlike the namespace-publisher handoff test above,
-/// this commits through the coordinator's `commit` path to exercise the fold, then
-/// reads the warm `snapshot()` WITHOUT reopening.
+/// Regression (PR #307 review): the warm post-publish fold must pick a same
+/// Lance-version registration with a new `table_branch` by its clock, exactly
+/// as a fresh reopen does; the buggy fold kept the first equal-version row.
 #[tokio::test]
 async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     let dir = tempfile::tempdir().unwrap();
@@ -1821,6 +2034,7 @@ async fn test_commit_with_expected_accepts_matching_versions() {
         TableVersionExpectation {
             table_key: "node:Person".to_string(),
             table_version: 1,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
     expected.insert(
@@ -1828,6 +2042,7 @@ async fn test_commit_with_expected_accepts_matching_versions() {
         TableVersionExpectation {
             table_key: "node:Company".to_string(),
             table_version: 1,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
 
@@ -1869,6 +2084,7 @@ async fn test_commit_with_expected_rejects_stale_with_typed_details() {
         TableVersionExpectation {
             table_key: "node:Person".to_string(),
             table_version: 1,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
 
@@ -1895,6 +2111,132 @@ async fn test_commit_with_expected_rejects_stale_with_typed_details() {
         },
         other => panic!("expected OmniError::Manifest, got {:?}", other),
     }
+}
+
+/// RFC 0062: two registrations of one identity can carry equal Lance version
+/// numbers on different native refs, so a pin naming one ref must be refused
+/// when the winner at that number sits on another.
+#[tokio::test]
+async fn test_commit_with_expected_rejects_same_number_on_another_native_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let person_entry = mc.snapshot().dataset("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.dataset_path))
+        .await
+        .unwrap();
+    person_ds
+        .create_branch("feature", person_entry.published_dataset_version, None)
+        .await
+        .unwrap();
+    let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
+    let person_schema = Arc::new(feature_ds.schema().into());
+    let batch = entity_batch(
+        Arc::clone(&person_schema),
+        "person-alice",
+        "Alice",
+        Some(30),
+    );
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], Arc::clone(&person_schema));
+    feature_ds.append(reader, None).await.unwrap();
+    let feature_version = feature_ds.version().version;
+
+    let batch = entity_batch(Arc::clone(&person_schema), "person-bob", "Bob", Some(30));
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], Arc::clone(&person_schema));
+    person_ds.append(reader, None).await.unwrap();
+    let main_version = person_ds.version().version;
+    assert_eq!(
+        feature_version, main_version,
+        "the test needs equal Lance numbers on the two refs"
+    );
+
+    let feature_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.dataset_path,
+        Some("feature"),
+        feature_version,
+    )
+    .await
+    .unwrap();
+    GraphNamespacePublisher::new(uri, None)
+        .publish_requests(&[feature_metadata.to_create_table_version_request(
+            "node:Person",
+            feature_version,
+            1,
+            Some("feature"),
+        )])
+        .await
+        .unwrap();
+    let main_metadata =
+        table_version_metadata_for_state(uri, &person_entry.dataset_path, None, main_version)
+            .await
+            .unwrap();
+    GraphNamespacePublisher::new(uri, None)
+        .publish_requests(&[main_metadata.to_create_table_version_request(
+            "node:Person",
+            main_version,
+            1,
+            None,
+        )])
+        .await
+        .unwrap();
+
+    let mut mc = ManifestCoordinator::open(uri).await.unwrap();
+    let winner = mc.snapshot().dataset("node:Person").unwrap().clone();
+    assert_eq!(winner.published_dataset_version, main_version);
+    assert_eq!(winner.native_dataset_branch, None);
+    let manifest_version = mc.version();
+
+    let update = append_person_and_make_update(uri, &person_entry, "Carol").await;
+    let mut feature_pin = HashMap::new();
+    feature_pin.insert(
+        person_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version: feature_version,
+            native_ref: NativeRefPin::Exact(Some("feature".to_string())),
+        },
+    );
+    let err = mc
+        .commit_with_expected(std::slice::from_ref(&update), &feature_pin)
+        .await
+        .expect_err("a pin on the feature ref must not be satisfied by the root-ref winner");
+    assert!(
+        err.to_string().contains("native_ref:"),
+        "unexpected refusal: {err}"
+    );
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(reopened.version(), manifest_version);
+    assert_eq!(
+        reopened
+            .snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        main_version
+    );
+
+    let mut root_pin = HashMap::new();
+    root_pin.insert(
+        person_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version: main_version,
+            native_ref: NativeRefPin::Exact(None),
+        },
+    );
+    mc.commit_with_expected(std::slice::from_ref(&update), &root_pin)
+        .await
+        .expect("the same pin naming the root lineage matches the winner");
+    assert_eq!(
+        mc.snapshot()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        update.published_dataset_version
+    );
 }
 
 #[tokio::test]
@@ -1941,6 +2283,7 @@ async fn test_commit_with_expected_catches_drift_on_untouched_table() {
         TableVersionExpectation {
             table_key: "node:Company".to_string(),
             table_version: 1,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
 
@@ -1981,6 +2324,7 @@ async fn test_commit_with_expected_unknown_table_reports_actual_zero() {
         TableVersionExpectation {
             table_key: "node:DoesNotExist".to_string(),
             table_version: 7,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
     let err = mc
@@ -2029,6 +2373,7 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
         TableVersionExpectation {
             table_key: "node:Person".to_string(),
             table_version: 1,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
 
@@ -2244,6 +2589,7 @@ async fn test_publish_rejects_manifest_stamped_at_future_version() {
         TableVersionExpectation {
             table_key: "node:Person".to_string(),
             table_version: 1,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
     let err = GraphNamespacePublisher::new(uri, None)

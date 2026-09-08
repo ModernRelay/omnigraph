@@ -361,12 +361,14 @@ Object IDs and initial physical paths are name-independent:
 
 ```text
 table:{stable_table_id:016x}:{table_incarnation_id:016x}
-table_version:{stable_table_id:016x}:{table_incarnation_id:016x}:{version:020}
-table_tombstone:{stable_table_id:016x}:{table_incarnation_id:016x}:{version:020}
+table_version:{stable_table_id:016x}:{table_incarnation_id:016x}:{manifest_version:020}
+table_tombstone:{stable_table_id:016x}:{table_incarnation_id:016x}:{manifest_version:020}
 
 nodes/{stable_table_id:016x}-{table_incarnation_id:016x}
 edges/{stable_table_id:016x}-{table_incarnation_id:016x}
 ```
+
+Since [RFC 0062](0062-manifest-version-clock.md) the trailing segment is the `__manifest` version that wrote the row; the table's Lance version stays in the row's `table_version` column.
 
 The current registration row binds one identity pair to its current alias and
 unchanging path. A type rename updates that binding under the same registration
@@ -715,3 +717,10 @@ The implementation review completed these gates:
 This implementation closes BLOCKER-07's specification-ownership contradiction.
 RFC 0023 through RFC 0026 may consume the stable pair, but each still owns its
 independent activation, evidence, and format/recovery gates.
+
+## Decision log
+
+- 2026-09-07: RFC 0062 amends §4.5: the trailing `{version:020}` of
+  `table_version:` and `table_tombstone:` object ids becomes the `__manifest`
+  version that wrote the row (the manifest clock); the table's Lance version
+  stays in the row's `table_version` column.

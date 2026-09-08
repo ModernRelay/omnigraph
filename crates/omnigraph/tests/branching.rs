@@ -1858,7 +1858,7 @@ async fn branch_merge_applies_node_insert_to_main() {
 
 /// Rust because the pins are native table versions, the target ref's physical
 /// HEAD, and the entry retained on an empty delta; the row-visible half is
-/// `merge_adopt_*.gqt`.
+/// `merge_adopt_*.gqt`. The lazy iteration stops after its reads (RFC 0062, decision log 2026-09-08).
 #[tokio::test]
 async fn branch_merge_preserves_state_when_native_versions_differ() {
     for branch_updates in [8, 2] {
@@ -1961,13 +1961,18 @@ async fn branch_merge_preserves_state_when_native_versions_differ() {
                 .dataset("node:Person")
                 .unwrap()
                 .clone();
-            assert!(
-                merged_entry.published_dataset_version > target_entry.published_dataset_version,
-                "{target}, {branch_updates} updates: changed rows must advance target's own version"
-            );
-            assert_eq!(
-                merged_entry.native_dataset_branch.as_deref(),
+            let expected_ref = if lazy_target {
                 Some(target_native.as_str())
+            } else {
+                source_entry.native_dataset_branch.as_deref()
+            };
+            assert_eq!(
+                (
+                    merged_entry.published_dataset_version,
+                    merged_entry.native_dataset_branch.as_deref()
+                ),
+                (source_entry.published_dataset_version, expected_ref),
+                "{target}, {branch_updates} updates: the adopt registers the source's version, as a pointer switch onto the source ref or a fork onto the target's own ref, ordered by the manifest clock (RFC 0062)"
             );
             let reopened = Omnigraph::open(uri).await.unwrap();
             for handle in [&main, &reopened] {
@@ -1991,6 +1996,9 @@ async fn branch_merge_preserves_state_when_native_versions_differ() {
                     50,
                     "{target}, {branch_updates} updates: source value must survive adoption"
                 );
+            }
+            if lazy_target {
+                continue;
             }
             main.mutate(
                 target,
