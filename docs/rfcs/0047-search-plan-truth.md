@@ -325,8 +325,16 @@ prototype's retirement label must not be reused as a current-code fact.
 
 ## Rollout
 
-Ordered stages after acceptance. The retained prototype supplies starting
-points; each stage must be checked against the revised scope:
+For a standalone RFC 0047 implementation, use the ordered stages below after
+acceptance. For the combined release, use
+[RFC 0048's implementation phases](0048-search-contracts.md#implementation-phases):
+plan identity and target validation belong to foundations/composition;
+projectable metrics and complete ties to retrieval/composition qualification;
+and warnings, retrieval descriptors, and coverage to the agent-facing read
+path. These are the same correctness obligations, implemented once.
+
+The retained prototype supplies starting points; each stage must be checked
+against the revised scope:
 
 1. Substrate fences for the Lance 11 update→optimize stale-vector window
    (test-only; can land before acceptance as an ordinary change).
@@ -339,8 +347,10 @@ points; each stage must be checked against the revised scope:
    aggregated).
 6. `metrics`/`retrievals` metadata with embedding coverage.
 
-`implementation` advances to `in-progress` at the first landed stage and
-`complete` when stage 6 ships. Stages 2+ reference this RFC once accepted.
+For the standalone slice, `implementation` advances to `in-progress` at the
+first landed stage and `complete` when stage 6 ships. For the combined release,
+record completion against the corresponding RFC 0048 phase evidence instead
+of requiring this interim sequence. Stages 2+ reference this RFC once accepted.
 The lexical replacement and staged language are sequenced by RFC 0048, not
 by a retirement commit in this rollout. Before porting prototype code, capture
 the current compiler/engine baseline and identify which guarantees already

@@ -1138,31 +1138,166 @@ by this draft.
 ## Rollout
 
 Acceptance requires the frontmatter gates to have concrete dispositions and
-owned evidence. The following work can be developed in slices, but the initial
-public contract ships as one coordinated pre-stable change and one necessary
-format rebuild:
+owned evidence. Phase 0 supplies the decision work and prototypes needed for
+acceptance; the later phases implement and qualify the accepted contracts.
+Each phase can be reviewed in separate PRs. The public contract ships as one
+coordinated pre-stable change with one necessary format rebuild, without
+requiring users to adopt an interim language or rebuild after each phase.
 
-1. **Settle and prototype the language/semantics.** Rank boundaries, target
-   and binding multiplicity, metric namespace, per-group selection, stored
-   query identity, snapshot follow-up, exact statistics and fuzzy scoring
-   specification. Golden plans must distinguish graph-scope-first from
-   retrieval-first. Keep unsupported shapes as typed errors.
-2. **Qualify schema and exact execution.** Resolved representation identities,
-   analyzers, typed lexical matching, exact/fuzzy scoring, vector geometry,
-   `knn` and ANN contracts, migration/refusal, and whole-query resource
-   admission. Reuse the sealed scan, graph, and publication owners.
-3. **Complete the initial agent path.** Named lexical/vector sources, explicit
-   windows, RRF, graph-defined eligibility and expansion, per-group selection,
-   compact projection and snapshot-coherent source reads, truthful metadata,
-   stored-query recipes and inspectable plans. Fuzzy ranked retrieval is part
-   of this milestone. Remove legacy syntax in the same release and update
-   application/stored queries, user guides, and release notes.
-4. **Enable qualified acceleration and measure.** Gate each native path on
-   scan/score/order parity and resource evidence. A correct bounded scan path
-   may ship first. Run the fixed-corpus quality evaluation and ANN effort
-   qualification before assigning performance-oriented defaults.
+### Implementation phases
 
-Explicit extension scope:
+These dependencies describe integration order. Test fixtures, migration
+tooling, and transport work can develop alongside their dependencies once the
+relevant contracts are fixed. Native-path experiments can begin after the
+exact evaluator exists; enabling a path requires its qualification gate.
+Every phase extends the [existing test owners](#research-context-and-required-qualification)
+and records its implementation PRs and evidence in this RFC.
+
+| Phase | Depends on | Outcome |
+|---|---|---|
+| 0. Resolve contracts | Current-code audit and design review | Accepted semantics, executable oracles, and owned qualification criteria |
+| 1. Build shared foundations | 0 | Resolved representations, typed stages, and one execution/resource context |
+| 2. Implement exact retrieval | 1 | Complete lexical matching, exact/fuzzy scoring, and exact vector selection |
+| 3. Compose graph and ranking stages | 2 | Named fusion, graph-defined populations, metric origin, and per-group selection |
+| 4. Complete agent-facing reads | 3 for end-to-end qualification | Stored-query recipes, truthful metadata, and coherent source reads |
+| 5. Qualify execution and defaults | 2 for native comparisons; 3–4 for full-pipeline evaluation | Qualified physical paths, resource evidence, and measured retrieval defaults |
+| 6. Ship the coordinated migration | 1–5 | One supported query/schema cutover with verified upgrade and client behavior |
+
+#### Phase 0: resolve contracts and build the oracles
+
+Refresh the compiler/engine baseline and identify the remaining RFC 0047
+guarantees before porting any prototype code.
+Settle the grammar and metric namespace, target/binding multiplicity, per-group
+semantics, complete tie comparators, and the relationship to RFC 0047. Freeze
+the exact and fuzzy scoring specifications, statistics population, vector
+numeric rules, and checked fusion arithmetic. Resolve encoding/provider
+identity and the shared schema-version decisions with RFCs 0040/0043/0044.
+Specify resource units and admission limits, follow-up/retention behavior,
+and the proposed response changes before their implementations diverge.
+
+Completion requires parser/typechecker prototypes and golden plans for both
+graph-scope-first and retrieval-first queries, independent numerical score
+fixtures, and concrete dispositions for the acceptance blockers. Define the
+fixed retrieval/agent-task corpus and evaluation criteria here, before tuning
+defaults. A capability listing or the existing compiler baseline is not that
+evidence. Compiler, search, schema, and read-contract owners supply these proofs.
+
+#### Phase 1: build representation, plan, and resource foundations
+
+Implement accepted representation identities and validation, typed lexical
+queries, named stage IR, target/metric binding, and plan fingerprints. Resolve
+query inputs and encoders once per execution. Introduce the shared snapshot,
+admission, cancellation, and resource-accounting context that every later
+operator must use. Extend the sealed storage interfaces and existing
+schema/rebuild tooling; coordinate one format boundary for the final release.
+
+Completion requires compiler/schema fixtures for serialization, parameter
+bounds, invalid references, rename versus drop/re-add identity, incompatible
+encoding refusal, and migration rewrite idempotence. Tests must show that
+operators and fallbacks share a budget rather than resetting it. Schema and
+plan types must not depend on index presence or a second semantic registry.
+
+#### Phase 2: implement complete lexical and vector retrieval
+
+Build the exact scan evaluator for the declared analyzers and `Terms` relation,
+then exact and fuzzy lexical scoring against the Phase 0 oracle. Add exact
+`knn` with the accepted geometry, normalization, invalid-value handling, and
+total comparator. Establish the ANN source contract and its qualified exact
+fallback before enabling indexed approximation. Charge analysis, statistics,
+representation coverage, scoring, and selection to the Phase 1 context.
+
+Completion requires `.gqt` result/error cases plus search and substrate
+fixtures for the lexical qualification matrix, snapshot-correct statistics,
+vector numeric boundaries, complete ties, and explicit budget/cancellation
+failure. Exercise append/update/delete, compaction, and different index states
+through the exact path. The Boolean fuzzy predicate and fuzzy ranked source
+must agree on membership before the cutoff; shipping only the predicate does
+not complete this phase. Native acceleration remains separately qualified.
+
+#### Phase 3: compose graph scope, fusion, and selection
+
+Connect the retrievers to graph-defined eligible targets and implement named
+weighted RRF, graph expansion between rank blocks, per-group selection, and
+final ordering/projection. Preserve associated binding rows, distinct target
+identity, arm membership, and metric origin through fan-out and aggregation.
+Reuse existing traversal and qualified DataFusion operators, wiring them into
+the Phase 1 memory/scratch accounting; introduce no eager graph cross product.
+
+Completion requires plans and `.gqt` cases that distinguish filtering before
+and after a cut, rank traversal-introduced targets, preserve one arm vote per
+target through repeated paths, and keep source windows independent of final
+limits. Search/traversal/ordering/aggregation owners verify missing-arm metrics,
+RRF arithmetic, per-group boundaries, and inherited metric reductions. Include
+fan-out and sort/spill failures that cannot return successful partial results.
+
+#### Phase 4: complete the agent-facing read path
+
+Expose the staged plan through existing inline and stored queries, with
+definition/execution fingerprints, inspectable plans, named metrics, and
+truthful completion, coverage, and selection metadata. Carry graph identities
+and resolved snapshot context into selective property reads and further graph
+queries. Reuse existing request fields and recheck authorization on follow-up.
+Resolve the combined HTTP/CLI compatibility questions and regenerate OpenAPI.
+
+Completion requires an end-to-end discovery → source read → graph expansion →
+exact verification journey through embedded, HTTP, stored-query, and CLI paths.
+The snapshot, policy, and transport owners verify concurrent graph changes,
+unavailable/expired snapshots, revoked access, missing representations, and
+client serialization/error behavior. Large projections and fallback work
+must stay within the same resource contract. Stable ranked cursors and a
+durable search-result store are not part of this phase.
+
+#### Phase 5: qualify physical execution and measure retrieval
+
+Compare each proposed Lance/index path against the Phase 2 exact evaluator
+and the Phase 3 composition rules. Qualify graph-ID/native-row-mask mapping,
+analyzer certificates, complete expansion, scoring/statistics, ties, uncovered
+tails, raw-vector rescoring, and physical partition behavior. Native ANN is
+evaluated against exact `knn` for recall and bounded effort; it is not required
+to discover the exact candidate set. Preserve rebuild/recovery ownership.
+
+Completion requires correctness and resource evidence for every enabled path,
+including cancellation, model calls, coverage scans, graph fan-out,
+sorting/spill, output, and fallback within the remaining budget. Run the
+fixed-corpus lexical, dense, and fused retrieval comparison and the agent-task
+evaluation; record
+quality, latency, and context use with the configuration. Freeze source/window
+defaults and each enabled index family's `ann_default_v1` mapping only after
+that evaluation. An unqualified native path stays disabled while a qualified
+exact fallback serves its contract; measured limits must remain explicit.
+
+#### Phase 6: ship the coordinated language and data migration
+
+Remove the legacy search grammar, IR variants, and compatibility execution
+paths in the same public release that supplies the complete new path. Deliver
+the schema/query rewrite diagnostics, application and stored-query examples,
+client changes, user/developer guides, and release notes. Exercise the
+[migration sequence](#migration-sequence) using the existing export/init/load
+and explicit index-reconciliation owners.
+
+Completion requires predecessor/current format refusal and rebuild tests,
+compatible-value preservation, explicit unresolved-encoding refusal, and
+successful migrated queries and follow-up reads. Verify ordinary graph queries
+as well as fuzzy, lexical, vector, fused, and graph-scoped journeys. Run the
+required compiler/engine/transport suites, canonical workspace checks, and
+documentation/OpenAPI checks for the final implementation. Users encounter
+one supported cutover; temporary implementation scaffolding is removed.
+
+### Release and completion criteria
+
+Phases 1–4 establish the full initial feature path; Phase 5 qualifies its
+execution and defaults; Phase 6 makes it a supported release. Fuzzy ranked
+retrieval, coherent follow-up, and whole-query resource bounds are required
+for that release. They cannot be moved to the extension list to mark the
+implementation complete. An acceleration path may remain disabled only when
+the qualified fallback preserves the promised semantics and resource behavior.
+
+Frontmatter remains the implementation-status authority. Advance it when
+implementation lands, and mark it complete only after the release criteria
+and their owned evidence pass. Historical prototypes and current-code baseline
+tests do not count as completion of a new phase.
+
+### Extensions after the initial release
 
 | Capability | Disposition |
 |---|---|
@@ -1174,10 +1309,8 @@ Explicit extension scope:
 | Snippets / token-budget packing | Deferred; initial compact projection and selective reads retain source/version attribution |
 | General cross-identity fusion | Deferred; initial arms share a declared target, and graph mappings never happen implicitly |
 
-The implementation is complete only when the initial path and its required
-correctness/transport/resource gates pass. Listing an extension does not claim
-support. A physical acceleration gate can remain closed while the qualified
-exact fallback serves its contract.
+Listing an extension does not claim support or require it for the initial
+release. Each extension retains its stated semantic and qualification boundary.
 
 ## Unresolved questions
 
