@@ -111,6 +111,8 @@ pub(crate) struct StagedTablePath {
     pub(crate) full_path: String,
     /// Final Lance ref recorded in the manifest update.
     pub(crate) table_branch: Option<String>,
+    /// The ref the pin was read on, see `NativeRefPin`.
+    pub(crate) pinned_native_ref: crate::db::manifest::NativeRefPin,
     /// First-touch named-branch fork deferred until the v9 recovery envelope
     /// (whose retained mutation/load payload field is `protocol_v3`) is
     /// durable. Preparation reads the inherited `source_entry`; after arming,
@@ -200,6 +202,7 @@ impl MutationStaging {
         identity: crate::db::manifest::TableIdentity,
         full_path: String,
         table_branch: Option<String>,
+        pinned_native_ref: Option<String>,
         deferred_fork: Option<crate::db::DeferredTableFork>,
         expected_version: u64,
         op_kind: MutationOpKind,
@@ -219,6 +222,7 @@ impl MutationStaging {
                 identity,
                 full_path,
                 table_branch,
+                pinned_native_ref: crate::db::manifest::NativeRefPin::Exact(pinned_native_ref),
                 deferred_fork,
             });
         self.expected_versions
@@ -507,11 +511,6 @@ impl MutationStaging {
             op_kinds: _,
         } = self;
 
-        let expected_identities = paths
-            .iter()
-            .map(|(table_key, path)| (table_key.clone(), path.identity))
-            .collect();
-
         let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
             Vec::with_capacity(pending.len());
         let mut __dst_pt: Vec<_> = pending.into_iter().collect();
@@ -655,10 +654,28 @@ impl MutationStaging {
             }
         }
 
+        let expected_versions = expected_versions
+            .iter()
+            .map(|(table_key, table_version)| {
+                let path = paths.get(table_key).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "MutationStaging::stage_all: missing path for table '{table_key}'"
+                    ))
+                })?;
+                Ok((
+                    path.identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key: table_key.clone(),
+                        table_version: *table_version,
+                        native_ref: path.pinned_native_ref.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<crate::db::manifest::ExpectedTableVersions>>()?;
+
         Ok(StagedMutation {
             staged: staged_entries,
             expected_versions,
-            expected_identities,
         })
     }
 }
@@ -912,11 +929,10 @@ pub(crate) struct StagedMutation {
     /// Deletes flow through this same vector as inserts/updates/overwrites —
     /// there is no separate inline-commit path.
     staged: Vec<StagedTableEntry>,
-    /// Pre-write manifest version per table — the publisher's CAS fence.
-    expected_versions: HashMap<String, u64>,
-    /// Identity paired with every alias in `expected_versions`, including a
-    /// zero-row delete that produced no physical staged effect.
-    expected_identities: HashMap<String, crate::db::manifest::TableIdentity>,
+    /// Pre-write manifest pin per table — the publisher's CAS fence. Covers
+    /// every touched table, including a zero-row delete that produced no
+    /// physical staged effect.
+    expected_versions: crate::db::manifest::ExpectedTableVersions,
 }
 
 /// Per-table state captured during `stage_all` and consumed by
@@ -1076,29 +1092,7 @@ impl StagedMutation {
         let StagedMutation {
             mut staged,
             expected_versions,
-            expected_identities,
         } = self;
-
-        let expected_versions = expected_versions
-            .into_iter()
-            .map(|(table_key, table_version)| {
-                let identity = expected_identities
-                    .get(&table_key)
-                    .copied()
-                    .ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "staged mutation is missing identity for table '{table_key}'"
-                        ))
-                    })?;
-                Ok((
-                    identity,
-                    crate::db::manifest::TableVersionExpectation {
-                        table_key,
-                        table_version,
-                    },
-                ))
-            })
-            .collect::<Result<crate::db::manifest::ExpectedTableVersions>>()?;
 
         // Per-(table_key, branch) queues for every touched table. Sorted by
         // `acquire_many` internally so all multi-table writers (mutation,

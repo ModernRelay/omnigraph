@@ -3499,25 +3499,11 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(ids.value(row).to_string())
 }
 
-/// A source version at or below the target's must be written onto the target's
-/// lineage (`docs/dev/merge.md` §Table classification); rows still decide the delta.
-fn adopt_requires_target_lineage(
-    source_entry: &crate::db::DatasetEntry,
-    target_entry: Option<&crate::db::DatasetEntry>,
-) -> bool {
-    target_entry.is_some_and(|target| {
-        source_entry.published_dataset_version <= target.published_dataset_version
-    })
-}
-
 fn adopt_advances_head(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
     target_entry: Option<&crate::db::DatasetEntry>,
 ) -> bool {
-    if adopt_requires_target_lineage(source_entry, target_entry) {
-        return true;
-    }
     match (target_active, source_entry.native_dataset_branch.as_deref()) {
         // Source on a branch, target on main — delta applied onto main's lineage.
         (None, Some(_)) => true,
@@ -3531,8 +3517,8 @@ fn adopt_advances_head(
 }
 
 /// Classify a table whose target equals base: a proven insertion-only descendant
-/// is `AdoptPureInserts`, any other HEAD-advancing delta (a source at or below the
-/// target's version included) is `AdoptWithDelta`, a newer pointer or fork is `AdoptSourceState`.
+/// is `AdoptPureInserts`, any other HEAD-advancing delta is `AdoptWithDelta`, a
+/// pointer switch or fork is `AdoptSourceState` (RFC 0062 orders the switch).
 async fn classify_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -3626,12 +3612,13 @@ async fn classify_general_adopt(
     }
 }
 
-/// What publishing a table's adopted source state does to `__manifest`; planning
-/// lets classification drop a table whose registration is already stored (#473)
-/// or whose source version is at or below the target's.
+/// What publishing a table's adopted source state does to `__manifest`.
+/// An empty delta does not imply an empty publish: source and target can hold
+/// the same content at different Lance versions (#473).
 #[must_use = "the adopt plan decides whether this table is a merge candidate"]
 enum AdoptPublish {
-    /// The planned registration is field-for-field the stored entry.
+    /// The planned registration is field-for-field the stored entry
+    /// (`reregisters_current_entry`).
     Nothing,
     /// A pointer switch onto a lineage the target can already read.
     Pointer(crate::db::DatasetUpdate),
@@ -3644,7 +3631,7 @@ enum AdoptPublish {
 }
 
 /// Plan what adopting the source's table state publishes, without an effect;
-/// only a source newer than the target reaches a branch-bearing arm.
+/// reaching a branch-bearing arm means the delta was empty.
 fn plan_adopted_source_state(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
@@ -3738,11 +3725,10 @@ fn keep_publishing_candidate(
         CandidateTableState::AdoptSourceState {
             validation_delta: None
         }
-    ) && (adopt_requires_target_lineage(source_entry, target_entry)
-        || matches!(
-            plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
-            AdoptPublish::Nothing
-        ));
+    ) && matches!(
+        plan_adopted_source_state(target_active, source_entry, target_entry, table_key),
+        AdoptPublish::Nothing
+    );
     if publishes_nothing {
         return None;
     }
@@ -3780,31 +3766,12 @@ mod adopt_plan_tests {
             native_dataset_branch: branch.map(ToOwned::to_owned),
             entity_count: row_count,
             version_metadata: metadata(manifest_path),
+            manifest_version: 0,
         }
-    }
-
-    /// `adopt_requires_target_lineage` mirrors the projection fold's `>=`
-    /// (`db/manifest/state.rs`): a source at or below the target's version
-    /// advances HEAD; a newer source on main does not; no target entry, no rule.
-    #[test]
-    fn source_at_or_below_target_version_advances_head() {
-        let target = entry(4, Some("feature"), 3, "manifest-v4");
-        let below = entry(3, None, 3, "manifest-v3");
-        let equal = entry(4, None, 3, "manifest-v4-main");
-        let above = entry(5, None, 3, "manifest-v5");
-        assert!(adopt_advances_head(Some("feature"), &below, Some(&target)));
-        assert!(adopt_advances_head(Some("feature"), &equal, Some(&target)));
-        assert!(!adopt_advances_head(Some("feature"), &above, Some(&target)));
-        assert!(!adopt_advances_head(Some("feature"), &below, None));
     }
 
     /// The #473 shape: the source advanced two Lance versions on a branch and
     /// came back to the target's content. The plan must be `Nothing`.
-    ///
-    /// This pins the classification layer specifically. The publisher's
-    /// widened registry guard also lets the redundant registration through, so
-    /// no integration test can tell the two layers apart and a revert of this
-    /// one would otherwise go unnoticed.
     #[test]
     fn net_zero_source_on_a_branch_plans_nothing() {
         let target = entry(2, None, 3, "manifest-v2");
@@ -3928,16 +3895,6 @@ async fn publish_adopted_source_state(
     )?;
 
     match plan_adopted_source_state(target_active, source_entry, target_entry, table_key) {
-        AdoptPublish::Pointer(update)
-            if target_entry.is_some_and(|current| {
-                update.published_dataset_version <= current.published_dataset_version
-            }) =>
-        {
-            Err(OmniError::manifest_internal(format!(
-                "branch merge table '{table_key}' plans a pointer at version {} at or below the target's registration; classification must route that onto the target lineage",
-                update.published_dataset_version
-            )))
-        }
         AdoptPublish::Pointer(update) => Ok(update),
         AdoptPublish::Fork {
             source_branch,
@@ -5521,6 +5478,12 @@ impl Omnigraph {
                             .dataset(table_key)
                             .map(|entry| entry.published_dataset_version)
                             .unwrap_or(0),
+                        native_ref: match target_snapshot.dataset(table_key) {
+                            Some(entry) => crate::db::manifest::NativeRefPin::Exact(
+                                entry.native_dataset_branch.clone(),
+                            ),
+                            None => crate::db::manifest::NativeRefPin::Unchecked,
+                        },
                     },
                 ))
             })

@@ -142,6 +142,9 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
         crate::db::manifest::TableVersionExpectation {
             table_key: table_key.to_string(),
             table_version: entry.published_dataset_version,
+            native_ref: crate::db::manifest::NativeRefPin::Exact(
+                entry.native_dataset_branch.clone(),
+            ),
         },
     );
     commit_prepared_updates_on_branch_with_expected(
@@ -196,6 +199,7 @@ async fn maintain_indices_for_branch(
     let catalog = Arc::clone(&txn.catalog);
 
     let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
+    let mut pin_read_refs: Vec<Option<String>> = Vec::new();
     let mut work_by_table = HashMap::<String, PlannedIndexWork>::new();
     let mut existing_targets =
         std::collections::HashMap::<String, crate::storage_layer::SnapshotHandle>::new();
@@ -265,6 +269,7 @@ async fn maintain_indices_for_branch(
                 confirmed_version: None,
                 table_branch: native_active.clone(),
             });
+            pin_read_refs.push(entry.native_dataset_branch.clone());
             if !first_touch {
                 existing_targets.insert(table_key.clone(), ds);
             } else {
@@ -321,6 +326,7 @@ async fn maintain_indices_for_branch(
                 confirmed_version: None,
                 table_branch: native_active.clone(),
             });
+            pin_read_refs.push(entry.native_dataset_branch.clone());
             if !first_touch {
                 existing_targets.insert(table_key.clone(), ds);
             } else {
@@ -461,12 +467,14 @@ async fn maintain_indices_for_branch(
     } else {
         let expected_versions = recovery_pins
             .iter()
-            .map(|pin| {
+            .zip(pin_read_refs.iter())
+            .map(|(pin, read_ref)| {
                 (
                     pin.identity,
                     crate::db::manifest::TableVersionExpectation {
                         table_key: pin.table_key.clone(),
                         table_version: pin.expected_version,
+                        native_ref: crate::db::manifest::NativeRefPin::Exact(read_ref.clone()),
                     },
                 )
             })
@@ -1053,6 +1061,8 @@ pub(crate) struct OpenedForMutation {
     pub(crate) expected_version: u64,
     pub(crate) full_path: String,
     pub(crate) table_branch: Option<String>,
+    /// The ref the pin was read on, see `NativeRefPin`.
+    pub(crate) pinned_native_ref: Option<String>,
     /// RFC-022 first-touch named-branch writes stage against the inherited
     /// source snapshot and defer the durable Lance ref creation until after
     /// their v9 recovery intent (`protocol_v3` payload) is armed in
@@ -1168,6 +1178,7 @@ pub(super) async fn open_for_mutation_on_branch(
                     expected_version: entry.published_dataset_version,
                     full_path,
                     table_branch: native_active,
+                    pinned_native_ref: entry.native_dataset_branch.clone(),
                     deferred_fork: None,
                 });
             }
@@ -1179,6 +1190,7 @@ pub(super) async fn open_for_mutation_on_branch(
                     expected_version: entry.published_dataset_version,
                     full_path,
                     table_branch: None,
+                    pinned_native_ref: entry.native_dataset_branch.clone(),
                     deferred_fork: None,
                 });
             }
@@ -1214,6 +1226,7 @@ pub(super) async fn open_for_mutation_on_branch(
                 expected_version: version,
                 full_path,
                 table_branch: None,
+                pinned_native_ref: entry.native_dataset_branch.clone(),
                 deferred_fork: None,
             })
         }
@@ -1236,6 +1249,7 @@ pub(super) async fn open_for_mutation_on_branch(
                     expected_version: entry.published_dataset_version,
                     full_path,
                     table_branch: Some(native_active.to_string()),
+                    pinned_native_ref: entry.native_dataset_branch.clone(),
                     deferred_fork: Some(DeferredTableFork {
                         source_entry: entry.clone(),
                         target_branch: native_active.to_string(),
@@ -1262,6 +1276,7 @@ pub(super) async fn open_for_mutation_on_branch(
                 expected_version: version,
                 full_path,
                 table_branch,
+                pinned_native_ref: entry.native_dataset_branch.clone(),
                 deferred_fork: None,
             })
         }

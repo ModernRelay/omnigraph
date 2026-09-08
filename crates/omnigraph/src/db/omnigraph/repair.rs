@@ -125,7 +125,8 @@ struct RepairTableTask {
     identity: crate::db::manifest::TableIdentity,
     table_key: String,
     full_path: String,
-    manifest_version: u64,
+    pinned_data_version: u64,
+    pinned_native_ref: Option<String>,
 }
 
 pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Result<RepairStats> {
@@ -173,7 +174,8 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
                 identity: entry.identity,
                 table_key,
                 full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
-                manifest_version: entry.published_dataset_version,
+                pinned_data_version: entry.published_dataset_version,
+                pinned_native_ref: entry.native_dataset_branch.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -195,7 +197,8 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
             identity,
             table_key,
             full_path,
-            manifest_version,
+            pinned_data_version,
+            pinned_native_ref,
         } = task;
         // `classify_drift` inspects raw Lance transaction history
         // (`read_transaction_by_version`), a Lance-only maintenance read the
@@ -205,19 +208,19 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         let ds = handle.dataset();
         let lance_head_version = ds.version().version;
 
-        if lance_head_version < manifest_version {
+        if lance_head_version < pinned_data_version {
             return Err(OmniError::manifest_internal(format!(
                 "{} is at Lance HEAD version {}, behind published dataset version {}",
                 dataset_subject(&table_key),
                 lance_head_version,
-                manifest_version
+                pinned_data_version
             )));
         }
 
-        if lance_head_version == manifest_version {
+        if lance_head_version == pinned_data_version {
             tables.push(DatasetRepairStats {
                 type_key: table_key,
-                published_dataset_version: manifest_version,
+                published_dataset_version: pinned_data_version,
                 lance_head_version,
                 classification: RepairClassification::NoDrift,
                 action: RepairAction::NoOp,
@@ -227,7 +230,7 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
             continue;
         }
 
-        let classification = classify_drift(ds, manifest_version, lance_head_version).await;
+        let classification = classify_drift(ds, pinned_data_version, lance_head_version).await;
         let action = match (
             options.confirm,
             options.force,
@@ -259,14 +262,15 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
                 identity,
                 crate::db::manifest::TableVersionExpectation {
                     table_key: table_key.clone(),
-                    table_version: manifest_version,
+                    table_version: pinned_data_version,
+                    native_ref: crate::db::manifest::NativeRefPin::Exact(pinned_native_ref),
                 },
             );
         }
 
         tables.push(DatasetRepairStats {
             type_key: table_key,
-            published_dataset_version: manifest_version,
+            published_dataset_version: pinned_data_version,
             lance_head_version,
             classification: classification.classification,
             action,
@@ -323,14 +327,14 @@ async fn ensure_no_pending_recovery_sidecars(db: &Omnigraph, operation: &str) ->
 
 async fn classify_drift(
     ds: &Dataset,
-    manifest_version: u64,
+    pinned_data_version: u64,
     lance_head_version: u64,
 ) -> ClassificationResult {
     let mut operations = Vec::new();
     let mut saw_suspicious = false;
     let mut error = None;
 
-    for version in manifest_version.saturating_add(1)..=lance_head_version {
+    for version in pinned_data_version.saturating_add(1)..=lance_head_version {
         match ds.read_transaction_by_version(version).await {
             Ok(Some(transaction)) => {
                 let operation = transaction.operation;

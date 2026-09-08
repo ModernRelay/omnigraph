@@ -56,8 +56,8 @@ use super::publisher::{
     PublishPrecondition,
 };
 use super::{
-    DatasetUpdate, ExpectedTableVersions, ManifestChange, ManifestCoordinator, TableIdentity,
-    TableRegistration, TableRename, TableTombstone, TableVersionExpectation,
+    DatasetUpdate, ExpectedTableVersions, ManifestChange, ManifestCoordinator, NativeRefPin,
+    TableIdentity, TableRegistration, TableRename, TableTombstone, TableVersionExpectation,
 };
 
 /// System actor identifier for recovery-owned lineage: legacy recovery,
@@ -496,8 +496,8 @@ pub(crate) struct SidecarTablePin {
     /// sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_version: Option<u64>,
-    /// Lance branch ref this dataset lives on (mirrors
-    /// `DatasetEntry::native_dataset_branch`). Required for the recovery sweep
+    /// Lance branch ref the attempt PUBLISHES this dataset on, not the ref the
+    /// pin was read on (see `NativeRefPin`). Required for the recovery sweep
     /// to open the dataset at the correct ref — `Dataset::open(path)`
     /// alone returns the default ref (typically main), which would
     /// classify a feature-branch sidecar against main's HEAD and silently
@@ -5017,6 +5017,7 @@ async fn roll_forward_ensure_indices_v8(
             TableVersionExpectation {
                 table_key: slot.table_key.clone(),
                 table_version: slot.expected_version,
+                native_ref: NativeRefPin::Unchecked,
             },
         );
         updates.push(ManifestChange::Update(DatasetUpdate {
@@ -5328,6 +5329,7 @@ async fn publish_schema_apply_v7_forward(
             TableVersionExpectation {
                 table_key: registration.table_key.clone(),
                 table_version: 0,
+                native_ref: NativeRefPin::Unchecked,
             },
         );
         changes.push(ManifestChange::RegisterTable(TableRegistration {
@@ -5342,6 +5344,7 @@ async fn publish_schema_apply_v7_forward(
             TableVersionExpectation {
                 table_key: rename.expected_table_key.clone(),
                 table_version: rename.expected_version,
+                native_ref: NativeRefPin::Unchecked,
             },
         );
         changes.push(ManifestChange::RenameTable(TableRename {
@@ -5363,6 +5366,7 @@ async fn publish_schema_apply_v7_forward(
             .or_insert_with(|| TableVersionExpectation {
                 table_key: slot.table_key.clone(),
                 table_version: slot.expected_version,
+                native_ref: NativeRefPin::Unchecked,
             });
         changes.push(ManifestChange::Update(DatasetUpdate {
             identity: slot.identity,
@@ -5379,6 +5383,7 @@ async fn publish_schema_apply_v7_forward(
             TableVersionExpectation {
                 table_key: tombstone.table_key.clone(),
                 table_version: tombstone.tombstone_version.saturating_sub(1),
+                native_ref: NativeRefPin::Unchecked,
             },
         );
         changes.push(ManifestChange::Tombstone(TableTombstone {
@@ -5838,6 +5843,7 @@ async fn roll_forward_branch_merge_v4(
             TableVersionExpectation {
                 table_key: slot.table_key.clone(),
                 table_version: slot.expected_version,
+                native_ref: NativeRefPin::Unchecked,
             },
         );
         updates.push(ManifestChange::Update(DatasetUpdate {
@@ -7619,6 +7625,7 @@ async fn roll_forward_all(
                 TableVersionExpectation {
                     table_key: pin.table_key.clone(),
                     table_version: slot.expected_version,
+                    native_ref: NativeRefPin::Unchecked,
                 },
             );
             updates.push(ManifestChange::Update(DatasetUpdate {
@@ -7730,25 +7737,21 @@ async fn roll_forward_all(
             TableVersionExpectation {
                 table_key: reg.table_key.clone(),
                 table_version: 0,
+                native_ref: NativeRefPin::Unchecked,
             },
         );
         published_versions.insert(reg.identity, head_version);
     }
 
     // SchemaApply-only: tombstone removed types (and renamed sources).
-    //
-    // Filtered against `snapshot`: when the manifest no longer has an
-    // entry for `tomb.table_key`, the tombstone has already landed in
-    // a prior recovery / the writer's Phase C — skip emit so the
-    // publisher doesn't error on a redundant tombstone.
     for tomb in &sidecar.tombstones {
-        if snapshot
+        let Some(native_ref) = snapshot
             .datasets()
             .find(|entry| entry.identity == tomb.identity)
-            .is_none()
-        {
+            .map(|entry| NativeRefPin::Exact(entry.native_dataset_branch.clone()))
+        else {
             continue;
-        }
+        };
         updates.push(ManifestChange::Tombstone(TableTombstone {
             identity: tomb.identity,
             table_key: tomb.table_key.clone(),
@@ -7762,6 +7765,7 @@ async fn roll_forward_all(
             TableVersionExpectation {
                 table_key: tomb.table_key.clone(),
                 table_version: tomb.tombstone_version.saturating_sub(1),
+                native_ref,
             },
         );
     }
@@ -7842,6 +7846,7 @@ async fn push_table_update(
         TableVersionExpectation {
             table_key: table_key.to_string(),
             table_version: expected_version,
+            native_ref: NativeRefPin::Unchecked,
         },
     );
     Ok(published_version)

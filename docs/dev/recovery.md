@@ -12,7 +12,7 @@ commit protocol, not an offline repair convenience.
 
 Active writers emit identity-aware recovery sidecar schema **v9**. Manifest
 schema and recovery schema are independent version spaces; the current
-manifest is v6.
+manifest is v7.
 
 Every owned table slot carries:
 
