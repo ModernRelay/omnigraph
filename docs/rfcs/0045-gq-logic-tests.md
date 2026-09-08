@@ -729,8 +729,10 @@ expect section is JSONL, one object per row, same keys.
   body is the author's statement of the values, and the computed check
   proves the compiler and the executor agree.
 
-Ranking scores stay unprojected in logic tests (existing search-test
-practice): assert the resulting row order, never the score values.
+Ranking scores are projectable (`nearest` and `bm25` since v0.11.0, `T33`
+ties the projection to the executed retrieval) and their values are
+assertable: the 12-decimal normalization renders a `Float32` score stably. Row order is still asserted with `expect ordered`;
+project the score only when the value itself is the claim.
 
 ### Runner mechanics
 

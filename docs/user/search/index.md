@@ -97,6 +97,15 @@ query relevant($q: String) {
 }
 ```
 
+`score` is the relevance the ordering used, one computation observed twice:
+the projected `bm25(...)` must repeat the leading `order` key (`T33`), and
+`nearest(...)` projects its distance the same way; that distance is the
+squared L2 distance Lance ranks by. Without an alias the column is
+`d._score` or `d._distance`. `rrf(...)` in `return` is refused until the
+fused score becomes a column (`T37`), and so is a `nearest(...)` or
+`bm25(...)` that appears only as an `rrf` arm, and so are the predicates
+`search(...)`, `fuzzy(...)` and `match_text(...)` (`T35`).
+
 Exact String predicates remain correct without an index. A free-text index does
 not accelerate equality, `starts_with`, or literal substring `contains`.
 
