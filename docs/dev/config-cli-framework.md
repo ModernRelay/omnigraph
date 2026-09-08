@@ -359,6 +359,15 @@ non-root paths, query and fragment; compare canonical origins, not prefixes.
 Managed requests reject redirects. Existing finite request/response bounds
 remain; the current 8 MiB JSON limit is not an export-streaming design.
 
+For proposed managed query/mutation connections,
+[CC-11](../rfcs/0059-config-cli-coherency.md#8-credentials-actor-and-transport)
+sets a 10-second connection deadline within a 30-second total request deadline,
+including the complete response body. The inspected baseline instead has a
+10-second total deadline. The proposal retains the 8 MiB response bound and
+prohibits automatic retry, credential fallback, and data requests to the Intent
+API. A submitted mutation's timeout leaves its outcome unknown. These proposed
+bounds do not qualify other managed operations or change legacy transport.
+
 The server verifies signed data credentials offline: signature, issuer,
 audience, expiry and cluster/root/incarnation binding, then action grants
 intersect applied Cedar permissions. Control permission does not imply data
@@ -850,6 +859,11 @@ Framework conformance assertions (acceptance criteria, not test results):
     catalog, unknown/unauthorized graphs, profiles/defaults, address conflicts
     and stable JSON. Results come from the active server catalog; existing
     direct listing and direct validation retain their separate behavior.
+14. Proposed query/mutation deadline fixtures verify success after 10 seconds
+    and before 30, the 10-second connection bound, and expiry of the complete
+    request at 30 seconds even while receiving body chunks. A submitted
+    mutation remains unknown after timeout; no automatic retry or authority
+    fallback occurs.
 
 Before accepting a new command: name its authority and target classes; define
 omissions, credentials, effects, failure/retry and compatibility; register it;

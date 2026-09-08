@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-09-06
+updated: 2026-09-08
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -204,7 +204,7 @@ create an exception to the publication, recovery, or trust boundaries.
 | 7 and 12, derived state and one authority | Credentials validate rather than select targets. Routing does not rewrite desired files, the applied ledger, accepted schema, or guard records. |
 | 8 and 9, explicit failures and typed semantics | Selected invalid/unsupported paths refuse without substitution. Query parsing, typed semantics, and source-selection contracts remain unchanged. |
 | 10, trust at the boundary and engine policy | Managed data retains verified graph/action ceilings plus Cedar; restored public actor shapes cannot manufacture verified signed authority. Direct writes retain their existing policy checks. |
-| 11, bounded observable failure and resource use | Preserve the existing managed transport bounds, distinguish unknown outcomes from refusal, and define eligibility before adding another operation. |
+| 11, bounded observable failure and resource use | Keep explicit managed transport bounds, distinguish unknown outcomes from refusal, and define eligibility before adding another operation. |
 | 13, evidence at the owning layer | Resolver/cache/HTTP/boot/public API changes have separate owning fixtures; source inspection and executed evidence remain distinct. |
 
 No deny-list exception is requested: in particular, no shadow source of truth,
@@ -538,14 +538,23 @@ Keep existing TTL validation (default 3,600 seconds; accepted range
 the existing endpoint rejects one. Run/lifecycle replay guarantees must not
 be generalized to token minting.
 
-**CC-11 — Preserve bounded, offline managed transport.** Retain no redirects,
-10-second connect and request deadlines, and the existing 8 MiB JSON-response
-bound for the initially eligible requests. Preserve the 64 KiB cached-record
-and 8 KiB token bounds and existing validators. Data requests do not call the
-Intent API, mint credentials, or refresh sessions. Streaming routes need an
-explicit bounded streaming contract before qualification; they must not
-inherit an unsuitable JSON limit or remove bounds silently. Legacy transport
-does not acquire new restrictions merely because managed support is added.
+**CC-11 — Bound offline managed query/mutation requests.** Use a 10-second
+connection deadline and a 30-second total request deadline for the initially
+eligible stored and ad-hoc queries/mutations. The total deadline includes
+connection establishment and consumption of the complete response body; body
+progress does not restart it. Retain no redirects, no automatic retries, and
+the existing 8 MiB JSON-response bound. A mutation timeout after submission
+leaves the outcome unknown; it does not prove cancellation or lack of effects.
+
+The 30-second total replaces the inspected baseline's 10-second total in this
+proposed contract; it is not a claim that those historical binaries already
+use 30 seconds. Preserve the 64 KiB cached-record and 8 KiB token bounds and
+existing validators. Data requests do not call the Intent API, mint
+credentials, refresh sessions, or fall back to another authority. Other
+operations and streaming routes require their own explicit bounded transport
+contract before qualification; they must not inherit an unsuitable JSON limit
+or remove bounds silently. Legacy transport does not acquire new restrictions
+merely because managed support is added.
 
 **CC-12 — Preserve actor attribution boundaries.** Direct writes retain
 `--as` and operator actor defaults. Authenticated served writes derive actor
@@ -760,7 +769,7 @@ this draft alone does not authorize implementation.
 | 1. Contract | Upstream CLI/RFC owners; CP spec owners | Amend operator/addressing and managed CLI/data RFCs, document compatibility boundary, update CP DEC/UIS/IDN/CFG references. |
 | 2. Baseline fixtures | Upstream CLI tests | Capture exact legacy routes, credential choices, refusals, and accepted syntax before replacing dispatch. |
 | 3. Config and resolver | `operator.rs`, `scope.rs`, command classification | Validated variants, selected connection identity, deterministic precedence; no auth/network selection. |
-| 4. Managed query/mutate | Managed credential helper and `GraphClient` | Exact endpoint match, existing cache/transport contract, removal of normal cwd dispatch, bounded temporary guard. |
+| 4. Managed query/mutate | Managed credential helper and `GraphClient` | Exact endpoint match, existing cache format and CC-11 transport bounds, removal of normal cwd dispatch, bounded temporary guard. |
 | Accepted catalog extension | CLI command classification, scope/client helpers and integration tests | CC-18 / #653: existing served endpoint, standard addressing, stable JSON, preserved direct list/validate; managed variant separately qualified. |
 | 5. Compatibility | Server/cluster library owners | Isolated public-shape/opt-in boot work with external compile and authorization fixtures. |
 | 6. Consumers | CLI release and CP packaging/pilot owners | Matched scripts/config/binary rollout after tests; update upstream pins only with relevant conformance results. |
@@ -808,6 +817,9 @@ Secrets remain test-only fixtures and are never emitted in diagnostics.
 | Other API, cluster, endpoint, expired or malformed managed cache | Refuse before bearer transmission, even with valid ambient legacy tokens. |
 | Managed entry added at an existing legacy URL | Literal legacy URL keeps its prior credential chain and transport. |
 | Managed redirect, timeout, oversized JSON | Bounded failure; no redirected credential, retry to another target, or silent unbounded path. |
+| Managed query/mutation connection stalls | Connection deadline remains 10 seconds within the 30-second total; no automatic retry or alternate authority. |
+| Managed stored/ad-hoc query/mutation completes after 10 seconds but before 30 | One request succeeds with its complete bounded response; it does not inherit the old 10-second total deadline. |
+| Managed query/mutation response headers or body remain incomplete at 30 seconds | Total request expires, including when body chunks arrive before expiry; no automatic retry, target fallback, or Intent API request. A submitted mutation's outcome remains unknown. |
 | Stored/ad-hoc read and mutation | Exact action ceiling plus Cedar; stored invocation additionally requires `invoke_query`. |
 | Direct actor and authenticated HTTP actor override | Direct attribution preserved; remote override refused and principal server-derived. |
 | Managed schema apply or another unqualified route | Unsupported in place; no direct/API/static fallback. |
@@ -936,3 +948,10 @@ The links identify inspected source, not executed test results:
   explicit-profile precedence and legacy/direct exceptions, prohibit
   unsupported-target fallback, and keep partial apply/recovery/boot authority
   unchanged. No maintainer acceptance or implementation completion is recorded.
+- **2026-09-08 — Narrow query/mutation deadline agreement.** CC-11 replaces its
+  proposed 10-second total request deadline with 30 seconds, including the
+  complete response body, while retaining the 10-second connection deadline.
+  Redirect refusal, the 8 MiB response bound, offline authority, and no
+  automatic retry remain required. CC-17 adds late-success and deadline
+  coverage, including unknown mutation outcomes. This agreement does not
+  accept the rest of this draft or record implementation completion.
