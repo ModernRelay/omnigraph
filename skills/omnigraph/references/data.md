@@ -20,7 +20,7 @@ edits.
 | Task | Command | Why |
 |------|---------|-----|
 | Add/update a single entity | `mutate` with a named mutation | typechecked, parameterized, auditable |
-| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file; keyed node and edge IDs derive from `@key` |
+| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file; keyed node IDs derive from `@key` |
 | Additive-only bulk | `load --mode append` | fails on key collision |
 | Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
 | Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
@@ -35,8 +35,8 @@ edits.
 > escapes the row ceiling but not the 32 MiB strict-input Arrow preflight
 > (`strict_input_arrow_bytes`), so a bulk replacement above ~32 MiB is one
 > `overwrite` chunk followed by `merge` chunks. Also: against a non-local
-> target, `--mode overwrite` (like `cleanup` and `branch delete`, verb or
-> statement) requires explicit `--yes` consent in non-interactive runs.
+> target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
+> explicit `--yes` consent in non-interactive runs.
 >
 > **Direct and served are one command.** `load` works against a graph store
 > (writing storage directly) *and* an `omnigraph-server` endpoint (the
@@ -76,9 +76,7 @@ JSONL format:
   `id` from its complete typed key tuple; omit `id` in hand-authored keyed
   input. An unkeyed node gets a generated id unless one is supplied.
 - Edges: `{"edge":"<EdgeType>","from":"<src_id>","to":"<dst_id>","data":{...edge_props...}}`.
-  Unkeyed edges use generated or supplied IDs. Keyed edges derive them from
-  `@key(src, dst, ...)`; omit `data.id`, or supply the exact derived value.
-  See [edge keys](schema.md#edge-keys) for identity and merge semantics.
+  Edges also use generated or supplied ids.
 
 Load command:
 
@@ -97,26 +95,14 @@ one-shot review-branch flow below). Without `--from`, the target `--branch`
   The loader validates constraints and referential integrity before publication.
   Use a review branch for an established graph.
 - **`merge`** (upsert) — inserts or updates each row by logical entity `id`
-  (derived from the typed `@key` tuple for keyed nodes and edges). Rows not in the file
+  (derived from the typed `@key` tuple for keyed nodes). Rows not in the file
   are preserved. The safe default for incremental bulk updates.
 - **`append`** (strict insert) — fails on entity-ID collision. Use when you're
   certain every row is new.
 
-With `--json`, an effectful data mutation or load returns the exact published
-`commit`; a no-op data mutation returns `commit: null`. Branch statements have
-[different receipt semantics](changes.md#branch-statement-receipts). For
-conditional data writes, feeds, and diff inspection, see [`changes.md`](changes.md).
-
-### Export and date spelling
-
-`export` retains these node/edge envelopes and includes entity IDs. Its `data`
-uses Arrow JSON spelling: null properties are omitted, Date/DateTime values are
-strings, and F32 values print at 32-bit width. A DateTime is UTC without a `Z`
-suffix; integer widths remain bare JSON numbers. The loader accepts calendar-day
-Date strings or integer epoch days, and ISO DateTime strings or integer epoch
-milliseconds. Other JSON types, including whole-number floats, are refused.
-A Date string carrying a time of day is also refused; use DateTime for an instant.
-Change images keep explicit nulls; see [changes](changes.md#inspect-one-commit).
+With `--json`, an effectful `mutate` or `load` returns the exact published
+`commit`; a no-op mutation returns `commit: null`. For compare-and-swap writes,
+feeds, and diff inspection, see [`changes.md`](changes.md).
 
 ### Embeddings are explicit input
 
@@ -165,13 +151,6 @@ Long-lived branches compound merge risk. The usual flow is: create → load →
 verify → `merge --delete-branch`, all in the same session. Source deletion only
 happens after a successful merge publication.
 
-Retain a branch whose imported commits are still needed by other live branches.
-For example, if `x` was merged into both `s` and `t`, finish their dependent
-merge before deleting the last branch holding `x`'s lineage. Otherwise the
-merge base can fall back to an older commit and report a false
-`divergent_update`. Ordinary single-target review branches can still be deleted
-promptly. Do not assume merge ancestry is already self-contained.
-
 ### Schema apply blocks non-main branches
 
 `omnigraph schema apply` rejects the request if any non-main branches exist. Merge or delete them first. This is enforced — it's not just a guideline.
@@ -201,33 +180,6 @@ omnigraph branch delete <branch-name> --store $REPO
 All support `--json` for automation-friendly output. Address the graph with a
 positional `file://`/`s3://`/preview `az://` URI (shown), `--store <uri>`, or
 `--server <name>`.
-
-The same four operations are GQ statements, for a client that already sends
-`.gq` source. Wrong-door rule: the control writes go through `mutate`, the
-listing through `query`; the other verb refuses the statement. A statement
-names its branches itself, so `--branch`, `--snapshot`, `--if-commit`, a
-positional name, and `--params` are refused beside it.
-
-```bash
-omnigraph mutate -e 'branch create "<branch-name>" from main' --store $REPO
-omnigraph query  -e 'branch list' --format table --store $REPO
-omnigraph mutate -e 'branch merge "<branch-name>" into main' --store $REPO
-omnigraph mutate -e 'branch delete "<branch-name>"' --store $REPO
-```
-
-A name outside the identifier alphabet `[a-z_][a-z0-9_]*` (an uppercase
-letter, a leading digit, `/`, `-`, or `.`) is quoted: `branch create
-"staging-2026-04-14"`. Quoting a name that needs no quotes is always allowed.
-`from` and `into` default to `main`.
-`--json` on a control write prints a `ChangeOutput` with `outcome.kind`
-(`created`, `deleted`, `merged`) and, for a merge, `outcome.merge`; the
-statement form has no `--delete-branch`, so delete the source with a second
-statement.
-
-The `commit` in that statement response is not an exact merge receipt; see
-[branch statement receipts](changes.md#branch-statement-receipts). Keep branch
-statement files outside the stored-query directory: `lint` and registry
-validation deliberately reject them.
 
 ## Inspecting State After Changes
 

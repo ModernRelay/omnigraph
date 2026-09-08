@@ -91,40 +91,6 @@ query hybrid($vq: Vector(1536), $tq: String) {
 }
 ```
 
-### Return the ranking score
-
-Project the same `nearest(...)` or `bm25(...)` expression that leads `order`:
-
-```gq
-query scored_titles($q: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.title, $q) as score }
-    order { bm25($d.title, $q) desc }
-    limit 10
-}
-```
-
-The result is F32: BM25 relevance or nearest squared L2 distance, computed by
-the ordering. Without an alias its column is `d._score` or `d._distance`.
-T33 refuses a different/missing leading order expression. An RRF arm is not
-a leading order expression; `rrf(...)` itself cannot be returned (T37), and
-scores cannot appear under aggregates. Search predicates belong in `match`.
-
-### Filtered nearest results and cost
-
-A standalone nearest ordering widens candidates when later filters/traversals
-leave `limit` short: four times, then sixteen times, then one exact pass over
-the whole type if needed. Fewer survivors than `limit` can therefore mean a
-whole-type pass on every execution. Selective traversal scopes can prefilter
-the search. The default IVF partition cap is 20 per index delta
-(`OMNIGRAPH_ANN_NPROBES`; `0` removes it); a short scan can widen that cap.
-A full candidate count does not make ANN ranking exact.
-
-An RRF nearest arm keeps its top-k window and widens only its own probe cap;
-later traversal filtering can shorten the fused answer. Do not assume the
-standalone nearest fill guarantee applies to RRF. Rank within a known scope
-when possible, and distinguish fewer eligible rows from approximate ranking.
-
 ### Text filter (not ranking — no `limit` required)
 
 ```gq
@@ -179,7 +145,6 @@ For a served graph, declare a named provider under `providers.embedding` in
 be `${ENV_VAR}` references and are resolved by the server at startup. Generated
 vectors are finite, nonzero, and L2-normalized.
 
-For the earlier v0.9→v0.10 upgrade, full-text queries require compatible
-rebuilt indexes on each branch that uses them. Current v7 binaries first require
-a v6 store to be exported/rebuilt at a new root; an FTS rebuild cannot bypass
-that format boundary. See [migrations](migrations.md).
+After upgrading a Lance 9/10 store, full-text queries can require
+`rebuild-full-text-indexes` on each live branch. Ordinary reads and vector
+search do not depend on that rebuild; see [`commands.md`](commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).

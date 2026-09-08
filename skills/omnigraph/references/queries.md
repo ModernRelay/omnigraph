@@ -38,9 +38,7 @@ Lint returns:
 - `"errors": N` — count of type errors (exit 1 when nonzero)
 - `"warnings": N` — count of drift warnings
 
-Run lint after editing query declarations or their schema. A file containing
-one branch statement is a separate form that lint intentionally refuses; keep
-it outside registered query directories.
+Run lint after every `.gq` or `.pg` edit. Wire into precommit.
 
 ## Parameterization
 
@@ -77,12 +75,6 @@ query recent_signals() {
     limit 50
 }
 ```
-
-A bare node variable projects the node as one object (`id` plus every
-property except `Blob` and `Vector` ones): `return { $s }` gives
-`{"id": "sig-1", "slug": "sig-1", "name": "…"}` under the column `s`;
-`sum`/`avg`/`min`/`max` refuse a bare node binding (`T8`), `count($s)` counts
-rows.
 
 ### Edge traversal (lowerCamelCase)
 
@@ -164,19 +156,9 @@ traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
 `{min,max}` multi-hop, rebinding a taken variable name, or projecting bare
 `$w` (project a property instead).
 
-Node variables: each `$_` is a distinct anonymous node, so two anonymous
-traversals from one variable are independent (a source with two neighbours
-matches two by two rows). Binding a node variable a second time (`$p:
-Person` after `$p` is bound, at the top level or inside `not { }`) adds the
-second binding's property matches as constraints on the same rows; it never
-introduces a second `$p`. Variable names beginning with `__` are reserved.
-
 Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
-typecheck (T22) — use the directional form there. Hop counts are shortest-path
-distances from the start node; a node is never re-reached through its own
-self-loop or a cycle, and the start node is returned only through its own
-self-loop, which counts as one hop.
+typecheck (T22) — use the directional form there.
 
 ### Negation
 
@@ -258,16 +240,7 @@ query friend_counts() {
 }
 ```
 
-Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on
-non-aggregated return fields. `min`/`max` accept numeric, String, Bool, Date,
-and DateTime properties and retain the property's type. Bool orders false
-before true; dates order chronologically. `sum`/`avg` remain numeric and
-return F64. Lists, vectors, and Blobs are not min/max inputs.
-
-With no matching rows, an all-aggregate query returns one row: count is 0 and
-the other aggregates are null (omitted in JSON). A query that also projects a
-group value returns no rows. A bare node binding is accepted only by count;
-the other aggregates need a property.
+Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
 
 ## Filter Operators
 
@@ -288,13 +261,7 @@ match {
 
 ## Mutations
 
-> **No top-level `mutation { ... }` wrapper.** A data mutation is a named
-> `query`; the body's verb (`insert` / `update` / `delete`) determines that it
-> is a write. Dispatch via `omnigraph mutate`. A file may instead contain
-> exactly one [branch statement](data.md#branch-commands-quick-reference),
-> never alongside query declarations. `lint` and the stored-query registry
-> deliberately reject that statement form with Q000; keep it outside registered
-> query directories.
+> **No top-level `mutation { ... }` wrapper.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` — that fails the parser at character 1 with `parse error: expected query_file`. Every executable block in a `.gq` file is a named `query`; the body's verb (`insert` / `update` / `delete`) determines whether it's a write. Dispatch via `omnigraph mutate` (not `query`).
 
 ### Insert
 
@@ -371,13 +338,11 @@ Prefer ISO strings on both paths:
 
 | Path | Date | DateTime |
 |---|---|---|
-| `mutate --params` | `"2026-04-29"` (a calendar day, `YYYY-MM-DD`) | ISO string `"2026-04-29T10:00:00Z"` |
-| `load` JSONL | `"2026-04-29"` (a calendar day; integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` (integer epoch milliseconds also accepted) |
+| `mutate --params` | ISO string `"2026-04-29"` | ISO string `"2026-04-29T10:00:00Z"` |
+| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` |
 
 Integer epoch days remain useful for generated Arrow-oriented input, but are
-not required for hand-authored JSONL. A `Date` string with a time of day
-(`"2026-04-29T10:00:00Z"`) is refused on both paths and in `date(...)`
-literals; an instant belongs in a `DateTime`.
+not required for hand-authored JSONL.
 
 ## Naming Convention
 

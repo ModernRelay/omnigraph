@@ -13,11 +13,6 @@ directory**, converged Terraform-style. It is the **only way to serve** a
 graph (the server is cluster-only); the data-plane operations in the other
 references work against the cluster's graphs unchanged.
 
-This page describes direct cluster operations. If the directory has a managed
-`.omnigraph/context`, use [managed operations](managed.md): plan/apply go through
-the control API, apply requires a saved plan, and local edits need `cluster push`.
-Use `--direct` only to intentionally select the direct path described here.
-
 ## The model
 
 ```
@@ -48,12 +43,6 @@ graphs:
 `queries` also accepts a file list (`[a.gq, b.gq]`) or a fine-grained
 `name: { file: ... }` map. Discovery is loud: unparseable files and duplicate
 names across files fail validation.
-
-Relative schema, query, and policy paths cannot contain `..` or traverse
-symlinks, including discovered query files (`config_path_escape` /
-`config_path_symlink`). Direct absolute paths retain their existing behavior;
-managed uploads require all files to remain inside the bundle. Branch statement
-files are not stored queries and fail bundle validation.
 
 ## The loop (memorize this)
 
@@ -104,20 +93,6 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
 - **Data is NOT cluster's job**: rows flow through `omnigraph load / mutate`
   against the derived roots, with branches as usual.
 
-## Observe without acquiring the lock
-
-```bash
-omnigraph cluster observe --config . --json
-omnigraph cluster plan --observe --config . --json
-```
-
-These report live observations without taking the cluster lock, running the
-recovery sweep, or writing the ledger. An existing lock is reported rather
-than refused. Outputs carry `authority: "observed"` and the exact `state_cas`
-read. Ordinary locked operations report `locked`; a bundle with
-`state.lock: false` reports `unlocked`. An observation is not permission or a
-lock to apply against later; apply captures and validates its own authority.
-
 ## The config contract (do not blur this)
 
 | File | Owns | Read by |
@@ -146,11 +121,6 @@ exposed (`GET /graphs/<id>/queries`, `POST
 (`cluster` → server-level gate incl. `graph_list`; a graph id → that
 graph's gate incl. `invoke_query`). Bearer tokens and bind stay process-level
 (env/flags).
-
-An applied empty cluster can serve its readiness witness and empty authorized
-inventory. Missing/unapplied state still refuses, as does a nonempty cluster
-with no healthy graphs. Use `/readyz` to inspect the booted revision and draining
-state; see [readiness and shutdown](server-policy.md#readiness-and-shutdown).
 
 **Config-free serving.** `--cluster` also accepts a `file://`, `s3://`, or
 preview `az://` storage-root URI

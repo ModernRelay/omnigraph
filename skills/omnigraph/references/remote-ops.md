@@ -19,21 +19,11 @@ omnigraph query get_person --server production --graph knowledge \
 selects a graph served by that cluster. Do not use the cluster control-plane
 `--config` flag on data-plane commands.
 
-For managed folder routing and separate data credentials, use
-[managed operations](managed.md). The retry rules here concern data-plane
-requests; managed control/lifecycle submissions have their own idempotency
-records and status workflow.
-
 ## Successful write receipts
 
-With `--json`, a successful effectful data mutation or load returns `commit`
-with the exact `graph_commit_id` and metadata published by that attempt. A
-data mutation that matches nothing returns `"commit": null`.
-
-Branch statements passed to `mutate` are an exception: create/delete return
-null, and a publishing merge can return a later target commit or null. Use
-their `outcome` and verify the intended effect; see [branch statement
-receipts](changes.md#branch-statement-receipts).
+With `--json`, a successful effectful `mutate` or `load` returns `commit` with
+the exact `graph_commit_id` and metadata published by that attempt. A successful
+mutation that matches nothing returns `"commit": null`.
 
 Persist the receipt with downstream state when a workflow needs an audit or
 resume position. Do not infer the published commit by listing history after the
@@ -60,7 +50,7 @@ omnigraph export --server production --graph knowledge \
 For `load --from <base> --branch <review>`, inspect the review branch rather
 than assuming branch creation means the load landed. Strict inserts of unkeyed
 nodes and edges can duplicate on a blind retry. Mutation `insert` and
-`load --mode merge` upsert keyed nodes and edges by their derived logical IDs;
+`load --mode merge` upsert keyed nodes by their derived logical IDs;
 `load --mode append` remains strict and reports an ID collision. Verification
 is still safer when the requested value matters.
 

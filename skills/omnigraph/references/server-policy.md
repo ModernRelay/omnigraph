@@ -20,8 +20,7 @@ single-graph server mode.
 | Route family | Purpose |
 |---|---|
 | `GET /healthz`, `/openapi.json` | Process metadata |
-| `GET /readyz` | Serving/draining state and booted revision; unauthenticated, no graph names |
-| `GET /graphs` | List served and quarantined graphs, subject to authorization (`graph_list`) |
+| `GET /graphs` | List served graphs (`graph_list`) |
 | `/graphs/{id}/query`, `/mutate` | Inline GQ reads and writes |
 | `/graphs/{id}/mutate/if-graph-commit` | Conditional inline mutation |
 | `/graphs/{id}/queries` | List/invoke stored queries, including conditional writes |
@@ -45,26 +44,6 @@ write receipts and conditional semantics are summarized in
 The deprecated `/read` response does not carry that commit position; consumers
 that need conditional writes must use `/query`.
 
-Branch statements use `/query` for `branch list` and `/mutate` for branch
-create/delete/merge. They use the corresponding branch policy action; their
-[receipt semantics](changes.md#branch-statement-receipts) differ from data
-mutations. Do not infer that a null branch-statement commit means no effect.
-
-## Readiness and shutdown
-
-`/healthz` only reports process health. `/readyz` reports serving/draining
-state, `booted_serving_digest`, the ledger revision/CAS read at boot, served
-and unserved graph counts, and the configured shutdown grace. Compare the
-booted digest with the intended applied revision when checking a rollout.
-An applied empty cluster can be ready; a nonempty all-failed cluster refuses
-startup. Authorized `/graphs` includes quarantined graph identities.
-
-Readiness turns off with HTTP 503 when shutdown starts. One deadline bounds
-startup/shutdown draining: `--shutdown-grace-seconds`, else
-`OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, else 25 seconds. A clean drain exits 0;
-the watchdog exits 2 at the deadline if work remains. Set the orchestrator's
-termination grace longer than the configured server grace.
-
 ## Authentication and actor identity
 
 Bearer tokens map actors at the server boundary. Request headers and bodies
@@ -76,30 +55,10 @@ echo "$TOKEN" | omnigraph login production
 omnigraph query get_person --server production --graph knowledge
 ```
 
-A server with no static tokens, signed-token trust, or policy refuses to start
-unless explicitly given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`).
-Use that only on a trusted development network. Static tokens without a policy
-allow only `read`; other actions remain denied.
-
-### Signed data credentials
-
-`--data-token-trust FILE` loads public signing trust bound to the exact cluster
-root, issuer, account, cluster ID, and incarnation. Invalid trust/root bindings
-refuse startup. Verification is local and does not depend on the issuer being
-online. Static credentials can coexist; a failed signed credential never falls
-back to static or anonymous access.
-
-A signed token resolves `principal:<immutable-principal-id>`. Current Cedar
-policy must explicitly permit that actor, and the token's graph/action grants
-must also allow the operation. Control-plane permission is not data permission;
-tokens cannot grant `schema_apply` or `admin`. Stored calls require
-`invoke_query` plus the body's action. See [managed data access](managed.md#data-access)
-for minting, expiry, and clearing local credentials.
-
-Trust changes require restart. Install old and new keys before issuing with a
-new key; retain the old key for at least 86,430 seconds after its last issuance
-before removing it. Issuer logout does not revoke issued tokens; accepted
-operations can complete after expiry.
+A server with neither tokens nor policy refuses to start unless explicitly
+given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only on a
+trusted development network. Tokens without a policy allow only `read`; other
+actions remain denied.
 
 ## Cedar actions
 
