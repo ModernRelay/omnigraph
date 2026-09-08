@@ -391,8 +391,8 @@ ordinary targets and the compatibility repair's ambiguity rules. The existing
 authenticated NDJSON protocol, graph publication, and server policy owners are
 unchanged. This adds a 32 MiB input bound and a separate 300-second load deadline
 while retaining the 8 MiB response bound and requiring branch creation authority
-for `--from`. Local transport and permission evidence is separate from live
-managed corpus qualification.
+for `--from`. Transport and authorization tests cover the CLI-to-server
+contract; engine publication and recovery semantics remain unchanged.
 
 2026-09-06: The compatibility repair restores the three public struct shapes
 and isolates canonical-root validation in opt-in managed boot. This replaces
