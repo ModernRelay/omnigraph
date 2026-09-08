@@ -62,6 +62,11 @@ are interim mechanisms, not permanent language requirements. The guarantees
 can be implemented directly in the staged model if both RFCs land together;
 there is no requirement to release an interim syntax first. RFC 0048 also
 owns the deliberate changes to selection and tie semantics at that cutover.
+For the combined release, the [user-facing migration
+matrix](0048-search-contracts.md#user-facing-changes-and-migration) distinguishes
+breaking query/schema changes from additive capabilities and unchanged graph
+behavior. This RFC's narrower compatibility statements apply to its standalone
+slice.
 
 ## Motivation
 

@@ -115,6 +115,85 @@ language semantics.
 
 ## User and operational behavior
 
+### User-facing changes and migration
+
+This section describes the proposed combined RFC 0047/0048 release. It is a
+draft migration contract, not a description of features already shipped.
+Search queries and representation declarations change together in one
+pre-stable release. Ordinary graph queries keep their language, but their
+graphs still cross the storage-format upgrade described below.
+
+#### Breaking changes
+
+| Existing usage or expectation | Proposed change | What users must do |
+|---|---|---|
+| `fuzzy`, `search`, or `match_text` | These spellings are removed without compatibility aliases. Boolean matching and ranked lexical retrieval consume the same typed `terms` query. | Choose `match_terms` for filtering or `lexical` for retrieval; set term combination and edit tolerance deliberately. |
+| `nearest`, retrieval expressions inside `order`, or positional RRF | Retrieval moves into explicit `rank` stages. Vector retrieval distinguishes exact `knn` from approximate `ann`; fusion names its inputs. | Rewrite inline and stored queries, choose exact versus approximate retrieval, and project named metrics instead of repeating retrieval expressions. |
+| Vector candidate depth inherited from final `limit`, while BM25 fusion arms scan uncapped | Each source and fusion stage has its own candidate window. Final `limit` counts output rows; graph fan-out can produce several rows per selected target. Stage comparators determine selection before final ordering. | Choose source/fusion windows explicitly and review tie keys and expected row counts. A migration cannot infer the intended recall/cost tradeoff from the old limit. |
+| `@index` or `@key` implicitly makes a String searchable by analyzed text | Analyzed matching requires `@analyzed`; lexical ranking also requires a compatible scoring declaration. Exact key/index annotations keep their separate meaning. | Review which fields need analyzed matching or ranking and add those declarations. An exact-only slug does not need an analyzer. |
+| Implicit vector geometry or an unresolved `@embed` model | Geometry and compatible encoding recipes become declared representation semantics. Bare `@embed` and model labels without recoverable revision identity require resolution. | Declare the geometry and resolve the encoding identity. Reuse old vectors only when compatible; regenerate them when the encoding recipe changes. |
+| Existing search rows, scores, or ordering survive a spelling-only rewrite | `terms` defaults to all terms and zero edits. Schema-owned analysis, complete fuzzy matching, long-token handling, scoring policies, and explicit selection boundaries can change results. | Review analyzer choices, fuzzy scoring, relevance expectations, score thresholds, and tie fixtures. The rewrite does not promise equivalent results to legacy search. |
+| Queries relying on silently ignored search constructs or permissive parameter handling | Invalid shapes, incompatible representations, token-empty queries, and exhausted budgets produce typed failures. A successful partial candidate set cannot stand in for an exact result. | Handle the declared errors and size queries explicitly; do not interpret a failure as an empty successful search. |
+| Existing graph files open directly after the upgrade | The accepted-schema change requires an export/init/load rebuild. Compatible values and logical graph content are carried over; commit history, branches, and physical indexes are not preserved by that rebuild. | Plan the data upgrade even if no query uses search. Retain the predecessor graph if its history is needed, rebuild indexes explicitly, and obtain fresh snapshot references from the rebuilt graph. |
+
+#### Additive capabilities
+
+These capabilities extend the query language without requiring ordinary graph
+queries to adopt ranking. Existing search queries still need the rewrites above.
+
+- Explicit exact vector retrieval and fuzzy lexical ranking, with the same
+  lexical matching definition available as a Boolean predicate.
+- Named lexical/vector sources and weighted fusion, with each source's rank,
+  score or distance available for projection. Missing arm membership remains
+  distinguishable from a computed score.
+- Ranking within a graph-defined population, further traversal of selected
+  targets, and selection with per-group quotas.
+- Inspectable query definitions and plans, retrieval/coverage metadata, and
+  completion of snapshot-coherent selective reads through existing read and
+  stored-query facilities. Stable ranked pagination remains deferred.
+
+#### What remains unchanged
+
+- Ordinary graph matching, traversal, exact property predicates, aggregates,
+  projection, and non-retrieval ordering/limits retain their existing roles.
+  String equality, `starts_with`, and String `contains` remain exact and
+  case-sensitive; they require no analyzed declaration.
+- Applications keep their own node, edge, and property model. Source texts,
+  passages, and their relationships remain application data; there is no
+  required `Document` type or `EvidenceReference` wrapper.
+- Queries still use the existing query endpoint and typed parameter/stored-query
+  mechanisms. Stored-query bodies that use removed search constructs must be
+  updated, even though the invocation mechanism is retained.
+- Graph commits, branches, coherent reads, and existing authorization retain
+  their contracts. Index maintenance remains explicit. These guarantees do not
+  imply preservation of old branches or snapshots across the format rebuild.
+
+#### HTTP, CLI, and SDK compatibility still to confirm
+
+Keeping the query endpoint does not by itself establish wire compatibility.
+The combined release extends result metadata and coherent follow-up behavior;
+its exact response fields, metric serialization, diagnostics, and CLI output
+must be reviewed against API types, OpenAPI, and client parsers. In particular,
+clients that reject unknown fields or parse human output may need updates.
+RFC 0047's narrower additive-envelope and legacy `/read` commitments must be
+reconciled at this boundary. Until that review, this RFC makes no blanket
+claim that existing HTTP/SDK clients work unchanged.
+
+#### Migration sequence
+
+1. Review the schema and resolve analyzer, scoring, vector geometry, and
+   encoding choices before rebuilding data.
+2. Rewrite application and stored queries against that schema, choosing
+   matching modes, exact/approximate retrieval, and candidate windows.
+3. Use the existing export/init/load upgrade path, regenerate incompatible
+   representations, and reconcile indexes explicitly.
+4. Validate rewritten queries, expected results, client response/error handling,
+   and snapshot follow-up before switching applications to the rebuilt graph.
+
+The release must include the schema/query migration diagnostics, updated
+examples, user guides, and release notes. Detailed semantics and remaining
+acceptance gates follow; the migration tools must not guess unresolved choices.
+
 ### Schema and analyzers
 
 The annotations below are proposed syntax. The representation identity
@@ -859,26 +938,17 @@ hide a partial candidate population. No invariant exception is requested.
 
 ## Compatibility and reversibility
 
-- **Format:** representation semantics require coordinated accepted SchemaIR
-  and internal manifest versions. Older/newer incompatible binaries refuse
-  rather than reinterpret. Existing export/init/load crosses the boundary;
-  rows and compatible values survive, while commit history, branches, and
-  physical indexes are not preserved by that rebuild.
-- **Query language:** one pre-stable breaking change replaces legacy lexical
-  functions, retrieval-in-order, `nearest`, and positional RRF. No alias
-  execution engine is retained. Target-stage selection and final row ordering
-  are deliberately separate, including their tie rules.
-- **Wire:** keep the existing query/parameter submission path and typed
-  stored-query mechanism. Extend result metadata and snapshot-bound follow-up
-  support there; do not claim every addition is wire-compatible before the
-  API types/OpenAPI contract is reviewed. Regenerate OpenAPI when implemented.
-- **Documentation:** these are draft capabilities, not current user-guide
-  behavior. Implementation changes update user/developer guides, stored-query
-  examples, and release notes together.
-- **Reversibility:** grammar remains changeable before stable release. Accepted
-  representation identities, scoring meanings, and format compatibility still
-  require evidence because deployed data and queries depend on them. Reverting
-  a format change requires another explicit rebuild.
+The [user-facing migration matrix](#user-facing-changes-and-migration) owns
+the breaking/additive classification, client compatibility limits, and upgrade
+sequence. Representation semantics require coordinated accepted SchemaIR and
+internal manifest versions. Incompatible binaries refuse rather than
+reinterpret data; implementation must regenerate OpenAPI and update current
+developer guides alongside the user-facing material listed above.
+
+Grammar remains changeable before stable release. Accepted representation
+identities, scoring meanings, and format compatibility still require evidence
+because deployed data and queries depend on them. Reverting a format change
+requires another explicit rebuild.
 
 ## Alternatives
 
