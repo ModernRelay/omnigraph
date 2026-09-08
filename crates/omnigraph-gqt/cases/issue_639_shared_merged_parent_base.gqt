@@ -1,18 +1,18 @@
 # issue: 639
-# red_on: 2026-09-06, main 5d74278c: step 8 `branch merge t` failed with `merge conflicts: node type 'Item', entity id 'a' (divergent_update)`; steps 1-7 green, both imports `fast_forward`.
+# red_on: 2026-09-07, main 5d74278c: step 8 `branch merge t` failed with `merge conflicts: node type 'Person', entity id 'a' (divergent_update)`; steps 1-7 green, both imports `fast_forward`.
 # notes: main and t both fast-forward x (a=1), then main sets a=2 and t
-# notes: sets x=1. The base of the t-into-main merge must be x's commit; the
+# notes: sets b's age. The base of the t-into-main merge must be x's commit; the
 # notes: fork point (a=0) makes x's write look like an edit on both sides.
 
 --- schema
-node Item {
-    slug: String @key
-    value: I32
+node Person {
+    name: String @key
+    age: I32
 }
 
 --- seed
-{"type":"Item","data":{"slug":"a","value":0}}
-{"type":"Item","data":{"slug":"x","value":0}}
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
 
 --- mutate
 branch create x
@@ -26,7 +26,7 @@ branch create t
 
 --- mutate branch: x
 query set_a_on_x() {
-    update Item set { value: 1 } where slug = "a"
+    update Person set { age: 1 } where name = "a"
 }
 
 --- expect affected: nodes=1 edges=0
@@ -43,14 +43,14 @@ branch merge x into t
 
 --- mutate
 query set_a_on_main() {
-    update Item set { value: 2 } where slug = "a"
+    update Person set { age: 2 } where name = "a"
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: t
-query set_x_on_t() {
-    update Item set { value: 1 } where slug = "x"
+query set_b_on_t() {
+    update Person set { age: 1 } where name = "b"
 }
 
 --- expect affected: nodes=1 edges=0
@@ -62,14 +62,14 @@ branch merge t
 
 --- query
 query values_on_main() {
-    match { $i: Item }
-    return { $i.slug, $i.value }
+    match { $p: Person }
+    return { $p.name, $p.age }
 }
 
 --- expect unordered
-{"i.slug": "a", "i.value": 2}
-{"i.slug": "x", "i.value": 1}
+{"p.name": "a", "p.age": 2}
+{"p.name": "b", "p.age": 1}
 
 --- expect shape
-i.slug: String
-i.value: I32
+p.name: String
+p.age: I32

@@ -38,7 +38,7 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0063**; lower gaps are historical and must
+The next available number is **0064**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0058 by
 PR #662 for retained merged ancestry; 0059 by PR #675; 0060 by PR #677).
@@ -185,4 +185,4 @@ This table is the human index for the canonical RFC corpus.
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
-| [0062](0062-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
+| [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |

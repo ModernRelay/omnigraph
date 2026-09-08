@@ -2,17 +2,17 @@
 # notes: companion of issue_639_shared_merged_parent_base: the ordinary flow around a deleted branch: s forks main; x forks main,
 # notes: writes, is merged into main and deleted; s merges into main. Only main's
 # notes: walk reaches x's commit before shared history, so it is not a base
-# notes: candidate and the merge proceeds on the fork point (RFC 0062 step 1).
+# notes: candidate and the merge proceeds on the fork point (RFC 0063 step 1).
 
 --- schema
-node Item {
-    slug: String @key
-    value: I32
+node Person {
+    name: String @key
+    age: I32
 }
 
 --- seed
-{"type":"Item","data":{"slug":"a","value":0}}
-{"type":"Item","data":{"slug":"x","value":0}}
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
 
 --- mutate
 branch create s
@@ -26,7 +26,7 @@ branch create x
 
 --- mutate branch: x
 query set_a_on_x() {
-    update Item set { value: 1 } where slug = "a"
+    update Person set { age: 1 } where name = "a"
 }
 
 --- expect affected: nodes=1 edges=0
@@ -42,8 +42,8 @@ branch delete x
 --- expect ok
 
 --- mutate branch: s
-query set_x_on_s() {
-    update Item set { value: 1 } where slug = "x"
+query set_b_on_s() {
+    update Person set { age: 1 } where name = "b"
 }
 
 --- expect affected: nodes=1 edges=0
@@ -55,14 +55,14 @@ branch merge s
 
 --- query
 query values_on_main() {
-    match { $i: Item }
-    return { $i.slug, $i.value }
+    match { $p: Person }
+    return { $p.name, $p.age }
 }
 
 --- expect unordered
-{"i.slug": "a", "i.value": 1}
-{"i.slug": "x", "i.value": 1}
+{"p.name": "a", "p.age": 1}
+{"p.name": "b", "p.age": 1}
 
 --- expect shape
-i.slug: String
-i.value: I32
+p.name: String
+p.age: I32
