@@ -1,0 +1,81 @@
+# issue: 681
+# red_on: 2026-09-07, main @ 5f94a741, under the expectation the issue filed (no rows after the b0 merge): the final read returned {"a.name":"alice","b.name":"bob"}; ruled the multiset default the same day, and that row is the claim below
+# notes: unkeyed edge type (RFC 0044): b0's re-insert of a pair main holds is a fresh row, b1's delete
+# notes: removes the inherited row; merge b1 empties main, merge b0 adopts the fresh row. DST nightly seed 221206.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate
+branch create b1
+
+--- expect ok
+
+--- mutate branch: b0
+query readd() {
+    insert Knows { from: "alice", to: "bob" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: b1
+query delete() {
+    delete Knows where from = "alice"
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge b1
+
+--- expect ok
+
+--- query
+query after_delete_merge() {
+    match {
+        $a: Person
+        $a knows $b
+    }
+    return { $a.name, $b.name }
+}
+
+--- expect unordered
+
+--- expect shape
+a.name: String
+b.name: String
+
+--- mutate
+branch merge b0
+
+--- expect ok
+
+--- query
+query after_readd_merge() {
+    match {
+        $a: Person
+        $a knows $b
+    }
+    return { $a.name, $b.name }
+}
+
+--- expect unordered
+{"a.name": "alice", "b.name": "bob"}
+
+--- expect shape
+a.name: String
+b.name: String

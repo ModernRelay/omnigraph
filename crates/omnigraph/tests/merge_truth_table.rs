@@ -46,7 +46,7 @@ mod helpers;
 
 use std::time::Instant;
 
-use helpers::{count_rows, mixed_params, mutate_branch, params, query_main};
+use helpers::{count_rows, first_column_sorted, mixed_params, mutate_branch, params, query_main};
 use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::error::{MergeConflictKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
@@ -100,6 +100,22 @@ query get_person($name: String) {
         $p: Person { name: $name }
     }
     return { $p.name, $p.age }
+}
+
+query all_knows() {
+    match {
+        $a: Person
+        $a $w:knows $b
+    }
+    return { $a.name, $b.name }
+}
+
+query knows_of($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name }
 }
 "#;
 
@@ -602,10 +618,11 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
             InsertAliceCarol,
             // Both sides insert the same logical edge but each generates a
             // fresh ULID id, so the merge sees two distinct rows with the
-            // same (src, dst) pair and keeps both. This is the current
-            // behavior; whether duplicate Knows edges should be deduplicated
-            // by endpoints is tracked separately — the cell pins the
-            // current contract.
+            // same (src, dst) pair and keeps both: the documented multiset
+            // default for unkeyed edge types. Declaring `@key(src, dst)`
+            // opts into convergence instead (RFC 0044); the keyed twin
+            // `add_edge_add_edge_keyed_twin_converges` asserts it. This
+            // cell pins the unkeyed contract.
             Expected::Merged(GraphAssert {
                 persons: 4,
                 knows_edges: 3,
@@ -1070,4 +1087,78 @@ async fn merge_pair_truth_table() {
     // a fixed time budget in a correctness test flakes under parallel test load
     // (it tripped at ~31s in the full `--test-threads=4` gate while passing at
     // ~20s in isolation). Merge-perf regressions belong in a bench, not here.
+}
+
+// ─── Keyed twin of (AddEdge, AddEdge) ───────────────────────────────────────
+
+const KEYED_TRUTH_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    @key(src, dst)
+}
+"#;
+
+/// The keyed twin of the `(AddEdge, AddEdge)` cell: with `@key(src, dst)`
+/// declared, both sides insert Alice→Carol, the ids derive equal, and the
+/// merge converges to one row instead of keeping both. The matrix cell
+/// pins the unkeyed multiset default; this twin pins the opt-in.
+#[tokio::test]
+async fn add_edge_add_edge_keyed_twin_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main_db = Omnigraph::init(uri, KEYED_TRUTH_SCHEMA).await.unwrap();
+    load_jsonl(&main_db, TRUTH_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    main_db.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    let insert = params(&[("$from", "Alice"), ("$to", "Carol")]);
+    mutate_branch(
+        &mut main_db,
+        "main",
+        TRUTH_MUTATIONS,
+        "insert_knows",
+        &insert,
+    )
+    .await
+    .unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        TRUTH_MUTATIONS,
+        "insert_knows",
+        &insert,
+    )
+    .await
+    .unwrap();
+
+    main_db
+        .branch_merge("feature", "main")
+        .await
+        .expect("identical born-on-both keyed edges converge without conflict");
+    // Base holds Bob→Carol; the converged Alice→Carol makes two rows, not
+    // three — and the PAIRS must be exactly these two (a merge that dropped
+    // Bob→Carol while duplicating Alice→Carol would also count 2, as would
+    // one with the right sources and wrong targets).
+    assert_eq!(count_rows(&main_db, "edge:Knows").await, 2);
+    for (from, to) in [("Alice", "Carol"), ("Bob", "Carol")] {
+        let knows = query_main(
+            &mut main_db,
+            TRUTH_MUTATIONS,
+            "knows_of",
+            &params(&[("$name", from)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first_column_sorted(&knows),
+            vec![to.to_string()],
+            "{from} must know exactly {to} after the merge"
+        );
+    }
 }

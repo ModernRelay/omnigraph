@@ -351,11 +351,11 @@ pub async fn knows_pairs_target_mode(
     omnigraph::instrumentation::with_traversal_mode(mode, knows_pairs_target(db, target)).await
 }
 
-/// The BOUND-EDGE spelling (`$a $e:knows $b`): scans edge rows
+/// The BOUND-EDGE spelling (`$a $e:knows $b`) at ROW grain: scans edge rows
 /// directly, dispatched BEFORE mode selection and WITHOUT the visited gate —
-/// the third arm that sees ghost rows the gated modes hide. Deduped
-/// (multiple identical ghost rows are one pair at set level).
-pub async fn knows_pairs_bound_target(db: &Omnigraph, target: ReadTarget) -> Vec<(String, String)> {
+/// the third arm that sees ghost rows the gated modes hide — one entry per
+/// physical row, sorted, duplicates kept (the query-channel count observer).
+pub async fn knows_rows_bound_target(db: &Omnigraph, target: ReadTarget) -> Vec<(String, String)> {
     use arrow_array::{Array, StringArray};
     let qr = query_target(
         db,
@@ -366,7 +366,7 @@ pub async fn knows_pairs_bound_target(db: &Omnigraph, target: ReadTarget) -> Vec
     )
     .await
     .expect("all_knows_bound traversal");
-    let mut pairs = std::collections::BTreeSet::new();
+    let mut pairs = Vec::new();
     for batch in qr.batches() {
         let froms = batch
             .column(0)
@@ -380,11 +380,20 @@ pub async fn knows_pairs_bound_target(db: &Omnigraph, target: ReadTarget) -> Vec
             .expect("bound col 1 = to name");
         for i in 0..froms.len() {
             if froms.is_valid(i) && tos.is_valid(i) {
-                pairs.insert((froms.value(i).to_string(), tos.value(i).to_string()));
+                pairs.push((froms.value(i).to_string(), tos.value(i).to_string()));
             }
         }
     }
-    pairs.into_iter().collect()
+    pairs.sort();
+    pairs
+}
+
+/// [`knows_rows_bound_target`] deduped: pairs at set level (multiple
+/// identical rows, ghost or live, are one pair).
+pub async fn knows_pairs_bound_target(db: &Omnigraph, target: ReadTarget) -> Vec<(String, String)> {
+    let mut pairs = knows_rows_bound_target(db, target).await;
+    pairs.dedup();
+    pairs
 }
 
 /// `person_rows_target` on main.
@@ -401,17 +410,19 @@ pub async fn knows_pairs(db: &Omnigraph) -> Vec<(String, String)> {
 /// The PHYSICAL channel of a branch: parse `export_jsonl` (stored rows,
 /// NO query machinery — the read that classified #474's ghost row on the
 /// CLI) into the same shapes the model uses. Persons: sorted
-/// `(name, age, ver)` with missing/null → -1. Knows edges: sorted DEDUPED
-/// `(from, to)` pairs, self-loops INCLUDED (that inclusion is the whole
-/// point — the query channel hides them). Company/WorksAt lines are ignored
-/// (outside the modeled world).
+/// `(name, age, ver)` with missing/null → -1. Knows edges: sorted
+/// `(from, to)` pairs at ROW grain, DUPLICATES KEPT (the one channel that
+/// sees the multiset: an unkeyed pair inserted twice is two rows here and
+/// one pair on every query channel), self-loops INCLUDED (that inclusion is
+/// the whole point — the query channel hides them). Company/WorksAt lines
+/// are ignored (outside the modeled world).
 pub async fn physical_view_on(
     db: &Omnigraph,
     branch: &str,
 ) -> (Vec<(String, i64, i64)>, Vec<(String, String)>) {
     let dump = db.export_jsonl(branch, &[]).await.expect("export_jsonl");
     let mut persons = Vec::new();
-    let mut knows = std::collections::BTreeSet::new();
+    let mut knows = Vec::new();
     for line in dump.lines().filter(|l| !l.trim().is_empty()) {
         let value: serde_json::Value = serde_json::from_str(line).expect("export line is JSON");
         if value.get("type").and_then(|t| t.as_str()) == Some("Person") {
@@ -435,11 +446,12 @@ pub async fn physical_view_on(
                 .and_then(|t| t.as_str())
                 .expect("Knows has to")
                 .to_string();
-            knows.insert((from, to));
+            knows.push((from, to));
         }
     }
     persons.sort();
-    (persons, knows.into_iter().collect())
+    knows.sort();
+    (persons, knows)
 }
 
 /// Seeds for a fleet run: `OMNIGRAPH_DST_SEEDS` (comma-separated u64s) when
