@@ -29,16 +29,19 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
 use omnigraph_api_types::{
     BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
-    BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeBaselineOutput,
-    ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
-    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, EntityKindOutput,
-    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphListResponse, IngestOutput,
-    IngestRequest, InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotOutput, change_baseline_output, change_feed_output,
-    change_scope, commit_changes_output, commit_output, ingest_receipt_output, read_output,
-    schema_apply_output, snapshot_payload,
+    BranchListOutput, BranchMergeOutcome, BranchMergeOutput, BranchMergeRequest,
+    BranchOutcomeOutput, ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest,
+    ChangeFeedOutput, ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput,
+    CommitListOutput, CommitOutput, EntityKindOutput, ErrorOutput, ExportRequest,
+    GraphBatchLoadOutput, GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
+    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    branch_list_read_output, change_baseline_output, change_feed_output, change_scope,
+    commit_changes_output, commit_output, ingest_receipt_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::query::ast::BranchWrite;
+use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
@@ -49,10 +52,11 @@ use crate::blob_cli::{
 };
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, build_blob_http_client, build_http_client,
-    is_remote_uri, legacy_change_request_body, precondition_failed_cli, query_params_from_json,
-    remote_json, remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor,
-    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    apply_bearer_token, apply_server_flag, branch_statement_change_request,
+    branch_statement_query_request, build_blob_http_client, build_http_client, is_remote_uri,
+    legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
+    remote_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
+    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
@@ -68,6 +72,7 @@ pub(crate) enum GraphClient {
         http: reqwest::Client,
         base_url: String,
         token: Option<String>,
+        response_limit: Option<usize>,
     },
 }
 
@@ -112,6 +117,20 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 }
 
 impl GraphClient {
+    /// An already validated managed credential never enters legacy scope or token resolution.
+    pub(crate) fn managed(endpoint: &str, graph: &str, token: String) -> Result<Self> {
+        Ok(Self::Remote {
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            base_url: remote_url(endpoint, &["graphs", graph], &[])?,
+            token: Some(token),
+            response_limit: Some(8 * 1024 * 1024),
+        })
+    }
+
     /// The single owner of registry (`GET /graphs`) addressing: the bare base
     /// URL of `server` (a config name or literal URL) — never `/graphs/<id>`
     /// — with the keyed bearer-token chain. Synchronous: pure config
@@ -124,6 +143,7 @@ impl GraphClient {
             http: build_http_client()?,
             base_url: base,
             token,
+            response_limit: None,
         })
     }
 
@@ -211,6 +231,7 @@ impl GraphClient {
                 http: build_http_client()?,
                 base_url: uri,
                 token,
+                response_limit: None,
             })
         } else {
             Ok(GraphClient::Embedded { uri, actor: None })
@@ -275,6 +296,7 @@ impl GraphClient {
                 http: build_http_client()?,
                 base_url: resolved.uri,
                 token,
+                response_limit: None,
             })
         } else {
             let actor = resolve_cli_actor(cli_as)?;
@@ -310,6 +332,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -335,6 +358,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -363,6 +387,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -388,6 +413,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(base_url, &["commits"], &[("branch", branch)])?,
@@ -414,6 +440,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -446,6 +473,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
                 let mut query = Vec::new();
@@ -503,6 +531,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
                 let mut query = Vec::new();
@@ -577,6 +606,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let request = apply_bearer_token(
                     http.request(
@@ -656,6 +686,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let data = std::fs::read_to_string(data)?;
                 let mut query = vec![("branch", branch), ("mode", mode.as_str())];
@@ -726,6 +757,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let data = std::fs::read_to_string(data)?;
                 remote_json(
@@ -778,6 +810,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
             } => {
                 let (url, body) = if expected_head.is_some() {
                     (
@@ -795,18 +828,20 @@ impl GraphClient {
                         legacy_change_request_body(query_source, query_name, branch, params_json),
                     )
                 };
-                remote_json_with_graph_commit_precondition(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     url,
                     Some(body),
                     token.as_deref(),
                     expected_head,
+                    *response_limit,
                 )
                 .await
             }
             GraphClient::Embedded { uri, actor } => {
-                let (selected_name, query_params) = select_named_query(query_source, query_name)?;
+                let (selected_name, query_params) =
+                    select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
@@ -838,8 +873,126 @@ impl GraphClient {
                     affected_edges: receipt.result.affected_edges,
                     actor_id: actor.map(String::from),
                     commit: receipt.commit.as_ref().map(commit_output),
+                    outcome: None,
                 })
             }
+        }
+    }
+
+    /// A control write statement (`branch create`, `branch delete`, `branch
+    /// merge`) from `-e`/`--query`: `POST /mutate` with the source alone, or
+    /// the engine call the matching `branch` verb makes, answered as the
+    /// server answers it (`branch` received the effect, both counts `0`,
+    /// `commit` the target's head after a publishing merge).
+    pub(crate) async fn branch_write_statement(
+        &self,
+        query_source: &str,
+        write: BranchWrite,
+    ) -> Result<ChangeOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["mutate"], &[])?,
+                    Some(serde_json::to_value(branch_statement_change_request(
+                        query_source,
+                    ))?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let query_name = write.statement_name().to_string();
+                let (branch, commit, outcome) = match write {
+                    BranchWrite::Create { name, from } => {
+                        let from = from.unwrap_or_else(|| "main".to_string());
+                        self.branch_create_from(&from, &name).await?;
+                        (
+                            name.clone(),
+                            None,
+                            BranchOutcomeOutput::Created { from, name },
+                        )
+                    }
+                    BranchWrite::Delete { name } => {
+                        self.branch_delete(&name).await?;
+                        (name.clone(), None, BranchOutcomeOutput::Deleted { name })
+                    }
+                    BranchWrite::Merge { source, into } => {
+                        let target = into.unwrap_or_else(|| "main".to_string());
+                        let merge: BranchMergeOutcome =
+                            self.branch_merge(&source, &target, false).await?.outcome;
+                        let commit = match merge {
+                            BranchMergeOutcome::AlreadyUpToDate => None,
+                            BranchMergeOutcome::FastForward | BranchMergeOutcome::Merged => {
+                                match Self::open_embedded(uri).await {
+                                    Ok(db) => db
+                                        .list_commits(Some(&target))
+                                        .await
+                                        .ok()
+                                        .and_then(|commits| commits.first().map(commit_output)),
+                                    Err(_) => None,
+                                }
+                            }
+                        };
+                        (
+                            target.clone(),
+                            commit,
+                            BranchOutcomeOutput::Merged {
+                                source,
+                                target,
+                                merge,
+                            },
+                        )
+                    }
+                };
+                Ok(ChangeOutput {
+                    branch,
+                    query_name,
+                    affected_nodes: 0,
+                    affected_edges: 0,
+                    actor_id: actor.clone(),
+                    commit,
+                    outcome: Some(outcome),
+                })
+            }
+        }
+    }
+
+    /// The `branch list` statement from `-e`/`--query`: `POST /query` with
+    /// the source alone, or the engine's ref list in byte order, both as the
+    /// one `ReadOutput` shape (`branch_list_read_output`).
+    pub(crate) async fn branch_list_statement(&self, query_source: &str) -> Result<ReadOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(branch_statement_query_request(
+                        query_source,
+                    ))?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => Ok(branch_list_read_output(
+                &self.branch_list().await?.branches,
+            )?),
         }
     }
 
@@ -858,12 +1011,13 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
             } => {
                 let (branch, snapshot) = match &target {
                     ReadTarget::Branch(branch) => (Some(branch.clone()), None),
                     ReadTarget::Snapshot(snapshot) => (None, Some(snapshot.as_str().to_string())),
                 };
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["query"], &[])?,
@@ -875,17 +1029,25 @@ impl GraphClient {
                         snapshot,
                     })?),
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let (selected_name, query_params) = select_named_query(query_source, query_name)?;
+                let (selected_name, query_params) =
+                    select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
                 let (result, graph_commit_id) = db
                     .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
-                Ok(read_output(selected_name, &target, result, graph_commit_id))
+                Ok(read_output(
+                    selected_name,
+                    &target,
+                    result,
+                    graph_commit_id,
+                )?)
             }
         }
     }
@@ -911,6 +1073,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
             } => {
                 let body = InvokeStoredQueryRequest {
                     params: params_json.cloned(),
@@ -918,7 +1081,7 @@ impl GraphClient {
                     snapshot,
                     expect_mutation: Some(expect_mutation),
                 };
-                remote_json_with_graph_commit_precondition(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     if expected_head.is_some() {
@@ -929,6 +1092,7 @@ impl GraphClient {
                     Some(serde_json::to_value(body)?),
                     token.as_deref(),
                     expected_head,
+                    *response_limit,
                 )
                 .await
             }
@@ -950,6 +1114,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -984,6 +1149,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -1021,6 +1187,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,
@@ -1087,6 +1254,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 // MR-694 PR B: SchemaApplyRequest carries allow_data_loss so
                 // Hard-mode drops are no longer CLI-only; the server's
@@ -1136,6 +1304,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 let request = apply_bearer_token(
                     http.request(Method::POST, remote_url(base_url, &["export"], &[])?),
@@ -1345,6 +1514,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                ..
             } => {
                 remote_json(
                     http,

@@ -12,6 +12,7 @@
 <!-- Pick one. A substantive change needs (1) or (2). -->
 
 - [ ] Fixes an **accepted** issue: Closes #
+      (a fix under `crates/`, `tools/`, or the root manifests carries an `issue_N_*.gqt` case or an `issue_N` test in the diff, or asks a maintainer for the `no-repro` label; `Fix Regression Gate` checks, `docs/dev/ci.md`)
 - [ ] Is an RFC PR, or implements an **accepted** RFC: <link to docs/rfcs/NNNN-*.md>
 - [ ] **Trivial fast-lane** (typo / docs / dependency bump / comment / one-line CI) — no issue/RFC required
 
@@ -25,7 +26,7 @@
 ## Local verification
 
 <!-- List the exact commands run and their results. Use "not run" with a reason
-instead of implying that post-merge CI has already provided evidence. -->
+instead of implying that CI has already provided evidence. -->
 
 - `command` — result
 

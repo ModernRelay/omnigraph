@@ -64,10 +64,16 @@ use crate::error::{OmniError, Result};
 ///   non-null `id` field using Lance's unenforced-primary-key metadata. The
 ///   annotation is present at dataset creation and preserved by overwrites;
 ///   older graphs cross this immutable boundary by export/init/load rebuild.
+/// - v7 — RFC-0062 re-keys `__manifest` registration and tombstone rows on
+///   `(identity, manifest_version)`, the `__manifest` version that wrote the
+///   row, carried as the row key's trailing segment, and projects a table's
+///   current registration by the greatest manifest version instead of the
+///   greatest per-native-ref Lance version. The unreleased v7–v19 stamps of the
+///   rejected MemWAL experiment never shipped; v7 is reused.
 ///
-/// v1–v5 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v6 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 6;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 7;
 
 /// The oldest on-disk internal-schema stamp this binary will open. With no
 /// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
@@ -276,8 +282,8 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 6` the live
-    /// range is exactly `[6, 6]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 7` the live
+    /// range is exactly `[7, 7]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
@@ -294,10 +300,10 @@ mod tests {
         }
         let future_stamp = INTERNAL_MANIFEST_SCHEMA_VERSION + 1;
         let future = refuse_if_stamp_unsupported(future_stamp)
-            .expect_err("the first abandoned post-v6 stamp must be refused")
+            .expect_err("the first abandoned post-v7 stamp must be refused")
             .to_string();
-        assert!(future.contains("internal schema v7"), "got: {future}");
-        assert!(future.contains("expects v6"), "got: {future}");
+        assert!(future.contains("internal schema v8"), "got: {future}");
+        assert!(future.contains("expects v7"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 

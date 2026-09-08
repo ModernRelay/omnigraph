@@ -180,10 +180,11 @@ fn openapi_info_contains_version() {
 // Path coverage tests
 // ---------------------------------------------------------------------------
 
-// The canonical served spec keeps `/healthz` and `/graphs` flat; every
+// The canonical served spec keeps `/healthz`, `/readyz`, and `/graphs` flat; every
 // protected route nests under `/graphs/{graph_id}/…`.
 const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
+    "/readyz",
     "/graphs",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
@@ -924,6 +925,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "BranchMergeOutcome",
     "BranchMergeOutput",
     "BranchMergeRequest",
+    "BranchOutcomeOutput",
     "BlobEntityKind",
     "ChangeOutput",
     "ChangeRequest",
@@ -1132,6 +1134,91 @@ fn change_output_schema_has_expected_fields() {
     assert!(props.contains_key("affected_nodes"));
     assert!(props.contains_key("affected_edges"));
     assert_optional_commit_field(&doc, "ChangeOutput");
+
+    let outcome = props
+        .get("outcome")
+        .expect("ChangeOutput must expose the branch statement outcome");
+    let required = schema["required"].as_array().unwrap();
+    assert!(
+        required
+            .iter()
+            .all(|field| field.as_str() != Some("outcome")),
+        "ChangeOutput.outcome must stay optional: a mutation body never carries it"
+    );
+    let outcome_ref = outcome["$ref"].as_str().or_else(|| {
+        outcome["oneOf"]
+            .as_array()
+            .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+    });
+    assert_eq!(
+        outcome_ref,
+        Some("#/components/schemas/BranchOutcomeOutput")
+    );
+}
+
+#[test]
+fn branch_outcome_output_schema_is_tagged_by_kind() {
+    let doc = openapi_json();
+    let variants = doc["components"]["schemas"]["BranchOutcomeOutput"]["oneOf"]
+        .as_array()
+        .expect("BranchOutcomeOutput must be a oneOf over its kinds");
+    let mut seen = Vec::new();
+    for variant in variants {
+        let kind = variant["properties"]["kind"]["enum"][0]
+            .as_str()
+            .expect("each variant pins its kind");
+        let required: Vec<&str> = variant["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"kind"), "{kind} must require kind");
+        let mut fields: Vec<&str> = variant["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| key.as_str())
+            .filter(|key| *key != "kind")
+            .collect();
+        fields.sort_unstable();
+        let expected: &[&str] = match kind {
+            "created" => &["from", "name"],
+            "deleted" => &["name"],
+            "merged" => &["merge", "source", "target"],
+            other => panic!("unexpected kind {other}"),
+        };
+        assert_eq!(fields, expected, "{kind} fields");
+        if kind == "merged" {
+            assert_eq!(
+                variant["properties"]["merge"]["$ref"],
+                "#/components/schemas/BranchMergeOutcome"
+            );
+        }
+        seen.push(kind);
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, ["created", "deleted", "merged"]);
+}
+
+#[test]
+fn read_target_output_allows_null_branch_and_null_snapshot() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["ReadTargetOutput"];
+    assert!(
+        schema["required"].as_array().is_none_or(|r| r.is_empty()),
+        "a branch list answer carries target {{branch: null, snapshot: null}}"
+    );
+    for field in ["branch", "snapshot"] {
+        let types = schema["properties"][field]["type"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} must be a nullable string"));
+        assert!(types.iter().any(|t| t == "null"), "{field} must allow null");
+        assert!(
+            types.iter().any(|t| t == "string"),
+            "{field} must allow a string"
+        );
+    }
 }
 
 #[test]
@@ -2189,12 +2276,12 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
         .unwrap();
     let (_, json) = json_response(&app, request).await;
     // Every cluster path operation must have a `cluster_` operation_id.
-    // Flat-mounted paths (healthz, management /graphs) keep their
+    // Flat-mounted paths (healthz, readyz, management /graphs) keep their
     // original operation_ids — they're not per-graph.
     let paths = json["paths"].as_object().unwrap();
     let mut checked = 0;
     for (path, item) in paths {
-        if path == "/healthz" || path == "/graphs" {
+        if path == "/healthz" || path == "/readyz" || path == "/graphs" {
             continue;
         }
         for method in ["get", "head", "post", "put", "delete", "patch"] {

@@ -1,0 +1,53 @@
+# issue: none
+# notes: rrf(nearest, bm25) with `$d knows $t` over 10 docs, edges leaving 3, 6,
+# notes: 9 (30%, the rrf gate's Threshold fallback), limit 2: both arms rank the
+# notes: eligible rows in row order and the unfiltered top-2 (0, 1) has no edge,
+# notes: so the fused set is the two nearest docs with an edge (3 > 2): d003, d006.
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    text: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0],"text":"needle needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0],"text":"needle needle needle needle needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0],"text":"needle needle needle needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d003","n":3,"name":"doc-003","embedding":[3.0,0.0,0.0,0.0],"text":"needle needle needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0],"text":"needle needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d005","n":5,"name":"doc-005","embedding":[5.0,0.0,0.0,0.0],"text":"needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d006","n":6,"name":"doc-006","embedding":[6.0,0.0,0.0,0.0],"text":"needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d007","n":7,"name":"doc-007","embedding":[7.0,0.0,0.0,0.0],"text":"needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d008","n":8,"name":"doc-008","embedding":[8.0,0.0,0.0,0.0],"text":"needle needle filler"}}
+{"type":"Doc","data":{"slug":"d009","n":9,"name":"doc-009","embedding":[9.0,0.0,0.0,0.0],"text":"needle filler"}}
+{"edge":"Knows","from":"d003","to":"d004","data":{"id":"e003_0"}}
+{"edge":"Knows","from":"d006","to":"d007","data":{"id":"e006_0"}}
+{"edge":"Knows","from":"d009","to":"d000","data":{"id":"e009_0"}}
+
+--- query
+query fused($q: Vector(4), $t: String) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    limit 2
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
+
+--- expect unordered
+{"d.slug":"d003"}
+{"d.slug":"d006"}
+
+--- expect shape
+d.slug: String

@@ -22,6 +22,11 @@ Run `omnigraph <command> --help` for the flags supported by your installed
 version. The [CLI reference](reference.md) summarizes addressing, commands,
 configuration, and output formats.
 
+For a managed cluster, first select it with `use` and request a scoped data
+credential with `cluster token`. Then run `query` or `mutate` from that folder
+with an explicit `--graph`. See [managed data access](managed-data.md)
+for permissions, expiry, offline operation, and local credential clearing.
+
 ## Create, load, and query a graph
 
 ```bash
@@ -68,6 +73,17 @@ omnigraph load --data batch.jsonl --mode merge \
 omnigraph query inspect --query review.gq \
   --branch review/new-data --store ./graph.omni
 omnigraph branch merge review/new-data --into main --store ./graph.omni
+```
+
+Each branch operation is also a GQ statement, run through the same verbs that
+run any `.gq` source: the control writes through `mutate`, the listing through
+`query`. A statement names its branches itself, so it takes no `--branch`:
+
+```bash
+omnigraph mutate -e 'branch create "review/new-data" from main' --store ./graph.omni
+omnigraph query  -e 'branch list' --format table --store ./graph.omni
+omnigraph mutate -e 'branch merge "review/new-data" into main' --store ./graph.omni
+omnigraph mutate -e 'branch delete "review/new-data"' --store ./graph.omni
 ```
 
 See [Branches and commits](../branching/index.md) for isolation, history, and
@@ -130,7 +146,8 @@ from the token; clients cannot override it with `--as`.
 
 ## Manage a cluster
 
-Cluster commands read a directory containing `cluster.yaml`:
+Without a managed context, cluster commands read a directory containing
+`cluster.yaml`:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
@@ -140,6 +157,30 @@ omnigraph cluster apply --config ./company-brain --as act-alice
 
 They manage graph definitions, schemas, stored queries, and policies—not graph
 data. See [Operating a cluster](../clusters/index.md).
+
+For a managed cluster, log in to its Intent API and select the cluster for
+your config directory:
+
+```bash
+omnigraph login --api https://control.example
+omnigraph use CLUSTER_ID --api https://control.example --config ./company-brain
+omnigraph cluster plan --config ./company-brain --json > plan.json
+omnigraph cluster apply --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
+omnigraph cluster status --config ./company-brain --json
+omnigraph cluster history --config ./company-brain --json
+omnigraph logout --api https://control.example
+```
+
+Commit and push external configuration before planning. The API plans its
+bound head, or the pushed revision selected with `--rev`. Apply uses the exact
+saved plan and your current permissions. To release an unused plan, run
+`omnigraph cluster cancel PLAN_RUN_ID --config ./company-brain`; its result
+remains in history and cannot be applied afterward.
+
+The folder's `.omnigraph/context` selects the managed API. An unavailable API
+or malformed context causes an error. To intentionally use the direct
+`cluster.yaml` path, pass `--direct`. See [Managed cluster commands](reference.md#managed-cluster-commands)
+for credential storage, automation, bounded waits, and exit codes.
 
 ## Validate source before running it
 

@@ -14,13 +14,253 @@ use tower::ServiceExt;
 mod support;
 use support::*;
 
+/// External consumers may construct and exhaustively destructure the legacy
+/// public settings and identity records without opting into managed trust.
+#[test]
+fn legacy_public_struct_literals_and_destructuring_compile() {
+    use omnigraph_cluster::ServingSnapshot;
+    use omnigraph_server::{
+        AuthSource, BootWitness, DEFAULT_SHUTDOWN_GRACE, ResolvedActor, Scope, ServerConfig,
+        ServerConfigMode,
+    };
+
+    let ServerConfig {
+        mode,
+        bind,
+        allow_unauthenticated,
+        require_all_graphs,
+        witness,
+        shutdown_grace,
+    } = ServerConfig {
+        mode: ServerConfigMode::Multi {
+            graphs: vec![],
+            config_path: "cluster".into(),
+            server_policy: None,
+        },
+        bind: "127.0.0.1:0".into(),
+        allow_unauthenticated: true,
+        require_all_graphs: false,
+        witness: BootWitness::default(),
+        shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+    };
+    assert!(matches!(mode, ServerConfigMode::Multi { .. }));
+    assert_eq!(bind, "127.0.0.1:0");
+    assert!(allow_unauthenticated && !require_all_graphs);
+    assert!(witness.applied_graphs.is_empty());
+    assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
+
+    let ServingSnapshot {
+        graphs,
+        queries,
+        policies,
+        diagnostics,
+        config_digest,
+        state_revision,
+        state_cas,
+        applied_graphs,
+        quarantined_graphs,
+    } = ServingSnapshot {
+        graphs: vec![],
+        queries: vec![],
+        policies: vec![],
+        diagnostics: vec![],
+        config_digest: None,
+        state_revision: 0,
+        state_cas: None,
+        applied_graphs: vec![],
+        quarantined_graphs: vec![],
+    };
+    assert!(graphs.is_empty() && queries.is_empty() && policies.is_empty());
+    assert!(diagnostics.is_empty() && config_digest.is_none() && state_cas.is_none());
+    assert_eq!(state_revision, 0);
+    assert!(applied_graphs.is_empty() && quarantined_graphs.is_empty());
+
+    let ResolvedActor {
+        actor_id,
+        tenant_id,
+        scopes,
+        source,
+    } = ResolvedActor {
+        actor_id: "legacy-actor".into(),
+        tenant_id: None,
+        scopes: vec![Scope::Full],
+        source: AuthSource::Static,
+    };
+    assert_eq!(&*actor_id, "legacy-actor");
+    assert!(tenant_id.is_none());
+    assert_eq!(scopes, vec![Scope::Full]);
+    assert_eq!(source, AuthSource::Static);
+}
+
+#[tokio::test]
+async fn data_trust_root_mismatch_refuses_before_recovery_open() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = converged_cluster_dir("").await;
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+    // A read-write engine open normally cleans matching no-op schema staging.
+    // Wrong public trust must refuse before even that recovery effect.
+    let staging = graph.join("_schema.pg.staging");
+    fs::write(&staging, &schema).unwrap();
+    let trust_path = temp.path().join("trust.json");
+    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let result = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&temp.path().to_path_buf()),
+        Some("127.0.0.1:0".into()),
+        true,
+        true,
+        &trust_path,
+    )
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("serving-root binding")
+    );
+    assert!(
+        staging.exists(),
+        "invalid trust must not open the graph for recovery"
+    );
+}
+
+#[tokio::test]
+async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
+    let mut tokens = data_tokens::DataTokens::new();
+    let store = converged_cluster_dir("").await;
+    let config = tempfile::tempdir().unwrap();
+    let canonical_root = format!(
+        "file://{}",
+        fs::canonicalize(store.path()).unwrap().display()
+    );
+    fs::write(
+        config.path().join("cluster.yaml"),
+        format!("version: 1\nstorage: {canonical_root}\n"),
+    )
+    .unwrap();
+    let config_path = config.path().to_path_buf();
+    let trust_path = config.path().join("trust.json");
+    tokens.document["canonical_root"] = serde_json::json!(format!(
+        "file://{}",
+        fs::canonicalize(config.path()).unwrap().display()
+    ));
+    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    assert!(
+        omnigraph_server::load_server_settings_with_data_token_trust(
+            Some(&config_path),
+            None,
+            true,
+            false,
+            &trust_path,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("serving-root binding")
+    );
+
+    tokens.document["canonical_root"] = serde_json::json!(canonical_root);
+    fs::write(&trust_path, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let managed = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&config_path),
+        None,
+        true,
+        false,
+        &trust_path,
+    )
+    .await
+    .unwrap()
+    .with_shutdown_grace(std::time::Duration::from_secs(7));
+    let legacy = cluster_settings(&config_path).await.unwrap();
+    assert_eq!(managed.canonical_root(), canonical_root);
+    assert_eq!(managed.config().witness.state_cas, legacy.witness.state_cas);
+    assert_eq!(managed.config().witness.applied_graphs, vec!["knowledge"]);
+    assert_eq!(
+        managed.config().shutdown_grace,
+        std::time::Duration::from_secs(7)
+    );
+    let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &managed.config().mode;
+    assert_eq!(graphs[0].graph_id, "knowledge");
+    assert!(graphs[0].uri.contains("/graphs/knowledge.omni"));
+
+    let direct = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&std::path::PathBuf::from(&canonical_root)),
+        None,
+        true,
+        false,
+        &trust_path,
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct.canonical_root(), canonical_root);
+    assert_eq!(
+        direct.config().witness.state_cas,
+        managed.config().witness.state_cas
+    );
+}
+
+#[tokio::test]
+async fn applied_empty_cluster_still_requires_exact_data_trust_root() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
+    assert!(omnigraph_cluster::import_config_dir(temp.path()).await.ok);
+    let applied = omnigraph_cluster::apply_config_dir(temp.path()).await;
+    assert!(applied.ok && applied.converged, "{applied:?}");
+    let mut tokens = data_tokens::DataTokens::new();
+    let trust = temp.path().join("trust.json");
+    fs::write(&trust, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let source = temp.path().to_path_buf();
+    assert!(
+        omnigraph_server::load_server_settings_with_data_token_trust(
+            Some(&source),
+            None,
+            false,
+            true,
+            &trust,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("serving-root binding")
+    );
+    let root = format!(
+        "file://{}",
+        fs::canonicalize(temp.path()).unwrap().display()
+    );
+    tokens.document["canonical_root"] = serde_json::json!(root);
+    fs::write(&trust, serde_json::to_vec(&tokens.document).unwrap()).unwrap();
+    let settings = omnigraph_server::load_server_settings_with_data_token_trust(
+        Some(&source),
+        None,
+        false,
+        true,
+        &trust,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settings.canonical_root(), root);
+    assert!(settings.config().require_all_graphs);
+    assert!(!settings.config().allow_unauthenticated);
+    assert_eq!(
+        settings.config().witness.booted_serving_digest,
+        applied.desired_revision.config_digest
+    );
+    assert!(settings.config().witness.applied_graphs.is_empty());
+    let omnigraph_server::ServerConfigMode::Multi { graphs, .. } = &settings.config().mode;
+    assert!(graphs.is_empty());
+    assert!(!temp.path().join("graphs").exists());
+}
+
 mod multi_graph_startup {
     use super::*;
     use omnigraph::storage::normalize_root_uri;
     use omnigraph_server::{GraphHandle, GraphId, GraphKey, GraphRegistry, InsertError};
     use std::sync::Arc;
 
-    async fn build_multi_mode_app(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
+    async fn build_multi_mode_state(
+        graph_ids: &[&str],
+        policy: Option<omnigraph_policy::PolicyEngine>,
+    ) -> (Vec<tempfile::TempDir>, AppState) {
         let mut dirs = Vec::with_capacity(graph_ids.len());
         let mut handles = Vec::with_capacity(graph_ids.len());
         for id in graph_ids {
@@ -38,9 +278,51 @@ mod multi_graph_startup {
             dirs.push(dir);
         }
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
+        let state = AppState::new_multi(handles, Vec::new(), policy, workload, None).unwrap();
+        (dirs, state)
+    }
+
+    async fn build_multi_mode_app(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
+        let (dirs, state) = build_multi_mode_state(graph_ids, None).await;
+        (dirs, build_app(state))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signed_registry_lists_only_granted_served_and_quarantined_graphs() {
+        let tokens = data_tokens::DataTokens::new();
+        let policy = omnigraph_policy::PolicyEngine::load_server_from_source(&format!(
+            "version: 1\ngroups:\n  viewers: [\"{}\"]\nrules:\n  - id: list\n    allow:\n      actors: {{group: viewers}}\n      actions: [graph_list]\n",tokens.actor
+        )).unwrap();
+        let (_dirs, state) = build_multi_mode_state(&["alpha", "beta"], Some(policy)).await;
+        let state = state
+            .with_data_token_trust(tokens.trust.clone())
+            .with_boot_witness(
+                omnigraph_server::BootWitness {
+                    applied_graphs: vec![
+                        "alpha".into(),
+                        "beta".into(),
+                        "ghost-allowed".into(),
+                        "ghost-hidden".into(),
+                    ],
+                    ..Default::default()
+                },
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                omnigraph_server::DEFAULT_SHUTDOWN_GRACE,
+            );
         let app = build_app(state);
-        (dirs, app)
+        let token = tokens.token(serde_json::json!([
+            {"graph_id":"alpha","actions":["graph_list"]},
+            {"graph_id":"beta","actions":["read"]},
+            {"graph_id":"ghost-allowed","actions":["graph_list"]}
+        ]));
+        let (status, body) = json_response(&app, get_request("/graphs", &token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["graphs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["graphs"][0]["graph_id"], "alpha");
+        assert_eq!(body["quarantined"], serde_json::json!(["ghost-allowed"]));
+        let read = tokens.token(serde_json::json!([{"graph_id":"alpha","actions":["read"]}]));
+        let (status, _) = json_response(&app, get_request("/graphs", &read)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     /// Cluster route `/graphs/{graph_id}/snapshot` resolves to the right
@@ -553,6 +835,103 @@ rules:
             resp_viewer.status(),
             StatusCode::FORBIDDEN,
             "viewer must be denied graph_list (Cedar gate)"
+        );
+    }
+}
+
+mod readiness_witness {
+    use super::*;
+    use omnigraph::storage::normalize_root_uri;
+    use omnigraph_server::{BootWitness, GraphHandle, GraphId, GraphKey};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `/readyz` reports the boot witness and counts only, turns off while
+    /// draining, and leaves `/healthz` alone; the quarantined ids are on the
+    /// gated `GET /graphs`, derived from the applied set minus the registry
+    /// (RFC 0049).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn readyz_reports_counts_and_graphs_names_the_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        let handle = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: normalize_root_uri(&graph_uri).unwrap(),
+            engine: Arc::new(engine),
+            policy: None,
+            queries: None,
+        });
+        // The inventory is gated: a bearer token and a server policy that
+        // permits `graph_list` for it. Readiness needs neither.
+        let policy_path = dir.path().join("server-policy.yaml");
+        fs::write(
+            &policy_path,
+            r#"
+version: 1
+groups:
+  operators: [act-test]
+rules:
+  - id: operators-list-graphs
+    allow:
+      actors: { group: operators }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let server_policy = omnigraph_policy::PolicyEngine::load_server(&policy_path).unwrap();
+        let tokens = vec![("act-test".to_string(), "secret".to_string())];
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let draining = Arc::new(AtomicBool::new(false));
+        let state = AppState::new_multi(vec![handle], tokens, Some(server_policy), workload, None)
+            .unwrap()
+            .with_boot_witness(
+                BootWitness {
+                    booted_serving_digest: Some("digest-1".to_string()),
+                    state_revision: 42,
+                    state_cas: Some("sha256:abc".to_string()),
+                    applied_graphs: vec!["alpha".to_string(), "beta".to_string()],
+                },
+                Arc::clone(&draining),
+                std::time::Duration::from_secs(7),
+            );
+        let app = build_app(state);
+
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["status"], "serving");
+        assert_eq!(body["booted_serving_digest"], "digest-1");
+        assert_eq!(body["state_revision"], 42);
+        assert_eq!(body["state_cas"], "sha256:abc");
+        assert_eq!(body["served_graph_count"], 1);
+        assert_eq!(body["quarantined_graph_count"], 1);
+        assert_eq!(body["shutdown_grace_seconds"], 7);
+        assert!(
+            body.get("served_graphs").is_none() && body.get("quarantined_graphs").is_none(),
+            "public readiness carries no graph id: {body}"
+        );
+
+        // The ids live on the gated inventory: refused without the token,
+        // listed with it.
+        let (status, _) = json_response(&app, get_request("/graphs", "wrong")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = json_response(&app, get_request("/graphs", "secret")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["graphs"][0]["graph_id"], "alpha");
+        assert_eq!(body["quarantined"], serde_json::json!(["beta"]));
+
+        draining.store(true, Ordering::SeqCst);
+        let (status, body) = json_response(&app, get_request("/readyz", "")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["status"], "draining");
+        let (status, _) = json_response(&app, get_request("/healthz", "")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "liveness is unchanged while draining"
         );
     }
 }

@@ -2,7 +2,10 @@
 
 A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
-covered in [Mutations](../mutations/index.md).
+covered in [Mutations](../mutations/index.md). A file may instead hold exactly
+one branch statement (`branch create`, `branch delete`, `branch merge`, or
+`branch list`), never beside a query declaration; see
+[Branches, Commits, and History](../branching/index.md).
 
 ```gq
 query engineers($title: String) @description("People with a title") {
@@ -49,9 +52,21 @@ Inside `match { ... }`:
 | `$p.age >= 18` | Apply a filter expression. |
 | `not { $p Blocked $other }` | Keep rows for which the inner pattern has no match. |
 
+Hop counts are shortest-path distances from the start node: `{2,2}` returns the
+nodes exactly two hops away. A node is never re-reached through its own
+self-loop or through a cycle back to it. The start node is returned only
+through its own self-loop, which counts as one hop, never through a cycle.
+
 An unbound traversal has set semantics for endpoint pairs. Binding the edge
 returns one result per matching edge, so parallel edges remain distinct. Edge
 bindings are available only for a single hop.
+
+Each `$_` is a distinct anonymous node: two anonymous traversals from one
+variable are independent, so a source with two neighbours matches two by two
+rows. Binding a variable a second time (`$p: Person` after `$p` is already
+bound, at the top level or inside `not { }`) adds the second binding's
+property matches as constraints on the same rows; it never introduces a
+second `$p`. Variable names beginning with `__` are reserved.
 
 Traversal spelling begins with a lowercase letter (`worksAt` for the declared
 edge `WorksAt`); edge lookup itself is case-insensitive.
@@ -82,6 +97,20 @@ limit 20
 
 Return expressions include variables, properties, literals, `now()`, earlier
 projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
+`min` and `max` accept a numeric, `String`, `Bool`, `Date`, or `DateTime`
+column and return the column's own type; `Bool` orders `false` before `true`,
+dates and datetimes chronologically. When no row matches, a query whose
+projections are all aggregates returns one row: `count` is 0 and every other
+aggregate is null; a query that also projects a group value returns no rows.
+A bare node variable returns the node as one object: its `id` and every
+property except `Blob` and `Vector` ones, so `return { $p }` gives a column
+`p` holding `{"id": "alice", "name": "alice", "age": 30}`; project a property
+(`$p.name`, `$p.embedding`) for a single field. `count($p)` counts rows; the
+other aggregates take a property, not a bare node binding (`T8`). Each
+projection produces one result column, named by its alias or, without one,
+by its expression (`$p.name` gives `p.name`). Two projections that would
+produce the same column name are refused at compile time (`T25`); give each
+its own alias.
 Search expressions are documented in [Search](../search/index.md).
 
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
@@ -93,8 +122,16 @@ distance and `bm25(...)` by descending relevance score, so the score (never
 any internal scan or traversal order) is what the row order means, including
 through multi-hop traversals. Keys after the search function apply as
 secondary sorts before the id tie-breaker; the search function itself must
-lead the order clause. Aggregated queries are outside search ordering: group
-results are not score-ranked. One bound on the tie-break: a `bm25()` ordering
+lead the order clause. The score is also a result value: `return { $d.slug,
+nearest($d.vector, $v) as score }` returns the distance the ordering used, and
+`bm25(...) as score` the relevance score, provided the projected expression
+repeats the leading `order` key (`T33`); without an alias the column is
+`d._distance` or `d._score`. A rank expression under an aggregate (`T32`),
+`rrf(...)` in `return` (`T37`, until the fused score becomes a column), and
+the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
+(`T35`, they belong in `match`) are refused at compile time. Aggregated
+queries are outside search ordering: group
+results are not score-ranked and cannot project a score (`T9`). One bound on the tie-break: a `bm25()` ordering
 with no secondary keys reads a bounded set of top-scoring matches, so among
 rows tied exactly at that bound's cut, which rows enter the result follows
 the scan bound rather than entity ids.
@@ -125,6 +162,32 @@ conditional mutation.
 
 See [Branches, Commits, and History](../branching/index.md).
 
+## JSON result spelling
+
+JSON `rows` follow Arrow's JSON conventions: OmniGraph writes them with the
+`arrow-json` writer from the result batches and keeps no per-type spelling of
+its own. The spellings a consumer sees:
+
+- A null cell's key is omitted from its row, and from a struct cell; a null
+  element inside a list value stays `null`.
+- `Date` is `"2024-01-01"`; `DateTime` is `"2024-01-01T12:34:56.789"` in UTC
+  with no `Z`, and no fractional part when it is zero.
+- Integers of every width are bare numbers; JavaScript's `JSON.parse` rounds
+  values beyond 2^53.
+- `F32` prints at 32-bit width (`0.99`) and `F64` at 64-bit width; integral
+  floats carry `.0`; magnitudes from 1e10 up or below 1e-5 take exponent form
+  (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
+- `Vector(N)` and list properties are JSON arrays.
+
+On input, a `Date` string is a calendar day, `"2024-01-01"`; a string that
+carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is refused as a
+load value, a param, or a `date(...)` literal, and an instant belongs in a
+`DateTime` property.
+
+A `Date` or `DateTime` count outside the range the writer can format is refused
+on load. A read that meets one fails with status 500; the error names the
+column, the result row, and the count, and an `update` of that row repairs it.
+
 ## Linting
 
 Validate queries without running them:
@@ -133,10 +196,12 @@ Validate queries without running them:
 omnigraph lint --query queries.gq --schema schema.pg --json
 ```
 
-`Q000` identifies parse errors. `L201` warns when a nullable property is never
-set by any update query in the inspected set. Type errors report the affected
-query and source location. The command exits nonzero when the overall status is
-an error.
+`Q000` identifies parse errors. A file that holds a [branch
+statement](../branching/index.md) where query declarations were expected also
+reports `Q000`. `L201` warns when a nullable
+property is never set by any update query in the inspected set. Type errors
+report the affected query and source location. The command exits nonzero when
+the overall status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

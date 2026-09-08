@@ -1,0 +1,52 @@
+# issue: none
+# notes: two rows of one self-loop pair (unkeyed type): the gated traversal returns the pair once, the bound
+# notes: traversal counts both rows. The DST model's membership oracles rely on this grain.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+
+--- mutate
+query two_loops() {
+    insert Knows { from: "a", to: "a" }
+    insert Knows { from: "a", to: "a" }
+}
+
+--- expect affected: nodes=0 edges=2
+
+--- query
+query gated() {
+    match {
+        $p: Person
+        $p knows $q
+    }
+    return { $p.name, $q.name }
+}
+
+--- expect unordered
+{"p.name": "a", "q.name": "a"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- query
+query bound_rows() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { count($q.name) as n }
+}
+
+--- expect unordered
+{"n": 2}
+
+--- expect shape
+n: I64

@@ -34,11 +34,12 @@ The cluster sidecars are separate from each graph's ordinary recovery-v9 sidecar
 | Operation | Mutation | Responsibility |
 |---|---|---|
 | `validate` | None | Parse the whole bundle, normalize references, type-check schemas and queries, validate policies and bindings, and report all diagnostics. |
-| `plan` | None | Compare desired resource digests with recorded/applied and observed state; compute dependencies and approval requirements. |
+| `plan` | None | Compare desired resource digests with recorded/applied and observed state; compute dependencies and approval requirements. `--observe` takes no lock and labels the output `authority: observed`. |
 | `approve` | Approval artifact | Bind one irreversible planned operation to exact before/after/config digests and an actor. |
 | `apply` | Resources and ledger | Re-plan under the lock, execute eligible changes in dependency order, recover interrupted changes, then CAS the applied ledger. |
 | `status` | None | Read the ledger, lock, recoveries, approvals, and current observations. |
 | `refresh` | Ledger observations | Reconcile recorded observations with live resources without changing the desired bundle. |
+| `observe` | None | `refresh` without the lock, the recovery sweep, or the write: report the statuses and observations `refresh` would record, labeled `authority: observed` with the exact `state_cas` read (RFC 0049). |
 | `import` | Initial ledger | Adopt declared existing resources after validation and observation. |
 | `force-unlock` | Lock only | Remove one exact stale lock ID after an operator proves no owner is alive. |
 
@@ -48,7 +49,7 @@ Destructive graph deletion requires a matching unconsumed approval. Any relevant
 
 ## Concurrency
 
-State-changing operations acquire `__cluster/lock.json` with storage-native create-if-absent semantics. Final ledger publication is also conditional on the state version observed under the operation. The lock coordinates operator processes; graph-level manifest gates and recovery still own data correctness.
+State-changing operations acquire `__cluster/lock.json` with storage-native create-if-absent semantics. Observe-only reads (`plan --observe`, `observe`) take no lock and write nothing; their output says so (`authority: observed`) and names the `state_cas` they read, and an existing lock is reported rather than refused. A bundle that sets `state.lock: false` gets `authority: unlocked` on every command that would otherwise have held the lock. Final ledger publication is also conditional on the state version observed under the operation. The lock coordinates operator processes; graph-level manifest gates and recovery still own data correctness.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 
@@ -69,6 +70,56 @@ Serving verifies ledger/resource digests, builds each graph's query registry and
 Servers do not hot-reload. Apply the new revision and restart every server that should serve it.
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
+
+The optional [offline data-token profile](../rfcs/0053-offline-data-token-verification.md)
+uses immutable public trust loaded before graph open. The Core's opt-in
+root-bound serving snapshot supplies the canonical storage root from the same
+resolution as the applied revision; the server checks that root against trust
+without reading a managed identity marker. The verifier resolves
+`principal:<sub>` and retains per-graph action ceilings. Graph selection checks the ceiling before registry
+lookup; the common authorization gate checks actions before Cedar, which must
+explicitly permit signed identities even when no static credentials exist.
+Static credential authority remains unchanged. Issuer reachability is outside
+the serving request path.
+
+A replica reports what it booted from on `GET /readyz` (RFC 0049): the
+applied `config_digest` as `booted_serving_digest`, the ledger revision and
+CAS, and how many applied graphs it serves and does not; it answers 503 from
+the shutdown signal on. Graph ids stay on the authenticated `GET /graphs`,
+which also lists the quarantined ones. Graceful shutdown is bounded by one
+deadline (`--shutdown-grace-seconds`, default 25), kept by a thread and armed
+by a listener installed before graphs open, after which the process exits 2
+without claiming success.
+
+### Public embedding APIs
+
+Ordinary callers use `read_serving_snapshot` or
+`read_serving_snapshot_from_storage`, `load_server_settings`, and `serve`.
+`ServingSnapshot` and `ServerConfig` contain their ordinary public fields;
+trust-disabled boot does not add root canonicalization solely for signed
+credentials.
+
+Managed callers use `read_root_bound_serving_snapshot` or its `_from_storage`
+counterpart to obtain an opaque `RootBoundServingSnapshot`. Its snapshot and
+canonical-root accessors refer to the same opened store. Do not reconstruct
+that binding by reopening a caller-supplied path. Server embedders use
+`load_server_settings_with_data_token_trust` and
+`serve_with_data_token_trust`; `ManagedServerConfig` keeps the configuration
+and validated trust together. `with_shutdown_grace` changes only the shutdown
+bound. A failed managed load must not be retried through ordinary `serve`.
+The binary's `--data-token-trust FILE` selects this managed path.
+
+`ResolvedActor` is a public identity projection, not proof of authentication.
+Middleware and protected handlers retain `AuthenticatedActor`, whose private
+state carries verified claims and graph selection. `DataTokenTrust::verify_at`
+returns the identity projection for existing callers;
+`verify_authenticated_at` returns the opaque authenticated result used by the
+server. Public actor construction cannot grant signed-token permissions.
+
+In-process hosts that assemble `AppState` and call its existing
+`with_data_token_trust` method continue to own their graph/root binding. Use
+the managed settings loader when the library should validate the applied
+snapshot and trust binding together.
 
 ## Azure boundary
 

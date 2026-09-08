@@ -188,19 +188,89 @@ pub struct QueryIoProbes {
     /// regression changes this count while every result assertion still
     /// passes.
     pub bm25_scan_rows: Arc<AtomicU64>,
-    /// Uncapped retries taken after a maximum-bounded ANN scan under-filled
-    /// its requested candidate count. Includes standalone nearest queries and
-    /// individual RRF nearest arms.
-    pub ann_uncapped_retries: Arc<AtomicU64>,
-    /// Effective maximum probe budget recorded by the most recent ANN scan.
-    /// Zero represents Lance's `None` (the uncapped retry).
+    /// Rescans taken at the scan site after a maximum-bounded nearest scan
+    /// returned fewer than `k` rows with partitions left unsearched (the
+    /// probe ladder in `execute_node_scan`). Every scan of a nearest target
+    /// counts, RRF arms included.
+    pub ann_rescans: Arc<AtomicU64>,
+    /// The subset of `ann_rescans` that reran the scan as Lance's flat exact
+    /// kNN (`use_index(false)`) because the IVF scan held rows at
+    /// `_distance = +inf`: a pushed prefilter admitted fewer rows than `k`
+    /// and Lance emitted the admitted rows its probes never reached without
+    /// a distance, so the batches were out of `nearest` order (the ladder
+    /// comment in `execute_node_scan`). A scan that the engine ran flat from
+    /// the start (the gate's `id IN` list at most `k` long) is not a rescan
+    /// and increments neither.
+    pub ann_flat_rescans: Arc<AtomicU64>,
+    /// Requested maximum probe budget of the most recent nearest scan. Zero
+    /// represents no maximum (the ladder's last rung, the overfetch loop's
+    /// exact pass, or `OMNIGRAPH_ANN_NPROBES=0`). Lance applies the value per
+    /// index delta, so the partitions read may be a multiple.
     pub ann_max_nprobes: Arc<AtomicU64>,
+    /// Rows the most recent nearest scan returned (its `k` when full).
+    pub ann_scan_rows: Arc<AtomicU64>,
+    /// `partitions_searched` of the most recent nearest scan, summed over
+    /// index deltas as Lance reports it through `scan_stats_callback`; left
+    /// untouched by a scan whose summary carried no partition counters (a
+    /// flat scan).
+    pub ann_partitions_searched: Arc<AtomicU64>,
+    /// `partitions_ranked` of the same scan (partition count summed over
+    /// index deltas).
+    pub ann_partitions_ranked: Arc<AtomicU64>,
+    /// `partitions_searched` of every nearest scan in scope order: one entry
+    /// per rung of every ladder, RRF arms included, so a test can read how
+    /// many partitions each rescan actually touched.
+    pub ann_rung_partitions_searched: Arc<Mutex<Vec<u64>>>,
+    /// Capped nearest scans that ended short of `k` without a usable Lance
+    /// execution summary (`scan_stats_callback` never fired, or exactly one
+    /// of the `partitions_searched` / `partitions_ranked` counters was
+    /// absent). Counts the ladder's fail-closed uncapped rescans; the
+    /// rationale for failing closed is the ladder comment in
+    /// `execute_node_scan`. A flat scan (summary fired, neither counter present) is
+    /// exhaustion, not a missing summary, and never increments this.
+    pub ann_summary_missing: Arc<AtomicU64>,
+    /// Query-level reruns with a larger `k` (×4, ×16, then the exact pass)
+    /// after a FULL nearest scan was cut short of `limit` by a later operator
+    /// (`execute_query`).
+    pub ann_overfetches: Arc<AtomicU64>,
+    /// Exact passes of the overfetch loop: the 16 × `k` scan was full and
+    /// the answer still short, so the query reran flat over every live row
+    /// of the type. Says nothing about whether the pass filled `limit`; a
+    /// scan that was not full never reaches it.
+    pub ann_exact_passes: Arc<AtomicU64>,
     /// Plan verdicts recorded by the rrf prefilter gate
     /// (`execute_rrf_fusion`), one per rrf execution in scope order. The
     /// gate's two plans are answer-identical by design, so a gate that
     /// silently always falls back to postfilter passes every result-level
     /// test — admission and fence tests assert on this probe instead.
     pub rrf_gate_verdicts: Arc<Mutex<Vec<RrfGateVerdict>>>,
+    /// Plan verdicts recorded by the nearest prefilter gate
+    /// (`nearest_prefilter_gate`), one per standalone `nearest` query whose
+    /// pipeline holds a top-level Expand leaving the ranked variable (a plain
+    /// nearest records none), in scope order; same record shape as the rrf
+    /// gate's. The prefiltered plan returns at least as many rows as the
+    /// unfiltered one when no operator above the Expand drops eligible rows
+    /// (the relation is `nearest_prefilter_gate`'s doc), and the same rows on
+    /// a single-partition fixture, so a gate that silently always falls back
+    /// passes every small-fixture result test: admission tests assert on this
+    /// probe.
+    pub ann_prefilter_verdicts: Arc<Mutex<Vec<RrfGateVerdict>>>,
+    /// The projection handed to `Scanner::project` by every NodeScan in scope
+    /// order (`execute_node_scan`): `None` when the scan took every column,
+    /// else the exact column list, including `_distance`/`_score` on a search
+    /// scan. Lets a test pin that a pruned search scan reads only its needed
+    /// columns and names Lance's scoring column explicitly.
+    pub node_scan_projections: Arc<Mutex<Vec<Option<Vec<String>>>>>,
+    /// Misses of `ReadCaches::accepted_catalog`, counted in
+    /// `Omnigraph::build_accepted_catalog_with_schema_gate_held`.
+    pub catalog_builds: Arc<AtomicU64>,
+    /// Misses of `ReadCaches::compiled_queries`, counted in
+    /// `Omnigraph::compile_named_query`.
+    pub query_compiles: Arc<AtomicU64>,
+    /// Full-text validations entered (`TableStore::validate_full_text_demand`):
+    /// scans with a full-text query, a SQL-string filter, or a `contains_tokens`
+    /// demand in a typed filter; other scans record nothing.
+    pub fts_validations: Arc<AtomicU64>,
 }
 
 /// The two candidate plans of the rrf prefilter gate. Over FTS-index-covered
@@ -605,7 +675,8 @@ pub(crate) fn record_bm25_scan_rows(rows: u64) {
     let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
 }
 
-/// Record the effective ANN maximum. No-op when no probes are installed.
+/// Record the requested ANN maximum of a nearest scan (zero = none). No-op
+/// when no probes are installed.
 pub(crate) fn record_ann_probe_budget(maximum: Option<usize>) {
     let _ = current(|p| {
         p.ann_max_nprobes
@@ -613,10 +684,55 @@ pub(crate) fn record_ann_probe_budget(maximum: Option<usize>) {
     });
 }
 
-/// Record one uncapped ANN retry after a bounded scan under-filled. No-op when
+/// Record one scan-site rescan of a starved bounded nearest scan. No-op when
 /// no probes are installed.
-pub(crate) fn record_ann_uncapped_retry() {
-    let _ = current(|p| p.ann_uncapped_retries.fetch_add(1, Ordering::Relaxed));
+pub(crate) fn record_ann_rescan() {
+    let _ = current(|p| p.ann_rescans.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one scan-site rescan taken as the flat exact kNN after an IVF
+/// scan held `_distance = +inf` rows. Counted beside `record_ann_rescan`,
+/// never instead of it. No-op when no probes are installed.
+pub(crate) fn record_ann_flat_rescan() {
+    let _ = current(|p| p.ann_flat_rescans.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record the rows a nearest scan returned. No-op when no probes are installed.
+pub(crate) fn record_ann_scan_rows(rows: u64) {
+    let _ = current(|p| p.ann_scan_rows.store(rows, Ordering::Relaxed));
+}
+
+/// Record the partition counters Lance reported for one nearest scan
+/// (`partitions_searched` / `partitions_ranked`, summed over index deltas).
+/// No-op when no probes are installed.
+pub(crate) fn record_ann_partition_counters(searched: u64, ranked: u64) {
+    let _ = current(|p| {
+        p.ann_partitions_searched.store(searched, Ordering::Relaxed);
+        p.ann_partitions_ranked.store(ranked, Ordering::Relaxed);
+        p.ann_rung_partitions_searched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(searched);
+    });
+}
+
+/// Record one capped nearest scan that ended short without a usable Lance
+/// execution summary (the ladder's fail-closed uncapped rescan). No-op when
+/// no probes are installed.
+pub(crate) fn record_ann_summary_missing() {
+    let _ = current(|p| p.ann_summary_missing.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one query-level overfetch rerun of a standalone nearest query.
+/// No-op when no probes are installed.
+pub(crate) fn record_ann_overfetch() {
+    let _ = current(|p| p.ann_overfetches.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Record one exact pass of the overfetch loop. No-op when no probes are
+/// installed.
+pub(crate) fn record_ann_exact_pass() {
+    let _ = current(|p| p.ann_exact_passes.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Record one rrf prefilter-gate verdict. No-op when no probes are installed
@@ -630,6 +746,42 @@ pub(crate) fn record_rrf_gate_verdict(verdict: RrfGateVerdict) {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(verdict);
     });
+}
+
+/// Probe-only: the projection a NodeScan hands to `Scanner::project`.
+pub(crate) fn record_node_scan_projection(projection: Option<&[&str]>) {
+    let _ = current(|p| {
+        p.node_scan_projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(projection.map(|columns| columns.iter().map(|c| c.to_string()).collect()));
+    });
+}
+
+/// Record one nearest prefilter-gate verdict. No-op when no probes are
+/// installed (production).
+pub(crate) fn record_ann_prefilter_verdict(verdict: RrfGateVerdict) {
+    let _ = current(|p| {
+        p.ann_prefilter_verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(verdict);
+    });
+}
+
+/// Probe-only: one accepted-catalog build (a memo miss).
+pub(crate) fn record_catalog_build() {
+    let _ = current(|p| p.catalog_builds.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Probe-only: one named-query compilation (a compiled-query cache miss).
+pub(crate) fn record_query_compile() {
+    let _ = current(|p| p.query_compiles.fetch_add(1, Ordering::Relaxed));
+}
+
+/// Probe-only: one full-text validation entered by a scan.
+pub(crate) fn record_fts_validation() {
+    let _ = current(|p| p.fts_validations.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Record `commits` walked into a change-feed poll's first-parent chain. No-op

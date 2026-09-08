@@ -7,17 +7,65 @@ use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Sn
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
+use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use utoipa::{IntoParams, ToSchema};
 
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
 /// `Omnigraph-If-Graph-Commit`; HTTP header names are case-insensitive.
 pub const GRAPH_COMMIT_PRECONDITION_HEADER: &str = "omnigraph-if-graph-commit";
+
+/// The `Accept` / `Content-Type` value that selects an Arrow IPC stream on the
+/// query routes (RFC 0051); JSON is the default.
+pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
+/// Response header carrying `ReadOutput.query_name` beside an Arrow IPC body.
+pub const QUERY_NAME_HEADER: &str = "omnigraph-query-name";
+/// Response header carrying `ReadOutput.target.branch` beside an Arrow IPC body.
+pub const BRANCH_HEADER: &str = "omnigraph-branch";
+/// Response header carrying `ReadOutput.target.snapshot` beside an Arrow IPC body.
+pub const SNAPSHOT_ID_HEADER: &str = "omnigraph-snapshot-id";
+/// Response header carrying `ReadOutput.graph_commit_id` beside an Arrow IPC body.
+pub const GRAPH_COMMIT_ID_HEADER: &str = "omnigraph-graph-commit-id";
+
+/// The refusal texts a branch statement can answer with, shared by the server
+/// handlers and the CLI so the two fronts cannot drift apart. The server's HTTP
+/// tests and the CLI's tests keep literal copies as the pins.
+pub mod branch_statement_refusals {
+    /// A control write sent to a read door. `{statement}` is the statement's
+    /// two keywords.
+    pub const CONTROL_WRITE_AT_READ_DOOR: &str =
+        "statement '{statement}' is a control write; use POST /mutate";
+    /// A read sent to a write door. `{statement}` is the statement's two
+    /// keywords.
+    pub const READ_AT_WRITE_DOOR: &str = "statement '{statement}' is a read; use POST /query";
+    /// A request target (branch or snapshot) beside a statement.
+    pub const REQUEST_TARGET: &str =
+        "a branch statement names its branches itself; drop the request target";
+    /// A query name or parameters beside a statement.
+    pub const NAME_OR_PARAMS: &str = "a branch statement takes no name and no parameters";
+    /// An expected head beside a statement.
+    pub const COMMIT_PRECONDITION: &str = "a branch statement takes no commit precondition";
+    /// Any statement sent to a deprecated route.
+    pub const DEPRECATED_ROUTE: &str =
+        "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
+
+    /// Fill the `{statement}` placeholder of the two door refusals.
+    pub fn with_statement(template: &str, statement: &str) -> String {
+        template.replace("{statement}", statement)
+    }
+}
+
+/// The refusal both fronts answer for a source that holds no declaration.
+pub mod query_file_refusals {
+    /// An empty or declaration-less source, from which no query can be picked.
+    pub const NO_QUERY: &str = "query file contains no query";
+}
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
 #[derive(ToSchema)]
@@ -274,7 +322,8 @@ pub struct ReadOutput {
     pub row_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
-    pub rows: Value,
+    #[schema(value_type = Value)]
+    pub rows: Box<RawValue>,
     /// Effective graph head commit id of the exact snapshot this read was
     /// served from. On a fresh named branch this is the inherited source head,
     /// so it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:
@@ -284,9 +333,9 @@ pub struct ReadOutput {
     pub graph_commit_id: Option<String>,
 }
 
-/// Indefinitely byte-stable response shape for the deprecated `POST /read`
-/// route. The canonical [`ReadOutput`] may grow additive fields; this legacy
-/// envelope deliberately cannot carry them.
+/// Indefinitely byte-stable envelope of the deprecated `POST /read` route; cell
+/// spelling follows the JSON writer. The canonical [`ReadOutput`] may grow
+/// additive fields; this legacy envelope deliberately cannot carry them.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LegacyReadOutput {
     pub query_name: String,
@@ -294,7 +343,8 @@ pub struct LegacyReadOutput {
     pub row_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<String>,
-    pub rows: Value,
+    #[schema(value_type = Value)]
+    pub rows: Box<RawValue>,
 }
 
 impl From<ReadOutput> for LegacyReadOutput {
@@ -309,14 +359,49 @@ impl From<ReadOutput> for LegacyReadOutput {
     }
 }
 
+/// The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.
+/// A merge conflict has no kind: it is the 409 `POST /branches/merge` answers.
+/// The statement grammar is `BranchStmt` in `omnigraph-compiler`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchOutcomeOutput {
+    /// `name` was forked off `from`.
+    Created { from: String, name: String },
+    /// `name` was removed.
+    Deleted { name: String },
+    /// `source` was merged into `target`; `merge` is the three-way result,
+    /// one of `already_up_to_date`, `fast_forward`, `merged`.
+    Merged {
+        source: String,
+        target: String,
+        merge: BranchMergeOutcome,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeOutput {
+    /// The branch that received the effect. For a branch statement: the
+    /// created branch, the deleted branch (gone by the time this is read),
+    /// or the merge target.
     pub branch: String,
+    /// The declared mutation's name, or a branch statement's two keywords
+    /// (`branch create`, `branch delete`, `branch merge`).
     pub query_name: String,
+    /// Nodes the mutation touched. Not reported for a branch statement,
+    /// which moves refs, not nodes or edges: `0` whenever `outcome` is present.
     pub affected_nodes: usize,
+    /// Edges the mutation touched, under the `affected_nodes` rule.
     pub affected_edges: usize,
     pub actor_id: Option<String>,
+    /// The commit this write published, if any. For a branch statement: the
+    /// target's head, read after the merge released its gates, so under a
+    /// concurrent writer it may name a later commit than the merge published.
+    /// `null` for `created`, `deleted`, and `already_up_to_date`, which publish
+    /// nothing, and `null` when that head read fails.
     pub commit: Option<CommitOutput>,
+    /// Present only when the request was a branch statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<BranchOutcomeOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -433,7 +518,8 @@ pub struct ChangeEndpointsOutput {
 /// One exact logical entity image, decoded with the commit-era schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeImageOutput {
-    /// Exact logical property values; user-schema keys verbatim.
+    /// Exact logical property values, user-schema keys verbatim; a null cell
+    /// keeps its key, an absent key was outside that commit's schema.
     pub properties: Value,
     /// Present for edge images only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -649,7 +735,9 @@ pub struct QueryRequest {
     /// GQ read-query source. May declare one or more named queries; pick one
     /// with `name` when more than one is declared. Mutations
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
-    /// deprecated alias `POST /change`) instead.
+    /// deprecated alias `POST /change`) instead. May instead be the branch
+    /// statement `branch list`, sent with no `name`, `params`, `branch`, or
+    /// `snapshot`.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]
@@ -800,7 +888,9 @@ impl BlobStatOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
-    /// May declare multiple named mutations; pick one with `name`.
+    /// May declare multiple named mutations; pick one with `name`. May instead
+    /// be one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),
+    /// sent with no `name`, `params`, or `branch`.
     ///
     /// Accepts the legacy field name `query_source` as a deserialization alias.
     #[schema(
@@ -1063,6 +1153,34 @@ pub struct HealthOutput {
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
+}
+
+/// The readiness witness of one replica (`GET /readyz`, RFC 0049): whether
+/// it is serving or draining, the applied revision it booted from, and how
+/// many graphs it does and does not serve. Unauthenticated, so it carries
+/// no graph id: those stay behind `GET /graphs`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReadinessOutput {
+    /// False once shutdown has begun; the response is then 503.
+    pub ready: bool,
+    /// `serving` or `draining`.
+    pub status: String,
+    /// The `config_digest` of the applied revision this process booted from.
+    /// Fixed for the life of the process: the server never reloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub booted_serving_digest: Option<String>,
+    /// The ledger revision the process booted from.
+    pub state_revision: u64,
+    /// The ledger CAS (`sha256:<hex>`) the process booted from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_cas: Option<String>,
+    /// How many graphs this process serves.
+    pub served_graph_count: usize,
+    /// How many graphs the applied revision names that this process does
+    /// not serve, for any reason. `GET /graphs` names them.
+    pub quarantined_graph_count: usize,
+    /// The bound on graceful shutdown, after which the process exits 2.
+    pub shutdown_grace_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1467,21 +1585,49 @@ pub fn read_output(
     target: &ReadTarget,
     result: QueryResult,
     graph_commit_id: Option<String>,
-) -> ReadOutput {
+) -> Result<ReadOutput, CompilerError> {
     let columns = result
         .schema()
         .fields()
         .iter()
         .map(|field| field.name().clone())
         .collect();
-    ReadOutput {
+    let rows = String::from_utf8(result.to_json_bytes()?).map_err(|err| {
+        CompilerError::Execution(format!("query result rendered invalid UTF-8: {err}"))
+    })?;
+    let rows = RawValue::from_string(rows).map_err(|err| {
+        CompilerError::Execution(format!("query result rendered invalid JSON: {err}"))
+    })?;
+    Ok(ReadOutput {
         query_name,
         target: read_target_output(target),
         row_count: result.num_rows(),
         columns,
-        rows: result.to_rust_json(),
+        rows,
         graph_commit_id,
+    })
+}
+
+/// The `branch list` answer: one `{"name": ..}` row per branch in the order
+/// given, column `name`, no target and no graph commit (the statement reads
+/// the ref list, not a branch).
+pub fn branch_list_read_output(branches: &[String]) -> Result<ReadOutput, serde_json::Error> {
+    #[derive(Serialize)]
+    struct Row<'a> {
+        name: &'a str,
     }
+    let rows = branches.iter().map(|name| Row { name }).collect::<Vec<_>>();
+    Ok(ReadOutput {
+        query_name: "branch list".to_string(),
+        target: ReadTargetOutput {
+            branch: None,
+            snapshot: None,
+        },
+        row_count: branches.len(),
+        columns: vec!["name".to_string()],
+        rows: serde_json::value::to_raw_value(&rows)?,
+        graph_commit_id: None,
+    })
 }
 
 pub fn ingest_output(
@@ -1611,6 +1757,11 @@ pub struct GraphInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
+    /// Graphs the applied revision names that this process does not serve,
+    /// for any reason, sorted (RFC 0049). Empty when every applied graph is
+    /// served.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined: Vec<String>,
 }
 
 #[cfg(test)]

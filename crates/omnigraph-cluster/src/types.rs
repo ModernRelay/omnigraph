@@ -217,6 +217,8 @@ pub struct ApprovalRequirement {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanOutput {
     pub ok: bool,
+    /// Whether this plan held the cluster lock or only observed the ledger.
+    pub authority: LedgerAuthority,
     pub config_dir: String,
     pub desired_revision: DesiredRevision,
     pub resource_digests: BTreeMap<String, String>,
@@ -244,12 +246,38 @@ pub struct StatusOutput {
 pub enum StateSyncOperation {
     Refresh,
     Import,
+    /// `refresh` without the lock, the sweep, or the write (RFC 0049).
+    Observe,
+}
+
+/// Under which authority a command read the ledger (RFC 0049).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerAuthority {
+    /// The command held `__cluster/lock.json`.
+    #[default]
+    Locked,
+    /// The bundle sets `state.lock: false`: the command wrote (or planned)
+    /// without the lock, as the `state_lock_disabled` warning says.
+    Unlocked,
+    /// The command took no lock and wrote nothing. Its findings are a
+    /// point-in-time observation; `state_cas` names the ledger it read.
+    Observed,
+}
+
+/// Options for [`crate::plan_config_dir_with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlanOptions {
+    /// Plan without the cluster lock and label the output `observed`.
+    pub observe: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StateSyncOutput {
     pub ok: bool,
     pub operation: StateSyncOperation,
+    /// Whether this command held the cluster lock or only observed.
+    pub authority: LedgerAuthority,
     pub config_dir: String,
     pub state_observations: StateObservations,
     pub resource_digests: BTreeMap<String, String>,

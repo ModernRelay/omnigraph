@@ -41,6 +41,44 @@ pub struct ServingSnapshot {
     pub queries: Vec<ServingQuery>,
     pub policies: Vec<ServingPolicy>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The applied revision's `config_digest`: what a server booted from
+    /// reports as its `booted_serving_digest` (RFC 0049).
+    pub config_digest: Option<String>,
+    /// The ledger revision and CAS this snapshot was read from.
+    pub state_revision: u64,
+    pub state_cas: Option<String>,
+    /// Every graph the applied revision names, sorted.
+    pub applied_graphs: Vec<String>,
+    /// Applied graphs this snapshot does not serve because pending recovery
+    /// quarantined them, sorted. A sidecar for a graph the revision does not
+    /// name is not in this list.
+    pub quarantined_graphs: Vec<String>,
+}
+
+/// A serving snapshot paired with the canonical root of the same opened store.
+///
+/// The binding is read-only metadata for managed boot trust, not a writer fence
+/// or a guarantee that the ledger has not changed since this snapshot was read.
+/// Only the root-bound readers can construct this pair.
+#[derive(Debug, Clone)]
+pub struct RootBoundServingSnapshot {
+    snapshot: ServingSnapshot,
+    canonical_root: String,
+}
+
+impl RootBoundServingSnapshot {
+    pub fn snapshot(&self) -> &ServingSnapshot {
+        &self.snapshot
+    }
+
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+
+    /// Discard the root binding and return the legacy snapshot projection.
+    pub fn into_snapshot(self) -> ServingSnapshot {
+        self.snapshot
+    }
 }
 
 /// Read the applied revision as a serving snapshot — the read-only loader for
@@ -53,10 +91,14 @@ pub struct ServingSnapshot {
 pub async fn read_serving_snapshot(
     config_dir: impl AsRef<Path>,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    let config_dir = config_dir.as_ref().to_path_buf();
+    let backend = store_for_serving_snapshot(config_dir.as_ref())?;
+    read_snapshot_with_store(&backend).await
+}
+
+fn store_for_serving_snapshot(config_dir: &Path) -> Result<ClusterStore, Vec<Diagnostic>> {
     // The declared storage: root decides where the ledger/catalog/graphs
     // live; config parse errors surface through the normal validation path.
-    let parsed = parse_cluster_config(&config_dir);
+    let parsed = parse_cluster_config(config_dir);
     let storage_root = parsed.raw.as_ref().and_then(|raw| {
         raw.storage
             .as_deref()
@@ -69,9 +111,9 @@ pub async fn read_serving_snapshot(
             Ok(backend) => backend,
             Err(diagnostic) => return Err(vec![diagnostic]),
         },
-        None => ClusterStore::for_config_dir(&config_dir),
+        None => ClusterStore::for_config_dir(config_dir),
     };
-    read_snapshot_with_store(backend).await
+    Ok(backend)
 }
 
 /// Read the applied revision directly from a storage root URI — config-free
@@ -84,7 +126,38 @@ pub async fn read_serving_snapshot_from_storage(
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let backend =
         ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
-    read_snapshot_with_store(backend).await
+    read_snapshot_with_store(&backend).await
+}
+
+/// Read an applied snapshot and its canonical store root for managed boot trust.
+/// Ordinary snapshot reads do not perform this extra canonicalization step.
+pub async fn read_root_bound_serving_snapshot(
+    config_dir: impl AsRef<Path>,
+) -> Result<RootBoundServingSnapshot, Vec<Diagnostic>> {
+    let backend = store_for_serving_snapshot(config_dir.as_ref())?;
+    read_root_bound_snapshot_with_store(&backend).await
+}
+
+/// Read a root-bound applied snapshot directly from its storage URI.
+pub async fn read_root_bound_serving_snapshot_from_storage(
+    storage_root: &str,
+) -> Result<RootBoundServingSnapshot, Vec<Diagnostic>> {
+    let backend =
+        ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
+    read_root_bound_snapshot_with_store(&backend).await
+}
+
+async fn read_root_bound_snapshot_with_store(
+    backend: &ClusterStore,
+) -> Result<RootBoundServingSnapshot, Vec<Diagnostic>> {
+    let snapshot = read_snapshot_with_store(backend).await?;
+    let canonical_root = backend
+        .canonical_root()
+        .map_err(|diagnostic| vec![diagnostic])?;
+    Ok(RootBoundServingSnapshot {
+        snapshot,
+        canonical_root,
+    })
 }
 
 /// Cluster root for a graph **storage URI** of the cluster layout
@@ -207,7 +280,7 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
 }
 
 async fn read_snapshot_with_store(
-    backend: ClusterStore,
+    backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let mut startup_diagnostics: Vec<Diagnostic> = Vec::new();
@@ -271,6 +344,10 @@ async fn read_snapshot_with_store(
         diagnostics.extend(startup_diagnostics);
         return Err(diagnostics);
     };
+    let boot_config_digest = state.applied_revision.config_digest.clone();
+    let boot_state_revision = state.state_revision;
+    let boot_state_cas = observations.state_cas.clone();
+    let boot_applied_graphs = applied_graph_ids(&state);
 
     let required_embedding_providers: BTreeSet<String> = state
         .applied_revision
@@ -434,18 +511,30 @@ async fn read_snapshot_with_store(
     }
 
     if graphs.is_empty() {
-        if saw_applied_graph && !quarantined_graphs.is_empty() {
+        if saw_applied_graph {
             diagnostics.push(Diagnostic::error(
                 "cluster_no_healthy_graphs",
                 CLUSTER_RECOVERIES_DIR,
                 "all applied graphs are quarantined by startup safety checks; resolve the graph-specific diagnostics, then retry",
             ));
-        } else {
+        } else if boot_state_revision == 0
+            || boot_state_cas.is_none()
+            || !boot_config_digest.as_deref().is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
             diagnostics.push(Diagnostic::error(
                 "cluster_empty",
                 CLUSTER_STATE_FILE,
-                "the applied revision records no graphs; apply a cluster with at least one graph before serving from it",
+                "an empty cluster requires an applied configuration digest, a positive state revision and an observed ledger CAS; run `cluster apply` before serving",
             ));
+        } else if let Err(diagnostic) = backend.canonical_root() {
+            // Empty serving still needs an actual storage root. Unlike a
+            // nonempty revision, it will not open a graph to check one later.
+            diagnostics.push(diagnostic);
         }
     }
     if has_errors(&diagnostics) {
@@ -457,6 +546,14 @@ async fn read_snapshot_with_store(
         queries,
         policies,
         diagnostics: startup_diagnostics,
+        config_digest: boot_config_digest,
+        state_revision: boot_state_revision,
+        state_cas: boot_state_cas,
+        quarantined_graphs: quarantined_graphs
+            .into_iter()
+            .filter(|graph_id| boot_applied_graphs.contains(graph_id))
+            .collect(),
+        applied_graphs: boot_applied_graphs,
     })
 }
 

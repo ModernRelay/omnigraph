@@ -384,8 +384,9 @@ source; certificates are derived proof).
 
 - **Format:** new accepted SchemaIR version and internal manifest stamp; the
   new binary reads and writes only the new stamp; older binaries refuse it
-  rather than misread it. v6 graphs rebuild through export/init/load under
-  the existing strict-single-version policy. The rebuild preserves rows,
+  rather than misread it. Graphs on predecessor internal stamps rebuild
+  through export/init/load under the existing strict-single-version policy.
+  The rebuild preserves rows,
   vectors, blobs, and logical shape; it does not preserve commit history,
   branches, or physical indexes (all derived state is rebuilt under the
   accepted semantics).

@@ -1,0 +1,56 @@
+# issue: none
+# notes: 5 docs indexed, then the farthest (d004 at 4.0) moved to -1.0. Nearest
+# notes: from -0.3 under limit 6 (above the 5 live rows): the moved row ranks
+# notes: SECOND by its new vector (0.7, between d000 at 0.3 and d001 at 1.3) and
+# notes: exactly 5 rows come back, so its old position is gone, not a sixth row.
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","n":3,"name":"doc-003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0]}}
+
+--- mutate
+query mv($s: String, $e: Vector(4)) {
+    update Doc set { embedding: $e } where slug = $s
+}
+
+--- params
+{"s": "d004", "e": [-1.0, 0.0, 0.0, 0.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query scenario($q: Vector(4)) {
+    match {
+        $d: Doc
+    }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 6
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d000"}
+{"d.slug":"d004"}
+{"d.slug":"d001"}
+{"d.slug":"d002"}
+{"d.slug":"d003"}
+
+--- expect shape
+d.slug: String

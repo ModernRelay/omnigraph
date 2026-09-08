@@ -160,6 +160,20 @@ Use the standard storage credential environment for the chosen backend. Azure
 is a qualification preview and requires the admission wrapper for every writer;
 see [Deployment](../deployment.md#azure-blob-preview).
 
+## Declared paths
+
+Every `schema`, `queries`, and policy `file` path is resolved against the
+directory that holds `cluster.yaml`. A relative path must stay inside that
+directory: a `..` segment is refused with `config_path_escape`, and a path
+that reaches its file through a symbolic link, on the way to it or as a
+query file discovered inside a declared directory, is refused with
+`config_path_symlink`. Each diagnostic names the setting that declared the
+path. The bundle is one directory of files read exactly as declared, so what
+gets applied never depends on something outside it.
+
+An absolute path is accepted as given and is not checked for either shape.
+Prefer relative paths; they are what keep a bundle portable and hermetic.
+
 ## Command behavior
 
 | Command | Changes graph or cluster state? | Use |

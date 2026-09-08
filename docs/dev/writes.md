@@ -98,7 +98,7 @@ result.
 
 ## Keyed writes
 
-Every v6 graph table has exactly the non-null physical `id` field as Lance's
+Every v6-or-later graph table has exactly the non-null physical `id` field as Lance's
 unenforced primary key. Production strict insert and upsert route through the
 sealed, exact-`id`, filter-bearing MergeInsert adapter:
 

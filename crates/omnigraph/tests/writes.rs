@@ -31,6 +31,47 @@ use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy
 
 use helpers::*;
 
+#[tokio::test]
+async fn actor_named_types_remain_customer_owned_and_writable() {
+    for type_name in ["Actor", "OmniActor"] {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = format!("node {type_name} {{\n  actorId: String @key\n}}\n");
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), &schema)
+            .await
+            .unwrap();
+        let data = serde_json::json!({"type": type_name, "data": {"actorId": "customer"}});
+        load_jsonl(&db, &data.to_string(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        let mutation =
+            format!("query insert_actor() {{ insert {type_name} {{ actorId: \"inserted\" }} }}");
+        let result = db
+            .mutate(
+                "main",
+                &mutation,
+                "insert_actor",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.affected_nodes, 1);
+        let query =
+            format!("query actors() {{ match {{ $a: {type_name} }} return {{ $a.actorId }} }}");
+        let rows = db
+            .query(
+                ReadTarget::branch("main"),
+                &query,
+                "actors",
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 2);
+        assert_eq!(db.catalog().node_types.len(), 1);
+        assert_eq!(db.schema_source().as_str(), schema);
+    }
+}
+
 /// `omnigraph load` (no `--branch`) writes directly to the target — no
 /// `__run__*` staging branch is created on success.
 #[tokio::test]
@@ -923,7 +964,7 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
 }
 
 /// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
-/// delete predicate referencing a NULLable column must NOT drop a later
+/// delete predicate referencing a nullable column must NOT drop a later
 /// statement's matching row just because that column is NULL (SQL UNKNOWN).
 /// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
 /// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
@@ -1801,7 +1842,7 @@ query insert_then_replace_blob(
         .await
         .unwrap();
     assert_eq!(qr.num_rows(), 1);
-    let json = qr.to_sdk_json();
+    let json = qr.to_rust_json().unwrap();
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "letter");
     assert_eq!(row["d.note"], "draft 1");
@@ -2734,5 +2775,99 @@ async fn multi_table_staging_matches_serial_staging() {
     assert_eq!(
         serial, concurrent,
         "staging concurrency must not change any observable effect"
+    );
+}
+
+// ─── Edge @key write-path pins ───────────────────────────────────────────────
+
+const EDGE_KEY_WRITE_SCHEMA: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    since: String?
+    @key(src, dst)
+}
+"#;
+
+const EDGE_KEY_WRITE_SEED: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}"#;
+
+/// A query is constructive or destructive, never both: a mutation mixing a
+/// delete and an insert of the same derived edge id is refused with the
+/// split guidance. Across two mutations the later commit wins: a delete
+/// then a re-insert of the same key re-creates the row under the same
+/// derived id.
+#[tokio::test]
+async fn keyed_edge_delete_then_reinsert_spans_two_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, EDGE_KEY_WRITE_SCHEMA).await.unwrap();
+    load_jsonl(&db, EDGE_KEY_WRITE_SEED, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    const MUTATIONS: &str = r#"
+query seed_knows() {
+    insert Knows { from: "Alice", to: "Bob", since: "2020" }
+}
+
+query replace_knows() {
+    delete Knows where from = "Alice"
+    insert Knows { from: "Alice", to: "Bob", since: "2021" }
+}
+
+query drop_knows() {
+    delete Knows where from = "Alice"
+}
+"#;
+    mutate_main(&mut db, MUTATIONS, "seed_knows", &params(&[]))
+        .await
+        .unwrap();
+
+    let err = mutate_main(&mut db, MUTATIONS, "replace_knows", &params(&[]))
+        .await
+        .expect_err("a mutation mixing a delete and an insert must be refused");
+    assert!(
+        err.to_string().contains("constructive or destructive"),
+        "got: {}",
+        err
+    );
+
+    mutate_main(&mut db, MUTATIONS, "drop_knows", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(count_rows(&db, "edge:Knows").await, 0);
+
+    mutate_main(&mut db, MUTATIONS, "seed_knows", &params(&[]))
+        .await
+        .expect("re-inserting a deleted key re-creates the row");
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+}
+
+/// Edge key immutability is enforced structurally: the typechecker refuses
+/// every edge update (T16; the mutation executor carries a second refusal
+/// behind it). A future edge-update feature must revisit the key-column
+/// rule when this pin goes red.
+#[tokio::test]
+async fn update_refuses_edge_types_pinning_key_immutability() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, EDGE_KEY_WRITE_SCHEMA).await.unwrap();
+    load_jsonl(&db, EDGE_KEY_WRITE_SEED, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    const MUTATIONS: &str = r#"
+query set_since() {
+    update Knows set { since: "2021" } where from = "Alice"
+}
+"#;
+    let err = mutate_main(&mut db, MUTATIONS, "set_since", &params(&[]))
+        .await
+        .expect_err("update on an edge type must be refused");
+    assert!(
+        err.to_string()
+            .contains("update mutation for edge type `Knows` is not supported"),
+        "got: {}",
+        err
     );
 }

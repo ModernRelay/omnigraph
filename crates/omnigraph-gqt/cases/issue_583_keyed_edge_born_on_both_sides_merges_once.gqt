@@ -1,0 +1,76 @@
+# issue: 583
+# red_on: 2026-09-07, main @ ad425c68 (no edge keys yet): the schema is refused at parse, "@key constraint is not supported on edges (edge Knows)"; with that line removed the same fork returned the a->c edge TWICE from the bound traversal and count($w.since) was 2, one physical row per side of the fork (the #583 shape).
+# notes: a keyed edge (@key(src, dst)) inserted on both sides of a fork with the
+# notes: same key derives the same id on both sides, so the three-way merge sees
+# notes: one logical edge changed identically and main holds it once: the bound
+# notes: traversal returns one row and counts 1. Unkeyed edge types keep both rows (multiset default, RFC 0044).
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: I32
+    @key(src, dst)
+}
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"c"}}
+
+--- mutate
+branch create s
+
+--- expect ok
+
+--- mutate branch: s
+query link_on_s() {
+    insert Knows { from: "a", to: "c", since: 1 }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query link_on_main() {
+    insert Knows { from: "a", to: "c", since: 1 }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge s
+
+--- expect outcome: merged
+
+--- query
+query bound_edges() {
+    match {
+        $p: Person
+        $p $w:knows $f
+    }
+    return { $p.name, $f.name, $w.since }
+}
+
+--- expect unordered
+{"p.name": "a", "f.name": "c", "w.since": 1}
+
+--- expect shape
+p.name: String
+f.name: String
+w.since: I32
+
+--- query
+query edge_count() {
+    match {
+        $p: Person
+        $p $w:knows $f
+    }
+    return { count($w.since) as n }
+}
+
+--- expect unordered
+{"n": 1}
+
+--- expect shape
+n: I64

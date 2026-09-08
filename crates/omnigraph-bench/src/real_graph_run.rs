@@ -1182,9 +1182,9 @@ fn verify_account(
         return Ok(());
     }
     let entity = entity.ok_or_else(|| verification_error(format!("missing Account {id}")))?;
-    if entity.as_object().map(serde_json::Map::len) != Some(11) {
+    if entity.as_object().map(serde_json::Map::len) != Some(7) {
         return Err(verification_error(format!(
-            "Account {id} does not contain exactly the accepted schema fields"
+            "Account {id} does not contain exactly the seven non-null schema fields (a null cell's key is omitted)"
         )));
     }
     for (field, expected) in [
@@ -1199,12 +1199,7 @@ fn verify_account(
         ("email", Value::Null),
         ("lastLoginTime", Value::Null),
     ] {
-        if entity.get(field) != Some(&expected) {
-            return Err(verification_error(format!(
-                "Account {id}.{field} differs: expected {expected}, observed {:?}",
-                entity.get(field)
-            )));
-        }
+        verify_field(entity, field, &expected, "Account", id)?;
     }
     let expected_time_ms = if id.starts_with("omnigraph-bench-fin-v1-src-") {
         1_577_836_800_000
@@ -1232,9 +1227,9 @@ fn verify_transfer(
         return Ok(());
     }
     let entity = entity.ok_or_else(|| verification_error(format!("missing transfer {id}")))?;
-    if entity.as_object().map(serde_json::Map::len) != Some(9) {
+    if entity.as_object().map(serde_json::Map::len) != Some(8) {
         return Err(verification_error(format!(
-            "transfer {id} does not contain exactly the accepted schema fields"
+            "transfer {id} does not contain exactly the eight non-null schema fields (a null cell's key is omitted)"
         )));
     }
     let source_side = id == SOURCE_EDGE;
@@ -1255,12 +1250,7 @@ fn verify_transfer(
             }),
         ),
     ] {
-        if entity.get(field) != Some(&expected) {
-            return Err(verification_error(format!(
-                "transfer {id}.{field} differs: expected {expected}, observed {:?}",
-                entity.get(field)
-            )));
-        }
+        verify_field(entity, field, &expected, "transfer", id)?;
     }
     verify_datetime_millis(
         entity.get("createTime"),
@@ -1275,18 +1265,46 @@ fn verify_transfer(
     Ok(())
 }
 
+/// A null expectation means the key is absent: entity JSON omits a null cell.
+fn verify_field(
+    entity: &Value,
+    field: &str,
+    expected: &Value,
+    kind: &str,
+    id: &str,
+) -> Result<(), RealGraphRunError> {
+    let observed = entity.get(field);
+    let matches = match expected {
+        Value::Null => observed.is_none(),
+        expected => observed == Some(expected),
+    };
+    if !matches {
+        return Err(verification_error(format!(
+            "{kind} {id}.{field} differs: expected {expected}, observed {observed:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn verify_datetime_millis(
     observed: Option<&Value>,
     expected: i64,
     kind: &str,
     id: &str,
 ) -> Result<(), RealGraphRunError> {
+    let spelled = arrow_array::temporal_conversions::date64_to_datetime(expected)
+        .map(|datetime| format!("{datetime:?}"))
+        .ok_or_else(|| {
+            verification_error(format!(
+                "{kind} {id}.createTime expectation {expected} is unformattable"
+            ))
+        })?;
     let observed = observed
-        .and_then(Value::as_i64)
-        .ok_or_else(|| verification_error(format!("{kind} {id}.createTime is not an integer")))?;
-    if observed != expected {
+        .and_then(Value::as_str)
+        .ok_or_else(|| verification_error(format!("{kind} {id}.createTime is not a string")))?;
+    if observed != spelled {
         return Err(verification_error(format!(
-            "{kind} {id}.createTime differs: expected epoch-ms {expected}, observed {observed}"
+            "{kind} {id}.createTime differs: expected {spelled} (epoch-ms {expected}), observed {observed}"
         )));
     }
     Ok(())

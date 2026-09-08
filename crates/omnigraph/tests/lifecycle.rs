@@ -47,7 +47,10 @@ async fn init_creates_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    // Keep the original public struct-literal API as well as the v2 format.
+    let db = Omnigraph::init_with_options(uri, TEST_SCHEMA, InitOptions { force: false })
+        .await
+        .unwrap();
 
     assert!(dir.path().join("_schema.pg").exists());
     assert!(dir.path().join("_schema.ir.json").exists());
@@ -60,6 +63,10 @@ async fn init_creates_graph() {
         serde_json::from_str(&fs::read_to_string(dir.path().join("__schema_state.json")).unwrap())
             .unwrap();
     assert_eq!(ir.ir_version, 2);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("_schema.ir.json")).unwrap()).unwrap();
+    assert!(persisted.get("actor_provenance").is_none());
+    assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
     assert!(ir.next_identity_id > 1);
     assert!(SchemaIdentityDomain::parse(ir.schema_identity_domain.as_str()).is_ok());
     assert_eq!(state["format_version"].as_u64(), Some(2));
@@ -94,13 +101,14 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        6,
-        "fresh graphs must use the restored pre-WAL v6 manifest format"
+        7,
+        "fresh graphs must use the v7 manifest format (RFC 0062 manifest clock)"
     );
     assert!(snap.dataset("node:Person").is_some());
     assert!(snap.dataset("node:Company").is_some());
     assert!(snap.dataset("edge:Knows").is_some());
     assert!(snap.dataset("edge:WorksAt").is_some());
+    assert_eq!(snap.datasets().count(), 4);
     for table_key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
         let dataset = snap.open_dataset(table_key).await.unwrap();
         let primary_key = dataset
@@ -303,6 +311,79 @@ async fn open_refuses_pre_identity_schema_state_format() {
         err.to_string()
             .contains("schema state format 1 is unsupported")
     );
+}
+
+#[tokio::test]
+async fn open_refuses_v3_live_or_staged_schema_without_changing_files() {
+    fn files(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut result = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    result.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    // The unsupported version is the boundary, including disabled bindings.
+    // Do not require this binary to understand the removed binding shape.
+    for (filename, enabled) in [
+        ("_schema.ir.json", true),
+        ("_schema.ir.json", false),
+        ("_schema.ir.json.staging", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        drop(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+        let mut ir: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join("_schema.ir.json")).unwrap()).unwrap();
+        ir["ir_version"] = serde_json::json!(3);
+        ir["actor_provenance"] = serde_json::json!({ "enabled": enabled });
+        // With matching source, historical recovery would clean these
+        // staged files before later discovering an unsupported live IR.
+        fs::write(dir.path().join("_schema.pg.staging"), TEST_SCHEMA).unwrap();
+        fs::copy(
+            dir.path().join("__schema_state.json"),
+            dir.path().join("__schema_state.json.staging"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(filename),
+            serde_json::to_vec_pretty(&ir).unwrap(),
+        )
+        .unwrap();
+        let before = files(dir.path());
+
+        for read_only in [true, false] {
+            let opened = if read_only {
+                Omnigraph::open_read_only(uri).await
+            } else {
+                Omnigraph::open(uri).await
+            };
+            let error = match opened {
+                Ok(_) => panic!("unsupported v3 schema must refuse in either open mode"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("unsupported ir_version 3"),
+                "{error}"
+            );
+            assert_eq!(
+                files(dir.path()),
+                before,
+                "refusal must preserve every durable file"
+            );
+        }
+    }
 }
 
 #[tokio::test]

@@ -482,11 +482,12 @@ Per the standing CI budget:
 
 - **Canonical Test Workspace invocation:** minimized checked-in regressions,
   bounded parser smoke corpus, four fixed operation seeds, and deterministic
-  local failpoint cells run in their existing workspace owners. Post-merge CI
-  already compiles one workspace feature superset with engine/cluster failpoints;
-  RFC 0032 does not add a second Cargo invocation or a third feature graph. The
-  current CI does not run the full workspace suite on every PR, so this is not
-  described as a PR gate. Corpus file count/bytes and non-vacuous cases are
+  local failpoint cells run in their existing workspace owners. `Test Workspace`
+  already compiles one workspace feature superset with engine/cluster failpoints
+  on every pull request and after merge; RFC 0032 does not add a second Cargo
+  invocation or a third feature graph. `Test Workspace` is a reporting context,
+  not a required one, so this is not described as a PR gate. Corpus file
+  count/bytes and non-vacuous cases are
   asserted. The ordinary additions own an internally enforced **20 s** aggregate
   parent allocation and the failpoint sensitivity cells own **10 s**, both
   inside that same invocation. Qualified durable-cut cells do not run on local
@@ -670,3 +671,17 @@ seed) pair and byte-diffs the two runs' reports, so the replay claim is
 itself under test instead of asserted. If the record/replay arbiter
 sketched in §4.1 is ever attempted, that meta-test shape is its acceptance
 gate.
+
+## 14. Amendment (2026-09-04): §8 CI posture on pull requests
+
+Added when the pull-request tier landed in `ci.yml`. `Test Workspace` now
+runs the workspace feature superset on every pull request that is not
+documentation-only, as a reporting context, and again after merge, on
+tags, and by dispatch. §8's first bullet is rewritten to say so; its
+conclusion stands for a different reason: RFC 0032's additions are not a
+PR gate because `Test Workspace` is not a required context, no longer
+because the suite skipped pull requests. Superseded sentences: "Post-merge
+CI already compiles one workspace feature superset with engine/cluster
+failpoints" and "The current CI does not run the full workspace suite on
+every PR, so this is not described as a PR gate." Nothing else in §8
+changes; the budgets and the RustFS child runner's placement are as written.

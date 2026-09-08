@@ -230,6 +230,12 @@ async fn export_jsonl_round_trips_branch_snapshot() {
         .collect::<HashSet<_>>();
 
     let main_jsonl = db.export_jsonl("main", &[]).await.unwrap();
+    assert!(
+        main_jsonl.lines().any(
+            |line| line == r#"{"type":"Person","data":{"id":"Alice","age":30,"name":"Alice"}}"#
+        ),
+        "export line bytes: `id` first, then the catalog's column order, the writer's spelling: {main_jsonl}"
+    );
     let feature_jsonl = db.export_jsonl("feature", &[]).await.unwrap();
     let mut feature_unordered = Vec::new();
     db.export_jsonl_unordered_to_writer("feature", &[], &mut feature_unordered)
@@ -514,13 +520,12 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
         .find(|row| row["type"] == "CalendarDay")
         .unwrap();
     assert_eq!(day["data"]["id"], "19723");
-    assert_eq!(day["data"]["day"].as_i64(), Some(19_723));
+    assert_eq!(day["data"]["day"], "2024-01-01");
     let instant = rows.iter().find(|row| row["type"] == "Instant").unwrap();
     assert_eq!(instant["data"]["id"], "1704067200000");
     assert_eq!(
-        instant["data"]["happened_at"].as_i64(),
-        Some(1_704_067_200_000),
-        "Date64 export must be an exact JSON integer, not a display fallback"
+        instant["data"]["happened_at"], "2024-01-01T00:00:00",
+        "Date64 exports as the DateTime string of RFC 0051"
     );
 
     let rejected_dir = tempfile::tempdir().unwrap();
@@ -1007,6 +1012,41 @@ node Document {
     assert_eq!(document("neighbor")["content"], "base64:TmVpZ2hib3I=");
     assert!(document("null")["content"].is_null());
     assert_eq!(document("external")["content"], canonical_external_uri);
+
+    let entity_id = |title: &str| document(title)["id"].as_str().unwrap().to_string();
+    let readme = db
+        .entity_at_target(
+            ReadTarget::branch("main"),
+            "node:Document",
+            &entity_id("readme"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(readme["content"], "base64:SGVsbG8=");
+    let external = db
+        .entity_at_target(
+            ReadTarget::branch("main"),
+            "node:Document",
+            &entity_id("external"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(external["content"], canonical_external_uri);
+    let null = db
+        .entity_at_target(
+            ReadTarget::branch("main"),
+            "node:Document",
+            &entity_id("null"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        null.get("content").is_none(),
+        "entity fetch omits a null cell's key: {null}"
+    );
 
     // Rebuild ingress is policy-aware. Restore the caller-owned source and
     // explicitly authorize the import rather than relying on ambient file

@@ -1,0 +1,74 @@
+# issue: none
+# red_on: 2026-09-07, main @ 5f94a741: `branch merge main into feature` failed with `storage: Concurrent modification: table version 4 already exists for identity … (edge:Knows) with different state`
+# notes: sibling of merge_adopt_lower_source_version_keeps_edges: two edge writes
+# notes: on `feature` instead of three make the two edge tables reach the same
+# notes: version number on different native branches. Adopting `main` into
+# notes: `feature` must fast-forward and show all four edges.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query add_b_c() {
+    insert Knows { from: "b", to: "c" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: feature
+query add_c_a() {
+    insert Knows { from: "c", to: "a" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query add_a_c_on_main() {
+    insert Knows { from: "a", to: "c" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- query branch: feature
+query edges_on_feature() {
+    match {
+        $x: Person
+        $x knows $y
+    }
+    return { $x.name, $y.name }
+}
+
+--- expect unordered
+{"x.name": "a", "y.name": "b"}
+{"x.name": "b", "y.name": "c"}
+{"x.name": "c", "y.name": "a"}
+{"x.name": "a", "y.name": "c"}
+
+--- expect shape
+x.name: String
+y.name: String

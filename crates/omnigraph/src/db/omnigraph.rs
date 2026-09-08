@@ -3,11 +3,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray,
-    ListArray, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array, new_null_array,
-};
+use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
@@ -55,11 +51,12 @@ use super::manifest::{
     GenesisManifestAttempt, ManifestChange, Snapshot, TableRegistration, TableTombstone,
 };
 use super::schema_state::{
-    SCHEMA_SOURCE_FILENAME, load_validated_schema_contract,
-    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_state_identity,
-    recover_schema_state_files, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
-    schema_state_uri, validate_schema_contract, validate_schema_ir_against_snapshot,
-    write_schema_contract, write_schema_contract_staging,
+    SCHEMA_SOURCE_FILENAME, SchemaContractText, load_validated_schema_contract,
+    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_contract_text,
+    read_schema_contract_text_for_source, read_schema_state_identity, recover_schema_state_files,
+    render_schema_contract, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
+    schema_state_uri, validate_schema_contract, validate_schema_contract_text,
+    validate_schema_ir_against_snapshot, write_schema_contract, write_schema_contract_staging,
 };
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
@@ -412,8 +409,11 @@ impl Omnigraph {
         preflight_init_target(&root, storage.as_ref(), options).await?;
 
         let schema_shape = read_schema_shape_from_source(schema_source)?;
-        let resolution = initialize_schema_ir(SchemaIdentityDomain::new(), &schema_shape)
-            .map_err(|error| OmniError::manifest(error.to_string()))?;
+        let resolution = initialize_schema_ir(
+            SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid()),
+            &schema_shape,
+        )
+        .map_err(|error| OmniError::manifest(error.to_string()))?;
         for diagnostic in &resolution.diagnostics {
             tracing::warn!(
                 target: "omnigraph::schema::identity",
@@ -429,6 +429,12 @@ impl Omnigraph {
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
+        let (_, ir_json, state_json) = render_schema_contract(&schema_ir)?;
+        let contract = SchemaContractText {
+            source: schema_source.to_string(),
+            ir_json,
+            state_json,
+        };
 
         // Every init write needs atomic create-if-absent (the root init claim,
         // the strict-mode `_schema.pg` defence, and each Lance commit), so
@@ -510,8 +516,7 @@ impl Omnigraph {
         // remove the graph directory manually before retrying `init`.
         let coordinator = match init_commit_phase(
             &root,
-            schema_source,
-            &schema_ir,
+            &contract,
             &catalog,
             &storage,
             !schema_pg_claimed,
@@ -575,6 +580,16 @@ impl Omnigraph {
         };
 
         let session = lance_access.data_session();
+        let catalog = Arc::new(catalog);
+        let read_caches = Arc::new(crate::runtime_cache::ReadCaches {
+            session: Arc::clone(&session),
+            handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
+            accepted_catalog: crate::runtime_cache::AcceptedCatalogMemo::default(),
+            compiled_queries: crate::runtime_cache::CompiledQueryCache::default(),
+        });
+        read_caches
+            .accepted_catalog
+            .memoize(contract, Arc::clone(&catalog));
         Ok(Self {
             root_uri: root.clone(),
             storage,
@@ -584,15 +599,12 @@ impl Omnigraph {
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
             // sessions reuse the process-wide object-store registry.
-            table_store: TableStore::new(&root, session.clone()),
+            table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
             feed_cut_cache: tokio::sync::RwLock::new(None),
-            read_caches: Arc::new(crate::runtime_cache::ReadCaches {
-                session,
-                handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
-            }),
+            read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
-                catalog: Arc::new(catalog),
+                catalog,
                 source: Arc::new(schema_source.to_string()),
                 schema_ir_hash: accepted_schema_ir_hash,
                 schema_identity_domain,
@@ -667,6 +679,14 @@ impl Omnigraph {
         // Both open modes refuse: there is no in-place migration, and the check is
         // a stamp read with no object-store writes, so it is safe under ReadOnly.
         crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
+        // Hold the same schema gate through format preflight and contract
+        // capture. A v3 live or staged IR must refuse before the local write
+        // probe, coordinator open, or either recovery sweep can change files.
+        let schema_contract_guard = write_queue
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        crate::db::schema_state::refuse_unsupported_schema_versions(&root, storage.as_ref())
+            .await?;
         // Read-write opens write before the first user mutation (recovery
         // sweeps, schema-stamp migration), and every write needs atomic
         // create-if-absent; read-only opens perform no writes.
@@ -686,12 +706,8 @@ impl Omnigraph {
         // observe a partial promotion, or publish an old catalog after a live
         // apply completed. ReadOnly still performs no recovery writes; this gate
         // only serializes its read with an in-process publisher.
-        let schema_contract_guard = write_queue
-            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
-            .await;
-        // `coordinator` was opened before the await above. A live handle may have
-        // published while this open blocked, so refresh under the continuously
-        // held gate before either recovery or contract capture.
+        // Refresh under the continuously held gate before either recovery or
+        // contract capture, preserving the coherent snapshot boundary.
         coordinator.refresh().await?;
         // Both the schema-state recovery sweep AND the manifest-drift
         // recovery sweep are gated on `OpenMode::ReadWrite`. Read-only
@@ -747,15 +763,26 @@ impl Omnigraph {
                 "graph at '{root}' is missing its schema files: '_schema.pg' was not found although '__manifest' is readable; restore the matching '_schema.pg', '_schema.ir.json', and '__schema_state.json' contract from a backup, or rebuild a fresh graph from an existing export or backup"
             )));
         };
-        let (accepted_ir, accepted_state) =
-            load_validated_schema_contract_for_source(&root, Arc::clone(&storage), &schema_source)
-                .await?;
+        let contract =
+            read_schema_contract_text_for_source(&root, storage.as_ref(), schema_source).await?;
+        let (accepted_ir, accepted_state) = validate_schema_contract_text(&contract)?;
         validate_schema_ir_against_snapshot(&accepted_ir, &coordinator.snapshot())?;
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_physical_schemas(&mut catalog)?;
 
         let session = lance_access.data_session();
+        let catalog = Arc::new(catalog);
+        let schema_source = Arc::new(contract.source.clone());
+        let read_caches = Arc::new(crate::runtime_cache::ReadCaches {
+            session: Arc::clone(&session),
+            handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
+            accepted_catalog: crate::runtime_cache::AcceptedCatalogMemo::default(),
+            compiled_queries: crate::runtime_cache::CompiledQueryCache::default(),
+        });
+        read_caches
+            .accepted_catalog
+            .memoize(contract, Arc::clone(&catalog));
         let db = Self {
             root_uri: root.clone(),
             storage,
@@ -765,16 +792,13 @@ impl Omnigraph {
             // warm across reads, writes, and maintenance. Mutable control
             // metadata uses the context's separate zero-cache session; both
             // sessions reuse the process-wide object-store registry.
-            table_store: TableStore::new(&root, session.clone()),
+            table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
             feed_cut_cache: tokio::sync::RwLock::new(None),
-            read_caches: Arc::new(crate::runtime_cache::ReadCaches {
-                session,
-                handles: Arc::new(crate::runtime_cache::TableHandleCache::default()),
-            }),
+            read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
-                catalog: Arc::new(catalog),
-                source: Arc::new(schema_source),
+                catalog,
+                source: schema_source,
                 schema_ir_hash: accepted_state.schema_ir_hash,
                 schema_identity_domain,
             })),
@@ -966,11 +990,25 @@ impl Omnigraph {
     /// [`Self::load_accepted_catalog_with_schema_gate_held`] unless they perform
     /// that post-resolution identity join themselves.
     async fn build_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
-        let (schema_ir, _) =
-            load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
+        let text = read_schema_contract_text(self.uri(), self.storage.as_ref()).await?;
+        if let Some(catalog) = self.read_caches.accepted_catalog.get(&text) {
+            return Ok(catalog);
+        }
+        let (schema_ir, _) = validate_schema_contract_text(&text)?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
-        Ok(Arc::new(catalog))
+        crate::instrumentation::record_catalog_build();
+        let catalog = Arc::new(catalog);
+        self.read_caches
+            .accepted_catalog
+            .memoize(text, Arc::clone(&catalog));
+        Ok(catalog)
+    }
+
+    /// The per-graph read caches (`ReadCaches`): table handles, the accepted
+    /// catalog memo, and the compiled-query cache.
+    pub(crate) fn read_caches(&self) -> &Arc<crate::runtime_cache::ReadCaches> {
+        &self.read_caches
     }
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
@@ -1828,6 +1866,7 @@ impl Omnigraph {
     async fn invalidate_read_caches(&self) {
         self.runtime_cache.invalidate_all().await;
         self.read_caches.handles.invalidate_all().await;
+        // `accepted_catalog` and `compiled_queries` are content-keyed: no invalidation.
         // Hygiene, like the caches above: the incarnation key already makes a
         // stale feed cut miss, but a same-branch refresh clears it so an
         // e_tag-less substrate cannot serve a recreated branch's projection
@@ -4147,8 +4186,7 @@ enum InitCommitError {
 
 async fn init_commit_phase(
     root: &str,
-    schema_source: &str,
-    schema_ir: &SchemaIR,
+    contract: &SchemaContractText,
     catalog: &Catalog,
     storage: &Arc<dyn StorageAdapter>,
     write_schema_pg: bool,
@@ -4158,14 +4196,14 @@ async fn init_commit_phase(
     if write_schema_pg {
         let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
         storage
-            .write_text(&schema_path, schema_source)
+            .write_text(&schema_path, &contract.source)
             .await
             .map_err(InitCommitError::BeforePhysicalInit)?;
         crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)
             .map_err(InitCommitError::BeforePhysicalInit)?;
     }
 
-    write_schema_contract(root, storage.as_ref(), schema_ir)
+    write_schema_contract(root, storage.as_ref(), contract)
         .await
         .map_err(InitCommitError::BeforePhysicalInit)?;
     crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)
@@ -4296,194 +4334,10 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema
     )))
 }
 
-fn record_batch_row_to_json(batch: &RecordBatch, row: usize) -> Result<serde_json::Value> {
-    let mut obj = serde_json::Map::new();
-    for (i, field) in batch.schema().fields().iter().enumerate() {
-        obj.insert(
-            field.name().clone(),
-            json_value_from_array(batch.column(i).as_ref(), row)?,
-        );
-    }
-    Ok(serde_json::Value::Object(obj))
-}
-
-fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Value> {
-    if array.is_null(row) {
-        return Ok(serde_json::Value::Null);
-    }
-
-    match array.data_type() {
-        DataType::Utf8 => Ok(serde_json::Value::String(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected StringArray"))?
-                .value(row)
-                .to_string(),
-        )),
-        DataType::LargeUtf8 => Ok(serde_json::Value::String(
-            array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeStringArray"))?
-                .value(row)
-                .to_string(),
-        )),
-        DataType::Boolean => Ok(serde_json::Value::Bool(
-            array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected BooleanArray"))?
-                .value(row),
-        )),
-        DataType::Int32 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Int32Array"))?
-                .value(row),
-        ))),
-        DataType::Int64 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Int64Array"))?
-                .value(row),
-        ))),
-        DataType::UInt32 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected UInt32Array"))?
-                .value(row),
-        ))),
-        DataType::UInt64 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected UInt64Array"))?
-                .value(row),
-        ))),
-        DataType::Float32 => {
-            let value = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Float32Array"))?
-                .value(row) as f64;
-            Ok(serde_json::Value::Number(
-                serde_json::Number::from_f64(value).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "cannot encode f32 value '{}' as JSON",
-                        value
-                    ))
-                })?,
-            ))
-        }
-        DataType::Float64 => {
-            let value = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Float64Array"))?
-                .value(row);
-            Ok(serde_json::Value::Number(
-                serde_json::Number::from_f64(value).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "cannot encode f64 value '{}' as JSON",
-                        value
-                    ))
-                })?,
-            ))
-        }
-        DataType::Date32 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Date32Array"))?
-                .value(row),
-        ))),
-        DataType::Date64 => Ok(serde_json::Value::Number(serde_json::Number::from(
-            array
-                .as_any()
-                .downcast_ref::<Date64Array>()
-                .ok_or_else(|| OmniError::manifest_internal("expected Date64Array"))?
-                .value(row),
-        ))),
-        DataType::Binary => Ok(serde_json::Value::String(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected BinaryArray"))?
-                .value(row),
-        ))),
-        DataType::LargeBinary => Ok(serde_json::Value::String(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeBinaryArray"))?
-                .value(row),
-        ))),
-        DataType::List(_) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected ListArray"))?;
-            let values = list.value(row);
-            let mut out = Vec::with_capacity(values.len());
-            for idx in 0..values.len() {
-                out.push(json_value_from_array(values.as_ref(), idx)?);
-            }
-            Ok(serde_json::Value::Array(out))
-        }
-        DataType::LargeList(_) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected LargeListArray"))?;
-            let values = list.value(row);
-            let mut out = Vec::with_capacity(values.len());
-            for idx in 0..values.len() {
-                out.push(json_value_from_array(values.as_ref(), idx)?);
-            }
-            Ok(serde_json::Value::Array(out))
-        }
-        DataType::FixedSizeList(_, _) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected FixedSizeListArray"))?;
-            let values = list.value(row);
-            let mut out = Vec::with_capacity(values.len());
-            for idx in 0..values.len() {
-                out.push(json_value_from_array(values.as_ref(), idx)?);
-            }
-            Ok(serde_json::Value::Array(out))
-        }
-        DataType::Struct(fields) => {
-            let struct_array = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| OmniError::manifest_internal("expected StructArray"))?;
-            let mut obj = serde_json::Map::new();
-            for (field_idx, field) in fields.iter().enumerate() {
-                obj.insert(
-                    field.name().clone(),
-                    json_value_from_array(struct_array.column(field_idx).as_ref(), row)?,
-                );
-            }
-            Ok(serde_json::Value::Object(obj))
-        }
-        _ => {
-            let value = arrow_cast::display::array_value_to_string(array, row)
-                .map_err(OmniError::arrow_internal)?;
-            Ok(serde_json::Value::String(value))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use arrow_array::Int32Array;
+
     use super::*;
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
@@ -5059,9 +4913,14 @@ edge WorksAt: Person -> Company
         batches
             .into_iter()
             .flat_map(|batch| {
-                (0..batch.num_rows())
-                    .map(|row| record_batch_row_to_json(&batch, row).unwrap())
-                    .collect::<Vec<_>>()
+                let rows =
+                    omnigraph_compiler::result::QueryResult::new(batch.schema(), vec![batch])
+                        .to_rust_json()
+                        .unwrap();
+                match rows {
+                    Value::Array(rows) => rows,
+                    other => vec![other],
+                }
             })
             .collect()
     }

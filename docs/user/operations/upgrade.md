@@ -142,7 +142,8 @@ mapping is:
 | v3 | latest 0.7.x |
 | v4 | latest 0.8.x |
 | v5 | the exact unreleased development build that wrote it |
-| v6 | current 0.9.x–0.10.x line; entity export/import normally not required within this generation |
+| v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
+| v7 | current 0.11.x line; entity export/import normally not required within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary rather
 than rebuilding with it.

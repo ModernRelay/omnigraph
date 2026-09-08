@@ -12,7 +12,7 @@ use arrow_array::{
         UInt32Builder, UInt64Builder,
     },
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SchemaRef};
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
@@ -712,6 +712,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.identity,
             opened.full_path,
             opened.table_branch,
+            opened.pinned_native_ref,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
@@ -764,6 +765,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.identity,
             opened.full_path,
             opened.table_branch,
+            opened.pinned_native_ref,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
@@ -1469,7 +1471,7 @@ fn build_node_batch(
                     [key] => format!("@key property '{key}'"),
                     _ => format!("@key properties ({})", key_properties.join(", ")),
                 };
-                let key_value = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                let key_value = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
                     OmniError::manifest(format!(
                         "node {} missing {key_description}",
                         node_type.name
@@ -1518,15 +1520,6 @@ fn build_edge_batch(
         &row_refs,
     )?;
 
-    let ids: Vec<String> = rows
-        .iter()
-        .map(|(_, _, data)| {
-            data.get("id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(generate_id)
-        })
-        .collect();
     let srcs: Vec<String> = rows
         .iter()
         .map(|(from, _, _)| {
@@ -1545,18 +1538,17 @@ fn build_edge_batch(
                 .to_string()
         })
         .collect();
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    columns.push(Arc::new(StringArray::from(ids)));
-    columns.push(Arc::new(StringArray::from(srcs)));
-    columns.push(Arc::new(StringArray::from(dsts)));
+    let src_column: ArrayRef = Arc::new(StringArray::from(srcs));
+    let dst_column: ArrayRef = Arc::new(StringArray::from(dsts));
 
     // Build edge property columns (skip id, src, dst at indices 0-2)
     let data_values: Vec<JsonValue> = rows.iter().map(|(_, _, data)| data.clone()).collect();
+    let mut property_columns: Vec<ArrayRef> =
+        Vec::with_capacity(schema.fields().len().saturating_sub(3));
     for field in schema.fields().iter().skip(3) {
         if edge_type.blob_properties.contains(field.name()) {
             let col = build_blob_column(field.name(), field.is_nullable(), &data_values)?;
-            columns.push(col);
+            property_columns.push(col);
         } else {
             let col = build_column_from_json(
                 field.name(),
@@ -1565,11 +1557,108 @@ fn build_edge_batch(
                 &data_values,
                 JsonConversionMode::LoaderCompat,
             )?;
-            columns.push(col);
+            property_columns.push(col);
         }
     }
 
+    // Keyed edge types derive the id from the (remapped) key columns; an
+    // explicit id must equal the derivation exactly. Unkeyed types keep the
+    // explicit-or-generated behavior.
+    let key_columns = edge_key_columns(
+        edge_type,
+        &schema,
+        &src_column,
+        &dst_column,
+        &property_columns,
+    )?;
+    let ids = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, (_, _, data))| {
+            if let Some(key_columns) = &key_columns {
+                let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "edge {} is missing a non-null @key value",
+                        edge_type.name
+                    ))
+                })?;
+                match data.get("id") {
+                    None => {}
+                    Some(JsonValue::String(explicit_id)) => {
+                        if *explicit_id != canonical {
+                            return Err(OmniError::manifest(format!(
+                                "edge {} explicit id '{}' does not match its canonical @key id '{}'",
+                                edge_type.name, explicit_id, canonical
+                            )));
+                        }
+                    }
+                    Some(value) => {
+                        return Err(OmniError::manifest(format!(
+                            "edge {} explicit id must be a string, got {}",
+                            edge_type.name, value
+                        )));
+                    }
+                }
+                Ok(canonical)
+            } else {
+                Ok(data
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(generate_id))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    columns.push(Arc::new(StringArray::from(ids)));
+    columns.push(src_column);
+    columns.push(dst_column);
+    columns.extend(property_columns);
+
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
+}
+
+/// Resolve a keyed edge type's key columns to their built arrays: endpoints
+/// from the src/dst columns, composite members from the property columns
+/// (schema positions 3+). `Ok(None)` for unkeyed edge types.
+fn edge_key_columns(
+    edge_type: &omnigraph_compiler::catalog::EdgeType,
+    schema: &SchemaRef,
+    src_column: &ArrayRef,
+    dst_column: &ArrayRef,
+    property_columns: &[ArrayRef],
+) -> Result<Option<Vec<ArrayRef>>> {
+    edge_type
+        .key
+        .as_ref()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| match column.as_str() {
+                    "src" => Ok(src_column.clone()),
+                    "dst" => Ok(dst_column.clone()),
+                    property => {
+                        let schema_index = schema.index_of(property).map_err(|_| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{property}' is missing from edge {} Arrow schema",
+                                edge_type.name
+                            ))
+                        })?;
+                        schema_index
+                            .checked_sub(3)
+                            .and_then(|property_index| property_columns.get(property_index))
+                            .cloned()
+                            .ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "@key property '{property}' has an invalid schema position"
+                                ))
+                            })
+                    }
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
 }
 
 /// Normalize a bounded group of caller-shaped rows into one dense logical
@@ -1673,7 +1762,7 @@ fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Resul
         .map(|(row_index, object)| {
             let explicit_id = optional_row_id(&node_type.name, object)?;
             if let Some(key_columns) = &key_columns {
-                let canonical = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
                     OmniError::manifest(format!(
                         "node {} is missing a non-null @key value",
                         node_type.name
@@ -1723,13 +1812,6 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
         &rows.iter().collect::<Vec<_>>(),
     )?;
 
-    let ids = objects
-        .iter()
-        .map(|object| {
-            optional_row_id(&edge_type.name, object)
-                .map(|id| id.map(str::to_string).unwrap_or_else(generate_id))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let srcs = objects
         .iter()
         .map(|object| validate_required_row_string(&edge_type.name, "src", object))
@@ -1738,11 +1820,10 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
         .iter()
         .map(|object| validate_required_row_string(&edge_type.name, "dst", object))
         .collect::<Result<Vec<_>>>()?;
+    let src_column: ArrayRef = Arc::new(StringArray::from(srcs));
+    let dst_column: ArrayRef = Arc::new(StringArray::from(dsts));
 
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
-    columns.push(Arc::new(StringArray::from(srcs)) as ArrayRef);
-    columns.push(Arc::new(StringArray::from(dsts)) as ArrayRef);
+    let mut property_columns = Vec::with_capacity(schema.fields().len().saturating_sub(3));
     for field in schema.fields().iter().skip(3) {
         let column = if edge_type.blob_properties.contains(field.name()) {
             build_blob_column(field.name(), field.is_nullable(), rows)?
@@ -1755,8 +1836,51 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
                 JsonConversionMode::Strict,
             )?
         };
-        columns.push(column);
+        property_columns.push(column);
     }
+
+    // Keyed edge types derive the id from the key columns; an explicit id
+    // must equal the derivation exactly. Unkeyed types keep the
+    // explicit-or-generated behavior.
+    let key_columns = edge_key_columns(
+        edge_type,
+        &schema,
+        &src_column,
+        &dst_column,
+        &property_columns,
+    )?;
+    let ids = objects
+        .iter()
+        .enumerate()
+        .map(|(row_index, object)| {
+            let explicit_id = optional_row_id(&edge_type.name, object)?;
+            if let Some(key_columns) = &key_columns {
+                let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "edge {} is missing a non-null @key value",
+                        edge_type.name
+                    ))
+                })?;
+                if let Some(explicit_id) = explicit_id
+                    && explicit_id != canonical
+                {
+                    return Err(OmniError::manifest(format!(
+                        "edge {} explicit id '{}' does not match its canonical @key id '{}'",
+                        edge_type.name, explicit_id, canonical
+                    )));
+                }
+                Ok(canonical)
+            } else {
+                Ok(explicit_id.map(str::to_string).unwrap_or_else(generate_id))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+    columns.push(src_column);
+    columns.push(dst_column);
+    columns.extend(property_columns);
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
@@ -2213,6 +2337,7 @@ fn build_column_from_json(
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
                 values.push(parse_date32_json_value(
+                    name,
                     row.get(name).unwrap_or(&JsonValue::Null),
                 )?);
             }
@@ -2222,6 +2347,7 @@ fn build_column_from_json(
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
                 values.push(parse_date64_json_value(
+                    name,
                     row.get(name).unwrap_or(&JsonValue::Null),
                 )?);
             }
@@ -2246,7 +2372,7 @@ fn build_column_from_json(
                     ))
                 })?;
                 for item in items {
-                    append_json_list_item(builder.values(), field.data_type(), item)?;
+                    append_json_list_item(name, builder.values(), field.data_type(), item)?;
                 }
                 builder.append(true);
             }
@@ -2451,6 +2577,7 @@ fn checked_json_f32(value: f64, context: &str) -> Result<f32> {
 }
 
 fn append_json_list_item(
+    property: &str,
     builder: &mut Box<dyn ArrayBuilder>,
     data_type: &DataType,
     value: &JsonValue,
@@ -2575,7 +2702,7 @@ fn append_json_list_item(
                 .as_any_mut()
                 .downcast_mut::<Date32Builder>()
                 .ok_or_else(|| OmniError::manifest("list Date32 builder downcast failed"))?;
-            if let Some(value) = parse_date32_json_value(value)? {
+            if let Some(value) = parse_date32_json_value(property, value)? {
                 builder.append_value(value);
             } else {
                 builder.append_null();
@@ -2586,7 +2713,7 @@ fn append_json_list_item(
                 .as_any_mut()
                 .downcast_mut::<Date64Builder>()
                 .ok_or_else(|| OmniError::manifest("list Date64 builder downcast failed"))?;
-            if let Some(value) = parse_date64_json_value(value)? {
+            if let Some(value) = parse_date64_json_value(property, value)? {
                 builder.append_value(value);
             } else {
                 builder.append_null();
@@ -2603,42 +2730,77 @@ fn append_json_list_item(
     Ok(())
 }
 
-fn parse_date32_json_value(value: &JsonValue) -> Result<Option<i32>> {
+fn parse_date32_json_value(property: &str, value: &JsonValue) -> Result<Option<i32>> {
     if value.is_null() {
         return Ok(None);
     }
     if let Some(days) = value.as_i64() {
-        let days = i32::try_from(days)
-            .map_err(|_| OmniError::manifest(format!("Date value out of range: {}", days)))?;
-        return Ok(Some(days));
+        let days = i32::try_from(days).map_err(|_| {
+            OmniError::manifest(format!(
+                "Date value {days} for property '{property}' is outside the i32 day range"
+            ))
+        })?;
+        return Ok(Some(checked_date32(days)?));
     }
     if let Some(days) = value.as_u64() {
-        let days = i32::try_from(days)
-            .map_err(|_| OmniError::manifest(format!("Date value out of range: {}", days)))?;
-        return Ok(Some(days));
+        let days = i32::try_from(days).map_err(|_| {
+            OmniError::manifest(format!(
+                "Date value {days} for property '{property}' is outside the i32 day range"
+            ))
+        })?;
+        return Ok(Some(checked_date32(days)?));
     }
     if let Some(value) = value.as_str() {
-        return Ok(Some(parse_date32_literal(value)?));
+        return parse_date32_literal(value)
+            .map(Some)
+            .map_err(|e| OmniError::manifest(format!("property '{property}': {e}")));
     }
-    Ok(None)
+    Err(OmniError::manifest(format!(
+        "invalid Date value {value} for property '{property}': expected an integer day count or a date string"
+    )))
 }
 
-fn parse_date64_json_value(value: &JsonValue) -> Result<Option<i64>> {
+fn parse_date64_json_value(property: &str, value: &JsonValue) -> Result<Option<i64>> {
     if value.is_null() {
         return Ok(None);
     }
     if let Some(ms) = value.as_i64() {
-        return Ok(Some(ms));
+        return Ok(Some(checked_date64(ms)?));
     }
     if let Some(ms) = value.as_u64() {
-        let ms = i64::try_from(ms)
-            .map_err(|_| OmniError::manifest(format!("DateTime value out of range: {}", ms)))?;
-        return Ok(Some(ms));
+        let ms = i64::try_from(ms).map_err(|_| {
+            OmniError::manifest(format!(
+                "DateTime value {ms} for property '{property}' is outside the i64 millisecond range"
+            ))
+        })?;
+        return Ok(Some(checked_date64(ms)?));
     }
     if let Some(value) = value.as_str() {
-        return Ok(Some(parse_date64_literal(value)?));
+        return parse_date64_literal(value)
+            .map(Some)
+            .map_err(|e| OmniError::manifest(format!("property '{property}': {e}")));
     }
-    Ok(None)
+    Err(OmniError::manifest(format!(
+        "invalid DateTime value {value} for property '{property}': expected an integer millisecond count or a datetime string"
+    )))
+}
+
+fn checked_date32(days: i32) -> Result<i32> {
+    if !omnigraph_compiler::json_output::date32_renderable(days) {
+        return Err(OmniError::manifest(format!(
+            "Date value {days} is outside the range the JSON writer can format"
+        )));
+    }
+    Ok(days)
+}
+
+fn checked_date64(ms: i64) -> Result<i64> {
+    if !omnigraph_compiler::json_output::date64_renderable(ms) {
+        return Err(OmniError::manifest(format!(
+            "DateTime value {ms} is outside the range the JSON writer can format"
+        )));
+    }
+    Ok(ms)
 }
 
 fn generate_id() -> String {
@@ -2646,6 +2808,14 @@ fn generate_id() -> String {
 }
 
 pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
+    omnigraph_compiler::check_date_literal(value).map_err(OmniError::manifest)?;
+    cast_date32_literal(value)
+}
+
+/// The bare arrow `Utf8 -> Date32` cast, time-bearing strings read as their UTC day.
+/// `parse_date32_literal` fronts it with the check; the legacy explicit-id compare
+/// calls it bare, since old writers derived those ids through this very cast.
+fn cast_date32_literal(value: &str) -> Result<i32> {
     let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
     let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date32)
         .map_err(|e| OmniError::manifest(format!("invalid Date literal '{}': {}", value, e)))?;
@@ -2663,6 +2833,13 @@ pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
 }
 
 pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
+    if value.starts_with(['+', '-']) {
+        return ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
+            .iter()
+            .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+            .map(|datetime| datetime.and_utc().timestamp_millis())
+            .ok_or_else(|| OmniError::manifest(format!("invalid DateTime literal '{value}'")));
+    }
     let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
     let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date64)
         .map_err(|e| OmniError::manifest(format!("invalid DateTime literal '{}': {}", value, e)))?;
@@ -2859,19 +3036,19 @@ pub(crate) fn composite_unique_key(
     Ok(Some(parts))
 }
 
-/// Derive the exact physical node id for a typed `@key` tuple.
+/// Derive the exact physical row id for a typed `@key` tuple (node or edge).
 ///
 /// A one-column key retains the historical scalar spelling. Composite keys use
 /// a JSON array of the per-column canonical strings: JSON escaping makes the
 /// encoding deterministic and unambiguous without inventing a delimiter that
 /// user data could forge.
-pub(crate) fn canonical_node_id(key_columns: &[ArrayRef], row: usize) -> Result<Option<String>> {
+pub(crate) fn canonical_key_id(key_columns: &[ArrayRef], row: usize) -> Result<Option<String>> {
     let Some(parts) = composite_unique_key(key_columns, row)? else {
         return Ok(None);
     };
     match parts.as_slice() {
         [] => Err(OmniError::manifest_internal(
-            "cannot derive a physical node id from an empty @key tuple",
+            "cannot derive an id from an empty @key tuple",
         )),
         [scalar] => Ok(Some(scalar.clone())),
         _ => serde_json::to_string(&parts)
@@ -3022,7 +3199,7 @@ fn explicit_id_matches_scalar_key(array: &ArrayRef, row: usize, explicit: &str) 
         let parsed = explicit
             .parse::<i32>()
             .ok()
-            .or_else(|| parse_date32_literal(explicit).ok());
+            .or_else(|| cast_date32_literal(explicit).ok());
         return Ok(parsed == Some(a.value(row)));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
@@ -3130,6 +3307,219 @@ edge WorksAt: Person -> Company
 {"edge": "Knows", "from": "Alice", "to": "Bob"}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
+
+    /// A wrong-typed JSON date is refused in both conversion modes, scalar and
+    /// list item, nullable or not, naming the property; integer counts, date
+    /// strings, and `null` still load with their values intact.
+    // FIXME(#628): Rust rather than `.gqt` because a `.gqt` seed failure is a
+    // harness error, not an expectable outcome. Once GQ has a `load`
+    // statement, this and `load_refuses_float_epoch_in_nullable_date_issue_628`
+    // become one `issue_628_*.gqt` case with an `--- expect error:` step.
+    #[test]
+    fn wrong_typed_date_values_are_refused_in_both_modes_issue_628() {
+        let modes = [JsonConversionMode::LoaderCompat, JsonConversionMode::Strict];
+        for (data_type, wrong, expected) in [
+            (
+                DataType::Date32,
+                serde_json::json!({"day": 19723.0}),
+                "invalid Date value 19723.0 for property 'day'",
+            ),
+            (
+                DataType::Date32,
+                serde_json::json!({"day": true}),
+                "invalid Date value true for property 'day'",
+            ),
+            (
+                DataType::Date32,
+                serde_json::json!({"day": {}}),
+                "invalid Date value {} for property 'day'",
+            ),
+            (
+                DataType::Date64,
+                serde_json::json!({"day": 1704067200000.0}),
+                "invalid DateTime value 1704067200000.0 for property 'day'",
+            ),
+            (
+                DataType::Date64,
+                serde_json::json!({"day": true}),
+                "invalid DateTime value true for property 'day'",
+            ),
+            (
+                DataType::Date64,
+                serde_json::json!({"day": {}}),
+                "invalid DateTime value {} for property 'day'",
+            ),
+        ] {
+            let rows = vec![wrong.clone()];
+            for mode in modes {
+                for nullable in [true, false] {
+                    let err = build_column_from_json("day", &data_type, nullable, &rows, mode)
+                        .expect_err("a wrong-typed date is refused, never stored as NULL");
+                    assert!(
+                        err.to_string().contains(expected),
+                        "{mode:?} {data_type:?} nullable={nullable} {wrong}: {err}"
+                    );
+                }
+            }
+            let list_type = DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                data_type.clone(),
+                true,
+            )));
+            let list_rows = vec![serde_json::json!({"days": [19723, wrong["day"].clone()]})];
+            let list_expected = expected.replace("'day'", "'days'");
+            for mode in modes {
+                let err = build_column_from_json("days", &list_type, true, &list_rows, mode)
+                    .expect_err("a wrong-typed date list item is refused, never stored as NULL");
+                assert!(
+                    err.to_string().contains(&list_expected),
+                    "{mode:?} {data_type:?}: {err}"
+                );
+            }
+        }
+        for (data_type, good, stored) in [
+            (
+                DataType::Date32,
+                serde_json::json!({"day": 19723}),
+                Some(19_723_i64),
+            ),
+            (
+                DataType::Date32,
+                serde_json::json!({"day": "2024-01-01"}),
+                Some(19_723),
+            ),
+            (DataType::Date32, serde_json::json!({"day": null}), None),
+            (
+                DataType::Date64,
+                serde_json::json!({"day": 1704067200000_i64}),
+                Some(1_704_067_200_000),
+            ),
+            (
+                DataType::Date64,
+                serde_json::json!({"day": "2024-01-01T00:00:00Z"}),
+                Some(1_704_067_200_000),
+            ),
+            (DataType::Date64, serde_json::json!({"day": null}), None),
+        ] {
+            let column = build_column_from_json(
+                "day",
+                &data_type,
+                true,
+                std::slice::from_ref(&good),
+                JsonConversionMode::LoaderCompat,
+            )
+            .expect("integer counts, date strings, and null still load");
+            let value = match data_type {
+                DataType::Date32 => column
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .map(|a| (!a.is_null(0)).then(|| i64::from(a.value(0)))),
+                _ => column
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .map(|a| (!a.is_null(0)).then(|| a.value(0))),
+            }
+            .expect("a date column of the declared type");
+            assert_eq!(value, stored, "{good}");
+        }
+    }
+
+    #[test]
+    fn signed_year_datetime_strings_read_back_as_the_writer_spells_them() {
+        assert_eq!(
+            parse_date64_literal("+10000-01-01T00:00:00").unwrap(),
+            253_402_300_800_000
+        );
+        assert_eq!(
+            parse_date64_literal("+10000-01-01T00:00:00.789").unwrap(),
+            253_402_300_800_789
+        );
+        assert_eq!(
+            parse_date64_literal("-0001-12-31T00:00:00").unwrap(),
+            chrono::NaiveDate::from_ymd_opt(-1, 12, 31)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        );
+        assert!(parse_date64_literal("+10000-13-01T00:00:00").is_err());
+    }
+
+    /// The load surface refuses a `Date` string with a time of day; a Rust test
+    /// because a `.gqt` seed refusal is a harness failure, not an expectation.
+    /// The param and literal surfaces: `cases/issue_671_date_string_with_time_of_day_refused.gqt`.
+    #[tokio::test]
+    async fn load_refuses_date_string_with_a_time_of_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let version_before = db.version().await;
+
+        let rows = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": "2024-01-01T02:00:00+05:00"}}
+"#;
+        let err = load_jsonl(&db, rows, LoadMode::Overwrite)
+            .await
+            .expect_err("a datetime string in a Date? property fails the load");
+        assert!(
+            err.to_string().contains(
+                "invalid Date literal '2024-01-01T02:00:00+05:00': a Date is a calendar day (YYYY-MM-DD); a string with a time of day belongs in a DateTime"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            db.version().await,
+            version_before,
+            "a refused load leaves no commit behind"
+        );
+    }
+
+    /// Pins the premise the refusal rests on: arrow's `Utf8 -> Date32` cast
+    /// routes an unsigned string over 10 bytes through its instant parser.
+    #[test]
+    fn date_string_with_a_time_of_day_takes_arrows_instant_route() {
+        let raw: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some("2024-01-01T02:00:00+05:00")]));
+        let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date32).unwrap();
+        let days = casted.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(days.value(0), 19_722, "arrow keeps the UTC day, 2023-12-31");
+
+        assert!(parse_date32_literal("2024-01-01T02:00:00+05:00").is_err());
+        assert!(parse_date32_literal("+2024-01-01T02:00:00+05:00").is_err());
+        assert_eq!(parse_date32_literal("+2024-01-01").unwrap(), 19_723);
+    }
+
+    #[test]
+    fn date_counts_outside_the_render_range_are_refused() {
+        assert_eq!(
+            parse_date32_json_value("day", &serde_json::json!(19_723)).unwrap(),
+            Some(19_723)
+        );
+        assert_eq!(
+            parse_date64_json_value("day", &serde_json::json!(1_704_067_200_000_i64)).unwrap(),
+            Some(1_704_067_200_000)
+        );
+        for days in [i32::MAX, i32::MIN] {
+            let err = parse_date32_json_value("day", &serde_json::json!(days)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "Date value {days} is outside the range the JSON writer can format"
+                )),
+                "{err}"
+            );
+        }
+        for ms in [i64::MAX, i64::MIN] {
+            let err = parse_date64_json_value("day", &serde_json::json!(ms)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "DateTime value {ms} is outside the range the JSON writer can format"
+                )),
+                "{err}"
+            );
+        }
+    }
 
     #[test]
     fn strict_json_conversion_rejects_nullable_wrong_types_and_list_items() {
@@ -3589,6 +3979,38 @@ node Doc {
         assert!(result.is_err());
     }
 
+    /// The compatibility load surface (`load_jsonl`, behind `omnigraph load`
+    /// and `POST /graphs/{id}/load`) refuses a float epoch in a nullable
+    /// `Date?` edge property and leaves the store version unchanged.
+    // FIXME(#628): same conversion as
+    // `wrong_typed_date_values_are_refused_in_both_modes_issue_628`.
+    #[tokio::test]
+    async fn load_refuses_float_epoch_in_nullable_date_issue_628() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let version_before = db.version().await;
+
+        let rows = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": 19723.0}}
+"#;
+        let err = load_jsonl(&db, rows, LoadMode::Overwrite)
+            .await
+            .expect_err("a float epoch in a Date? property fails the load");
+        assert!(
+            err.to_string().contains(
+                "invalid Date value 19723.0 for property 'since': expected an integer day count or a date string"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            db.version().await,
+            version_before,
+            "a refused load leaves no commit behind"
+        );
+    }
+
     #[tokio::test]
     #[allow(deprecated)]
     async fn test_ingest_creates_branch_and_reports_tables() {
@@ -3964,6 +4386,10 @@ node Doc {
             ),
             (Arc::new(Date32Array::from(vec![19_723])), "2024-01-01"),
             (
+                Arc::new(Date32Array::from(vec![19_722])),
+                "2024-01-01T02:00:00+05:00",
+            ),
+            (
                 Arc::new(Date64Array::from(vec![1_704_067_200_000])),
                 "2024-01-01T00:00:00Z",
             ),
@@ -3988,7 +4414,7 @@ node Doc {
     fn composite_node_id_is_deterministic_and_unambiguous() {
         let scalar: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["a,b"]))];
         assert_eq!(
-            canonical_node_id(&scalar, 0).unwrap().as_deref(),
+            canonical_key_id(&scalar, 0).unwrap().as_deref(),
             Some("a,b"),
             "one-column keys retain their historical scalar id"
         );
@@ -3999,7 +4425,7 @@ node Doc {
             Arc::new(StringArray::from(vec!["quote\"and\\slash"])),
         ];
         assert_eq!(
-            canonical_node_id(&composite, 0).unwrap().as_deref(),
+            canonical_key_id(&composite, 0).unwrap().as_deref(),
             Some(r#"["a,b","7","quote\"and\\slash"]"#)
         );
     }

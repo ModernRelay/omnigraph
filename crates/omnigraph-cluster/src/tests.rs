@@ -1284,6 +1284,7 @@ async fn refresh_records_live_schema_digest_and_graph_manifest_version() {
         sha256_hex(SCHEMA.as_bytes())
     );
     assert!(out.observations["graph.knowledge"]["graph_manifest_version"].is_u64());
+    assert_legacy_state_resource_fields(dir.path());
 }
 
 #[tokio::test]
@@ -1590,6 +1591,30 @@ fn historical_graph_digest(
 
 fn read_state_json(config_dir: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(config_dir.join(CLUSTER_STATE_FILE)).unwrap()).unwrap()
+}
+
+fn assert_legacy_state_resource_fields(config_dir: &Path) {
+    let state = read_state_json(config_dir);
+    assert_eq!(state["version"], 1);
+    let resources = state["applied_revision"]["resources"].as_object().unwrap();
+    assert!(resources.contains_key("schema.knowledge"));
+    for resource in resources.values() {
+        // These are the complete pre-#663 StateResource keys, whose decoder
+        // denies unknown fields. Pin the serialized contract independently.
+        for key in resource.as_object().unwrap().keys() {
+            assert!(
+                matches!(
+                    key.as_str(),
+                    "digest"
+                        | "applies_to"
+                        | "embedding_provider"
+                        | "embedding_profile"
+                        | "external_blob_policy"
+                ),
+                "unexpected ledger field: {key}"
+            );
+        }
+    }
 }
 
 fn recovery_sidecars(config_dir: &Path) -> Vec<std::path::PathBuf> {
@@ -2062,6 +2087,7 @@ async fn apply_schema_update_and_dependent_query_in_one_run() {
         desired.resource_digests["schema.knowledge"]
     );
     let state = read_state_json(dir.path());
+    assert_legacy_state_resource_fields(dir.path());
     assert_eq!(
         state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
         desired.resource_digests["schema.knowledge"]
@@ -3980,8 +4006,18 @@ async fn storage_root_file_uri_relocates_the_cluster() {
     assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
     assert!(!dir.path().join("graphs").exists());
 
-    // The serving snapshot follows the root.
+    // Both readers follow the declared root, never the config directory.
     let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+    let bound = read_root_bound_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(
+        bound.canonical_root(),
+        format!(
+            "file://{}",
+            fs::canonicalize(storage.path()).unwrap().display()
+        )
+    );
+    assert_eq!(bound.snapshot().state_cas, snapshot.state_cas);
+
     assert!(
         snapshot.graphs[0].root.starts_with(storage.path()),
         "{:?}",
@@ -4102,6 +4138,22 @@ async fn serving_snapshot_reads_converged_cluster() {
     let snapshot = read_serving_snapshot(dir.path())
         .await
         .expect("converged cluster must serve");
+    let bound = read_root_bound_serving_snapshot(dir.path()).await.unwrap();
+    assert_eq!(
+        bound.canonical_root(),
+        format!("file://{}", fs::canonicalize(dir.path()).unwrap().display())
+    );
+    assert_eq!(bound.snapshot().state_cas, snapshot.state_cas);
+    let direct = read_serving_snapshot_from_storage(bound.canonical_root())
+        .await
+        .unwrap();
+    let direct_bound = read_root_bound_serving_snapshot_from_storage(bound.canonical_root())
+        .await
+        .unwrap();
+    assert_eq!(direct_bound.canonical_root(), bound.canonical_root());
+    assert_eq!(direct_bound.snapshot().state_cas, snapshot.state_cas);
+    assert_eq!(direct.state_cas, snapshot.state_cas);
+    assert_eq!(bound.into_snapshot().config_digest, snapshot.config_digest);
     assert_eq!(snapshot.graphs.len(), 1);
     assert_eq!(snapshot.graphs[0].graph_id, "knowledge");
     assert!(snapshot.graphs[0].root.ends_with("graphs/knowledge.omni"));
@@ -4491,16 +4543,82 @@ async fn serving_snapshot_refuses_tampered_blob_and_stripped_bindings() {
 }
 
 #[tokio::test]
-async fn serving_snapshot_refuses_empty_cluster() {
+async fn serving_snapshot_refuses_unapplied_or_invalid_empty_cluster() {
     let dir = fixture();
     write_state_resources(dir.path(), &[]); // state exists, no graphs
+    let state_path = dir.path().join(CLUSTER_STATE_FILE);
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    for (revision, digest) in [
+        (1, serde_json::Value::Null),
+        (0, json!("a".repeat(64))),
+        (1, json!("a".repeat(63))),
+        (1, json!("A".repeat(64))),
+        (1, json!("g".repeat(64))),
+    ] {
+        let mut state = original.clone();
+        state["state_revision"] = json!(revision);
+        state["applied_revision"]["config_digest"] = digest;
+        let bytes = serde_json::to_vec(&state).unwrap();
+        fs::write(&state_path, &bytes).unwrap();
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == "cluster_empty"),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), bytes);
+    }
+}
 
-    let err = read_serving_snapshot(dir.path()).await.unwrap_err();
-    assert!(
-        err.iter()
-            .any(|diagnostic| diagnostic.code == "cluster_empty"),
-        "{err:?}"
+#[tokio::test]
+async fn serving_snapshot_reads_applied_empty_cluster() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs: {}\n",
+    )
+    .unwrap();
+    let imported = import_config_dir(dir.path()).await;
+    assert!(imported.ok, "{imported:?}");
+    let applied = apply_config_dir(dir.path()).await;
+    assert!(applied.ok && applied.converged, "{applied:?}");
+    let digest = desired_revision_digest(&applied);
+    let bytes = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let canonical_root = format!("file://{}", fs::canonicalize(dir.path()).unwrap().display());
+    // Only the root locator comes from desired config at boot. An unapplied
+    // graph addition must not change this valid empty applied revision.
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs:\n  future:\n    schema: ./missing.pg\n",
+    )
+    .unwrap();
+    let from_directory = read_serving_snapshot(dir.path()).await.unwrap();
+    let from_root = read_root_bound_serving_snapshot_from_storage(&canonical_root)
+        .await
+        .unwrap();
+    assert_eq!(from_root.canonical_root(), canonical_root);
+    for snapshot in [&from_directory, from_root.snapshot()] {
+        assert!(snapshot.graphs.is_empty());
+        assert!(snapshot.applied_graphs.is_empty());
+        assert!(snapshot.quarantined_graphs.is_empty());
+        assert_eq!(snapshot.config_digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            snapshot.state_revision,
+            state["state_revision"].as_u64().unwrap()
+        );
+        assert!(snapshot.state_revision > 0);
+        assert_eq!(
+            snapshot.state_cas,
+            Some(format!("sha256:{}", sha256_hex(&bytes)))
+        );
+    }
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        bytes
     );
+    assert!(!dir.path().join("graphs").exists());
 }
 
 // ---- query discovery (Terraform-style declaration) ----
@@ -4631,6 +4749,59 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
         out.diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "query_parse_error"),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn query_discovery_rejects_a_discovered_branch_statement_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("branch.gq"), "branch create b0\n").unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./branch.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "query_parse_error"
+                && diagnostic.message.contains("branch statement")
+        }),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+#[test]
+fn query_discovery_rejects_a_named_branch_statement_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("branch.gq"), "branch create b0\n").unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      b0:\n        file: ./branch.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "query_parse_error"
+                && diagnostic.path == "graphs.knowledge.queries.b0"
+                && diagnostic.message.contains("branch statement")
+        }),
         "{:?}",
         out.diagnostics
     );
@@ -4770,4 +4941,307 @@ async fn plan_annotates_apply_dispositions() {
         by_resource["policy.base"].disposition,
         Some(ApplyDisposition::Applied)
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn validate_refuses_paths_that_escape_or_cross_a_symlink() {
+    let dir = fixture();
+    // A `..` segment leaves the bundle.
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+metadata:
+  name: test
+graphs:
+  knowledge:
+    schema: ../people.pg
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "config_path_escape" && d.path == "graphs.knowledge.schema"),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| d.code == "schema_file_missing"),
+        "a refused path is reported once: {:?}",
+        out.diagnostics
+    );
+
+    // A symbolic link reaches outside the bundle.
+    let elsewhere = tempdir().unwrap();
+    fs::write(elsewhere.path().join("people.gq"), QUERY).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("linked")).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+metadata:
+  name: test
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries: ./linked/
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "config_path_symlink" && d.path == "graphs.knowledge.queries"),
+        "{:?}",
+        out.diagnostics
+    );
+
+    // A symbolic link *inside* a real directory is refused before it is read.
+    fs::create_dir_all(dir.path().join("queries")).unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path().join("people.gq"),
+        dir.path().join("queries/linked.gq"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        r#"
+version: 1
+metadata:
+  name: test
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries: ./queries/
+"#,
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "config_path_symlink"
+                && d.path == "graphs.knowledge.queries"
+                && d.message.contains("linked.gq")),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        !out.resources.iter().any(|r| r.address.contains("linked")),
+        "a refused entry is never a resource: {:?}",
+        out.resources
+    );
+
+    // An absolute path keeps its old behavior, `..` included.
+    let absolute = elsewhere.path().join("sub/../people.pg");
+    fs::create_dir_all(elsewhere.path().join("sub")).unwrap();
+    fs::write(elsewhere.path().join("people.pg"), SCHEMA).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        format!(
+            "version: 1\nmetadata:\n  name: test\ngraphs:\n  knowledge:\n    schema: {}\n",
+            absolute.display()
+        ),
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| d.code.starts_with("config_path_")),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+#[tokio::test]
+async fn plan_observe_takes_no_lock_and_reports_observed_authority() {
+    let dir = fixture();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let state = r#"{
+  "version": 1,
+  "state_revision": 7,
+  "applied_revision": {
+    "config_digest": "old",
+    "resources": {
+      "graph.knowledge": { "digest": "old-graph" }
+    }
+  }
+}"#;
+    fs::write(state_dir.join("state.json"), state).unwrap();
+    // Another process holds the lock; an observer reports it and proceeds.
+    fs::write(
+        dir.path().join(CLUSTER_LOCK_FILE),
+        r#"{"version":1,"lock_id":"01OTHER","operation":"apply","created_at":"2026-09-03T00:00:00Z","pid":1}"#,
+    )
+    .unwrap();
+
+    let out = plan_config_dir_with_options(dir.path(), PlanOptions { observe: true }).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.authority, LedgerAuthority::Observed);
+    assert_eq!(out.state_observations.state_revision, 7);
+    assert_eq!(
+        out.state_observations.state_cas.as_deref(),
+        Some(format!("sha256:{}", sha256_hex(state.as_bytes())).as_str())
+    );
+    assert!(out.state_observations.locked);
+    assert_eq!(out.state_observations.lock_id.as_deref(), Some("01OTHER"));
+    assert!(!out.state_observations.lock_acquired);
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| d.code == "state_lock_disabled" || d.code == "state_lock_held"),
+        "{:?}",
+        out.diagnostics
+    );
+    // The foreign lock is exactly as it was: nothing created, nothing removed.
+    assert!(
+        fs::read_to_string(dir.path().join(CLUSTER_LOCK_FILE))
+            .unwrap()
+            .contains("01OTHER")
+    );
+    // The locked path still labels itself.
+    fs::remove_file(dir.path().join(CLUSTER_LOCK_FILE)).unwrap();
+    let locked = plan_config_dir(dir.path()).await;
+    assert_eq!(locked.authority, LedgerAuthority::Locked);
+    assert!(locked.state_observations.lock_acquired);
+}
+
+#[tokio::test]
+async fn observe_reports_drift_without_writing_the_ledger() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", None, &[]);
+    let ledger = serde_json::to_string(&json!({
+        "version": 1,
+        "state_revision": 3,
+        "applied_revision": {
+            "config_digest": "old",
+            "resources": { "graph.knowledge": { "digest": graph_digest } }
+        }
+    }))
+    .unwrap();
+    fs::write(state_dir.join("state.json"), &ledger).unwrap();
+
+    let out = observe_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(out.operation, StateSyncOperation::Observe);
+    assert_eq!(out.authority, LedgerAuthority::Observed);
+    assert_eq!(out.state_observations.state_revision, 3);
+    assert!(!out.state_observations.lock_acquired);
+    assert_eq!(
+        out.resource_statuses["graph.knowledge"].status,
+        ResourceLifecycleStatus::Applied
+    );
+    // Nothing was written: the bytes, the revision, and the absence of a lock.
+    assert_eq!(
+        fs::read_to_string(state_dir.join("state.json")).unwrap(),
+        ledger
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+
+    // A graph that disappeared is reported as drifted, still without a write.
+    fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR)).unwrap();
+    let out = observe_config_dir(dir.path()).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    assert_eq!(
+        out.resource_statuses["graph.knowledge"].status,
+        ResourceLifecycleStatus::Drifted
+    );
+    assert_eq!(
+        fs::read_to_string(state_dir.join("state.json")).unwrap(),
+        ledger
+    );
+}
+
+#[tokio::test]
+async fn a_bundle_without_the_lock_is_labeled_unlocked() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE))
+            .unwrap()
+            .replace("lock: true", "lock: false"),
+    )
+    .unwrap();
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", None, &[]);
+    fs::write(
+        state_dir.join("state.json"),
+        serde_json::to_string(&json!({
+            "version": 1,
+            "state_revision": 3,
+            "applied_revision": {
+                "config_digest": "old",
+                "resources": { "graph.knowledge": { "digest": graph_digest } }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let plan = plan_config_dir(dir.path()).await;
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert_eq!(plan.authority, LedgerAuthority::Unlocked);
+    assert!(!plan.state_observations.lock_acquired);
+    let refresh = refresh_config_dir(dir.path()).await;
+    assert!(refresh.ok, "{:?}", refresh.diagnostics);
+    assert_eq!(refresh.authority, LedgerAuthority::Unlocked);
+    assert!(
+        refresh
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "state_lock_disabled")
+    );
+    // An observer stays an observer whatever the bundle says.
+    let observe = observe_config_dir(dir.path()).await;
+    assert_eq!(observe.authority, LedgerAuthority::Observed);
+}
+
+#[tokio::test]
+async fn refresh_refuses_to_advance_past_the_last_revision() {
+    let dir = fixture();
+    init_derived_graph(dir.path()).await;
+    let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+    fs::create_dir_all(&state_dir).unwrap();
+    let graph_digest = historical_graph_digest("knowledge", None, &[]);
+    let ledger = serde_json::to_string(&json!({
+        "version": 1,
+        "state_revision": u64::MAX,
+        "applied_revision": {
+            "config_digest": "old",
+            "resources": { "graph.knowledge": { "digest": graph_digest } }
+        }
+    }))
+    .unwrap();
+    fs::write(state_dir.join("state.json"), &ledger).unwrap();
+
+    let out = refresh_config_dir(dir.path()).await;
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics
+            .iter()
+            .any(|d| d.code == "state_revision_overflow"),
+        "{:?}",
+        out.diagnostics
+    );
+    assert_eq!(
+        fs::read_to_string(state_dir.join("state.json")).unwrap(),
+        ledger
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
 }

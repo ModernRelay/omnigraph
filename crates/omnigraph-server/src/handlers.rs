@@ -4,6 +4,14 @@
 
 use super::*;
 use futures::StreamExt;
+use omnigraph::db::MergeOutcome;
+use omnigraph_compiler::query::ast::{BranchStmt, QueryDecl, QueryFile};
+
+mod dispatch;
+use dispatch::{
+    Door, ReadDispatch, classify, control_write_at_read_door, read_at_write_door,
+    refuse_statement_envelope, refuse_wrong_door, run_branch_statement,
+};
 
 /// Liveness probe.
 ///
@@ -26,6 +34,48 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
         internal_schema_version: SERVER_INTERNAL_SCHEMA_VERSION,
         source_version: SERVER_SOURCE_VERSION.map(str::to_string),
     })
+}
+
+/// Readiness witness (RFC 0049).
+///
+/// Unauthenticated, and therefore minimal: it reports whether this replica
+/// is serving or draining, the applied `config_digest` it booted from, the
+/// ledger revision and CAS it read, and how many graphs it serves and does
+/// not serve. Graph ids are topology and stay behind `GET /graphs`. Answers
+/// 503 once shutdown has begun; `/healthz` stays 200 while the process is
+/// alive.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "health",
+    operation_id = "readiness",
+    responses(
+        (status = 200, description = "Serving", body = ReadinessOutput),
+        (status = 503, description = "Draining", body = ReadinessOutput),
+    ),
+)]
+pub(crate) async fn server_ready(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<ReadinessOutput>) {
+    let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst);
+    let served_graph_count = state.routing().registry.list().len();
+    let quarantined_graph_count = state.quarantined_graphs().len();
+    let output = ReadinessOutput {
+        ready: !draining,
+        status: if draining { "draining" } else { "serving" }.to_string(),
+        booted_serving_digest: state.witness.booted_serving_digest.clone(),
+        state_revision: state.witness.state_revision,
+        state_cas: state.witness.state_cas.clone(),
+        served_graph_count,
+        quarantined_graph_count,
+        shutdown_grace_seconds: state.shutdown_grace.as_secs(),
+    };
+    let status = if draining {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(output))
 }
 
 #[utoipa::path(
@@ -51,7 +101,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 /// deterministic output across requests).
 pub(crate) async fn server_graphs_list(
     State(state): State<AppState>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
     let registry = &state.routing().registry;
 
@@ -72,16 +122,29 @@ pub(crate) async fn server_graphs_list(
         },
     )?;
 
+    let may_list = |id: &str| {
+        actor
+            .as_ref()
+            .is_none_or(|actor| actor.0.permits_graph_listing(id))
+    };
     let mut graphs: Vec<GraphInfo> = registry
         .list()
         .into_iter()
+        .filter(|handle| may_list(handle.key.graph_id.as_str()))
         .map(|handle| GraphInfo {
             graph_id: handle.key.graph_id.as_str().to_string(),
             uri: handle.uri.clone(),
         })
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
-    Ok(Json(GraphListResponse { graphs }))
+    Ok(Json(GraphListResponse {
+        graphs,
+        quarantined: state
+            .quarantined_graphs()
+            .into_iter()
+            .filter(|id| may_list(id))
+            .collect(),
+    }))
 }
 
 pub(crate) async fn server_openapi(
@@ -114,7 +177,7 @@ const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
 /// always-flat endpoints. `/graphs` is the management enumeration —
 /// it lives at the root in both single mode (405) and multi mode, and
 /// must never be rewritten to `/graphs/{graph_id}/graphs`.
-const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/graphs"];
+const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/readyz", "/graphs"];
 
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the
@@ -216,6 +279,10 @@ pub(crate) async fn require_bearer_auth(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
+    // Request extensions supplied by an embedder are projections, never an
+    // authentication result for this request. Rebuild both from its credential.
+    request.extensions_mut().remove::<ResolvedActor>();
+    request.extensions_mut().remove::<AuthenticatedActor>();
     if !state.requires_bearer_auth() {
         return Ok(next.run(request).await);
     }
@@ -235,6 +302,7 @@ pub(crate) async fn require_bearer_auth(
     let Some(actor) = state.authenticate_bearer_token(provided_token) else {
         return Err(ApiError::unauthorized("invalid bearer token"));
     };
+    request.extensions_mut().insert(actor.actor().clone());
     request.extensions_mut().insert(actor);
 
     Ok(next.run(request).await)
@@ -277,6 +345,11 @@ pub(crate) async fn resolve_graph_handle(
         })?;
     let graph_id = GraphId::try_from(graph_id_str.to_string())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if let Some(actor) = request.extensions_mut().get_mut::<AuthenticatedActor>() {
+        if !actor.select_graph(&graph_id) {
+            return Err(ApiError::forbidden("credential does not permit this graph"));
+        }
+    }
     let key = GraphKey::cluster(graph_id.clone());
     let handle = match registry.get(&key) {
         RegistryLookup::Ready(handle) => handle,
@@ -340,10 +413,22 @@ pub(crate) enum Authz {
 /// request. See `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
 /// at `tests/server.rs`.
 pub(crate) fn authorize(
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
+    if let Some(actor) = actor {
+        if !actor.permits_action(request.action) {
+            return Ok(Authz::Denied(
+                "credential does not permit this action".to_string(),
+            ));
+        }
+        if actor.source == AuthSource::SignedData && policy.is_none() {
+            return Ok(Authz::Denied(
+                "signed data credentials require an applied Cedar policy permit".to_string(),
+            ));
+        }
+    }
     let Some(engine) = policy else {
         // No PolicyEngine installed. Three runtime states can reach this:
         //
@@ -424,7 +509,7 @@ pub(crate) fn authorize(
 /// [`Authz`] decision directly to hide a denial as a 404 while letting an
 /// operational failure keep its true status.
 pub(crate) fn authorize_request(
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<(), ApiError> {
@@ -454,7 +539,7 @@ pub(crate) fn authorize_request(
 /// branch. Defaults to `main` when `branch` is omitted. Read-only.
 pub(crate) async fn server_snapshot(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<SnapshotQuery>,
 ) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
@@ -515,12 +600,12 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     security(("bearer_token" = [])),
 )]
 #[deprecated(
-    note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat"
+    note = "use POST /query instead; /read is kept indefinitely with a byte-stable envelope"
 )]
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
-/// Execute a GQ read query. Behavior is unchanged from prior releases; the
-/// route is kept indefinitely for byte-stable back-compat. New integrations
+/// Execute a GQ read query. The route is kept indefinitely with a byte-stable
+/// envelope; cell spelling follows the JSON writer. New integrations
 /// should target `POST /query`, which has clean field names (`query` /
 /// `name`) and a 400-on-mutation guard. Responses from this route include
 /// `Deprecation: true` and `Link: <query>; rel="successor-version"`
@@ -528,26 +613,24 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
 /// signal.
 pub(crate) async fn server_read(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ReadRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
-    let (selected_name, target, result, _graph_commit_id) = run_query(
+    let output = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
+        Door::Read,
         &request.query_source,
         request.query_name.as_deref(),
         request.params.as_ref(),
         request.branch,
         request.snapshot,
-        false, // /read predates the D2 rule; legacy callers may submit mutating queries here
     )
-    .await?;
+    .await?
+    .into_read_output()?;
     Ok((
         deprecation_headers("<query>; rel=\"successor-version\""),
-        // `/read` has an indefinite byte-stable response contract. The
-        // canonical `/query` route exposes the additive graph-commit token;
-        // omitting it here preserves the legacy JSON body exactly.
-        Json(api::read_output(selected_name, &target, result, None).into()),
+        Json(output.into()),
     ))
 }
 
@@ -559,7 +642,7 @@ pub(crate) async fn server_read(
     request_body = QueryRequest,
     responses(
         (status = 200, description = "Query results", body = ReadOutput),
-        (status = 400, description = "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries", body = ErrorOutput),
+        (status = 400, description = "Bad request - also returned when the query body contains mutations (use POST /mutate, or its deprecated alias POST /change, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
@@ -575,28 +658,35 @@ pub(crate) async fn server_read(
 /// write queries. It shares `POST /read` target semantics (branch xor
 /// snapshot) and the same Cedar action (Read), while its canonical response
 /// additionally carries the pinned graph-commit token.
+///
+/// The GQ statement `branch list` is also served here, with no `branch`,
+/// `snapshot`, `name`, or `params`: it answers one row per branch (column
+/// `name`, byte order) under the same `read` check as `GET /branches`.
+/// `branch create`, `branch delete`, and `branch merge` are rejected with
+/// 400; send them to `POST /mutate`.
 pub(crate) async fn server_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<QueryRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    let (selected_name, target, result, graph_commit_id) = run_query(
+    let output = run_query(
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
+        Door::Query,
         &request.query,
         request.name.as_deref(),
         request.params.as_ref(),
         request.branch,
         request.snapshot,
-        true, // /query is read-only; reject mutations
     )
-    .await?;
-    Ok(Json(api::read_output(
-        selected_name,
-        &target,
-        result,
-        graph_commit_id,
-    )))
+    .await?
+    .into_read_output()?;
+    Ok(Json(output))
+}
+
+/// A result the JSON writer refuses to render answers 500 (RFC 0051), never 400.
+fn render_error(err: impl std::fmt::Display) -> ApiError {
+    ApiError::internal(err.to_string())
 }
 
 /// OpenAPI-only marker for an unstructured octet-stream response body.
@@ -674,7 +764,7 @@ struct BlobBinaryBody(Vec<u8>);
 /// resolution share the exact helper used by `/query`.
 pub(crate) async fn server_blob_get(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
 ) -> std::result::Result<Response, ApiError> {
@@ -738,7 +828,7 @@ pub(crate) async fn server_blob_get(
 /// deliberately ignored while If-None-Match is still evaluated.
 pub(crate) async fn server_blob_head(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
 ) -> std::result::Result<Response, ApiError> {
@@ -761,7 +851,7 @@ fn parse_blob_read_query(
 
 async fn read_blob_for_delivery(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     query: BlobReadQuery,
 ) -> std::result::Result<omnigraph::BlobRead, ApiError> {
     let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
@@ -833,7 +923,7 @@ fn redact_blob_api_error(mapped: ApiError) -> ApiError {
 pub(crate) async fn server_export(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<ExportRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) = request
@@ -974,26 +1064,46 @@ fn reject_graph_commit_expected_head(
     Ok(())
 }
 
-/// Shared implementation behind `POST /mutate` (canonical) and
-/// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
-/// each route handler wraps it (the alias also attaches Deprecation
-/// headers).
-/// Shared backend for `/mutate` (canonical) and `/change` (deprecated alias).
+/// Shared backend for `/mutate` (canonical), `/mutate/if-graph-commit`,
+/// `/change` (deprecated alias), and the stored-mutation arm of
+/// `/queries/{name}`. Returns the bare `ChangeOutput`; each route handler
+/// wraps it (the alias also attaches Deprecation headers).
 ///
-/// Decoupled from `ChangeRequest` so MR-969's `/queries/{name}` stored-query
-/// handler can call this directly with registry-supplied fields without
-/// rebuilding the request body. Today's HTTP handlers unpack the request and
-/// call here; the registry would do the same.
+/// Order: parse and classify first; a branch statement then passes
+/// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise
+/// runs the same handler body as its `/branches` route (its own Cedar action
+/// and admission check). A mutation body takes `branch` (defaulting to
+/// `main` only here, so a defaulted target is never mistaken for a spelled
+/// one), then the `Change` check, admission, selection, and the engine call.
 pub(crate) async fn run_mutate(
     state: AppState,
     handle: Arc<GraphHandle>,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
+    door: Door,
     query: &str,
     name: Option<&str>,
     params_json: Option<&Value>,
-    branch: String,
+    branch: Option<String>,
     expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
+    let queries = match classify(query)? {
+        QueryFile::Queries(queries) => queries,
+        QueryFile::Branch(stmt) => {
+            refuse_wrong_door(door, &stmt)?;
+            refuse_statement_envelope(
+                branch.is_some(),
+                name.is_some() || params_json.is_some(),
+                expected_head.is_some(),
+            )?;
+            return match stmt {
+                BranchStmt::Write(write) => {
+                    run_branch_statement(&state, &handle, actor, write).await
+                }
+                BranchStmt::List => Err(read_at_write_door()),
+            };
+        }
+    };
+    let branch = branch.unwrap_or_else(|| "main".to_string());
     let actor_arc = actor
         .map(|a| Arc::clone(&a.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
@@ -1018,7 +1128,7 @@ pub(crate) async fn run_mutate(
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
     let (selected_name, query_params) =
-        select_named_query(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
+        select_named_query(queries, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
     let params = query_params_from_json(&query_params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
@@ -1042,43 +1152,52 @@ pub(crate) async fn run_mutate(
         affected_edges: receipt.result.affected_edges,
         actor_id: actor_id.map(str::to_string),
         commit: receipt.commit.as_ref().map(api::commit_output),
+        outcome: None,
     })
 }
 
-/// Shared backend for `/query` (canonical) and `/read` (deprecated alias).
+/// Shared backend for `/query` (canonical), `/read` (deprecated alias), and
+/// the stored-read arm of `/queries/{name}`.
 ///
-/// Mirrors [`run_mutate`]'s decoupled shape so MR-969's stored-query handler
-/// can call here with registry-supplied fields. Rejects inline source that
-/// contains mutations (D2 rule); callers wanting writes go through
-/// [`run_mutate`] instead.
+/// Order: parse and classify first; `branch list` then passes
+/// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise runs
+/// the handler body of `GET /branches` (a scope-free `read` check). A
+/// declared query resolves and authorizes its read target, is refused at
+/// every door but `Read` when it contains mutations, and runs.
 ///
 /// Intentionally does **not** take [`AppState`] (unlike [`run_mutate`]):
-/// reads are not admission-gated today, so there is no `state.workload`
-/// consumer. The signature grows the parameter when Phase 1 (MR-976) adds
-/// the request envelope's `expect: { max_rows_scanned: N }` budget, or
-/// MR-969 extends per-actor admission to stored-read invocations.
+/// reads are not admission-gated, so there is no `state.workload` consumer.
 pub(crate) async fn run_query(
     handle: Arc<GraphHandle>,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
+    door: Door,
     query: &str,
     name: Option<&str>,
     params_json: Option<&Value>,
     branch: Option<String>,
     snapshot: Option<String>,
-    reject_mutations: bool,
-) -> std::result::Result<
-    (
-        String,
-        ReadTarget,
-        omnigraph_compiler::result::QueryResult,
-        Option<String>,
-    ),
-    ApiError,
-> {
+) -> std::result::Result<ReadDispatch, ApiError> {
+    let queries = match classify(query)? {
+        QueryFile::Queries(queries) => queries,
+        QueryFile::Branch(stmt) => {
+            refuse_wrong_door(door, &stmt)?;
+            refuse_statement_envelope(
+                branch.is_some() || snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            return match stmt {
+                BranchStmt::List => Ok(ReadDispatch::BranchList(
+                    branch_list_body(&handle, actor).await?,
+                )),
+                BranchStmt::Write(write) => Err(control_write_at_read_door(&write)),
+            };
+        }
+    };
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
-    let query_decl = select_named_query_decl(query, name)
+    let query_decl = select_named_query_decl(queries, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if reject_mutations && !query_decl.mutations.is_empty() {
+    if door != Door::Read && !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
             query_decl.name
@@ -1094,7 +1213,12 @@ pub(crate) async fn run_query(
             .await
             .map_err(ApiError::from_omni)?
     };
-    Ok((selected_name, target, result, graph_commit_id))
+    Ok(ReadDispatch::Rows {
+        query_name: selected_name,
+        target,
+        result,
+        graph_commit_id,
+    })
 }
 
 /// Resolve one branch-or-snapshot read target and apply the graph's Cedar
@@ -1102,7 +1226,7 @@ pub(crate) async fn run_query(
 /// helper so snapshot-to-policy-branch resolution cannot drift by route.
 pub(crate) async fn resolve_authorized_read_target(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     branch: Option<String>,
     snapshot: Option<String>,
 ) -> std::result::Result<ReadTarget, ApiError> {
@@ -1168,20 +1292,20 @@ pub(crate) async fn resolve_authorized_read_target(
 pub(crate) async fn server_change(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
     reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let output = run_mutate(
         state,
         handle,
         actor.as_ref().map(|Extension(actor)| actor),
+        Door::Change,
         &request.query,
         request.name.as_deref(),
         request.params.as_ref(),
-        branch,
+        request.branch,
         None,
     )
     .await?;
@@ -1199,10 +1323,11 @@ pub(crate) async fn server_change(
     request_body = ChangeRequest,
     responses(
         (status = 200, description = "Mutation results", body = ChangeOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 400, description = "Bad request - also returned when `branch list` arrives here instead of POST /query, when a request target accompanies a branch statement, when a name or parameters accompany a branch statement, and when a commit precondition accompanies a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 404, description = "`branch delete` of a branch that does not exist, as DELETE /branches/{branch} answers", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict; also `branch create` of a branch that already exists, and a conflicting `branch merge`, whose body carries `merge_conflicts`", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -1225,24 +1350,32 @@ pub(crate) async fn server_change(
 ///
 /// Pairs with `POST /query` (read-only). The legacy `POST /change` route
 /// has identical semantics and is kept as a deprecated alias.
+///
+/// The GQ statements `branch create`, `branch delete`, and `branch merge`
+/// (grammar: `BranchStmt` in `omnigraph-compiler`) are also served
+/// here, with no `branch`, `name`, or `params`: each runs the handler body
+/// of its `/branches` route (same Cedar action, admission check, and errors,
+/// including the 409 of a conflicting merge) and answers a `ChangeOutput`
+/// whose `outcome` names the effect. `branch list` is rejected with 400;
+/// send it to `POST /query`.
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
     reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
     Ok(Json(
         run_mutate(
             state,
             handle,
             actor.as_ref().map(|Extension(actor)| actor),
+            Door::Mutate,
             &request.query,
             request.name.as_deref(),
             request.params.as_ref(),
-            branch,
+            request.branch,
             None,
         )
         .await?,
@@ -1280,21 +1413,21 @@ pub(crate) async fn server_mutate(
 pub(crate) async fn server_mutate_if_graph_commit(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
     let expected_head = require_graph_commit_expected_head(&headers)?;
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
     Ok(Json(
         run_mutate(
             state,
             handle,
             actor.as_ref().map(|Extension(actor)| actor),
+            Door::Mutate,
             &request.query,
             request.name.as_deref(),
             request.params.as_ref(),
-            branch,
+            request.branch,
             Some(&expected_head),
         )
         .await?,
@@ -1358,7 +1491,7 @@ pub(crate) fn parse_optional_invoke_body(
 pub(crate) async fn server_invoke_query(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -1400,7 +1533,7 @@ pub(crate) async fn server_invoke_query(
 pub(crate) async fn server_invoke_query_if_graph_commit(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
     headers: axum::http::HeaderMap,
     body: Bytes,
@@ -1412,7 +1545,7 @@ pub(crate) async fn server_invoke_query_if_graph_commit(
 async fn invoke_stored_query(
     state: AppState,
     handle: Arc<GraphHandle>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     name: String,
     body: Bytes,
     expected_head: Option<String>,
@@ -1490,15 +1623,15 @@ async fn invoke_stored_query(
                 "stored mutation cannot target a snapshot",
             ));
         }
-        let branch = req.branch.unwrap_or_else(|| "main".to_string());
         let output = run_mutate(
             state,
             handle,
             actor_ref,
+            Door::Mutate,
             &source,
             Some(&query_name),
             req.params.as_ref(),
-            branch,
+            req.branch,
             expected_head.as_deref(),
         )
         .await?;
@@ -1509,23 +1642,19 @@ async fn invoke_stored_query(
                 "the graph-commit conditional route applies only to stored mutations",
             ));
         }
-        let (selected, target, result, graph_commit_id) = run_query(
+        let output = run_query(
             handle,
             actor_ref,
+            Door::Query,
             &source,
             Some(&query_name),
             req.params.as_ref(),
             req.branch,
             req.snapshot,
-            true,
         )
-        .await?;
-        Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
-            selected,
-            &target,
-            result,
-            graph_commit_id,
-        ))))
+        .await?
+        .into_read_output()?;
+        Ok(Json(InvokeStoredQueryResponse::Read(output)))
     }
 }
 
@@ -1553,7 +1682,7 @@ async fn invoke_stored_query(
 /// lacks (a known gap until per-query authorization lands).
 pub(crate) async fn server_list_queries(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<QueriesCatalogOutput>, ApiError> {
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -1594,7 +1723,7 @@ pub(crate) async fn server_list_queries(
 /// before constructing GQ queries. Read-only.
 pub(crate) async fn server_schema_get(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<SchemaOutput>, ApiError> {
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -1640,7 +1769,7 @@ pub(crate) async fn server_schema_get(
 pub(crate) async fn server_schema_apply(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<SchemaApplyRequest>,
 ) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
     let actor_arc = actor
@@ -1712,7 +1841,7 @@ pub(crate) async fn server_schema_apply(
 /// Authorize one load target without touching request data.
 async fn authorize_load_scope(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     branch: &str,
     from: Option<&str>,
 ) -> std::result::Result<(), ApiError> {
@@ -1762,7 +1891,7 @@ async fn authorize_load_scope(
 async fn run_ingest(
     state: AppState,
     handle: Arc<GraphHandle>,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     request: IngestRequest,
 ) -> std::result::Result<IngestOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
@@ -1829,7 +1958,7 @@ async fn run_ingest(
 pub(crate) async fn server_load(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<Json<IngestOutput>, ApiError> {
     Ok(Json(
@@ -1904,7 +2033,7 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
 pub(crate) async fn server_load_ndjson(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<GraphBatchLoadQuery>,
     request: Request,
 ) -> std::result::Result<Json<GraphBatchLoadOutput>, ApiError> {
@@ -2001,7 +2130,7 @@ pub(crate) async fn server_load_ndjson(
 pub(crate) async fn server_ingest(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<IngestOutput>), ApiError> {
     let output = run_ingest(
@@ -2031,13 +2160,24 @@ pub(crate) async fn server_ingest(
 )]
 /// List all branches.
 ///
-/// Returns branch names sorted alphabetically. Read-only.
+/// Returns branch names sorted by name in byte order. Read-only. The GQ statement
+/// `branch list` on `POST /query` runs the same body.
 pub(crate) async fn server_branch_list(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<BranchListOutput>, ApiError> {
+    let branches = branch_list_body(&handle, actor.as_ref().map(|Extension(actor)| actor)).await?;
+    Ok(Json(BranchListOutput { branches }))
+}
+
+/// Body shared by `GET /branches` and the `branch list` statement: one
+/// scope-free `read` check, then the names in byte order.
+async fn branch_list_body(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+) -> std::result::Result<Vec<String>, ApiError> {
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Read,
@@ -2045,12 +2185,13 @@ pub(crate) async fn server_branch_list(
             target_branch: None,
         },
     )?;
-    let mut branches = {
-        let db = &handle.engine;
-        db.branch_list().await.map_err(ApiError::from_omni)?
-    };
+    let mut branches = handle
+        .engine
+        .branch_list()
+        .await
+        .map_err(ApiError::from_omni)?;
     branches.sort();
-    Ok(Json(BranchListOutput { branches }))
+    Ok(branches)
 }
 
 #[utoipa::path(
@@ -2074,25 +2215,50 @@ pub(crate) async fn server_branch_list(
 ///
 /// Forks `name` off of `from` (defaults to `main`). The new branch shares
 /// backing dataset data with its parent until it is mutated. Returns 409 if `name`
-/// already exists.
+/// already exists. The GQ statement `branch create` on `POST /mutate` runs
+/// the same body.
 pub(crate) async fn server_branch_create(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
     let from = request.from.unwrap_or_else(|| "main".to_string());
+    branch_create_body(
+        &state,
+        &handle,
+        actor.as_ref().map(|Extension(actor)| actor),
+        &from,
+        &request.name,
+    )
+    .await?;
+    Ok(Json(BranchCreateOutput {
+        uri: handle.uri.clone(),
+        from,
+        name: request.name,
+        actor_id: actor.map(|Extension(actor)| actor.actor_id.as_ref().to_string()),
+    }))
+}
+
+/// Body shared by `POST /branches` and the `branch create` statement: the
+/// `branch_create` check on (`from`, `name`), admission, the engine call.
+async fn branch_create_body(
+    state: &AppState,
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    from: &str,
+    name: &str,
+) -> std::result::Result<(), ApiError> {
     let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
+        .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::BranchCreate,
-            branch: Some(from.clone()),
-            target_branch: Some(request.name.clone()),
+            branch: Some(from.to_string()),
+            target_branch: Some(name.to_string()),
         },
     )?;
     // Branch metadata only — small constant bytes estimate. The Lance
@@ -2102,22 +2268,15 @@ pub(crate) async fn server_branch_create(
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    {
-        let db = &handle.engine;
-        db.branch_create_from_as(
-            ReadTarget::branch(&from),
-            &request.name,
-            actor.as_ref().map(|Extension(a)| a.actor_id.as_ref()),
+    handle
+        .engine
+        .branch_create_from_as(
+            ReadTarget::branch(from),
+            name,
+            actor.map(|actor| actor.actor_id.as_ref()),
         )
         .await
-        .map_err(ApiError::from_omni)?;
-    }
-    Ok(Json(BranchCreateOutput {
-        uri: handle.uri.clone(),
-        from,
-        name: request.name,
-        actor_id: actor.map(|Extension(actor)| actor.actor_id.as_ref().to_string()),
-    }))
+        .map_err(ApiError::from_omni)
 }
 
 /// Path-param shape for [`server_branch_delete`]. Named-field
@@ -2156,27 +2315,41 @@ pub(crate) struct BranchPath {
 ///
 /// **Irreversible.** Removes the branch pointer; commits remain reachable
 /// only if referenced by another branch. Returns 404 if the branch does not
-/// exist.
+/// exist. The GQ statement `branch delete` on `POST /mutate` runs the same
+/// body.
 pub(crate) async fn server_branch_delete(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(BranchPath { branch }): Path<BranchPath>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    branch_delete_body(&state, &handle, actor_ref, &branch).await?;
+    Ok(Json(BranchDeleteOutput {
+        uri: handle.uri.clone(),
+        name: branch,
+        actor_id: actor_ref.map(|actor| actor.actor_id.as_ref().to_string()),
+    }))
+}
+
+/// Body shared by `DELETE /branches/{branch}` and the `branch delete`
+/// statement: the `branch_delete` check on `name`, admission, the engine call.
+async fn branch_delete_body(
+    state: &AppState,
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    name: &str,
+) -> std::result::Result<(), ApiError> {
     let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
+        .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor
-        .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::BranchDelete,
             branch: None,
-            target_branch: Some(branch.clone()),
+            target_branch: Some(name.to_string()),
         },
     )?;
     // Metadata-only manifest tombstone — small constant estimate.
@@ -2184,17 +2357,11 @@ pub(crate) async fn server_branch_delete(
         .workload
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
-    {
-        let db = &handle.engine;
-        db.branch_delete_as(&branch, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?;
-    }
-    Ok(Json(BranchDeleteOutput {
-        uri: handle.uri.clone(),
-        name: branch,
-        actor_id: actor_id.map(str::to_string),
-    }))
+    handle
+        .engine
+        .branch_delete_as(name, actor.map(|actor| actor.actor_id.as_ref()))
+        .await
+        .map_err(ApiError::from_omni)
 }
 
 #[utoipa::path(
@@ -2227,50 +2394,20 @@ pub(crate) async fn server_branch_delete(
 /// merge, under its own `branch_delete` policy check. The merge is durable by
 /// then, so a deletion refusal or failure never fails the request; it is
 /// reported via `branch_deleted: false` + `branch_delete_error`.
+///
+/// The GQ statement `branch merge` on `POST /mutate` runs the same body
+/// (without the deletion composition) and answers the same 409 on conflict.
 pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchMergeRequest>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let target = request.target.unwrap_or_else(|| "main".to_string());
-    let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
-        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor
-        .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
-    authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::BranchMerge,
-            branch: Some(request.source.clone()),
-            target_branch: Some(target.clone()),
-        },
-    )?;
-    // Merge body is small JSON; the heavy work is in the engine but is
-    // bounded per-(table, branch) by the writer queue. Small constant
-    // estimate suffices for the actor in-flight count.
-    let _admission = state
-        .workload
-        .try_admit(&actor_arc, 256)
-        .map_err(ApiError::from_workload_reject)?;
-    let outcome = {
-        let db = &handle.engine;
-        db.branch_merge_as(&request.source, &target, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    let outcome = branch_merge_body(&state, &handle, actor_ref, &request.source, &target).await?;
     let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(
-            &handle,
-            actor.as_ref().map(|Extension(a)| a),
-            &request.source,
-        )
-        .await
-        {
+        match delete_merged_source_branch(&handle, actor_ref, &request.source).await {
             Ok(()) => (Some(true), None),
             Err(message) => (Some(false), Some(message)),
         }
@@ -2281,10 +2418,46 @@ pub(crate) async fn server_branch_merge(
         source: request.source,
         target,
         outcome: outcome.into(),
-        actor_id: actor_id.map(str::to_string),
+        actor_id: actor_ref.map(|actor| actor.actor_id.as_ref().to_string()),
         branch_deleted,
         branch_delete_error,
     }))
+}
+
+/// Body shared by `POST /branches/merge` and the `branch merge` statement:
+/// the `branch_merge` check on (`source`, `target`), admission, the engine
+/// call. A conflict surfaces as `ApiError::merge_conflict` (409).
+async fn branch_merge_body(
+    state: &AppState,
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    source: &str,
+    target: &str,
+) -> std::result::Result<MergeOutcome, ApiError> {
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::BranchMerge,
+            branch: Some(source.to_string()),
+            target_branch: Some(target.to_string()),
+        },
+    )?;
+    // Merge body is small JSON; the heavy work is in the engine but is
+    // bounded per-(table, branch) by the writer queue. Small constant
+    // estimate suffices for the actor in-flight count.
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, 256)
+        .map_err(ApiError::from_workload_reject)?;
+    handle
+        .engine
+        .branch_merge_as(source, target, actor.map(|actor| actor.actor_id.as_ref()))
+        .await
+        .map_err(ApiError::from_omni)
 }
 
 /// Delete the source branch of a just-landed merge, mirroring
@@ -2294,7 +2467,7 @@ pub(crate) async fn server_branch_merge(
 /// already durable, so the request must not report failure for it.
 async fn delete_merged_source_branch(
     handle: &GraphHandle,
-    actor: Option<&ResolvedActor>,
+    actor: Option<&AuthenticatedActor>,
     source: &str,
 ) -> std::result::Result<(), String> {
     match authorize(
@@ -2342,7 +2515,7 @@ async fn delete_merged_source_branch(
 /// order. Read-only.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
     // An omitted `branch` means main's history, so the policy gate must
@@ -2399,7 +2572,7 @@ pub(crate) struct CommitPath {
 /// metadata. Read-only.
 pub(crate) async fn server_commit_show(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
     authorize_request(
@@ -2432,18 +2605,18 @@ pub(crate) fn read_target_from_request(
 }
 
 pub(crate) fn select_named_query_decl(
-    query_source: &str,
+    queries: Vec<QueryDecl>,
     requested_name: Option<&str>,
-) -> Result<omnigraph_compiler::query::ast::QueryDecl> {
-    let parsed = parse_query(query_source)?;
+) -> Result<QueryDecl> {
     let query = if let Some(name) = requested_name {
-        parsed
-            .queries
+        queries
             .into_iter()
             .find(|query| query.name == name)
             .ok_or_else(|| color_eyre::eyre::eyre!("query '{}' not found", name))?
-    } else if parsed.queries.len() == 1 {
-        parsed.queries.into_iter().next().unwrap()
+    } else if queries.len() == 1 {
+        queries.into_iter().next().unwrap()
+    } else if queries.is_empty() {
+        bail!(crate::api::query_file_refusals::NO_QUERY);
     } else {
         bail!("query file contains multiple queries; pass --name");
     };
@@ -2451,10 +2624,10 @@ pub(crate) fn select_named_query_decl(
 }
 
 pub(crate) fn select_named_query(
-    query_source: &str,
+    queries: Vec<QueryDecl>,
     requested_name: Option<&str>,
 ) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
-    let query = select_named_query_decl(query_source, requested_name)?;
+    let query = select_named_query_decl(queries, requested_name)?;
     Ok((query.name, query.params))
 }
 
@@ -2735,7 +2908,7 @@ pub(crate) fn parse_change_query(
 /// a large commit continues via the opaque `page_token`.
 pub(crate) async fn server_commit_changes(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::CommitChangesOutput>, ApiError> {
@@ -2947,7 +3120,7 @@ fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, 
 /// state.
 pub(crate) async fn server_changes_feed(
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
@@ -3025,7 +3198,7 @@ pub(crate) async fn server_changes_feed(
 pub(crate) async fn server_changes_baseline(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
     let branch = normalize_change_branch(request.branch.as_deref())?;

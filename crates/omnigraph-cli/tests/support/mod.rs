@@ -23,6 +23,8 @@ pub fn cli() -> Command {
     let mut command = Command::cargo_bin("omnigraph").unwrap();
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
     command.env_remove("OMNIGRAPH_CONFIG");
+    command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
+    command.env_remove("OMNIGRAPH_CONTROL_API");
     command
 }
 
@@ -30,6 +32,31 @@ pub fn cli_process() -> StdCommand {
     let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"));
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
     command.env_remove("OMNIGRAPH_CONFIG");
+    command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
+    command.env_remove("OMNIGRAPH_CONTROL_API");
+    command
+}
+
+pub mod managed_http;
+
+pub fn write_managed_context(config: &Path, origin: &str) {
+    fs::create_dir_all(config.join(".omnigraph")).unwrap();
+    fs::write(
+        config.join(".omnigraph/context"),
+        format!("version: 1\ncluster: managed-test\napi: {origin}\n"),
+    )
+    .unwrap();
+}
+
+pub fn managed_cli(config: &Path, origin: &str) -> Command {
+    let mut command = cli();
+    command
+        .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+        .env("OMNIGRAPH_CONTROL_API", origin)
+        .env("OMNIGRAPH_TOKEN", "data-token-must-not-be-used")
+        .current_dir(config)
+        .arg("cluster")
+        .timeout(Duration::from_secs(15));
     command
 }
 

@@ -1856,6 +1856,235 @@ async fn branch_merge_applies_node_insert_to_main() {
     assert_eq!(qr.num_rows(), 1);
 }
 
+/// Rust because the pins are native table versions, the target ref's physical
+/// HEAD, and the entry retained on an empty delta; the row-visible half is
+/// `merge_adopt_*.gqt`. The lazy iteration stops after its reads (RFC 0062, decision log 2026-09-08).
+#[tokio::test]
+async fn branch_merge_preserves_state_when_native_versions_differ() {
+    for branch_updates in [8, 2] {
+        for lazy_target in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let main = init_and_load(&dir).await;
+            main.branch_create("feature").await.unwrap();
+            let history_branch = if lazy_target { "main" } else { "feature" };
+            let history_updates = branch_updates + i64::from(lazy_target);
+            for age in 40..40 + history_updates {
+                main.mutate(
+                    history_branch,
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            let (source, target) = if lazy_target {
+                main.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    main.branch_merge("main", "feature").await.unwrap(),
+                    MergeOutcome::Merged
+                );
+                main.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+                )
+                .await
+                .unwrap();
+                main.branch_create_from(ReadTarget::branch("main"), "child")
+                    .await
+                    .unwrap();
+                ("feature", "child")
+            } else {
+                assert_eq!(
+                    main.branch_merge("feature", "main").await.unwrap(),
+                    MergeOutcome::FastForward
+                );
+                main.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+                )
+                .await
+                .unwrap();
+                ("main", "feature")
+            };
+            let target_native = graph_native_ref(uri, target).await;
+            let source_entry = snapshot_branch(&main, source)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            let target_entry = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            if branch_updates == 2 {
+                assert_eq!(
+                    source_entry.published_dataset_version, target_entry.published_dataset_version,
+                    "fixture must exercise equal numeric versions on different refs"
+                );
+            } else {
+                assert!(
+                    source_entry.published_dataset_version < target_entry.published_dataset_version,
+                    "fixture must exercise a lower source version"
+                );
+            }
+            assert_ne!(
+                source_entry.native_dataset_branch,
+                target_entry.native_dataset_branch
+            );
+            assert_eq!(
+                target_entry.native_dataset_branch.as_deref() == Some(target_native.as_str()),
+                !lazy_target
+            );
+            assert_eq!(
+                main.branch_merge(source, target).await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let merged_entry = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            let expected_ref = if lazy_target {
+                Some(target_native.as_str())
+            } else {
+                source_entry.native_dataset_branch.as_deref()
+            };
+            assert_eq!(
+                (
+                    merged_entry.published_dataset_version,
+                    merged_entry.native_dataset_branch.as_deref()
+                ),
+                (source_entry.published_dataset_version, expected_ref),
+                "{target}, {branch_updates} updates: the adopt registers the source's version, as a pointer switch onto the source ref or a fork onto the target's own ref, ordered by the manifest clock (RFC 0062)"
+            );
+            let reopened = Omnigraph::open(uri).await.unwrap();
+            for handle in [&main, &reopened] {
+                let result = handle
+                    .query(
+                        ReadTarget::branch(target),
+                        TEST_QUERIES,
+                        "get_person",
+                        &params(&[("$name", "Alice")]),
+                    )
+                    .await
+                    .unwrap();
+                let batch = result.concat_batches().unwrap();
+                assert_eq!(
+                    batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    50,
+                    "{target}, {branch_updates} updates: source value must survive adoption"
+                );
+            }
+            if lazy_target {
+                continue;
+            }
+            main.mutate(
+                target,
+                MUTATION_QUERIES,
+                "add_friend",
+                &params(&[("$from", "Alice"), ("$to", "Diana")]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                main.branch_merge(target, "main").await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let result = main
+                .query(
+                    ReadTarget::branch("main"),
+                    TEST_QUERIES,
+                    "get_person",
+                    &params(&[("$name", "Alice")]),
+                )
+                .await
+                .unwrap();
+            let batch = result.concat_batches().unwrap();
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                50,
+                "{target}, {branch_updates} updates: an unrelated edit must not roll back main"
+            );
+
+            let before_empty = snapshot_branch(&main, target)
+                .await
+                .unwrap()
+                .dataset("node:Person")
+                .unwrap()
+                .clone();
+            let table_uri = format!("{uri}/{}", before_empty.dataset_path);
+            let head_before =
+                open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+                    .await
+                    .version()
+                    .version;
+            assert_eq!(
+                main.branch_merge("main", target).await.unwrap(),
+                MergeOutcome::FastForward
+            );
+            let reopened = Omnigraph::open(uri).await.unwrap();
+            for handle in [&main, &reopened] {
+                let after_empty = snapshot_branch(handle, target)
+                    .await
+                    .unwrap()
+                    .dataset("node:Person")
+                    .unwrap()
+                    .clone();
+                assert_eq!(after_empty.type_key, before_empty.type_key);
+                assert_eq!(after_empty.dataset_path, before_empty.dataset_path);
+                assert_eq!(
+                    after_empty.native_dataset_branch,
+                    before_empty.native_dataset_branch
+                );
+                assert_eq!(
+                    after_empty.published_dataset_version,
+                    before_empty.published_dataset_version
+                );
+                assert_eq!(after_empty.entity_count, before_empty.entity_count);
+                assert!(
+                    after_empty.same_registration(&before_empty),
+                    "empty adoption must retain the target's Lance manifest metadata"
+                );
+            }
+            assert_eq!(
+                open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+                    .await
+                    .version()
+                    .version,
+                head_before,
+                "empty adoption must not advance the physical target HEAD"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn branch_merge_records_single_latest_commit_with_two_parents() {
     let dir = tempfile::tempdir().unwrap();
@@ -3416,4 +3645,256 @@ async fn merge_delta_only_bumps_changed_rows() {
          Got only {:?}",
         unique_versions
     );
+}
+
+// ─── Edge @key: born-on-both convergence and divergence (issue #583) ─────────
+
+const EDGE_KEY_MERGE_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: String?
+    @key(src, dst)
+}
+"#;
+
+// The unkeyed control: identical fixture without the key declaration.
+const EDGE_UNKEYED_MERGE_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: String?
+}
+"#;
+
+const EDGE_KEY_MERGE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Person","data":{"name":"Carol"}}
+{"type":"Person","data":{"name":"Dave"}}
+{"type":"Person","data":{"name":"Eve"}}
+{"edge":"Knows","from":"Alice","to":"Carol"}
+{"edge":"Knows","from":"Alice","to":"Dave"}
+{"edge":"Knows","from":"Alice","to":"Eve"}"#;
+
+const EDGE_KEY_MERGE_MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+
+query add_knows_since($from: String, $to: String, $since: String) {
+    insert Knows { from: $from, to: $to, since: $since }
+}
+"#;
+
+const EDGE_KEY_MERGE_QUERIES: &str = r#"
+query friends() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+    }
+    return { $f.name }
+}
+
+query friend_edges() {
+    match {
+        $p: Person { name: "Alice" }
+        $p $w:knows $f
+    }
+    return { $f.name }
+}
+"#;
+
+/// Issue #583's repro with `@key(src, dst)` declared: the same keyed edge
+/// inserted on both sides of a fork derives the same id, so the merge
+/// converges with no conflict and both the plain and the bound-edge
+/// traversal return 4 rows.
+#[tokio::test]
+async fn branch_merge_converges_born_on_both_keyed_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("identical born-on-both keyed edges converge without conflict");
+
+    assert_eq!(count_rows(&main, "edge:Knows").await, 4);
+    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&plain).len(), 4);
+    let bound = query_main(
+        &mut main,
+        EDGE_KEY_MERGE_QUERIES,
+        "friend_edges",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_column_sorted(&bound).len(), 4);
+}
+
+/// The unkeyed control pins the documented multiset outcome the RFC's
+/// acceptance threshold names: the merge keeps both rows (5 edges), the
+/// plain traversal's visited gate suppresses the duplicate (4), and the
+/// bound-edge traversal reports every row (5).
+#[tokio::test]
+async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_UNKEYED_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("unkeyed born-on-both edges keep the documented multiset outcome");
+
+    assert_eq!(count_rows(&main, "edge:Knows").await, 5);
+    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&plain).len(), 4);
+    let bound = query_main(
+        &mut main,
+        EDGE_KEY_MERGE_QUERIES,
+        "friend_edges",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_column_sorted(&bound).len(), 5);
+}
+
+/// Distinct keyed pairs inserted one per side derive distinct ids and merge
+/// cleanly: no conflict, both rows land.
+#[tokio::test]
+async fn branch_merge_keeps_distinct_keyed_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Bob"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("distinct keyed pairs must merge cleanly");
+    // Three fixture edges plus the two distinct new pairs.
+    assert_eq!(count_rows(&main, "edge:Knows").await, 5);
+}
+
+/// Two branches inserting the same key with DIFFERENT non-key properties
+/// surface `DivergentInsert`, with the derived id as the conflict entity id.
+#[tokio::test]
+async fn branch_merge_reports_divergent_insert_for_keyed_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows_since",
+        &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", "2020")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_KEY_MERGE_MUTATIONS,
+        "add_knows_since",
+        &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", "2021")]),
+    )
+    .await
+    .unwrap();
+
+    let err = main.branch_merge("feature", "main").await.unwrap_err();
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(
+                conflicts.iter().any(|conflict| {
+                    conflict.type_key == "edge:Knows"
+                        && conflict.kind == MergeConflictKind::DivergentInsert
+                        && conflict.entity_id.as_deref() == Some(r#"["Alice","Bob"]"#)
+                }),
+                "expected DivergentInsert on the derived edge id, got {conflicts:?}"
+            );
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
 }

@@ -1,0 +1,63 @@
+# issue: 473
+# red_on: none; guard case, green before and after RFC 0062 (a net-zero branch merges as fast_forward and publishes no registration)
+# notes: The same-branch re-registration of issue 473. `b0` forks from `main`,
+# notes: makes real edge commits that net back to the fork point (insert b->c,
+# notes: then delete it), and merges into an unmoved `main`. The adopt arm would
+# notes: re-emit `main`'s own registration `(Knows, v2, None, 1 row)`, so the
+# notes: merge reports `fast_forward` and publishes no registration for the
+# notes: table, and `main` still reads its one edge.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query add_b_c() {
+    insert Knows { from: "b", to: "c" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: b0
+query drop_b_c() {
+    delete Knows where from = "b"
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge b0
+
+--- expect outcome: fast_forward
+
+--- restart
+
+--- query
+query edges_on_main() {
+    match {
+        $x: Person
+        $x knows $y
+    }
+    return { $x.name, $y.name }
+}
+
+--- expect unordered
+{"x.name": "a", "y.name": "b"}
+
+--- expect shape
+x.name: String
+y.name: String

@@ -1,10 +1,11 @@
 # issue: 563
-# red_on: 2026-08-29, pre-fix build: the bm25 scan cap (limit 2 x 4 = 8 rows) fed count() only the capped window, so total was 8, not 20.
-# notes: an aggregate's value is computed over the matching rows, so the BM25
-# notes: scan cap must never apply to aggregate returns. Rust twin:
-# notes: bm25_ordered_aggregate_counts_all_matches_not_the_capped_scan (tests/search.rs).
-# notes: Seed geometry: 20 chunks all matching "needle", strict tf gradient
-# notes: (tf = 20 - c) so BM25 has a real order with no ties.
+# red_on: 2026-08-28, retry disabled: the capped 8-row scan window held no edge-bearing chunk and the query returned 0 rows instead of 2.
+# notes: chunks 8..=11 carry the only edges; the limit 2 x 4 = 8-row cap
+# notes: window (either scan direction) excludes them, so filling the limit proves
+# notes: the uncapped retry ran. Passes on pre-cap code too (an unbounded scan
+# notes: finds everything): this case guards the retry GIVEN the cap, not the cap
+# notes: itself; the cap is the aggregate case's job. Rust twin:
+# notes: bm25_join_fills_limit_when_capped_scan_underfills_issue_563 (crates/omnigraph/tests/search.rs).
 
 --- schema
 node Chunk {
@@ -48,12 +49,13 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 {"edge":"ChunkOfArtifact","from":"chunk-11","to":"art-0","data":{"id":"e-11","label":"of"}}
 
 --- query
-query recall_count($q: String) {
+query recall($q: String) {
     match {
         $c: Chunk
+        $c chunkOfArtifact $a
         search($c.text, $q)
     }
-    return { count($c) as total }
+    return { $c.slug, $a.slug }
     order { bm25($c.text, $q) }
     limit 2
 }
@@ -61,5 +63,10 @@ query recall_count($q: String) {
 --- params
 {"q": "needle"}
 
---- expect unordered
-{"total": 20}
+--- expect ordered
+{"c.slug": "chunk-08", "a.slug": "art-0"}
+{"c.slug": "chunk-09", "a.slug": "art-0"}
+
+--- expect shape
+c.slug: String
+a.slug: String

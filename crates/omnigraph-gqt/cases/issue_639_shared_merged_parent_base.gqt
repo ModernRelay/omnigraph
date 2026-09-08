@@ -1,0 +1,75 @@
+# issue: 639
+# red_on: 2026-09-07, main 5d74278c: step 8 `branch merge t` failed with `merge conflicts: node type 'Person', entity id 'a' (divergent_update)`; steps 1-7 green, both imports `fast_forward`.
+# notes: main and t both fast-forward x (a=1), then main sets a=2 and t
+# notes: sets b's age. The base of the t-into-main merge must be x's commit; the
+# notes: fork point (a=0) makes x's write look like an edit on both sides.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
+
+--- mutate
+branch create x
+
+--- expect ok
+
+--- mutate
+branch create t
+
+--- expect ok
+
+--- mutate branch: x
+query set_a_on_x() {
+    update Person set { age: 1 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge x
+
+--- expect outcome: fast_forward
+
+--- mutate
+branch merge x into t
+
+--- expect outcome: fast_forward
+
+--- mutate
+query set_a_on_main() {
+    update Person set { age: 2 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: t
+query set_b_on_t() {
+    update Person set { age: 1 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge t
+
+--- expect outcome: merged
+
+--- query
+query values_on_main() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "a", "p.age": 2}
+{"p.name": "b", "p.age": 1}
+
+--- expect shape
+p.name: String
+p.age: I32

@@ -95,7 +95,7 @@ impl Collector<'_> {
         })
     }
 
-    fn observe_lits(&mut self, site_kind: &'static str, literals: Vec<String>) {
+    fn observe_literals(&mut self, site_kind: &'static str, literals: Vec<String>) {
         let item = self.item();
         self.sites
             .extend(literals.into_iter().map(|value| StringSite {
@@ -125,7 +125,7 @@ impl Collector<'_> {
                 _ => None,
             };
             if let Some(site_kind) = site_kind {
-                self.observe_lits(site_kind, attribute_literals(attribute));
+                self.observe_literals(site_kind, attribute_literals(attribute));
             }
         }
     }
@@ -192,7 +192,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     fn visit_file(&mut self, node: &'ast syn::File) {
         for attribute in &node.attrs {
             if attribute.path().is_ident("doc") {
-                self.observe_lits("rustdoc", attribute_literals(attribute));
+                self.observe_literals("rustdoc", attribute_literals(attribute));
             }
         }
         for item in &node.items {
@@ -208,7 +208,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             this.with_public_docs(is_public(&node.vis), |this| {
                 this.visit_attributes(&node.attrs);
                 if is_presentation_helper(this.source_path, &node.sig.ident.to_string()) {
-                    this.observe_lits(
+                    this.observe_literals(
                         "presentation_helper",
                         token_literals(node.block.to_token_stream()),
                     );
@@ -258,7 +258,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
                         .iter()
                         .flat_map(|item| token_literals(item.to_token_stream()))
                         .collect();
-                    this.observe_lits("display_impl", literals);
+                    this.observe_literals("display_impl", literals);
                 } else {
                     for item in &node.items {
                         this.visit_impl_item(item);
@@ -410,9 +410,9 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     fn visit_lit(&mut self, node: &'ast Lit) {
         if let Lit::Str(value) = node {
             if self.in_error_impl() {
-                self.observe_lits("error_constructor", vec![value.value()]);
+                self.observe_literals("error_constructor", vec![value.value()]);
             } else if is_cli_renderer(self.source_path) {
-                self.observe_lits("cli_human_output", vec![value.value()]);
+                self.observe_literals("cli_human_output", vec![value.value()]);
             }
         }
     }
@@ -445,7 +445,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             None
         };
         if let Some(site_kind) = site_kind {
-            self.observe_lits(site_kind, token_literals(node.tokens.clone()));
+            self.observe_literals(site_kind, token_literals(node.tokens.clone()));
         }
     }
 
@@ -456,14 +456,14 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         };
         let called = path.path.to_token_stream().to_string().replace(' ', "");
         if is_diagnostic_constructor(&called) {
-            self.observe_lits(
+            self.observe_literals(
                 "diagnostic_constructor",
                 expression_list_literals(&node.args),
             );
             return;
         }
         if is_error_constructor(&called) || (called.starts_with("Self::") && self.in_error_impl()) {
-            self.observe_lits("error_constructor", expression_list_literals(&node.args));
+            self.observe_literals("error_constructor", expression_list_literals(&node.args));
             return;
         }
         visit::visit_expr_call(self, node);
@@ -474,7 +474,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             node.method.to_string().as_str(),
             "context" | "with_context" | "wrap_err" | "wrap_err_with"
         ) {
-            self.observe_lits("error_constructor", expression_list_literals(&node.args));
+            self.observe_literals("error_constructor", expression_list_literals(&node.args));
             self.visit_expr(&node.receiver);
             return;
         }
@@ -490,7 +490,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         for field in &node.fields {
             let member = field.member.to_token_stream().to_string();
             if is_message_field(&member) {
-                self.observe_lits(site_kind, expression_literals(&field.expr));
+                self.observe_literals(site_kind, expression_literals(&field.expr));
             }
             self.visit_expr(&field.expr);
         }

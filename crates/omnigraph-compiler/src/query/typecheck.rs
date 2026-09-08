@@ -129,6 +129,7 @@ pub fn infer_query_result_schema(
             catalog,
             &projection.expr,
             projection.alias.as_deref(),
+            &query.order_clause,
             ctx,
             &params,
         )?;
@@ -159,26 +160,69 @@ fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropTy
     Ok(out)
 }
 
+/// Names beginning with `__` are the compiler's: lowering mints `__anon_N`
+/// for anonymous traversal endpoints and `__temp_<var>_N` for cycle-closing
+/// traversals, and the plan check refuses a name introduced twice, so a user
+/// variable spelled like one would fail there with a message about the
+/// plan. Refuse it here, once, with the reason.
+fn refuse_reserved_variable_names(clauses: &[Clause]) -> Result<()> {
+    fn check(name: &str) -> Result<()> {
+        if name.starts_with("__") {
+            return Err(CompilerError::Type(format!(
+                "variable `${name}`: names beginning with `__` are reserved for the compiler"
+            )));
+        }
+        Ok(())
+    }
+    for clause in clauses {
+        match clause {
+            Clause::Binding(binding) => check(&binding.variable)?,
+            Clause::Traversal(traversal) => {
+                check(&traversal.src)?;
+                check(&traversal.dst)?;
+                if let Some(edge) = &traversal.edge_binding {
+                    check(edge)?;
+                }
+            }
+            Clause::Filter(_) => {}
+            Clause::Negation(inner) => refuse_reserved_variable_names(inner)?,
+        }
+    }
+    Ok(())
+}
+
 fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
     let mut ctx = TypeContext {
         bindings: HashMap::new(),
         aliases: HashMap::new(),
         traversals: Vec::new(),
     };
-    let mut alias_exprs: HashMap<String, &Expr> = HashMap::new();
-
     let params = parse_declared_param_types(&query.params)?;
+
+    refuse_reserved_variable_names(&query.match_clause)?;
 
     // Typecheck match clauses
     typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;
 
     // Typecheck return projections
+    let mut result_columns: HashSet<String> = HashSet::new();
     for proj in &query.return_clause {
         let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
         reject_blob_read_value(&resolved, &proj.expr)?;
+        check_projection(&proj.expr, &query.order_clause)?;
+        // T25: one result column per name. The executor emits a batch with
+        // every projection's column under its executed name; two columns of
+        // one name survive the batch (Arrow allows it) and every reader that
+        // keys a row by column name keeps the last one, so the first value
+        // is lost without an error.
+        let column = executed_column_name(&proj.expr, proj.alias.as_deref());
+        if !result_columns.insert(column.clone()) {
+            return Err(CompilerError::Type(format!(
+                "T25: result column `{column}` is produced by more than one projection; give each projection its own alias"
+            )));
+        }
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
-            alias_exprs.insert(alias.clone(), &proj.expr);
         }
     }
 
@@ -191,11 +235,11 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     let has_standalone_nearest = query
         .order_clause
         .iter()
-        .any(|ord| expr_contains_standalone_nearest_with_aliases(&ord.expr, &alias_exprs));
+        .any(|ord| expr_contains_standalone_nearest(&ord.expr));
     let has_rrf = query
         .order_clause
         .iter()
-        .any(|ord| expr_contains_rrf_with_aliases(&ord.expr, &alias_exprs));
+        .any(|ord| expr_contains_rrf(&ord.expr));
     if has_rrf && query.limit.is_none() {
         return Err(CompilerError::Type(
             "T21: rrf ordering requires a limit clause".to_string(),
@@ -1215,7 +1259,7 @@ fn resolve_expr_type(
                     )));
                 }
                 return Ok(ResolvedType::Scalar(PropType::scalar(
-                    ScalarType::F64,
+                    ScalarType::F32,
                     false,
                 )));
             }
@@ -1252,7 +1296,7 @@ fn resolve_expr_type(
             }
 
             Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::F64,
+                ScalarType::F32,
                 false,
             )))
         }
@@ -1438,7 +1482,7 @@ fn resolve_expr_type(
             }
 
             Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::F64,
+                ScalarType::F32,
                 false,
             )))
         }
@@ -1463,10 +1507,10 @@ fn resolve_expr_type(
 
             for ty in [primary_ty, secondary_ty] {
                 match ty {
-                    ResolvedType::Scalar(s) if s.scalar == ScalarType::F64 && !s.list => {}
+                    ResolvedType::Scalar(s) if s.scalar == ScalarType::F32 && !s.list => {}
                     ResolvedType::Scalar(s) => {
                         return Err(CompilerError::Type(format!(
-                            "T21: rrf rank expressions must evaluate to F64, got {}",
+                            "T21: rrf rank expressions must evaluate to F32, got {}",
                             s.display_name()
                         )));
                     }
@@ -1540,33 +1584,7 @@ fn resolve_expr_type(
         Expr::Aggregate { func, arg } => {
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&arg_type, arg)?;
-
-            // T8: sum/avg require numeric; min/max require numeric or string
-            match func {
-                AggFunc::Sum | AggFunc::Avg => {
-                    if let ResolvedType::Scalar(s) = &arg_type
-                        && (s.list || !s.scalar.is_numeric())
-                    {
-                        return Err(CompilerError::Type(format!(
-                            "T8: {} requires numeric type, got {}",
-                            func,
-                            s.display_name()
-                        )));
-                    }
-                }
-                AggFunc::Min | AggFunc::Max => {
-                    if let ResolvedType::Scalar(s) = &arg_type
-                        && (s.list || (!s.scalar.is_numeric() && s.scalar != ScalarType::String))
-                    {
-                        return Err(CompilerError::Type(format!(
-                            "T8: {} requires numeric or string type, got {}",
-                            func,
-                            s.display_name()
-                        )));
-                    }
-                }
-                _ => {} // count works on any type
-            }
+            check_aggregate_argument(func, arg, &arg_type)?;
 
             Ok(ResolvedType::Aggregate)
         }
@@ -1602,10 +1620,75 @@ fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
     Ok(())
 }
 
+/// Exhaustive over `Expr`, so a new variant fails to compile here instead of
+/// reaching the executor's catch-all arm; a rank expression is projectable when
+/// it repeats the retrieval `order` executes (T33, `Expr::score_column`).
+fn check_projection(expr: &Expr, order_clause: &[Ordering]) -> Result<()> {
+    match expr {
+        Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::Literal(_) => Ok(()),
+        Expr::Aggregate { func, arg } => match arg.as_ref() {
+            Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => {
+                Err(CompilerError::Type(format!(
+                    "T32: `{}` under `{func}` in `return`: a retrieval selects the rows an aggregate counts; state the filter instead",
+                    rank_keyword(arg)
+                )))
+            }
+            inner => check_projection(inner, order_clause),
+        },
+        Expr::Nearest { .. } | Expr::Bm25 { .. } => {
+            let executed = order_clause.first().is_some_and(|lead| &lead.expr == expr);
+            if !executed {
+                return Err(CompilerError::Type(format!(
+                    "T33: `{}` in `return` must repeat the retrieval stated as the leading `order` key; the projection reads the score that ordering computed",
+                    rank_keyword(expr)
+                )));
+            }
+            if expr.score_column().is_none() {
+                return Err(CompilerError::Type(format!(
+                    "T33: `{}` projects its score only over a property field; name the property the retrieval ranks",
+                    rank_keyword(expr)
+                )));
+            }
+            Ok(())
+        }
+        Expr::Rrf { .. } => Err(CompilerError::Type(
+            "T37: `rrf` cannot be projected in `return`; order by `rrf(...)` and project plain columns"
+                .to_string(),
+        )),
+        Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. } => {
+            Err(CompilerError::Type(format!(
+                "T35: `{}` cannot be projected in `return`; a search predicate belongs in `match`",
+                rank_keyword(expr)
+            )))
+        }
+        Expr::AliasRef(name) => Err(CompilerError::Type(format!(
+            "T36: `{name}` cannot be projected in `return`; an alias is resolved in `order`, not projected again"
+        ))),
+    }
+}
+
+fn rank_keyword(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Nearest { .. } => "nearest",
+        Expr::Bm25 { .. } => "bm25",
+        Expr::Rrf { .. } => "rrf",
+        Expr::Search { .. } => "search",
+        Expr::Fuzzy { .. } => "fuzzy",
+        Expr::MatchText { .. } => "match_text",
+        Expr::Now
+        | Expr::PropAccess { .. }
+        | Expr::Variable(_)
+        | Expr::Literal(_)
+        | Expr::Aggregate { .. }
+        | Expr::AliasRef(_) => "expression",
+    }
+}
+
 fn infer_projection_field(
     catalog: &Catalog,
     expr: &Expr,
     alias: Option<&str>,
+    order_clause: &[Ordering],
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
 ) -> Result<Field> {
@@ -1618,6 +1701,8 @@ fn infer_projection_field(
             // unsupported Blob value.
             let resolved_arg = resolve_expr_type(catalog, arg, ctx, params)?;
             reject_blob_read_value(&resolved_arg, arg)?;
+            check_aggregate_argument(func, arg, &resolved_arg)?;
+            check_projection(expr, order_clause)?;
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
                 AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
@@ -1628,12 +1713,42 @@ fn infer_projection_field(
             };
             Ok(Field::new(name, data_type, nullable))
         }
+        Expr::Nearest { .. } | Expr::Bm25 { .. } => {
+            resolve_expr_type(catalog, expr, ctx, params)?;
+            check_projection(expr, order_clause)?;
+            Ok(Field::new(name, DataType::Float32, false))
+        }
         _ => {
             let resolved = resolve_expr_type(catalog, expr, ctx, params)?;
             reject_blob_read_value(&resolved, expr)?;
+            check_projection(expr, order_clause)?;
             let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
             Ok(Field::new(name, data_type, nullable))
         }
+    }
+}
+
+/// The column name a projection carries in the executed result batch
+/// (`exec/projection.rs`, `evaluate_projection` and the aggregate path): the
+/// alias when given, else `var.prop` for a property, the variable or
+/// parameter name for a bare variable, `literal` for a literal, and the
+/// argument's executed name for an aggregate; every other expression keeps
+/// `projection_name`'s spelling. `projection_name` is the inferred-schema
+/// spelling and names an unaliased property by the property alone; the two
+/// spellings drift for unaliased projections today, and this function
+/// follows the executor because T25 guards the batch the executor builds.
+pub fn executed_column_name(expr: &Expr, alias: Option<&str>) -> String {
+    if let Some(alias) = alias {
+        return alias.to_string();
+    }
+    match expr {
+        Expr::PropAccess { variable, property } => format!("{variable}.{property}"),
+        Expr::Variable(variable) => variable.clone(),
+        Expr::Literal(_) => "literal".to_string(),
+        Expr::Aggregate { arg, .. } => executed_column_name(arg, None),
+        // `now()` lowers to the hidden parameter and is named after it.
+        Expr::Now => crate::query::ast::NOW_PARAM_NAME.to_string(),
+        other => projection_name(other, None),
     }
 }
 
@@ -1647,14 +1762,55 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
         Expr::PropAccess { property, .. } => property.clone(),
         Expr::Variable(variable) => variable.clone(),
         Expr::Literal(_) => "literal".to_string(),
-        Expr::Nearest { .. } => "nearest".to_string(),
-        Expr::Search { .. } => "search".to_string(),
-        Expr::Fuzzy { .. } => "fuzzy".to_string(),
-        Expr::MatchText { .. } => "match_text".to_string(),
-        Expr::Bm25 { .. } => "bm25".to_string(),
-        Expr::Rrf { .. } => "rrf".to_string(),
+        Expr::Nearest { .. } | Expr::Bm25 { .. } => match expr.score_column() {
+            Some((variable, column)) => format!("{variable}.{column}"),
+            None => rank_keyword(expr).to_string(),
+        },
+        Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. } | Expr::Rrf { .. } => {
+            rank_keyword(expr).to_string()
+        }
         Expr::Aggregate { func, .. } => func.to_string(),
         Expr::AliasRef(name) => name.clone(),
+    }
+}
+
+/// T8: `count` takes a scalar or a node, `sum`/`avg` a numeric, `min`/`max` an
+/// orderable scalar; none takes an aggregate.
+fn check_aggregate_argument(func: &AggFunc, arg: &Expr, arg_type: &ResolvedType) -> Result<()> {
+    match (func, arg_type) {
+        (_, ResolvedType::Aggregate) => Err(CompilerError::Type(format!(
+            "T8: {func} cannot take an aggregate or a forward alias reference as its argument"
+        ))),
+        (AggFunc::Count, _) => Ok(()),
+        (_, ResolvedType::Node(_)) => {
+            let subject = match arg {
+                Expr::Variable(name) => format!("node binding `${name}`"),
+                Expr::AliasRef(alias) => format!("node projection `{alias}`"),
+                other => format!("node value `{other:?}`"),
+            };
+            Err(CompilerError::Type(format!(
+                "T8: {func} cannot take {subject} bare; access one of the node's properties (`$var.{{prop}}`)"
+            )))
+        }
+        (AggFunc::Sum | AggFunc::Avg, ResolvedType::Scalar(s))
+            if s.list || !s.scalar.is_numeric() =>
+        {
+            Err(CompilerError::Type(format!(
+                "T8: {} requires numeric type, got {}",
+                func,
+                s.display_name()
+            )))
+        }
+        (AggFunc::Min | AggFunc::Max, ResolvedType::Scalar(s))
+            if s.list || !s.scalar.is_orderable() =>
+        {
+            Err(CompilerError::Type(format!(
+                "T8: {} requires a numeric, String, Bool, Date, or DateTime scalar, got {}",
+                func,
+                s.display_name()
+            )))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1669,10 +1825,10 @@ fn resolved_type_to_field_shape(
                 CompilerError::Type(format!("type `{}` not found in catalog", type_name))
             })?;
             let fields: Vec<Field> = node_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
+                .node_object_fields()
+                .map(|field| {
+                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                })
                 .collect();
             Ok((DataType::Struct(fields.into()), false))
         }
@@ -1688,7 +1844,11 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
         Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
         Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
         Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
-        Literal::Date(_) => Ok(PropType::scalar(ScalarType::Date, false)),
+        Literal::Date(value) => {
+            crate::types::check_date_literal(value)
+                .map_err(|reason| CompilerError::Type(format!("T3: {reason}")))?;
+            Ok(PropType::scalar(ScalarType::Date, false))
+        }
         Literal::DateTime(_) => Ok(PropType::scalar(ScalarType::DateTime, false)),
         Literal::List(items) => {
             if items.is_empty() {
@@ -1855,49 +2015,28 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
     }
 }
 
-fn expr_contains_standalone_nearest_with_aliases(
-    expr: &Expr,
-    alias_exprs: &HashMap<String, &Expr>,
-) -> bool {
-    expr_contains_standalone_nearest_inner(expr, alias_exprs, &mut HashSet::new())
-}
-
-fn expr_contains_standalone_nearest_inner(
-    expr: &Expr,
-    alias_exprs: &HashMap<String, &Expr>,
-    seen_aliases: &mut HashSet<String>,
-) -> bool {
+/// T33 admits a projected rank expression only as a repeat of the leading
+/// `order` key, so an alias never leads the order and the walk stops at
+/// `AliasRef` (T18 refuses an alias key beside `nearest`).
+fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
     match expr {
         Expr::Nearest { .. } => true,
-        Expr::Aggregate { arg, .. } => {
-            expr_contains_standalone_nearest_inner(arg, alias_exprs, seen_aliases)
-        }
+        Expr::Aggregate { arg, .. } => expr_contains_standalone_nearest(arg),
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
         | Expr::Bm25 { field, query } => {
-            expr_contains_standalone_nearest_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_standalone_nearest_inner(query, alias_exprs, seen_aliases)
+            expr_contains_standalone_nearest(field) || expr_contains_standalone_nearest(query)
         }
         Expr::Fuzzy {
             field,
             query,
             max_edits,
         } => {
-            expr_contains_standalone_nearest_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_standalone_nearest_inner(query, alias_exprs, seen_aliases)
-                || max_edits.as_deref().is_some_and(|expr| {
-                    expr_contains_standalone_nearest_inner(expr, alias_exprs, seen_aliases)
-                })
-        }
-        Expr::AliasRef(name) => {
-            if !seen_aliases.insert(name.clone()) {
-                return false;
-            }
-            let found = alias_exprs.get(name).is_some_and(|expr| {
-                expr_contains_standalone_nearest_inner(expr, alias_exprs, seen_aliases)
-            });
-            seen_aliases.remove(name);
-            found
+            expr_contains_standalone_nearest(field)
+                || expr_contains_standalone_nearest(query)
+                || max_edits
+                    .as_deref()
+                    .is_some_and(expr_contains_standalone_nearest)
         }
         // nearest() nested under rrf() is handled by T21 and should not trigger T17/T18 checks.
         Expr::Rrf { .. } => false,
@@ -1905,44 +2044,21 @@ fn expr_contains_standalone_nearest_inner(
     }
 }
 
-fn expr_contains_rrf_with_aliases(expr: &Expr, alias_exprs: &HashMap<String, &Expr>) -> bool {
-    expr_contains_rrf_inner(expr, alias_exprs, &mut HashSet::new())
-}
-
-fn expr_contains_rrf_inner(
-    expr: &Expr,
-    alias_exprs: &HashMap<String, &Expr>,
-    seen_aliases: &mut HashSet<String>,
-) -> bool {
+fn expr_contains_rrf(expr: &Expr) -> bool {
     match expr {
         Expr::Rrf { .. } => true,
-        Expr::Aggregate { arg, .. } => expr_contains_rrf_inner(arg, alias_exprs, seen_aliases),
+        Expr::Aggregate { arg, .. } => expr_contains_rrf(arg),
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
-        | Expr::Bm25 { field, query } => {
-            expr_contains_rrf_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_rrf_inner(query, alias_exprs, seen_aliases)
-        }
+        | Expr::Bm25 { field, query } => expr_contains_rrf(field) || expr_contains_rrf(query),
         Expr::Fuzzy {
             field,
             query,
             max_edits,
         } => {
-            expr_contains_rrf_inner(field, alias_exprs, seen_aliases)
-                || expr_contains_rrf_inner(query, alias_exprs, seen_aliases)
-                || max_edits
-                    .as_deref()
-                    .is_some_and(|expr| expr_contains_rrf_inner(expr, alias_exprs, seen_aliases))
-        }
-        Expr::AliasRef(name) => {
-            if !seen_aliases.insert(name.clone()) {
-                return false;
-            }
-            let found = alias_exprs
-                .get(name)
-                .is_some_and(|expr| expr_contains_rrf_inner(expr, alias_exprs, seen_aliases));
-            seen_aliases.remove(name);
-            found
+            expr_contains_rrf(field)
+                || expr_contains_rrf(query)
+                || max_edits.as_deref().is_some_and(expr_contains_rrf)
         }
         _ => false,
     }

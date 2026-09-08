@@ -104,11 +104,15 @@ the delete is blocked again.
 
 ```bash
 omnigraph cluster status  --config ./company-brain
+omnigraph cluster observe --config ./company-brain
 omnigraph cluster refresh --config ./company-brain
 omnigraph cluster import  --config ./company-brain
 ```
 
 - `status` reads recorded state without changing resources.
+- `observe` reports what `refresh` would record, without taking the lock or
+  writing anything; the output is labeled `observed` and names the ledger
+  version it read. `plan --observe` does the same for a plan.
 - `refresh` updates observations for an existing state record.
 - `import` initializes state from declared resources when adopting an existing
   cluster.

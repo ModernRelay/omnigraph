@@ -1,4 +1,5 @@
 pub(crate) mod lower;
+pub(crate) mod validate;
 
 use std::collections::HashMap;
 

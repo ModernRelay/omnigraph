@@ -369,8 +369,9 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
     assert_eq!(got, vec!["b", "c"]);
 }
 
-// Self-loop a->a plus a->b: the self-edge is a genuine length-1 walk, so the
-// reach set is {a, b} (walk semantics); traversal must terminate. Cycle
+// Self-loop a->a plus a->b: the start node's own self-edge is a hop-1
+// destination, so the reach set is {a, b} (distance semantics; the start node
+// is never re-reached through a cycle); traversal must terminate. Cycle
 // pruning: see variable_hops_terminate_and_dedup_on_cycle.
 #[tokio::test]
 async fn variable_hops_handle_self_loop() {
@@ -388,9 +389,46 @@ async fn variable_hops_handle_self_loop() {
     assert_eq!(got, vec!["a", "b"]);
 }
 
+// Self-loop on a LATER node (b->b) under a range starting above 1: b is one
+// hop from a, so `{2,2}` returns only c. Before the fix the self-edge emitted
+// b again at hop 2. `{1,5}` is the control: a range starting at 1 already
+// deduped the re-emission through `seen_dst`, so its answer is unchanged.
+#[tokio::test]
+async fn pinned_range_does_not_re_reach_a_self_looped_node() {
+    const EXACTLY_2: &str = r#"
+query reach2($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{2,2} $f
+    }
+    return { $f.name }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"b"}
+{"edge":"Knows","from":"b","to":"c"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+
+    let p = params(&[("$name", "a")]);
+    let exactly_two = both_modes(&mut db, EXACTLY_2, "reach2", &p).await;
+    assert_eq!(
+        exactly_two,
+        vec!["c"],
+        "b is one hop away; its self-loop must not re-reach it at hop 2"
+    );
+    let ranged = both_modes(&mut db, REACH_5, "reach", &p).await;
+    assert_eq!(ranged, vec!["b", "c"], "a range starting at 1 is unchanged");
+}
+
 // A stored self-loop must appear in every single-hop spelling — directed,
-// undirected (docs/user/queries/index.md: "a self-loop, appears once"), and
-// bound-edge — and all three must agree.
+// undirected (docs/user/queries/index.md: set semantics for endpoint pairs,
+// so the loop appears once), and bound-edge — and all three must agree.
 #[tokio::test]
 async fn single_hop_self_loop_is_emitted_by_all_spellings() {
     const QUERIES: &str = r#"

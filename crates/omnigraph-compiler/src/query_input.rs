@@ -5,9 +5,15 @@ use serde_json::Value;
 
 use crate::error::CompilerError;
 use crate::ir::ParamMap;
-use crate::json_output::{JS_MAX_SAFE_INTEGER_U64, is_js_safe_integer_i64};
-use crate::query::ast::{Literal, Param, QueryDecl};
+use crate::query::ast::{Literal, Param, QueryDecl, QueryFile};
 use crate::query::parser::parse_query;
+
+const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
+const JS_MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
+
+fn is_js_safe_integer_i64(value: i64) -> bool {
+    (-JS_MAX_SAFE_INTEGER_I64..=JS_MAX_SAFE_INTEGER_I64).contains(&value)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonParamMode {
@@ -254,12 +260,13 @@ macro_rules! params {
 }
 
 pub fn find_named_query(query_source: &str, query_name: &str) -> RunInputResult<QueryDecl> {
-    let queries = parse_query(query_source)?;
-    queries
-        .queries
-        .into_iter()
-        .find(|query| query.name == query_name)
-        .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name)))
+    match parse_query(query_source)? {
+        QueryFile::Queries(queries) => queries
+            .into_iter()
+            .find(|query| query.name == query_name)
+            .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name))),
+        QueryFile::Branch(stmt) => Err(RunInputError::message(stmt.not_a_declaration_message())),
+    }
 }
 
 pub fn json_params_to_param_map(
@@ -421,7 +428,11 @@ fn json_value_to_literal_typed(
             Ok(Literal::Bool(value))
         }
         "Date" => match value {
-            Value::String(value) => Ok(Literal::Date(value.clone())),
+            Value::String(value) => {
+                crate::types::check_date_literal(value)
+                    .map_err(|reason| RunInputError::message(format!("param '{key}': {reason}")))?;
+                Ok(Literal::Date(value.clone()))
+            }
             other => Err(match mode {
                 JsonParamMode::Standard => {
                     RunInputError::message(format!("param '{}': expected date string", key))
@@ -785,6 +796,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "param 'id': integer 9007199254740992 exceeds JS safe integer range; pass a decimal string for exact values"
+        );
+    }
+
+    #[test]
+    fn find_named_query_refuses_a_branch_statement() {
+        let error = find_named_query("branch merge b0 into main", "b0")
+            .expect_err("a branch statement has no declaration to return");
+        assert_eq!(
+            error.to_string(),
+            "`branch merge` is a branch statement, not a query declaration"
         );
     }
 

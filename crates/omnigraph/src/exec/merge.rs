@@ -3512,23 +3512,13 @@ fn adopt_advances_head(
             target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
                 == Some(target_branch)
         }
-        // Source on main (pointer switch) or target doesn't own (fork): no advance.
         _ => false,
     }
 }
 
-/// Classify a table whose target state equals base (the adopt / fast-forward
-/// case). A proven insertion-only descendant becomes
-/// [`CandidateTableState::AdoptPureInserts`]; every other non-empty delta that
-/// advances target HEAD becomes [`CandidateTableState::AdoptWithDelta`] with
-/// its write payload pre-computed for recovery planning. Pointer switches and
-/// forks become [`CandidateTableState::AdoptSourceState`] and do not advance
-/// data HEAD.
-///
-/// The HEAD-advancing subcases mirror [`publish_adopted_source_state`]: source
-/// on a branch with the target either on main or owning the table. Computing the
-/// delta here (rather than inside the publish) is what closes the recovery gap —
-/// the classifier knows whether the publish will move Lance HEAD.
+/// Classify a table whose target equals base: a proven insertion-only descendant
+/// is `AdoptPureInserts`, any other HEAD-advancing delta is `AdoptWithDelta`, a
+/// pointer switch or fork is `AdoptSourceState` (RFC 0062 orders the switch).
 async fn classify_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -3623,14 +3613,12 @@ async fn classify_general_adopt(
 }
 
 /// What publishing a table's adopted source state does to `__manifest`.
-///
 /// An empty delta does not imply an empty publish: source and target can hold
-/// the same content at different Lance versions. Planning purely lets
-/// classification drop a table whose registration is already stored, which the
-/// registry guard would otherwise reject (#473).
+/// the same content at different Lance versions (#473).
 #[must_use = "the adopt plan decides whether this table is a merge candidate"]
 enum AdoptPublish {
-    /// The planned registration is field-for-field the stored entry.
+    /// The planned registration is field-for-field the stored entry
+    /// (`reregisters_current_entry`).
     Nothing,
     /// A pointer switch onto a lineage the target can already read.
     Pointer(crate::db::DatasetUpdate),
@@ -3642,11 +3630,8 @@ enum AdoptPublish {
     },
 }
 
-/// Plan what adopting the source's table state publishes, without an effect.
-///
-/// Reaching a branch-bearing arm means the delta was empty: the HEAD-advancing
-/// case is classified [`CandidateTableState::AdoptWithDelta`] and published by
-/// [`publish_adopted_delta`].
+/// Plan what adopting the source's table state publishes, without an effect;
+/// reaching a branch-bearing arm means the delta was empty.
 fn plan_adopted_source_state(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
@@ -3781,16 +3766,12 @@ mod adopt_plan_tests {
             native_dataset_branch: branch.map(ToOwned::to_owned),
             entity_count: row_count,
             version_metadata: metadata(manifest_path),
+            manifest_version: 0,
         }
     }
 
     /// The #473 shape: the source advanced two Lance versions on a branch and
     /// came back to the target's content. The plan must be `Nothing`.
-    ///
-    /// This pins the classification layer specifically. The publisher's
-    /// widened registry guard also lets the redundant registration through, so
-    /// no integration test can tell the two layers apart and a revert of this
-    /// one would otherwise go unnoticed.
     #[test]
     fn net_zero_source_on_a_branch_plans_nothing() {
         let target = entry(2, None, 3, "manifest-v2");
@@ -4850,6 +4831,95 @@ impl Omnigraph {
         Box::pin(self.branch_merge_impl(source, target, actor_id)).await
     }
 
+    /// The merge base over the two captured lineages, with the records of
+    /// merged parents that live in other branches read from those branches;
+    /// a record no live branch holds leaves the walk at the base it found.
+    async fn resolve_merge_base(
+        &self,
+        source_commits: &crate::db::commit_graph::CommitGraphSnapshot,
+        target_commits: &crate::db::commit_graph::CommitGraphSnapshot,
+        source_commit_id: &str,
+        target_commit_id: &str,
+        merging_branches: &[Option<&str>],
+    ) -> Result<crate::db::commit_graph::GraphCommit> {
+        let mut imported = HashMap::new();
+        let mut other_branches: Option<Vec<String>> = None;
+        loop {
+            let search = CommitGraph::merge_base_search(
+                source_commits,
+                target_commits,
+                &imported,
+                source_commit_id,
+                target_commit_id,
+            );
+            let resolved =
+                search.unresolved_source.is_empty() && search.unresolved_target.is_empty();
+            let next_branch = if resolved {
+                None
+            } else {
+                if other_branches.is_none() {
+                    other_branches = Some(
+                        self.branch_list()
+                            .await?
+                            .into_iter()
+                            .filter(|branch| {
+                                !merging_branches.contains(&Some(branch.as_str()))
+                                    && !(branch == "main" && merging_branches.contains(&None))
+                            })
+                            .collect(),
+                    );
+                }
+                other_branches.as_mut().and_then(Vec::pop)
+            };
+            let Some(branch) = next_branch else {
+                let both_sides: Vec<&String> = search
+                    .unresolved_source
+                    .iter()
+                    .filter(|id| search.unresolved_target.contains(id))
+                    .collect();
+                if !both_sides.is_empty() {
+                    tracing::warn!(
+                        commits = ?both_sides,
+                        "merge lineage names commits no live branch holds that both branches \
+                         descend from; the merge base may be older than the true one"
+                    );
+                } else if !resolved {
+                    tracing::debug!(
+                        source = ?search.unresolved_source,
+                        target = ?search.unresolved_target,
+                        "merge lineage names commits no live branch holds; the merge base is \
+                         chosen from the reachable history"
+                    );
+                }
+                return search.base.ok_or_else(|| {
+                    OmniError::manifest(
+                        "captured branch commits are unavailable or have no common ancestor"
+                            .to_string(),
+                    )
+                });
+            };
+            let branch = Some(branch.as_str()).filter(|b| *b != "main");
+            let rows = match ManifestCoordinator::read_graph_lineage_at(self.uri(), branch).await {
+                Ok((rows, _)) => rows,
+                Err(OmniError::BranchNotFound { .. }) => {
+                    tracing::debug!(
+                        branch = ?branch,
+                        "branch listed for merge-base resolution was deleted before its \
+                         lineage was read"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for row in rows {
+                let commit = crate::db::commit_graph::graph_commit_from_manifest_row(row);
+                imported
+                    .entry(commit.graph_commit_id.clone())
+                    .or_insert(commit);
+            }
+        }
+    }
+
     async fn branch_merge_impl(
         &self,
         source: &str,
@@ -4908,17 +4978,15 @@ impl Omnigraph {
             .effective_graph_head
             .clone()
             .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
-        let base_commit = CommitGraph::merge_base_from_snapshots(
-            source_commits,
-            target_commits,
-            &source_head_commit_id,
-            &target_head_commit_id,
-        )
-        .ok_or_else(|| {
-            OmniError::manifest(
-                "captured branch commits are unavailable or have no common ancestor".to_string(),
+        let base_commit = self
+            .resolve_merge_base(
+                &source_commits,
+                &target_commits,
+                &source_head_commit_id,
+                &target_head_commit_id,
+                &relevant_branches,
             )
-        })?;
+            .await?;
 
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id
@@ -5058,6 +5126,7 @@ impl Omnigraph {
             }),
         };
         let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
+        let mut fenced_but_unpublished_table_keys: Vec<String> = Vec::new();
         let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
         let mut blob_table_keys = HashSet::new();
         let mut blob_selection = crate::table_store::PersistedBlobSelection::default();
@@ -5088,7 +5157,7 @@ impl Omnigraph {
             let has_blob = schema_has_blob(&schema_for_table_key(catalog, table_key)?)?;
             if !has_blob {
                 if same_manifest_state(base_entry, target_entry) {
-                    if let Some(candidate) = classify_adopt(
+                    match classify_adopt(
                         self,
                         catalog,
                         base_snapshot,
@@ -5100,7 +5169,10 @@ impl Omnigraph {
                     )
                     .await?
                     {
-                        candidates.insert(table_key.clone(), candidate);
+                        Some(candidate) => {
+                            candidates.insert(table_key.clone(), candidate);
+                        }
+                        None => fenced_but_unpublished_table_keys.push(table_key.clone()),
                     }
                 } else {
                     let table_walk_timing = crate::instrumentation::start_merge_timing(
@@ -5301,8 +5373,11 @@ impl Omnigraph {
                     )
                     .await?
                 };
-                if let Some(candidate) = candidate {
-                    candidates.insert(table_key.clone(), candidate);
+                match candidate {
+                    Some(candidate) => {
+                        candidates.insert(table_key.clone(), candidate);
+                    }
+                    None => fenced_but_unpublished_table_keys.push(table_key.clone()),
                 }
                 continue;
             }
@@ -5475,6 +5550,7 @@ impl Omnigraph {
 
         let expected_versions = candidates
             .keys()
+            .chain(fenced_but_unpublished_table_keys.iter())
             .filter_map(|table_key| {
                 let identity = target_snapshot
                     .dataset(table_key)
@@ -5489,6 +5565,12 @@ impl Omnigraph {
                             .dataset(table_key)
                             .map(|entry| entry.published_dataset_version)
                             .unwrap_or(0),
+                        native_ref: match target_snapshot.dataset(table_key) {
+                            Some(entry) => crate::db::manifest::NativeRefPin::Exact(
+                                entry.native_dataset_branch.clone(),
+                            ),
+                            None => crate::db::manifest::NativeRefPin::Unchecked,
+                        },
                     },
                 ))
             })

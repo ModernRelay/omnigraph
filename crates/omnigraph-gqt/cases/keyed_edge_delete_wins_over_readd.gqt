@@ -1,0 +1,66 @@
+# issue: none
+# notes: keyed twin of issue_681_sibling_merge_readopts_deleted_edge.gqt: with @key(src, dst) (RFC 0044) b0's
+# notes: re-insert upserts the same row, so b1's delete wins in both merges and the pair stays gone.
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    @key(src, dst)
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate
+branch create b1
+
+--- expect ok
+
+--- mutate branch: b0
+query readd() {
+    insert Knows { from: "alice", to: "bob" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: b1
+query delete() {
+    delete Knows where from = "alice"
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge b1
+
+--- expect ok
+
+--- mutate
+branch merge b0
+
+--- expect ok
+
+--- query
+query edges_on_main() {
+    match {
+        $a: Person
+        $a knows $b
+    }
+    return { $a.name, $b.name }
+}
+
+--- expect unordered
+
+--- expect shape
+a.name: String
+b.name: String

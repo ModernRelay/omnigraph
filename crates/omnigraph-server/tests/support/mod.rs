@@ -2,6 +2,8 @@
 //! from the monolithic tests/server.rs in the modularization).
 #![allow(dead_code)]
 
+pub mod data_tokens;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

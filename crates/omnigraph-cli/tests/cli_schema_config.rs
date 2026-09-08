@@ -127,6 +127,20 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
 }
 
 #[test]
+fn schema_show_preserves_plain_source_and_json_contract() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let source = fs::read_to_string(fixture("test.pg")).unwrap();
+
+    let plain = output_success(cli().args(["schema", "show"]).arg(&graph));
+    assert_eq!(stdout_string(&plain).trim_end(), source.trim_end());
+    let json = output_success(cli().args(["schema", "show", "--json"]).arg(&graph));
+    let payload: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(payload, serde_json::json!({ "schema_source": source }));
+}
+
+#[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());

@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::Result;
-use omnigraph_server::{ServerConfig, init_tracing, load_server_settings, serve};
+use omnigraph_server::{
+    init_tracing, load_server_settings, load_server_settings_with_data_token_trust,
+    resolve_shutdown_grace, serve, serve_with_data_token_trust,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph-server")]
@@ -21,9 +24,13 @@ struct Cli {
     cluster: Option<PathBuf>,
     #[arg(long)]
     bind: Option<String>,
-    /// Run without bearer tokens and without a policy file (MR-723).
-    /// Required when neither is configured — otherwise the server
-    /// refuses to start to prevent shipping the illusion of protection.
+    /// Public JSON trust for offline signed data credentials (RFC 0053).
+    /// Its canonical root must match this serving snapshot. Read once at boot.
+    #[arg(long)]
+    data_token_trust: Option<PathBuf>,
+    /// Run without credential sources and without a policy file (MR-723).
+    /// Required when no static tokens, signed-token trust, or policy is
+    /// configured — otherwise startup refuses to prevent an unprotected deployment.
     /// Equivalent to setting `OMNIGRAPH_UNAUTHENTICATED=1`.
     #[arg(long)]
     unauthenticated: bool,
@@ -32,6 +39,13 @@ struct Cli {
     /// serve. Equivalent to setting `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
     #[arg(long)]
     require_all_graphs: bool,
+    /// Bound on graceful shutdown, in seconds (RFC 0049): readiness turns off
+    /// at the signal, in-flight requests drain, and at the deadline the
+    /// process exits 2. Zero cuts off immediately. Equivalent to
+    /// `OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`; default 25. The orchestrator's own
+    /// termination grace must be longer.
+    #[arg(long)]
+    shutdown_grace_seconds: Option<u64>,
 }
 
 #[tokio::main]
@@ -40,12 +54,29 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let settings: ServerConfig = load_server_settings(
-        cli.cluster.as_ref(),
-        cli.bind,
-        cli.unauthenticated,
-        cli.require_all_graphs,
-    )
-    .await?;
-    serve(settings).await
+    match cli.data_token_trust {
+        Some(trust_path) => {
+            let settings = load_server_settings_with_data_token_trust(
+                cli.cluster.as_ref(),
+                cli.bind,
+                cli.unauthenticated,
+                cli.require_all_graphs,
+                &trust_path,
+            )
+            .await?
+            .with_shutdown_grace(resolve_shutdown_grace(cli.shutdown_grace_seconds)?);
+            serve_with_data_token_trust(settings).await
+        }
+        None => {
+            let mut settings = load_server_settings(
+                cli.cluster.as_ref(),
+                cli.bind,
+                cli.unauthenticated,
+                cli.require_all_graphs,
+            )
+            .await?;
+            settings.shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
+            serve(settings).await
+        }
+    }
 }
