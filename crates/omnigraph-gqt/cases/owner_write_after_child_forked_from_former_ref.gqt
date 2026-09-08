@@ -1,0 +1,124 @@
+# issue: none
+# red_on: 2026-09-08, PR 662 @ 2850d86f with the pointer switch: the owner's write armed recovery, its reclaim failed on the former ref's dependent fork, and the next open failed with `cannot discard unpublished fork … parent version is 2, expected exact fork point 4`.
+# notes: After the switch, a child that writes the table forks from the former ref, so that ref
+# notes: is no longer pinned but is the parent of the child's fork. The owner's next write must
+# notes: refuse before arming, name the dependent child, and leave the graph openable; deleting
+# notes: the child is the exit, after which the owner's write reclaims the ref and succeeds.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query feature_write() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create child from feature
+
+--- expect ok
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query main_write() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- mutate branch: child
+query child_writes() {
+    insert Person { name: "carol", age: 1 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: feature
+query owner_writes_after_child_wrote() {
+    update Person set { age: 34 } where name = "alice"
+}
+
+--- expect error: dependent child branches
+
+--- restart
+
+--- query branch: child
+query child_reads_after_restart() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"carol","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: feature
+query feature_reads_after_restart() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate branch: child
+query child_writes_again() {
+    insert Person { name: "dave", age: 2 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch delete child
+
+--- expect ok
+
+--- mutate branch: feature
+query owner_writes_after_child_deleted() {
+    update Person set { age: 34 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: feature
+query feature_reads_own_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":34}
+
+--- expect shape
+p.name: String
+p.age: I32

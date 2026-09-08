@@ -116,6 +116,9 @@ pub(crate) struct CommitOutcome {
     /// no lineage was recorded or the commit is the genesis. Lets the caller
     /// update its in-memory commit cache without re-reading the manifest.
     pub parent_commit_id: Option<String>,
+    /// Installed only after the graph coordinator has adopted its lineage.
+    /// Absent if the successful publisher attempt had a different base.
+    projection: Option<Box<ProjectionAccumulator>>,
 }
 
 /// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
@@ -195,6 +198,31 @@ pub struct Snapshot {
     /// snapshots, time-travel / Snapshot-id reads, and directly-built test
     /// snapshots, which fall back to a plain open.
     read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
+}
+
+/// Ephemeral native-table liveness proof derived from every live graph branch.
+/// Never persist or reuse this across the control-gate envelope that captured it.
+pub(crate) struct NativeForkReferences {
+    referenced: HashSet<(TableIdentity, String)>,
+    owned: HashSet<(TableIdentity, String)>,
+}
+
+impl NativeForkReferences {
+    pub(crate) fn contains(&self, identity: TableIdentity, native: &str) -> bool {
+        self.referenced.contains(&(identity, native.to_string()))
+    }
+
+    pub(crate) fn owner_contains(&self, identity: TableIdentity, native: &str) -> bool {
+        self.owned.contains(&(identity, native.to_string()))
+    }
+}
+
+pub(crate) fn detached_native_lineage_error(table_key: &str, native: &str) -> OmniError {
+    OmniError::manifest(format!(
+        "table '{table_key}' has detached native lineage '{native}' still pinned by another graph branch; \
+         writing would destroy that branch's history. Create a new branch from this branch's current \
+         snapshot and write there"
+    ))
 }
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
@@ -898,8 +926,8 @@ pub(crate) struct ManifestCoordinator {
     /// O(history). The tag is the staleness fence: a path that advances
     /// `dataset` without folding must clear this, and a missed clear is
     /// caught by the tag mismatch — stale accumulators degrade to a full
-    /// scan, never serve as current. One extra lineage-row copy beside the
-    /// commit graph's; the maps are O(tables + branches).
+    /// scan, never serve as current. Lineage remains owned by the commit graph;
+    /// these maps are O(table lifetimes + branches), including retired tables.
     projection: Option<(u64, ProjectionAccumulator)>,
 }
 
@@ -913,6 +941,26 @@ pub(crate) enum LineageRefresh {
 }
 
 impl ManifestCoordinator {
+    /// Take an operation-local copy of this exact immutable view. The caller
+    /// still checks its authority after acquiring the operation's gates.
+    pub(crate) fn capture(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            dataset: self.dataset.clone(),
+            known_state: self.known_state.clone(),
+            active_branch: self.active_branch.clone(),
+            native_branch: self.native_branch.clone(),
+            branch_identifier: self.branch_identifier.clone(),
+            publisher: Arc::clone(&self.publisher),
+            // Native controls use this exact state and then discard the
+            // capture; they never incrementally refresh or publish content.
+            // Avoid copying accumulators that also retain retired table
+            // lifetimes. A future refresh of this copy safely takes the full
+            // reconstruction path.
+            projection: None,
+        }
+    }
+
     fn default_batch_publisher(
         root_uri: &str,
         active_branch: Option<&str>,
@@ -1133,8 +1181,8 @@ impl ManifestCoordinator {
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
         // Boxed wholesale for the same stack-depth reason as
         // `refresh_with_lineage`: this body now builds the projection
-        // accumulators and is awaited inside the merge future via
-        // coordinator swaps.
+        // accumulators and is awaited inside merge authority capture and
+        // publication.
         Box::pin(Self::open_with_lineage_inner(
             root_uri,
             branch,
@@ -1204,16 +1252,79 @@ impl ManifestCoordinator {
         delete_target_native: &str,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<bool> {
+        let snapshot =
+            Self::snapshot_native_under_control_gates(root_uri, candidate_native, control_session)
+                .await?;
+        Ok(snapshot
+            .datasets()
+            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target_native)))
+    }
+
+    /// Read one exact native manifest ref for a control-plane liveness proof.
+    /// The caller must hold the schema-control gate (and the target's ordinary
+    /// branch/table gates before destroying it), or full recovery quiescence.
+    /// Native refs must come from a listing in that same envelope. This does
+    /// not capture a BranchIdentifier and must not serve general reads or OCC.
+    pub(crate) async fn snapshot_native_under_control_gates(
+        root_uri: &str,
+        candidate_native: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Snapshot> {
         let root = root_uri.trim_end_matches('/');
         // The caller resolved every candidate from one listing; open the
         // native ref directly rather than paying a listing per branch.
         let dataset =
             open_manifest_dataset_native_with_session(root, candidate_native, control_session)
                 .await?;
-        let snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
-        Ok(snapshot
-            .datasets()
-            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target_native)))
+        Ok(Self::snapshot_from_state(
+            root,
+            read_manifest_state(&dataset).await?,
+        ))
+    }
+
+    /// Prove native-table liveness from main and every live branch, including
+    /// lazy borrowers whose logical owner no longer uses the ref. Any unreadable
+    /// branch fails the entire proof closed. See the control-envelope contract
+    /// on `snapshot_native_under_control_gates`.
+    pub(crate) async fn native_fork_references_under_control_gates(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<NativeForkReferences> {
+        let root = root_uri.trim_end_matches('/');
+        let main = open_manifest_dataset_native_with_session(root, None, control_session).await?;
+        let mut branches: Vec<_> = list_branch_contents(&main)
+            .await?
+            .into_keys()
+            .filter(|name| name != "main")
+            .collect();
+        branches.sort();
+        let mut references = NativeForkReferences {
+            referenced: HashSet::new(),
+            owned: HashSet::new(),
+        };
+        let mut add = |native: Option<&str>, snapshot: Snapshot| {
+            for entry in snapshot.datasets() {
+                if let Some(table_native) = entry.native_dataset_branch.as_deref() {
+                    let key = (entry.identity, table_native.to_string());
+                    references.referenced.insert(key.clone());
+                    if native == Some(table_native) {
+                        references.owned.insert(key);
+                    }
+                }
+            }
+        };
+        add(
+            None,
+            Self::snapshot_from_state(root, read_manifest_state(&main).await?),
+        );
+        for native in branches {
+            add(
+                Some(&native),
+                Self::snapshot_native_under_control_gates(root, Some(&native), control_session)
+                    .await?,
+            );
+        }
+        Ok(references)
     }
 
     /// Return a Snapshot from the known manifest state. No storage I/O.
@@ -1363,7 +1474,7 @@ impl ManifestCoordinator {
             return Ok(None);
         }
 
-        // Exception safety: fold a compact O(tables + branches) clone and
+        // Exception safety: fold an O(table lifetimes + branches) clone and
         // install only after every row classification succeeds.
         let mut folded = projection.clone();
         for (fragment, offsets) in &dead_head_rows {
@@ -1563,6 +1674,7 @@ impl ManifestCoordinator {
             return Ok(CommitOutcome {
                 version: self.version(),
                 parent_commit_id: None,
+                projection: None,
             });
         }
 
@@ -1570,23 +1682,42 @@ impl ManifestCoordinator {
             dataset,
             parent_commit_id,
             known_state,
+            base_incarnation,
+            projection,
         } = self
             .publisher
             .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
             .await?;
+        let retain_projection = self.projection.as_ref().is_some_and(|(version, _)| {
+            *version == self.version()
+                && base_incarnation.as_ref().is_some_and(|base| {
+                    base.matches(&self.incarnation())
+                        && (dataset.version().version == base.version
+                            || base.version.checked_add(1) == Some(dataset.version().version))
+                })
+        });
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
         // so adopt it directly instead of an O(fragments) `read_manifest_state`.
         self.dataset = dataset;
         self.known_state = known_state;
-        // The projection accumulators do not ride this fold — cleared so a
-        // later incremental refresh cannot serve the pre-publish lineage as
-        // "unchanged" (the staleness fence on the `projection` field).
+        // Until the caller has adopted the committed lineage, refresh must
+        // still rebuild it. This also covers failures after durable publication
+        // and compatibility callers that do not maintain a graph cache.
         self.projection = None;
         Ok(CommitOutcome {
             version: self.version(),
             parent_commit_id,
+            projection: if retain_projection { projection } else { None },
         })
+    }
+
+    /// Complete the in-memory handoff after the caller updated its graph cache.
+    /// An intervening foreign publish keeps the existing full-refresh path.
+    pub(crate) fn acknowledge_published_lineage(&mut self, outcome: &mut CommitOutcome) {
+        if outcome.version == self.version() {
+            self.projection = outcome.projection.take().map(|p| (outcome.version, *p));
+        }
     }
 
     /// Project the graph-lineage rows out of `__manifest` at `branch` without an
@@ -1759,20 +1890,28 @@ impl ManifestCoordinator {
         Ok(all)
     }
 
-    /// Every live native branch ref except `main`, sorted. Cleanup compares
-    /// per-table fork refs against exactly this set.
-    pub(crate) async fn list_native_graph_branches(&self) -> Result<Vec<String>> {
+    /// One operation-local branch listing for deletion's namespace and
+    /// ancestry checks. The caller holds the schema-control gate, so no native
+    /// branch create/delete can intervene in the supported control envelope.
+    pub(crate) async fn native_branches_and_descendants(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
         let branches = list_branch_contents(&self.dataset).await?;
-        let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
-        names.sort();
-        Ok(names)
+        let descendants = Self::descendants_from_branch_contents(name, &branches)?;
+        let mut natives = branches
+            .into_keys()
+            .filter(|native| native != "main")
+            .collect::<Vec<_>>();
+        natives.sort();
+        Ok((natives, descendants))
     }
 
-    /// Logical names of every branch forked (transitively) from `name`.
-    /// Lance records parents by native ref, so the walk runs on native names
-    /// and maps each child back to its logical name.
-    pub async fn descendant_branches(&self, name: &str) -> Result<Vec<String>> {
-        let branches = list_branch_contents(&self.dataset).await?;
+    /// Walk Lance's native parents and return logical descendant names.
+    fn descendants_from_branch_contents(
+        name: &str,
+        branches: &HashMap<String, lance::dataset::refs::BranchContents>,
+    ) -> Result<Vec<String>> {
         let Some(native) =
             crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), name)?
         else {

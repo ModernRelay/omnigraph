@@ -546,7 +546,8 @@ impl Display for MergePhaseTopologyError {
 /// Runner-v1 admits only its declared non-fast-forward general three-way
 /// route. `KeyedStage` and `KeyedCommit` are sub-buckets of
 /// `PhysicalPublish`; their expected interval count is the route's admitted
-/// merge-insert call count. Additive unknown phases remain valid only when
+/// constructive adapter call count (upsert, known-present update, and fenced
+/// insert). Additive unknown phases remain valid only when
 /// observed; a new zero-count phase must be classified here before the compact
 /// stored representation may omit it.
 pub(crate) fn validate_successful_merge_phase_topology(
@@ -564,54 +565,67 @@ pub(crate) fn validate_successful_merge_phase_topology(
             ),
         ));
     }
-    if route.stage_merge_insert_calls < expected_table_walks {
-        return Err(MergePhaseTopologyError::new(
-            "phase_topology_mismatch",
-            format!(
-                "route.stage_merge_insert_calls must be at least the diverged-table count: minimum={expected_table_walks}, observed={}",
-                route.stage_merge_insert_calls
-            ),
-        ));
-    }
-    if route.stage_merge_insert_rows < route.stage_merge_insert_calls {
-        return Err(MergePhaseTopologyError::new(
-            "phase_topology_mismatch",
-            format!(
-                "route.stage_merge_insert_rows must be at least the merge-insert call count: minimum={}, observed={}",
-                route.stage_merge_insert_calls, route.stage_merge_insert_rows
-            ),
-        ));
-    }
-    for (field, observed) in [
+    let mut constructive_calls = 0_u64;
+    let mut constructive_rows = 0_u64;
+    for (adapter, calls, rows) in [
         (
-            "route.stage_known_present_update_calls",
-            route.stage_known_present_update_calls,
+            "stage_merge_insert",
+            route.stage_merge_insert_calls,
+            route.stage_merge_insert_rows,
         ),
         (
-            "route.stage_known_present_update_rows",
+            "stage_known_present_update",
+            route.stage_known_present_update_calls,
             route.stage_known_present_update_rows,
         ),
         (
-            "route.stage_fenced_insert_calls",
+            "stage_fenced_insert",
             route.stage_fenced_insert_calls,
-        ),
-        (
-            "route.stage_fenced_insert_rows",
             route.stage_fenced_insert_rows,
         ),
-        (
-            "route.strict_insert_preflight_calls",
-            route.strict_insert_preflight_calls,
-        ),
     ] {
-        if observed != 0 {
+        if rows < calls || (calls == 0 && rows != 0) {
             return Err(MergePhaseTopologyError::new(
                 "phase_topology_mismatch",
                 format!(
-                    "{field} is not part of the general three-way route: expected=0, observed={observed}"
+                    "route.{adapter}_rows must cover every nonempty call and be zero without calls: calls={calls}, rows={rows}"
                 ),
             ));
         }
+        constructive_calls = constructive_calls.checked_add(calls).ok_or_else(|| {
+            MergePhaseTopologyError::new(
+                "phase_topology_overflow",
+                "constructive adapter call total does not fit u64".to_string(),
+            )
+        })?;
+        constructive_rows = constructive_rows.checked_add(rows).ok_or_else(|| {
+            MergePhaseTopologyError::new(
+                "phase_topology_overflow",
+                "constructive adapter row total does not fit u64".to_string(),
+            )
+        })?;
+    }
+    // General fixtures may update existing rows or insert disjoint rows on
+    // diverged sides. Exact-content verification owns those logical results;
+    // this gate requires constructive work plus the declared general walks.
+    if constructive_calls < expected_table_walks {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "constructive adapter calls must be at least the diverged-table count: minimum={expected_table_walks}, observed={constructive_calls}"
+            ),
+        ));
+    }
+    // General-route inserts use exact target preflight. A provenance shortcut
+    // has no preflight and is still refused by this route's phase contract.
+    if route.strict_insert_preflight_calls != route.stage_fenced_insert_calls {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "route.strict_insert_preflight_calls must match general-route fenced insert calls: expected={}, observed={}",
+                route.stage_fenced_insert_calls, route.strict_insert_preflight_calls
+            ),
+        ));
     }
 
     let mut by_name = BTreeMap::new();
@@ -750,12 +764,12 @@ pub(crate) fn validate_successful_merge_phase_topology(
     let keyed_commit = by_name.get("KeyedCommit").copied();
     for (name, phase) in [("KeyedStage", keyed_stage), ("KeyedCommit", keyed_commit)] {
         match phase {
-            Some(phase) if phase.interval_count != route.stage_merge_insert_calls => {
+            Some(phase) if phase.interval_count != constructive_calls => {
                 return Err(MergePhaseTopologyError::new(
                     "phase_topology_mismatch",
                     format!(
                         "{name} interval_count mismatch: expected={}, observed={}",
-                        route.stage_merge_insert_calls, phase.interval_count
+                        constructive_calls, phase.interval_count
                     ),
                 ));
             }
@@ -763,8 +777,7 @@ pub(crate) fn validate_successful_merge_phase_topology(
                 return Err(MergePhaseTopologyError::new(
                     "missing_phase_evidence",
                     format!(
-                        "successful general merge has {} merge-insert calls but is missing required phase `{name}`",
-                        route.stage_merge_insert_calls
+                        "successful general merge has {constructive_calls} constructive calls but is missing required phase `{name}`"
                     ),
                 ));
             }
@@ -3179,23 +3192,116 @@ mod tests {
             MergePhaseEvidenceForm::StoredSample,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("stage_merge_insert_calls"));
+        assert!(error.to_string().contains("constructive adapter calls"));
 
-        let mut wrong_route = general_route(2);
-        wrong_route.stage_known_present_update_calls = 1;
-        wrong_route.stage_known_present_update_rows = 1;
+        for (upserts, updates, inserts) in [(2, 0, 0), (0, 2, 0), (0, 0, 2), (0, 2, 2), (1, 1, 1)] {
+            let mut split_route = general_route(upserts);
+            split_route.stage_known_present_update_calls = updates;
+            split_route.stage_known_present_update_rows = updates;
+            split_route.stage_fenced_insert_calls = inserts;
+            split_route.stage_fenced_insert_rows = inserts;
+            split_route.strict_insert_preflight_calls = inserts;
+            let keyed_calls = upserts + updates + inserts;
+            let split_phases = test_general_merge_stored_phases(2, keyed_calls);
+            validate_successful_merge_phase_topology(
+                &split_phases,
+                &split_route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap();
+            let mut raw_split_phases = split_phases;
+            raw_split_phases.push(phase("ProvenInsertHistory", 0, 0, 0));
+            raw_split_phases.push(phase("ProvenInsertPlanScan", 0, 0, 0));
+            validate_successful_merge_phase_topology(
+                &raw_split_phases,
+                &split_route,
+                2,
+                MergePhaseEvidenceForm::RawSnapshot,
+            )
+            .unwrap();
+        }
+
+        let mut wrong_keyed_count = general_route(2);
+        wrong_keyed_count.stage_known_present_update_calls = 1;
+        wrong_keyed_count.stage_known_present_update_rows = 1;
         let error = validate_successful_merge_phase_topology(
             &phases,
-            &wrong_route,
+            &wrong_keyed_count,
             2,
             MergePhaseEvidenceForm::StoredSample,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("stage_known_present_update_calls")
-        );
+        assert!(error.to_string().contains("KeyedStage interval_count"));
+
+        let mut insufficient_constructive_work = general_route(0);
+        insufficient_constructive_work.stage_fenced_insert_calls = 1;
+        insufficient_constructive_work.stage_fenced_insert_rows = 1;
+        insufficient_constructive_work.strict_insert_preflight_calls = 1;
+        let error = validate_successful_merge_phase_topology(
+            &phases,
+            &insufficient_constructive_work,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("diverged-table count"));
+
+        let mut split_route = general_route(0);
+        split_route.stage_known_present_update_calls = 2;
+        split_route.stage_known_present_update_rows = 2;
+        split_route.stage_fenced_insert_calls = 2;
+        split_route.stage_fenced_insert_rows = 2;
+        for preflights in [0, 1, 3] {
+            split_route.strict_insert_preflight_calls = preflights;
+            let error = validate_successful_merge_phase_topology(
+                &test_general_merge_stored_phases(2, 4),
+                &split_route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("strict_insert_preflight_calls"));
+        }
+        split_route.strict_insert_preflight_calls = 2;
+        for (updates, update_rows, inserts, insert_rows, field) in [
+            (2, 0, 2, 2, "stage_known_present_update_rows"),
+            (0, 2, 2, 2, "stage_known_present_update_rows"),
+            (2, 2, 2, 0, "stage_fenced_insert_rows"),
+            (2, 2, 0, 2, "stage_fenced_insert_rows"),
+        ] {
+            let mut invalid = split_route.clone();
+            invalid.stage_known_present_update_calls = updates;
+            invalid.stage_known_present_update_rows = update_rows;
+            invalid.stage_fenced_insert_calls = inserts;
+            invalid.stage_fenced_insert_rows = insert_rows;
+            let error = validate_successful_merge_phase_topology(
+                &phases,
+                &invalid,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(field));
+        }
+        for (calls, rows, expected) in [
+            (u64::MAX, u64::MAX, "call total"),
+            (1, u64::MAX, "row total"),
+        ] {
+            let mut overflow = general_route(calls);
+            overflow.stage_merge_insert_rows = rows;
+            overflow.stage_known_present_update_calls = 1;
+            overflow.stage_known_present_update_rows = 1;
+            let error = validate_successful_merge_phase_topology(
+                &phases,
+                &overflow,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "phase_topology_overflow");
+            assert!(error.to_string().contains(expected));
+        }
 
         let mut zero_rows = general_route(2);
         zero_rows.stage_merge_insert_rows = 0;

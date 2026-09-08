@@ -5,6 +5,129 @@ harness. A case describes one benchmark point. A suite selects cases and says
 how many samples to collect. These files are experiment definitions, not run
 records, fixtures, or result storage.
 
+## Branch operation diagnostics
+
+The engine's `scenarios` target supplements the declarative merge cases with
+one-operation create, create-from, list, and delete measurements:
+
+```bash
+cargo bench --locked -p omnigraph-engine --bench scenarios -- \
+  --scenario branch-create-from --branches 8 --tables 4 \
+  --rows 1000 --dims 32 --runs 5 --out /tmp/branch-create-from.jsonl
+```
+
+Use `branch-create`, `branch-create-from`, `branch-list`, or `branch-delete`.
+`--branches` counts existing siblings, excluding `main` and the delete target;
+`--tables` counts populated tables. One table contains `--rows` vectors of
+`--dims` dimensions, and each remaining table contains one scalar row.
+Create-from uses a named source with data distinct from main. The delete
+target owns a native fork for every table. Counts must be positive and these
+scenarios do not accept `--baseline`.
+
+Each repetition prepares a fresh fixture, measures one public operation, and
+verifies the resulting branch registry and pinned table views in separate
+processes. Operation time excludes graph open. Operation-process peak RSS
+includes runtime initialization and graph open, but excludes setup and final
+verification. Delete reports acknowledgement and completed reclamation
+separately. Compare identical parameters, builds, and machines; these JSONL
+records are diagnostic evidence and do not enter the durable archive.
+
+`fenced-adopt-all-new` measures an insertion-only merge into an unchanged
+target. `general-merge-updates --delta-rows 50 --source-mode update` measures
+updates into a diverged target; `--source-mode insert` selects new IDs instead.
+Their route counters report the classifier and write adapter actually used.
+Hold the delta fixed while changing `--rows` to measure scaling, and run
+`OMNIGRAPH_MERGE_LINEAGE=off`, `on`, and `verify` separately when comparing
+classification paths. Verify mode executes both paths and is not comparable
+to a single-path throughput sample.
+
+### Small graph-age fixtures
+
+`--history-commits N` adds paired, real updates of one existing row before
+forking, then restores its original embedding. The accepted row count and
+content stay fixed while graph commits, table versions, and deletion history
+accumulate. N defaults to zero and must be even, at most 256.
+`--retired-branches N` creates, writes, deletes, and awaits reclamation of N
+temporary branches before the measured workload, at most 32. This is a
+separate churn dimension; retired branches do not add reachable main history.
+Both options apply to branch controls and `general-merge-updates` only.
+The setup records and checks actual history growth and content restoration.
+Explicit age diagnostics also record fixture file count and byte size through
+a metadata-only census between setup and the operation process.
+
+Two optional controls separate history from physical layout and reusable
+views. `--cache-state cold` (the default) uses a fresh operation process and
+graph handle without prewarming; it does not evict the OS page cache.
+`--cache-state warm` performs one read-only branch-registry and accepted
+snapshot metadata pass over every live branch on that same handle. It opens
+no user-table payloads. Fresh open, prewarm, and the operation each have their
+own timers and foreground I/O counters.
+
+`--manifest-layout uncompacted` (the default) preserves the generated layout.
+`--manifest-layout compacted` runs Lance compaction on every live `__manifest`
+native ref after setup. This is direct physical preparation of a disposable,
+exclusively owned benchmark fixture, not a public graph-maintenance API. It
+does not optimize user tables, build indexes, or clean up versions. Setup
+compares every typed manifest cell before/after and verifies retained native
+versions, full reachable graph history, heads, table pins, and branch identity.
+The receipt records fragment counts, logical row counts, and native versions;
+the compacted arm must actually rewrite fragments. Physical compaction keeps
+logical history, so fewer files must not be reported as less retained history.
+Warm or compacted controls are limited to 256 rows, 16 dimensions, eight
+siblings, and eight tables. Existing scenario defaults remain unchanged.
+
+Use the small sequential matrix to compare accumulated history without a
+large data fixture:
+
+```bash
+python3 scripts/bench-branch-age.py --plan
+python3 scripts/bench-branch-age.py \
+  --binary /absolute/path/to/scenarios \
+  --build-receipt /absolute/path/to/build.json \
+  --output /tmp/branch-age-results
+```
+
+The runner requires a saved release scenario executable and a matching clean
+source build receipt (`source.before/after`, successful locked Cargo command,
+and `binary.path/sha256`). It never compiles implicitly. Its default matrix
+uses 16 rows, four-dimensional vectors, 0/16/64 extra history commits, and a
+separate eight-retired-branch case. Branch controls use two populated tables
+and two sibling branches; general merge uses one table, two source updates,
+and eight disjoint target updates. Each point collects three samples.
+`--extended` additionally varies live siblings and populated tables to eight;
+`--smoke --runs 1` checks one tiny aged/churned fixture per operation.
+`--history-only` selects just H0/H16/H64, and `--scenario` can select fewer
+operations. Cache/layout selectors choose one condition per invocation;
+the runner never expands a Cartesian matrix implicitly. For example, inspect
+matched history plans, then run each with the same saved binary and separate
+output directories:
+
+```bash
+python3 scripts/bench-branch-age.py --plan --history-only --scenario branch-delete
+python3 scripts/bench-branch-age.py --plan --history-only --scenario branch-delete --cache-state warm
+python3 scripts/bench-branch-age.py --plan --history-only --scenario branch-delete --manifest-layout compacted
+```
+
+The runner uses one process group at a time, lower scheduling priority, two
+threads per Tokio/Lance CPU/Rayon pool, two Lance I/O slots, a 256 MiB Lance
+memory pool, and three-second pauses between points. These are recorded
+runtime settings, not a hard CPU or process-memory cap. Each point has a
+180-second whole-process watchdog. All child phases and fixture parameters
+must verify before a sample is accepted. Counters cover foreground operation
+I/O; deferred reclaim I/O is outside their task-local scope. Open time and
+delete completion time remain separate from acknowledgement latency.
+Explicit age runs of create/create-from additionally time the first accepted
+snapshot, pinned opens, and one payload row per inherited table after the fork.
+Those reads have separate counters and do not enter acknowledgement or
+operation-completion time. The operation child's whole-process RSS includes
+open, optional prewarm and first read; its pre/post-operation high-water marks
+remain available. Final exact branch/table verification still runs in the
+third process. The bounded SHA reader works on Python 3.9 and later.
+
+These fixtures model accumulated history on the current format. They do not
+claim compatibility with old binary formats or legacy bare branch refs, and
+their constrained-runtime timings are not comparable to unrestricted runs.
+
 ## Layout
 
 - `cases/*.case-v1.yaml` assigns the fixture, workload, environment, and

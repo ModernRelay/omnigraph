@@ -142,8 +142,15 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
         "measured operation phase must not scan final rows"
     );
     assert!(
-        !operation.contains("snapshot_of("),
-        "measured operation phase must not scan graph-visible final state"
+        operation
+            .find("source_head_builder(uri, &source_snapshot)")
+            .unwrap()
+            < pre_hwm,
+        "source ref resolution must be common unmeasured preparation"
+    );
+    assert!(
+        !operation[pre_hwm..].contains("snapshot_of("),
+        "the measured operation must not read final graph state"
     );
 
     let baseline = source
@@ -153,7 +160,27 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
         .split_once("/// Phase 2: measured bulk all-new operation")
         .expect("baseline function boundary")
         .0;
-    assert!(baseline.contains(".with_branch(\"adopt-source\", None)"));
+    assert!(baseline.contains("let source_table = source_builder"));
+    assert!(
+        !source.contains(".with_branch(\"adopt-source\","),
+        "physical source opens must use captured native refs, not logical branch names"
+    );
+    assert_eq!(
+        source
+            .matches("source_head_builder(uri, &source_snapshot)")
+            .count(),
+        3
+    );
+    let source_opener = source
+        .split_once("fn source_head_builder")
+        .unwrap()
+        .1
+        .split_once("fn adopt_fixture_root")
+        .unwrap()
+        .0;
+    assert!(source_opener.contains("entry.dataset_path"));
+    assert!(source_opener.contains("entry.native_dataset_branch.as_deref()"));
+    assert!(source_opener.contains("builder.with_branch(native_ref, None)"));
     assert!(baseline.contains(".with_session(main_table.session())"));
     assert!(baseline.contains(".filter(\"id LIKE 'adopt-new-%'\")"));
     assert!(baseline.contains(".execute_stream(source)"));
@@ -290,4 +317,220 @@ fn child_record_protocol_rejects_missing_duplicate_malformed_and_non_object_evid
         refusal.protocol_error.is_none(),
         "a refused child reports cap evidence but no scenario metrics"
     );
+}
+
+#[test]
+fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
+    let source = include_str!("../benches/scenarios/rfc023.rs");
+    let operation = source
+        .split_once("pub(super) async fn general_merge_operation")
+        .unwrap()
+        .1
+        .split_once("async fn verify_fixture_row")
+        .unwrap()
+        .0;
+    assert!(operation.contains("probes.completed_full_walk_classification_calls()"));
+    assert!(operation.contains("probes.completed_lineage_classification_calls()"));
+    assert!(operation.contains("full_walk_classifications + lineage_classifications > 0"));
+    assert!(!operation.contains("ordered_cursor_scan_calls > 0"));
+    assert!(operation.contains("MergeOutcome::Merged"));
+    assert!(
+        operation.contains(
+            "probes.stage_merge_insert_rows() + probes.stage_known_present_update_rows()"
+        )
+    );
+    assert!(operation.contains("\"classifier_route\": classifier_route"));
+    assert!(operation.contains("args.delta_rows as u64"));
+    assert!(!operation.contains("snapshot_of("));
+    assert!(source.contains("pub(super) async fn general_merge_verify"));
+    let wrapper = operation.find("helpers::cost::cost_harness").unwrap();
+    let open = operation.find("Omnigraph::open(uri)").unwrap();
+    let prewarm = operation
+        .find("fixture_controls::prewarm(&db, args)")
+        .unwrap();
+    let measure = operation[prewarm..].find("helpers::cost::measure").unwrap() + prewarm;
+    let timer = operation
+        .find("let operation_start = Instant::now()")
+        .unwrap();
+    assert!(wrapper < open && open < prewarm && prewarm < measure && measure < timer);
+    assert!(operation.contains("fixture_controls::io_metrics(\"open\", &open_io)"));
+    assert!(operation.contains("operation_io_metrics(&io)"));
+    assert!(operation.contains("\"operation_open_us\""));
+    let setup = source
+        .split_once("pub(super) async fn general_merge_setup")
+        .unwrap()
+        .1
+        .split_once("pub(super) async fn general_merge_operation")
+        .unwrap()
+        .0;
+    assert!(
+        setup.find("age_fixture(&db, args)").unwrap()
+            < setup
+                .find("db.branch_create(GENERAL_MERGE_SOURCE_BRANCH)")
+                .unwrap()
+    );
+    let verify = source
+        .split_once("pub(super) async fn general_merge_verify")
+        .unwrap()
+        .1;
+    assert!(
+        verify
+            .contains("args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0")
+    );
+    assert!(verify.contains("verify_general_all_rows(&table, args, true)"));
+    assert!(verify.contains("verify_general_all_rows(&source_table, args, false)"));
+    assert!(source.contains("scanner.batch_size(256)"));
+    assert!(source.contains("duplicate aged fixture ID"));
+    assert!(source.contains("aged fixture row missing"));
+}
+
+#[test]
+fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
+    let harness = include_str!("../benches/scenarios.rs");
+    let source = include_str!("../benches/scenarios/branch_control.rs");
+    assert!(harness.contains("branch_control::is_scenario(&args.scenario)"));
+    for phase in ["setup", "operation", "verify"] {
+        assert!(harness.contains(&format!("branch_control::{phase}(args).await")));
+    }
+    for argument in [
+        "--branches",
+        "--tables",
+        "--history-commits",
+        "--retired-branches",
+        "--cache-state",
+        "--manifest-layout",
+    ] {
+        assert!(
+            harness.matches(argument).count() >= 3,
+            "workload dimensions must parse, propagate, and be documented"
+        );
+    }
+    assert!(source.contains("args.branches == 0 || args.tables == 0 || args.runs == 0"));
+    assert!(source.contains("if args.baseline"));
+    let operation = source
+        .split_once("pub(super) async fn operation")
+        .unwrap()
+        .1
+        .split_once("pub(super) async fn verify")
+        .unwrap()
+        .0;
+    let timer = operation.find("let started = Instant::now()").unwrap();
+    assert!(operation.find("Omnigraph::open(").unwrap() < timer);
+    for call in [
+        "db.branch_create(TARGET)",
+        "db.branch_create_from(",
+        "db.branch_list()",
+        "db.branch_delete(TARGET)",
+    ] {
+        assert!(operation.find(call).unwrap() > timer);
+    }
+    assert!(!operation.contains("branch_view("));
+    assert!(!operation.contains("snapshot_of("));
+    assert!(operation.contains("\"completed_operations\": 1"));
+    assert!(operation.contains("\"rss_boundary\""));
+    let acknowledgement = operation.find("let operation_wall_us").unwrap();
+    let reclaim_join = operation.find("db.wait_for_fork_reclaims().await").unwrap();
+    let completion = operation.find("let operation_complete_wall_us").unwrap();
+    assert!(acknowledgement < reclaim_join && reclaim_join < completion);
+    assert!(operation.contains("\"post_ack_reclaim_wait_us\""));
+    assert!(operation.contains("\"operation_complete_wall_us\""));
+    let prewarm = operation
+        .find("fixture_controls::prewarm(&db, args)")
+        .unwrap();
+    let first_read = operation
+        .find("fixture_controls::first_read(&db, TARGET, args.tables)")
+        .unwrap();
+    assert!(prewarm < timer && completion < first_read);
+    assert!(operation.contains("fixture_controls::io_metrics(\"open\", &open_io)"));
+    assert!(
+        operation.find("std::fs::write(").unwrap()
+            > operation.find("let operation_wall_us").unwrap()
+    );
+    assert!(source.contains("created.tables, fixture.branches[parent].tables"));
+    assert!(source.contains("!refs.contains_key(native_ref)"));
+    assert!(source.contains("assert_eq!(verified_reclaimed_table_refs, args.tables)"));
+    let compact = source
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("entry.native_ref.as_deref()"));
+    assert!(compact.contains("dataset.list_branches().await"));
+    assert!(compact.contains("created.effective_head,fixture.branches[parent].effective_head"));
+    assert!(compact.contains(".resolve_snapshot(branch)"));
+    assert!(compact.contains("assert_eq!(listed,names,"));
+    assert!(compact.contains("assert_ne!(source.tables,branches[\"main\"].tables,"));
+    assert!(source.contains("\"verification_passed\": true"));
+    assert!(
+        operation.find("helpers::cost::cost_harness").unwrap()
+            < operation.find("Omnigraph::open(").unwrap()
+    );
+    assert!(operation.find("helpers::cost::measure").unwrap() < timer);
+    assert!(operation.find("operation_io_metrics(&io)").unwrap() > completion);
+    let setup = source
+        .split_once("pub(super) async fn setup")
+        .unwrap()
+        .1
+        .split_once("pub(super) async fn operation")
+        .unwrap()
+        .0;
+    assert!(
+        setup.find("age_fixture(&db, args)").unwrap()
+            < setup.find("for branch in 0..args.branches").unwrap()
+    );
+    assert!(harness.contains("rfc023_scenarios::validate_fixture_age(&args)"));
+    for cache in ["cold", "warm"] {
+        for layout in ["uncompacted", "compacted"] {
+            rfc023_limits::validate_view_controls(cache, layout).unwrap();
+        }
+    }
+    for (cache, layout) in [
+        ("hot", "compacted"),
+        ("cold", "optimized"),
+        ("", "uncompacted"),
+    ] {
+        assert!(rfc023_limits::validate_view_controls(cache, layout).is_err());
+    }
+    let aging = include_str!("../benches/scenarios/rfc023.rs");
+    assert!(aging.contains("args.age_options_supplied && !supported"));
+    assert!(aging.contains("args.history_commits > 256"));
+    assert!(aging.contains("!args.history_commits.is_multiple_of(2)"));
+    assert!(aging.contains("args.retired_branches > 32"));
+    assert!(
+        aging.contains("args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8")
+    );
+    let age = aging
+        .split_once("pub(super) async fn age_fixture")
+        .unwrap()
+        .1
+        .split_once("pub(super) fn operation_io_metrics")
+        .unwrap()
+        .0;
+    assert!(age.contains("after.checked_sub(before)"));
+    assert!(age.contains("Some(args.history_commits)"));
+    assert!(age.contains("verify_fixture_row(&table, \"base\", 0, args.dims, args.seed)"));
+    assert!(age.contains("db.wait_for_fork_reclaims().await"));
+    assert!(age.contains("retired native fork was not reclaimed"));
+    assert!(age.contains("retirement must not publish on main"));
+    assert!(!age.contains("Dataset::write"));
+    for field in [
+        "setup_history_commits_applied",
+        "setup_main_history_after_age",
+        "setup_retired_branches_applied",
+        "setup_age_content_verified",
+        "operation_io_manifest_reads",
+        "operation_io_data_reads",
+        "operation_io_boundary",
+    ] {
+        assert!(aging.contains(field), "missing age/IO evidence {field}");
+    }
+    let controls = include_str!("../benches/scenarios/fixture_controls.rs");
+    assert!(setup.contains("fixture_controls::prepare_layout(uri, args)"));
+    assert!(controls.contains("compaction changed a retained manifest cell"));
+    assert!(controls.contains("versions.is_subset(&retained)"));
+    assert!(controls.contains("compaction changed branch history/head/table pins"));
+    assert!(controls.contains("compaction changed native branch identity or registry"));
+    assert!(controls.contains("compacted arm must perform physical work"));
+    assert!(controls.contains("one payload row from every table"));
+    assert!(!controls.contains("cleanup_old_versions("));
+    assert!(!controls.contains(".optimize().await"));
 }

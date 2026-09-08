@@ -16,7 +16,10 @@ pub use omnigraph::{
     Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction, RepairClassification,
     RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason,
 };
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{
+    DeferredTableFork, ForkRefStatus, WriteAuthorityToken, WriteTxn,
+    classify_fork_ref_with_references, force_delete_orphan_ref,
+};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 pub(crate) use schema_state::SchemaContractText;
 

@@ -31,7 +31,7 @@ use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, SnapshotDataset};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, Snapshot, SnapshotDataset};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use sha2::{Digest as _, Sha256};
@@ -39,6 +39,32 @@ use sha2::{Digest as _, Sha256};
 use super::{Args, rfc023_limits, seeded_vector};
 
 const SMALL_UPSERT_ROWS: usize = 32;
+
+/// Age is setup work for these two existing fixture families only.
+pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
+    let supported = super::branch_control::is_scenario(&args.scenario)
+        || args.scenario == "general-merge-updates";
+    if args.age_options_supplied && !supported {
+        return Err(
+            "age/cache/layout controls require branch controls or general-merge-updates".into(),
+        );
+    }
+    if args.history_commits > 256 || !args.history_commits.is_multiple_of(2) {
+        return Err("--history-commits must be even and at most 256".into());
+    }
+    if args.retired_branches > 32 {
+        return Err("--retired-branches must be at most 32".into());
+    }
+    rfc023_limits::validate_view_controls(&args.cache_state, &args.manifest_layout)?;
+    if (args.cache_state == "warm" || args.manifest_layout == "compacted")
+        && (args.rows > 256 || args.dims > 16 || args.branches > 8 || args.tables > 8)
+    {
+        return Err(
+            "warm/compacted controls require rows <= 256, dims <= 16, branches/tables <= 8".into(),
+        );
+    }
+    Ok(())
+}
 
 pub(super) fn validate_args(args: &Args) -> Result<(), String> {
     match args.scenario.as_str() {
@@ -430,11 +456,11 @@ pub(super) async fn fenced_small_upsert(args: &Args) -> serde_json::Value {
     })
 }
 
-fn graph_schema(dims: usize) -> String {
+pub(super) fn graph_schema(dims: usize) -> String {
     format!("node Chunk {{\n  slug: String @key\n  embedding: Vector({dims})\n}}\n")
 }
 
-fn vector_json_patterns(dims: usize, seed: u64) -> Vec<String> {
+pub(super) fn vector_json_patterns(dims: usize, seed: u64) -> Vec<String> {
     (0..16)
         .map(|pattern| {
             let id = format!("benchmark-vector-pattern-{pattern}");
@@ -467,7 +493,160 @@ fn graph_jsonl_chunk(prefix: &str, start: usize, end: usize, vector_patterns: &[
     jsonl
 }
 
-async fn load_graph_rows(
+/// Add current-format history without changing the logical base fixture.
+/// Each pair writes a different first-row vector and restores the exact base
+/// vector. Branch churn is separate: its commits are retired, not main ancestry.
+pub(super) async fn age_fixture(db: &Omnigraph, args: &Args) -> serde_json::Value {
+    let started = Instant::now();
+    let before = db
+        .list_commits(None)
+        .await
+        .expect("read history before aging")
+        .len();
+    let original = vector_json_patterns(args.dims, args.seed);
+    let mut alternate: Vec<f32> = serde_json::from_str(&format!("[{}]", original[0]))
+        .expect("decode original first-row vector");
+    alternate[0] = if alternate[0] == 0.0 {
+        1.0
+    } else {
+        -alternate[0]
+    };
+    let alternate = serde_json::to_string(&alternate).unwrap();
+    let alternate = vec![alternate[1..alternate.len() - 1].to_string()];
+    assert_ne!(
+        alternate[0], original[0],
+        "age updates must change real content"
+    );
+    let mut applied = 0;
+    for commit in 0..args.history_commits {
+        let patterns = if commit % 2 == 0 {
+            &alternate
+        } else {
+            &original
+        };
+        let row = graph_jsonl_chunk("base", 0, 1, patterns);
+        db.load("main", &row, LoadMode::Merge)
+            .await
+            .expect("apply age update");
+        applied += 1;
+    }
+    let after = db
+        .list_commits(None)
+        .await
+        .expect("read history after aging")
+        .len();
+    assert_eq!(
+        after.checked_sub(before),
+        Some(args.history_commits),
+        "requested age must create exactly that many reachable commits"
+    );
+    let aged_head = db
+        .resolve_snapshot("main")
+        .await
+        .expect("capture aged main head");
+    let mut retired = 0;
+    for index in 0..args.retired_branches {
+        let branch = format!("age-retired-{index}");
+        db.branch_create(&branch)
+            .await
+            .expect("create retirement fixture branch");
+        let row = graph_jsonl_chunk("age-retired-row", 0, 1, &original);
+        db.load(&branch, &row, LoadMode::Append)
+            .await
+            .expect("first-touch retired branch");
+        let snapshot = db
+            .snapshot_of(ReadTarget::branch(&branch))
+            .await
+            .expect("capture retirement branch");
+        let entry = snapshot
+            .dataset("node:Chunk")
+            .expect("retirement Chunk entry");
+        let native = entry
+            .native_dataset_branch
+            .clone()
+            .expect("retirement must own a native fork");
+        let path = format!("{}/{}", db.uri(), entry.dataset_path);
+        let table = snapshot
+            .open_dataset("node:Chunk")
+            .await
+            .expect("open retirement table");
+        assert_eq!(
+            table.count_rows(None).await.unwrap(),
+            args.rows + 1,
+            "retired append must add one row"
+        );
+        drop(table);
+        drop(snapshot);
+        db.branch_delete(&branch)
+            .await
+            .expect("retire fixture branch");
+        db.wait_for_fork_reclaims().await;
+        assert!(
+            !db.branch_list().await.unwrap().contains(&branch),
+            "retired graph branch remains live"
+        );
+        let physical = DatasetBuilder::from_uri(&path)
+            .load()
+            .await
+            .expect("open surviving table after retirement");
+        assert!(
+            !physical
+                .list_branches()
+                .await
+                .unwrap()
+                .contains_key(&native),
+            "retired native fork was not reclaimed"
+        );
+        retired += 1;
+    }
+    assert_eq!(
+        db.resolve_snapshot("main").await.unwrap(),
+        aged_head,
+        "retirement must not publish on main"
+    );
+    let snapshot = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .expect("capture aged base fixture");
+    let table = snapshot
+        .open_dataset("node:Chunk")
+        .await
+        .expect("open aged base table");
+    assert_eq!(
+        table.count_rows(None).await.unwrap(),
+        args.rows,
+        "aging must preserve main row count"
+    );
+    verify_fixture_row(&table, "base", 0, args.dims, args.seed).await;
+    serde_json::json!({
+        "setup_history_commits_requested": args.history_commits,
+        "setup_history_commits_applied": applied,
+        "setup_main_history_before_age": before,
+        "setup_main_history_after_age": after,
+        "setup_retired_branches_requested": args.retired_branches,
+        "setup_retired_branches_applied": retired,
+        "setup_retired_native_refs_reclaimed": retired,
+        "setup_age_content_verified": true,
+        "setup_age_wall_us": started.elapsed().as_micros() as u64,
+        "setup_age_semantics": "paired current-format main updates restore exact first-row content; retired branch commits are not reachable main history",
+    })
+}
+
+pub(super) fn operation_io_metrics(io: &super::helpers::cost::IoCounts) -> serde_json::Value {
+    serde_json::json!({
+        "operation_io_manifest_reads": io.manifest_reads,
+        "operation_io_manifest_read_bytes": io.manifest_read_bytes,
+        "operation_io_data_reads": io.data_reads,
+        "operation_io_data_opener_reads": io.data_opener_reads,
+        "operation_io_data_scan_reads": io.data_scan_reads,
+        "operation_io_internal_open_count": io.internal_open_count,
+        "operation_io_data_open_count": io.data_open_count,
+        "operation_io_manifest_scan_count": io.manifest_scan_count,
+        "operation_io_boundary": "shared cost_harness installed before open; measure resets before operation and collects after timing; task-local foreground probes exclude spawned reclaim and unwrapped warm data handles; not all filesystem I/O",
+    })
+}
+
+pub(super) async fn load_graph_rows(
     db: &Omnigraph,
     branch: &str,
     prefix: &str,
@@ -528,6 +707,19 @@ fn only_node_table_uri(root: &std::path::Path) -> String {
         .to_str()
         .expect("UTF-8 benchmark table URI")
         .to_string()
+}
+
+/// Physical checks intentionally read HEAD, using the exact ref captured in
+/// graph metadata. Logical names are not native refs after branch recreation.
+fn source_head_builder(graph_uri: &str, snapshot: &Snapshot) -> DatasetBuilder {
+    let entry = snapshot
+        .dataset("node:Chunk")
+        .expect("source table metadata");
+    let builder = DatasetBuilder::from_uri(format!("{graph_uri}/{}", entry.dataset_path));
+    match entry.native_dataset_branch.as_deref() {
+        Some(native_ref) => builder.with_branch(native_ref, None),
+        None => builder,
+    }
 }
 
 fn adopt_fixture_root(args: &Args) -> &std::path::Path {
@@ -642,8 +834,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
             .expect("count prepared physical main rows"),
         args.rows
     );
-    let physical_source = DatasetBuilder::from_uri(&table_uri)
-        .with_branch("adopt-source", None)
+    let physical_source = source_head_builder(uri, &source_snapshot)
         .load()
         .await
         .expect("open prepared physical source table");
@@ -716,6 +907,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
 async fn direct_lance_append_baseline(
     args: &Args,
     table_uri: &str,
+    source_builder: DatasetBuilder,
     source_plan: &rfc023_limits::ChunkPlan,
     operation_open_ms: u64,
     operation_pre_peak_rss_bytes: u64,
@@ -728,9 +920,8 @@ async fn direct_lance_append_baseline(
             .load()
             .await
             .expect("open prepared physical main dataset");
-        let source_table = DatasetBuilder::from_uri(table_uri)
+        let source_table = source_builder
             .with_session(main_table.session())
-            .with_branch("adopt-source", None)
             .load()
             .await
             .expect("open prepared physical source branch");
@@ -859,8 +1050,15 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
     let db = Omnigraph::open(uri)
         .await
         .expect("fresh-open phased RFC-023 benchmark fixture");
-    let operation_open_ms = open_start.elapsed().as_millis() as u64;
     let table_uri = only_node_table_uri(root);
+    // Both arms resolve physical source identity before the timer/HWM boundary.
+    // This is preparation, not a final-state verification scan.
+    let source_snapshot = db
+        .snapshot_of(ReadTarget::branch("adopt-source"))
+        .await
+        .expect("resolve prepared source ref");
+    let source_builder = source_head_builder(uri, &source_snapshot);
+    let operation_open_ms = open_start.elapsed().as_millis() as u64;
     let source_plan = adopt_source_plan(args);
     let operation_pre_peak_rss_bytes = super::current_process_peak_rss_bytes();
 
@@ -870,6 +1068,7 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
         let metrics = direct_lance_append_baseline(
             args,
             &table_uri,
+            source_builder,
             &source_plan,
             operation_open_ms,
             operation_pre_peak_rss_bytes,
@@ -940,7 +1139,8 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
 
     serde_json::json!({
         "routing": "production-omnigraph-branch-merge",
-        "measurement_boundary": "operation_wall_ms starts after the common fresh Omnigraph::open and covers Omnigraph::branch_merge; no post-op scan",
+        "measurement_boundary": "operation_wall starts after separately recorded fresh Omnigraph::open and optional metadata prewarm, and covers Omnigraph::branch_merge; no post-op scan",
+        "rss_boundary": "operation child whole-process wait4 HWM includes runtime, graph open, optional metadata prewarm, merge and output; setup and final verification are separate children",
         "production_path": true,
         "baseline": false,
         "operation_open_ms": operation_open_ms,
@@ -1309,8 +1509,7 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
         .load()
         .await
         .expect("open physical main after measured operation");
-    let physical_source = DatasetBuilder::from_uri(&table_uri)
-        .with_branch("adopt-source", None)
+    let physical_source = source_head_builder(uri, &source_snapshot)
         .load()
         .await
         .expect("open physical source after measured operation");
@@ -1517,6 +1716,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     )
     .await;
 
+    let age = age_fixture(&db, args).await;
+
     let branch_start = Instant::now();
     db.branch_create(GENERAL_MERGE_SOURCE_BRANCH)
         .await
@@ -1566,6 +1767,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         .await
         .expect("advance main after the branch forked");
     let target_diverge_ms = diverge_start.elapsed().as_millis() as u64;
+    let layout = super::fixture_controls::prepare_layout(uri, args).await;
 
     let verify_start = Instant::now();
     let main_snapshot = db
@@ -1606,8 +1808,8 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let setup_verify_ms = verify_start.elapsed().as_millis() as u64;
 
     let setup_fingerprint = format!(
-        "general-merge-updates-v2:mode={}:rows={}:delta={}:target_delta={}:dims={}:seed={}:\
-         main-v{}-rows{}:source-v{}-rows{}",
+        "general-merge-updates-v3:mode={}:rows={}:delta={}:target_delta={}:dims={}:seed={}:\
+         main-v{}-rows{}:source-v{}-rows{}:history={}:retired={}",
         args.source_mode,
         args.rows,
         args.delta_rows,
@@ -1618,9 +1820,11 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         setup_main_rows,
         setup_source_dataset_version,
         setup_source_rows,
+        args.history_commits,
+        args.retired_branches,
     );
 
-    serde_json::json!({
+    let mut metrics = serde_json::json!({
         "rows": args.rows,
         "dims": args.dims,
         "delta_rows": args.delta_rows,
@@ -1642,23 +1846,41 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         "source_load_ms": source_load_ms,
         "target_diverge_ms": target_diverge_ms,
         "setup_verify_ms": setup_verify_ms,
-    })
+    });
+    metrics
+        .as_object_mut()
+        .unwrap()
+        .extend(age.as_object().unwrap().clone());
+    metrics
+        .as_object_mut()
+        .unwrap()
+        .extend(layout.as_object().unwrap().clone());
+    metrics
 }
 
 /// Phase 2: the measured child. Opens the fixture and runs exactly one
 /// production `branch_merge`, then records wall time plus this process's peak
 /// RSS. The parent's `wait4` peak for this child is the memory number.
 pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
+    super::helpers::cost::cost_harness(async {
     let root = general_merge_fixture_root(args);
     let uri = root.to_str().expect("UTF-8 benchmark fixture root");
+    let ((db, operation_open_elapsed), open_io) = super::helpers::cost::measure(async {
     let open_start = Instant::now();
     let db = Omnigraph::open(uri)
         .await
         .expect("fresh-open general-merge fixture");
-    let operation_open_ms = open_start.elapsed().as_millis() as u64;
+    let operation_open_elapsed = open_start.elapsed();
+    (db, operation_open_elapsed)
+    }).await;
+    let operation_open_ms = operation_open_elapsed.as_millis() as u64;
+    let operation_open_us = operation_open_elapsed.as_micros() as u64;
+    let prewarm = super::fixture_controls::prewarm(&db, args).await;
     let operation_pre_peak_rss_bytes = super::current_process_peak_rss_bytes();
 
     let probes = MergeWriteProbes::default();
+    let ((outcome, operation_elapsed, operation_post_peak_rss_bytes), io) =
+        super::helpers::cost::measure(async {
     let operation_start = Instant::now();
     let outcome = with_merge_write_probes(
         probes.clone(),
@@ -1667,9 +1889,11 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     .await
     .expect("run production branch merge");
     let operation_elapsed = operation_start.elapsed();
+    let operation_post_peak_rss_bytes = super::current_process_peak_rss_bytes();
+    (outcome, operation_elapsed, operation_post_peak_rss_bytes)
+    }).await;
     let operation_wall_ms = operation_elapsed.as_millis() as u64;
     let operation_wall_us = u64::try_from(operation_elapsed.as_micros()).unwrap_or(u64::MAX);
-    let operation_post_peak_rss_bytes = super::current_process_peak_rss_bytes();
     let operation_hwm_increase_bytes = operation_post_peak_rss_bytes
         .checked_sub(operation_pre_peak_rss_bytes)
         .filter(|increase| *increase > 0);
@@ -1684,15 +1908,28 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
     );
     let ordered_cursor_scan_calls = probes.ordered_cursor_scan_calls();
     let fenced_insert_calls = probes.stage_fenced_insert_calls();
+    let full_walk_classifications = probes.completed_full_walk_classification_calls();
+    let lineage_classifications = probes.completed_lineage_classification_calls();
+    let classifier_route = match (full_walk_classifications > 0, lineage_classifications > 0) {
+        (true, true) => "full-walk-and-lineage",
+        (true, false) => "full-walk",
+        (false, true) => "lineage",
+        (false, false) => "no-general-classifier",
+    };
     // `update` mode must be on the general route — that is the whole point.
     // `insert` mode deliberately asserts nothing about the route: it exists to
     // DISCOVER whether the proven adopt shortcut survives a moved target, so
     // the route is recorded as a result rather than pinned as a precondition.
     if args.source_mode == "update" {
         assert!(
-            ordered_cursor_scan_calls > 0,
-            "update-mode run did not enter the ordered diff — it took a shortcut path \
-             and is not measuring the route issue #384 reports"
+            full_walk_classifications + lineage_classifications > 0,
+            "update-mode run must complete a three-way classifier"
+        );
+        assert_eq!(fenced_insert_calls, 0, "update-only workload inserted rows");
+        assert_eq!(
+            probes.stage_merge_insert_rows() + probes.stage_known_present_update_rows(),
+            args.delta_rows as u64,
+            "every selected source update must be written once"
         );
         assert_eq!(
             probes.strict_insert_preflight_calls(),
@@ -1700,16 +1937,27 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
             "an update-only delta must not preflight strict inserts"
         );
     }
-    let took_proven_shortcut = fenced_insert_calls > 0 && ordered_cursor_scan_calls == 0;
+    let took_proven_shortcut =
+        fenced_insert_calls > 0 && full_walk_classifications == 0 && lineage_classifications == 0;
 
-    serde_json::json!({
+    let mut metrics = serde_json::json!({
         "routing": "production-omnigraph-branch-merge-diverged-target",
         "source_mode": args.source_mode,
+        "classifier_route": classifier_route,
+        "probe_completed_full_walk_classifications": full_walk_classifications,
+        "probe_completed_lineage_classifications": lineage_classifications,
+        "probe_lineage_candidate_scan_rows": probes.lineage_candidate_scan_rows(),
+        "probe_lineage_candidate_address_take_calls": probes.lineage_candidate_address_take_calls(),
+        "probe_lineage_candidate_address_take_rows": probes.lineage_candidate_address_take_rows(),
+        "probe_proven_insert_history_read_calls": probes.proven_insert_history_read_calls(),
+        "probe_stage_known_present_update_calls": probes.stage_known_present_update_calls(),
+        "probe_stage_known_present_update_rows": probes.stage_known_present_update_rows(),
         "took_proven_shortcut": took_proven_shortcut,
         "measurement_boundary": "operation_wall_ms starts after the common fresh Omnigraph::open and covers Omnigraph::branch_merge; no post-op scan",
         "production_path": true,
         "baseline": false,
         "operation_open_ms": operation_open_ms,
+        "operation_open_us": operation_open_us,
         "operation_wall_ms": operation_wall_ms,
         "operation_wall_us": operation_wall_us,
         "operation_pre_peak_rss_bytes": operation_pre_peak_rss_bytes,
@@ -1732,7 +1980,12 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
         "probe_validation_scan_projected_bytes": probes.validation_scan_projected_bytes(),
         "probe_stage_vector_index_calls": probes.stage_vector_index_calls(),
         "probe_phase_us": merge_phase_metrics(&probes),
-    })
+    });
+    metrics.as_object_mut().unwrap().extend(operation_io_metrics(&io).as_object().unwrap().clone());
+    metrics.as_object_mut().unwrap().extend(super::fixture_controls::io_metrics("open", &open_io).as_object().unwrap().clone());
+    metrics.as_object_mut().unwrap().extend(prewarm.as_object().unwrap().clone());
+    metrics
+    }).await
 }
 
 /// Verify one exact deterministic fixture row through the public snapshot
@@ -1821,6 +2074,103 @@ async fn verify_fixture_row(
     })
 }
 
+/// Age experiments use small fixtures, but verify every row in bounded batches
+/// so a restored representative cannot hide unrelated data loss or source drift.
+async fn verify_general_all_rows(table: &SnapshotDataset, args: &Args, merged_main: bool) -> usize {
+    let inserting = args.source_mode == "insert";
+    let expected = args.rows + if inserting { args.delta_rows } else { 0 };
+    let mut seen = vec![false; expected];
+    let mut scanner = table.scan();
+    scanner.project(&["id", "slug", "embedding"]).unwrap();
+    scanner.batch_size(256);
+    scanner.batch_size_bytes(rfc023_limits::KEYED_WRITE_MAX_BYTES);
+    let mut stream = scanner
+        .try_into_stream()
+        .await
+        .expect("scan complete aged merge view");
+    let mut observed = 0;
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .expect("read complete aged merge view")
+    {
+        let batch = rfc023_limits::compact_oversized_verification_slice(batch).unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let slugs = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let vectors = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let values = vectors
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(vectors.value_length() as usize, args.dims);
+        for row in 0..batch.num_rows() {
+            assert!(!ids.is_null(row) && !slugs.is_null(row) && !vectors.is_null(row));
+            let id = ids.value(row);
+            assert_eq!(slugs.value(row), id);
+            let (prefix, ordinal, slot, seed) = if let Some(suffix) = id.strip_prefix("base-") {
+                let ordinal = suffix.parse::<usize>().expect("base row ordinal");
+                assert!(ordinal < args.rows, "unexpected base ID {id}");
+                let seed = if merged_main && ordinal >= args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS
+                {
+                    args.seed ^ 0x0230_0385
+                } else if !inserting && ordinal < args.delta_rows {
+                    args.seed ^ 0x0230_0384
+                } else {
+                    args.seed
+                };
+                ("base", ordinal, ordinal, seed)
+            } else {
+                assert!(inserting, "unexpected inserted ID {id}");
+                let ordinal = id
+                    .strip_prefix("adopt-new-")
+                    .expect("known inserted ID domain")
+                    .parse::<usize>()
+                    .expect("inserted row ordinal");
+                assert!(ordinal < args.delta_rows, "unexpected inserted ID {id}");
+                (
+                    "adopt-new",
+                    ordinal,
+                    args.rows + ordinal,
+                    args.seed ^ 0x0230_0384,
+                )
+            };
+            assert_eq!(id, format!("{prefix}-{ordinal:010}"));
+            assert!(
+                !std::mem::replace(&mut seen[slot], true),
+                "duplicate aged fixture ID {id}"
+            );
+            verify_fixture_vector(
+                values,
+                usize::try_from(vectors.value_offset(row)).unwrap(),
+                args.dims,
+                seed,
+                ordinal,
+                id,
+            );
+            observed += 1;
+        }
+    }
+    assert_eq!(observed, expected, "aged fixture row domain changed");
+    assert!(
+        seen.into_iter().all(|present| present),
+        "aged fixture row missing"
+    );
+    observed
+}
+
 /// Phase 3: unmeasured correctness check. The merged main must have the exact
 /// expected row count, and representative rows from both disjoint deltas must
 /// retain their deterministic payloads.
@@ -1867,11 +2217,29 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
         args.seed ^ 0x0230_0385,
     )
     .await;
+    let (verified_complete_main_rows, verified_complete_source_rows) =
+        if args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0 {
+            let main_rows = verify_general_all_rows(&table, args, true).await;
+            let source_snapshot = db
+                .snapshot_of(ReadTarget::branch(GENERAL_MERGE_SOURCE_BRANCH))
+                .await
+                .expect("capture unchanged aged source");
+            let source_table = source_snapshot
+                .open_dataset("node:Chunk")
+                .await
+                .expect("open unchanged aged source");
+            let source_rows = verify_general_all_rows(&source_table, args, false).await;
+            (Some(main_rows), Some(source_rows))
+        } else {
+            (None, None)
+        };
     let verify_wall_ms = verify_start.elapsed().as_millis() as u64;
 
     serde_json::json!({
         "verify_wall_ms": verify_wall_ms,
         "final_rows": final_rows,
+        "verified_complete_main_rows": verified_complete_main_rows,
+        "verified_complete_source_rows": verified_complete_source_rows,
         "verify_main_dataset_version": table.published_dataset_version(),
         "source_delta_row": source_delta_row,
         "target_delta_row": target_delta_row,

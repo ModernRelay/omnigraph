@@ -1367,7 +1367,9 @@ pub async fn cleanup_all_datasets(
                     // version list so `keep=N` retains exactly the newest N
                     // available versions (with HEAD as the unavoidable floor
                     // when N=0).
-                    let versions = ds.versions().await.map_err(OmniError::storage)?;
+                    // Only version numbers are needed: avoid fetching every
+                    // historical manifest and its summary metadata.
+                    let versions = ds.version_refs().await.map_err(OmniError::storage)?;
                     let retain = (keep as usize).max(1);
                     let cutoff = if versions.len() <= retain {
                         versions.first()
@@ -1459,15 +1461,13 @@ pub struct BranchReconcileStats {
 /// (`reclaim_orphaned_fork_and_refork`); this is the guaranteed-convergence
 /// backstop that also covers (1) and any table the write path never revisits.
 ///
-/// The orphan test is therefore **per-table**, not per-branch-name: a Lance
-/// branch `B` on table `T` is an orphan iff `B` is not a live manifest branch
-/// at all (origin 1) OR the manifest's branch-`B` snapshot does not place `T`
-/// on `B` (origin 2). A legitimately-forked table (`table_branch == Some(B)`)
-/// is kept. `main` and internal/system branches are never candidates. Lance
-/// refuses to force-delete a branch with referencing descendants, so children
-/// are dropped before parents (longest name first). Idempotent and authority-
-/// derived: no-ops once reconciled, and degrades to finding nothing if a future
-/// Lance atomic multi-dataset branch op prevents orphans from forming.
+/// Liveness is graph-wide and keyed by immutable table identity plus native
+/// ref: any live snapshot or pending recovery pin protects the whole ref,
+/// including lazy children of a branch whose owner adopted another pointer.
+/// `main` and internal/system branches are never candidates. Lance refuses to
+/// force-delete a branch with referencing descendants, so children are dropped
+/// before parents (longest name first). The proof is derived under cleanup's
+/// schema-control gate; no separate registry or persistent authority is added.
 #[cfg(all(test, feature = "failpoints"))]
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
     let catalog = db.catalog();
@@ -1478,21 +1478,6 @@ async fn reconcile_orphaned_branches_with_catalog(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
 ) -> Result<BranchReconcileStats> {
-    use std::collections::{HashMap, HashSet};
-
-    // Live manifest branches: the set whose per-table placements are
-    // authoritative. A branch absent here is a whole-branch (origin-1) orphan.
-    // Native refs: a fork of a dead incarnation is an orphan even while the
-    // same logical branch lives on under a fresh incarnation.
-    let live_branches: HashSet<String> = db
-        .coordinator
-        .read()
-        .await
-        .all_native_branches()
-        .await?
-        .into_iter()
-        .collect();
-
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
     let table_targets: Vec<(crate::db::manifest::TableIdentity, String, String)> =
@@ -1506,12 +1491,10 @@ async fn reconcile_orphaned_branches_with_catalog(
             .collect();
 
     let mut stats = BranchReconcileStats::default();
-    // Per-branch snapshots are resolved once and cached across tables (few
-    // branches in practice); origin-2 detection consults the branch's own view.
-    // Failures are cached too: one branch-level read failure should not refetch
-    // and append duplicate per-table noise for every table that lists the ref.
-    let mut branch_snapshots: HashMap<String, crate::db::Snapshot> = HashMap::new();
-    let mut failed_branch_snapshots: HashSet<String> = HashSet::new();
+    // Capture one complete proof only when a native table ref needs checking.
+    // The held schema gate keeps it valid for the rest of this sweep, including
+    // lazy borrowers whose logical owner no longer uses their pinned ref.
+    let mut references = None;
 
     // Per-table fault isolation: one table's transient failure is recorded and
     // logged, never aborting the rest of the sweep.
@@ -1531,55 +1514,49 @@ async fn reconcile_orphaned_branches_with_catalog(
             }
         };
 
+        // Main and internal refs cannot be reclaimed. An empty candidate
+        // iterator needs no graph-wide liveness reads and consumes no proof hook.
+        let mut listed = listed
+            .into_iter()
+            .filter(|branch| {
+                branch != "main"
+                    && !crate::db::is_internal_system_branch(
+                        crate::branch_names::logical_branch_name(branch),
+                    )
+            })
+            .peekable();
+        if listed.peek().is_none() {
+            continue;
+        }
+        if references.is_none() {
+            let captured = match crate::failpoints::maybe_fail(
+                crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
+            ) {
+                Ok(()) => {
+                    crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
+                        db.root_uri(),
+                        &db.control_session(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match captured {
+                Ok(captured) => references = Some(captured),
+                Err(error) => {
+                    stats
+                        .failures
+                        .push(("__manifest".to_string(), error.to_string()));
+                    return Ok(stats);
+                }
+            }
+        }
+        let references = references.as_ref().expect("candidate refs require a proof");
+
         // Decide per (table, branch) whether the fork is an orphan.
         let mut orphans: Vec<String> = Vec::new();
         for branch in listed {
-            // `main` is not a named Lance branch; system/internal branches
-            // (e.g. the schema-apply lock) own legitimate forks — never touch.
-            let logical = crate::branch_names::logical_branch_name(&branch).to_string();
-            if branch == "main" || crate::db::is_internal_system_branch(&logical) {
-                continue;
-            }
-            let is_orphan = if !live_branches.contains(&branch) {
-                true // origin 1: whole branch gone from the manifest
-            } else {
-                // origin 2: live branch, but does the manifest place THIS
-                // table on it? Resolve (and cache) the branch's snapshot.
-                if failed_branch_snapshots.contains(&branch) {
-                    continue;
-                }
-                if !branch_snapshots.contains_key(&branch) {
-                    let branch_snapshot = match crate::failpoints::maybe_fail(
-                        crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
-                    ) {
-                        Ok(()) => db.snapshot_for_branch(Some(&logical)).await,
-                        Err(injected) => Err(injected),
-                    };
-                    match branch_snapshot {
-                        Ok(snap) => {
-                            branch_snapshots.insert(branch.clone(), snap);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "omnigraph::cleanup",
-                                table = %table_key,
-                                branch = %branch,
-                                error = %err,
-                                "resolving branch snapshot failed during reconcile; skipping",
-                            );
-                            stats.failures.push((table_key.clone(), err.to_string()));
-                            failed_branch_snapshots.insert(branch.clone());
-                            continue;
-                        }
-                    }
-                }
-                branch_snapshots[&branch]
-                    .datasets()
-                    .find(|entry| entry.identity == identity)
-                    .map(|e| e.native_dataset_branch.as_deref() != Some(branch.as_str()))
-                    .unwrap_or(true)
-            };
-            if is_orphan {
+            if !references.contains(identity, &branch) {
                 orphans.push(branch);
             }
         }
@@ -1605,21 +1582,16 @@ async fn reconcile_orphaned_branches_with_catalog(
                     Some(crate::branch_names::logical_branch_name(&branch).to_string()),
                 ))
                 .await;
-            // Decide under the queue from FRESH authority via the shared
-            // classifier (same decision the write-path reclaim uses) — never
-            // from the sweep-start `live_branches` capture. A branch created
-            // AFTER that capture is absent from the stale set yet may already
-            // carry a legitimately-published fork (an in-process writer held
-            // this queue through its fork+publish; we just waited on it), so a
-            // stale "origin-1 ⇒ delete" shortcut would destroy a live fork.
-            // Only `Orphan` is reclaimed; `Indeterminate` (transient read) is
-            // skipped and recorded. (Cross-process writers remain the documented
-            // one-winner-CAS gap.) One key held at a time → no lock-order
-            // inversion vs multi-table `acquire_many` writers.
-            match super::table_ops::classify_fork_ref(db, &table_key, identity, &branch, None).await
+            // The schema gate keeps the graph-wide proof valid; re-check
+            // pending recovery ownership under the table queue before deletion.
+            match super::table_ops::classify_fork_ref_with_references(
+                db, identity, &branch, None, references,
+            )
+            .await
             {
                 super::table_ops::ForkRefStatus::Orphan => {}
-                super::table_ops::ForkRefStatus::Legitimate => continue,
+                super::table_ops::ForkRefStatus::Legitimate
+                | super::table_ops::ForkRefStatus::Borrowed => continue,
                 super::table_ops::ForkRefStatus::Indeterminate => {
                     tracing::warn!(
                         target: "omnigraph::cleanup",

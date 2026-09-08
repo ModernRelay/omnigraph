@@ -37,14 +37,14 @@ use super::layout::{
 use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
 use super::migrations::guard_stamp;
 use super::state::{
-    GraphLineageRow, GraphLineageRowPart, ManifestState, assemble_manifest_state,
-    graph_head_object_id, graph_lineage_row_parts, head_lineage_row, manifest_rows_batch,
-    manifest_schema, read_manifest_state, read_publish_scan,
+    GraphLineageRow, GraphLineageRowPart, ManifestState, ProjectionAccumulator,
+    assemble_manifest_projection, graph_head_object_id, graph_lineage_row_parts, head_lineage_row,
+    manifest_rows_batch, manifest_schema, read_manifest_state, read_publish_scan,
 };
 use super::{
-    DatasetEntry, ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, NativeRefPin,
-    OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, TableIdentity,
-    TableRegistration, TableRename, TableTombstone, WinnerRef,
+    DatasetEntry, ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, ManifestIncarnation,
+    NativeRefPin, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
+    TableIdentity, TableRegistration, TableRename, TableTombstone, WinnerRef,
 };
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
@@ -139,6 +139,12 @@ pub(super) struct PublishOutcome {
     /// the O(fragments) post-publish `read_manifest_state` re-scan. Byte-identical
     /// to that re-scan: built through the same `assemble_manifest_state` reduction.
     pub known_state: ManifestState,
+    /// Exact successful-attempt base, when its branch lifetime was checked.
+    pub base_incarnation: Option<ManifestIncarnation>,
+    /// Compact fold returned with `known_state`, absent for the compatibility
+    /// no-op that reads only table state. Never a second durable state. Boxed
+    /// to keep the outcome small across nested async publication callers.
+    pub projection: Option<Box<ProjectionAccumulator>>,
 }
 
 #[async_trait]
@@ -215,6 +221,28 @@ type FoldedPublishInputs = (
 );
 
 impl GraphNamespacePublisher {
+    fn checked_base_incarnation(
+        &self,
+        dataset: &Dataset,
+        precondition: &PublishPrecondition,
+    ) -> Option<ManifestIncarnation> {
+        let branch_identifier = match precondition {
+            PublishPrecondition::ExactGraphHead(expected) => expected.branch_identifier.clone(),
+            PublishPrecondition::Any if self.branch.is_none() => {
+                lance::dataset::refs::BranchIdentifier::main()
+            }
+            // Compatibility publishers on named branches carry no checked
+            // lifetime. They keep the conservative full-refresh behavior.
+            PublishPrecondition::Any => return None,
+        };
+        Some(ManifestIncarnation {
+            version: dataset.version().version,
+            e_tag: dataset.manifest_location().e_tag.clone(),
+            timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
+            branch_identifier,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn new(root_uri: &str, branch: Option<&str>) -> Self {
         Self::new_with_session(root_uri, branch, crate::lance_access::control_session())
@@ -673,7 +701,7 @@ impl GraphNamespacePublisher {
             .unwrap_or(false)
     }
 
-    /// Build the inputs for [`assemble_manifest_state`] from the pre-publish state
+    /// Build the inputs for [`assemble_manifest_projection`] from the pre-publish state
     /// unioned with the pending rows about to be committed — the in-memory basis
     /// for the post-publish `known_state` fold (RFC-013 PR2 #1b), so the caller
     /// skips the O(fragments) re-scan. Mirrors `read_manifest_scan`'s row handling
@@ -684,13 +712,13 @@ impl GraphNamespacePublisher {
     /// `OBJECT_TYPE_TABLE` rows feed only `table_locations`; lineage rows
     /// (`graph_commit`/`graph_head`) are not manifest-state entries.
     fn fold_inputs(
-        existing_versions: &HashMap<(TableIdentity, u64), DatasetEntry>,
-        existing_tombstones: &HashMap<(TableIdentity, u64), u64>,
+        existing_versions: HashMap<(TableIdentity, u64), DatasetEntry>,
+        existing_tombstones: HashMap<(TableIdentity, u64), u64>,
         rows: &[PendingVersionRow],
-        registered_tables: &HashMap<TableIdentity, TableRegistration>,
+        registered_tables: HashMap<TableIdentity, TableRegistration>,
         new_manifest_version: u64,
     ) -> Result<FoldedPublishInputs> {
-        let mut registrations = registered_tables.clone();
+        let mut registrations = registered_tables;
         for row in rows {
             if row.object_type == OBJECT_TYPE_TABLE {
                 let identity = row.identity.ok_or_else(|| {
@@ -716,12 +744,8 @@ impl GraphNamespacePublisher {
             }
         }
 
-        let mut version_map: HashMap<(TableIdentity, u64), DatasetEntry> =
-            existing_versions.clone();
-        let mut tombstones: Vec<(TableIdentity, u64)> = existing_tombstones
-            .keys()
-            .map(|(identity, clock)| (*identity, *clock))
-            .collect();
+        let mut version_map = existing_versions;
+        let mut tombstones: Vec<(TableIdentity, u64)> = existing_tombstones.into_keys().collect();
 
         for row in rows {
             match row.object_type.as_str() {
@@ -1037,6 +1061,8 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 dataset,
                 parent_commit_id: None,
                 known_state,
+                base_incarnation: None,
+                projection: None,
             });
         }
 
@@ -1068,6 +1094,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // here instead of transparently re-parenting the prepared intent.
             self.check_publish_precondition(&dataset, &graph_heads, precondition)
                 .await?;
+            let base_incarnation = self.checked_base_incarnation(&dataset, precondition);
 
             let latest_per_table =
                 Self::latest_visible_per_identity(&existing_versions, &existing_tombstones);
@@ -1103,19 +1130,19 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 // Expected-version-only publish with no changes and no lineage:
                 // the precondition held, nothing to write. Fold the unchanged state
                 // from the loaded maps — no re-scan (RFC-013 PR2 #1b).
-                let known_state = assemble_manifest_state(
+                let (known_state, projection) = assemble_manifest_projection(
                     dataset.version().version,
                     known_tables,
-                    existing_versions.values().cloned().collect(),
-                    existing_tombstones
-                        .keys()
-                        .map(|(identity, version)| (*identity, *version)),
+                    existing_versions.into_values().collect(),
+                    existing_tombstones.into_keys(),
                     graph_heads,
                 )?;
                 return Ok(PublishOutcome {
                     dataset,
                     parent_commit_id,
                     known_state,
+                    base_incarnation,
+                    projection: Some(Box::new(projection)),
                 });
             }
 
@@ -1123,10 +1150,10 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // rows we are about to commit, BEFORE `rows` is moved into merge_rows
             // (RFC-013 PR2 #1b). Recomputed per attempt from freshly-loaded state.
             let (fold_registrations, fold_entries, fold_tombstones) = Self::fold_inputs(
-                &existing_versions,
-                &existing_tombstones,
+                existing_versions,
+                existing_tombstones,
                 &rows,
-                &known_tables,
+                known_tables,
                 new_manifest_version,
             )?;
             let mut fold_graph_heads = graph_heads;
@@ -1144,7 +1171,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // In particular, alias collisions must fail without advancing
             // `__manifest`; discovering one after `merge_rows` would be an
             // acknowledged-but-unreadable manifest commit.
-            let mut known_state = assemble_manifest_state(
+            let (mut known_state, projection) = assemble_manifest_projection(
                 new_manifest_version,
                 fold_registrations,
                 fold_entries,
@@ -1167,6 +1194,8 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         dataset: new_dataset,
                         parent_commit_id,
                         known_state,
+                        base_incarnation,
+                        projection: Some(Box::new(projection)),
                     });
                 }
                 Err(err) => {

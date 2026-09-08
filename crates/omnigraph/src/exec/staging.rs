@@ -1161,6 +1161,20 @@ impl StagedMutation {
         // the target branch fresh on any mismatch, returning the snapshot from
         // that same authority view. No prepared table pin is patched forward.
         let snapshot = db.revalidate_write_txn(txn).await?;
+        // A merge from main detaches the target's former ref while a child may
+        // still pin it; a first-touch fork must not reclaim that history, and
+        // the recovery envelope cannot represent reseeding an existing lineage,
+        // so the proof runs before arming.
+        let fork_references = if staged
+            .iter()
+            .any(|entry| entry.path.deferred_fork.is_some())
+        {
+            Some(Box::pin(crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
+                db.root_uri(), &db.control_session(),
+            )).await?)
+        } else {
+            None
+        };
         for entry in &staged {
             let current = snapshot
                 .dataset(&entry.table_key)
@@ -1188,15 +1202,53 @@ impl StagedMutation {
             // A deferred fork is intentionally staged from the exact inherited
             // source entry. The source ref (often main) may advance after the
             // graph branch was cut; that is unrelated to this branch's pinned
-            // snapshot. The target ref does not exist yet, so there is no live
-            // target HEAD to compare until after the recovery intent is armed.
-            if entry.path.deferred_fork.is_some() {
+            // snapshot. The liveness proof above excludes borrowed target refs;
+            // any remaining orphan collision is checked under the same gates.
+            if let Some(fork) = entry.path.deferred_fork.as_ref() {
+                if fork_references
+                    .as_ref()
+                    .expect("deferred-fork liveness proof")
+                    .contains(entry.path.identity, &fork.target_branch)
+                {
+                    return Err(crate::db::manifest::detached_native_lineage_error(
+                        &entry.table_key,
+                        &fork.target_branch,
+                    ));
+                }
                 if entry.dataset.version() != current {
                     return Err(OmniError::manifest_read_set_changed(
                         format!("published_dataset_version:{}", entry.table_key),
                         Some(current.to_string()),
                         Some(entry.dataset.version().to_string()),
                     ));
+                }
+                let branches =
+                    crate::branch_control::list_branch_contents(entry.dataset.dataset()).await?;
+                if branches.contains_key(&fork.target_branch) {
+                    match crate::db::classify_fork_ref_with_references(
+                        db,
+                        entry.path.identity,
+                        &fork.target_branch,
+                        None,
+                        fork_references
+                            .as_ref()
+                            .expect("deferred-fork liveness proof"),
+                    )
+                    .await
+                    {
+                        crate::db::ForkRefStatus::Orphan => {
+                            crate::db::force_delete_orphan_ref(
+                                db,
+                                &entry.table_key,
+                                &entry.path.full_path,
+                                &fork.target_branch,
+                            )
+                            .await?;
+                        }
+                        crate::db::ForkRefStatus::Borrowed
+                        | crate::db::ForkRefStatus::Legitimate
+                        | crate::db::ForkRefStatus::Indeterminate => {}
+                    }
                 }
                 continue;
             }

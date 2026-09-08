@@ -1686,11 +1686,15 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     .await
     .unwrap();
 
-    // Publish the handoff through a WARM coordinator's `commit` (exercises the
-    // post-publish fold), NOT GraphNamespacePublisher (which reopens fresh).
-    let mut experiment_mc = ManifestCoordinator::open_at_branch(uri, "experiment")
-        .await
-        .unwrap();
+    // Publish through the warm graph coordinator so both its projection and
+    // lineage adopt the same successful attempt.
+    let mut experiment_mc = crate::db::graph_coordinator::GraphCoordinator::open_branch(
+        uri,
+        "experiment",
+        Arc::new(crate::storage::ObjectStorageAdapter::local()),
+    )
+    .await
+    .unwrap();
     // Pre-publish: experiment inherits feature's ownership of Person@Vf.
     assert_eq!(
         experiment_mc
@@ -1701,15 +1705,26 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
             .as_deref(),
         Some("feature"),
     );
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        Some("experiment"),
+        experiment_mc.branch_identifier().await.unwrap(),
+        experiment_mc.exact_graph_head(),
+    ));
+    let intent = experiment_mc.new_lineage_intent(None, None).unwrap();
     experiment_mc
-        .commit(&[DatasetUpdate {
-            identity: person_entry.identity,
-            type_key: "node:Person".to_string(),
-            published_dataset_version: feature_version,
-            native_dataset_branch: Some("experiment".to_string()),
-            entity_count: 1,
-            version_metadata: experiment_metadata,
-        }])
+        .commit_changes_with_intent_and_expected(
+            &[ManifestChange::Update(DatasetUpdate {
+                identity: person_entry.identity,
+                type_key: "node:Person".to_string(),
+                published_dataset_version: feature_version,
+                native_dataset_branch: Some("experiment".to_string()),
+                entity_count: 1,
+                version_metadata: experiment_metadata,
+            })],
+            &HashMap::new(),
+            intent,
+            &precondition,
+        )
         .await
         .unwrap();
 
@@ -1740,6 +1755,17 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
         folded_branch, scanned_branch,
         "warm coordinator's folded known_state diverged from a fresh re-scan after an \
          owner-branch handoff (folded {folded_branch:?} vs scanned {scanned_branch:?})",
+    );
+    let probes = crate::instrumentation::QueryIoProbes::default();
+    crate::instrumentation::with_query_io_probes(probes.clone(), experiment_mc.refresh())
+        .await
+        .unwrap();
+    assert_eq!(
+        probes
+            .manifest_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "same-version ownership handoff must retain its exact projection"
     );
 }
 
@@ -3424,4 +3450,111 @@ async fn projection_refresh_matches_clean_full_reopen() {
     folded_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
     full_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
     assert_eq!(folded_lineage, full_lineage);
+
+    // A local publish already has the exact next state. Once the graph cache
+    // has adopted its lineage, the next refresh must not rebuild that state.
+    let mut writer = crate::db::graph_coordinator::GraphCoordinator::open(
+        uri,
+        Arc::new(crate::storage::ObjectStorageAdapter::local()),
+    )
+    .await
+    .unwrap();
+    writer.commit_updates_with_actor(&[], None).await.unwrap();
+    let probes = crate::instrumentation::QueryIoProbes::default();
+    crate::instrumentation::with_query_io_probes(probes.clone(), writer.refresh())
+        .await
+        .unwrap();
+    assert_eq!(
+        probes
+            .manifest_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a successful local publish must preserve the coherent projection"
+    );
+
+    // If another writer advanced the base, preserving only our own lineage
+    // would hide its commit. The full refresh must still include both writers.
+    publish_empty_commit(&publisher).await.unwrap();
+    writer.commit_updates_with_actor(&[], None).await.unwrap();
+    writer.refresh().await.unwrap();
+    let fresh = crate::db::graph_coordinator::GraphCoordinator::open(
+        uri,
+        Arc::new(crate::storage::ObjectStorageAdapter::local()),
+    )
+    .await
+    .unwrap();
+    let mut actual = writer.load_commits().await.unwrap();
+    let mut expected = fresh.load_commits().await.unwrap();
+    actual.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    expected.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+
+    // Registration replacement and tombstone suppression must also survive
+    // the handoff; an append-only accumulator would retain the old alias.
+    let person = writer.snapshot().dataset("node:Person").unwrap().clone();
+    for change in [
+        ManifestChange::RenameTable(TableRename {
+            identity: person.identity,
+            expected_table_key: person.type_key.clone(),
+            table_key: "node:Human".to_string(),
+            table_path: person.dataset_path.clone(),
+        }),
+        ManifestChange::Tombstone(TableTombstone {
+            identity: person.identity,
+            table_key: "node:Human".to_string(),
+            tombstone_version: person.published_dataset_version,
+        }),
+    ] {
+        let intent = writer.new_lineage_intent(None, None).unwrap();
+        writer
+            .commit_changes_with_intent_and_expected(
+                &[change],
+                &HashMap::new(),
+                intent,
+                &PublishPrecondition::Any,
+            )
+            .await
+            .unwrap();
+        let probes = crate::instrumentation::QueryIoProbes::default();
+        crate::instrumentation::with_query_io_probes(probes.clone(), writer.refresh())
+            .await
+            .unwrap();
+        assert_eq!(
+            probes
+                .manifest_scan_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "local metadata replacements must preserve the exact projection"
+        );
+        let fresh = ManifestCoordinator::open(uri).await.unwrap();
+        let actual_snapshot = writer.snapshot();
+        let expected_snapshot = fresh.snapshot();
+        let mut actual = actual_snapshot.datasets().collect::<Vec<_>>();
+        let mut expected = expected_snapshot.datasets().collect::<Vec<_>>();
+        actual.sort_by(|a, b| a.type_key.cmp(&b.type_key));
+        expected.sort_by(|a, b| a.type_key.cmp(&b.type_key));
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"),);
+    }
+
+    // Publication alone cannot claim that a separate lineage cache adopted the
+    // commit. This is also the state left by a post-manifest failure.
+    reader.refresh_with_lineage().await.unwrap();
+    let unacknowledged = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: None,
+        actor_id: None,
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    reader
+        .commit_changes_with_lineage(&[], &HashMap::new(), Some(&unacknowledged))
+        .await
+        .unwrap();
+    let LineageRefresh::Replace(rows) = reader.refresh_with_lineage().await.unwrap() else {
+        panic!("an unacknowledged lineage handoff must reconstruct the complete history");
+    };
+    assert!(
+        rows.iter()
+            .any(|row| row.graph_commit_id == unacknowledged.graph_commit_id)
+    );
 }

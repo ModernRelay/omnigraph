@@ -78,7 +78,8 @@ the graph quiescent, Full recovery may:
 
 - roll a complete owned effect set forward;
 - restore/compensate an owned partial set to the pinned graph state;
-- remove an owned unpublished first-touch ref or dataset;
+- remove an owned unpublished first-touch ref or dataset, unless a live branch
+  pins it;
 - promote or discard owned schema staging;
 - refuse an invariant violation or ambiguous effect.
 
