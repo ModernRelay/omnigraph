@@ -48,8 +48,9 @@ impl IntentApiFixture {
     }
 
     /// Exercise request deadlines without introducing another HTTP fixture.
+    /// Delays stay bounded even when a caller times out before the response.
     pub fn with_response_delay(replies: Vec<IntentReply>, delay: Duration) -> Self {
-        assert!(delay <= Duration::from_secs(12), "fixture delay bound");
+        assert!(delay <= Duration::from_secs(32), "fixture delay bound");
         Self::start(replies, None, delay)
     }
 
