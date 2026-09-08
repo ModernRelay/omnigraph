@@ -2239,6 +2239,8 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// Empty cleanup sweeps skip the proof and two old branch-registry LISTs.
 /// Count retention uses version_refs() to avoid 18 manifest GETs, reducing
 /// Cleanup GET/LIST 227/136 -> 209/134. Other counts are unchanged.
+/// A branch first-touch write lists the table's refs once before arming, so
+/// an orphan ref is dropped pre-arm: AddFriend/InsertLegacy LIST 75/58 -> 76/59.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
