@@ -1223,6 +1223,46 @@ pub(crate) async fn list_sidecars(
     Ok(out)
 }
 
+/// Nonmutating absence proof for callers without recovery authority. Every
+/// JSON object blocks, including malformed and future sidecars; there is no
+/// need to read or interpret a body to establish that absence is unproven.
+pub(crate) async fn refuse_pending_recovery(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_LIST)?;
+    let pending = storage
+        .list_dir_bounded(
+            &recovery_dir_uri(root_uri),
+            ".json",
+            crate::storage::ListDirBounds {
+                max_matching_entries: 1,
+                max_irrelevant_entries: 1024,
+                max_uri_bytes: 131_072,
+            },
+        )
+        .await?;
+    if !pending.is_empty() {
+        return Err(OmniError::recovery_required(
+            "pending-recovery",
+            "graph has pending recovery; resolve it with explicit recovery authority before retrying",
+        ));
+    }
+    for staging in [
+        crate::db::schema_state::schema_source_staging_uri(root_uri),
+        crate::db::schema_state::schema_ir_staging_uri(root_uri),
+        crate::db::schema_state::schema_state_staging_uri(root_uri),
+    ] {
+        if storage.exists(&staging).await? {
+            return Err(OmniError::recovery_required(
+                "pending-schema-recovery",
+                "graph has staged schema recovery; resolve it with explicit recovery authority before retrying",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Best-effort discovery for the non-mutating read-only schema-coherence
 /// guard. ReadOnly historically skips recovery classification entirely, so a
 /// corrupt/future sidecar must not make an otherwise coherent read fail. Valid

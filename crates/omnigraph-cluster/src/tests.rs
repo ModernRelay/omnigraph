@@ -28,6 +28,623 @@ query find_person($name: String) {
 
 const POLICY: &str = "version: 1\nrules: []\n";
 
+const IDENTITY_GRAPH_POLICY: &str = r#"
+version: 1
+groups:
+  owners: [principal:owner, principal:collaborator]
+  readers: [principal:reader]
+rules:
+  - id: owners-read
+    allow: {actors: {group: owners}, actions: [read]}
+  - id: owners-schema
+    allow: {actors: {group: owners}, actions: [schema_apply], target_branch_scope: any}
+  - id: readers-read
+    allow: {actors: {group: readers}, actions: [read]}
+"#;
+
+const IDENTITY_CLUSTER_POLICY: &str = r#"
+version: 1
+groups:
+  owners: [principal:owner, principal:collaborator]
+rules:
+  - id: configure-cluster
+    allow: {actors: {group: owners}, actions: [config_manage]}
+"#;
+
+fn identity_fixture() -> tempfile::TempDir {
+    let dir = fixture();
+    fs::write(dir.path().join("base.policy.yaml"), IDENTITY_GRAPH_POLICY).unwrap();
+    fs::write(
+        dir.path().join("management.policy.yaml"),
+        IDENTITY_CLUSTER_POLICY,
+    )
+    .unwrap();
+    let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        format!(
+            "{config}  management:\n    file: ./management.policy.yaml\n    applies_to: [cluster]\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+async fn apply_identity_fixture(dir: &Path) {
+    let import = import_config_dir(dir).await;
+    assert!(import.ok, "{:?}", import.diagnostics);
+    let apply = apply_config_dir(dir).await;
+    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+}
+
+async fn identity_manifest_version(dir: &Path) -> u64 {
+    let uri = dir.join("graphs/knowledge.omni");
+    let db = Omnigraph::open_read_only(uri.to_str().unwrap())
+        .await
+        .unwrap();
+    db.snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version()
+}
+
+fn expand_identity_schema(dir: &Path) {
+    fs::write(
+        dir.join("people.pg"),
+        SCHEMA.replace("age: I32?", "age: I32?\n  email: String?"),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn identity_apply_cannot_disable_the_state_lock() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let permitted =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(permitted.plan.ok, "{:?}", permitted.plan.diagnostics);
+    let expected = permitted.authorization.unwrap();
+    let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    assert!(config.contains("lock: true"));
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config.replace("lock: true", "lock: false"),
+    )
+    .unwrap();
+    let planned =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(!planned.plan.ok);
+    assert!(planned.authorization.is_none());
+    let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let denied = authorize_apply_plan(dir.path(), &owner, &expected)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "authorization_requires_lock");
+    let denied =
+        apply_config_dir_authorized(dir.path(), ApplyOptions::default(), &owner, &expected).await;
+    assert!(!denied.apply.ok);
+    assert!(denied.authorization.is_none());
+    assert!(
+        denied
+            .apply
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "authorization_requires_lock")
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+}
+
+#[tokio::test]
+async fn identity_raw_configuration_changes_require_cluster_authority_without_resource_effects() {
+    let dir = identity_fixture();
+    fs::write(
+        dir.path().join("management.policy.yaml"),
+        IDENTITY_CLUSTER_POLICY.replace(
+            "[principal:owner, principal:collaborator]",
+            "[principal:owner]",
+        ),
+    )
+    .unwrap();
+    apply_identity_fixture(dir.path()).await;
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let collaborator = IdentityAuthorization::authenticated("principal:collaborator").unwrap();
+    let original = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let manifest = identity_manifest_version(dir.path()).await;
+    fs::write(dir.path().join("renamed.pg"), SCHEMA).unwrap();
+
+    for (case, candidate, schema) in [
+        (
+            "metadata",
+            original.replace("name: test", "name: renamed"),
+            SCHEMA.to_string(),
+        ),
+        (
+            "source binding",
+            original.replace("./people.pg", "./renamed.pg"),
+            SCHEMA.to_string(),
+        ),
+        (
+            "metadata with schema",
+            original.replace("name: test", "name: renamed"),
+            SCHEMA.replace("age: I32?", "age: I32?\n  email: String?"),
+        ),
+    ] {
+        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), candidate).unwrap();
+        fs::write(dir.path().join("people.pg"), schema).unwrap();
+        let planned =
+            plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+        assert!(planned.plan.ok, "{case}: {:?}", planned.plan.diagnostics);
+        let proof = planned.authorization.unwrap();
+        assert!(
+            proof
+                .checks
+                .iter()
+                .any(|check| check.action == "config_manage"),
+            "{case}"
+        );
+        if case != "metadata with schema" {
+            assert!(proof.effects.is_empty(), "{case}: {:?}", proof.effects);
+        }
+        let denied =
+            plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &collaborator)
+                .await;
+        assert!(!denied.plan.ok, "{case}");
+        assert!(denied.authorization.is_none(), "{case}");
+        let denied =
+            apply_config_dir_authorized(dir.path(), ApplyOptions::default(), &collaborator, &proof)
+                .await;
+        assert!(!denied.apply.ok, "{case}");
+        assert!(denied.authorization.is_none(), "{case}");
+        assert_eq!(
+            fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+            ledger,
+            "{case}"
+        );
+        assert_eq!(
+            identity_manifest_version(dir.path()).await,
+            manifest,
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn identity_schema_authorization_uses_applied_policy_and_preserves_collaborative_apply() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let reader = IdentityAuthorization::authenticated("principal:reader").unwrap();
+    let stranger = IdentityAuthorization::authenticated("principal:stranger").unwrap();
+    let collaborator = IdentityAuthorization::authenticated("principal:collaborator").unwrap();
+    expand_identity_schema(dir.path());
+    let before_state = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let before_manifest = identity_manifest_version(dir.path()).await;
+    let denied_plan =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &stranger).await;
+    assert!(!denied_plan.plan.ok);
+    assert!(
+        denied_plan.plan.changes.is_empty(),
+        "no protected migration preview on denial"
+    );
+    assert!(denied_plan.authorization.is_none());
+    let plan = plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(plan.plan.ok, "{:?}", plan.plan.diagnostics);
+    assert!(
+        plan.plan
+            .changes
+            .iter()
+            .any(|change| change.migration.is_some())
+    );
+    let expected = plan.authorization.unwrap();
+    assert!(
+        authorize_apply_plan(dir.path(), &reader, &expected)
+            .await
+            .is_err()
+    );
+    let checked = authorize_apply_plan(dir.path(), &collaborator, &expected)
+        .await
+        .unwrap();
+    assert_eq!(checked.actor, "principal:collaborator");
+    assert!(
+        checked
+            .checks
+            .iter()
+            .any(|check| check.action == "schema_apply")
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before_state
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, before_manifest);
+    let denied_apply =
+        apply_config_dir_authorized(dir.path(), ApplyOptions::default(), &reader, &expected).await;
+    assert!(!denied_apply.apply.ok);
+    assert!(
+        denied_apply
+            .apply
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy_denied")
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before_state
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, before_manifest);
+    assert_eq!(
+        fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
+            .unwrap()
+            .count(),
+        0
+    );
+    let applied = apply_config_dir_authorized(
+        dir.path(),
+        ApplyOptions {
+            actor: Some("forged".to_string()),
+        },
+        &collaborator,
+        &expected,
+    )
+    .await;
+    assert!(
+        applied.apply.ok && applied.apply.converged,
+        "{:?}",
+        applied.apply.diagnostics
+    );
+    assert_eq!(
+        applied.apply.actor.as_deref(),
+        Some("principal:collaborator")
+    );
+    assert_eq!(
+        applied.authorization.unwrap().actor,
+        "principal:collaborator"
+    );
+    assert!(identity_manifest_version(dir.path()).await > before_manifest);
+    assert!(
+        authorize_plan_read(
+            dir.path().to_str().unwrap(),
+            &stranger,
+            &["knowledge".to_string()]
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        authorize_plan_read(
+            dir.path().to_str().unwrap(),
+            &owner,
+            &["knowledge".to_string()]
+        )
+        .await
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn identity_apply_preflights_all_effects_and_candidate_policy_cannot_self_authorize() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let reader = IdentityAuthorization::authenticated("principal:reader").unwrap();
+    let before_state = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let before_manifest = identity_manifest_version(dir.path()).await;
+    // A desired policy update grants the caller every permission, but it is
+    // not applied and therefore cannot authorize either the plan or its writes.
+    fs::write(
+        dir.path().join("management.policy.yaml"),
+        IDENTITY_CLUSTER_POLICY.replace("principal:owner", "principal:reader"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        IDENTITY_GRAPH_POLICY.replace("principal:owner", "principal:reader"),
+    )
+    .unwrap();
+    expand_identity_schema(dir.path());
+    let denied =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &reader).await;
+    assert!(!denied.plan.ok);
+    assert!(denied.authorization.is_none());
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before_state
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, before_manifest);
+
+    // Altering the expected exact effect set cannot authorize a different plan.
+    fs::write(dir.path().join("base.policy.yaml"), IDENTITY_GRAPH_POLICY).unwrap();
+    fs::write(
+        dir.path().join("management.policy.yaml"),
+        IDENTITY_CLUSTER_POLICY,
+    )
+    .unwrap();
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let plan = plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(plan.plan.ok, "{:?}", plan.plan.diagnostics);
+    let mut changed_plan = plan.authorization.unwrap();
+    changed_plan.effects.clear();
+    let denied =
+        apply_config_dir_authorized(dir.path(), ApplyOptions::default(), &owner, &changed_plan)
+            .await;
+    assert!(!denied.apply.ok);
+    assert!(
+        denied
+            .apply
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "plan_authorization_stale")
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before_state
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, before_manifest);
+}
+
+#[tokio::test]
+async fn identity_apply_checks_denied_configuration_effect_before_allowed_schema_effect() {
+    let dir = identity_fixture();
+    fs::write(
+        dir.path().join("management.policy.yaml"),
+        IDENTITY_CLUSTER_POLICY.replace(", principal:collaborator", ""),
+    )
+    .unwrap();
+    apply_identity_fixture(dir.path()).await;
+    expand_identity_schema(dir.path());
+    fs::write(
+        dir.path().join("people.gq"),
+        QUERY.replace("$p.age", "$p.age, $p.email"),
+    )
+    .unwrap();
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let collaborator = IdentityAuthorization::authenticated("principal:collaborator").unwrap();
+    let plan = plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(plan.plan.ok, "{:?}", plan.plan.diagnostics);
+    let before_state = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let before_manifest = identity_manifest_version(dir.path()).await;
+    let denied = apply_config_dir_authorized(
+        dir.path(),
+        ApplyOptions::default(),
+        &collaborator,
+        &plan.authorization.unwrap(),
+    )
+    .await;
+    assert!(!denied.apply.ok);
+    assert!(
+        denied
+            .apply
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy_denied" && diagnostic.path == "cluster")
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before_state
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, before_manifest);
+    assert!(denied.authorization.is_none());
+}
+
+#[tokio::test]
+async fn identity_policy_activation_invalidates_old_plan_and_tampering_fails_closed() {
+    let dir = identity_fixture();
+    apply_identity_fixture(dir.path()).await;
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    expand_identity_schema(dir.path());
+    let planned =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(planned.plan.ok, "{:?}", planned.plan.diagnostics);
+    let expected = planned.authorization.unwrap();
+    // Migrate policy through the existing explicit storage-holder path, then
+    // retry the old candidate with the same authenticated identity.
+    fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        IDENTITY_GRAPH_POLICY
+            .replace("[schema_apply]", "[read]")
+            .replace(", target_branch_scope: any", ""),
+    )
+    .unwrap();
+    let migrated = apply_config_dir(dir.path()).await;
+    assert!(migrated.ok, "{:?}", migrated.diagnostics);
+    expand_identity_schema(dir.path());
+    let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let manifest = identity_manifest_version(dir.path()).await;
+    let denied =
+        apply_config_dir_authorized(dir.path(), ApplyOptions::default(), &owner, &expected).await;
+    assert!(!denied.apply.ok);
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, manifest);
+    let state = read_state_json(dir.path());
+    let digest = state["applied_revision"]["resources"]["policy.base"]["digest"]
+        .as_str()
+        .unwrap();
+    fs::write(
+        policy_payload_path(dir.path(), digest),
+        IDENTITY_GRAPH_POLICY,
+    )
+    .unwrap();
+    let denied =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(!denied.plan.ok);
+    assert!(
+        denied
+            .plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "catalog_payload_digest_mismatch")
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn identity_bootstrap_is_explicit_exact_once_and_recovery_does_not_reopen_it() {
+    let dir = identity_fixture();
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let denied =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(!denied.plan.ok);
+    let desired = load_desired(dir.path()).desired.unwrap();
+    let bootstrap = IdentityAuthorization::bootstrap(
+        "principal:owner",
+        desired.config_digest,
+        desired.resource_digests,
+    )
+    .unwrap();
+    let initial =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &bootstrap).await;
+    assert!(initial.plan.ok, "{:?}", initial.plan.diagnostics);
+    let authorization = initial.authorization.unwrap();
+    assert!(
+        authorize_apply_plan(dir.path(), &bootstrap, &authorization)
+            .await
+            .is_ok()
+    );
+    assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+    let imported = import_config_dir(dir.path()).await;
+    assert!(imported.ok, "{:?}", imported.diagnostics);
+    let applied = apply_config_dir_authorized(
+        dir.path(),
+        ApplyOptions::default(),
+        &bootstrap,
+        &authorization,
+    )
+    .await;
+    assert!(
+        applied.apply.ok && applied.apply.converged,
+        "{:?}",
+        applied.apply.diagnostics
+    );
+    let state = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let denied =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &bootstrap).await;
+    assert!(!denied.plan.ok);
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        state
+    );
+    fs::create_dir_all(dir.path().join(CLUSTER_RECOVERIES_DIR)).unwrap();
+    let sidecar = dir.path().join(CLUSTER_RECOVERIES_DIR).join("pending.json");
+    fs::write(&sidecar, "uncertain old authority").unwrap();
+    let denied =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(!denied.plan.ok);
+    assert!(
+        denied
+            .plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy_recovery_required")
+    );
+    assert_eq!(
+        fs::read_to_string(sidecar).unwrap(),
+        "uncertain old authority"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        state
+    );
+}
+
+#[tokio::test]
+async fn identity_new_graph_uses_existing_cluster_authority_and_empty_migration_is_explicit() {
+    let dir = identity_fixture();
+    // Cluster configuration authority does not imply schema rights on an
+    // existing graph, but does authorize a newly declared graph's initial schema.
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        IDENTITY_GRAPH_POLICY.replace("principal:owner", "principal:graph-owner"),
+    )
+    .unwrap();
+    apply_identity_fixture(dir.path()).await;
+    let owner = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config.replace("graphs:\n", "graphs:\n  fresh:\n    schema: ./people.pg\n"),
+    )
+    .unwrap();
+    let planned =
+        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(planned.plan.ok, "{:?}", planned.plan.diagnostics);
+    let applied = apply_config_dir_authorized(
+        dir.path(),
+        ApplyOptions::default(),
+        &owner,
+        &planned.authorization.unwrap(),
+    )
+    .await;
+    assert!(
+        applied.apply.ok && applied.apply.converged,
+        "{:?}",
+        applied.apply.diagnostics
+    );
+    assert!(dir.path().join("graphs/fresh.omni").exists());
+    assert_eq!(
+        applied
+            .authorization
+            .unwrap()
+            .checks
+            .iter()
+            .map(|check| check.action.as_str())
+            .collect::<Vec<_>>(),
+        ["config_manage"]
+    );
+
+    let empty = identity_fixture();
+    let candidate = fs::read_to_string(empty.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::write(
+        empty.path().join(CLUSTER_CONFIG_FILE),
+        "version: 1\ngraphs: {}\n",
+    )
+    .unwrap();
+    apply_identity_fixture(empty.path()).await;
+    let before = fs::read(empty.path().join(CLUSTER_STATE_FILE)).unwrap();
+    fs::write(empty.path().join(CLUSTER_CONFIG_FILE), candidate).unwrap();
+    let denied =
+        plan_config_dir_authorized(empty.path(), PlanOptions { observe: true }, &owner).await;
+    assert!(!denied.plan.ok);
+    assert!(
+        denied
+            .plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_policy_required")
+    );
+    let desired = load_desired(empty.path()).desired.unwrap();
+    let bootstrap = IdentityAuthorization::bootstrap(
+        "principal:owner",
+        desired.config_digest,
+        desired.resource_digests,
+    )
+    .unwrap();
+    let denied =
+        plan_config_dir_authorized(empty.path(), PlanOptions { observe: true }, &bootstrap).await;
+    assert!(!denied.plan.ok);
+    assert!(
+        denied
+            .plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "bootstrap_already_initialized")
+    );
+    assert_eq!(
+        fs::read(empty.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    assert!(!empty.path().join(CLUSTER_GRAPHS_DIR).exists());
+}
+
 fn fixture() -> tempfile::TempDir {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();

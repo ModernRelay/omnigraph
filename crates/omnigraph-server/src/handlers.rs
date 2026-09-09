@@ -41,7 +41,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 /// Unauthenticated, and therefore minimal: it reports whether this replica
 /// is serving or draining, the applied `config_digest` it booted from, the
 /// ledger revision and CAS it read, and how many graphs it serves and does
-/// not serve. Graph ids are topology and stay behind `GET /graphs`. Answers
+/// not serve. Graph ids stay behind authenticated catalog endpoints. Answers
 /// 503 once shutdown has begun; `/healthz` stays 200 while the process is
 /// alive.
 #[utoipa::path(
@@ -147,6 +147,49 @@ pub(crate) async fn server_graphs_list(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/graphs/discovery",
+    tag = "management",
+    operation_id = "discoverGraphs",
+    responses(
+        (status = 200, description = "Authenticated minimal graph inventory", body = GraphDiscoveryResponse),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Identity credential required", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+pub(crate) async fn server_graphs_discovery(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+) -> std::result::Result<Json<GraphDiscoveryResponse>, ApiError> {
+    let actor = actor.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    if actor.identity_claims().is_none() {
+        return Err(ApiError::forbidden(
+            "graph discovery requires a version 2 identity credential",
+        ));
+    }
+    // Both sets come from the accepted boot inventory. Never scan storage or
+    // include per-graph status, roots, diagnostics, schema, or policy contents.
+    let ids: std::collections::BTreeSet<String> = state
+        .routing()
+        .registry
+        .list()
+        .into_iter()
+        .map(|handle| handle.key.graph_id.as_str().to_owned())
+        .chain(state.quarantined_graphs())
+        .collect();
+    Ok(Json(GraphDiscoveryResponse {
+        graphs: ids
+            .into_iter()
+            .map(|graph_id| GraphDiscoveryEntry {
+                display_name: graph_id.clone(),
+                graph_id,
+            })
+            .collect(),
+    }))
+}
+
 pub(crate) async fn server_openapi(
     State(state): State<AppState>,
 ) -> Json<utoipa::openapi::OpenApi> {
@@ -177,7 +220,7 @@ const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
 /// always-flat endpoints. `/graphs` is the management enumeration —
 /// it lives at the root in both single mode (405) and multi mode, and
 /// must never be rewritten to `/graphs/{graph_id}/graphs`.
-const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/readyz", "/graphs"];
+const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/readyz", "/graphs", "/graphs/discovery"];
 
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the

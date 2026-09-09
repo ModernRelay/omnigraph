@@ -614,6 +614,59 @@ fn graphs_subcommand_help_lists_list_only() {
 }
 
 #[test]
+fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_context() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use support::managed_http::{IntentApiFixture, IntentReply};
+    let directory = tempdir().unwrap();
+    fs::create_dir(directory.path().join(".omnigraph")).unwrap();
+    fs::write(
+        directory.path().join(".omnigraph/context"),
+        "malformed context",
+    )
+    .unwrap();
+    let claims = serde_json::json!({"version":2,"iss":"https://issuer.example","aud":"urn:omnigraph:data:c",
+        "sub":"alice","account_id":"a","cluster_id":"c","cluster_incarnation":"i",
+        "principal_kind":"human","assurance":"verified_human","iat":1,"exp":3601,"jti":"j"});
+    let token = format!(
+        "header.{}.signature",
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    for discovery in [false, true] {
+        let reply = if discovery {
+            serde_json::json!({"graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
+        } else {
+            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha"}]})
+        };
+        let server = IntentApiFixture::new(vec![IntentReply::json(200, reply.clone())]);
+        let mut command = cli();
+        command
+            .current_dir(directory.path())
+            .env("OMNIGRAPH_BEARER_TOKEN", &token)
+            .args(["graphs", "list", "--server", &server.origin, "--json"]);
+        if discovery {
+            command.arg("--discovery");
+        }
+        let output = output_success(&mut command);
+        let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(actual, reply);
+        assert_eq!(
+            server.requests()[0].path,
+            if discovery {
+                "/graphs/discovery"
+            } else {
+                "/graphs"
+            }
+        );
+        assert_eq!(
+            server.requests()[0].headers["authorization"],
+            format!("Bearer {token}")
+        );
+        server.assert_complete();
+    }
+}
+
+#[test]
 fn init_with_store_flag_errors_instead_of_ignoring_it() {
     // `init` takes its target as a required positional URI and never reads
     // `--store`; passing both must be a loud guard error, not a silently

@@ -58,7 +58,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Preview or publish classified storage drift | direct |
 | `cleanup` | Delete old versions under an explicit retention policy | direct |
-| `graphs list` | List graphs on a server | served |
+| `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
@@ -303,9 +303,13 @@ context is present. API failures never trigger direct execution.
 
 ## Managed data access
 
-Use `cluster token` to cache scoped data authority, then `query` or `mutate`
-with `--graph` from the managed folder. See [managed data access](managed-data.md)
-for permissions, offline behavior, expiry, and local credential clearing.
+Use `cluster token` to cache an identity credential, `graphs list` to discover
+graphs, then `query` or `mutate` with `--graph` from the managed folder.
+Applied Cedar policy decides permissions. An explicitly addressed server uses
+`graphs list --discovery` for the minimal identity catalog; without the flag,
+its existing metadata listing requires `graph_list` permission. See
+[managed data access](managed-data.md) for legacy restricted credentials,
+offline behavior, expiry, and local credential clearing.
 
 ## Confirmation rules
 

@@ -37,6 +37,14 @@ impl DataTokens {
     }
 
     pub fn token(&self, grants: Value) -> String {
+        self.signed(Some(grants))
+    }
+
+    pub fn identity_token(&self) -> String {
+        self.signed(None)
+    }
+
+    fn signed(&self, grants: Option<Value>) -> String {
         let mut claims = self.fixture["claims"].clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -44,7 +52,12 @@ impl DataTokens {
             .as_secs();
         claims["iat"] = json!(now);
         claims["exp"] = json!(now + 3600);
-        claims["grants"] = grants;
+        if let Some(grants) = grants {
+            claims["grants"] = grants;
+        } else {
+            claims["version"] = json!(2);
+            claims.as_object_mut().unwrap().remove("grants");
+        }
         let content = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(self.fixture["header"].to_string()),

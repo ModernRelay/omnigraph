@@ -33,11 +33,11 @@ use api::{
     BlobReadQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
-    GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
-    QueryRequest, ReadOutput, ReadRequest, ReadinessOutput, SchemaApplyOutput, SchemaApplyRequest,
-    SchemaOutput, SnapshotQuery, graph_batch_load_receipt_output, ingest_receipt_output,
-    schema_apply_output, snapshot_payload,
+    GraphBatchLoadQuery, GraphDiscoveryEntry, GraphDiscoveryResponse, GraphInfo, GraphListResponse,
+    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
+    LegacyReadOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, ReadinessOutput,
+    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
+    graph_batch_load_receipt_output, ingest_receipt_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -100,6 +100,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_health,
         handlers::server_ready,
         handlers::server_graphs_list,
+        handlers::server_graphs_discovery,
         handlers::server_snapshot,
         handlers::server_blob_get,
         handlers::server_blob_head,
@@ -1972,6 +1973,7 @@ pub fn build_app(state: AppState) -> Router {
     // exposed — operators run `cluster apply` and restart.
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
+        .route("/graphs/discovery", get(server_graphs_discovery))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -2153,8 +2155,8 @@ pub async fn open_multi_graph_state(
     // resource-model refactor maps to the singleton
     // `Omnigraph::Server::"root"` entity at evaluation time.
     let server_policy = match server_policy_source {
-        Some(PolicySource::File(path)) => Some(PolicyEngine::load_server(path)?),
-        Some(PolicySource::Inline(source)) => Some(PolicyEngine::load_server_from_source(source)?),
+        Some(PolicySource::File(path)) => Some(PolicyEngine::load_cluster(path)?),
+        Some(PolicySource::Inline(source)) => Some(PolicyEngine::load_cluster_from_source(source)?),
         None => None,
     };
 

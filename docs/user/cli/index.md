@@ -22,10 +22,11 @@ Run `omnigraph <command> --help` for the flags supported by your installed
 version. The [CLI reference](reference.md) summarizes addressing, commands,
 configuration, and output formats.
 
-For a managed cluster, first select it with `use` and request a scoped data
-credential with `cluster token`. Then run `query` or `mutate` from that folder
-with an explicit `--graph`. See [managed data access](managed-data.md)
-for permissions, expiry, offline operation, and local credential clearing.
+For a managed cluster, first select it with `use` and cache an identity
+credential with `cluster token`. Run `graphs list` to discover graph names,
+then `query` or `mutate` from that folder with an explicit `--graph`. Applied
+Cedar policy determines your permissions. See [managed data access](managed-data.md)
+for legacy restricted credentials, expiry, offline operation, and clearing.
 
 ## Create, load, and query a graph
 

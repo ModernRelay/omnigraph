@@ -1722,14 +1722,36 @@ async fn main() -> Result<()> {
             }
         },
         Command::Graphs { command } => match command {
-            GraphsCommand::List { json } => {
-                // Registry scope (RFC-011): the bare server base URL, resolved
-                // synchronously — the async D7 require-graph probe cannot run
-                // here, and no `/graphs/<id>` is ever appended.
-                let client = client::GraphClient::resolve_registry(
-                    cli.server.as_deref(),
-                    cli.profile.as_deref(),
-                )?;
+            GraphsCommand::List { json, discovery } => {
+                let (client, discovery) = if let Some(client) = managed_data {
+                    (client, true)
+                } else {
+                    // Explicit operator addressing retains the legacy catalog
+                    // unless discovery is explicitly requested. Token bytes do
+                    // not choose configuration or change static-token behavior.
+                    (
+                        client::GraphClient::resolve_registry(
+                            cli.server.as_deref(),
+                            cli.profile.as_deref(),
+                        )?,
+                        discovery,
+                    )
+                };
+                if discovery {
+                    let payload = client.discover_graphs().await?;
+                    if json {
+                        print_json(&payload)?;
+                    } else {
+                        for entry in payload.graphs {
+                            if entry.display_name == entry.graph_id {
+                                println!("{}", entry.graph_id);
+                            } else {
+                                println!("{}\t{}", entry.graph_id, entry.display_name);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
                 let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;

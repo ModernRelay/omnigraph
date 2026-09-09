@@ -472,6 +472,28 @@ impl ClusterStore {
         digest: &str,
         address: &str,
     ) -> Result<String, Diagnostic> {
+        self.read_verified_payload_with_limit(kind, digest, address, None)
+            .await
+    }
+
+    pub(crate) async fn read_verified_payload_bounded(
+        &self,
+        kind: &ResourceKind,
+        digest: &str,
+        address: &str,
+        max_bytes: usize,
+    ) -> Result<String, Diagnostic> {
+        self.read_verified_payload_with_limit(kind, digest, address, Some(max_bytes))
+            .await
+    }
+
+    async fn read_verified_payload_with_limit(
+        &self,
+        kind: &ResourceKind,
+        digest: &str,
+        address: &str,
+        max_bytes: Option<usize>,
+    ) -> Result<String, Diagnostic> {
         let Some(relative) = Self::payload_relative(kind, digest) else {
             return Err(Diagnostic::error(
                 "catalog_payload_missing",
@@ -480,7 +502,10 @@ impl ClusterStore {
             ));
         };
         let uri = self.uri(&relative);
-        let text = self.adapter.read_text(&uri).await.map_err(|err| {
+        let text = match max_bytes {
+            Some(max_bytes) => self.adapter.read_text_if_exists_bounded(&uri, max_bytes as u64).await,
+            None => self.adapter.read_text(&uri).await.map(Some),
+        }.map_err(|err| {
             Diagnostic::error(
                 "catalog_payload_missing",
                 address,
@@ -489,7 +514,7 @@ impl ClusterStore {
                     self.display(&relative)
                 ),
             )
-        })?;
+        })?.ok_or_else(|| Diagnostic::error("catalog_payload_missing", address, "applied catalog payload is absent"))?;
         if sha256_hex(text.as_bytes()) != digest {
             return Err(Diagnostic::error(
                 "catalog_payload_digest_mismatch",

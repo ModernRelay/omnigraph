@@ -1743,8 +1743,8 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
 
 /// One entry in the response from `GET /graphs`. Cluster operators
 /// consume this list to discover which graphs the server is currently
-/// serving. The shape is intentionally minimal — `graph_id` and `uri`
-/// are the only fields a routing client needs.
+/// serving. This legacy metadata includes the storage `uri`; identity-only
+/// existence discovery uses [`GraphDiscoveryEntry`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphInfo {
     pub graph_id: String,
@@ -1762,6 +1762,22 @@ pub struct GraphListResponse {
     /// served.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quarantined: Vec<String>,
+}
+
+/// A graph's existence, without storage, schema, data, or serving metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GraphDiscoveryEntry {
+    pub graph_id: String,
+    /// Currently the graph identifier; no separate display name is configured.
+    pub display_name: String,
+}
+
+/// Authenticated minimal inventory from `GET /graphs/discovery`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GraphDiscoveryResponse {
+    pub graphs: Vec<GraphDiscoveryEntry>,
 }
 
 #[cfg(test)]

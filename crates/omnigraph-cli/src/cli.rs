@@ -574,14 +574,14 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
-    /// Cache a scoped data credential for this managed cluster, or forget it locally.
+    /// Cache an identity credential for this cluster, or forget it locally.
     Token {
         #[arg(long, default_value = ".")]
         config: PathBuf,
         #[arg(long)]
         json: bool,
-        /// Comma-separated data actions, such as read,change.
-        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        /// Legacy restricted profile: exact comma-separated actions; requires --graph.
+        #[arg(long, conflicts_with = "clear")]
         actions: Option<String>,
         /// Credential lifetime, 60 seconds to 24 hours (default 1h).
         #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
@@ -758,6 +758,9 @@ pub(crate) enum GraphsCommand {
     List {
         #[arg(long)]
         json: bool,
+        /// Minimal authenticated graph existence; requires an identity credential.
+        #[arg(long)]
+        discovery: bool,
     },
 }
 

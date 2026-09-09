@@ -621,6 +621,26 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
 
+    /// Observe that no recovery sidecar or staged schema artifact is present.
+    /// Performs no graph open, recovery, cleanup, or object-body reads. Any
+    /// pending JSON, including malformed or unsupported sidecars, refuses.
+    /// Listing refuses beyond one matching file, 1,024 unrelated entries or
+    /// 128 KiB of URI bytes; three fixed schema-staging paths are also probed.
+    ///
+    /// This is a point-in-time observation under the process-local schema gate,
+    /// not writer exclusion or a transferable recovery capability. Callers must
+    /// retain their existing writer exclusion through any subsequent effect.
+    pub async fn ensure_no_pending_recovery(uri: &str) -> Result<()> {
+        let root = normalize_root_uri(uri)?;
+        let storage = storage_for_uri(&root)?;
+        let identity = write_queue_root_identity(&root)?;
+        let queues = crate::db::write_queue::WriteQueueManager::for_root(&identity);
+        let _schema_gate = queues
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        crate::db::manifest::refuse_pending_recovery(&root, storage.as_ref()).await
+    }
+
     /// Whether the selected graph-manifest dataset references files outside
     /// its own root through Lance `base_paths`.
     ///

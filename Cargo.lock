@@ -5481,6 +5481,7 @@ name = "omnigraph-cli"
 version = "0.10.0"
 dependencies = [
  "assert_cmd",
+ "base64 0.22.1",
  "clap",
  "color-eyre",
  "futures",

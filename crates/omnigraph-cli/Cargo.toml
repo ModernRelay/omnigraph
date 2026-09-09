@@ -20,6 +20,7 @@ omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.10.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.10.0" }
 omnigraph-server = { path = "../omnigraph-server", version = "0.10.0" }
 clap = { workspace = true }
+base64 = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }

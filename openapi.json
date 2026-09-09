@@ -67,6 +67,51 @@
         ]
       }
     },
+    "/graphs/discovery": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "operationId": "discoverGraphs",
+        "responses": {
+          "200": {
+            "description": "Authenticated minimal graph inventory",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphDiscoveryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Identity credential required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/blob": {
       "get": {
         "tags": [
@@ -3542,7 +3587,7 @@
           "health"
         ],
         "summary": "Readiness witness (RFC 0049).",
-        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids are topology and stay behind `GET /graphs`. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
+        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids stay behind authenticated catalog endpoints. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
         "operationId": "readiness",
         "responses": {
           "200": {
@@ -4689,9 +4734,43 @@
           }
         }
       },
+      "GraphDiscoveryEntry": {
+        "type": "object",
+        "description": "A graph's existence, without storage, schema, data, or serving metadata.",
+        "required": [
+          "graph_id",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string",
+            "description": "Currently the graph identifier; no separate display name is configured."
+          },
+          "graph_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "GraphDiscoveryResponse": {
+        "type": "object",
+        "description": "Authenticated minimal inventory from `GET /graphs/discovery`.",
+        "required": [
+          "graphs"
+        ],
+        "properties": {
+          "graphs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphDiscoveryEntry"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "GraphInfo": {
         "type": "object",
-        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. The shape is intentionally minimal — `graph_id` and `uri`\nare the only fields a routing client needs.",
+        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. This legacy metadata includes the storage `uri`; identity-only\nexistence discovery uses [`GraphDiscoveryEntry`] instead.",
         "required": [
           "graph_id",
           "uri"

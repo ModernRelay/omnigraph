@@ -26,11 +26,34 @@ fn credential(context: &Context, endpoint: &str) -> Credential {
             .unwrap(),
         kid: "a".repeat(64),
         actor: "principal:alice".into(),
+        cluster_incarnation: None,
         grants: vec![Grant {
             graph_id: "knowledge".into(),
             actions: vec!["read".into(), "change".into(), "invoke_query".into()],
         }],
     }
+}
+
+fn identity_credential(context: &Context, endpoint: &str) -> Credential {
+    let mut credential = credential(context, endpoint);
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    credential.version = 2;
+    credential.grants.clear();
+    credential.cluster_incarnation = Some("incarnation-a".into());
+    credential.expires_at = OffsetDateTime::from_unix_timestamp(now + 3600)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let header = json!({"typ":"JWT","alg":"ES256","kid":credential.kid});
+    let claims = json!({"version":2,"iss":context.api,"aud":format!("urn:omnigraph:data:{}", context.cluster),
+        "sub":"alice","account_id":"account-a","cluster_id":context.cluster,"cluster_incarnation":"incarnation-a",
+        "principal_kind":"human","assurance":"verified_human","iat":now,"exp":now+3600,"jti":"test-credential"});
+    credential.token = format!(
+        "{}.{}.signature",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    credential
 }
 
 fn save(store: &MemoryStore, context: &Context, credential: &Credential) {
@@ -84,6 +107,7 @@ fn token_arguments_bound_authority_and_keep_direct_compatibility() {
         assert!(requested_grant(Some(bad), Some("read")).is_err());
     }
     assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--clear"]).is_ok());
+    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token"]).is_ok());
     assert!(
         Cli::try_parse_from([
             "omnigraph",
@@ -236,6 +260,96 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
     );
 }
 
+#[tokio::test]
+async fn identity_issuance_caches_no_permissions_and_discovers_without_control_calls() {
+    let discovery = json!({"graphs":[{"graph_id":"hidden","display_name":"hidden"}]});
+    let data = IntentApiFixture::new(vec![IntentReply::json(200, discovery.clone())]);
+    let mut context = context();
+    let cp = IntentApiFixture::with_origin(|origin| {
+        context.api = origin.to_owned();
+        let credential = identity_credential(&context, &data.origin);
+        let mut response = credential.metadata();
+        response["token"] = json!(credential.token);
+        vec![IntentReply::json(
+            200,
+            json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
+        )]
+    });
+    let store = MemoryStore::default();
+    let api = Api::new(cp.origin.clone(), Some("control-session".into())).unwrap();
+    let output = mint_profile(&store, &context, &api, None, 3600)
+        .await
+        .unwrap();
+    assert_eq!(output["data"]["version"], 2);
+    assert!(output["data"].get("grants").is_none());
+    assert!(output["data"].get("token").is_none());
+    assert_eq!(
+        cp.requests()[0].body,
+        json!({"version":2,"ttl_seconds":3600})
+    );
+    cp.assert_complete();
+    drop(cp);
+    let saved: Value = serde_json::from_str(&store.get(&key(&context)).unwrap().unwrap()).unwrap();
+    assert!(saved.get("grants").is_none());
+    assert!(
+        load(&store, &context, "any-graph", &["schema_apply"]).is_ok(),
+        "Cedar, not the local cache, decides permission"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let cli = Cli::try_parse_from(["omnigraph", "graphs", "list", "--json"]).unwrap();
+    let client = resolve(&cli, dir.path(), &store, || Ok(false))
+        .unwrap()
+        .unwrap();
+    let result = client.discover_graphs().await.unwrap();
+    assert_eq!(serde_json::to_value(result).unwrap(), discovery);
+    assert_eq!(data.requests()[0].path, "/graphs/discovery");
+    data.assert_complete();
+    save(&store, &context, &credential(&context, &data.origin));
+    let failure = resolve(&cli, dir.path(), &store, || Ok(false))
+        .err()
+        .unwrap();
+    assert_eq!(failure.body["type"], "data_profile_unsupported");
+}
+
+#[tokio::test]
+async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_replacement() {
+    for field in ["version", "grants", "roles", "actor", "incarnation"] {
+        let mut context = context();
+        let cp = IntentApiFixture::with_origin(|origin| {
+            context.api = origin.to_owned();
+            let credential = identity_credential(&context, "https://data.example");
+            let mut response = credential.metadata();
+            response["token"] = json!(credential.token);
+            let mut envelope = json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}});
+            match field {
+                "version" => envelope["data"]["version"] = json!(1),
+                "grants" => envelope["data"]["grants"] = json!([]),
+                "roles" => envelope["data"]["roles"] = json!(["admin"]),
+                "actor" => envelope["data"]["actor"] = json!("principal:other"),
+                _ => envelope["meta"]["incarnation"] = json!("other"),
+            }
+            vec![IntentReply::json(200, envelope)]
+        });
+        let store = MemoryStore::default();
+        store
+            .put(&key(&context), "existing-restricted-credential")
+            .unwrap();
+        let api = Api::new(cp.origin.clone(), Some("control-session".into())).unwrap();
+        assert!(
+            mint_profile(&store, &context, &api, None, 3600)
+                .await
+                .is_err(),
+            "accepted {field}"
+        );
+        assert_eq!(
+            store.get(&key(&context)).unwrap().as_deref(),
+            Some("existing-restricted-credential")
+        );
+        cp.assert_complete();
+    }
+}
+
 #[test]
 fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
     let context = context();
@@ -274,6 +388,10 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
         ("endpoint", json!("http://data.example")),
         ("endpoint", json!("https://user:secret@data.example")),
         ("token", json!("a.b")),
+        (
+            "token",
+            json!(identity_credential(&context, "https://data.example").token),
+        ),
         ("token", json!("x".repeat(MAX_TOKEN + 1))),
         ("kid", json!("not-a-fingerprint")),
         (
@@ -315,7 +433,13 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
 
 #[tokio::test]
 async fn invalid_issuance_never_replaces_cached_authority() {
-    for corruption in ["extra-action", "foreign-endpoint", "oversize-token"] {
+    for corruption in [
+        "extra-action",
+        "foreign-endpoint",
+        "oversize-token",
+        "profile-upgrade",
+        "hidden-profile-upgrade",
+    ] {
         let mut context = context();
         let valid = credential(&context, "https://data.example");
         let mut response = valid.metadata();
@@ -324,6 +448,11 @@ async fn invalid_issuance_never_replaces_cached_authority() {
             "extra-action" => response["grants"][0]["actions"] = json!(["read", "export"]),
             "foreign-endpoint" => {
                 response["endpoint"] = json!("https://user:password@data.example/path")
+            }
+            "profile-upgrade" => response["version"] = json!(2),
+            "hidden-profile-upgrade" => {
+                response["token"] =
+                    json!(identity_credential(&context, "https://data.example").token)
             }
             _ => response["token"] = json!("x".repeat(MAX_TOKEN + 1)),
         }
@@ -454,7 +583,10 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
         vec!["load", "--data", "data.jsonl", "--mode", "append"],
         vec!["schema", "plan", "--schema", "schema.pg"],
         vec!["commit", "list"],
-        vec!["graphs", "list"],
+        vec!["graphs", "list", "--server", "legacy"],
+        vec!["graphs", "list", "--server", "legacy", "--discovery"],
+        vec!["graphs", "list", "--profile", "legacy"],
+        vec!["graphs", "list", "--direct"],
         vec!["alias", "people"],
         vec!["queries", "list"],
         vec!["queries", "validate"],

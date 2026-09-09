@@ -14,6 +14,33 @@ use tower::ServiceExt;
 mod support;
 use support::*;
 
+#[tokio::test]
+async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = omnigraph_server::PolicySource::Inline(
+        "version: 1\ngroups:\n  operators: [operator]\nrules:\n  - id: inventory\n    allow:\n      actors: {group: operators}\n      actions: [graph_list]\n  - id: configuration\n    allow:\n      actors: {group: operators}\n      actions: [config_manage]\n".into(),
+    );
+    let state = omnigraph_server::open_multi_graph_state(
+        Vec::new(),
+        vec![("operator".into(), "static-token".into())],
+        Some(&source),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let (status, payload) = json_response(&app, get_request("/graphs", "static-token")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, serde_json::json!({"graphs":[]}));
+    let (status, _) = json_response(&app, get_request("/graphs/discovery", "static-token")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "new cluster policies do not reclassify static credentials"
+    );
+}
+
 /// External consumers may construct and exhaustively destructure the legacy
 /// public settings and identity records without opting into managed trust.
 #[test]

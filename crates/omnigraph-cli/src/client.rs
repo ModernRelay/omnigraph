@@ -33,11 +33,11 @@ use omnigraph_api_types::{
     BranchOutcomeOutput, ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest,
     ChangeFeedOutput, ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput,
     CommitListOutput, CommitOutput, EntityKindOutput, ErrorOutput, ExportRequest,
-    GraphBatchLoadOutput, GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
-    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
-    branch_list_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, ingest_receipt_output, read_output, schema_apply_output,
-    snapshot_payload,
+    GraphBatchLoadOutput, GraphDiscoveryResponse, GraphListResponse, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest,
+    SchemaOutput, SnapshotOutput, branch_list_read_output, change_baseline_output,
+    change_feed_output, change_scope, commit_changes_output, commit_output, ingest_receipt_output,
+    read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::BranchWrite;
@@ -119,13 +119,21 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 impl GraphClient {
     /// An already validated managed credential never enters legacy scope or token resolution.
     pub(crate) fn managed(endpoint: &str, graph: &str, token: String) -> Result<Self> {
+        Self::managed_url(remote_url(endpoint, &["graphs", graph], &[])?, token)
+    }
+
+    pub(crate) fn managed_registry(endpoint: &str, token: String) -> Result<Self> {
+        Self::managed_url(endpoint.to_owned(), token)
+    }
+
+    fn managed_url(base_url: String, token: String) -> Result<Self> {
         Ok(Self::Remote {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(10))
                 .build()?,
-            base_url: remote_url(endpoint, &["graphs", graph], &[])?,
+            base_url,
             token: Some(token),
             response_limit: Some(8 * 1024 * 1024),
         })
@@ -1529,6 +1537,30 @@ impl GraphClient {
                 "internal error: `graphs list` reached an embedded client — registry \
                  addressing always resolves a server"
             ),
+        }
+    }
+
+    /// Minimal existence inventory. No fallback to the metadata-bearing catalog.
+    pub(crate) async fn discover_graphs(&self) -> Result<GraphDiscoveryResponse> {
+        match self {
+            Self::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["graphs", "discovery"], &[])?,
+                    None,
+                    token.as_deref(),
+                    None,
+                    response_limit.or(Some(8 * 1024 * 1024)),
+                )
+                .await
+            }
+            Self::Embedded { .. } => bail!("graph discovery requires a server"),
         }
     }
 }
