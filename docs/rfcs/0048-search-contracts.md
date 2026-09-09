@@ -2063,7 +2063,9 @@ that recipe cannot be generalized to an `any`-term lexical recipe or to lexical
 retrieval as a whole. Query interpretation belongs in the frozen configuration.
 
 Each trial allows two searches, four single-passage reads, six tool calls,
-seven model responses, 60,000 evidence bytes and 180 seconds. Its 80-byte
+seven model responses and 60,000 evidence bytes, with a configured 180-second
+deadline. Recorded durations can include timeout/cleanup overhead; this is not
+a demonstrated hard wall-clock bound. Its 80-byte
 search-input cap is a harness constraint. Observed input refusals, deadline or
 provider failures, abstentions and citations to preview-only passages must
 stay visible in the results; they are not interchangeable with engine defects

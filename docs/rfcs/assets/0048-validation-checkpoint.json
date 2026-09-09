@@ -26,8 +26,8 @@
   "isolated_prototype": {
     "base_commit": "b1df2041c93e03aa13cee8308a0a574689baf210",
     "patch": "0048-staged-integration.patch",
-    "patch_sha256": "b01adca480e6bf1e88495177be00941af966256945e0a75f5d675addb86c5462",
-    "patch_check": "Applied to a temporary index at the exact base commit; all 28 resulting file hashes match the tested prototype. Blank context lines use the git-accepted empty-line form to avoid whitespace-only lines in this archival asset.",
+    "patch_sha256": "658b03d60a234b5a95367bdbf41a9218cbc762b76c9ba9aec1d29196b82fbbff",
+    "patch_check": "Applied to a temporary index at the exact base commit; all 28 resulting file hashes match the tested prototype. Blank context lines use the git-accepted empty-line form, and one truncated advisory hunk label is omitted. Neither normalization changes patch postimages.",
     "source_receipt": {
       "status": "Repeated-vocabulary red reproduced 50M work refusal; exact lookup and per-query fuzzy DP memoization preserve numerical oracle and pass units4 (1 instrument ignored), search57, staged GQT1, focused Clippy, actual CLI/TCP staged parity1. Frozen execution revision2 starts holdout after all checks and independent development dense L2 oracle. Not whole-query allocation ownership or production physical optimum.",
       "head": "b1df2041c93e03aa13cee8308a0a574689baf210",

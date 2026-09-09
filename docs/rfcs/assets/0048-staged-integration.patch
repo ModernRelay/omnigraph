@@ -1301,7 +1301,7 @@ index 52e399ff..4f4527c7 100644
  };
  use omnigraph_compiler::query::parser::parse_query;
  use omnigraph_compiler::query::typecheck::{
-@@ -662,6 +662,7 @@ fn validate_subst_tokens(body: &str, loop_var: Option<&str>) -> Result<(), Strin
+@@ -662,6 +662,7 @@
  /// error, never a silent skip.
  fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
      match expr {
