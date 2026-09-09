@@ -52,19 +52,21 @@ use helpers::*;
 /// RFC 0048's relational selection prototype. This checks DataFusion's
 /// public operators, not the unimplemented GQ stage lowering. Graph paths
 /// are represented by repeated target rows so deduplication must precede
-/// target windows; a semi-join then restores every selected binding row.
+/// target windows. Global cuts restore all winning target bindings; quotas
+/// restore only winning target/group pairs, using null-safe group equality.
 #[tokio::test]
 async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
     use std::sync::Arc;
 
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::NullEquality;
     use datafusion::dataframe::DataFrame;
     use datafusion::functions_window::row_number::row_number;
-    use datafusion::logical_expr::{ExprFunctionExt, JoinType, Partitioning};
+    use datafusion::logical_expr::{ExprFunctionExt, JoinType, LogicalPlanBuilder, Partitioning};
     use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 
-    async fn ids(frame: DataFrame) -> Vec<String> {
+    async fn strings(frame: DataFrame, column: &str) -> Vec<String> {
         frame
             .collect()
             .await
@@ -72,7 +74,7 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
             .iter()
             .flat_map(|batch| {
                 let ids = batch
-                    .column_by_name("id")
+                    .column_by_name(column)
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()
@@ -86,18 +88,22 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
-        Field::new("group_key", DataType::Utf8, false),
+        Field::new("group_key", DataType::Utf8, true),
         Field::new("score", DataType::Int64, false),
         Field::new("binding_id", DataType::Utf8, false),
     ]));
     for partitions in [1, 4] {
         for reverse in [false, true] {
             let mut rows = vec![
-                ("a", "x", 10, "path-1"),
-                ("a", "x", 10, "path-2"),
-                ("a", "x", 10, "path-3"),
-                ("b", "x", 9, "path-4"),
-                ("c", "y", 8, "path-5"),
+                ("a", Some("g1"), 10, "path-1"),
+                ("a", Some("g2"), 10, "path-2"),
+                ("a", Some("g2"), 10, "path-3"),
+                ("b", Some("g2"), 9, "path-4"),
+                ("c", Some("g1"), 11, "path-5"),
+                ("d", None, 12, "path-6"),
+                ("d", None, 12, "path-7"),
+                ("e", None, 11, "path-8"),
+                ("f", Some("g3"), 8, "path-9"),
             ];
             if reverse {
                 rows.reverse();
@@ -120,17 +126,28 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 ],
             )
             .unwrap();
-            let ctx = SessionContext::new_with_config(
-                SessionConfig::new()
-                    .with_target_partitions(partitions)
-                    .with_batch_size(1),
-            );
+            let mut config = SessionConfig::new()
+                .with_target_partitions(partitions)
+                .with_batch_size(1);
+            // Qualify a partitioned hash-join route. The default CollectLeft
+            // route fails distribution validation for this multi-batch source
+            // at four partitions; retain that fence below until requalified.
+            config
+                .options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold = 0;
+            config
+                .options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold_rows = 0;
+            let ctx = SessionContext::new_with_config(config);
             let bindings = ctx
-                .read_batch(batch)
+                .read_batches((0..batch.num_rows()).map(|row| batch.slice(row, 1)))
                 .unwrap()
                 .repartition(Partitioning::RoundRobinBatch(partitions))
                 .unwrap();
-            let target_fields = || vec![col("id"), col("group_key"), col("score")];
+            let target_fields = || vec![col("id"), col("score")];
+            let pair_fields = || vec![col("id"), col("group_key"), col("score")];
             let targets = bindings
                 .clone()
                 .select(target_fields())
@@ -138,40 +155,85 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 .distinct()
                 .unwrap();
             let order = || vec![col("score").sort(false, false), col("id").sort(true, false)];
+            assert_eq!(
+                strings(targets.clone().sort(order()).unwrap(), "id").await,
+                ["d", "c", "e", "a", "b", "f"]
+            );
             let top_two = targets
                 .clone()
                 .sort(order())
                 .unwrap()
                 .limit(0, Some(2))
                 .unwrap();
-            assert_eq!(ids(top_two.clone()).await, ["a", "b"]);
+            assert_eq!(strings(top_two.clone(), "id").await, ["d", "c"]);
 
-            // Filtering after the global cut cannot refill from c; filtering
+            let selected_bindings = bindings
+                .clone()
+                .join(
+                    top_two.select(vec![col("id")]).unwrap(),
+                    JoinType::LeftSemi,
+                    &["id"],
+                    &["id"],
+                    None,
+                )
+                .unwrap();
+            let binding_order = || {
+                let mut keys = order();
+                keys.push(col("group_key").sort(true, true));
+                keys.push(col("binding_id").sort(true, false));
+                keys
+            };
+            assert_eq!(
+                strings(
+                    selected_bindings.clone().sort(binding_order()).unwrap(),
+                    "binding_id",
+                )
+                .await,
+                ["path-6", "path-7", "path-5"]
+            );
+
+            // Filtering after the global cut cannot refill from f; filtering
             // before selection has a different logical population.
             assert!(
-                ids(top_two
-                    .clone()
-                    .filter(col("group_key").eq(lit("y")))
-                    .unwrap())
+                strings(
+                    selected_bindings
+                        .clone()
+                        .filter(col("group_key").eq(lit("g3")))
+                        .unwrap(),
+                    "id"
+                )
                 .await
                 .is_empty()
             );
             assert_eq!(
-                ids(targets
-                    .clone()
-                    .filter(col("group_key").eq(lit("y")))
-                    .unwrap()
-                    .sort(order())
-                    .unwrap()
-                    .limit(0, Some(2))
-                    .unwrap())
+                strings(
+                    bindings
+                        .clone()
+                        .filter(col("group_key").eq(lit("g3")))
+                        .unwrap()
+                        .select(target_fields())
+                        .unwrap()
+                        .distinct()
+                        .unwrap()
+                        .sort(order())
+                        .unwrap()
+                        .limit(0, Some(2))
+                        .unwrap(),
+                    "id"
+                )
                 .await,
-                ["c"]
+                ["f"]
             );
 
-            // Quotas apply to distinct targets, not graph paths. The full
-            // population has one winner in each group; the cut input only x.
-            let quota = |input: DataFrame| {
+            // Deduplicate within each group. A may compete in g1 and g2,
+            // but its two paths in g2 consume only one slot there.
+            let pairs = bindings
+                .clone()
+                .select(pair_fields())
+                .unwrap()
+                .distinct()
+                .unwrap();
+            let quota = |input: DataFrame, count: u64| {
                 input
                     .window(vec![
                         row_number()
@@ -182,33 +244,133 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                             .alias("within_group"),
                     ])
                     .unwrap()
-                    .filter(col("within_group").lt_eq(lit(1_u64)))
+                    .filter(col("within_group").lt_eq(lit(count)))
                     .unwrap()
                     .sort(order())
                     .unwrap()
             };
-            assert_eq!(ids(quota(targets.clone())).await, ["a", "c"]);
-            assert_eq!(ids(quota(top_two.clone())).await, ["a"]);
-
-            let selected_ids = top_two.select(vec![col("id")]).unwrap();
-            let selected_bindings = bindings
-                .clone()
-                .join(selected_ids, JoinType::LeftSemi, &["id"], &["id"], None)
+            let winners = quota(pairs.clone(), 1);
+            assert_eq!(strings(winners.clone(), "id").await, ["d", "c", "a", "f"]);
+            let cut_pairs = selected_bindings
+                .select(pair_fields())
                 .unwrap()
-                .sort(order())
+                .distinct()
                 .unwrap();
-            assert_eq!(ids(selected_bindings.clone()).await, ["a", "a", "a", "b"]);
-            assert_eq!(
-                ids(selected_bindings
-                    .select(vec![col("binding_id").alias("id")])
+            assert_eq!(strings(quota(cut_pairs, 1), "id").await, ["d", "c"]);
+
+            let reattach = |selected: DataFrame, null_equality: NullEquality| {
+                let right = selected
+                    .select(vec![
+                        col("id").alias("selected_id"),
+                        col("group_key").alias("selected_group"),
+                    ])
+                    .unwrap();
+                let plan = LogicalPlanBuilder::from(bindings.clone().into_unoptimized_plan())
+                    .join_detailed(
+                        right.into_unoptimized_plan(),
+                        JoinType::LeftSemi,
+                        (
+                            vec!["id", "group_key"],
+                            vec!["selected_id", "selected_group"],
+                        ),
+                        None,
+                        null_equality,
+                    )
                     .unwrap()
-                    .sort(vec![col("id").sort(true, false)])
-                    .unwrap())
-                .await,
-                ["path-1", "path-2", "path-3", "path-4"]
+                    .build()
+                    .unwrap();
+                DataFrame::new(ctx.state(), plan)
+                    .sort(binding_order())
+                    .unwrap()
+            };
+            let selected_pairs = reattach(winners.clone(), NullEquality::NullEqualsNull);
+            let expected_paths = ["path-6", "path-7", "path-5", "path-2", "path-3", "path-9"];
+            assert_eq!(
+                strings(selected_pairs.clone(), "binding_id").await,
+                expected_paths
             );
 
-            // Red control: counting paths as candidates makes a consume both
+            // Same logical plan, default optimizer policy: single-partition
+            // execution succeeds, but four partitions expose a native plan
+            // defect rather than different logical results. An upstream fix
+            // should remove this refusal fence and requalify default planning.
+            let default_ctx = SessionContext::new_with_config(
+                SessionConfig::new()
+                    .with_target_partitions(partitions)
+                    .with_batch_size(1),
+            );
+            let default_join =
+                DataFrame::new(default_ctx.state(), selected_pairs.into_unoptimized_plan());
+            if partitions == 4 {
+                let error = default_join.collect().await.unwrap_err().to_string();
+                assert!(error.contains("CollectLeft"), "{error}");
+                assert!(
+                    error.contains("does not satisfy distribution requirements: SinglePartition"),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(strings(default_join, "binding_id").await, expected_paths);
+            }
+            // With quota two, a wins both groups; e and b remain eligible
+            // despite duplicate paths for higher-ranked targets d and a.
+            assert_eq!(
+                strings(
+                    reattach(quota(pairs, 2), NullEquality::NullEqualsNull),
+                    "binding_id"
+                )
+                .await,
+                [
+                    "path-6", "path-7", "path-5", "path-8", "path-1", "path-2", "path-3", "path-4",
+                    "path-9"
+                ]
+            );
+
+            // Red control: joining winners by target alone restores a's
+            // losing g1 path, making g1 exceed its quota of one.
+            let wrong_target_join = bindings
+                .clone()
+                .join(
+                    winners.clone().select(vec![col("id")]).unwrap(),
+                    JoinType::LeftSemi,
+                    &["id"],
+                    &["id"],
+                    None,
+                )
+                .unwrap()
+                .sort(binding_order())
+                .unwrap();
+            assert_eq!(
+                strings(wrong_target_join, "binding_id").await,
+                [
+                    "path-6", "path-7", "path-5", "path-1", "path-2", "path-3", "path-9"
+                ]
+            );
+
+            // Red control: ordinary equality drops the winning null group.
+            assert_eq!(
+                strings(
+                    reattach(winners, NullEquality::NullEqualsNothing),
+                    "binding_id"
+                )
+                .await,
+                ["path-5", "path-2", "path-3", "path-9"]
+            );
+
+            // Red control: applying the quota to paths excludes e from the
+            // null group's two slots, although there are two distinct targets.
+            assert_eq!(
+                strings(
+                    quota(
+                        bindings.clone().filter(col("group_key").is_null()).unwrap(),
+                        2
+                    ),
+                    "id"
+                )
+                .await,
+                ["d", "d"]
+            );
+
+            // Red control: counting paths as candidates makes d consume both
             // slots. The oracle must distinguish that implementation.
             let wrong = bindings
                 .sort(order())
@@ -219,7 +381,7 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 .unwrap()
                 .distinct()
                 .unwrap();
-            assert_eq!(ids(wrong).await, ["a"]);
+            assert_eq!(strings(wrong, "id").await, ["d"]);
             println!("staged selection passed: partitions={partitions}, reversed={reverse}");
         }
     }

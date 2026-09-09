@@ -682,14 +682,46 @@ their origin. Aggregation does not implicitly inherit a constituent target's
 rank. These ordering rules require golden plans and fan-out fixtures.
 
 Selection per group consumes a bounded candidate relation, partitions by an
-explicit bound key, and takes at most N targets per group under a declared
-total order. It preserves the selected target identities and has an explicit
-final merge order/window. It is distinct from `count`/`sum` grouping inferred
-by current aggregate returns. A global candidate cut before this operation
-can leave groups empty; there is no implied refill. Retrieving top-N within
-every group of the full population is a different, separately bounded shape.
-The initial surface must express selection per group; exact spelling and
-null/multiple-group handling are parser/typechecker acceptance gates.
+explicit bound key tuple, and takes at most N distinct targets per group under
+a declared total order. Its selection unit is `(target identity, group key)`:
+
+- Evaluate group keys on incoming binding rows. A target can participate in
+  several groups through those bindings; there is no implicit array expansion.
+  Within one group, duplicate paths for the same target consume one slot.
+- Select winning target/group pairs, then retain every incoming binding row
+  belonging to a winning pair. Winning one group does not restore that target's
+  losing bindings in another group. A target winning several groups retains
+  its bindings in each; selected pairs, distinct targets, and output rows are
+  separate counts.
+- Use the language's grouping equivalence for each admitted key type. Null
+  components group together, as in existing aggregate grouping; they do not
+  mean “no group.” Reattachment must use that same equivalence, including
+  null-safe equality. Supported key types and tuple ordering need compiler
+  and execution fixtures; stringified keys are not the public contract.
+- A selection comparator must have one value per target/group pair. If an
+  expression varies across the pair's binding rows, require an explicit
+  supported reduction or reject it; never choose the first path's value.
+  Append stable target identity to break ties within each group.
+- Quota selection preserves metric values and their origins. Removing a
+  higher-ranked pair does not renumber surviving source ranks or create a
+  new source-membership vote. By default it filters the incoming active order;
+  an explicit final order can replace that order. Final `limit` still counts
+  binding rows, not pairs, and applies after the quota.
+
+For example, if `a` belongs to `g1` and `g2`, `c` beats `a` in `g1`, and `a`
+beats `b` in `g2`, quota one selects `(c, g1)` and `(a, g2)`. Restoring every
+binding for target `a` would also restore `(a, g1)` and violate `g1`'s quota.
+Global target selection can use a target-only semi-join; per-group selection
+requires the winning pair keys.
+
+This operator is distinct from `count`/`sum` grouping inferred by current
+aggregate returns. A global candidate cut before it can leave groups empty;
+there is no implied refill. Retrieving top-N within every group of the full
+population is a different, separately bounded shape. Selecting a global set
+of targets subject to quotas on *all* their overlapping memberships is also
+a different optimization problem; independent per-group winners do not claim
+that guarantee. The initial surface must express selection per group; exact
+spelling and enforcement of these rules are parser/typechecker acceptance gates.
 
 Per-group quotas and identity deduplication address concentration, but do not
 establish complementary reasoning coverage. Semantic diversification and
@@ -1114,7 +1146,7 @@ plan. The design reuses the right owner for each operation:
 | Lexical ranking | Structured Lance FTS where qualified; exact scoring fallback | Declared corpus statistics, fuzzy formula, numeric parity, complete boundaries |
 | Fusion | Explicit arm ranks, union, aggregate and sort | Common identity, missing-arm semantics, one snapshot, shared budgets |
 | Target selection and binding preservation | Distinct target stream for ranking; semi-join selected identities back to the incoming bindings | Deduplicate before candidate cuts; preserve every surviving graph binding and its metric origin |
-| Selection per group | DataFusion `row_number` window, filter, ordered merge | Correct partitioning, total comparator, distinct target and group semantics |
+| Selection per group | DataFusion distinct target/group pairs, `row_number`, filter, null-safe semi-join, ordered merge | Pair quotas, binding multiplicity, key equality, total comparator, metric preservation |
 | Graph expansion | Existing CSR/CSC and indexed edge paths | Retain traversal/path semantics, bound fan-out, carry metric origin |
 | Learned reranking | Future bounded scoring/model operator | Model identity, batched input, cancellation, resource and failure contracts |
 
@@ -1136,15 +1168,35 @@ DataFusion 54 provides sort, union, aggregation, joins, windows and limits.
 Its filter optimizer preserves limit boundaries; the new graph/search nodes
 must also encode semantic barriers. The
 `staged_target_selection_preserves_cutoffs_and_binding_rows` prototype executes
-typed DataFrame plans for distinct targets, ordered limits, per-group
-`row_number`, and a left semi-join back to the binding rows. It checks both
-filter placements, shows that a quota after a cutoff cannot refill from
-discarded targets, and preserves duplicate graph paths for selected targets.
-The fixture passes with reversed input and one/four partitions; a control
-that limits bindings before target deduplication produces the wrong target
-set. This is concrete relational execution evidence, not GQ lowering or a
-graph/search integration test. Null or multiple group keys, metric carriage,
-spill, and whole-query budgets remain separate qualification work.
+typed DataFrame plans for distinct targets, ordered limits, distinct
+target/group pairs, per-group `row_number`, and left semi-joins back to the
+binding rows. It checks both filter placements and shows that a quota after
+a cutoff cannot refill from discarded targets. The fixture includes multiple
+memberships, duplicate paths, a nullable string group key, and quotas of one
+and two. `LogicalPlanBuilder::join_detailed` with
+`NullEquality::NullEqualsNull` retains exactly the winning pairs' bindings,
+including null-key paths. Controls demonstrate that a target-only join
+exceeds a group's quota, ordinary equality drops the null group, and counting
+paths before deduplication excludes eligible targets. These checks pass with
+reversed input and one/four partitions, using actual one-row input batches.
+
+The successful route sets DataFusion's byte and row
+`hash_join_single_partition_threshold` options to zero to select partitioned
+hash joins. The same logical plan with default optimizer policy succeeds at
+one partition but fails at four: the resulting `CollectLeft` join receives a
+four-partition build input where `SinglePartition` is required, and the native
+plan sanity check refuses execution. The probe pins that failure as well as
+the successful route. The earlier single-batch fixture did not expose it.
+This test configuration is not a production-wide tuning recommendation;
+qualify distribution enforcement with the actual graph/Lance sources before
+choosing a planner policy, and remove the refusal fence if upstream fixes it.
+
+This is concrete relational execution evidence, not GQ lowering or a
+graph/search integration test. Composite keys and other key types, ambiguous
+per-pair comparator expressions, real metric carriage, spill, and whole-query
+budgets remain separate qualification work. Existing aggregate execution
+groups nulls together; its display-based key encoding is not a new adapter
+interface or a substitute for typed key equivalence.
 
 Existing bounded ordered-scan support can supply memory/scratch ownership.
 These operator tests do not establish whole-query memory or cancellation
@@ -1378,7 +1430,7 @@ Extend existing test owners rather than creating a parallel search harness:
 | Boundary | Required evidence and owner |
 |---|---|
 | Grammar / types / lowering | Compiler parser/typecheck/IR fixtures for schema default declarations and resolution, rank blocks, typed lexical queries, named metrics, invalid references, parameter bounds, removed syntax, and aggregate scope |
-| Query semantics | `.gqt` cases for filter-before/after-rank, traversal-introduced targets, distinct target versus binding-row counts, per-group selection, final limit independence, and exact verification |
+| Query semantics | `.gqt` cases for filter-before/after-rank, traversal-introduced targets, target/pair/binding-row counts, per-group multi-membership and null buckets, final limit independence, and exact verification |
 | Search mechanisms | `search.rs`, `rrf_prefilter_gate.rs`, `ordering.rs`, `aggregation.rs`, and traversal owners for arm ranks through fan-out, missing arm versus rescore, common-identity deduplication, and graph populations |
 | Substrate qualification | `lance_surface_guards.rs` and search owners for NFC/analyzer/index parity, native row-mask mapping, score statistics, vector metric/precision, tail coverage, complete boundaries and different partition layouts |
 | Snapshot / policy / transport | `point_in_time.rs`, policy owners, server `data_routes`/`stored_queries`/`openapi`, and CLI parity for coherent follow-up, expiry/refusal, metadata, policy-safe counts and resolved query identity |
@@ -1641,9 +1693,11 @@ release. Each extension retains its stated semantic and qualification boundary.
 
 ## Unresolved questions
 
-1. Final clause and stage/metric spelling, symbol scope, per-group null and
-   multiple-key behavior, and any user-defined selection tie keys. Settle with
-   parser/typechecker prototypes and RFC 0040 namespace coordination.
+1. Final clause and stage/metric spelling, symbol scope, admitted per-group
+   key types and tuple ordering, and any user-defined selection tie keys.
+   Null-bucket and multiple-membership semantics are specified above; prove
+   their lowering with parser/typechecker prototypes and RFC 0040 namespace
+   coordination.
 2. Qualification of the specified BM25 policy: the pinned numeric kernel across
    supported targets, exact live-row statistics, polymorphic field-corpus
    resolution, and native/fallback score and winner parity. Validate its edit
