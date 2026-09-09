@@ -19,8 +19,8 @@ blocked_on:
   - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
   - "NFC preprocessing implementation and Unicode identity, with query/scan/index parity and bounded normalization"
   - "Vector arithmetic, normalization, invalid-value handling, exact-rescore precision, and checked fusion/effort arithmetic"
-  - "Exact lexical evaluator, complete fuzzy ranked scoring specification, and scan/index membership, score, and boundary-order qualification"
-  - "Snapshot-visible BM25 statistics population, term accounting, numeric contract, and full boundary-tie handling"
+  - "Exact lexical evaluator and unified BM25 implementation qualified against the score oracle across index states and boundary ties"
+  - "Snapshot-visible live-row statistics, canonical float64/log1p implementation, and full boundary-tie handling"
   - "Whole-query admission and accounting for token construction, graph fan-out, coverage, sorting, scoring, fallback, and output bytes"
   - "Snapshot-coherent follow-up read and stored-query fingerprint contracts through the existing read surface"
   - "Checked-in retrieval judgments and agent-task evaluation corpus; bounded ann_default_v1 recall/latency qualification per index family"
@@ -47,14 +47,16 @@ The proposal has three layers:
 
 | Layer | Owns |
 |---|---|
-| Representation in accepted schema | Analyzer and scoring-family identity, vector geometry and space, source-property mapping, and encoding recipes |
+| Representation in accepted schema | Analyzer and default-scorer identity, vector geometry and space, source-property mapping, and encoding recipes |
 | Typed query plan | Eligibility, ranking target, lexical query, named sources, candidate windows, fusion, selection, and graph-stage placement |
 | Physical execution | Qualified Lance scans/indexes, DataFusion operators where they fit, existing graph traversal, and shared resource accounting |
 
 Schema authoring has concise defaults: bare `@analyzed` enables matching and
-BM25-family ranking, and embedding fields may inherit a schema-owned encoding
+BM25 ranking, and embedding fields may inherit a schema-owned encoding
 recipe. Accepted SchemaIR stores every resolved choice; runtime provider
 defaults cannot change an existing field's meaning.
+Lexical retrieval uses one default BM25 policy for exact and tolerant terms;
+callers specify edit tolerance once, without a separate fuzzy scorer selector.
 
 Ranked relations are first-class internally. Public composition extends the
 existing `.gq` clause language; it does not require general relation-valued
@@ -137,9 +139,9 @@ graphs still cross the storage-format upgrade described below.
 | `fuzzy`, `search`, or `match_text` | These spellings are removed without compatibility aliases. Boolean matching and ranked lexical retrieval consume the same typed `terms` query. | Choose `match_terms` for filtering or `lexical` for retrieval; set term combination and edit tolerance deliberately. |
 | `nearest`, retrieval expressions inside `order`, or positional RRF | Retrieval moves into explicit `rank` stages. Vector retrieval distinguishes exact `knn` from approximate `ann`; fusion names its inputs. | Rewrite inline and stored queries, choose exact versus approximate retrieval, and project named metrics instead of repeating retrieval expressions. |
 | Vector candidate depth inherited from final `limit`, while BM25 fusion arms scan uncapped | Each source and fusion stage has its own candidate window. Final `limit` counts output rows; graph fan-out can produce several rows per selected target. Stage comparators determine selection before final ordering. | Choose source/fusion windows explicitly and review tie keys and expected row counts. A migration cannot infer the intended recall/cost tradeoff from the old limit. |
-| `@index` or `@key` implicitly makes a String searchable by analyzed text | Analyzed matching requires `@analyzed`, which enables BM25-family ranking by default. Exact key/index annotations keep their separate meaning. | Declare `@analyzed` on searchable text, choose another analyzer when needed, or explicitly opt out of ranking with `scorer="none"`. An exact-only slug does not need an analyzer. |
+| `@index` or `@key` implicitly makes a String searchable by analyzed text | Analyzed matching requires `@analyzed`, which enables BM25 ranking by default. Exact key/index annotations keep their separate meaning. | Declare `@analyzed` on searchable text, choose another analyzer when needed, or explicitly opt out of ranking with `scorer="none"`. An exact-only slug does not need an analyzer. |
 | Implicit vector geometry or an unresolved `@embed` model | A field's encoding recipe and geometry must resolve at schema acceptance. The model may inherit a schema-owned default recipe; distance may inherit that recipe's declared default. Raw vectors require explicit distance. | Declare the source and dimensions, then resolve a compatible recipe and geometry. A new default cannot identify how old vectors were produced; unresolved legacy vectors still need operator resolution or regeneration. |
-| Existing search rows, scores, or ordering survive a spelling-only rewrite | `terms` defaults to all terms and zero edits. Schema-owned analysis, complete fuzzy matching, long-token handling, scoring policies, and explicit selection boundaries can change results. Lexical statistics use the snapshot-visible field corpus independently of graph eligibility. | Review analyzer choices, fuzzy scoring, relevance expectations, score thresholds, and tie fixtures. The rewrite does not promise equivalent results to legacy search. |
+| Existing search rows, scores, or ordering survive a spelling-only rewrite | `terms` defaults to all terms and zero edits. Analysis, complete fuzzy matching, and explicit selection boundaries can change results. Lexical ranking deduplicates query terms, groups fuzzy alternatives, and uses float64 scores with snapshot-visible field statistics independent of eligibility. | Review analyzer choices, fuzzy relevance, score thresholds, and tie fixtures. Repeating a query term no longer increases its weight. The rewrite does not promise equivalent results to legacy search. |
 | Queries relying on silently ignored search constructs or permissive parameter handling | Invalid shapes, incompatible representations, token-empty queries, and exhausted budgets produce typed failures. A successful partial candidate set cannot stand in for an exact result. | Handle the declared errors and size queries explicitly; do not interpret a failure as an empty successful search. |
 | Existing graph files open directly after the upgrade | The accepted-schema change requires an export/init/load rebuild. Compatible values and logical graph content are carried over; commit history, branches, and physical indexes are not preserved by that rebuild. | Plan the data upgrade even if no query uses search. Retain the predecessor graph if its history is needed, rebuild indexes explicitly, and obtain fresh snapshot references from the rebuilt graph. |
 
@@ -231,7 +233,7 @@ content write. Unknown arguments and unresolved required choices are errors.
 |---|---|---|
 | `@analyzed` | No annotation means no analyzed capability; `@index` and `@key` do not supply it. | Exact predicates remain available without it. |
 | `@analyzed.analyzer` | `standard_v1` | A named immutable profile such as `standard_folded_v1` or `english_v1`. |
-| `@analyzed.scorer` | `bm25_v1` family capability | `scorer="none"` permits analyzed filtering only; a lexical ranking source on that field is a typed error. |
+| `@analyzed.scorer` | `bm25_v1` capability and default policy for exact or tolerant `terms` | `scorer="none"` permits analyzed filtering only; a lexical ranking source on that field is a typed error. |
 | `@embed` source | No default | The source property is mandatory and resolves to its stable identity. |
 | `Vector` dimensions | No default | A positive dimension is mandatory and must be compatible with the resolved encoding recipe when present. |
 | `@embed.model` | The schema's declared default embedding recipe | Without that default, require an explicit model that resolves to a complete qualified recipe. A model label alone is insufficient. |
@@ -241,10 +243,12 @@ content write. Unknown arguments and unresolved required choices are errors.
 
 Thus bare `@analyzed` expands to
 `@analyzed(analyzer="standard_v1", scorer="bm25_v1")`.
-The schema's `scorer` argument declares an allowed family; the query still
-chooses an explicit versioned scoring policy, including exact versus fuzzy
-BM25. It does not implicitly enable edit tolerance, execute ranking, create
-an index, or remove the need for that policy's qualification. An explicit
+The initial scoring capability supplies one default policy, `bm25_v1`.
+`lexical` may omit `scoring`; spelling `scoring: bm25_v1` explicitly is
+equivalent. Exact and fuzzy search use that same policy, with edit tolerance
+specified once in `terms`. There is no separate `fuzzy_bm25_v1` selector.
+This default does not enable edit tolerance, execute ranking, create an
+index, or remove the need for the policy's qualification. An explicit
 `@analyzed(scorer="none")` retains the former matching-only use case.
 
 The graph schema may declare one default embedding recipe in its accepted
@@ -318,8 +322,10 @@ used by `simple` and lowercase. These are revised, unshipped `v1` definitions;
 the earlier no-NFC probe does not qualify them. Adding a profile or scorer
 version requires an RFC; accepted identities are never mutated.
 Query-time analyzer or vector-distance overrides do not exist. A lexical
-source selects an explicit, versioned scoring policy compatible with the
-field's declared scoring family; that selection does not change analysis.
+source resolves a versioned scoring policy compatible with the field's
+declared capability, using its accepted default when omitted. That resolution
+does not change analysis. The first release defines only `bm25_v1`; additional
+policies need explicit semantics and qualification rather than runtime aliases.
 
 For spelling tolerance on names and titles, the non-stemming profiles keep
 edit distance close to the spelling the user supplied. Under `english_v1`,
@@ -338,7 +344,7 @@ composition are future typed variants, not embedded vendor query strings.
 
 `match_terms(field, terms(...))` is a Boolean predicate on a scalar String
 property with `@analyzed`. A `lexical` source consumes the same description
-to select and rank matches with an explicit scoring policy. The Boolean
+to select and rank matches with a resolved scoring policy. The Boolean
 predicate introduces no score, ranking, candidate window, or implicit
 retrieval. Its contract is:
 
@@ -380,7 +386,7 @@ query find_organizations($q: String)
   }
   rank $o {
     lexical($o.name, terms($q, mode: any, max_edits: 1),
-            scoring: fuzzy_bm25_v1, candidates: 100) as words
+            candidates: 100) as words
     ann($o.embedding, $q, oversample: 4, candidates: 100) as meaning
     rrf(arm(words), arm(meaning, weight: 1.5),
         k: 60, candidates: 20) as combined
@@ -457,7 +463,7 @@ query organization_names($q: String) {
 
 No adjacent source inherits that edit budget. `lexical` with exact terms
 continues to select only its own exact matches; fuzzy retrieval must consume
-an explicitly tolerant query and compatible fuzzy scoring policy.
+an explicitly tolerant query. Both resolve the same default scoring policy.
 
 ### Vector behavior and agent recipes
 
@@ -701,15 +707,15 @@ indexed paths. The consumers differ in role: matching returns a Boolean;
 retrieval selects matches and computes ranking under its declared policy.
 Removed spellings have no separate IR variants or compatibility evaluators.
 
-Exact `bm25_v1` uses exact analyzed terms and a positive-score candidate
-contract. Its math starts from the pinned Lance `k1=1.2`, `b=0.75`, and IDF
-formula. Those constants alone do not define a score: the specification must
-fix query-term multiplicity, field-length accounting, population statistics,
-precision, and accumulation order before acceptance. Matching's set treatment
-of repeated terms does not silently settle ranking's term-frequency policy.
-Selecting this exact policy with a nonzero edit budget is a typed error;
-the evaluator must not ignore the requested tolerance. A fuzzy policy used
-with zero edits must satisfy its declared exact-scorer reduction.
+`bm25_v1` is one versioned term scorer for both exact and tolerant queries.
+Zero edits reduces to BM25 with unit weight per distinct analyzed query term;
+nonzero edits adds alternatives and an edit penalty within the same formula.
+Candidate membership is always the shared `Terms` relation, evaluated before
+the ranking cutoff. A score is not a second membership predicate. This removes
+the earlier requirement to coordinate `terms.max_edits` with a separate exact
+or fuzzy scorer selector. Query-term repetition and order carry no extra
+weight; intentional source weighting belongs to explicit fusion or a separately
+specified future scoring operator.
 
 The statistics population is part of source identity, independently of its
 eligible population and candidate window. The initial contract uses the
@@ -750,31 +756,105 @@ The prefilter probe proves neither live-row statistics parity nor a cost
 advantage for every query. Policy constrains the corpus before statistics;
 ordinary query filters do not replace the access-control boundary.
 
-Fuzzy ranked retrieval is required for the first complete path. The sketch
-names its policy `fuzzy_bm25_v1`, compatible with a field declaring the BM25
-family. This is a proposed scorer identity, not an existing Lance scorer.
-Its candidate membership uses the same complete `Terms` relation as the
-predicate. A `beto` query with one edit can therefore retrieve `beta` directly.
+For each distinct analyzed query term `q`, treat all stored terms within the
+declared edit budget as alternatives for that term. Let `N` be the number of
+documents in the field corpus, `df_q` the number containing at least one such
+alternative, `len_d` the total analyzed token count of document `d`, `avg_len`
+the corpus mean length, and `tf(t,d)` the occurrence count of stored term `t`.
+All analyzed occurrences contribute to length, including repetitions and
+terms unrelated to the query. A field value is the document unit; graph paths
+and index segments never multiply its frequency.
 
-Before accepting that scorer, freeze a numerical specification and fixtures
-for all of the following:
+The mathematical definition is:
 
-- Preference for exact matches and how edit cost affects contribution; state
-  whether preference is a boost or a strict ordering tier.
-- Deduplication of expansion terms across partitions and of repeated query
-  terms; no repeated posting/segment may amplify a target's score.
-- Whether alternatives contribute by maximum, sum, or another specified
-  reduction, including one stored term matching several query terms.
-- Which original/expanded term frequencies enter IDF and how they relate to
-  the declared statistics population and field lengths.
-- Zero-edit reduction to the exact scorer, numeric precision, total tie
-  handling, and equality of scores/order across index states.
+```text
+idf(q)       = log1p((N - df_q + 0.5) / (df_q + 0.5))
+norm(d)      = 1.2 * (0.25 + 0.75 * len_d / avg_len)
+weight(t,d)  = 2.2 * tf(t,d) / (tf(t,d) + norm(d))
+part(q,d)    = idf(q) * max [ 2^(-edit(q,t)) * weight(t,d) ]
+                       over stored terms t within the edit budget
+score(d)     = sum part(q,d) over distinct query terms q
+```
 
-The numerical fuzzy formula is an explicit blocking decision. Naming this
-source or qualifying Boolean membership does not qualify its scores. The
-first complete-path milestone cannot be marked complete by leaving fuzzy
-ranking to a later release. Scan-based correctness may ship before native
+An empty maximum contributes zero. `df_q` counts a document once even when
+several alternatives occur, before the full query's `all`/`any` membership
+test and ordinary eligibility filters. Alternative-specific rarity cannot
+give a misspelling extra weight: all alternatives share the term group's IDF.
+Using the maximum or sum of individual term document frequencies would not
+count the group's matched population: maximum misses disjoint occurrences,
+while sum double-counts documents containing several alternatives. Union DF
+also stays unchanged when spellings redistribute without changing which
+documents match the group. This semantic benefit has a cost: native per-term
+frequency metadata alone generally cannot produce it.
+Within a document, maximum contribution prevents adding different spellings
+from summing several pieces of evidence for one query term. Repeated occurrences
+of a single stored term still affect its BM25 term frequency. A stored term
+may contribute to several distinct query terms, matching the existing `Terms`
+membership rule; the score is not a count of independent facts.
+
+Edit weights are `1`, `1/2`, and `1/4` for zero, one, and two edits. These are
+versioned design choices, not values inferred from a backend or established
+as globally optimal. Exact preference is a contribution boost at equal term
+frequency and length, not a strict ordering tier above every fuzzy document.
+Length, term frequency, and other query terms can still change the winner.
+Changing `max_edits` may change group IDF and ranking, while membership retains
+the declared monotonicity. At zero edits each group contains only the exact
+term, so the same kernel supplies the exact-scorer reduction.
+
+The numeric profile uses float64 and `libm 0.2.16`'s scalar `log1p`
+implementation, with its dependency identity recorded in the scorer
+fingerprint. It does not delegate to the platform's logarithm. Count documents,
+tokens, and frequencies with checked `u64` arithmetic; compute `N - df_q`
+before conversion, reject inconsistent statistics,
+and handle an empty corpus before division. Convert counts to float64 for
+scoring, evaluate the parenthesized expressions above without algebraic
+reassociation or fused operations, and sum contributions in ascending UTF-8
+query-term order. Zero-contribution terms add zero; matching rows must produce
+a finite positive score or a typed numeric failure. Final ties use the source's
+stable target comparator. One canonical numeric implementation must serve all
+qualified paths; testing that pinned kernel across supported targets is
+required before acceptance. The Decimal oracle verifies mathematical values
+within its stated tolerance, not cross-platform bit identity. A future kernel
+change needs a new scorer identity unless score/order equivalence is proved.
+
+Native Lance BM25 does not supply this contract. The
+`native_fuzzy_bm25_rewards_a_rare_expansion` probe gives `beto` about 38 times
+the score of exact `beta` in a 100-document fixture and doubles scores for a
+repeated query term. The public float32 scorer also rounds a common term's
+positive IDF to zero at `N = 2^24`; the
+`native_bm25_idf_can_round_a_common_term_to_zero` guard reproduces this without
+allocating that corpus. Native scores or top-k cuts require new qualification;
+rescoring an incomplete native candidate set cannot establish exact winners.
+
+The [numerical fixtures](../../crates/omnigraph/tests/fixtures/lexical_scoring_v1.json)
+and `lexical_scoring_v1_reference_oracle` in the existing search test owner
+cover the chosen formula, zero-edit behavior, repeated/reordered terms,
+alternative aggregation, overlapping groups, `all`/`any`, null/token-empty
+values, and two-edit membership. They are design oracles over already-analyzed
+terms, not a production evaluator or relevance benchmark. The initial complete
+path must implement fuzzy ranking against these oracles; leaving it to a later
+release is not completion. Scan-based correctness may ship before native
 acceleration, with bounded failure when the work cannot complete.
+
+An exact physical baseline can compute field statistics in one snapshot-pinned
+pass, then score eligible values in a second pass. For each query term, count
+at most one family occurrence per document in the first pass; the second uses
+that document's term frequencies and the same edit relation for its maximum.
+Keep query-term statistics and bounded per-document state, not a retained
+corpus or persistent expansion dictionary. N/mean-length metadata may be reused
+when snapshot and analyzer identity qualify it; fuzzy family DF generally
+depends on the query and edit budget. Both passes, normalization, matching,
+and top-k selection share the execution budget.
+
+This is an implementation route to qualify, not a claim that two full scans
+meet production latency goals. Indexed acceleration must supply complete
+membership, live-row counts, term frequencies and group reductions, or prove
+conservative bounds for every pruned candidate. Lance's public scorer trait
+returns float32 additive term weights; merely substituting a scorer cannot
+provide the group's maximum reduction or this float64 contract. Reuse Lance
+postings through qualified upstream/adapter work and DataFusion group operators
+where appropriate; do not introduce another stored index. A numeric or quota
+post-pass over native top-k cannot restore discarded winners.
 
 ### Explicit ranking features and distance predicates
 
@@ -803,7 +883,7 @@ never be presented as a probability that an answer is correct.
 
 ### Representation identity and source attribution
 
-Accepted SchemaIR owns resolved analyzer/scoring-family fingerprints,
+Accepted SchemaIR owns resolved analyzer/default-scorer fingerprints,
 `VectorSpec { dimensions, distance, embedding_space }`, rename-stable source
 property references, and encoding compatibility. Physical indexes remain
 derived artifacts checked against that authority through RFC 0043's proofs.
@@ -1209,7 +1289,8 @@ does not make the proposed operators implemented behavior.
 | Current fusion windows | Corrected: vector arms inherit the final limit; BM25 arms scan uncapped. Named windows are a new semantic contract. |
 | BM25 statistics | Native covered-index prefiltering retains corpus scores. A real Lance fixture reverses the winner when only the statistics corpus changes. The initial contract now fixes the snapshot-visible field corpus independently of ordinary eligibility; live-row statistics and score parity still need qualification. |
 | Fuzzy matching | The pin still has the nonzero-edit analyzer bypass, per-segment query-wide expansion cap and incomplete flat behavior. The tokenizer/edit-distance probe passed 73,008 comparisons again; it does not qualify the revised NFC pipeline, scanner parity, or query budgets. |
-| Schema defaults | Bare analyzed fields now propose BM25-family capability; embedding model/distance omissions resolve through accepted schema metadata. The current grammar has no schema-wide recipe declaration. Its syntax, persistence, reapplication, and no-drift behavior require new fixtures. |
+| Lexical scoring | A native fuzzy fixture rewards a rare expansion and doubles repeated-term scores. The float32 statistics API can round positive common-term IDF to zero. The draft now defines one float64 BM25 policy with grouped alternatives and a pinned log1p kernel; its 12 Decimal fixtures and metamorphic checks pass, but native/fallback parity and retrieval quality remain unqualified. |
+| Schema defaults | Bare analyzed fields enable matching and default to the unified BM25 policy; embedding model/distance omissions resolve through accepted schema metadata. The current grammar has no schema-wide recipe declaration. Its syntax, persistence, reapplication, and no-drift behavior require new fixtures. |
 | NFC integration | Native tokenization differs for composed/decomposed input; explicit NFC preprocessing equalizes the fixture. A serialized `normalization: "NFC"` option is silently ignored by the pinned index parameters. The pinned normalizer can expand bytes and buffer a long sequence before yielding; pipeline integration and internal resource accounting are required. |
 | Vector arithmetic and encoding | Verified squared L2, cosine and shifted-dot kernels, current generated-vector normalization, and Gemini query/document roles. Added explicit formulas and requirements for invalid values, numeric parity and revision identity. |
 | Fusion arithmetic | Reproduced overflow with 16 finite maximum weights and `k=1`. Added checked arithmetic and explicit failure requirements. |
@@ -1263,6 +1344,17 @@ The current GQT baseline passed all 60 cases and 127 runner self-tests with
 This uses CI's thread-stack setting; the initial local run without it aborted
 on a runner self-test's stack overflow. These cases qualify the current
 language, not the proposed stages.
+
+The later scorer experiment adds two native guards and
+`lexical_scoring_v1_reference_oracle`, whose twelve cases are independently
+generated by the checked-in [Decimal fixture generator](../../crates/omnigraph/tests/fixtures/lexical_scoring_v1.py).
+The generator uses 80-digit precision; the float64 reference uses pinned
+`libm 0.2.16` and checks score error within `2e-14 * max(1, expected)`, exact
+fixture order, repeated-term invariance, filter-independent scores, and
+membership inclusion at edit budgets zero through two. Its passing numerical
+checks do not assert bit-for-bit equivalence with native scores or validate a
+streaming, indexed, or resource-bounded evaluator. The fixture's source strings
+already represent analyzed tokens; NFC/tokenizer coverage remains separate.
 
 ### Research context and required qualification
 
@@ -1395,10 +1487,11 @@ and records its implementation PRs and evidence in this RFC.
 Refresh the compiler/engine baseline and identify the remaining RFC 0047
 guarantees before porting any prototype code.
 Settle the grammar and metric namespace, target/binding multiplicity, per-group
-semantics, complete tie comparators, and the relationship to RFC 0047. Freeze
-the exact and fuzzy scoring specifications, snapshot-visible field-statistics
-accounting, vector numeric rules, and checked fusion arithmetic. Resolve encoding/provider
-identity and the shared schema-version decisions with RFCs 0040/0043/0044.
+semantics, complete tie comparators, and the relationship to RFC 0047. Qualify
+the unified BM25 reference, its pinned numeric kernel, and snapshot-visible
+live-row statistics; freeze vector numeric rules and checked fusion arithmetic.
+Resolve encoding/provider identity and the shared schema-version decisions
+with RFCs 0040/0043/0044.
 Prototype the schema-wide default-recipe declaration and its omission/override
 rules; qualify the NFC implementation and profile fingerprint before fixing
 the analyzer definitions.
@@ -1551,9 +1644,11 @@ release. Each extension retains its stated semantic and qualification boundary.
 1. Final clause and stage/metric spelling, symbol scope, per-group null and
    multiple-key behavior, and any user-defined selection tie keys. Settle with
    parser/typechecker prototypes and RFC 0040 namespace coordination.
-2. The numerical fuzzy scoring policy and exact BM25 term/numeric accounting,
-   including live-row statistics and polymorphic field-corpus resolution.
-   These are acceptance gates, not optional future enhancements.
+2. Qualification of the specified BM25 policy: the pinned numeric kernel across
+   supported targets, exact live-row statistics, polymorphic field-corpus
+   resolution, and native/fallback score and winner parity. Validate its edit
+   weights and maximum reduction on the owned retrieval/task corpus before
+   release; numerical fixtures alone do not establish a good relevance default.
 3. Resolved representation serialization and immutable encoding revisions,
    schema-wide default declaration syntax and migration integration,
    normalizer/Unicode identity and analyzer/artifact fingerprint mapping, and
@@ -1645,6 +1740,15 @@ release. Each extension retains its stated semantic and qualification boundary.
   unknown; exact coverage is a typed, budgeted request with no silent
   downgrade. Reconciled RFC 0047 so observability does not unconditionally
   force exhaustive counting into bounded discovery.
+- 2026-09-09 — defined one BM25 policy for exact and tolerant `terms`, with a
+  schema-supplied default and optional explicit policy spelling. Removed the
+  proposed separate fuzzy scorer selector. Native experiments exposed rare
+  expansion amplification, repeated-query weighting, and float32 IDF rounding
+  to zero. Chose per-query-term union DF, maximum alternative contribution,
+  edit weights 1/0.5/0.25, and float64 with pinned log1p; twelve independent
+  Decimal fixtures now exercise the reference. The exact two-pass route and
+  native adapter requirements are explicit; runtime and task-quality
+  qualification remain required.
 
 ## Appendix: implementation evidence (non-normative)
 
@@ -1724,9 +1828,10 @@ Later Lance versions require renewed qualification.
   They do not prove index-independent scores. Global indexed statistics
   aggregate immutable segments, while the scalar String flat leg adds its
   scanned rows to a base scorer; deletion/overlay masks do not themselves
-  recompute corpus statistics. Snapshot-visible corpus definition, query
-  term multiplicity, document-length treatment, and numeric parity must be
-  fixed before `bm25_v1` qualifies. Fuzzy membership supplies none of them.
+  recompute corpus statistics. The unified scorer above defines corpus scope,
+  query-term multiplicity, length treatment and fuzzy reductions; the pin's
+  raw scores do not implement it. Exact live-row statistics, the canonical
+  numeric kernel, and score/winner parity still require qualification.
 
 **Cross-RFC composition contracts.**
 

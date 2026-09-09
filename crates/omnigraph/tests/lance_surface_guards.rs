@@ -4533,3 +4533,101 @@ fn nfc_preprocessing_requires_an_explicit_bounded_integration() {
         consumed.get()
     );
 }
+
+/// RFC 0048 scorer-selection probe. Native fuzzy BM25 can give a rare
+/// expansion more weight than the exact query term. This is a characterization
+/// of the pin, not the proposed fuzzy scorer's intended ordering.
+#[tokio::test]
+async fn native_fuzzy_bm25_rewards_a_rare_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+    let texts: Vec<_> = std::iter::repeat_n("beta", 90)
+        .chain(["beto"])
+        .chain(std::iter::repeat_n("gamma", 9))
+        .collect();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(texts))]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.path().join("fuzzy").to_str().unwrap(),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .stem(false)
+                .remove_stop_words(false)
+                .ascii_folding(false)
+                .max_token_length(None),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut results = HashMap::new();
+    for (name, query, expected_rows) in [
+        ("exact", FullTextSearchQuery::new("beta".into()), 90),
+        (
+            "fuzzy",
+            FullTextSearchQuery::new_fuzzy("beta".into(), Some(1)),
+            91,
+        ),
+        (
+            "repeat",
+            FullTextSearchQuery::new_fuzzy("beta beta".into(), Some(1)),
+            91,
+        ),
+    ] {
+        let mut scan = dataset.scan();
+        scan.full_text_search(query.with_column("text".into()).unwrap())
+            .unwrap();
+        scan.project(&["text"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        let texts = batch.column_by_name("text").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        let mut grouped = HashMap::new();
+        for i in 0..batch.num_rows() {
+            if let Some(previous) = grouped.insert(texts.value(i).to_string(), scores.value(i)) {
+                assert_eq!(previous, scores.value(i), "identical field values must tie");
+            }
+        }
+        println!("{name}: {grouped:?}");
+        results.insert(name, grouped);
+    }
+    assert!(results["fuzzy"]["beto"] > results["fuzzy"]["beta"]);
+    assert_eq!(results["exact"]["beta"], results["fuzzy"]["beta"]);
+    for term in ["beta", "beto"] {
+        assert_eq!(results["repeat"][term], 2.0 * results["fuzzy"][term]);
+    }
+}
+
+/// A positive mathematical IDF can round to zero in the native f32 kernel.
+/// No large dataset is needed to exercise the public statistics/scorer API.
+#[test]
+fn native_bm25_idf_can_round_a_common_term_to_zero() {
+    use lance_index::scalar::inverted::{MemBM25Scorer, Scorer};
+
+    let count = 1_usize << 24;
+    let scorer = MemBM25Scorer::new(
+        count as u64,
+        count,
+        HashMap::from([("beta".to_string(), count)]),
+    );
+    let native = scorer.query_weight("beta");
+    let stable = libm::log1p(0.5 / (count as f64 + 0.5));
+    println!("common-term IDF at N={count}: native={native}, log1p/f64={stable}");
+    assert_eq!(native, 0.0);
+    assert!(stable > 0.0);
+}
