@@ -88,13 +88,13 @@ Server suites are organized by public route: `auth_policy`, `data_routes`, `sche
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
-The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V8 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
+The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V9 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
 
 ```bash
-OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8 -- --exact --nocapture
+OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9 -- --exact --nocapture
 ```
 
-The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v8 fence. RFC 0062 introduced v7's registration clock; RFC 0042's native-ref retirement metadata requires the current v8 stamp. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request with the releases it installs.
+The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v9 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, and RFC 0040's system columns stamp new graphs v9. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires genuine v0.9 and
 v0.10 local standalone journeys through the default v6 → v7 → v8 route. It fails

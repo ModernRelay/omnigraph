@@ -36,7 +36,7 @@ policy change must still be applied by an administrator to affect GitHub.
 deliberately not required: with strict checks every merge invalidates every
 other open pull request's required contexts, so a required 60-minute context
 would space merges an hour apart. The merger waits for `Test Workspace`,
-`V5 ↔ V8 Format Fence`, and both `RustFS S3 Integration` shards, all
+`V5 ↔ V9 Format Fence`, and both `RustFS S3 Integration` shards, all
 reporting contexts, to report and reads a red result before merging. All of
 them run again on
 every push to `main`, on tags, and by dispatch, where a red run makes `main`

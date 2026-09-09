@@ -595,13 +595,13 @@ jobs:
           fi
           grep -Fq "v0.9 refusal and export/import rebuild completed" "$test_log" \
             || { echo "::error::v0.9 upgrade regression did not complete"; exit 1; }
-          grep -Eq "test current_v8_refuses_and_rebuilds_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
+          grep -Eq "test current_v9_refuses_and_rebuilds_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
             || { echo "::error::exact v0.9 refusal and rebuild regression did not pass"; exit 1; }
           if grep -Fq "skipping immediate-predecessor v6 upgrade test" "$test_log"; then
             echo "::error::v6 format fence skipped despite a configured 0.10 release binary"
             exit 1
           fi
-          grep -Eq "test current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8 \\.\\.\\. ok" "$test_log" \
+          grep -Eq "test current_v9_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v9 \\.\\.\\. ok" "$test_log" \
             || { echo "::error::exact v6 format fence did not pass"; exit 1; }
 
 
@@ -685,8 +685,8 @@ jobs:
           cargo test --locked -p omnigraph-engine --test forbidden_apis --features failpoints -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log protocol "$test_log"
 
-  v5_v8_format_fence:
-    name: V5 ↔ V8 Format Fence
+  v5_v9_format_fence:
+    name: V5 ↔ V9 Format Fence
     needs: classify_changes
     # Pull requests too, as a reporting context like `Test Workspace`: a
     # fence red reports on the pull request instead of first appearing on `main`.
@@ -719,7 +719,7 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: crossversion-v5-v8
+          key: crossversion-v5-v9
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
@@ -755,21 +755,21 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           echo "OMNIGRAPH_V5_BIN=$v5_bin" >> "$GITHUB_ENV"
 
-      - name: Run exact v5↔v8 refusal and rebuild fence
+      - name: Run exact v5↔v9 refusal and rebuild fence
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/v5-v8-format-fence.log"
+          test_log="$RUNNER_TEMP/v5-v9-format-fence.log"
           cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
-            current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8 \
+            current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
           if grep -Fq "skipping immediate-predecessor v5 upgrade test" "$test_log"; then
-            echo "::error::v5↔v8 format fence skipped despite a configured predecessor binary"
+            echo "::error::v5↔v9 format fence skipped despite a configured predecessor binary"
             exit 1
           fi
-          grep -Eq "test current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8 \.\.\. ok" "$test_log" \
-            || { echo "::error::exact v5↔v8 format fence did not execute normally"; exit 1; }
+          grep -Eq "test current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9 \.\.\. ok" "$test_log" \
+            || { echo "::error::exact v5↔v9 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
-            || { echo "::error::v5↔v8 format fence matched the wrong test set"; exit 1; }
+            || { echo "::error::v5↔v9 format fence matched the wrong test set"; exit 1; }
 
   test_aws_feature:
     name: Test omnigraph-server --features aws
