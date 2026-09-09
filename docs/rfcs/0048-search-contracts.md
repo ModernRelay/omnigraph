@@ -1066,6 +1066,17 @@ contributions from several partitions, pruning those contributions requires a
 valid global-score bound; ordinary local top-k is insufficient. ANN remains
 explicitly approximate.
 
+Rescoring a shortlist selected with table-local BM25 statistics cannot repair
+this error: the global winner may already have been discarded. Lance 11's
+public `InvertedIndex::bm25_stats_for_terms` and `bm25_search` with a supplied
+`MemBM25Scorer` provide a lower-level shared-statistics path to investigate.
+They do not establish the complete contract: the scorer is native float32,
+the RFC requires different fuzzy-group scoring, and immutable index statistics
+can still count deleted rows. Reconcile live corpus statistics, uncovered
+rows and invalidated coverage before using them for a global candidate cut.
+Any cache remains derived from the accepted snapshot and representation
+identities. Native index statistics alone are not a new source of truth.
+
 Qualification must cover two unrelated node types, an explicitly selected
 edge type, equal id strings across types, multiple searchable fields,
 incompatible vector spaces, empty/unavailable sources, snapshot changes,
@@ -1744,10 +1755,18 @@ the reported passing count does not establish that remote-storage proof.
 The 2026-09-09 prototypes extend existing test owners:
 
 - [Lance surface guards](../../crates/omnigraph/tests/lance_surface_guards.rs):
-  `fts_statistics_scope_can_reverse_ranking` creates two real indexed Lance
+  `fts_statistics_scope_can_reverse_ranking` creates real indexed Lance
   datasets and searches identical eligible native row IDs. The first alpha
   target scores approximately 1.145 versus beta's 0.383 under field statistics;
   under eligible-only statistics beta scores 1.204 versus alpha's 0.357.
+  Its two disjoint physical partitions also show that native local top-1
+  removes every globally winning alpha target. Summing the partitions' public
+  index statistics and supplying one scorer before their cuts recovers the
+  correct winning score band, checked against independent closed-form IDFs.
+  This establishes neither canonical entity tie-breaking nor fuzzy/numerical
+  equivalence. After one deletion, the affected table has five live rows while
+  its immutable index statistics still count six; the old dataset view retains
+  all six rows. The index count cannot stand in for the accepted live corpus.
   `nfc_preprocessing_requires_an_explicit_bounded_integration` checks native
   tokenizer behavior, the ignored unknown parameter, normalization expansion,
   and consumption of 8,194 input scalars before the first output scalar.
