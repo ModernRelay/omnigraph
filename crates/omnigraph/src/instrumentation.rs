@@ -969,6 +969,18 @@ pub struct MergeWriteProbes {
     pub ordered_cursor_scan_calls: Arc<AtomicU64>,
     pub ordered_cursor_batch_rows: Arc<AtomicU64>,
     pub ordered_cursor_batch_bytes: Arc<AtomicU64>,
+    /// Successfully completed table classifications, including no-op or
+    /// conflict results. Verify mode can complete both; a lineage gate miss
+    /// completes only the full walk. These report execution, not env intent.
+    pub completed_full_walk_classification_calls: Arc<AtomicU64>,
+    pub completed_lineage_classification_calls: Arc<AtomicU64>,
+    /// Physical identity discovery work, separate from logical candidates.
+    pub lineage_candidate_scan_rows: Arc<AtomicU64>,
+    pub lineage_candidate_address_take_calls: Arc<AtomicU64>,
+    pub lineage_candidate_address_take_rows: Arc<AtomicU64>,
+    pub lineage_candidate_address_take_max_rows: Arc<AtomicU64>,
+    pub lineage_candidate_budget_fallback_calls: Arc<AtomicU64>,
+    pub proven_insert_history_read_calls: Arc<AtomicU64>,
     /// Bounded row hydrations the two-phase ordered merge cursor performs
     /// after its narrow key sort: take calls, hydrated rows, and measured
     /// hydrated bytes. Cost tests use these to prove payload bytes flow
@@ -1053,6 +1065,37 @@ impl MergeWriteProbes {
     }
     pub fn ordered_cursor_batch_bytes(&self) -> u64 {
         self.ordered_cursor_batch_bytes.load(Ordering::Relaxed)
+    }
+    pub fn completed_full_walk_classification_calls(&self) -> u64 {
+        self.completed_full_walk_classification_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn completed_lineage_classification_calls(&self) -> u64 {
+        self.completed_lineage_classification_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_scan_rows(&self) -> u64 {
+        self.lineage_candidate_scan_rows.load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_address_take_calls(&self) -> u64 {
+        self.lineage_candidate_address_take_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_address_take_rows(&self) -> u64 {
+        self.lineage_candidate_address_take_rows
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_address_take_max_rows(&self) -> u64 {
+        self.lineage_candidate_address_take_max_rows
+            .load(Ordering::Relaxed)
+    }
+    pub fn lineage_candidate_budget_fallback_calls(&self) -> u64 {
+        self.lineage_candidate_budget_fallback_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn proven_insert_history_read_calls(&self) -> u64 {
+        self.proven_insert_history_read_calls
+            .load(Ordering::Relaxed)
     }
     pub fn ordered_cursor_hydration_calls(&self) -> u64 {
         self.ordered_cursor_hydration_calls.load(Ordering::Relaxed)
@@ -1271,8 +1314,51 @@ pub(crate) fn record_external_blob_probe() {
     });
 }
 
-/// Record the explicit production bounds applied to one ordered merge cursor.
-/// No-op when no test probe is installed.
+/// Record a completed table classifier, independently of its scan strategy.
+pub(crate) fn record_completed_merge_classification(lineage: bool) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        let counter = if lineage {
+            &p.completed_lineage_classification_calls
+        } else {
+            &p.completed_full_walk_classification_calls
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn record_lineage_candidate_scan_rows(rows: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.lineage_candidate_scan_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn record_lineage_candidate_address_take(rows: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.lineage_candidate_address_take_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.lineage_candidate_address_take_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+        p.lineage_candidate_address_take_max_rows
+            .fetch_max(rows as u64, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn record_lineage_candidate_budget_fallback() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.lineage_candidate_budget_fallback_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn record_proven_insert_history_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.proven_insert_history_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one full ordered cursor and its requested scanner bounds.
 pub(crate) fn record_ordered_cursor_scan(batch_rows: usize, batch_bytes: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.ordered_cursor_scan_calls.fetch_add(1, Ordering::Relaxed);

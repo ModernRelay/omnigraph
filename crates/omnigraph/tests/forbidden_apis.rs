@@ -348,12 +348,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "all_native_branches",
-    ),
-    (
-        "db/graph_coordinator.rs",
-        "GraphCoordinator",
-        "branch_descendants",
+        "native_branches_and_descendants",
     ),
     (
         "db/graph_coordinator.rs",
@@ -419,6 +414,16 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
+        "snapshot_native_under_control_gates",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "native_fork_references_under_control_gates",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
         "refresh_with_lineage",
     ),
     (
@@ -445,12 +450,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
-        "list_native_graph_branches",
-    ),
-    (
-        "db/manifest.rs",
-        "ManifestCoordinator",
-        "descendant_branches",
+        "native_branches_and_descendants",
     ),
     (
         "db/manifest.rs",
@@ -842,6 +842,10 @@ durable_calls! {
     ("db/manifest/recovery.rs", "discard_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
+    // First-touch merge: enumerate native refs before arming recovery; no mutation.
+    ("exec/merge.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // First-touch write: enumerate native refs before arming recovery; no mutation.
+    ("exec/staging.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
@@ -2621,18 +2625,64 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         );
     }
 
-    for function_name in [
-        "branch_create_as",
-        "branch_create_from_impl",
-        "branch_delete_as",
+    for (function_name, capture_method, recovery_method) in [
+        (
+            "branch_create_as",
+            "capture_branch_control_source",
+            "ensure_no_pending_recovery_sidecars_under_gates",
+        ),
+        (
+            "branch_create_from_impl",
+            "capture_branch_control_source",
+            "ensure_no_pending_recovery_sidecars_under_gates",
+        ),
+        (
+            "branch_delete_as",
+            "open_coordinator_for_branch",
+            "ensure_branch_delete_recovery_safe_under_gates",
+        ),
     ] {
         let function = functions
             .get(function_name)
             .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
         assert_eq!(
-            method_call_count(&function.block, "open_coordinator_for_branch"),
+            method_call_count(&function.block, capture_method),
             1,
             "Omnigraph::{function_name} must take exactly one post-gate operation-local control capture"
+        );
+        let capture_statement = function
+            .block
+            .stmts
+            .iter()
+            .position(|statement| {
+                let block = syn::Block {
+                    brace_token: function.block.brace_token,
+                    stmts: vec![statement.clone()],
+                };
+                method_call_count(&block, capture_method) > 0
+            })
+            .expect("control capture must occur in a statement");
+        let before_capture = syn::Block {
+            brace_token: function.block.brace_token,
+            stmts: function.block.stmts[..capture_statement].to_vec(),
+        };
+        for required in ["acquire_many", recovery_method] {
+            assert_eq!(
+                method_call_count(&before_capture, required),
+                1,
+                "Omnigraph::{function_name} must acquire table gates and finish recovery checks before capture"
+            );
+        }
+    }
+
+    let capture_helper = functions
+        .get("capture_branch_control_source")
+        .expect("missing Omnigraph::capture_branch_control_source");
+    for required in ["probe_latest_incarnation", "validated_cached_coordinator"] {
+        assert_eq!(
+            method_call_count(&capture_helper.block, required),
+            1,
+            "source reuse must freshly verify bound authority and route misses through the verified cache"
         );
     }
 

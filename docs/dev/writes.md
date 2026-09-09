@@ -43,6 +43,36 @@ schema/catalog, target graph branch, optional graph head, native branch
 identity, table-incarnation identities, and expected table versions. Every
 planning and validation step uses that view.
 
+Branch merge also uses the captured target for physical table opens and
+publication. It never changes the `Omnigraph` handle's active branch while the
+merge runs. Publication reuses the active coordinator, or takes the cached
+non-active target coordinator, only when its branch identity, graph head, and
+manifest version match the captured transaction; otherwise it opens the target
+coordinator from durable state. The publisher independently reads fresh authority
+and enforces the exact graph-head precondition on every attempt. Successful
+publication returns a taken coordinator to the one-entry merge cache; failure
+drops it. Commit IDs and timestamps are minted for the captured branch without
+reloading manifest history. The existing schema and branch gates still serialize
+conflicting control operations.
+
+Native branch creation uses an operation-local capture of the bound coordinator
+or that same one-entry cache after the control gates and recovery checks. Reuse
+requires a fresh match of the complete manifest incarnation, including the
+native branch lifetime; a stale or missing view takes the existing refresh/open
+path. Captures share immutable lineage and the Lance session, copy current
+table state, and leave the handle's active branch unchanged.
+
+After a content publication, the publisher returns the projection (the
+in-memory `__manifest` state folded from the journal) it already built from the
+successful attempt's freshly read base. The coordinator retains
+it only when that exact base matches its previously coherent view and its graph
+cache has adopted the published lineage. A foreign advance, unsupported base,
+or failure before lineage adoption leaves the full-refresh fallback armed.
+Registration replacement, rename, tombstone, and same-version physical-owner
+handoff use the existing complete fold. This is disposable process memory;
+`__manifest` remains the only durable graph authority. Publication still scans
+history for collision, expected-version, and lineage validation.
+
 Finalization acquires the root-shared gate order:
 
 1. schema;
@@ -131,6 +161,26 @@ inside the protected effect window. Recovery may delete only a ref or dataset
 whose exact creation it owns. Table forks are named by the branch's native ref;
 sidecar table pins carry that native name while the sidecar's `branch` stays
 logical.
+
+Reclamation checks the current table pins of every live graph branch, not just
+the fork's original owner. A detached native ref can still hold a child's
+accepted snapshot. Cleanup and recovery retain such refs, and a first-touch
+writer refuses to recreate them before arming recovery. A first-touch merge
+classifies a pre-existing target native ref the same way: a ref another branch
+pins is refused as detached lineage, a ref a pending operation claims or whose
+liveness cannot be verified is refused as a conflict, and an orphan is deleted
+before the operation arms, on the write path as on the merge path, so the
+armed fork starts from a clean name and a crash between arming and forking
+leaves nothing recovery must explain. The deletes run table by table before
+the refusal check of the next table, so a refusal may follow a completed
+delete; nothing referenced the deleted ref, so no state is lost. This liveness view is derived under the
+control gates and is not persisted as another authority.
+Deletion derives native refs and descendants from one registry listing. It
+reuses already loaded borrower snapshots only when their native ref matches
+that listing and their manifest incarnation matches a fresh probe; other
+branches use the bounded manifest-only proof. Unreadable candidates still
+prevent deletion. This reduces repeated work under the existing gates without
+changing their scope.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, pointer, or recovery effect belongs to the

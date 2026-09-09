@@ -1,0 +1,84 @@
+# issue: none
+# red_on: 2026-09-08, PR 662 @ 2850d86f: `branch merge hotfix into feature` failed with `merge target ref … already exists … refusing to claim unowned physical state`.
+# notes: After main is merged into a branch that owned a fork (pointer switch), the former fork
+# notes: lingers unregistered and unpinned. A later diverged branch merged into that branch is a
+# notes: first touch; it must reclaim the orphan fork and succeed, as the branch's own next write
+# notes: would. hotfix forks from main, so its merge base is main's commit, not feature's head: a
+# notes: three-way merge whose target side is unchanged. bob, written on main before the switch,
+# notes: is visible on feature only if the reclaimed fork starts from main's lineage.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query feature_write() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query main_write() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query main_adds_bob() {
+    insert Person { name: "bob", age: 40 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+branch create hotfix
+
+--- expect ok
+
+--- mutate branch: hotfix
+query hotfix_write() {
+    update Person set { age: 33 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge hotfix into feature
+
+--- expect outcome: merged
+
+--- query branch: feature
+query feature_reads_hotfix() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":33}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I32

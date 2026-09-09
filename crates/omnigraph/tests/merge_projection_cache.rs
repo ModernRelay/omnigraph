@@ -1,6 +1,6 @@
 //! Structural gates for the incremental merge-authority projection cache: a
-//! repeated merge must serve its branch authority through the INCREMENTAL
-//! projection fold (reading only appended catalog fragments), retains at most
+//! repeated merge reuses acknowledged local publication views and refreshes
+//! foreign changes through an incremental projection fold, retains at most
 //! one non-bound branch's complete authority, and a
 //! delete/recreate of a cached branch must be fenced to a full re-read, never
 //! a stale reuse. The explicit fold-vs-full correctness oracle lives with the
@@ -82,9 +82,8 @@ fn branch_delete_purges_merge_authority_after_acquiring_branch_gate() {
     );
 }
 
-/// One handle, two branches — the pattern `merge_truth_table.rs` documents
-/// (two handles for one store invite cache-coherency surprises that are out
-/// of scope here).
+/// Update both branches through one handle, allowing publication to retain
+/// the acknowledged source and target projections.
 async fn diverge(db: &mut Omnigraph, round: i64) {
     mutate_branch(
         db,
@@ -105,9 +104,9 @@ async fn diverge(db: &mut Omnigraph, round: i64) {
     .unwrap();
 }
 
-/// The headline pin: after a first merge has warmed the authority cache, a
-/// later merge (with real intervening publishes on both branches) refreshes
-/// the cached branch's projection incrementally — no full O(history) re-read.
+/// Acknowledged local publishes retain exact projections; an external publish
+/// still requires the physical-address incremental fold. Both paths avoid a
+/// full history rebuild and must preserve the merged payload.
 #[test]
 fn repeated_merge_refreshes_projection_incrementally() {
     on_big_stack(|| async {
@@ -120,8 +119,8 @@ fn repeated_merge_refreshes_projection_incrementally() {
             let outcome = db.branch_merge("feature", "main").await.unwrap();
             assert_eq!(outcome, MergeOutcome::Merged);
 
-            // Real history advances between the merges, so the cached authority is
-            // provably stale and must REFRESH (not merely probe-hit).
+            // Both writes use this handle. Publication returns the acknowledged
+            // exact projections, so no deleted head row needs reconstructing.
             diverge(&mut db, 1).await;
 
             let (outcome, io) = measure(db.branch_merge("feature", "main")).await;
@@ -133,16 +132,14 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 io.projection_incremental_refreshes,
                 io.projection_full_refreshes,
             );
-            assert!(
-                io.projection_full_refreshes <= 1,
-                "the cached non-bound authority must stay incremental; only the publishing \
-                 bound coordinator may rebuild once (observed {})",
-                io.projection_full_refreshes,
+            eprintln!("local publication reuse: {io:?}");
+            assert_eq!(
+                io.projection_full_refreshes, 0,
+                "acknowledged local publication must retain both exact projections",
             );
             assert_eq!(
-                io.projection_identity_rows, 1,
-                "one replaced feature head must hydrate one row by physical address, \
-                 never the containing history-sized fragment"
+                io.projection_identity_rows, 0,
+                "acknowledged local heads must not be hydrated again"
             );
             assert!(
                 io.manifest_reads > 0,
@@ -165,6 +162,48 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 "incremental repeated merge used {} manifest object reads; hidden full scans must not ride the measured path",
                 io.manifest_reads,
             );
+
+            // Advance the source through a different handle. The measured
+            // handle's cached source is now stale, while its local target
+            // publication remains acknowledged. This keeps the physical-take
+            // cost fence non-vacuous after the local reuse optimization.
+            let foreign = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+            foreign.mutate(
+                "feature", MUTATION_QUERIES, "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
+            ).await.unwrap();
+            db.mutate(
+                "main", MUTATION_QUERIES, "set_age",
+                &mixed_params(&[("$name", "Bob")], &[("$age", 28)]),
+            ).await.unwrap();
+            let (outcome, foreign_io) = measure(db.branch_merge("feature", "main")).await;
+            assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
+            eprintln!("foreign publication refresh: {foreign_io:?}");
+            assert!(foreign_io.projection_incremental_refreshes >= 1);
+            assert_eq!(foreign_io.projection_full_refreshes, 0);
+            assert_eq!(
+                foreign_io.projection_identity_rows, 1,
+                "one externally replaced feature head must hydrate one row by physical address",
+            );
+            assert!(foreign_io.manifest_reads > 0 && foreign_io.manifest_read_bytes > 0);
+            assert!(foreign_io.manifest_reads <= 32);
+
+            // Check every Person payload after the measured refresh, on both
+            // source and target, so reduced I/O cannot hide a stale merge.
+            for (branch, bob_age) in [("main", 28), ("feature", 25)] {
+                assert_eq!(count_rows_branch(&db, branch, "node:Person").await, 4);
+                for (name, age) in [("Alice", 33), ("Bob", bob_age), ("Charlie", 35), ("Diana", 28)] {
+                    let result = db.query(
+                        omnigraph::db::ReadTarget::branch(branch), TEST_QUERIES, "get_person",
+                        &params(&[("$name", name)]),
+                    ).await.unwrap();
+                    assert_eq!(result.num_rows(), 1);
+                    let batch = result.concat_batches().unwrap();
+                    let actual_age = batch.column(1).as_any()
+                        .downcast_ref::<arrow_array::Int32Array>().unwrap().value(0);
+                    assert_eq!(actual_age, age, "{branch}/{name}");
+                }
+            }
         })
         .await;
     });

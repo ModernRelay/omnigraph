@@ -384,7 +384,7 @@ pub(crate) enum SidecarKind {
     Load,
     /// `schema_apply::apply_schema_with_lock` — table rewrites + indices.
     SchemaApply,
-    /// `branch_merge_on_current_target` — three-way merge publishes.
+    /// `branch_merge_on_captured_target` — three-way merge publishes.
     BranchMerge,
     /// `ensure_indices_for_branch` — index lifecycle commits.
     EnsureIndices,
@@ -4801,6 +4801,23 @@ async fn roll_back_ensure_indices_v8(
         .as_ref()
         .expect("prepared schema-v8 protocol");
     let all_sidecars = list_sidecars(root_uri, storage).await?;
+    let fork_references = if protocol
+        .effects
+        .iter()
+        .any(|effect| effect.source_fork_version.is_some())
+    {
+        Some(
+            Box::pin(
+                super::ManifestCoordinator::native_fork_references_under_control_gates(
+                    root_uri,
+                    &crate::lance_access::control_session(),
+                ),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     for ((pin, state), effect) in prepared.tables.iter().zip(states.iter()).map(|pair| {
         let effect = protocol
@@ -4831,6 +4848,15 @@ async fn roll_back_ensure_indices_v8(
                 pin.table_key
             )));
         };
+        if fork_references
+            .as_ref()
+            .is_some_and(|references| references.contains(pin.identity, target_branch))
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while a live graph snapshot pins it",
+                prepared.operation_id, pin.table_path, target_branch
+            )));
+        }
         if all_sidecars.iter().any(|candidate| {
             candidate.operation_id != prepared.operation_id
                 && candidate.tables.iter().any(|candidate_pin| {
@@ -6223,6 +6249,23 @@ async fn cleanup_unpublished_no_effect_forks(
         return Ok(NoEffectForkCleanup::Complete);
     }
 
+    // The sidecar's own branch is insufficient authority: another branch may
+    // lazily borrow this exact table ref. Full recovery is quiesced; an owned
+    // writer's conflict cleanup holds the schema/branch/table gate envelope.
+    let fork_references = if states
+        .iter()
+        .any(|state| state.unpublished_fork && state.effect_ownership == EffectOwnership::None)
+    {
+        Some(
+            super::ManifestCoordinator::native_fork_references_under_control_gates(
+                root_uri,
+                &crate::lance_access::control_session(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let all_sidecars = list_sidecars(root_uri, storage).await?;
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
         if !state.unpublished_fork || state.effect_ownership != EffectOwnership::None {
@@ -6245,6 +6288,15 @@ async fn cleanup_unpublished_no_effect_forks(
         else {
             continue;
         };
+
+        if fork_references
+            .as_ref()
+            .is_some_and(|references| references.contains(pin.identity, target_branch))
+        {
+            // No effect belongs to this sidecar, so it may retire without
+            // reclaiming a ref whose history a published snapshot still owns.
+            continue;
+        }
 
         let has_competing_claim = all_sidecars.iter().any(|candidate| {
             candidate.operation_id != sidecar.operation_id

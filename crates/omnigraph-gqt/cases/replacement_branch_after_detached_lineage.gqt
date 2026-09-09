@@ -1,0 +1,115 @@
+# issue: none
+# notes: The documented remedy for `detached native lineage`: create a replacement branch from
+# notes: the affected branch and write there. The replacement's write succeeds, merging it back
+# notes: into the affected branch is refused with the same error while the child still pins the
+# notes: former fork, and the child's rows survive a restart. Reduced from
+# notes: branching.rs::branch_write_refuses_detached_native_lineage_before_arming, which keeps
+# notes: the storage-level facts (no recovery sidecar, the native ref identifier unchanged).
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query feature_write() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create child from feature
+
+--- expect ok
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query main_write() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- mutate branch: feature
+query feature_write_refused() {
+    update Person set { age: 33 } where name = "alice"
+}
+
+--- expect error: detached native lineage
+
+--- mutate
+branch create replacement from feature
+
+--- expect ok
+
+--- mutate branch: replacement
+query replacement_write() {
+    update Person set { age: 33 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: replacement
+query replacement_reads_its_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":33}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate
+branch merge replacement into feature
+
+--- expect error: detached native lineage
+
+--- restart
+
+--- query branch: child
+query child_kept_its_rows() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: feature
+query feature_unchanged_by_the_refusals() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+
+--- expect shape
+p.name: String
+p.age: I32

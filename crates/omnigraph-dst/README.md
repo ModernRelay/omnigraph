@@ -74,7 +74,7 @@ Three distinct instruments, complementary — none subsumes another:
    latent sector errors), write-side weather (corrupted, lost, misdirected
    writes), ack-loss, and bounded staleness. Unaimed — discovers handling
    bugs statistically across the whole run.
-2. **Crash-window hunt**: a named failpoint (71 in `catalog::CRASH_WINDOWS`)
+2. **Crash-window hunt**: a named failpoint (72 in `catalog::CRASH_WINDOWS`)
    armed at a seeded op index. Aimed — guarantees a specific dangerous
    moment is exercised.
 3. **Crash-state enumeration** (ALICE-style): kill at completion #k for
@@ -90,7 +90,7 @@ and `tests/lane_b.rs`.
 
 ## Fault axes
 
-- **Crash windows**: `Scenario::crash_at` arms any of the engine's 71 named
+- **Crash windows**: `Scenario::crash_at` arms any of the engine's 72 named
   failpoints (`catalog::CRASH_WINDOWS`) at a seeded op index. The ignored
   `dst_hunt_crash_window_sweep` test sweeps the whole catalog.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`

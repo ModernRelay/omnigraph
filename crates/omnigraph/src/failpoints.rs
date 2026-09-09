@@ -181,6 +181,8 @@ pub mod names {
         "branch_merge.rewrite_after_delete_pre_confirm";
     pub const BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE: &str =
         "branch_merge.rewrite_after_merge_pre_delete";
+    pub const BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE: &str =
+        "branch_merge.rewrite_after_insert_pre_update";
     pub const CLASSIFY_FRESH_READ: &str = "classify.fresh_read";
     /// A Blob read has captured one exact graph snapshot and table authority,
     /// but has not opened the selected Lance table version yet. Tests replace

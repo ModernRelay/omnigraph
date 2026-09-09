@@ -242,6 +242,21 @@ impl GraphCoordinator {
         })
     }
 
+    /// An operation-local source for native branch controls. Current table
+    /// state is copied; cached lineage and the Lance session are shared.
+    /// Callers must first probe the complete manifest incarnation. This copy
+    /// does not establish lineage completeness after a state-only refresh;
+    /// native creation uses only its manifest, and other uses must refresh.
+    pub(crate) fn capture_for_branch_control(&self) -> Self {
+        Self {
+            root_uri: self.root_uri.clone(),
+            storage: Arc::clone(&self.storage),
+            manifest: self.manifest.capture(),
+            commit_graph: self.commit_graph.capture(),
+            bound_branch: self.bound_branch.clone(),
+        }
+    }
+
     pub fn root_uri(&self) -> &str {
         &self.root_uri
     }
@@ -362,21 +377,20 @@ impl GraphCoordinator {
         self.manifest.native_branch()
     }
 
-    /// Every live native branch ref except `main` (logical names may differ).
-    pub(crate) async fn all_native_branches(&self) -> Result<Vec<String>> {
-        self.manifest.list_native_graph_branches().await
-    }
-
-    pub async fn branch_descendants(&self, name: &str) -> Result<Vec<String>> {
-        self.manifest
-            .descendant_branches(name)
-            .await
-            .map(|branches| {
-                branches
-                    .into_iter()
-                    .filter(|branch| !is_internal_system_branch(branch))
-                    .collect()
-            })
+    /// Capture deletion's native registry and descendants from one listing
+    /// while the caller holds the schema-control gate.
+    pub(crate) async fn native_branches_and_descendants(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let (natives, descendants) = self.manifest.native_branches_and_descendants(name).await?;
+        Ok((
+            natives,
+            descendants
+                .into_iter()
+                .filter(|branch| !is_internal_system_branch(branch))
+                .collect(),
+        ))
     }
 
     pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
@@ -758,7 +772,7 @@ impl GraphCoordinator {
         precondition: &PublishPrecondition,
     ) -> Result<PublishedSnapshot> {
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
-        let outcome = self
+        let mut outcome = self
             .manifest
             .commit_changes_with_lineage_and_precondition(
                 changes,
@@ -769,6 +783,7 @@ impl GraphCoordinator {
             .await?;
         failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let commit = self.apply_lineage_to_cache(intent, &outcome);
+        self.manifest.acknowledge_published_lineage(&mut outcome);
         Ok(PublishedSnapshot {
             graph_manifest_version: outcome.version,
             _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
@@ -785,9 +800,25 @@ impl GraphCoordinator {
         actor_id: Option<&str>,
         merged_parent_commit_id: Option<String>,
     ) -> Result<LineageIntent> {
+        Self::new_lineage_intent_for_branch(
+            self.current_branch(),
+            actor_id,
+            merged_parent_commit_id,
+        )
+    }
+
+    /// Mint identity for an explicitly captured branch without reading graph
+    /// state. Parentage and branch authority are resolved by the publisher's
+    /// precondition; minting an ID and timestamp does not need a coordinator.
+    pub(crate) fn new_lineage_intent_for_branch(
+        branch: Option<&str>,
+        actor_id: Option<&str>,
+        merged_parent_commit_id: Option<String>,
+    ) -> Result<LineageIntent> {
+        let branch = normalize_branch_name(branch.unwrap_or("main"))?;
         Ok(LineageIntent {
             graph_commit_id: crate::dst_ids::new_ulid().to_string(),
-            branch: self.current_branch().map(str::to_string),
+            branch,
             actor_id: actor_id.map(str::to_string),
             merged_parent_commit_id,
             created_at: crate::db::now_micros()?,
