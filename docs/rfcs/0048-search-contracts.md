@@ -24,7 +24,7 @@ blocked_on:
   - "Whole-query admission and accounting for token construction, graph fan-out, coverage, sorting, scoring, fallback, and output bytes"
   - "Snapshot-coherent follow-up read and stored-query fingerprint contracts through the existing read surface"
   - "All-node scope, representation selection, typed union/narrowing grammar, and an explicit disposition for cross-type search in the initial release"
-  - "Checked-in retrieval judgments and agent-task evaluation corpus; bounded ann_default_v1 recall/latency qualification per index family"
+  - "Maintained retrieval judgments and a broader agent-task corpus beyond the diagnostic pilot; bounded ann_default_v1 recall/latency qualification per index family"
 ---
 
 # RFC 0048: Search contracts and retrieval algebra
@@ -83,6 +83,10 @@ also expose limits that the implementation must respect: native BM25 needs
 shared live statistics before cross-table cuts, native buffers can sit outside
 the DataFusion pool, and a graph snapshot does not freeze an external encoder.
 No universal best physical plan or retrieval default has been established.
+The completed agent pilot also distinguishes finding and reading a passage
+from using it correctly: an answer can cite real evidence while confusing a
+proposal with current behavior. Agent recipes need explicit search semantics
+and enough source context to make that distinction.
 
 The migration is deliberately breaking because the API is pre-stable. Search
 queries and representation declarations move together in one cutover; the
@@ -96,7 +100,8 @@ Maintainers need to resolve the stage/type contract, representation and schema
 version identities, whole-query resource protocol, cross-type release scope,
 and the read/error envelope before calling the design accepted. The
 [implementation handoff](#implementation-handoff-and-validation-checkpoint)
-separates checked-in tests from isolated experiments and unfinished evaluation.
+separates checked-in tests, isolated experiments and the completed diagnostic
+pilot from the remaining production qualification.
 The [phases](#implementation-phases) specify what each implementation must
 prove. Sparse/multivector representations, learned reranking and stable ranked
 pagination retain extension contracts; they are not prerequisites for the
@@ -1948,7 +1953,7 @@ representation serialization, general metrics or resource protocol.
 | Numerical and lifecycle oracle | Twelve independently generated Decimal fixtures pass through the experimental scorer across absent/indexed data, tails, updates, deletes, compaction and pinned/reopened snapshots. The current search owner passes 57 tests. | Qualify every accepted analyzer and accelerated scorer, canonical ties, cross-type live statistics and native numeric differences. |
 | Shared admission and resources | Empty terms are refused even on empty populations. A later invalid source is rejected before an earlier source reads an oversized field. A graph suffix with 100,200 bindings fails despite final `limit 1`. Arrow-view and CPU-cooperation regressions pass. | Preallocation/native decode, queued work, analyzed maps, serialization, cancellation propagation and complete cleanup are not bounded by these probes. |
 | Accepted identities and follow-up | Actual stored-query and CLI journeys distinguish current from pinned reads after changes, check unavailable snapshots and revoked access, and preserve JSON/JSONL snapshot metadata. A controlled provider/export test proves that a model label does not freeze encoding. | Persist resolved schema recipes/defaults, coordinate the format fence, complete system-ID lookup for entities without an application key, and qualify execution/definition fingerprints and transport errors. |
-| Actual agent utility | Public repository passages, questions, model settings and budgets were frozen before held-out runs. Development runs exposed accounting and repeated-comparison defects; the revised executable was frozen before held-out evaluation. | The held-out pilot is not fully adjudicated at this checkpoint. No modality winner, production default or broad task-quality conclusion is established. |
+| Actual agent utility | Public repository passages, questions, model settings and budgets were frozen before held-out runs. Development runs exposed accounting and repeated-comparison defects; the revised executable was frozen before held-out evaluation. All 44 trials now have recorded outcomes and assistant source review; independent arithmetic checks agree on every completed dense and hybrid candidate list. | The pilot has no independent human adjudication and covers one small document workload. No modality winner, production default or broad task-quality conclusion is established. |
 | Physical plan choice | Native same-oracle comparisons cover join strategies, target/pair selection, duplicate paths, null keys, early/late hydration, spill and cleanup. The measured choices and limits are recorded above. | There is no universal winning plan. Production optimizer choices need the full graph pipeline, workload dimensions and shared-resource evidence. |
 
 The distinction between checked-in and experimental tests matters. This PR's
@@ -2039,7 +2044,7 @@ fusion votes merely because they are separate tables. Missing indexes cannot
 remove types from scope. The full rules and required counterexamples live in
 [graph-wide discovery](#graph-wide-discovery-across-entity-types).
 
-#### Agent-pilot interpretation and remaining work
+#### Completed agent pilot and interpretation
 
 The frozen pilot uses all 109 tracked Markdown documents under `docs/` at
 `bf1e5ca15868c9ce2444062e9d9d02b539d786e3`, split into 1,439 passages of at most
@@ -2072,14 +2077,58 @@ stay visible in the results; they are not interchangeable with engine defects
 or failed relevance. Debug binaries, variable host load, API calls and process
 startup prevent physical-performance conclusions from these latencies.
 
-Finish all trials and separately review required claims, source entailment and
-whether each citation was actually read. Report failures in the denominator,
-actual model/embedding/engine calls, bytes and latency. Known supporting quotes
-are incomplete relevance labels; they cannot establish NDCG or Recall@100.
-No hold-out tuning or selective retry may be reported as fresh held-out
-evidence. This pilot is a diagnostic starting point for Phase 5; a maintained,
-broader corpus and reproducible production configuration remain required
-before freezing retrieval defaults.
+All 44 held-out task/arm pairs completed acquisition without tuning or
+selective retries. The [final diagnostic record](assets/0048-agent-pilot-results.json)
+preserves every answer, its review, cited source passages, failures, completed
+call counts, bytes and latency. The earlier validation inventory's partial-run
+count remains a historical checkpoint. Corpus, tasks, protocol, saved vectors,
+executable and the 28 experimental source files still match their frozen
+identities; event logs agree with final trial records. All 23 completed dense
+top-20 lists agree with independent exhaustive float64 squared-L2 calculation
+over the saved float32 vectors. All ten completed hybrid top-10 lists agree
+with independent rational RRF. These finite checks do not qualify near ties,
+ANN or production staged fusion.
+
+Every answer was reviewed against required claims, cited passages and source
+status by the assistant, without independent human adjudication. A strict
+success requires complete required claims, supported substantive statements
+without contradictions or a draft presented as current implementation, and
+full reads of every citation. Failures remain in the denominator:
+
+| Frozen recipe | Trials | Final answers, including abstentions | Answers with citations, all read | Strict supported tasks |
+|---|---:|---:|---:|---:|
+| Exact lexical, all terms | 11 | 11 | 4 | 3 |
+| One-edit lexical, all terms | 11 | 10 | 5 | 3 |
+| Dense | 11 | 11 | 11 | 8 |
+| Exact lexical + dense, application RRF | 11 | 9 | 9 | 8 |
+
+These counts describe this recipe, corpus and reviewer. The shared tool
+description recommended short keyword queries but did not explain the lexical
+conjunction. The held-out run recorded nine tool-budget refusals and five
+query subprocess timeouts, with zero search-input-size refusals. Three trials
+ended without an answer: one provider failure and two deadline failures.
+All 115 completed engine processes exited successfully; the five timed-out
+queries are separate and must not disappear from that statement. The record
+contains 160 completed answering-model responses and 23 completed query
+embedding responses; these are not complete provider-attempt or billing counts.
+
+Reading a citation was insufficient in several cases. One answer used an
+older embedding RFC's label checks to justify a stronger encoding-compatibility
+claim. Another used an unbounded merge runtime to answer a question about a
+configured bounded query pool. Two answers stated unimplemented durable-head
+mechanics as current behavior. Conversely, several correct answers found
+supporting passages outside the frozen gold quotations. Citation-read checks
+and exact quote coverage therefore cannot replace claim and source review.
+
+The implementation lesson is to expose recipe semantics through the existing
+typed stored-query descriptions and instructions, and to preserve source
+revision, status and section context when applications need them. Those are
+ordinary source properties and projections, not a new evidence wrapper or
+engine-defined credibility score. A future evaluation should freeze explicit
+`all` and `any` recipes, source-context choices and broader tasks before running
+them. This completed pilot is a diagnostic starting point for Phase 5; it does
+not change the proposed default or establish NDCG, Recall@100, a modality
+winner, or a physical-performance result.
 
 ### Research context and required qualification
 

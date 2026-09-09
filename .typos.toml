@@ -42,3 +42,8 @@ extend-glob = ["0048-validation-checkpoint.json"]
 
 [type.search_checkpoint.extend-words]
 colum = "colum" # deliberate typo in the null-column question; not a prose exemption
+
+[type.search_pilot_results]
+extend-glob = ["0048-agent-pilot-results.json"]
+# Passage identities are frozen 20-digit hexadecimal hashes, including citations.
+extend-ignore-re = ['\b[0-9a-f]{20}\b']
