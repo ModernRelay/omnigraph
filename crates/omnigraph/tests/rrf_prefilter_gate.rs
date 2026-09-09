@@ -60,6 +60,7 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
 
     use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::catalog::TableProvider;
     use datafusion::common::NullEquality;
     use datafusion::dataframe::DataFrame;
     use datafusion::functions_aggregate::expr_fn::min;
@@ -196,7 +197,7 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 .await
                 .unwrap();
                 assert_eq!(dataset.get_fragments().len(), 3);
-                ctx.read_table(Arc::new(
+                let provider = Arc::new(
                     LanceTableProvider::new_with_ordering(
                         Arc::new(dataset),
                         false,
@@ -204,8 +205,35 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                         source == "lance-ordered",
                     )
                     .with_batch_size(1),
-                ))
-                .unwrap()
+                );
+                // Call the public scan contract directly so this checks an
+                // actual provider limit, not only a sort's top-K rewrite.
+                let projection = vec![schema.index_of("binding_id").unwrap()];
+                let scan = provider
+                    .scan(
+                        &ctx.state(),
+                        Some(&projection),
+                        &[col("score").lt(lit(10_i64))],
+                        Some(1),
+                    )
+                    .await
+                    .unwrap();
+                let batches = datafusion::physical_plan::collect(scan, ctx.task_ctx())
+                    .await
+                    .unwrap();
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                for batch in &batches {
+                    assert_eq!(batch.num_columns(), 1);
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    for id in ids.iter().flatten() {
+                        assert!(matches!(id, "path-4" | "path-9"), "{source}: {id}");
+                    }
+                }
+                ctx.read_table(provider).unwrap()
             };
             let bindings = source_frame
                 .repartition(Partitioning::RoundRobinBatch(partitions))
@@ -254,6 +282,79 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 )
                 .await,
                 ["path-6", "path-7", "path-5"]
+            );
+
+            // A final projection hides every ordering/filter/target key. The
+            // optimized native plan must still choose targets before binding
+            // pagination, and cannot move a later filter through that limit.
+            let page = selected_bindings
+                .clone()
+                .sort(binding_order())
+                .unwrap()
+                .limit(1, Some(1))
+                .unwrap()
+                .filter(col("group_key").is_null())
+                .unwrap()
+                .select(vec![col("binding_id")])
+                .unwrap();
+            assert_eq!(page.schema().fields().len(), 1);
+            assert_eq!(strings(page, "binding_id").await, ["path-7"]);
+
+            let first_binding = selected_bindings
+                .clone()
+                .sort(binding_order())
+                .unwrap()
+                .limit(0, Some(1))
+                .unwrap();
+            assert!(
+                strings(
+                    first_binding
+                        .filter(col("binding_id").eq(lit("path-7")))
+                        .unwrap()
+                        .select(vec![col("binding_id")])
+                        .unwrap(),
+                    "binding_id",
+                )
+                .await
+                .is_empty()
+            );
+            // Red control for premature pushdown: this placement has one row.
+            assert_eq!(
+                strings(
+                    selected_bindings
+                        .clone()
+                        .filter(col("binding_id").eq(lit("path-7")))
+                        .unwrap()
+                        .sort(binding_order())
+                        .unwrap()
+                        .limit(0, Some(1))
+                        .unwrap()
+                        .select(vec![col("binding_id")])
+                        .unwrap(),
+                    "binding_id",
+                )
+                .await,
+                ["path-7"]
+            );
+
+            // Also qualify an optimized ordered cut with unprojected
+            // predicate and ordering columns over fragmented native input.
+            assert_eq!(
+                strings(
+                    bindings
+                        .clone()
+                        .filter(col("score").lt(lit(10_i64)))
+                        .unwrap()
+                        .sort(binding_order())
+                        .unwrap()
+                        .limit(0, Some(1))
+                        .unwrap()
+                        .select(vec![col("binding_id")])
+                        .unwrap(),
+                    "binding_id",
+                )
+                .await,
+                ["path-4"]
             );
 
             // Filtering after the global cut cannot refill from f; filtering

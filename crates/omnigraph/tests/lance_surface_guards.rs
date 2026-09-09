@@ -251,6 +251,143 @@ async fn lance_provider_scan_payloads_need_accounting_beyond_the_session_pool() 
     assert!(repeated_backing_bytes > logical_id_bytes);
 }
 
+/// RFC 0048: dropping a result future is not a uniform I/O cancellation
+/// boundary. Drive the real public scheduler with a reader whose in-flight
+/// future is observable and cannot complete until explicitly released. This
+/// qualifies scheduler ownership, not a cloud client or a whole graph query.
+#[tokio::test]
+async fn native_scheduler_drop_distinguishes_queued_and_dispatched_reads() {
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use futures::future::BoxFuture;
+    use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::traits::Reader;
+    use object_store::path::Path;
+    use tokio::sync::Semaphore;
+
+    #[derive(Debug, Default)]
+    struct ReadState {
+        started: AtomicUsize,
+        active: AtomicUsize,
+        completed: AtomicUsize,
+    }
+
+    struct InFlight(Arc<ReadState>);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct GatedReader {
+        path: Path,
+        state: Arc<ReadState>,
+        release: Arc<Semaphore>,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for GatedReader {
+        fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for GatedReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+        fn block_size(&self) -> usize {
+            1
+        }
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+        fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(64) })
+        }
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> BoxFuture<'static, object_store::Result<Bytes>> {
+            let state = self.state.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                state.started.fetch_add(1, Ordering::SeqCst);
+                state.active.fetch_add(1, Ordering::SeqCst);
+                let _in_flight = InFlight(state.clone());
+                release.acquire().await.unwrap().forget();
+                state.completed.fetch_add(1, Ordering::SeqCst);
+                Ok(Bytes::from(vec![0; range.len()]))
+            })
+        }
+        fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
+            self.get_range(0..64)
+        }
+    }
+
+    async fn reaches(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counter.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    for lite in [false, true] {
+        let state = Arc::new(ReadState::default());
+        let release = Arc::new(Semaphore::new(0));
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::memory()),
+            SchedulerConfig {
+                io_buffer_size_bytes: 1,
+                use_lite_scheduler: Some(lite),
+            },
+        );
+        let weak_scheduler = Arc::downgrade(&scheduler);
+        let file = scheduler.open_reader(Arc::new(GatedReader {
+            path: Path::from("gated-read"),
+            state: state.clone(),
+            release: release.clone(),
+        }));
+        let mut dispatched = Box::pin(file.submit_single(0..16, 0));
+        assert!(futures::poll!(dispatched.as_mut()).is_pending());
+        reaches(&state.active, 1).await;
+        // Sixteen bytes are admitted against a one-byte I/O buffer setting.
+        // Priority progress can exceed that setting; it is not hard admission.
+        let mut queued = Box::pin(file.submit_single(32..48, 1));
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        assert_eq!(state.started.load(Ordering::SeqCst), 1);
+
+        // Destroy every public scheduler owner, retaining only the blocked
+        // reader's control state. No sleep or server timing chooses the result.
+        drop(queued);
+        drop(dispatched);
+        drop(file);
+        drop(scheduler);
+        assert!(weak_scheduler.upgrade().is_none());
+        assert_eq!(state.started.load(Ordering::SeqCst), 1);
+        assert_eq!(state.completed.load(Ordering::SeqCst), 0);
+        let active_after_drop = state.active.load(Ordering::SeqCst);
+        assert_eq!(active_after_drop, usize::from(!lite));
+
+        // The standard scheduler still owns the in-flight read; let it drain
+        // before ending the test. Lite has already dropped the reader future.
+        release.add_permits(1);
+        reaches(&state.active, 0).await;
+        assert_eq!(state.completed.load(Ordering::SeqCst), usize::from(!lite));
+        assert_eq!(state.started.load(Ordering::SeqCst), 1);
+        println!(
+            "lite={lite}: active after owner drop={active_after_drop}; queued read never started; 16-byte request admitted with 1-byte I/O buffer"
+        );
+    }
+}
+
 /// Append one uniquely keyed row while preserving the V2_2/stable-row-id shape
 /// used by the production tables. Tag/cleanup guards use this to create exact,
 /// distinguishable versions without introducing a graph-level writer.

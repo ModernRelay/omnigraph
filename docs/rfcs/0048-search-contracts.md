@@ -43,6 +43,13 @@ The [CI checkpoint](#ci-checkpoint-and-regression-disposition) has four failing
 GQT search regressions. They reproduce the defects this design must resolve;
 passing native probes and the completed agent pilot do not close those failures.
 
+The [contract-to-code matrix](#contract-to-code-qualification) identifies what
+the pinned substrates supply and what the adapter must own. Its additional
+probes preserve the tested optimized stage boundaries, but confirm that Arrow
+buffer tracking and Lance I/O buffering are not hard admission limits. Native
+cancellation also differs by scheduler. These are Phase 1 resource gates;
+table-provider registration alone cannot close them.
+
 The immediate problem is correctness. Today, the same text can match before an
 index is built and stop matching afterward; fuzzy indexed and uncovered rows
 can disagree. Retrieval hidden inside `order` also makes a final output limit
@@ -1447,6 +1454,15 @@ nodes through the sealed `TableStore` boundary so snapshot selection, analyzer
 certificates, policy, and visibility remain enforced. No public raw Lance
 handle or string-generated query semantics is introduced.
 
+There is a further public-API boundary: `Scanner::create_plan()` is public,
+but `create_plan_with_session()` is crate-private in this pin. The public
+`LanceTableProvider::scan` calls the latter internally with its caller's
+session. A separately configured vector/FTS scanner does not gain that planning
+entry point merely because its returned plan later executes with a shared
+`TaskContext`. Qualify caller configuration and budget propagation for each
+configured search source; use public adapter primitives or an upstream hook
+where the required planning control is unavailable.
+
 `Scanner::with_row_addr_prefilter` accepts a mask in the same dataset's native
 `_rowid` space, including stable row IDs when enabled. Graph `id` values cannot
 be passed directly. The adapter must resolve them at the accepted dataset
@@ -1663,6 +1679,11 @@ Arrow buffer replaces its previous reservation. Qualification must cover
 over-limit refusal and buffers shared across query/cache owners before using
 that mechanism as the memory contract. Reuse substrate ownership where it
 fits; a process-wide pointer registry is not a substitute for those proofs.
+The [isolated Arrow probe](assets/0048-arrow-pool-probe.py) now makes both
+limitations executable: claiming a 20-byte buffer overfills a one-byte pool,
+and a second owner's claim transfers the reservation while the first owner
+still retains the array. The fallible DataFusion reservation control refuses
+the same allocation. See the contract-to-code checkpoint below.
 
 Preserve resource refusal as a typed outcome through native error wrappers
 and the engine/API boundary. A fair-share consumer may be refused while total
@@ -1706,6 +1727,27 @@ These operator tests do not establish whole-query memory or cancellation
 bounds. Registering fully materialized batches in `MemTable` would leave the
 materialization cost intact. Graph traversal must not be replaced with eager
 Cartesian products merely to fit a relational plan.
+
+The native scheduler guard adds a concrete cancellation boundary. With one
+read blocked inside `Reader::get_range`, dropping its result future and every
+public scheduler owner cancels a queued second read. The standard scheduler's
+already dispatched read remains alive and completes only after the fixture
+releases it; the lightweight scheduler drops that reader future. Both admit
+the first 16-byte read with `io_buffer_size_bytes=1`. Priority progress makes
+that setting a backpressure target, not hard byte admission. These results
+use the real public schedulers and a controlled reader, not a cloud request
+or a full query. Do not switch all backends to the lightweight scheduler to
+claim cancellation: it has different polling and concurrency behavior.
+
+The query resource design must identify the owner of dispatched I/O through
+completion or cancellation, and account for its memory, retry work and
+concurrency until that boundary settles. A dropped stream, elapsed request
+timeout or zero visible output does not prove that physical work has stopped.
+Before enabling a native route, demonstrate bounded shutdown with the actual
+reader/client, decode tasks, plan, output queue and encoder calls. Use a
+qualified reader/transport adapter or an upstream change where detached work
+cannot otherwise be governed. This is an implementation acceptance gate,
+not permission to weaken the cancellation contract.
 
 Lance vector refinement rescans retrieved vectors; it is not a learned
 cross-encoder reranker. Native fuzzy expansion and shared FTS scorer helpers
@@ -1828,6 +1870,105 @@ The existing compiler baseline passed 350 tests with
 `cargo test -p omnigraph-compiler --locked --lib`. This is evidence about the
 current compiler, not a parser prototype, new engine behavior, end-to-end
 resource qualification, or a relevance result for this proposal.
+
+### Contract-to-code qualification
+
+This matrix is the implementation decision record for Lance 11.0.0,
+DataFusion 54.0.0 and Arrow 58.3.0. **Reuse** means use the public primitive
+within its established semantics; **adapter** means OmniGraph must supply the
+missing contract; **bounded fallback** means complete evaluation under the
+same query budget or typed refusal. **Upstream** identifies a limitation that
+needs a qualified workaround or upstream fix before enabling that route.
+None of these labels means the full search feature has shipped.
+
+The [source and probe receipt](assets/0048-upstream-contract-checkpoint.json)
+records the inspected source files, archive checksums, lockfile and executable
+probe results. Every recorded source file was compared byte-for-byte with its
+crate archive, whose checksum matched `Cargo.lock`. Full upstream guides were
+read alongside the code, including [DataFusion integration](https://lance.org/integrations/datafusion/),
+[object stores](https://lance.org/guide/object_store/) and
+[observability](https://lance.org/guide/observability/). Live documentation
+describes available concepts; the exact crate source and qualified tests
+determine what this pin can promise.
+
+| Search promise | Pinned interface and limit | Decision | Minimal falsifier and disposition |
+|---|---|---|---|
+| Accepted analyzer, including fuzzy input | `InvertedIndexParams::build`; native fuzzy and flat paths choose different analysis/expansion behavior; NFC needs preprocessing. | Reuse tokenizer; adapter plus bounded fallback for complete membership. | Same composed/decomposed or capitalized typo before/after indexing must have identical membership. Native Unicode/analyzer guards expose the limits; the four current GQT regressions remain open. |
+| One exact/fuzzy lexical score | `InvertedIndex::bm25_stats_for_terms`, `MemBM25Scorer`; native float32 BM25 does not implement the proposed grouped fuzzy formula or numeric policy. | Bounded exact scorer first; native acceleration only after parity qualification. | Rare expansion, repeated terms, common-term IDF and deletion change native scores. Existing native and independent Decimal fixtures exercise these counterexamples; full indexed parity remains open. |
+| Cross-table lexical ranking | Public shared scorer can be supplied before native per-table cuts; immutable index statistics can include deleted rows. | Adapter owns live corpus aggregation, scoring policy and complete cut boundaries. | Two local top-1 cuts lose the global winner; the shared-statistics probe recovers its score band. Canonical ties and live multi-type statistics remain open. |
+| Exact `knn` and declared `ann` effort | `Scanner::nearest`, `use_index(false)`, metric/refinement controls and `scan_stats_callback`; refinement scores only retrieved candidates. | Reuse qualified scanner paths; adapter owns geometry, coverage, ties and effort. | ANN omits a true neighbor or returns an unreached `+inf` row. Existing vector guards fence the latter; family-specific recall, arithmetic and complete-tie qualification remain required. |
+| Graph-scoped candidate population | `Scanner::with_row_addr_prefilter` consumes the selected dataset's native `_rowid` domain. | Adapter resolves accepted graph identity to pinned native identity. | Delete/compact a target, then search an older snapshot with a graph mask. Native identity guards exist; the full graph-mask retriever remains open. |
+| Independent candidate windows and final output size | Scanner limits and FTS collectors can cut before OmniGraph sees candidates. Native row-ID or score-only ties are not the declared entity comparator. | Adapter owns every semantic cut; bounded fallback for an unqualified boundary. | More tied targets than the native window, with reversed graph/native identity order. Sorting a truncated subset cannot pass this gate; production qualification remains open. |
+
+| Composition promise | Pinned interface and limit | Decision | Minimal falsifier and disposition |
+|---|---|---|---|
+| Configured retrieval shares planning and execution context | Public `Scanner::create_plan()` takes no session; `create_plan_with_session()` is crate-private, used internally by public `LanceTableProvider::scan`. | Reuse provider for qualified scans; adapter or upstream hook for required configured-source controls. | Execute vector/FTS plus downstream operators under one tiny allowance and nondefault planning options. Ordinary provider pool/control probes pass; configured retrieval-source propagation remains open. |
+| Filters stay on their side of a stage | `TableProvider::scan` applies filters before limit before projection. `UserDefinedLogicalNodeCore` provides predicate and limit pushdown controls. | Reuse ordinary relational nodes; conservative adapter barriers for graph/search nodes. | Filter before/after a target cut or binding limit must produce different fixture results. Extended staged probe passes all twelve native/memory configurations; new GQ nodes still need the same oracle. |
+| Hidden ranking and identity columns survive optimization | `necessary_children_exprs` defines extension input demand; its default retains all input columns. Provider filters may reference unprojected columns. | Adapter declares every stage dependency; prune only after its last use. | Project only `binding_id` after target ranking, offset/limit and a nullable-group filter. Extended probe returns exactly `path-7`; moving a later filter before the limit changes empty output into one row. |
+| Group quotas preserve graph bindings | DataFusion `dense_rank`, distinct, `row_number` and typed null-safe joins; nullable join dynamic filters have a measured defect. | Reuse windows; qualify each join route and retain the dynamic-filter fence. | Two paths to one target consume one slot; null-key pairs survive. Existing native selection oracles pass the fenced routes and expose 20 expected bindings becoming 18 on the affected route. |
+| Global order and late payload reads | `ExecutionPlan` ordering/distribution properties and Lance `TakeExec`; partition-local order is insufficient for a global cut. | Adapter restores declared order and validates properties after hydration. | Shuffle partitions and tie keys, then hydrate and apply another ordered stage. Existing terminal-take result checks pass; downstream reliance on take's ordering metadata remains open. |
+| Fusion and all-node discovery retain type/metric identity | DataFusion union, aggregate and sort can compose compatible Arrow relations; no native operator resolves OmniGraph's accepted all-type scope or score comparability. | Adapter expands the schema scope, carries type/entity/source identity and performs declared fusion. | Same entity ID text in two types, incompatible vector spaces, duplicated paths, missing arms and overflowing weights. Scalar controls cover some arithmetic/multiplicity cases; cross-type grammar and complete integration remain open. |
+| Coherent source reads and truthful metadata | Pinned Lance datasets/tags and native takes supply per-table reads; statistics and task metrics have narrower scopes than graph completion. | Reuse snapshot carriers; adapter owns schema/graph identity, authorization, retention and response classification. | Change head or drop/re-add a type between search/read; ask for exact counts under insufficient budget. Existing snapshot mechanisms are qualified; proposed reference/error/count envelopes remain integration work. |
+
+| Resource promise | Pinned interface and limit | Decision | Minimal falsifier and disposition |
+|---|---|---|---|
+| One memory allowance across arms and fallback | `RuntimeEnv`/`TaskContext` share participating `MemoryPool` reservations; Lance decoded batches can remain outside them. | Reuse pool; adapter owns admission for native input, retained state and output. | One-byte pool retains a 304-byte native scan result while aggregation refuses. Existing guard passes; preallocation and whole-query accounting remain open. |
+| Shared Arrow buffers count once without stealing another owner's allowance | Optional `Array::claim` and `ArrowMemoryPool::reserve` track buffers infallibly and replace prior reservations. | Tracking primitive only; adapter or upstream fallible allocation/ownership support required. | New isolated probe overfills 1 byte with 20 bytes; second query claims the buffer and first pool falls to zero while its array remains live. Last-alias cleanup and fallible refusal controls pass. |
+| I/O buffering and cancellation stay bounded | `ScanScheduler`, `FileScheduler`, `SchedulerConfig`; priority progress can exceed the byte setting; standard scheduler dispatches detached tasks. | Adapter or upstream support for admission, task lifetime and actual transport shutdown. | New native guard admits 16 bytes against 1; queued read never starts, standard in-flight read survives all public owners, lite read future is dropped. Cloud/decode/whole-query shutdown remains open. |
+| Spill and post-error cleanup preserve allowances | DataFusion `DiskManager`; positive limits are checked after writes and a refused write can leave stale accounting. Plans may retain hash-build reservations after stream completion. | Disable spilling for no-write policy; adapter plus upstream qualification for positive limits and cleanup. | Existing seven-byte refusal and collected-plan probes expose the boundaries. Dispose of query-owned runtime/plan; qualify bounded write overshoot before advertising a hard scratch quota. |
+| External encoding and CPU work respect the same attempt | DataFusion owned-task/cooperation utilities help; neither Lance nor Arrow freezes an external provider or budgets arbitrary analysis/model work. | Adapter owns resolved encoder identity, cancellation and cumulative work. | Same provider label changes vectors; long normalization/token work delays yielding. Existing provider and CPU controls expose both; end-to-end request/encoder cancellation remains open. |
+
+The pinned [table-provider contract](https://docs.rs/crate/datafusion-catalog/54.0.0/source/src/table.rs)
+allows an advisory scan limit to return extra rows and disallows pushing it
+through inexact filters. Lance's ordinary provider reports exact filters
+because its scan evaluates them; that is not authority to move a filter across
+an OmniGraph candidate cut. For extension stages, retain
+`supports_limit_pushdown=false` and conservative
+`prevent_predicate_push_down_columns` until a rewrite is proven. Implement
+`necessary_children_exprs` only with target, metric, comparator, group and
+payload dependencies accounted for. The [extension API](https://docs.rs/crate/datafusion-expr/54.0.0/source/src/logical_plan/extension.rs)
+already offers these hooks; a separate query optimizer is not required.
+Validate parameters before optimization can erase an empty branch.
+
+The extended stage probe also calls `LanceTableProvider::scan` directly in
+its eight native configurations with projection `binding_id`, filter
+`score < 10` and limit one. It returns one eligible row with no score column.
+This checks the actual provider limit separately from an optimizer's sort
+top-K rewrite. The composed checks additionally exercise twelve combinations
+of memory/native source, input reversal and one/four target partitions.
+
+DataFusion's [execution-plan contract](https://docs.rs/crate/datafusion-physical-plan/54.0.0/source/src/execution_plan.rs)
+requires cooperative streams and owned background tasks that stop when
+dropped. Lance's pinned [standard scheduler](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-io/src/scheduler.rs)
+spawns dispatched reads without retaining their join handles; its drop path
+closes the queue. The [lightweight scheduler](https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-io/src/scheduler/lite.rs)
+keeps reader futures in task state and drops them on abandonment. The new
+guard establishes that difference at the native scheduling boundary. It does
+not establish that dropping any particular OS or cloud request cancels its
+underlying operation, or that per-request timeouts impose a query deadline.
+
+Reproduce the new qualification from the repository root:
+
+```sh
+cargo test -p omnigraph-engine --test lance_surface_guards --locked
+cargo test -p omnigraph-engine --test rrf_prefilter_gate --locked
+python3 docs/rfcs/assets/0048-arrow-pool-probe.py
+```
+
+The Arrow runner creates an isolated temporary crate, checks all resolved
+registry versions/checksums against the workspace lockfile, and enables only
+there the optional Arrow pool features. Its [Rust probe](assets/0048-arrow-pool-probe.rs)
+and result receipt are reviewable; production dependency features are unchanged.
+These deterministic mechanism checks do not add latency, peak-memory or
+retrieval-quality claims. They supplement the frozen integrated prototype and
+agent evaluation rather than changing their inputs or results.
+
+The focused run reports 43 Lance surface guards, 13 RRF/prefilter tests and
+11 benchmark contracts passing, plus the isolated Arrow assertions. The S3
+same-version guard returns early without configured storage credentials, so
+its passing libtest entry is not remote-storage evidence. Both workspace
+Clippy feature graphs pass. The four previously recorded GQT failures remain
+open; these native checks neither repair them nor replace release validation.
 
 ### Assumption audit
 
@@ -2338,6 +2479,10 @@ rules; qualify the NFC implementation and profile fingerprint before fixing
 the analyzer definitions.
 Specify resource units and admission limits, follow-up/retention behavior,
 and the proposed response changes before their implementations diverge.
+Use the [contract-to-code matrix](#contract-to-code-qualification) as the
+native-route acceptance checklist. Every open row needs its named falsifier
+closed, a bounded fallback, or an explicit upstream dependency; API existence
+does not count as implementation evidence.
 Pull one minimal integrated query through the actual compiler, engine and GQT
 forward into this qualification work. Exercise shared-resource refusal as well
 as successful results before broadening the operator set. Isolated parser and
@@ -2372,6 +2517,12 @@ encoding refusal, default/override resolution, export/reapplication stability,
 and migration rewrite idempotence. Tests must show that
 operators and fallbacks share a budget rather than resetting it. Schema and
 plan types must not depend on index presence or a second semantic registry.
+Close the matrix's native allocation, shared-buffer ownership and dispatched
+I/O gates here before using these foundations to claim whole-query limits.
+Exercise cancellation while reads, decode work, output queues and encoder
+calls are active, with retained plans and shared caches present. Keep the
+native scheduler counterexample as an upstream compatibility fence; a passing
+counterexample test documents the missing guarantee, not its repair.
 
 #### Phase 2: implement complete lexical and vector retrieval
 

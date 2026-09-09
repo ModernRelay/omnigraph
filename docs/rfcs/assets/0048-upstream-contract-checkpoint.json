@@ -1,0 +1,408 @@
+{
+  "schema": "omnigraph-rfc0048-upstream-contract-checkpoint-v1",
+  "source_baseline_commit": "112507f183b0fc6e63a68c05e85ba56078edd13f",
+  "scope": "Pinned upstream mechanism qualification; not full-query resource, cloud cancellation, performance, or retrieval-quality evidence.",
+  "workspace_lock_sha256": "993d736f15af06b87c8ca1d6914db4283138ce30f8607e1a2632ee7dbc8d75f9",
+  "packages": [
+    {
+      "name": "lance",
+      "version": "11.0.0",
+      "archive_sha256": "be781f40c7a75f9eae2188a2f71174acb7a360dca97163db40b041d0828dea48",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "lance-index",
+      "version": "11.0.0",
+      "archive_sha256": "b0e0cb95f2c4f341c4dd04ac60f6a89ea26a6f75e09570225cbda4854c8b088e",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "lance-io",
+      "version": "11.0.0",
+      "archive_sha256": "414d50997391b1ac83dc183c1612fdff88f58b959806078dc4c5e465154566de",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "datafusion-catalog",
+      "version": "54.0.0",
+      "archive_sha256": "f7dd61161508f8f5fa1107774ea687bd753c22d83a32eebf963549f89de14139",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "datafusion-expr",
+      "version": "54.0.0",
+      "archive_sha256": "6932f4d71eed9c8d9341476a2b845aadfabde5495d08dbcd8fc23881f49fa7a0",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "datafusion-optimizer",
+      "version": "54.0.0",
+      "archive_sha256": "77f20e8cf9e8654d92f4c16b24c487353ee5bf153ffc12d5772cd399ab8cd281",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "datafusion-physical-plan",
+      "version": "54.0.0",
+      "archive_sha256": "776ee54d47d15bdb126452f9ca17b03761e3b004682914beaedd3f86eb507fbc",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "datafusion-execution",
+      "version": "54.0.0",
+      "archive_sha256": "37a8643ab852eb68864e1b72ae789e8066282dce48eea6347ffb0aee33d1ccc0",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "arrow-buffer",
+      "version": "58.3.0",
+      "archive_sha256": "0c6cd424c2693bcdbc150d843dc9d4d137dd2de4782ce6df491ad11a3a0416c0",
+      "matches_workspace_lock": true
+    },
+    {
+      "name": "arrow-array",
+      "version": "58.3.0",
+      "archive_sha256": "cfd33d3e92f207444098c75b42de99d329562be0cf686b307b097cc52b4e999e",
+      "matches_workspace_lock": true
+    }
+  ],
+  "source_files": [
+    {
+      "package": "lance-11.0.0",
+      "path": "src/dataset.rs",
+      "sha256": "e317e230733137ccb3323339a3c91ade50eb4fd06f46d9a460c42e34784077da",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/dataset.rs"
+    },
+    {
+      "package": "lance-11.0.0",
+      "path": "src/dataset/scanner.rs",
+      "sha256": "5ccf3c5623d39fd5e68ede8139b270525486e60f8aa06acf7fcd2a2ed449295b",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/dataset/scanner.rs"
+    },
+    {
+      "package": "lance-11.0.0",
+      "path": "src/datafusion/dataframe.rs",
+      "sha256": "b652ec61262a8231d26a66b180837a7c730f1b3e5bbb070dcdef4ccd637df811",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/datafusion/dataframe.rs"
+    },
+    {
+      "package": "lance-11.0.0",
+      "path": "src/io/exec/fts.rs",
+      "sha256": "f690c3410371bae8a57e339a69b6d06233f21948d8d78fd33cdc97984800e683",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/io/exec/fts.rs"
+    },
+    {
+      "package": "lance-11.0.0",
+      "path": "src/io/exec/take.rs",
+      "sha256": "31701ed49fd25a88b08bc6f77769f2d9b39476e6f881510cddd002f829a5ca50",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance/src/io/exec/take.rs"
+    },
+    {
+      "package": "lance-index-11.0.0",
+      "path": "src/scalar/inverted.rs",
+      "sha256": "d530ed8e801e118d3ad133242fe51a8c28866857114d98cd35046356db7c5b6d",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted.rs"
+    },
+    {
+      "package": "lance-index-11.0.0",
+      "path": "src/scalar/inverted/scorer.rs",
+      "sha256": "8936641fba2e67678abfe4867d88b1aec4c5ff684dfb31d1d2aff8d6f7dbe4e0",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/scorer.rs"
+    },
+    {
+      "package": "lance-index-11.0.0",
+      "path": "src/scalar/inverted/tokenizer.rs",
+      "sha256": "35e21c43bcd339de52756f3bc5ef8e0a81b77673ab7c7c419f1ca6e98337ac26",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/tokenizer.rs"
+    },
+    {
+      "package": "lance-index-11.0.0",
+      "path": "src/scalar/inverted/index/search.rs",
+      "sha256": "cf47f321ceda07b66d2df078c1e8a2a41ff34ed69cedc88e60b2e0436a39a5ea",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/index/search.rs"
+    },
+    {
+      "package": "lance-index-11.0.0",
+      "path": "src/scalar/inverted/index/flat_search.rs",
+      "sha256": "75b8e07b3c4dd9b7292731a6161efac517986814694f2f51a1b8219f1ebf6d9a",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-index/src/scalar/inverted/index/flat_search.rs"
+    },
+    {
+      "package": "lance-io-11.0.0",
+      "path": "src/scheduler.rs",
+      "sha256": "48478e4ddbfea3301934866d3143863420a5300809937758111b44d20e2f01e6",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-io/src/scheduler.rs"
+    },
+    {
+      "package": "lance-io-11.0.0",
+      "path": "src/scheduler/lite.rs",
+      "sha256": "591b690d109802437c4de6144ae08183e87fbc6f90beb70993ef8eb6b5170191",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-io/src/scheduler/lite.rs"
+    },
+    {
+      "package": "lance-io-11.0.0",
+      "path": "src/traits.rs",
+      "sha256": "d8344cdc3aa44d5459076ceaec3a480c28a396e7fd8d44383bf98097f0381c74",
+      "matches_archive": true,
+      "url": "https://github.com/lance-format/lance/blob/ab6b5bbe46009ed78746b444df8db59a8bc5d842/rust/lance-io/src/traits.rs"
+    },
+    {
+      "package": "datafusion-catalog-54.0.0",
+      "path": "src/table.rs",
+      "sha256": "645adfdf201db4ac3e566f3e616a00ecff31acfebb1d8df560db2aa98e30a3af",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-catalog/54.0.0/source/src/table.rs"
+    },
+    {
+      "package": "datafusion-expr-54.0.0",
+      "path": "src/logical_plan/extension.rs",
+      "sha256": "9755a8ef93c3459feea8e3914e534acfc0a31b53ded5c821209e7bbe2e103256",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-expr/54.0.0/source/src/logical_plan/extension.rs"
+    },
+    {
+      "package": "datafusion-optimizer-54.0.0",
+      "path": "src/push_down_filter.rs",
+      "sha256": "13fc17abab2f379b0c13426ee6708d9b14c5146b4ef2d3a27a32db7905314c0c",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-optimizer/54.0.0/source/src/push_down_filter.rs"
+    },
+    {
+      "package": "datafusion-optimizer-54.0.0",
+      "path": "src/push_down_limit.rs",
+      "sha256": "cd1a33eb829a0bbfecf41af53dfa99d25ff74efdac4a7f770d0d8148c21c0c6b",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-optimizer/54.0.0/source/src/push_down_limit.rs"
+    },
+    {
+      "package": "datafusion-optimizer-54.0.0",
+      "path": "src/optimize_projections/mod.rs",
+      "sha256": "b5120f43adf11bac662ef4882b151baeb3df23ebedb2194b126c36f593c76698",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-optimizer/54.0.0/source/src/optimize_projections/mod.rs"
+    },
+    {
+      "package": "datafusion-physical-plan-54.0.0",
+      "path": "src/execution_plan.rs",
+      "sha256": "79db7478ca23047b0890082576d83df2283dc78e361e69048e9b352b79cb228b",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-physical-plan/54.0.0/source/src/execution_plan.rs"
+    },
+    {
+      "package": "datafusion-execution-54.0.0",
+      "path": "src/memory_pool/arrow.rs",
+      "sha256": "eadc063f12178d502debdbdcc9fa00e92003e775c819a302dbdc0e06b43ee9d1",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-execution/54.0.0/source/src/memory_pool/arrow.rs"
+    },
+    {
+      "package": "datafusion-execution-54.0.0",
+      "path": "src/memory_pool/mod.rs",
+      "sha256": "f306dc1800ce0512e5eff2bc31af215eed7ead1de6dfa7b6cc161c5a52c57f09",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-execution/54.0.0/source/src/memory_pool/mod.rs"
+    },
+    {
+      "package": "datafusion-execution-54.0.0",
+      "path": "src/disk_manager.rs",
+      "sha256": "c1bba907327a81bf264144322cf109ab91e8c8b9bcdb1a693d320e437c8898bb",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/datafusion-execution/54.0.0/source/src/disk_manager.rs"
+    },
+    {
+      "package": "arrow-buffer-58.3.0",
+      "path": "src/pool.rs",
+      "sha256": "8a6a396005c6cd9c2f4970de004bb3a982eb4782373d9862eda0af3c038f996b",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/arrow-buffer/58.3.0/source/src/pool.rs"
+    },
+    {
+      "package": "arrow-buffer-58.3.0",
+      "path": "src/bytes.rs",
+      "sha256": "77fa7219ae49504b95fe345047a3358d4f130b353628213b2f16d3378f4bbe46",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/arrow-buffer/58.3.0/source/src/bytes.rs"
+    },
+    {
+      "package": "arrow-buffer-58.3.0",
+      "path": "src/buffer/immutable.rs",
+      "sha256": "3f10e81efa242387b11f4355ff7a509f9d0d672c1acbe682edac7142592a38ff",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/arrow-buffer/58.3.0/source/src/buffer/immutable.rs"
+    },
+    {
+      "package": "arrow-array-58.3.0",
+      "path": "src/array/mod.rs",
+      "sha256": "64308d3f7ca0271d57cff5c407323a6315374bba8542b7dbf98392979539b83b",
+      "matches_archive": true,
+      "url": "https://docs.rs/crate/arrow-array/58.3.0/source/src/array/mod.rs"
+    }
+  ],
+  "additional_full_guides_read": [
+    "https://lance.org/integrations/datafusion/",
+    "https://lance.org/guide/object_store/",
+    "https://lance.org/guide/observability/"
+  ],
+  "checked_at_utc": "2026-09-09T23:10:04.370399+00:00",
+  "local_date": "2026-09-10",
+  "local_timezone": "Europe/London",
+  "probe_source_files": [
+    {
+      "path": "crates/omnigraph/tests/lance_surface_guards.rs",
+      "sha256": "4ef0ee1ad5c30330aaa9505d3dc63fafdc0be621e82d2fd4c982861c48f87505"
+    },
+    {
+      "path": "crates/omnigraph/tests/rrf_prefilter_gate.rs",
+      "sha256": "52fd511e11a7d5b7f1036e2b22d4193d2ae112066783df815920bc702b4c5a24"
+    },
+    {
+      "path": "crates/omnigraph/tests/benchmark_scenario_contract.rs",
+      "sha256": "14028cac7f691bdcfddb256d7f5a14802d138d6ad82813083ae7727b8155f39a"
+    },
+    {
+      "path": "docs/rfcs/assets/0048-arrow-pool-probe.py",
+      "sha256": "4fee63ad32782ce3971d01b8ac0b73f788e09857ef4f7445ec974afb16acf1b2"
+    },
+    {
+      "path": "docs/rfcs/assets/0048-arrow-pool-probe.rs",
+      "sha256": "840eb647e28ed66d0831a0ec0be4d5a646db022849f521ec14814ffcf4dc0ad5"
+    }
+  ],
+  "baseline": {
+    "commit": "112507f183b0fc6e63a68c05e85ba56078edd13f",
+    "lance_surface_guards": {
+      "passed": 42,
+      "failed": 0
+    },
+    "staged_target_selection_preserves_cutoffs_and_binding_rows": {
+      "passed": 1,
+      "failed": 0
+    },
+    "s3_configured": false
+  },
+  "focused_suites": [
+    {
+      "target": "lance_surface_guards",
+      "passed": 43,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "target": "rrf_prefilter_gate",
+      "passed": 13,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "target": "benchmark_scenario_contract",
+      "passed": 11,
+      "failed": 0,
+      "exit_code": 0
+    }
+  ],
+  "environment_skips": [
+    "public_physical_ref_token_rejects_s3_same_version_aba: OMNIGRAPH_S3_TEST_BUCKET absent; its early return is counted as passing by libtest. No S3 proof claimed."
+  ],
+  "stage_probe": {
+    "name": "staged_target_selection_preserves_cutoffs_and_binding_rows",
+    "configurations": 12,
+    "sources": [
+      "memory",
+      "lance-ordered",
+      "lance-unordered"
+    ],
+    "target_partitions": [
+      1,
+      4
+    ],
+    "input_order": [
+      "forward",
+      "reversed"
+    ],
+    "native_fragments": 3,
+    "input_batch_rows": 1,
+    "new_assertions": {
+      "hidden_columns_offset_then_null_filter": [
+        "path-7"
+      ],
+      "binding_limit_then_path_filter": [],
+      "path_filter_then_binding_limit": [
+        "path-7"
+      ],
+      "unprojected_score_filter_then_ordered_limit": [
+        "path-4"
+      ],
+      "direct_provider_scan": {
+        "native_configurations": 8,
+        "projection": [
+          "binding_id"
+        ],
+        "filter": "score < 10",
+        "limit": 1,
+        "returned_rows": 1,
+        "allowed_binding_ids": [
+          "path-4",
+          "path-9"
+        ]
+      }
+    }
+  },
+  "scheduler_probe": {
+    "name": "native_scheduler_drop_distinguishes_queued_and_dispatched_reads",
+    "boundary": "Real public ScanScheduler/FileScheduler with controlled Reader futures; no cloud transport or full-query claim.",
+    "io_buffer_size_bytes": 1,
+    "first_request_bytes": 16,
+    "standard": {
+      "started_reads": 1,
+      "active_after_all_public_owners_dropped": 1,
+      "completed_after_gate_released": 1,
+      "queued_read_started": false
+    },
+    "lite": {
+      "started_reads": 1,
+      "active_after_all_public_owners_dropped": 0,
+      "completed_after_gate_released": 0,
+      "queued_read_started": false
+    }
+  },
+  "arrow_probe": {
+    "workspace_lock_sha256": "993d736f15af06b87c8ca1d6914db4283138ce30f8607e1a2632ee7dbc8d75f9",
+    "probe_source_sha256": "840eb647e28ed66d0831a0ec0be4d5a646db022849f521ec14814ffcf4dc0ad5",
+    "resolved_lock_sha256": "eb75ceeae90329d1278d322ea6fd2ceaab047cd72fb10fa193a0d13136a5ea11",
+    "registry_dependencies_match_workspace": true,
+    "observations": {
+      "buffer_bytes": 20,
+      "pool_capacity": 1,
+      "available_after_claim": -19,
+      "fallible_admission_refused": true,
+      "same_owner_shared_once": true,
+      "cross_owner_reservation_transferred": true,
+      "released_after_last_alias": true
+    }
+  },
+  "reproduction_commands": [
+    "cargo test -p omnigraph-engine --test lance_surface_guards --test rrf_prefilter_gate --test benchmark_scenario_contract --locked",
+    "python3 docs/rfcs/assets/0048-arrow-pool-probe.py"
+  ],
+  "prior_evidence_unchanged": [
+    "0048-staged-integration.patch",
+    "0048-validation-checkpoint.json",
+    "0048-agent-pilot-results.json"
+  ],
+  "open_release_gates": [
+    "Four existing GQT search regressions recorded in RFC 0048 remain unresolved.",
+    "Whole-query preallocation, shared-buffer/cache ownership, dispatched I/O, decode/encoder cancellation and output accounting remain unqualified.",
+    "Native canonical fuzzy scoring/live statistics/ties and complete cross-type lowering remain unqualified."
+  ]
+}
