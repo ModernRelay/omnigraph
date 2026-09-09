@@ -3760,6 +3760,11 @@ fn lexical_scoring_v1_reference_oracle() {
             bits(scores.clone()),
             bits(evaluate(case, &repeated, case.edits, &eligible))
         );
+        let reordered: Vec<_> = case.query.iter().rev().cloned().collect();
+        assert_eq!(
+            bits(scores.clone()),
+            bits(evaluate(case, &reordered, case.edits, &eligible))
+        );
 
         // Narrowing eligibility must not recompute the scoring corpus.
         let subset: Vec<_> = eligible.iter().copied().step_by(2).collect();
