@@ -109,6 +109,13 @@ that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
 that changes no entities returns `"commit": null`.
 
+When a graph server returns a structured error, `--json` preserves its `error`,
+optional `code`, and typed detail fields on stdout and exits with code 1.
+For example, a policy refusal retains `"code": "forbidden"`; scripts need not
+parse its human-readable message. Invalid or incomplete server responses remain
+diagnostics and do not produce a fabricated structured refusal. Conditional
+mutation mismatches retain exit code 4 as described below.
+
 ### Conditional mutations
 
 ```bash

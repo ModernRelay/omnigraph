@@ -52,7 +52,7 @@ use crate::blob_cli::{
 };
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, branch_statement_change_request,
+    RemoteErrorCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, build_blob_http_client, build_http_client, is_remote_uri,
     legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
     remote_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
@@ -634,7 +634,7 @@ impl GraphClient {
                 if !status.is_success() {
                     let text = response.text().await?;
                     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
+                        return Err(RemoteErrorCli { output: error }.into());
                     }
                     bail!("server returned {}: {}", status, text);
                 }
@@ -715,7 +715,7 @@ impl GraphClient {
                 let text = response.text().await?;
                 if !status.is_success() {
                     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
+                        return Err(RemoteErrorCli { output: error }.into());
                     }
                     bail!("server returned {}: {}", status, text);
                 }
@@ -1327,7 +1327,7 @@ impl GraphClient {
                 if !status.is_success() {
                     let text = response.text().await?;
                     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
+                        return Err(RemoteErrorCli { output: error }.into());
                     }
                     bail!("server returned {}: {}", status, text);
                 }

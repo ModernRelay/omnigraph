@@ -136,7 +136,7 @@ fn installed_file_is_current(installed: &fs::File, path: &std::path::Path) -> Re
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    let cli = {
+    let (cli, json) = {
         let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
@@ -147,8 +147,32 @@ async fn main() -> Result<()> {
                     .help("Print version"),
             )
             .get_matches_from(raw_args);
-        Cli::from_arg_matches(&matches)?
+        let mut command_matches = &matches;
+        while let Some((_, child)) = command_matches.subcommand() {
+            command_matches = child;
+        }
+        let json = command_matches
+            .try_get_one::<bool>("json")
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false);
+        (Cli::from_arg_matches(&matches)?, json)
     };
+    match run(cli).await {
+        Err(error) if json => {
+            if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
+                print_json(&remote.output)?;
+                std::io::stdout().flush()?;
+                std::process::exit(1);
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     if let Some(result) = managed::dispatch(&cli).await {
         let code = result.emit()?;
         if code != 0 {

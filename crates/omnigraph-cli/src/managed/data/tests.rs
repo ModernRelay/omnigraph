@@ -720,6 +720,8 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                 &error.downcast_ref::<crate::helpers::PreconditionFailedCli>().unwrap().output,
             )
             .unwrap()
+        } else if let Some(remote) = error.downcast_ref::<crate::helpers::RemoteErrorCli>() {
+            serde_json::to_string(&remote.output).unwrap()
         } else {
             error.to_string()
         };
