@@ -247,6 +247,7 @@ write_surfaces! {
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
+    ("db/omnigraph.rs", "ensure_no_pending_recovery"),
     ("db/omnigraph.rs", "manifest_has_external_base_paths"),
     ("db/omnigraph/export.rs", "capture_served_export_cut"),
     (
