@@ -186,6 +186,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
     "/readyz",
     "/graphs",
+    "/graphs/discovery",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/read",
@@ -2253,7 +2254,7 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         .unwrap();
     let (_, json) = json_response(&app, request).await;
     let paths = json["paths"].as_object().unwrap();
-    for flat in ["/healthz", "/graphs"] {
+    for flat in ["/healthz", "/graphs", "/graphs/discovery"] {
         assert!(
             paths.contains_key(flat),
             "{flat} must remain flat in multi mode"
@@ -2281,7 +2282,10 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
     let paths = json["paths"].as_object().unwrap();
     let mut checked = 0;
     for (path, item) in paths {
-        if path == "/healthz" || path == "/readyz" || path == "/graphs" {
+        if matches!(
+            path.as_str(),
+            "/healthz" | "/readyz" | "/graphs" | "/graphs/discovery"
+        ) {
             continue;
         }
         for method in ["get", "head", "post", "put", "delete", "patch"] {
@@ -2344,7 +2348,7 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         }
     }
 
-    for flat in ["/healthz", "/graphs"] {
+    for flat in ["/healthz", "/graphs", "/graphs/discovery"] {
         let item = paths.get(flat).unwrap();
         for method in ["get", "head", "post", "put", "delete", "patch"] {
             if let Some(operation) = item.get(method).filter(|value| value.is_object()) {

@@ -63,6 +63,25 @@ pub struct DataTokenClaims {
     pub grants: Vec<DataGrant>,
 }
 
+/// Version 2 authenticates identity only. All graph permissions come from
+/// applied policy; strict parsing refuses permission or membership claims.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityTokenClaims {
+    pub version: u8,
+    pub iss: String,
+    pub aud: String,
+    pub sub: String,
+    pub account_id: String,
+    pub cluster_id: String,
+    pub cluster_incarnation: String,
+    pub principal_kind: PrincipalKind,
+    pub assurance: DataAssurance,
+    pub iat: u64,
+    pub exp: u64,
+    pub jti: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataTokenHeader {
@@ -207,9 +226,9 @@ impl DataTokenTrust {
             .map(|actor| actor.actor().clone())
     }
 
-    /// Verify using an explicit admission time and retain the signed grant
-    /// ceiling. Failure is deliberately opaque: callers must not log a
-    /// credential or expose its unverified claims.
+    /// Verify using an explicit admission time and retain the exact signed
+    /// profile and any legacy ceiling. Failure is deliberately opaque: callers
+    /// must not log a credential or expose its unverified claims.
     #[must_use]
     pub fn verify_authenticated_at(&self, token: &str, now: u64) -> Option<AuthenticatedActor> {
         if token.len() > MAX_TOKEN_BYTES {
@@ -236,11 +255,44 @@ impl DataTokenTrust {
         )
         .ok()?;
         let claims_bytes = URL_SAFE_NO_PAD.decode(claims_part).ok()?;
-        let claims: DataTokenClaims = serde_json::from_slice(&claims_bytes).ok()?;
-        if !self.valid_claims(&claims, now) {
-            return None;
+        // The discriminator only chooses a parser. Reparse the original bytes
+        // into the strict profile so duplicate and unknown fields still fail.
+        let discriminator: serde_json::Value = serde_json::from_slice(&claims_bytes).ok()?;
+        match discriminator.get("version")?.as_u64()? {
+            1 => {
+                let claims: DataTokenClaims = serde_json::from_slice(&claims_bytes).ok()?;
+                self.valid_claims(&claims, now)
+                    .then(|| AuthenticatedActor::signed(claims))
+            }
+            2 => {
+                let claims: IdentityTokenClaims = serde_json::from_slice(&claims_bytes).ok()?;
+                self.valid_identity_claims(&claims, now)
+                    .then(|| AuthenticatedActor::signed_identity(claims))
+            }
+            _ => None,
         }
-        Some(AuthenticatedActor::signed(claims))
+    }
+
+    fn valid_identity_claims(&self, claims: &IdentityTokenClaims, now: u64) -> bool {
+        let Some(ttl) = claims.exp.checked_sub(claims.iat) else {
+            return false;
+        };
+        claims.version == 2
+            && claims.iss == self.issuer
+            && claims.aud == self.audience
+            && claims.account_id == self.account_id
+            && claims.cluster_id == self.cluster_id
+            && claims.cluster_incarnation == self.cluster_incarnation
+            && valid_id(&claims.sub)
+            && valid_id(&claims.jti)
+            && (60..=86_400).contains(&ttl)
+            && claims.exp > now
+            && claims.iat <= now.saturating_add(30)
+            && matches!(
+                (claims.principal_kind, claims.assurance),
+                (PrincipalKind::Human, DataAssurance::VerifiedHuman)
+                    | (PrincipalKind::Automation, DataAssurance::VerifiedWorkload)
+            )
     }
 
     fn valid_claims(&self, claims: &DataTokenClaims, now: u64) -> bool {

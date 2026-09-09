@@ -71,23 +71,49 @@ Servers do not hot-reload. Apply the new revision and restart every server that 
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
-The optional [offline data-token profile](../rfcs/0053-offline-data-token-verification.md)
+The optional [offline signed-token trust](../rfcs/0053-offline-data-token-verification.md)
 uses immutable public trust loaded before graph open. The Core's opt-in
 root-bound serving snapshot supplies the canonical storage root from the same
 resolution as the applied revision; the server checks that root against trust
 without reading a managed identity marker. The verifier resolves
-`principal:<sub>` and retains per-graph action ceilings. Graph selection checks the ceiling before registry
-lookup; the common authorization gate checks actions before Cedar, which must
-explicitly permit signed identities even when no static credentials exist.
-Static credential authority remains unchanged. Issuer reachability is outside
-the serving request path.
+`principal:<sub>` and retains a private, verified credential profile:
+
+- Version 1 keeps its existing per-graph action ceilings. Graph selection
+  checks the ceiling before registry lookup; the common authorization gate
+  checks actions before Cedar.
+- Version 2 authenticates a cluster-bound identity and rejects permission
+  fields. The same common gate requires applied Cedar policy for protected
+  operations, with no token-derived graph/action ceiling.
+
+Cedar must explicitly permit either signed profile even when no static
+credentials exist. Static credential authority remains unchanged. Issuer
+reachability is outside the serving request path. The profile boundary and
+applied-policy ownership are described in
+[RFC 0064](../rfcs/0064-identity-credentials-and-applied-policy.md).
+
+`GET /graphs/discovery` accepts only the verified identity profile and returns
+IDs and display names for the opened and quarantined graph inventory captured
+at boot. It neither scans storage nor discloses availability, paths, policy,
+schema, or query definitions. It needs no policy membership. The separate
+`GET /graphs` metadata response and its `graph_list` gate are unchanged;
+version 1 filtering remains an additional restriction. Typed discovery
+responses are additive to the existing public catalog types.
+
+The CLI's versioned keychain cache records the issuance profile and verifies
+its endpoint and identity bindings before replacement. A legacy issuance
+request cannot return an identity profile, and restricted caches are never
+silently upgraded. Only cached identity credentials select discovery
+automatically in a managed folder. Explicit server addressing keeps the
+existing catalog unless `graphs list --discovery` is requested; the CLI never
+infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
 CAS, and how many applied graphs it serves and does not; it answers 503 from
-the shutdown signal on. Graph ids stay on the authenticated `GET /graphs`,
-which also lists the quarantined ones. Graceful shutdown is bounded by one
-deadline (`--shutdown-grace-seconds`, default 25), kept by a thread and armed
+the shutdown signal on. Graph IDs stay on the authenticated catalog routes,
+which include quarantined graphs under their respective disclosure contracts.
+Graceful shutdown is bounded by one deadline (`--shutdown-grace-seconds`,
+default 25), kept by a thread and armed
 by a listener installed before graphs open, after which the process exits 2
 without claiming success.
 
@@ -115,6 +141,15 @@ state carries verified claims and graph selection. `DataTokenTrust::verify_at`
 returns the identity projection for existing callers;
 `verify_authenticated_at` returns the opaque authenticated result used by the
 server. Public actor construction cannot grant signed-token permissions.
+`DataTokenClaims` and `DataGrant` keep their version-1 shapes;
+`IdentityTokenClaims` is a separate strict type. Read-only claim accessors on
+`AuthenticatedActor` expose only the matching verified profile.
+
+Policy embedders must handle `PolicyAction::ConfigManage`,
+`PolicyResourceKind::Cluster`, and `PolicyEngineKind::Cluster`. These public
+enums are exhaustive, so an external exhaustive match must add the relevant
+arm when upgrading. Preserving existing constructors and direct storage-holder
+behavior does not remove that source compatibility requirement.
 
 In-process hosts that assemble `AppState` and call its existing
 `with_data_token_trust` method continue to own their graph/root binding. Use
