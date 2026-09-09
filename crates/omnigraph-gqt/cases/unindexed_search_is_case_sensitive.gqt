@@ -1,0 +1,103 @@
+# issue: none
+# notes: the same two titles live under `Indexed` (title @index) and `Doc` (no index). On the
+# notes: indexed type `search` lowercases the query and matches both rows for "deep" and "Deep";
+# notes: on the unindexed type the flat scan tokenizes both sides case-sensitively, so "deep"
+# notes: finds only the lowercase row and "Deep" only the capitalized one. Steps 3 and 4 state the
+# notes: indexed answer as the contract (RFC 0047 warning, RFC 0048 exact scan baseline).
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String
+}
+
+node Indexed {
+    slug: String @key
+    title: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d-upper","title":"Deep Learning"}}
+{"type":"Doc","data":{"slug":"d-lower","title":"deep dive"}}
+{"type":"Indexed","data":{"slug":"i-upper","title":"Deep Learning"}}
+{"type":"Indexed","data":{"slug":"i-lower","title":"deep dive"}}
+
+--- query
+query indexed_lowercase($q: String) {
+    match {
+        $d: Indexed
+        search($d.title, $q)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "deep"}
+
+--- expect ordered
+{"d.slug": "i-lower"}
+{"d.slug": "i-upper"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query indexed_capitalized($q: String) {
+    match {
+        $d: Indexed
+        search($d.title, $q)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "Deep"}
+
+--- expect ordered
+{"d.slug": "i-lower"}
+{"d.slug": "i-upper"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query unindexed_lowercase($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "deep"}
+
+--- expect ordered
+{"d.slug": "d-lower"}
+{"d.slug": "d-upper"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query unindexed_capitalized($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "Deep"}
+
+--- expect ordered
+{"d.slug": "d-lower"}
+{"d.slug": "d-upper"}
+
+--- expect shape
+d.slug: String

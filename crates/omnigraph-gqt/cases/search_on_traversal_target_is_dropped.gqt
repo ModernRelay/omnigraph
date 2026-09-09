@@ -1,0 +1,88 @@
+# issue: none
+# notes: A knows B, C and D; only B and D carry "needle". A `search` on the scan-rooted binding
+# notes: keeps B and D (step 1). The same predicate on the traversal target `$b` is hoisted off
+# notes: the pipeline and no scan owns `$b`, so C comes back too (step 2). A `bm25` ordering on
+# notes: `$b` is not dropped silently: the read fails with "search-ordered query produced rows
+# notes: without its 'b._score' ranking column" (step 3; D has the highest term frequency and
+# notes: must lead once the target is rankable). RFC 0047 T26 refuses both shapes at compile time;
+# notes: RFC 0048 ranks the traversal target. The contract stated here is the filtered and ranked
+# notes: answer.
+
+--- schema
+node Person {
+    name: String @key
+    bio: String @index
+}
+
+edge Knows: Person -> Person {
+}
+
+--- seed
+{"type":"Person","data":{"name":"A","bio":"hub"}}
+{"type":"Person","data":{"name":"B","bio":"needle here"}}
+{"type":"Person","data":{"name":"C","bio":"hay only"}}
+{"type":"Person","data":{"name":"D","bio":"needle needle"}}
+{"edge":"Knows","from":"A","to":"B","data":{}}
+{"edge":"Knows","from":"A","to":"C","data":{}}
+{"edge":"Knows","from":"A","to":"D","data":{}}
+
+--- query
+query scan_rooted($q: String) {
+    match {
+        $p: Person
+        search($p.bio, $q)
+    }
+    return { $p.name }
+    order { $p.name }
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"p.name": "B"}
+{"p.name": "D"}
+
+--- expect shape
+p.name: String
+
+--- query
+query traversal_target_filter($q: String) {
+    match {
+        $a: Person { name: "A" }
+        $a knows $b
+        search($b.bio, $q)
+    }
+    return { $b.name }
+    order { $b.name }
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"b.name": "B"}
+{"b.name": "D"}
+
+--- expect shape
+b.name: String
+
+--- query
+query traversal_target_rank($q: String) {
+    match {
+        $a: Person { name: "A" }
+        $a knows $b
+    }
+    return { $b.name }
+    order { bm25($b.bio, $q) }
+    limit 1
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"b.name": "D"}
+
+--- expect shape
+b.name: String

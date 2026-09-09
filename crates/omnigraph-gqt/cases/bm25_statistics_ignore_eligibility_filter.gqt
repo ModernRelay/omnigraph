@@ -1,0 +1,73 @@
+# issue: none
+# notes: `Doc` holds ten rows, four in group "e" (three "alpha", one "beta") and six "beta" rows in
+# notes: group "o"; `Four` holds only the four group-"e" rows. The query "alpha beta" filtered to
+# notes: group "e" ranks an alpha row first: the filter is a prefilter and BM25 statistics come from
+# notes: the whole field (alpha is rare in ten). The same four rows as their own type rank the beta
+# notes: row first (beta is rare in four). Same eligible rows, different winner; RFC 0048 chooses
+# notes: the field corpus, so this pins the current answer as the contract.
+
+--- schema
+node Doc {
+    slug: String @key
+    group: String
+    title: String @index
+}
+
+node Four {
+    slug: String @key
+    title: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"e1","group":"e","title":"alpha kiwi"}}
+{"type":"Doc","data":{"slug":"e2","group":"e","title":"alpha mango"}}
+{"type":"Doc","data":{"slug":"e3","group":"e","title":"alpha pear"}}
+{"type":"Doc","data":{"slug":"e4","group":"e","title":"beta plum"}}
+{"type":"Doc","data":{"slug":"o1","group":"o","title":"beta fig"}}
+{"type":"Doc","data":{"slug":"o2","group":"o","title":"beta lime"}}
+{"type":"Doc","data":{"slug":"o3","group":"o","title":"beta kale"}}
+{"type":"Doc","data":{"slug":"o4","group":"o","title":"beta yam"}}
+{"type":"Doc","data":{"slug":"o5","group":"o","title":"beta corn"}}
+{"type":"Doc","data":{"slug":"o6","group":"o","title":"beta bean"}}
+{"type":"Four","data":{"slug":"f1","title":"alpha kiwi"}}
+{"type":"Four","data":{"slug":"f2","title":"alpha mango"}}
+{"type":"Four","data":{"slug":"f3","title":"alpha pear"}}
+{"type":"Four","data":{"slug":"f4","title":"beta plum"}}
+
+--- query
+query filtered_in_ten($q: String) {
+    match {
+        $d: Doc { group: "e" }
+    }
+    return { $d.slug }
+    order { bm25($d.title, $q) }
+    limit 1
+}
+
+--- params
+{"q": "alpha beta"}
+
+--- expect ordered
+{"d.slug": "e1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query same_rows_as_four($q: String) {
+    match {
+        $f: Four
+    }
+    return { $f.slug }
+    order { bm25($f.title, $q) }
+    limit 1
+}
+
+--- params
+{"q": "alpha beta"}
+
+--- expect ordered
+{"f.slug": "f4"}
+
+--- expect shape
+f.slug: String

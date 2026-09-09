@@ -1,0 +1,96 @@
+# issue: none
+# notes: the index stores lowercased, stemmed terms ("Introduction" -> "introduct", "Deep" -> "deep").
+# notes: At zero edits the query is analyzed the same way, so "deep" and "Deep" both match the two
+# notes: Deep Learning rows (steps 3 and 4, controls). At a nonzero budget the query is tokenized
+# notes: bare and letter case spends edit budget: "introductio" is two edits from "introduct" and
+# notes: matches, "Introductio" is three and returns nothing (step 2). The contract stated here:
+# notes: the query goes through the field's analyzer at every budget (RFC 0048 analyzer parity).
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"intro","title":"Introduction to Deep Learning"}}
+{"type":"Doc","data":{"slug":"basics","title":"Deep Learning Basics"}}
+{"type":"Doc","data":{"slug":"guide","title":"A Guide to Graphs"}}
+
+--- query
+query lowercase_two_edits($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 2)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "introductio"}
+
+--- expect ordered
+{"d.slug": "intro"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query capitalized_two_edits($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 2)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "Introductio"}
+
+--- expect ordered
+{"d.slug": "intro"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query lowercase_zero_edits($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 0)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "deep"}
+
+--- expect ordered
+{"d.slug": "basics"}
+{"d.slug": "intro"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query capitalized_zero_edits($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 0)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "Deep"}
+
+--- expect ordered
+{"d.slug": "basics"}
+{"d.slug": "intro"}
+
+--- expect shape
+d.slug: String
