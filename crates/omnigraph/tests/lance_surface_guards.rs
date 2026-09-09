@@ -124,8 +124,8 @@ async fn lance_provider_scan_payloads_need_accounting_beyond_the_session_pool() 
 
     let directory = tempfile::tempdir().unwrap();
     let uri = directory.path().join("source.lance");
-    let dataset = fresh_dataset(uri.to_str().unwrap()).await;
-    let provider = Arc::new(LanceTableProvider::new(Arc::new(dataset), false, false));
+    let dataset = Arc::new(fresh_dataset(uri.to_str().unwrap()).await);
+    let provider = Arc::new(LanceTableProvider::new(Arc::clone(&dataset), false, false));
     let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1));
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::clone(&pool))
@@ -171,6 +171,84 @@ async fn lance_provider_scan_payloads_need_accounting_beyond_the_session_pool() 
     println!(
         "Lance scan retained {retained_bytes} bytes with zero reserved against a one-byte pool; aggregate refused"
     );
+
+    // Wide variable-length values exercise native adaptive batching; the
+    // original two tiny values decode into separate buffers at a one-row cap.
+    let mut wide = dataset.as_ref().clone();
+    let schema = Arc::new(Schema::from(wide.schema()));
+    let mut random = 606_u32;
+    let values: Vec<String> = (0..512)
+        .map(|i| {
+            let body: String = (0..128 + (i % 17) * 129)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    char::from(b'a' + (random % 26) as u8)
+                })
+                .collect();
+            format!("wide-{i}-{body}")
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(values)),
+            Arc::new(Int32Array::from_iter_values(0..512)),
+        ],
+    )
+    .unwrap();
+    wide.append(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Hold every batch so allocator address reuse cannot mimic shared native
+    // buffers. This is allocation evidence, not a peak-RSS measurement.
+    let mut scanner = wide.scan();
+    scanner.project(&["id"]).unwrap();
+    scanner.batch_size(256);
+    scanner.batch_size_bytes(65536);
+    let slices: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(slices.iter().map(RecordBatch::num_rows).sum::<usize>(), 514);
+    let strings: Vec<&StringArray> = slices
+        .iter()
+        .map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+        })
+        .collect();
+    let unique_buffers: HashSet<_> = strings
+        .iter()
+        .map(|array| array.values().data_ptr())
+        .collect();
+    assert!(
+        unique_buffers.len() < strings.len(),
+        "native output must actually share buffers"
+    );
+    let repeated_backing_bytes: usize = strings.iter().map(|array| array.values().len()).sum();
+    let logical_id_bytes: usize = strings
+        .iter()
+        .flat_map(|array| array.iter().flatten())
+        .map(str::len)
+        .sum();
+    assert!(repeated_backing_bytes > logical_id_bytes);
 }
 
 /// Append one uniquely keyed row while preserving the V2_2/stable-row-id shape

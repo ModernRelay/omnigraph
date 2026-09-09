@@ -1118,6 +1118,16 @@ the proposed identity contract and how unverifiable aliases are refused;
 neither an explicit provider/model label nor an inherited schema recipe is
 itself that proof. Default inheritance does not weaken this qualification.
 
+The existing CLI embedding/export owner now exercises a controlled provider
+counterexample. Identical requests with the same model label and graph snapshot
+return different query vectors and select different nodes. Schema/data export
+and reapplication preserve the label and stored vectors, but do not restore
+the original text-query answer. Explicit-vector controls remain consistent;
+a mismatched model label is rejected before another provider call. This
+qualifies the distinction between graph-snapshot coherence and resolved encoder
+identity. It does not claim that a particular public provider changes a model
+under a fixed label.
+
 Initial representations are scalar analyzed String fields and single dense
 vectors. Multiple fields can provide different views. Future sparse vectors,
 multivectors/late interaction, and named analyzed views need typed representation
@@ -1551,6 +1561,25 @@ account of all decoded input or retained output. This is a reservation-boundary
 probe, not a process-memory measurement or proof that transient decoding is
 bounded. The storage adapter must qualify scan/decode buffering and downstream
 ownership alongside operator, spill, fallback and output accounting.
+
+Cumulative processed input and live allocation size need separate units and
+limits. The same native guard now scans wide variable-length values with
+adaptive batching and proves that several output batches share decoded buffers.
+Summing each batch's `get_array_memory_size()` repeatedly charges that backing
+storage; it is neither unique live memory nor bytes of input processed.
+Reservations must follow retained allocations and their lifetimes, while input
+and work counters charge the logical values actually consumed. A smaller batch
+target cannot substitute for this ownership model. Graph relations, current
+scan batches, queued native work, analyzed state and output must all have an
+explicit accounting owner before the whole-query bound is qualified.
+
+Arrow 58.3's optional `Array::claim` and DataFusion 54's `ArrowMemoryPool`
+provide native shared-buffer tracking to evaluate. They do not supply hard
+admission by themselves: the adapter reserves infallibly, and claiming an
+Arrow buffer replaces its previous reservation. Qualification must cover
+over-limit refusal and buffers shared across query/cache owners before using
+that mechanism as the memory contract. Reuse substrate ownership where it
+fits; a process-wide pointer registry is not a substitute for those proofs.
 
 Preserve resource refusal as a typed outcome through native error wrappers
 and the engine/API boundary. A fair-share consumer may be refused while total
