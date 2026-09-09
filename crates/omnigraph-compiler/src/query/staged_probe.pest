@@ -1,0 +1,24 @@
+// RFC 0048 compiler experiment. Loaded only into the unit-test parser.
+// Reuse current tokens, graph patterns and scalar expressions; query_file
+// remains the production root and cannot reach any of these rules.
+probe_file = { SOI ~ probe_decl ~ EOI }
+probe_decl = { "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{" ~ probe_match ~ (probe_rank | probe_match)* ~ probe_return ~ probe_order? ~ limit_clause? ~ "}" }
+probe_match = { "match" ~ "{" ~ (probe_match_terms | clause)+ ~ "}" }
+probe_match_terms = { "match_terms" ~ "(" ~ expr ~ "," ~ probe_terms ~ ")" }
+probe_rank = { "rank" ~ variable ~ "{" ~ probe_source+ ~ "}" }
+probe_source = { (probe_lexical | probe_vector | probe_fusion) ~ "as" ~ ident }
+probe_lexical = { "lexical" ~ "(" ~ expr ~ "," ~ probe_terms ~ ("," ~ probe_option)* ~ ")" }
+probe_terms = { "terms" ~ "(" ~ expr ~ ("," ~ probe_option)* ~ ")" }
+probe_vector = { probe_vector_kind ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ probe_option)* ~ ")" }
+probe_vector_kind = { "knn" | "ann" }
+probe_fusion = { "rrf" ~ "(" ~ probe_arm ~ ("," ~ probe_arm)+ ~ ("," ~ probe_option)* ~ ")" }
+probe_arm = { "arm" ~ "(" ~ ident ~ ("," ~ probe_option)* ~ ")" }
+probe_option = { ident ~ ":" ~ expr }
+probe_return = { "return" ~ "{" ~ probe_projection+ ~ "}" }
+probe_projection = { probe_value ~ ("as" ~ ident)? ~ ","? }
+probe_order = { "order" ~ "{" ~ probe_ordering ~ ("," ~ probe_ordering)* ~ "}" }
+probe_ordering = { probe_value ~ order_dir? }
+probe_value = { probe_metric | probe_identity | probe_aggregate | expr }
+probe_metric = { "metric" ~ "(" ~ ident ~ "," ~ ident ~ ")" }
+probe_identity = { variable ~ ".@id" }
+probe_aggregate = { agg_func ~ "(" ~ probe_value ~ ")" }

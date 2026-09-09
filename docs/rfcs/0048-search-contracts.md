@@ -376,7 +376,8 @@ The current grammar has one `match`, followed by `return`, optional `order`,
 and optional `limit`. The proposed extension admits explicit rank boundaries
 between graph blocks. Each `match` retains graph-pattern semantics. Stage
 aliases are scoped plan names, not ordinary variables that hold relations.
-The following is a grammar sketch requiring parser/typechecker prototypes:
+The following proposed syntax is exercised by the test-only compiler
+prototype described below. The production parser still rejects rank stages:
 
 ```gq
 query find_organizations($q: String)
@@ -397,16 +398,31 @@ query find_organizations($q: String)
     metric(combined, score) as score,
     metric(words, rank) as lexical_rank
   }
-  order { score desc, $o.id asc }
+  order { score desc, $o.@id asc }
   limit 8
 }
 ```
 
 This sketch selects distinct `$o` identities. The source declarations read
 the rank block's incoming eligible population; a fusion declaration reads its
-named preceding inputs. The final declaration is the block's output. The
-plan is acyclic; duplicate aliases and forward references are errors. Exact
-alias/metric spelling must coordinate with RFC 0040. These names do not imply
+named preceding inputs **within the same rank block**. The final declaration
+is the block's output. Source aliases are unique across the query; duplicate
+aliases, duplicate arm references, and forward references are errors.
+Referencing an earlier block's arm in a new fusion is rejected: that arm's
+population precedes any intervening graph filter, and reusing its candidates
+could restore targets the filter removed. Cross-block candidate reuse needs
+an explicit bounded intersection/remapping contract; a common target type
+alone does not establish population compatibility.
+
+`arm(name)` resolves a current-block source, while `metric(name, field)` can
+read an earlier source's metric with its original target and population.
+Neither resolves a result alias. A bare name in final `order` resolves a
+projected result alias; `$name` remains a graph binding or query parameter.
+A result alias and a source alias may share a spelling because these syntactic
+positions distinguish them. Aliasing a metric must preserve its domain and
+source-instance identity, not just its underlying numeric type.
+`$o.@id` follows RFC 0040's system-field namespace; query-specific scores are
+not node properties or new system fields. These constructors do not imply
 arbitrary function calls, closures, or relation-valued transport parameters.
 
 Here, `candidates: 100` bounds each source, `candidates: 20` bounds fusion,
@@ -429,9 +445,10 @@ order { final output keys }
 limit final row count
 ```
 
-All rank-block inputs and targets must already be bound. Searching a
-traversal-introduced target is supported through its graph-defined eligible
-population; making it the first textual declaration is not required. A filter
+All rank-block inputs and targets must already be bound. The target must be a
+named node or edge binding; anonymous `$_` cannot name a reusable rank target.
+Searching a traversal-introduced target is supported through its graph-defined
+eligible population; making it the first textual declaration is not required. A filter
 in the second graph block filters the selected organizations or expanded rows;
 it does not retroactively change the first search population. Policy applies
 before selection and at every source read and expansion.
@@ -669,10 +686,15 @@ Fusion assigns new ranks after sorting by fused score and stable identity.
 Ranks are established before traversal fan-out, never by first-seen row order.
 
 After expansion, inherited metrics remain attached to the binding that was
-ranked. A second ranking has separate metrics. Aggregation cannot silently
-pick an inherited score when several origins collapse into a group. The query
-must request a supported explicit reduction or omit that metric; bare
-aggregate ordering by a discarded rank is rejected.
+ranked. A second ranking has separate metrics. Aggregation follows existing
+return semantics: non-aggregate projected values become grouping keys. A
+metric explicitly projected beside `count` is therefore a grouping key, not
+an arbitrarily chosen representative score. To obtain one score per otherwise
+defined group, request a supported explicit reduction, such as
+`min(metric(hits, rank))`, or omit the metric. The group has a new result
+identity; it does not inherit source membership or a constituent's active
+rank. Ordering by a discarded source metric is rejected. Ordering by a
+projected grouping key or explicit reduction remains valid.
 
 Without a final `order`, ranked output follows the latest ranking stage's
 order. Row-preserving filters and projection retain it; expansion orders
@@ -1448,6 +1470,26 @@ where needed for a logical case; keep native index lifecycle, arithmetic near
 ties, and execution-cost assertions in their existing Rust owners. Compiler
 goldens and API/CLI contract tests still cover boundaries GQT does not invoke.
 
+The test-only [staged compiler prototype](../../crates/omnigraph-compiler/src/query/staged_probe.rs)
+adds a separate Pest root using the existing grammar's tokens, graph patterns,
+and scalar expressions. The extra grammar and checker are compiled only for
+compiler unit tests; the production query root remains unchanged. Typed AST
+prefixes reuse the real graph typechecker to validate bindings at each stage,
+while the experimental plan retains the separate stages and incoming
+population references. It exercises the GQ examples in this RFC, multi-stage
+node and edge targets, non-leaking negation scopes, alias namespaces, metric
+domains/origins, aggregate output identity, final order/window separation,
+and rejection cases for inputs, bounds and references.
+
+This is partial compiler evidence, not completed staged AST/IR or execution.
+It does not qualify per-group syntax, complete result-shape/nullability
+inference, resolved analyzer/encoding identities, runtime parameter admission,
+resource bounds, or graph/Lance lowering. Its aggregate-order prototype uses
+explicit projected aliases; the final compiler must also preserve valid
+ordinary grouping-key expressions. Migrate or remove the experiment when the
+production compiler owns these constructs; do not maintain a second compiler
+or claim these fixtures replace executable `.gqt` cases.
+
 Default resolution requires its own compiler/schema and query fixtures:
 
 - Bare `@analyzed` and its explicit expansion resolve to the same field
@@ -1693,11 +1735,12 @@ release. Each extension retains its stated semantic and qualification boundary.
 
 ## Unresolved questions
 
-1. Final clause and stage/metric spelling, symbol scope, admitted per-group
-   key types and tuple ordering, and any user-defined selection tie keys.
+1. Complete grammar/typechecker/lowering qualification for the stated stage
+   and metric scopes, per-group clause spelling, admitted key types and tuple
+   ordering, and any user-defined selection tie keys. The partial compiler
+   prototype does not close the full result-schema and aggregation contract.
    Null-bucket and multiple-membership semantics are specified above; prove
-   their lowering with parser/typechecker prototypes and RFC 0040 namespace
-   coordination.
+   their lowering and retain RFC 0040 namespace coordination.
 2. Qualification of the specified BM25 policy: the pinned numeric kernel across
    supported targets, exact live-row statistics, polymorphic field-corpus
    resolution, and native/fallback score and winner parity. Validate its edit
