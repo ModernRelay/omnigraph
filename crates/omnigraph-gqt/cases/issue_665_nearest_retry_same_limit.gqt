@@ -22,7 +22,7 @@ edge Knows: Doc -> Doc {
 --- seed
 {"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d001","to":"d000","data":{"id":"e001"}}
+{"edge":"Knows","id":"e001","from":"d001","to":"d000","data":{}}
 
 --- query
 query nearest_with_edge($q: Vector(4)) {

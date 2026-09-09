@@ -2189,9 +2189,9 @@ impl TableStore {
     }
 
     /// Indexed neighbor lookup for graph traversal. Given an edge dataset and a
-    /// set of endpoint keys on `key_col` (`"src"` for out-traversal, `"dst"` for
-    /// in-traversal), return the matching edge rows projected to
-    /// `[key_col, opposite_col]`.
+    /// set of endpoint keys on `key_col` (the graph's `src` spelling for
+    /// out-traversal, its `dst` spelling for in-traversal), return the matching
+    /// edge rows projected to `[key_col, opposite_col]`.
     ///
     /// The `key_col IN (keys)` predicate is built as a structured DataFusion
     /// `Expr` and applied via `Scanner::filter_expr`, so Lance routes it through
@@ -2212,9 +2212,8 @@ impl TableStore {
         Self::scan_edges_by_endpoint_projected(ds, key_col, opposite_col, &[], keys).await
     }
 
-    /// `scan_edges_by_endpoint` with extra projected columns beyond the two
-    /// endpoints. Consumed by the bound-edge expand, which carries the edge's
-    /// physical id and declared property columns alongside each matched row.
+    /// Scan matching edges with endpoints and extra projected columns.
+    /// Bound-edge expansion requests identity and declared properties as extras.
     pub async fn scan_edges_by_endpoint_projected(
         ds: &Dataset,
         key_col: &str,
@@ -2230,7 +2229,12 @@ impl TableStore {
         let mut projection: Vec<&str> = Vec::with_capacity(2 + extra_cols.len());
         projection.push(key_col);
         projection.push(opposite_col);
-        projection.extend_from_slice(extra_cols);
+        projection.extend(
+            extra_cols
+                .iter()
+                .copied()
+                .filter(|extra| *extra != key_col && *extra != opposite_col),
+        );
         let key_list: Vec<datafusion::prelude::Expr> =
             keys.iter().map(|k| lit(k.clone())).collect();
         let filter_expr = col(key_col).in_list(key_list, false);
@@ -6089,17 +6093,9 @@ fn staged_keyed_merge_result(
     ))
 }
 
-/// Precondition guard for `stage_merge_insert`.
-/// Both opt into `SourceDedupeBehavior::FirstSeen` to suppress the Lance
-/// `processed_row_ids` bug (MR-957). FirstSeen would *also* silently
-/// collapse genuine duplicate source keys; this check restores fail-fast
-/// behavior on real dups by erroring before the builder gets a chance to
-/// silently skip them.
-///
-/// Today only single-column string keys are used at the call sites
-/// (`vec!["id".to_string()]`). The check restricts itself to that shape
-/// and surfaces an internal error if a future caller passes anything
-/// else — keeping the assumption explicit instead of silently degrading.
+/// Precondition guard for `stage_merge_insert`, whose `FirstSeen` dedupe (Lance
+/// `processed_row_ids` bug MR-957) would also silently collapse genuine
+/// duplicate source keys. Single-column string keys only; anything else errors.
 // Staged-write helper retained alongside the sealed storage surface; no
 #[allow(dead_code)]
 fn check_batch_unique_by_keys(

@@ -885,7 +885,7 @@ mod shape_section {
 
     fn person_struct() -> (Field, ArrayRef) {
         let fields = Fields::from(vec![
-            Field::new("id", DataType::Utf8, false),
+            Field::new("@id", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("age", DataType::Int32, true),
         ]);
@@ -1445,7 +1445,7 @@ const TRAVERSAL_SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  
                                 edge Knows: Person -> Person {\n    since: I64\n}\n";
 const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
                               {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
-                              {\"edge\":\"Knows\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"id\":\"k-1\",\"since\":2020}}\n";
+                              {\"edge\":\"Knows\",\"id\":\"k-1\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"since\":2020}}\n";
 const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person\n        \
                                $a.name = $n\n        $a knows $b\n    }\n    return { $b.name }\n}\n";
 const TRAVERSAL_PARAMS: &str = "--- params\n{\"n\": \"alice\"}\n";

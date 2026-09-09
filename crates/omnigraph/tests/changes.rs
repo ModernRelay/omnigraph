@@ -1882,7 +1882,7 @@ edge Refs: Note -> Note {
             "\n",
             r#"{"type":"Note","data":{"slug":"note-c","body":"same"}}"#,
             "\n",
-            r#"{"edge":"Refs","from":"note-a","to":"note-b","data":{"__id":"ref-1","label":"old"}}"#,
+            r#"{"edge":"Refs","id":"ref-1","from":"note-a","to":"note-b","data":{"label":"old"}}"#,
         ),
         LoadMode::Merge,
     )
@@ -1899,7 +1899,7 @@ edge Refs: Note -> Note {
                 "\n",
                 r#"{"type":"Note","data":{"slug":"note-c","body":"same"}}"#,
                 "\n",
-                r#"{"edge":"Refs","from":"note-a","to":"note-b","data":{"__id":"ref-1","label":"new"}}"#,
+                r#"{"edge":"Refs","id":"ref-1","from":"note-a","to":"note-b","data":{"label":"new"}}"#,
             ),
             LoadMode::Merge,
         )

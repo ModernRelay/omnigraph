@@ -278,7 +278,7 @@ payload: Blob
 node Document { name: String }
 edge Attaches: Document -> Document {
 payload: Blob?
-@unique(src, payload)
+@unique(@src, payload)
 }
 "#,
             "Attaches.payload",
@@ -601,10 +601,48 @@ edge Knows: Person -> Person
 
 #[test]
 fn test_parse_edge_unique_src_dst() {
+    for constraint in [
+        "@key(@id)",
+        "@unique(@id)",
+        "@index(@id)",
+        "@range(@id, 0..1)",
+        "@check(@id, \"x\")",
+    ] {
+        let error = parse_schema(&format!("node N {{ n: String {constraint} }}")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot reference '@id'; the identity is already the row key"),
+            "{error}"
+        );
+    }
+    for (constraint, expected) in [
+        (
+            "@unique(__src, @dst)",
+            "storage column '__src'; the system field is '@src'",
+        ),
+        (
+            "@key(__src, @dst)",
+            "storage column '__src'; the system field is '@src'",
+        ),
+        (
+            "@index(@src, __dst)",
+            "storage column '__dst'; the system field is '@dst'",
+        ),
+    ] {
+        let source = format!("node N {{ n: String }} edge E: N -> N {{ {constraint} }}");
+        let error = parse_schema(&source).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    parse_schema_for_vintage(
+        "node N { __src: String @unique(__src) }",
+        SYSTEM_COLUMNS_LEGACY,
+    )
+    .unwrap();
     let input = r#"
 node Person { name: String }
 edge Knows: Person -> Person {
-@unique(src, dst)
+@unique(@src, @dst)
 }
 "#;
     let schema = parse_schema(input).unwrap();
@@ -613,7 +651,7 @@ edge Knows: Person -> Person {
             assert!(
                 e.constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Unique(v) if v == &["src", "dst"]))
+                    .any(|c| matches!(c, Constraint::Unique(v) if v == &["@src", "@dst"]))
             );
         }
         _ => panic!("expected Edge"),
@@ -1214,7 +1252,6 @@ fn test_admission_reserves_leading_underscore_property_names() {
         }
     }
 
-    // Freed by RFC 0040: the legacy system spellings are ordinary names.
     parse_schema("node N { id: String @key src: String dst: String }")
         .expect("'id'/'src'/'dst' are ordinary user property names on admission");
 }
@@ -1315,7 +1352,7 @@ fn test_parse_edge_body_constraint_key() {
 node Person { name: String }
 edge Knows: Person -> Person {
 since: Date
-@key(src, dst, since)
+@key(@src, @dst, since)
 }
 "#;
     let schema = parse_schema(input).unwrap();
@@ -1324,7 +1361,7 @@ since: Date
             assert!(
                 e.constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Key(v) if v == &["src", "dst", "since"]))
+                    .any(|c| matches!(c, Constraint::Key(v) if v == &["@src", "@dst", "since"]))
             );
         }
         _ => panic!("expected Edge"),
@@ -1336,7 +1373,7 @@ fn test_parse_edge_key_endpoints_only() {
     let input = r#"
 node Person { name: String }
 edge Knows: Person -> Person {
-@key(src, dst)
+@key(@src, @dst)
 }
 "#;
     let schema = parse_schema(input).unwrap();
@@ -1345,7 +1382,7 @@ edge Knows: Person -> Person {
             assert!(
                 e.constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Key(v) if v == &["src", "dst"]))
+                    .any(|c| matches!(c, Constraint::Key(v) if v == &["@src", "@dst"]))
             );
         }
         _ => panic!("expected Edge"),
@@ -1357,18 +1394,28 @@ fn test_reject_edge_key_missing_endpoint() {
     let cases = [
         (
             "missing dst",
-            "@key(src)",
-            "@key on edge Knows must include both endpoints (missing 'dst')",
+            "@key(@src)",
+            "@key on edge Knows must include both endpoints (missing '@dst')",
         ),
         (
             "missing src",
-            "@key(dst)",
-            "@key on edge Knows must include both endpoints (missing 'src')",
+            "@key(@dst)",
+            "@key on edge Knows must include both endpoints (missing '@src')",
         ),
         (
             "missing both",
             "@key(since)",
-            "@key on edge Knows must include both endpoints (missing 'src')",
+            "@key on edge Knows must include both endpoints (missing '@src')",
+        ),
+        (
+            "user src is not an endpoint",
+            "src: String\n@key(src, @dst)",
+            "@key on edge Knows must include both endpoints (missing '@src')",
+        ),
+        (
+            "user dst is not an endpoint",
+            "dst: String\n@key(@src, dst)",
+            "@key on edge Knows must include both endpoints (missing '@dst')",
         ),
     ];
     for (case, constraint, expected) in cases {
@@ -1390,8 +1437,8 @@ fn test_reject_multiple_edge_keys() {
 node Person { name: String }
 edge Knows: Person -> Person {
 since: Date
-@key(src, dst)
-@key(src, dst, since)
+@key(@src, @dst)
+@key(@src, @dst, since)
 }
 "#;
     let error = parse_schema_diagnostic(input).expect_err("two @key groups");
@@ -1446,7 +1493,7 @@ since: Date @key
 
 #[test]
 fn test_reject_reserved_logical_property_names() {
-    for name in ["id", "src", "dst", "from", "to"] {
+    for name in ["from", "to"] {
         let input = format!(
             "node Person {{ name: String }}\nedge Knows: Person -> Person {{\n{name}: String\n}}\n"
         );
@@ -1469,7 +1516,7 @@ fn test_reject_repeated_key_column() {
 node Person { name: String }
 edge Knows: Person -> Person {
 since: Date
-@key(src, dst, since, since)
+@key(@src, @dst, since, since)
 }
 "#;
     let error = parse_schema_diagnostic(edge).expect_err("repeated edge member");
@@ -1496,31 +1543,31 @@ fn test_reject_edge_key_column_rules() {
         (
             "nullable member",
             "since: Date?",
-            "@key(src, dst, since)",
+            "@key(@src, @dst, since)",
             "@key property Knows.since cannot be nullable",
         ),
         (
             "list member",
             "tags: [String]",
-            "@key(src, dst, tags)",
+            "@key(@src, @dst, tags)",
             "@key is not supported on list property Knows.tags",
         ),
         (
             "vector member",
             "embedding: Vector(3)",
-            "@key(src, dst, embedding)",
+            "@key(@src, @dst, embedding)",
             "@key is not supported on vector property Knows.embedding",
         ),
         (
             "blob member",
             "payload: Blob",
-            "@key(src, dst, payload)",
+            "@key(@src, @dst, payload)",
             "@key is not supported on blob property Knows.payload",
         ),
         (
             "unknown member",
             "since: Date",
-            "@key(src, dst, weight)",
+            "@key(@src, @dst, weight)",
             "@key on Knows references unknown property 'weight'",
         ),
     ];

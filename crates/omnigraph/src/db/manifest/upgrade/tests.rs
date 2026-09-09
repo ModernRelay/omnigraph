@@ -5,9 +5,10 @@ use super::*;
 use crate::db::Omnigraph;
 
 async fn synthetic_v6_fixture(root: &str) {
-    let db = Omnigraph::init(root, "node Person { name: String }")
-        .await
-        .unwrap();
+    let db =
+        Omnigraph::init_with_legacy_system_columns_for_tests(root, "node Person { name: String }")
+            .await
+            .unwrap();
     db.mutate(
         "main",
         "query seed($name: String) { insert Person { name: $name } }",
@@ -775,9 +776,12 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         drop(
-            Omnigraph::init(root, "node Person { name: String }")
-                .await
-                .unwrap(),
+            Omnigraph::init_with_legacy_system_columns_for_tests(
+                root,
+                "node Person { name: String }",
+            )
+            .await
+            .unwrap(),
         );
         let mut dataset = open(root, None).await.unwrap();
         dataset
@@ -838,9 +842,10 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     let _scenario = crate::failpoints::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(root, "node Person { name: String }")
-        .await
-        .unwrap();
+    let db =
+        Omnigraph::init_with_legacy_system_columns_for_tests(root, "node Person { name: String }")
+            .await
+            .unwrap();
     db.branch_create("parent").await.unwrap();
     db.branch_create_from(crate::db::ReadTarget::branch("parent"), "child")
         .await
@@ -902,6 +907,54 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     .unwrap();
     assert_eq!(result.outcome, UpgradeOutcome::CheckFailed, "{result:?}");
     assert_eq!(stored_files(dir.path()), before);
+}
+
+/// A graph born at the current vintage (v9, RFC 0040 spellings) sits above the
+/// default route target: the default request is already current and
+/// effect-free, while an explicit lower or unreachable target is refused
+/// without effects.
+#[tokio::test]
+async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::failpoints::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    drop(
+        Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap(),
+    );
+    let before = stored_files(dir.path());
+    for check in [true, false] {
+        let result = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check,
+                to_format: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, UpgradeOutcome::AlreadyCurrent, "{result:?}");
+        assert_eq!(
+            result.observed_format,
+            Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
+        );
+        assert_eq!(stored_files(dir.path()), before);
+        for to_format in [8, 9] {
+            let refused = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check,
+                    to_format: Some(to_format),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused.outcome, UpgradeOutcome::CheckFailed, "{refused:?}");
+            assert_eq!(stored_files(dir.path()), before);
+        }
+    }
 }
 
 #[tokio::test]

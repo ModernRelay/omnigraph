@@ -375,12 +375,20 @@ async fn run_step(
         });
         return Ok(());
     }
-    if pending.is_none() && read_stamp(&main) == Some(step_target) {
-        if step_target == 8 {
+    let stamp = read_stamp(&main);
+    let served_above_default_target = report.target_defaulted
+        && stamp.is_some_and(|stamp| {
+            stamp > step_target && stamp <= super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+        });
+    if pending.is_none()
+        && let Some(expected) = stamp
+        && (expected == step_target || served_above_default_target)
+    {
+        if expected >= 8 {
             super::migrations::guard_stamp(&main)?;
         }
         read_manifest_state(&main).await?;
-        let branches = if step_target == 8 {
+        let branches = if expected >= 8 {
             crate::branch_control::list_live_manifest_branch_contents(&main).await?
         } else {
             legacy_branch_contents(&main).await?
@@ -404,7 +412,7 @@ async fn run_step(
                 .checkout_branch(native)
                 .await
                 .map_err(OmniError::storage)?;
-            if read_stamp(&branch) != Some(step_target)
+            if read_stamp(&branch) != Some(expected)
                 || branch.schema().metadata.contains_key(UPGRADE_PENDING_KEY)
             {
                 return Err(invalid(

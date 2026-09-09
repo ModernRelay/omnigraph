@@ -52,7 +52,7 @@ node Person {
 }
 
 edge Knows: Person -> Person {
-    @unique(__src, __dst)
+    @unique(@src, @dst)
 }
 "#;
 
@@ -3341,10 +3341,9 @@ async fn branch_merge_reports_unique_violation_conflict() {
     }
 }
 
-/// Regression for the MR-983 follow-up: the branch-merge path must enforce an
-/// edge composite `@unique(__src, __dst)` as a true composite key, consistent with
-/// the intake path. Two branches inserting the *same* (__src, __dst) pair must
-/// conflict on merge.
+/// Regression for the MR-983 follow-up: branch merge must enforce an edge
+/// composite `@unique(@src, @dst)` as a true composite key, like intake, so two
+/// branches inserting the same `(__src, __dst)` pair conflict on merge.
 #[tokio::test]
 async fn branch_merge_reports_composite_unique_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
@@ -3387,7 +3386,7 @@ async fn branch_merge_reports_composite_unique_violation_conflict() {
 
 /// Sibling to the above: pairs sharing `__src` but differing on `__dst` are unique
 /// on the (__src, __dst) tuple and must merge cleanly. Guards against the composite
-/// degrading back into a single-field `@unique(__src)` on the merge path.
+/// degrading back into a single-field `@unique(@src)` on the merge path.
 #[tokio::test]
 async fn branch_merge_allows_distinct_composite_unique_pairs() {
     let dir = tempfile::tempdir().unwrap();
@@ -4125,7 +4124,6 @@ async fn edge_tables_have_id_btree_after_ensure_indices() {
     let indices = ds.load_indices().await.unwrap();
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
 
-    // Should have BTree on __id, __src, __dst = 3 indices
     let index_names: Vec<_> = user_indices.iter().map(|idx| idx.fields.clone()).collect();
     assert!(
         user_indices.len() >= 3,
@@ -4219,7 +4217,7 @@ node Person {
 
 edge Knows: Person -> Person {
     since: String?
-    @key(src, dst)
+    @key(@src, @dst)
 }
 "#;
 
@@ -4271,10 +4269,9 @@ query friend_edges() {
 }
 "#;
 
-/// Issue #583's repro with `@key(src, dst)` declared: the same keyed edge
-/// inserted on both sides of a fork derives the same id, so the merge
-/// converges with no conflict and both the plain and the bound-edge
-/// traversal return 4 rows.
+/// Issue #583's repro with `@key(@src, @dst)` declared: the same keyed edge on
+/// both sides of a fork derives the same id, so the merge converges with no
+/// conflict and the plain and bound-edge traversals both return 4 rows.
 #[tokio::test]
 async fn branch_merge_converges_born_on_both_keyed_edge() {
     let dir = tempfile::tempdir().unwrap();

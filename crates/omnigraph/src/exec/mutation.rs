@@ -393,10 +393,18 @@ fn predicate_to_sql(
 ) -> Result<String> {
     let column = if is_edge {
         match predicate.property.as_str() {
-            "from" => system_columns.src.to_string(),
-            "to" => system_columns.dst.to_string(),
+            "from" | "@src" => system_columns.src.to_string(),
+            "to" | "@dst" => system_columns.dst.to_string(),
+            "@id" => system_columns.id.to_string(),
             other => other.to_string(),
         }
+    } else if predicate.property == "@id" {
+        system_columns.id.to_string()
+    } else if predicate.property.starts_with('@') {
+        return Err(OmniError::manifest(format!(
+            "unsupported node meta-field '{}' in mutation predicate",
+            predicate.property
+        )));
     } else {
         predicate.property.clone()
     };
@@ -1238,17 +1246,16 @@ impl Omnigraph {
             let schema = edge_type.arrow_schema.clone();
             let blob_props = edge_type.blob_properties.clone();
             let id = if let Some(key_columns) = edge_type.key.as_ref() {
+                let system_columns = catalog.system_columns;
                 let mut typed_keys = Vec::with_capacity(key_columns.len());
                 for key_col in key_columns {
-                    // Endpoint key columns arrive under the insert's from/to
-                    // parameters, aliased to src/dst by build_insert_batch.
-                    let assignment = match key_col.as_str() {
-                        "src" => "from",
-                        "dst" => "to",
-                        other => other,
+                    let (assignment, is_endpoint) = match key_col.as_str() {
+                        column if column == system_columns.src => ("from", true),
+                        column if column == system_columns.dst => ("to", true),
+                        other => (other, false),
                     };
                     let key_literal = resolved.get(assignment).ok_or_else(|| {
-                        if key_col == "src" || key_col == "dst" {
+                        if is_endpoint {
                             OmniError::manifest(format!(
                                 "missing required edge endpoint '{}'",
                                 assignment

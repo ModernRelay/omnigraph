@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::sync::mpsc;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use assert_cmd::Command;
 use reqwest::blocking::Client;
 use serde_json::Value;
-use tempfile::{TempDir, tempdir};
+use tempfile::{NamedTempFile, TempDir, tempdir};
 
 /// Hermetic default: point OMNIGRAPH_HOME at a path that exists on no
 /// machine, so spawned binaries never read the developer's real
@@ -203,6 +203,15 @@ policy: {{}}
 pub struct TestServer {
     child: Child,
     pub base_url: String,
+    stderr_log: NamedTempFile,
+}
+
+impl TestServer {
+    /// Everything the server wrote to stderr so far; the diagnostic of a
+    /// request that died mid-stream lives here, not in the client's error.
+    pub fn stderr(&self) -> String {
+        read_stderr(&self.stderr_log)
+    }
 }
 
 impl Drop for TestServer {
@@ -212,13 +221,17 @@ impl Drop for TestServer {
     }
 }
 
+fn read_stderr(stderr_log: &NamedTempFile) -> String {
+    fs::read_to_string(stderr_log.path()).expect("read server stderr log")
+}
+
 fn spawn_server_process(mut command: StdCommand) -> TestServer {
-    let mut stderr_log = tempfile::tempfile().unwrap();
+    let stderr_log = NamedTempFile::new().unwrap();
     let mut child = command
         .arg("--bind")
         .arg("127.0.0.1:0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_log.try_clone().unwrap()))
+        .stderr(Stdio::from(stderr_log.reopen().unwrap()))
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().expect("server stdout must be piped");
@@ -256,6 +269,7 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
             return TestServer {
                 child,
                 base_url: base_url.clone(),
+                stderr_log,
             };
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -270,9 +284,7 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let mut stderr = String::new();
-    let _ = stderr_log.seek(SeekFrom::Start(0));
-    let _ = stderr_log.read_to_string(&mut stderr);
+    let stderr = read_stderr(&stderr_log);
     match early_exit {
         Some(status) => {
             panic!("server exited before becoming healthy ({status}); stderr:\n{stderr}")
@@ -913,7 +925,7 @@ pub const BLOB_CLI_DATA: &str = r#"{"type":"Document","data":{"title":"readme","
 {"type":"Document","data":{"title":"empty","content":"base64:","note":"valid empty"}}
 {"type":"Document","data":{"title":"null","note":"null"}}
 {"type":"Document","data":{"title":"peer","note":"edge target"}}
-{"edge":"Attachment","from":"readme","to":"peer","data":{"__id":"attachment-1","payload":"base64:RWRnZQD/"}}"#;
+{"edge":"Attachment","id":"attachment-1","from":"readme","to":"peer","data":{"payload":"base64:RWRnZQD/"}}"#;
 
 pub const BLOB_NODE_BYTES: &[u8] = &[0, 1, 2, 3, 4, 255];
 pub const BLOB_EDGE_BYTES: &[u8] = b"Edge\0\xff";

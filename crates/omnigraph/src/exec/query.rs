@@ -3250,15 +3250,24 @@ async fn execute_expand_dispatch(
     .await
 }
 
-/// Single-hop expand with a bound edge variable (`$p $w:knows $f`). Differs
-/// from the unbound paths in two contracted ways: output cardinality is one
-/// row per matching edge ROW (parallel edges between the same endpoints stay
-/// distinct, because each carries its own properties), and the edge's declared
-/// property columns ride into the wide batch under the binding's prefix
-/// (`w.since`), where the ordinary filter/projection machinery consumes them.
-/// The physical edge `id` rides along as a hidden `w.id` column so ordering can
-/// totally order parallel edge rows; typecheck keeps it out of user expressions.
-/// Typecheck (T23) guarantees single-hop.
+/// An edge type's property columns that a filtered scan may project, sorted for
+/// determinism. Blobs are excluded: Lance rejects blob projection in a filtered
+/// scan (node scans carry the same guard) and typecheck rejects the access.
+fn projectable_edge_property_columns(
+    edge_def: &omnigraph_compiler::catalog::EdgeType,
+) -> Vec<&str> {
+    let mut cols: Vec<&str> = edge_def
+        .properties
+        .keys()
+        .map(String::as_str)
+        .filter(|c| !edge_def.blob_properties.contains(*c))
+        .collect();
+    cols.sort_unstable();
+    cols
+}
+
+/// Expand one row per matched edge with its identity, endpoints, and properties.
+/// Physical columns use the binding prefix; meta-fields address their roles.
 #[allow(clippy::too_many_arguments)]
 async fn execute_expand_bound(
     wide: &mut RecordBatch,
@@ -3289,19 +3298,11 @@ async fn execute_expand_bound(
         .edge_types
         .get(edge_type)
         .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
-    // Sorted for determinism. Blobs excluded: Lance rejects blob projection
-    // in a filtered scan (node scans carry the same guard); typecheck rejects
-    // the access. Physical `id` is always projected as hidden row identity,
-    // including for property-less edges.
-    let mut prop_cols: Vec<&str> = edge_def
-        .properties
-        .keys()
-        .map(String::as_str)
-        .filter(|c| !edge_def.blob_properties.contains(*c))
-        .collect();
-    prop_cols.sort_unstable();
-    let mut attach_cols: Vec<&str> = Vec::with_capacity(1 + prop_cols.len());
+    let prop_cols = projectable_edge_property_columns(edge_def);
+    let mut attach_cols: Vec<&str> = Vec::with_capacity(3 + prop_cols.len());
     attach_cols.push(catalog.system_columns.id);
+    attach_cols.push(catalog.system_columns.src);
+    attach_cols.push(catalog.system_columns.dst);
     attach_cols.extend(prop_cols.iter().copied());
     let attach_fields: Vec<Field> = attach_cols
         .iter()
@@ -3414,7 +3415,7 @@ async fn execute_expand_bound(
         edge_rows.push((batch_idx, edge_row));
     }
 
-    // Pair-parallel batch of physical id + declared non-blob properties. Even
+    // Pair-parallel batch of identity, endpoints, and non-blob properties. Even
     // when there are zero matches, attach a typed zero-row batch: later filter,
     // projection, and ordering must still see the bound edge's schema.
     let edge_attach = if scanned.is_empty() {
@@ -4357,7 +4358,7 @@ async fn execute_node_scan(
                 .iter()
                 .copied()
                 .filter(|name| {
-                    *name == "id"
+                    *name == catalog.system_columns.id
                         || node_type
                             .key
                             .as_ref()
@@ -6190,6 +6191,7 @@ mod needed_columns_tests {
 #[cfg(test)]
 mod column_projection_tests {
     use super::*;
+    use omnigraph_compiler::SYSTEM_COLUMNS_V3;
 
     use crate::db::ReadTarget;
     use crate::loader::{LoadMode, load_jsonl};
@@ -6338,7 +6340,7 @@ query first_slug() {
 
         let query = read_bytes(uri, Read::Query("list_slugs", ROWS)).await;
         let limited = read_bytes(uri, Read::Query("first_slug", 1)).await;
-        let pruned = read_bytes(uri, Read::LanceProjected(&["id", "slug"])).await;
+        let pruned = read_bytes(uri, Read::LanceProjected(&[SYSTEM_COLUMNS_V3.id, "slug"])).await;
         let full = read_bytes(uri, Read::LanceFull).await;
 
         println!("gq return slug          = {query} bytes");

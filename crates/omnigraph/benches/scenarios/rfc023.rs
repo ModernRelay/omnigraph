@@ -628,7 +628,15 @@ pub(super) async fn age_fixture(db: &Omnigraph, args: &Args) -> serde_json::Valu
         args.rows,
         "aging must preserve main row count"
     );
-    verify_fixture_row(&table, "base", 0, args.dims, args.seed).await;
+    verify_fixture_row(
+        &table,
+        db.catalog().system_columns.id,
+        "base",
+        0,
+        args.dims,
+        args.seed,
+    )
+    .await;
     serde_json::json!({
         "setup_history_commits_requested": args.history_commits,
         "setup_history_commits_applied": applied,
@@ -919,6 +927,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
 /// explicitly shares it between its main/source Dataset handles.
 async fn direct_lance_append_baseline(
     args: &Args,
+    id_column: &str,
     table_uri: &str,
     source_builder: DatasetBuilder,
     source_plan: &rfc023_limits::ChunkPlan,
@@ -940,7 +949,7 @@ async fn direct_lance_append_baseline(
             .expect("open prepared physical source branch");
         let mut source_scanner = source_table.scan();
         source_scanner
-            .filter("id LIKE 'adopt-new-%'")
+            .filter(&format!("{id_column} LIKE 'adopt-new-%'"))
             .expect("filter prepared all-new source rows");
         source_scanner.batch_size(source_plan.batch_rows);
         source_scanner.batch_size_bytes(rfc023_limits::KEYED_WRITE_MAX_BYTES);
@@ -1080,6 +1089,7 @@ pub(super) async fn fenced_adopt_operation(args: &Args) -> serde_json::Value {
         // freshly opened OmniGraph handle and caches in their measured child.
         let metrics = direct_lance_append_baseline(
             args,
+            db.catalog().system_columns.id,
             &table_uri,
             source_builder,
             &source_plan,
@@ -1249,6 +1259,7 @@ enum VerificationTable<'a> {
 
 async fn verify_id_content(
     table: VerificationTable<'_>,
+    id_column: &str,
     rows_per_prefix: usize,
     expected_prefixes: &[(&str, u64)],
     dims: usize,
@@ -1295,7 +1306,7 @@ async fn verify_id_content(
         VerificationTable::Physical(dataset) => {
             let mut scanner = dataset.scan();
             scanner
-                .project(&["id", "slug", "embedding"])
+                .project(&[id_column, "slug", "embedding"])
                 .expect("project exact physical-row verification scan");
             scanner.batch_size(scan_batch_rows);
             scanner.batch_size_bytes(scan_batch_bytes_target);
@@ -1309,7 +1320,7 @@ async fn verify_id_content(
         VerificationTable::Snapshot(table) => {
             let mut scanner = table.scan();
             scanner
-                .project(&["id", "slug", "embedding"])
+                .project(&[id_column, "slug", "embedding"])
                 .expect("project exact snapshot-row verification scan");
             scanner.batch_size(scan_batch_rows);
             scanner.batch_size_bytes(scan_batch_bytes_target);
@@ -1476,7 +1487,7 @@ async fn verify_id_content(
         "rows_per_prefix": per_prefix,
         "canonical_row_contract_sha256": format!("{:x}", canonical.finalize()),
         "fingerprint_version": "sha256-canonical-exact-fixture-row-contract-v2",
-        "projected_columns": ["id", "slug", "embedding"],
+        "projected_columns": [id_column, "slug", "embedding"],
         "payload_values_verified": true,
         "scan_batch_rows": scan_batch_rows,
         "scan_batch_bytes_target": scan_batch_bytes_target,
@@ -1531,6 +1542,7 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
     let base_domain = [("base", args.seed)];
     let physical_main_content = verify_id_content(
         VerificationTable::Physical(&physical_main),
+        db.catalog().system_columns.id,
         args.rows,
         &complete_domain,
         args.dims,
@@ -1540,6 +1552,7 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
     .await;
     let physical_source_content = verify_id_content(
         VerificationTable::Physical(&physical_source),
+        db.catalog().system_columns.id,
         args.rows,
         &complete_domain,
         args.dims,
@@ -1549,6 +1562,7 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
     .await;
     let manifest_main_content = verify_id_content(
         VerificationTable::Snapshot(&manifest_main),
+        db.catalog().system_columns.id,
         args.rows,
         if args.baseline {
             &base_domain
@@ -1562,6 +1576,7 @@ pub(super) async fn fenced_adopt_verify(args: &Args) -> serde_json::Value {
     .await;
     let manifest_source_content = verify_id_content(
         VerificationTable::Snapshot(&manifest_source),
+        db.catalog().system_columns.id,
         args.rows,
         &complete_domain,
         args.dims,
@@ -2006,6 +2021,7 @@ pub(super) async fn general_merge_operation(args: &Args) -> serde_json::Value {
 /// unbounded verification read.
 async fn verify_fixture_row(
     table: &SnapshotDataset,
+    id_column: &str,
     prefix: &str,
     ordinal: usize,
     dims: usize,
@@ -2014,10 +2030,10 @@ async fn verify_fixture_row(
     let id = format!("{prefix}-{ordinal:010}");
     let mut scanner = table.scan();
     scanner
-        .project(&["id", "slug", "embedding"])
+        .project(&[id_column, "slug", "embedding"])
         .expect("project representative merge-verification row");
     scanner
-        .filter(&format!("id = '{id}'"))
+        .filter(&format!("{id_column} = '{id}'"))
         .expect("filter representative merge-verification row");
     scanner
         .limit(Some(2), None)
@@ -2089,12 +2105,17 @@ async fn verify_fixture_row(
 
 /// Age experiments use small fixtures, but verify every row in bounded batches
 /// so a restored representative cannot hide unrelated data loss or source drift.
-async fn verify_general_all_rows(table: &SnapshotDataset, args: &Args, merged_main: bool) -> usize {
+async fn verify_general_all_rows(
+    table: &SnapshotDataset,
+    id_column: &str,
+    args: &Args,
+    merged_main: bool,
+) -> usize {
     let inserting = args.source_mode == "insert";
     let expected = args.rows + if inserting { args.delta_rows } else { 0 };
     let mut seen = vec![false; expected];
     let mut scanner = table.scan();
-    scanner.project(&["id", "slug", "embedding"]).unwrap();
+    scanner.project(&[id_column, "slug", "embedding"]).unwrap();
     scanner.batch_size(256);
     scanner.batch_size_bytes(rfc023_limits::KEYED_WRITE_MAX_BYTES);
     let mut stream = scanner
@@ -2220,10 +2241,18 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     } else {
         "base"
     };
-    let source_delta_row =
-        verify_fixture_row(&table, source_prefix, 0, args.dims, args.seed ^ 0x0230_0384).await;
+    let source_delta_row = verify_fixture_row(
+        &table,
+        db.catalog().system_columns.id,
+        source_prefix,
+        0,
+        args.dims,
+        args.seed ^ 0x0230_0384,
+    )
+    .await;
     let target_delta_row = verify_fixture_row(
         &table,
+        db.catalog().system_columns.id,
         "base",
         args.rows - GENERAL_MERGE_TARGET_DELTA_ROWS,
         args.dims,
@@ -2232,7 +2261,8 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
     .await;
     let (verified_complete_main_rows, verified_complete_source_rows) =
         if args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0 {
-            let main_rows = verify_general_all_rows(&table, args, true).await;
+            let main_rows =
+                verify_general_all_rows(&table, db.catalog().system_columns.id, args, true).await;
             let source_snapshot = db
                 .snapshot_of(ReadTarget::branch(GENERAL_MERGE_SOURCE_BRANCH))
                 .await
@@ -2241,7 +2271,9 @@ pub(super) async fn general_merge_verify(args: &Args) -> serde_json::Value {
                 .open_dataset("node:Chunk")
                 .await
                 .expect("open unchanged aged source");
-            let source_rows = verify_general_all_rows(&source_table, args, false).await;
+            let source_rows =
+                verify_general_all_rows(&source_table, db.catalog().system_columns.id, args, false)
+                    .await;
             (Some(main_rows), Some(source_rows))
         } else {
             (None, None)

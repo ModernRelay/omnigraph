@@ -1449,7 +1449,7 @@ async fn full_text_rebuild_refuses_unsupported_physical_inventory_before_effects
         // The other case models unsupported external/legacy missing-kind metadata,
         // even on a declared, otherwise rebuildable text property.
         raw.create_index_builder(
-            &[if missing_kind { "name" } else { "id" }],
+            &[if missing_kind { "name" } else { "__id" }],
             IndexType::Inverted,
             &lance_index::scalar::InvertedIndexParams::default(),
         )

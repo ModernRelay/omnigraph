@@ -86,8 +86,6 @@ impl NodeType {
     /// properties except `Blob` (T24) and `Vector`. Keyed on declared types: the
     /// engine rewrites Blob columns to their storage field before executing.
     pub fn node_object_fields(&self) -> impl Iterator<Item = &Arc<Field>> {
-        // The implicit id column is always the first Arrow field, whatever the
-        // graph's vintage spells it (RFC 0040); declared properties follow.
         self.arrow_schema
             .fields()
             .iter()
@@ -103,6 +101,20 @@ impl NodeType {
                 }
             })
             .map(|(_, field)| field)
+    }
+
+    /// [`Self::node_object_fields`] with the member name each field takes in
+    /// the projected object: the identity is the meta-field `@id` on every
+    /// vintage (RFC 0040), a declared property keeps its own name.
+    pub fn node_object_members(&self) -> impl Iterator<Item = (&str, &Arc<Field>)> {
+        self.node_object_fields().enumerate().map(|(index, field)| {
+            let member = if index == 0 && !self.properties.contains_key(field.name().as_str()) {
+                "@id"
+            } else {
+                field.name().as_str()
+            };
+            (member, field)
+        })
     }
 }
 
@@ -132,7 +144,7 @@ pub struct EdgeType {
     pub to_type: String,
     pub cardinality: Cardinality,
     pub properties: HashMap<String, PropType>,
-    /// Key column names (from `@key(src, dst, ...)`), always including both
+    /// Key column names (from `@key(@src, @dst, ...)`), always including both
     /// endpoints. IR-bound catalogs order endpoints first (src, dst), then
     /// composite members in stable property-ID order so renames cannot
     /// change physical tuple identity. The parse-path catalog
@@ -140,7 +152,7 @@ pub struct EdgeType {
     /// derivation; only IR-bound catalogs do.
     pub key: Option<Vec<String>>,
     /// Uniqueness constraints on edge fields, including endpoint fields
-    /// (e.g. `@unique(src, dst)`).
+    /// (e.g. `@unique(@src, @dst)`).
     pub unique_constraints: Vec<Vec<String>>,
     /// Index declarations on edge properties
     pub indices: Vec<Vec<String>>,
@@ -319,10 +331,10 @@ fn bound_to_literal(b: &ConstraintBound) -> LiteralValue {
     }
 }
 
+/// Builds a catalog from `.pg` source. Source-only catalogs bind to no stored
+/// graph, so they carry the current system column spellings; a stored graph's
+/// own spellings come from `build_catalog_from_ir`.
 pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
-    // Source-only catalogs are never bound to an existing graph, so they use
-    // the current spellings; a runtime catalog for a stored graph comes from
-    // `build_catalog_from_ir`, which resolves the graph's own spellings.
     let system_columns = schema_ir::SYSTEM_COLUMNS_V3;
     let mut node_types = HashMap::new();
     let mut edge_types = HashMap::new();
@@ -415,7 +427,6 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 }
             }
 
-            // Build Arrow schema: the identity column + all properties
             let mut fields = vec![Field::new(system_columns.id, DataType::Utf8, false)];
             for prop in &node.properties {
                 fields.push(Field::new(
@@ -636,7 +647,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 indices.push(columns);
                 continue;
             }
-            match schema_ir::constraint_from_ir(constraint, system_columns) {
+            match schema_ir::physical_constraint_from_ir(constraint, system_columns) {
                 Constraint::Key(_) => unreachable!("@key handled in stable property-id order"),
                 Constraint::Unique(columns) => unique_constraints.push(columns),
                 Constraint::Index(columns) => indices.push(columns),
@@ -766,7 +777,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 key = Some(columns);
                 continue;
             }
-            match schema_ir::constraint_from_ir(constraint, system_columns) {
+            match schema_ir::physical_constraint_from_ir(constraint, system_columns) {
                 Constraint::Key(_) => unreachable!("@key handled in stable property-id order"),
                 Constraint::Unique(columns) => unique_constraints.push(columns),
                 Constraint::Index(columns) => indices.push(columns),

@@ -2010,7 +2010,7 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
     request_body(
         content = String,
         content_type = "application/x-ndjson",
-        description = "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {}; optional `data.id` follows ordinary ID semantics. Duplicate, unknown, reserved physical, and noncanonical supplied node-ID members are refused."
+        description = "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"id\":\"<entity-id>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"id\":\"<entity-id>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {} and holds user properties; the optional top-level `id` follows ordinary ID semantics. Legacy-vintage graphs also accept `data.id` as identity when top-level `id` is absent and refuse both placements together. Duplicate, unknown, reserved physical, and noncanonical supplied entity-ID members are refused."
     ),
     responses(
         (status = 200, description = "One committed graph-batch result", body = GraphBatchLoadOutput),

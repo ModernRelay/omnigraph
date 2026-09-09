@@ -15,9 +15,9 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
-use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::types::PropType;
+use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SystemColumns};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -562,10 +562,21 @@ async fn load_jsonl_reader_once<R: BufRead>(
                         record_num, type_name
                     )));
                 }
-                let data = value
+                let identity = take_lenient_identity(&mut value, record_num)?;
+                let mut data = value
                     .get_mut("data")
                     .map(JsonValue::take)
                     .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+                let object = data.as_object_mut().ok_or_else(|| {
+                    OmniError::manifest(format!("record {record_num}: 'data' must be an object"))
+                })?;
+                place_identity(
+                    format_args!("record {record_num}"),
+                    object,
+                    identity,
+                    &catalog.node_types[&type_name].properties,
+                    catalog.system_columns,
+                )?;
                 if bounded_keyed_input {
                     account_keyed_json_row(
                         &format!("node:{type_name}"),
@@ -600,15 +611,23 @@ async fn load_jsonl_reader_once<R: BufRead>(
                         OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
                     })?
                     .to_string();
-                let data = value
+                let identity = take_lenient_identity(&mut value, record_num)?;
+                let mut data = value
                     .get_mut("data")
                     .map(JsonValue::take)
                     .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-                let canonical = catalog
-                    .lookup_edge_by_name(&edge_name)
-                    .unwrap()
-                    .name
-                    .clone();
+                let object = data.as_object_mut().ok_or_else(|| {
+                    OmniError::manifest(format!("record {record_num}: 'data' must be an object"))
+                })?;
+                let edge_type = catalog.lookup_edge_by_name(&edge_name).unwrap();
+                place_identity(
+                    format_args!("record {record_num}"),
+                    object,
+                    identity,
+                    &edge_type.properties,
+                    catalog.system_columns,
+                )?;
+                let canonical = edge_type.name.clone();
                 if bounded_keyed_input {
                     account_keyed_json_row(
                         &format!("edge:{canonical}"),
@@ -1143,14 +1162,22 @@ fn parse_strict_graph_rows<R: BufRead>(
 
         match (envelope.contains_key("type"), envelope.contains_key("edge")) {
             (true, false) => {
-                validate_strict_envelope_fields(line_number, &envelope, &["type", "data"])?;
+                validate_strict_envelope_fields(line_number, &envelope, &["type", "id", "data"])?;
                 let type_name = take_required_string(&mut envelope, "type", line_number)?;
-                let data = take_object_or_empty(&mut envelope, "data", line_number)?;
+                let identity = take_optional_string(&mut envelope, "id", line_number)?;
+                let mut data = take_object_or_empty(&mut envelope, "data", line_number)?;
                 if !catalog.node_types.contains_key(&type_name) {
                     return Err(OmniError::manifest(format!(
                         "line {line_number}: unknown node type '{type_name}'"
                     )));
                 }
+                place_identity(
+                    format_args!("line {line_number}"),
+                    &mut data,
+                    identity,
+                    &catalog.node_types[&type_name].properties,
+                    catalog.system_columns,
+                )?;
                 let table_key = format!("node:{type_name}");
                 let row = JsonValue::Object(data);
                 if bounded_keyed_input {
@@ -1162,9 +1189,10 @@ fn parse_strict_graph_rows<R: BufRead>(
                 validate_strict_envelope_fields(
                     line_number,
                     &envelope,
-                    &["edge", "from", "to", "data"],
+                    &["edge", "id", "from", "to", "data"],
                 )?;
                 let edge_name = take_required_string(&mut envelope, "edge", line_number)?;
+                let identity = take_optional_string(&mut envelope, "id", line_number)?;
                 let from = take_required_string(&mut envelope, "from", line_number)?;
                 let to = take_required_string(&mut envelope, "to", line_number)?;
                 let mut data = take_object_or_empty(&mut envelope, "data", line_number)?;
@@ -1180,6 +1208,13 @@ fn parse_strict_graph_rows<R: BufRead>(
                         "line {line_number}: unknown edge type '{edge_name}'"
                     ))
                 })?;
+                place_identity(
+                    format_args!("line {line_number}"),
+                    &mut data,
+                    identity,
+                    &edge_type.properties,
+                    catalog.system_columns,
+                )?;
                 let canonical = edge_type.name.clone();
                 let table_key = format!("edge:{canonical}");
                 if bounded_keyed_input {
@@ -1212,6 +1247,70 @@ fn parse_strict_graph_rows<R: BufRead>(
     }
 
     Ok(rows)
+}
+
+/// Place the envelope identity under the graph's physical spelling. Legacy
+/// graphs also accept `data.id`; current graphs reserve it for declared properties.
+fn place_identity(
+    location: fmt::Arguments<'_>,
+    data: &mut serde_json::Map<String, JsonValue>,
+    identity: Option<String>,
+    properties: &HashMap<String, PropType>,
+    system_columns: SystemColumns,
+) -> Result<()> {
+    if system_columns != SYSTEM_COLUMNS_LEGACY
+        && data.contains_key("id")
+        && !properties.contains_key("id")
+    {
+        return Err(OmniError::manifest(format!(
+            "{location}: unknown input field 'id': move data.id to the top-level 'id' field; \
+             data.id is only valid when the schema declares an 'id' property"
+        )));
+    }
+    if system_columns != SYSTEM_COLUMNS_LEGACY && data.contains_key(system_columns.id) {
+        return Err(OmniError::manifest(format!(
+            "{location}: data field '{}' is reserved physical state; the entity id \
+             is the top-level 'id' field",
+            system_columns.id
+        )));
+    }
+    if let Some(identity) = identity {
+        if system_columns == SYSTEM_COLUMNS_LEGACY && data.contains_key(system_columns.id) {
+            return Err(OmniError::manifest(format!(
+                "{location}: the entity id is given both as the top-level 'id' and \
+                 as data.{}",
+                system_columns.id
+            )));
+        }
+        data.insert(system_columns.id.to_string(), JsonValue::String(identity));
+    }
+    Ok(())
+}
+
+/// The lenient loader's twin of [`take_optional_string`] for the top-level
+/// `id`: a record whose `id` is present but not a string is refused.
+fn take_lenient_identity(value: &mut JsonValue, record_num: usize) -> Result<Option<String>> {
+    match value.get_mut("id").map(JsonValue::take) {
+        None => Ok(None),
+        Some(JsonValue::String(identity)) => Ok(Some(identity)),
+        Some(other) => Err(OmniError::manifest(format!(
+            "record {record_num}: top-level field 'id' must be a string, got {other}"
+        ))),
+    }
+}
+
+fn take_optional_string(
+    envelope: &mut serde_json::Map<String, JsonValue>,
+    field: &str,
+    line_number: usize,
+) -> Result<Option<String>> {
+    match envelope.remove(field) {
+        None => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(value) => Err(OmniError::manifest(format!(
+            "line {line_number}: top-level field '{field}' must be a string, got {value}"
+        ))),
+    }
 }
 
 fn validate_strict_envelope_fields(
@@ -1580,6 +1679,7 @@ fn build_edge_batch(
         &src_column,
         &dst_column,
         &property_columns,
+        system_columns,
     )?;
     let ids = rows
         .iter()
@@ -1638,6 +1738,7 @@ fn edge_key_columns(
     src_column: &ArrayRef,
     dst_column: &ArrayRef,
     property_columns: &[ArrayRef],
+    system_columns: SystemColumns,
 ) -> Result<Option<Vec<ArrayRef>>> {
     edge_type
         .key
@@ -1646,8 +1747,8 @@ fn edge_key_columns(
             columns
                 .iter()
                 .map(|column| match column.as_str() {
-                    "src" => Ok(src_column.clone()),
-                    "dst" => Ok(dst_column.clone()),
+                    endpoint if endpoint == system_columns.src => Ok(src_column.clone()),
+                    endpoint if endpoint == system_columns.dst => Ok(dst_column.clone()),
                     property => {
                         let schema_index = schema.index_of(property).map_err(|_| {
                             OmniError::manifest_internal(format!(
@@ -1878,6 +1979,7 @@ fn normalize_strict_edge_rows(
         &src_column,
         &dst_column,
         &property_columns,
+        system_columns,
     )?;
     let ids = objects
         .iter()
@@ -3793,58 +3895,68 @@ node Doc {
         let cases = [
             (
                 "recursive duplicate",
-                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","extra":{"x":1,"x":2}}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","extra":{"x":1,"x":2}}}"#,
                 "duplicate JSON member 'x'",
             ),
             (
                 "two objects on one line",
-                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"}} {"type":"Person","data":{"__id":"Bob","name":"Bob"}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice"}} {"type":"Person","id":"Bob","data":{"name":"Bob"}}"#,
                 "invalid strict JSON",
             ),
             (
                 "node and edge",
-                r#"{"type":"Person","edge":"Knows","data":{"__id":"Alice","name":"Alice"}}"#,
+                r#"{"type":"Person","edge":"Knows","id":"Alice","data":{"name":"Alice"}}"#,
                 "exactly one of 'type' or 'edge'",
             ),
             (
                 "unknown top-level field",
-                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"},"branch":"main"}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice"},"branch":"main"}"#,
                 "unknown top-level graph batch field 'branch'",
             ),
             (
                 "reserved top-level field",
-                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"},"_rowid":7}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice"},"_rowid":7}"#,
                 "reserved physical state",
             ),
             (
+                "legacy identity placement",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
                 "unknown data field",
-                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","nickname":"Al"}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","nickname":"Al"}}"#,
                 "unknown input field 'nickname'",
             ),
             (
                 "reserved data field",
-                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","_rowid":7}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","_rowid":7}}"#,
                 "reserved physical state",
             ),
             (
                 "non-string supplied id",
-                r#"{"type":"Person","data":{"__id":7,"name":"Alice"}}"#,
-                "field '__id' must be a string",
+                r#"{"type":"Person","id":7,"data":{"name":"Alice"}}"#,
+                "top-level field 'id' must be a string",
             ),
             (
                 "noncanonical id",
-                r#"{"type":"Person","data":{"__id":"person-1","name":"Alice"}}"#,
+                r#"{"type":"Person","id":"person-1","data":{"name":"Alice"}}"#,
                 "does not match its canonical @key id 'Alice'",
             ),
             (
                 "nullable wrong type",
-                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice","age":"old"}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","age":"old"}}"#,
                 "expects Int32",
             ),
             (
                 "edge structural field in data",
-                r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"__id":"knows-1","__src":"Mallory"}}"#,
+                r#"{"edge":"Knows","id":"knows-1","from":"Alice","to":"Bob","data":{"__src":"Mallory"}}"#,
                 "reserved structural state",
+            ),
+            (
+                "storage identity spelling in data",
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"}}"#,
+                "reserved physical state",
             ),
         ];
 
@@ -3875,6 +3987,72 @@ node Doc {
                 0,
                 "{case} wrote node rows"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_refuses_invalid_identity_envelopes_before_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person { name: String? } edge Knows: Person -> Person",
+        )
+        .await
+        .unwrap();
+        let before = db.version().await;
+        let mut cases = [
+            (
+                r#"{"type":"Person","data":{"id":"alice"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
+                r#"{"edge":"Knows","from":"alice","to":"bob","data":{"id":"knows-1"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
+                r#"{"type":"Person","id":"alice","data":{"id":"other"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
+                r#"{"type":"Person","id":null,"data":{}}"#,
+                "top-level field 'id' must be a string",
+            ),
+            (
+                r#"{"edge":"Knows","id":null,"from":"alice","to":"bob","data":{}}"#,
+                "top-level field 'id' must be a string",
+            ),
+            (
+                r#"{"type":"Person","id":"alice","data":{"__id":"alice"}}"#,
+                "record 1: data field '__id'",
+            ),
+        ]
+        .into_iter()
+        .map(|(input, expected)| (input.to_string(), expected))
+        .collect::<Vec<_>>();
+        for data in ["null", "[]", "7", "\"text\""] {
+            for envelope in [
+                r#""type":"Person""#,
+                r#""edge":"Knows","from":"alice","to":"bob""#,
+            ] {
+                let input = format!("{{{envelope},\"id\":\"entity-1\",\"data\":{data}}}");
+                cases.push((input, "record 1: 'data' must be an object"));
+            }
+        }
+        for (input, expected) in cases {
+            let error = load_jsonl(&db, &input, LoadMode::Overwrite)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(db.version().await, before);
+            let snapshot = db.snapshot().await;
+            for table in ["node:Person", "edge:Knows"] {
+                let dataset = snapshot.open_dataset(table).await.unwrap();
+                assert_eq!(
+                    dataset.count_rows(None).await.unwrap(),
+                    0,
+                    "{input}: {table}"
+                );
+            }
         }
     }
 

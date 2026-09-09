@@ -6,11 +6,13 @@
 //! hints are retained for resolution but deliberately skipped by shape
 //! serialization and hashing.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::schema_ir::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_META, SystemColumns};
 use crate::error::{CompilerError, Result};
 use crate::schema::ast::{
     Annotation, Cardinality, Constraint, InterfacePropertyOrigin, PropDecl, SchemaDecl, SchemaFile,
@@ -23,6 +25,51 @@ pub struct SchemaShape {
     pub interfaces: Vec<InterfaceShape>,
     pub nodes: Vec<NodeShape>,
     pub edges: Vec<EdgeShape>,
+}
+
+impl SchemaShape {
+    /// Canonicalize role spellings using the accepted graph's source dialect.
+    pub fn canonicalized_for_system_columns(&self, system_columns: SystemColumns) -> Cow<'_, Self> {
+        if system_columns != SYSTEM_COLUMNS_LEGACY {
+            return Cow::Borrowed(self);
+        }
+        let mut shape = self.clone();
+        for constraints in shape
+            .nodes
+            .iter_mut()
+            .map(|node| &mut node.constraints)
+            .chain(shape.edges.iter_mut().map(|edge| &mut edge.constraints))
+        {
+            for constraint in constraints.iter_mut() {
+                let normalize = |name: &mut String| {
+                    *name = match name.as_str() {
+                        name if name == SYSTEM_COLUMNS_META.id => {
+                            SYSTEM_COLUMNS_LEGACY.id.to_string()
+                        }
+                        name if name == SYSTEM_COLUMNS_META.src => {
+                            SYSTEM_COLUMNS_LEGACY.src.to_string()
+                        }
+                        name if name == SYSTEM_COLUMNS_META.dst => {
+                            SYSTEM_COLUMNS_LEGACY.dst.to_string()
+                        }
+                        _ => return,
+                    };
+                };
+                match constraint {
+                    Constraint::Key(names)
+                    | Constraint::Unique(names)
+                    | Constraint::Index(names) => {
+                        names.iter_mut().for_each(normalize);
+                    }
+                    Constraint::Range { property, .. } | Constraint::Check { property, .. } => {
+                        normalize(property)
+                    }
+                }
+            }
+            *constraints = canonical_constraints(constraints);
+        }
+        Cow::Owned(shape)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

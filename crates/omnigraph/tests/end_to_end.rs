@@ -128,9 +128,16 @@ node Flagged {
     slug: String @key
     active: Bool
     rating: I32?
+    id: String
+}
+edge Reflects: Flagged -> Flagged {
+    id: String
+    src: String
+    dst: String
 }
 "#;
-    let data = r#"{"type":"Flagged","data":{"slug":"alpha","active":true,"rating":42}}"#;
+    let data = r#"{"type":"Flagged","data":{"slug":"alpha","active":true,"rating":42,"id":"user-id"}}
+{"edge":"Reflects","id":"edge-id","from":"alpha","to":"alpha","data":{"id":"user-edge-id","src":"user-src","dst":"user-dst"}}"#;
 
     let db = Omnigraph::init(uri, schema).await.unwrap();
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
@@ -140,9 +147,27 @@ node Flagged {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(entity["__id"], serde_json::json!("alpha"));
+    assert_eq!(entity["@id"], serde_json::json!("alpha"));
     assert_eq!(entity["active"], serde_json::json!(true));
     assert_eq!(entity["rating"], serde_json::json!(42));
+    assert_eq!(entity["id"], "user-id");
+    assert!(entity.get("__id").is_none());
+    let version = db
+        .graph_manifest_version_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let edge = db
+        .entity_at("edge:Reflects", "edge-id", version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edge,
+        serde_json::json!({
+            "@id": "edge-id", "@src": "alpha", "@dst": "alpha",
+            "id": "user-edge-id", "src": "user-src", "dst": "user-dst"
+        })
+    );
 }
 
 #[tokio::test]
@@ -1182,7 +1207,7 @@ async fn blob_read_returns_bytes() {
 {"type":"Document","data":{"title":"empty","content":"base64:"}}
 {"type":"Document","data":{"title":"null"}}
 {"type":"Document","data":{"title":"peer"}}
-{"edge":"Attachment","from":"readme","to":"peer","data":{"__id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
+{"edge":"Attachment","id":"attachment-1","from":"readme","to":"peer","data":{"payload":"base64:RWRnZQ=="}}"#;
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let metacharacter_id = r"quote'\slash";

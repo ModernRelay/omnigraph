@@ -42,10 +42,11 @@ use lance_table::format::Fragment;
 
 use super::enumerate::{Emit, next_emit};
 use super::model::ChangeFeedScope;
-use super::row_compare::{OrderedRows, ScanTargets, rows_equal};
+use super::row_compare::{OrderedRows, ScanTargets, rows_equal_across_vintages};
 use crate::db::DatasetEntry;
 use crate::error::Result;
 use crate::table_store::{has_insert_absence_certificate, has_no_by_source_delete_marker};
+use omnigraph_compiler::SystemColumns;
 
 /// Whether one Lance transaction's operation preserves the live logical row set
 /// — i.e. can only add or modify rows in place, never remove, reuse, or re-stamp
@@ -360,6 +361,9 @@ pub(crate) struct CandidateUpserts {
     parents: Option<OrderedRows>,
     candidates: OrderedRows,
     scope: ChangeFeedScope,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
 }
 
 impl CandidateUpserts {
@@ -372,7 +376,8 @@ impl CandidateUpserts {
         after_id: Option<&str>,
         scope: ChangeFeedScope,
         scan_targets: ScanTargets,
-        id_col: &'static str,
+        from_columns: SystemColumns,
+        to_columns: SystemColumns,
     ) -> Result<Self> {
         crate::instrumentation::record_candidate_scan_targets(
             scan_targets.rows(),
@@ -393,7 +398,7 @@ impl CandidateUpserts {
             Some(window),
             Some(plan.child_fragments),
             scan_targets,
-            id_col,
+            to_columns.id,
         )
         .await?;
         let parents = if plan.parent_fragments.is_empty() {
@@ -406,7 +411,7 @@ impl CandidateUpserts {
                     None,
                     Some(plan.parent_fragments),
                     scan_targets,
-                    id_col,
+                    from_columns.id,
                 )
                 .await?,
             )
@@ -416,6 +421,9 @@ impl CandidateUpserts {
             parents,
             candidates,
             scope,
+            from_columns,
+            to_columns,
+            is_edge: from_entry.type_key.starts_with("edge:"),
         })
     }
 
@@ -456,11 +464,14 @@ impl CandidateUpserts {
             let emit = match before {
                 None => Emit::Insert(candidate),
                 Some(before) => {
-                    if rows_equal(
+                    if rows_equal_across_vintages(
                         &self.parent_dataset,
                         &before,
                         self.candidates.dataset(),
                         &candidate,
+                        self.from_columns,
+                        self.to_columns,
+                        self.is_edge,
                     )
                     .await?
                     {
@@ -487,6 +498,9 @@ pub(crate) struct FullMergeRows {
     from: OrderedRows,
     to: OrderedRows,
     scope: ChangeFeedScope,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
 }
 
 pub(crate) enum EmitSource {
@@ -509,7 +523,8 @@ impl EmitSource {
         after_id: Option<&str>,
         scope: &ChangeFeedScope,
         scan_targets: ScanTargets,
-        id_col: &'static str,
+        from_columns: SystemColumns,
+        to_columns: SystemColumns,
     ) -> Result<Self> {
         if let Some(candidate_plan) = candidate_plan {
             Ok(Self::Pruned(Box::new(
@@ -522,24 +537,38 @@ impl EmitSource {
                     after_id,
                     scope.clone(),
                     scan_targets,
-                    id_col,
+                    from_columns,
+                    to_columns,
                 )
                 .await?,
             )))
         } else {
-            let from = OrderedRows::open(from_dataset, after_id, id_col).await?;
-            let to = OrderedRows::open(to_dataset, after_id, id_col).await?;
+            let from = OrderedRows::open(from_dataset, after_id, from_columns.id).await?;
+            let to = OrderedRows::open(to_dataset, after_id, to_columns.id).await?;
             Ok(Self::FullMerge(Box::new(FullMergeRows {
                 from,
                 to,
                 scope: scope.clone(),
+                from_columns,
+                to_columns,
+                is_edge: from_entry.type_key.starts_with("edge:"),
             })))
         }
     }
 
     pub(crate) async fn next(&mut self) -> Result<Option<Emit>> {
         match self {
-            Self::FullMerge(full) => next_emit(&mut full.from, &mut full.to, &full.scope).await,
+            Self::FullMerge(full) => {
+                next_emit(
+                    &mut full.from,
+                    &mut full.to,
+                    &full.scope,
+                    full.from_columns,
+                    full.to_columns,
+                    full.is_edge,
+                )
+                .await
+            }
             Self::Pruned(candidates) => candidates.next().await,
         }
     }

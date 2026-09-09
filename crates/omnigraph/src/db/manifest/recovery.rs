@@ -10256,7 +10256,7 @@ node Person {
 
         db.load(
             "main",
-            r#"{"type":"Person","data":{"__id":"winner","age":22}}"#,
+            r#"{"type":"Person","id":"winner","data":{"age":22}}"#,
             crate::loader::LoadMode::Append,
         )
         .await
@@ -10589,7 +10589,7 @@ node Person { age: I32? }
 
         db.load(
             "main",
-            r#"{"type":"Person","data":{"__id":"winner","age":22}}"#,
+            r#"{"type":"Person","id":"winner","data":{"age":22}}"#,
             crate::loader::LoadMode::Append,
         )
         .await

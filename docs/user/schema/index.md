@@ -21,7 +21,7 @@ node Company {
 
 edge WorksAt: Person -> Company @card(0..) {
   role: String?
-  @unique(src, dst)
+  @unique(@src, @dst)
 }
 ```
 
@@ -61,13 +61,13 @@ rejected when a schema is admitted. The reserved namespace covers Lance's
 virtual system columns (`_rowid`, `_rowaddr`, `_rowoffset`,
 `_row_created_at_version`, `_row_last_updated_at_version`) and OmniGraph's
 own implicit stored columns, spelled `__id` on nodes and edges and
-`__src`/`__dst` on edges for graphs created at the current schema version.
-Graphs created before that version keep the earlier spellings `id`, `src`,
-and `dst` for their implicit columns and continue to reserve those three
-property names; on current graphs `id`, `src`, and `dst` are ordinary
-property names. Result payloads carry each graph's own implicit column
-names, and the schema endpoint (`GET /schema`) reports them in its
-`system_columns` field so clients never have to guess.
+`__src`/`__dst` on edges for newly created graphs.
+Supported existing graphs without the `system-columns` feature keep the earlier spellings `id`, `src`,
+and `dst` for their implicit columns. They reserve `id` on nodes and edges,
+and `src`/`dst` on edges. On current graphs all three names are ordinary
+property names. Query meta-fields use `@id`, `@src`, and `@dst`; projected
+node objects use `@id`, and JSONL exports use a top-level `id`. The schema
+endpoint (`GET /schema`) reports the physical spellings in `system_columns`.
 `_distance` and `_score` are also reserved for new declarations: search-ordered
 queries rank results by those columns. A graph whose schema already declared
 either name before this reservation keeps opening; only new schemas are
@@ -83,8 +83,8 @@ also have a single-property shorthand.
 
 | Constraint | Applies to | Meaning |
 |---|---|---|
-| `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `src` and `dst`, and a key may be declared only when the type is created. |
-| `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `src` and `dst`. |
+| `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `@src` and `@dst`, and a key may be declared only when the type is created. |
+| `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
 | `@range(p, min..max)` | node | Restricts a numeric property; either bound may be omitted. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
@@ -102,18 +102,26 @@ See [Search](../search/index.md#indexes).
 
 ## IDs
 
-Every node and edge has a String `id` in load and export data.
+Every node and edge has a String id. On the wire it rides at the top level of
+the load or export envelope, under the fixed key `id`, beside `type` (nodes) or
+`edge`; `data` holds user properties. Legacy-vintage graphs also accept
+`data.id` as identity when the top-level `id` is absent; providing both is
+refused. In queries the id is the meta-field
+`$p.@id` and an edge's endpoints are `$e.@src` and `$e.@dst`
+([system fields](../queries/index.md#system-fields)); a bare `id` in a query
+is always a user property of that name.
 
 - A node with `@key` derives its id from the complete typed key tuple. Renaming a
   key property with `@rename_from` does not change existing ids.
 - A node without a key receives a generated id unless input supplies one.
 - An edge with `@key` derives its id the same way, in the catalog's key
-  order: `src`, then `dst`, then any scalar members. A composite id encodes
+  order: `@src`, then `@dst`, then any scalar members. A composite id encodes
   as a JSON array of the member values, for example `["Alice","Bob"]`.
 - An edge without a key uses generated or supplied ids. Edges store their
-  endpoints as `src` and `dst`.
+  endpoints as the graph's endpoint columns, `__src` and `__dst` on graphs
+  created by this binary.
 
-For hand-authored load data, omit a keyed node's or keyed edge's `data.id`
+For hand-authored load data, omit a keyed node's or keyed edge's top-level `id`
 and let OmniGraph derive it; a supplied id on a keyed edge must equal the
 derived id exactly. Export includes ids so a graph can be rebuilt without losing edge
 references.

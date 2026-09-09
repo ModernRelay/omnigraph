@@ -625,7 +625,7 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             constraint,
         } => format!(
             "add constraint {} on {} '{}'",
-            render_constraint(constraint),
+            constraint,
             schema_type_kind_label(*type_kind),
             type_name
         ),
@@ -746,28 +746,6 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
         format!("{}?", base)
     } else {
         base
-    }
-}
-
-pub(crate) fn render_constraint(
-    constraint: &omnigraph_compiler::schema::ast::Constraint,
-) -> String {
-    match constraint {
-        omnigraph_compiler::schema::ast::Constraint::Key(columns) => {
-            format!("@key({})", columns.join(", "))
-        }
-        omnigraph_compiler::schema::ast::Constraint::Unique(columns) => {
-            format!("@unique({})", columns.join(", "))
-        }
-        omnigraph_compiler::schema::ast::Constraint::Index(columns) => {
-            format!("@index({})", columns.join(", "))
-        }
-        omnigraph_compiler::schema::ast::Constraint::Range { property, min, max } => {
-            format!("@range({}, {:?}, {:?})", property, min, max)
-        }
-        omnigraph_compiler::schema::ast::Constraint::Check { property, pattern } => {
-            format!("@check({}, {:?})", property, pattern)
-        }
     }
 }
 

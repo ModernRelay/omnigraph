@@ -1,5 +1,7 @@
 use super::*;
+use crate::changes::model::is_reserved_storage_system_column;
 use futures::TryStreamExt;
+use omnigraph_compiler::SYSTEM_COLUMNS_META;
 use std::future::Future;
 
 /// Initial row estimate used by Lance's byte-targeted export scanner.
@@ -359,19 +361,17 @@ async fn entity_from_snapshot(
     type_key: &str,
     id: &str,
 ) -> Result<Option<serde_json::Value>> {
-    if snapshot.dataset(type_key).is_none() {
+    let Some(entry) = snapshot.dataset(type_key) else {
         return Ok(None);
-    }
+    };
 
     let ds = db
         .storage()
         .open_snapshot_at_table(snapshot, type_key)
         .await?;
-    let filter_sql = format!(
-        "{} = '{}'",
-        db.catalog().system_columns.id,
-        id.replace('\'', "''")
-    );
+    let system_columns =
+        crate::db::manifest::system_columns_at_image(ds.dataset().schema(), &entry.type_key)?;
+    let filter_sql = format!("{} = '{}'", system_columns.id, id.replace('\'', "''"));
     let mut batches = db
         .storage()
         .scan_stream_bounded(
@@ -390,7 +390,25 @@ async fn entity_from_snapshot(
         .map_err(crate::table_store::TableStore::ordered_scan_error)?
     {
         if batch.num_rows() > 0 {
-            let mut image = logical_row_image(ds.dataset(), &batch, 0).await?;
+            let mut image = logical_row_image(ds.dataset(), &batch, 0, system_columns.id).await?;
+            for (physical, logical) in [(system_columns.id, SYSTEM_COLUMNS_META.id)]
+                .into_iter()
+                .chain(
+                    type_key
+                        .starts_with("edge:")
+                        .then_some([
+                            (system_columns.src, SYSTEM_COLUMNS_META.src),
+                            (system_columns.dst, SYSTEM_COLUMNS_META.dst),
+                        ])
+                        .into_iter()
+                        .flatten(),
+                )
+            {
+                let value = image.remove(physical).ok_or_else(|| {
+                    OmniError::manifest_internal(format!("entity image is missing '{physical}'"))
+                })?;
+                image.insert(logical.to_string(), value);
+            }
             image.retain(|_, value| !value.is_null());
             return Ok(Some(serde_json::Value::Object(image)));
         }
@@ -589,9 +607,8 @@ pub(crate) async fn logical_row_image(
     source_ds: &Dataset,
     batch: &RecordBatch,
     row: usize,
+    id_col: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
-    use crate::changes::model::is_reserved_storage_system_column;
-
     let row_batch = batch.slice(row, 1);
     let blob_properties = row_batch
         .schema()
@@ -625,7 +642,7 @@ pub(crate) async fn logical_row_image(
         .filter(|field| !is_reserved_storage_system_column(field.name()))
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
-    let lines = row_json_lines(&row_batch, &fields, blob_values.as_ref(), 0)?;
+    let lines = row_json_lines(&row_batch, &fields, blob_values.as_ref(), 0, id_col)?;
     let bytes = json_rows(&lines)
         .next()
         .ok_or_else(|| OmniError::manifest_internal("row image rendered no JSON object"))?;
@@ -639,6 +656,9 @@ pub(crate) async fn logical_row_image(
     Ok(image)
 }
 
+/// Emits one JSON line per row. The logical envelope keys the identity as `id`
+/// beside `type` on every vintage, so `data` skips the leading system column and
+/// carries user properties only (RFC 0040).
 async fn emit_export_rows_from_batch<Emit, EmitFuture>(
     catalog: &Catalog,
     table_key: &str,
@@ -650,33 +670,36 @@ where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
     EmitFuture: Future<Output = Result<()>>,
 {
+    let ids = named_string_column(batch, catalog.system_columns.id)?;
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type = catalog
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-        let fields = std::iter::once(catalog.system_columns.id.to_string()).chain(
-            node_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .skip(1)
-                .map(|field| field.name().clone()),
-        );
-        let fields = fields.collect::<Vec<_>>();
+        let fields = node_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .skip(1)
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
         let mut prefix = b"{\"type\":".to_vec();
         json_string_into(&mut prefix, type_name)?;
-        prefix.extend_from_slice(b",\"data\":");
+        prefix.extend_from_slice(b",\"id\":");
         for rows in render_windows(batch.num_rows()) {
             let lines = row_json_lines(
                 &batch.slice(rows.start, rows.len()),
                 &fields,
                 blob_values,
                 rows.start,
+                catalog.system_columns.id,
             )?;
-            for data in json_rows(&lines) {
-                let mut line = Vec::with_capacity(prefix.len() + data.len() + 2);
+            for (offset, data) in json_rows(&lines).enumerate() {
+                let row = rows.start + offset;
+                let mut line = Vec::with_capacity(prefix.len() + data.len() + 32);
                 line.extend_from_slice(&prefix);
+                json_string_into(&mut line, ids.value(row))?;
+                line.extend_from_slice(b",\"data\":");
                 line.extend_from_slice(data);
                 line.extend_from_slice(b"}\n");
                 emit_export_line(emit, line).await?;
@@ -686,40 +709,37 @@ where
     }
 
     if let Some(edge_name) = table_key.strip_prefix("edge:") {
+        let sources = named_string_column(batch, catalog.system_columns.src)?;
+        let destinations = named_string_column(batch, catalog.system_columns.dst)?;
         let edge_type = catalog
             .edge_types
             .get(edge_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
-        let fields = std::iter::once(catalog.system_columns.id.to_string()).chain(
-            edge_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .skip(3)
-                .map(|field| field.name().clone()),
-        );
-        let fields = fields.collect::<Vec<_>>();
+        let fields = edge_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .skip(3)
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
         for rows in render_windows(batch.num_rows()) {
             let lines = row_json_lines(
                 &batch.slice(rows.start, rows.len()),
                 &fields,
                 blob_values,
                 rows.start,
+                catalog.system_columns.id,
             )?;
             for (offset, data) in json_rows(&lines).enumerate() {
                 let row = rows.start + offset;
                 let mut line = b"{\"edge\":".to_vec();
                 json_string_into(&mut line, edge_name)?;
+                line.extend_from_slice(b",\"id\":");
+                json_string_into(&mut line, ids.value(row))?;
                 line.extend_from_slice(b",\"from\":");
-                json_string_into(
-                    &mut line,
-                    &named_string_value(batch, catalog.system_columns.src, row)?,
-                )?;
+                json_string_into(&mut line, sources.value(row))?;
                 line.extend_from_slice(b",\"to\":");
-                json_string_into(
-                    &mut line,
-                    &named_string_value(batch, catalog.system_columns.dst, row)?,
-                )?;
+                json_string_into(&mut line, destinations.value(row))?;
                 line.extend_from_slice(b",\"data\":");
                 line.extend_from_slice(data);
                 line.extend_from_slice(b"}\n");
@@ -770,6 +790,7 @@ fn row_json_lines(
     fields: &[String],
     blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
     first_row: usize,
+    id_col: &str,
 ) -> Result<Vec<u8>> {
     let source = batch.schema();
     let mut schema_fields: Vec<Arc<Field>> = Vec::new();
@@ -794,13 +815,17 @@ fn row_json_lines(
         columns.push(batch.column(index).clone());
     }
     let schema = Arc::new(Schema::new(schema_fields));
-    let projected =
-        RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)?;
+    let projected = RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(OmniError::arrow_internal)?;
     if let Some(cell) =
         omnigraph_compiler::json_output::unformattable_date(std::slice::from_ref(&projected))
     {
-        let id = projected
-            .column_by_name("id")
+        let id = batch
+            .column_by_name(id_col)
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
             .filter(|ids| ids.is_valid(cell.row))
             .map(|ids| ids.value(cell.row).to_string());
@@ -906,7 +931,7 @@ async fn export_blob_column_values(
     Ok(values)
 }
 
-fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Result<String> {
+fn named_string_column<'a>(batch: &'a RecordBatch, field_name: &str) -> Result<&'a StringArray> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
         OmniError::manifest_internal(format!("missing column '{}' in export batch", field_name))
     })?;
@@ -916,11 +941,11 @@ fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Resu
         .ok_or_else(|| {
             OmniError::manifest_internal(format!("expected Utf8 column '{}'", field_name))
         })?;
-    if array.is_null(row) {
+    if array.null_count() != 0 {
         return Err(OmniError::manifest_internal(format!(
             "unexpected null in export column '{}'",
             field_name
         )));
     }
-    Ok(array.value(row).to_string())
+    Ok(array)
 }

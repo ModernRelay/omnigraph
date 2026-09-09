@@ -8534,7 +8534,7 @@ node Embedding {
     let embedding = snapshot.open_dataset("node:Embedding").await.unwrap();
     assert!(embedding.has_unindexed_fragments().await.unwrap());
     assert_eq!(
-        embedding.index_coverage("id").await.unwrap(),
+        embedding.index_coverage("__id").await.unwrap(),
         omnigraph::IndexCoverage::Indexed,
         "only the excluded FTS tail and untrainable vector may remain"
     );

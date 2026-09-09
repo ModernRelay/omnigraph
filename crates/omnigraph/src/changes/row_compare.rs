@@ -23,6 +23,8 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use lance_core::datatypes::BlobHandling;
 use lance_table::format::Fragment;
 
+use omnigraph_compiler::{SYSTEM_COLUMNS_META, SystemColumns};
+
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
 use crate::db::{STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values};
@@ -33,10 +35,15 @@ use crate::table_store::TableStore;
 /// proof both change surfaces rely on: per field, its Arrow type, nullability,
 /// stable property identity marker, and whether it is a Blob. Name-keyed map
 /// comparison is order-insensitive, so a physical column reorder is not a false
-/// boundary. Shared by the per-commit enumerator (parent→child gate) and the
-/// cross-branch net diff so the two cannot drift.
+/// boundary. The system roles are keyed by role (`@id`, `@src`, `@dst`), not
+/// by the spelling `system_columns` resolved for this image, so the two
+/// vintages of one table fingerprint equal. The upgrade belongs to RFC 0040
+/// Rollout step 3. Shared by the per-commit enumerator (parent→child
+/// gate) and the cross-branch net diff so the two cannot drift.
 pub(crate) fn user_schema_fingerprint(
     dataset: &Dataset,
+    system_columns: SystemColumns,
+    is_edge: bool,
 ) -> HashMap<String, (String, bool, Option<String>, bool)> {
     dataset
         .schema()
@@ -45,7 +52,8 @@ pub(crate) fn user_schema_fingerprint(
         .filter(|field| !is_reserved_storage_system_column(&field.name))
         .map(|field| {
             (
-                field.name.clone(),
+                column_name_at_vintage(&field.name, system_columns, SYSTEM_COLUMNS_META, is_edge)
+                    .to_string(),
                 (
                     format!("{:?}", field.data_type()),
                     field.nullable,
@@ -502,6 +510,48 @@ pub(crate) async fn rows_equal(
     to_dataset: &Dataset,
     right: &RawRow,
 ) -> Result<bool> {
+    rows_equal_by_column(from_dataset, left, to_dataset, right, |name| name).await
+}
+
+pub(crate) async fn rows_equal_across_vintages(
+    from_dataset: &Dataset,
+    left: &RawRow,
+    to_dataset: &Dataset,
+    right: &RawRow,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
+) -> Result<bool> {
+    rows_equal_by_column(from_dataset, left, to_dataset, right, |name| {
+        column_name_at_vintage(name, from_columns, to_columns, is_edge)
+    })
+    .await
+}
+
+fn column_name_at_vintage(
+    name: &str,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
+) -> &str {
+    if name == from_columns.id {
+        to_columns.id
+    } else if is_edge && name == from_columns.src {
+        to_columns.src
+    } else if is_edge && name == from_columns.dst {
+        to_columns.dst
+    } else {
+        name
+    }
+}
+
+async fn rows_equal_by_column(
+    from_dataset: &Dataset,
+    left: &RawRow,
+    to_dataset: &Dataset,
+    right: &RawRow,
+    right_name: impl Fn(&str) -> &str,
+) -> Result<bool> {
     let blob_columns: HashSet<&str> = left
         .blob_signatures
         .iter()
@@ -518,11 +568,14 @@ pub(crate) async fn rows_equal(
         if is_reserved_storage_system_column(name) || blob_columns.contains(name.as_str()) {
             continue;
         }
-        let other = right.slice.column_by_name(name).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "schema-gated change row is missing column '{name}'"
-            ))
-        })?;
+        let other = right
+            .slice
+            .column_by_name(right_name(name))
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "schema-gated change row is missing column '{name}'"
+                ))
+            })?;
         if column.to_data() != other.to_data() {
             return Ok(false);
         }

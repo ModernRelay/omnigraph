@@ -1075,8 +1075,8 @@ node Thing {
     value: String
 }
 "#;
-    const DUPLICATES: &str = r#"{"type":"Thing","data":{"__id":"DUP","value":"first"}}
-{"type":"Thing","data":{"__id":"DUP","value":"second"}}
+    const DUPLICATES: &str = r#"{"type":"Thing","id":"DUP","data":{"value":"first"}}
+{"type":"Thing","id":"DUP","data":{"value":"second"}}
 "#;
 
     for mode in [LoadMode::Append, LoadMode::Overwrite] {

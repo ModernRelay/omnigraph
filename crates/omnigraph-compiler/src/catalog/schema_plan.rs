@@ -907,7 +907,8 @@ fn plan_constraints(
                 entity: format!("{}:{}", schema_type_kind_key(type_kind), type_name),
                 reason: format!(
                     "adding constraint '{}' to '{}' is not supported in schema migration v1",
-                    key, type_name
+                    constraint_from_ir(&constraint, system_columns),
+                    type_name
                 ),
                 code: None,
             }),
@@ -1215,7 +1216,7 @@ edge Knows: Person -> Person {
 node Person { name: String @key }
 edge Knows: Person -> Person {
     since: String?
-    @key(src, dst)
+    @key(@src, @dst)
 }
 "#,
         );
@@ -1679,6 +1680,14 @@ node Pair {
 
     #[test]
     fn plan_classifies_property_constraint_provenance_and_satisfaction_changes() {
+        let accepted = ir("node N { value: String } edge E: N -> N {}");
+        let desired = evolve(
+            &accepted,
+            "node N { value: String } edge E: N -> N { @unique(@src, @dst) }",
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.steps.iter().any(|step| matches!(step, UnsupportedChange { reason, .. }
+            if reason == "adding constraint '@unique(@dst, @src)' to 'E' is not supported in schema migration v1")));
         let accepted = ir("node N { value: String @unique }");
         let desired = evolve(&accepted, "node N { value: String @unique(value) }");
         let plan = plan_schema_migration(&accepted, &desired).unwrap();

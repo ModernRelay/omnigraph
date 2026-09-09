@@ -19,6 +19,8 @@ use super::publisher::{
 };
 use super::state::read_publish_scan;
 use super::*;
+#[cfg(feature = "failpoints")]
+use crate::db::Omnigraph;
 use crate::error::{ManifestConflictDetails, ManifestError, StorageFailureKind};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -213,36 +215,124 @@ async fn test_init_creates_manifest_and_sub_tables() {
 
 #[tokio::test]
 async fn exact_genesis_probe_rejects_another_initialization_attempt() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let catalog = build_test_catalog();
-    let control_session = crate::lance_access::control_session();
-    let committed_attempt = GenesisManifestAttempt::mint().unwrap();
+    for system_columns in [SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let current = build_test_catalog();
+        let mut schema_ir = current.bound_schema_ir().unwrap().clone();
+        if system_columns == SYSTEM_COLUMNS_LEGACY {
+            schema_ir
+                .features
+                .remove(omnigraph_compiler::FEATURE_SYSTEM_COLUMNS);
+            schema_ir.ir_version = omnigraph_compiler::required_ir_version(&schema_ir.features);
+        }
+        let catalog = build_catalog_from_ir(&schema_ir).unwrap();
+        assert_eq!(catalog.system_columns, system_columns);
+        let control_session = crate::lance_access::control_session();
+        let committed_attempt = GenesisManifestAttempt::mint(catalog.system_columns).unwrap();
 
-    ManifestCoordinator::init_commit(uri, &catalog, &control_session, &committed_attempt)
-        .await
-        .unwrap();
-    ManifestCoordinator::open_exact_genesis_with_lineage(uri, &committed_attempt, &control_session)
+        ManifestCoordinator::init_commit(uri, &catalog, &control_session, &committed_attempt)
+            .await
+            .unwrap();
+        ManifestCoordinator::open_exact_genesis_with_lineage(
+            uri,
+            &committed_attempt,
+            &control_session,
+        )
         .await
         .expect("the creating attempt must authenticate its own immutable genesis");
 
-    let foreign_attempt = GenesisManifestAttempt::mint().unwrap();
-    let error = match ManifestCoordinator::open_exact_genesis_with_lineage(
-        uri,
-        &foreign_attempt,
-        &control_session,
-    )
-    .await
-    {
-        Ok(_) => panic!("a valid v1 manifest from another initializer must not authenticate"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("genesis lineage does not match this initialization attempt"),
-        "unexpected probe error: {error:?}"
-    );
+        let foreign_attempt = GenesisManifestAttempt::mint(catalog.system_columns).unwrap();
+        let error = match ManifestCoordinator::open_exact_genesis_with_lineage(
+            uri,
+            &foreign_attempt,
+            &control_session,
+        )
+        .await
+        {
+            Ok(_) => panic!("a valid v1 manifest from another initializer must not authenticate"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("genesis lineage does not match this initialization attempt"),
+            "unexpected probe error: {error:?}"
+        );
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
+    let _scenario = crate::failpoints::FailScenario::setup();
+    for legacy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = "node Person { name: String }\n";
+        let db = if legacy {
+            Omnigraph::init_with_legacy_system_columns_for_tests(uri, schema)
+                .await
+                .unwrap()
+        } else {
+            Omnigraph::init(uri, schema).await.unwrap()
+        };
+        drop(db);
+        let mut manifest = open_manifest_dataset(uri, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut manifest, if legacy { 9 } else { 8 })
+            .await
+            .unwrap();
+        let before_version = manifest.version().version;
+        let reached_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let test_thread = std::thread::current().id();
+        let _probes = (!legacy).then(|| {
+            [
+                crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE,
+                crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+            ]
+            .map(|name| {
+                let reached_effects = Arc::clone(&reached_effects);
+                crate::failpoints::ScopedFailPoint::with_callback(name, move || {
+                    if std::thread::current().id() == test_thread {
+                        reached_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+        });
+        for mode in [
+            crate::db::OpenMode::ReadOnly,
+            crate::db::OpenMode::ReadWrite,
+        ] {
+            let result = match mode {
+                crate::db::OpenMode::ReadOnly => Omnigraph::open_read_only(uri).await,
+                crate::db::OpenMode::ReadWrite => Omnigraph::open(uri).await,
+            };
+            if legacy {
+                result.expect("stamp-first upgrade window must preserve legacy reads");
+            } else {
+                let error = result
+                    .err()
+                    .expect("current system columns require stamp 9");
+                assert!(
+                    error.to_string().contains("expected at least v9"),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                reached_effects.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unsupported system columns must refuse before the local write probe or recovery"
+            );
+            assert_eq!(
+                open_manifest_dataset(uri, None)
+                    .await
+                    .unwrap()
+                    .version()
+                    .version,
+                before_version
+            );
+        }
+    }
 }
 
 #[tokio::test]

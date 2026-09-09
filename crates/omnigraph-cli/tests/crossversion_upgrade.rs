@@ -137,12 +137,77 @@ fn canonical_export_rows(bytes: &[u8]) -> Vec<String> {
         .map(|line| {
             let mut value =
                 serde_json::from_str::<serde_json::Value>(line).expect("valid export JSONL");
+            relocate_legacy_export_identity(&mut value);
             normalize_f32_and_nulls(&mut value);
+            value.sort_all_objects();
             value.to_string()
         })
         .collect::<Vec<_>>();
     rows.sort();
     rows
+}
+
+fn export_for_rebuild(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .expect("export JSONL must be UTF-8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut value = serde_json::from_str(line).expect("valid export JSONL");
+            relocate_legacy_export_identity(&mut value);
+            format!("{value}\n")
+        })
+        .collect()
+}
+
+/// RFC 0040 exports identity beside `type`/`edge`; predecessor exports put it in `data`.
+fn relocate_legacy_export_identity(value: &mut serde_json::Value) {
+    let envelope = value.as_object_mut().expect("export record object");
+    if !envelope.contains_key("id") {
+        let identity = envelope
+            .get_mut("data")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|data| data.remove("id"))
+            .expect("legacy export identity");
+        envelope.insert("id".to_string(), identity);
+    }
+}
+
+#[test]
+fn canonical_export_rows_preserves_identity_across_envelopes() {
+    let legacy = br#"{"type":"Doc","data":{"id":"doc-1","title":"hello"}}"#;
+    let current = br#"{"type":"Doc","id":"doc-1","data":{"title":"hello"}}"#;
+    assert_eq!(
+        canonical_export_rows(legacy),
+        canonical_export_rows(current)
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&export_for_rebuild(legacy)).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(current).unwrap()
+    );
+    let edge = br#"{"edge":"links","from":"doc-1","to":"doc-2","data":{"id":"edge-1","weight":1.234567890123,"optional":null}}"#;
+    let rebuilt_edge: serde_json::Value = serde_json::from_str(&export_for_rebuild(edge)).unwrap();
+    assert_eq!(rebuilt_edge["id"], "edge-1");
+    assert_eq!(rebuilt_edge["from"], "doc-1");
+    assert_eq!(rebuilt_edge["to"], "doc-2");
+    assert_eq!(
+        rebuilt_edge["data"],
+        serde_json::json!({"weight": 1.234567890123, "optional": null})
+    );
+    let changed = br#"{"type":"Doc","id":"doc-2","data":{"title":"hello"}}"#;
+    assert_ne!(
+        canonical_export_rows(legacy),
+        canonical_export_rows(changed)
+    );
+    let user_id = br#"{"type":"Doc","id":"doc-1","data":{"id":"user-1","title":"hello"}}"#;
+    assert_ne!(
+        canonical_export_rows(current),
+        canonical_export_rows(user_id)
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&export_for_rebuild(user_id)).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(user_id).unwrap()
+    );
 }
 
 /// Every predecessor binary exported an F32 cell as widened 64-bit digits and
@@ -188,9 +253,8 @@ fn assert_exported_blob_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {
     );
 }
 
-/// Format v6 activates RFC-023 by installing exactly `id` as the unenforced
-/// Lance primary key on every graph dataset. Assert the rebuilt image crossed
-/// that physical boundary, which the current storage format preserves.
+/// Rebuilt graphs use `__id` as the unenforced Lance primary key (RFC 0040),
+/// preserving the primary-key contract introduced by format v6 (RFC 0023).
 fn assert_rebuilt_graph_datasets_use_exact_id_pk(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
@@ -337,7 +401,7 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
     assert_ok("export", &export);
     assert!(!export.stdout.is_empty(), "old export produced no rows");
     let v3_jsonl = temp.path().join("v3.jsonl");
-    std::fs::write(&v3_jsonl, &export.stdout).unwrap();
+    std::fs::write(&v3_jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     // 3. The CURRENT binary refuses the genuine v3 graph, names the writing
     //    release, and nudges to export — on the real on-disk shape.
@@ -422,7 +486,7 @@ fn current_v8_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v8() {
     let export = run_old(&previous, &["export", old_uri]);
     assert_ok("v4 export", &export);
     let jsonl = temp.path().join("v4.jsonl");
-    std::fs::write(&jsonl, &export.stdout).unwrap();
+    std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     let refusal = output_failure(cli().arg("snapshot").arg(&old_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
@@ -526,7 +590,7 @@ fn current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8() {
     assert_ok("v5 export", &export);
     assert!(!export.stdout.is_empty(), "v5 export produced no rows");
     let jsonl = temp.path().join("v5.jsonl");
-    std::fs::write(&jsonl, &export.stdout).unwrap();
+    std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     let refusal = output_failure(cli().arg("snapshot").arg(&v5_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
@@ -557,7 +621,11 @@ fn current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8() {
     duplicate_export.push_str(duplicate_line);
     duplicate_export.push('\n');
     let duplicate_jsonl = temp.path().join("v5-duplicate-id.jsonl");
-    std::fs::write(&duplicate_jsonl, duplicate_export).unwrap();
+    std::fs::write(
+        &duplicate_jsonl,
+        export_for_rebuild(duplicate_export.as_bytes()),
+    )
+    .unwrap();
 
     let rejected_graph = temp.path().join("rejected-v8-from-v5.omni");
     output_success(
@@ -691,7 +759,7 @@ fn current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8() {
     assert_ok("v6 export", &export);
     assert!(!export.stdout.is_empty(), "v6 export produced no rows");
     let jsonl = temp.path().join("v6.jsonl");
-    std::fs::write(&jsonl, &export.stdout).unwrap();
+    std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     let refusal = output_failure(cli().arg("snapshot").arg(&v6_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
@@ -979,7 +1047,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     let rebuilt_uri = rebuilt.to_str().unwrap();
     for (i, branch) in ["main", "review"].into_iter().enumerate() {
         let jsonl = temp.path().join(format!("v09-{branch}.jsonl"));
-        fs::write(&jsonl, &exports[i]).unwrap();
+        fs::write(&jsonl, export_for_rebuild(&exports[i])).unwrap();
         let mut load = cli();
         load.args(["load", "--mode", "overwrite", "--data"])
             .arg(&jsonl)

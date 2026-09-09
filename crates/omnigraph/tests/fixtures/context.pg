@@ -68,11 +68,11 @@ edge CitedIn: Artifact -> Trace
 edge Triggered: Signal -> Decision
 
 edge Correlates: Signal -> Signal {
-    @unique(__src, __dst)
+    @unique(@src, @dst)
 }
 
 // ── Decision lineage ─────────────────────────────────
 
 edge Supersedes: Decision -> Decision {
-    @unique(__src, __dst)
+    @unique(@src, @dst)
 }

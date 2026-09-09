@@ -4,7 +4,7 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
-use crate::catalog::schema_ir::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
+use crate::catalog::schema_ir::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_META, SYSTEM_COLUMNS_V3};
 use crate::error::{
     CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
@@ -140,15 +140,18 @@ fn is_implicit_edge_column_ref(
         && !prop_names.contains_key(col)
         && (col == SYSTEM_COLUMNS_LEGACY.src
             || col == SYSTEM_COLUMNS_LEGACY.dst
-            || col == SYSTEM_COLUMNS_V3.src
-            || col == SYSTEM_COLUMNS_V3.dst)
+            || col == META_SRC
+            || col == META_DST)
 }
 
-/// New schema admission reserves the whole leading-underscore namespace for
-/// system columns (RFC 0040): engine-owned names take the `__` prefix, the
-/// single-underscore space stays with the storage substrate, and no name is
-/// ever reserved individually again. Legacy-vintage evolution and persisted
-/// contracts keep their historical rules instead (see [`PropertyNameRules`]).
+/// Meta-field spellings (RFC 0040): the role-named form a constraint list uses
+/// on every vintage, which no user property can collide with.
+const META_SRC: &str = SYSTEM_COLUMNS_META.src;
+const META_DST: &str = SYSTEM_COLUMNS_META.dst;
+
+/// Rejects property names reserved for system columns. New schema admission
+/// reserves the whole leading-underscore namespace (RFC 0040); legacy-vintage
+/// evolution keeps its historical per-name rules (see [`PropertyNameRules`]).
 fn validate_property_names(schema: &SchemaFile, rules: PropertyNameRules) -> Result<()> {
     let reject_lance_names = |name: &str| -> Result<()> {
         if super::is_reserved_storage_system_column(name) {
@@ -180,8 +183,8 @@ fn validate_property_names(schema: &SchemaFile, rules: PropertyNameRules) -> Res
                     if collides {
                         return Err(CompilerError::Parse(format!(
                             "property name '{name}' collides with this graph's physical \
-                             column of the same name; the system column upgrade (RFC 0040) \
-                             frees the name"
+                             column of the same name; only graphs created with the system-columns feature \
+                             admit this property"
                         )));
                     }
                     let current = SYSTEM_COLUMNS_V3;
@@ -444,13 +447,14 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
     }
 }
 
+/// Extracts the name a constraint argument gives. A `constraint_arg` wraps an
+/// `ident`, a `@role` meta-field, or a literal; only the first two are names.
 fn extract_ident_from_constraint_arg(pair: pest::iterators::Pair<Rule>) -> Result<String> {
     if pair.as_rule() == Rule::ident {
         return Ok(pair.as_str().to_string());
     }
-    // constraint_arg wraps ident or literal
     if let Some(inner) = pair.into_inner().next() {
-        if inner.as_rule() == Rule::ident {
+        if inner.as_rule() == Rule::ident || inner.as_rule() == Rule::meta_field {
             return Ok(inner.as_str().to_string());
         }
     }
@@ -896,11 +900,7 @@ fn validate_property_annotations(
     all_properties: &[PropDecl],
     is_edge: bool,
 ) -> Result<()> {
-    // Logical system-column and endpoint-parameter names on edges: a property
-    // with one of these names would shadow the physical column (the Arrow
-    // schema gains a duplicate field) or collide with the insert's from/to
-    // parameter namespace, splitting identity between write doors.
-    if is_edge && matches!(prop.name.as_str(), "id" | "src" | "dst" | "from" | "to") {
+    if is_edge && matches!(prop.name.as_str(), "from" | "to") {
         return Err(CompilerError::Parse(format!(
             "property name '{}' is reserved on edge types ({}.{})",
             prop.name, type_name, prop.name
@@ -1122,6 +1122,37 @@ fn validate_type_constraints(
     let mut key_count = 0usize;
 
     for constraint in constraints {
+        let members = match constraint {
+            Constraint::Key(cols) | Constraint::Unique(cols) | Constraint::Index(cols) => {
+                cols.as_slice()
+            }
+            Constraint::Range { property, .. } | Constraint::Check { property, .. } => {
+                std::slice::from_ref(property)
+            }
+        };
+        for member in members {
+            if member == SYSTEM_COLUMNS_META.id {
+                return Err(CompilerError::Parse(format!(
+                    "constraint on {type_name} cannot reference '@id'; the identity is already the row key"
+                )));
+            }
+            if !prop_names.contains_key(member.as_str()) {
+                let meta = if member == SYSTEM_COLUMNS_V3.id {
+                    Some(SYSTEM_COLUMNS_META.id)
+                } else if is_edge && member == SYSTEM_COLUMNS_V3.src {
+                    Some(META_SRC)
+                } else if is_edge && member == SYSTEM_COLUMNS_V3.dst {
+                    Some(META_DST)
+                } else {
+                    None
+                };
+                if let Some(meta) = meta {
+                    return Err(CompilerError::Parse(format!(
+                        "constraint on {type_name} references storage column '{member}'; the system field is '{meta}'"
+                    )));
+                }
+            }
+        }
         match constraint {
             Constraint::Key(cols) => {
                 key_count += 1;
@@ -1142,17 +1173,22 @@ fn validate_type_constraints(
                     }
                 }
                 if is_edge {
-                    for endpoint in ["src", "dst"] {
-                        if !cols.iter().any(|col| col == endpoint) {
+                    for (meta, bare) in [
+                        (META_SRC, SYSTEM_COLUMNS_LEGACY.src),
+                        (META_DST, SYSTEM_COLUMNS_LEGACY.dst),
+                    ] {
+                        if !cols.iter().any(|col| {
+                            col == meta || (col == bare && !prop_names.contains_key(col.as_str()))
+                        }) {
                             return Err(CompilerError::Parse(format!(
                                 "@key on edge {} must include both endpoints (missing '{}')",
-                                type_name, endpoint
+                                type_name, meta
                             )));
                         }
                     }
                 }
                 for col in cols {
-                    if is_edge && (col == "src" || col == "dst") {
+                    if is_edge && is_implicit_edge_column_ref(col, is_edge, &prop_names) {
                         continue;
                     }
                     let prop = prop_names.get(col.as_str()).ok_or_else(|| {

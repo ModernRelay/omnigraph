@@ -616,16 +616,9 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
         (AddEdge, AddEdge) => mk(
             InsertAliceCarol,
             InsertAliceCarol,
-            // Both sides insert the same logical edge but each generates a
-            // fresh ULID id, so the merge sees two distinct rows with the
-            // same (src, dst) pair and keeps both: the documented multiset
-            // default for unkeyed edge types. Declaring `@key(src, dst)`
-            // opts into convergence instead (RFC 0044); the keyed twin
-            // `add_edge_add_edge_keyed_twin_converges` asserts it. This
-            // cell pins the unkeyed contract.
             Expected::Merged(GraphAssert {
                 persons: 4,
-                knows_edges: 3,
+                knows_edges: 3, // Independent ULIDs retain both unkeyed edges (RFC 0044).
                 alice_age: Some(30),
                 eve_present: false,
             }),
@@ -1098,14 +1091,13 @@ node Person {
 }
 
 edge Knows: Person -> Person {
-    @key(src, dst)
+    @key(@src, @dst)
 }
 "#;
 
-/// The keyed twin of the `(AddEdge, AddEdge)` cell: with `@key(src, dst)`
-/// declared, both sides insert Alice→Carol, the ids derive equal, and the
-/// merge converges to one row instead of keeping both. The matrix cell
-/// pins the unkeyed multiset default; this twin pins the opt-in.
+/// The keyed twin of the `(AddEdge, AddEdge)` cell: with `@key(@src, @dst)`,
+/// both sides insert Alice→Carol, the ids derive equal, and the merge converges
+/// to one row instead of keeping both — the cell pins the unkeyed default.
 #[tokio::test]
 async fn add_edge_add_edge_keyed_twin_converges() {
     let dir = tempfile::tempdir().unwrap();

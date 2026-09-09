@@ -10,15 +10,20 @@ version axes. Never derive one axis from another.
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
 | CLI ↔ server wire | Prefer additive changes; documented breaking release boundaries require coordinated upgrades. No global version handshake. | Shared DTOs, OpenAPI drift tests, and release-specific migration guidance. |
-| Graph storage | Current-format serving; explicit registered upgrades, otherwise rebuild. | Main-manifest stamp with `MIN_SUPPORTED == CURRENT`. |
+| Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, one value per system column vintage; explicit registered upgrades into the floor, otherwise rebuild; no open-time migration. | Main-manifest stamp guard on both bounds. |
 | Recovery sidecar | Independently versioned persisted protocol. | Sidecar grammar/version refusal before classification. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
 
-Normal graph open and new writes require **internal manifest schema v8**.
-`INTERNAL_MANIFEST_SCHEMA_VERSION` and `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`
-are both 8.
+The current binary serves **internal manifest schema v8 and v9**:
+`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` is 8 and
+`INTERNAL_MANIFEST_SCHEMA_VERSION` is 9. The two values are the two system
+column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.md): a
+supported existing graph with legacy spellings `id`/`src`/`dst` retains stamp 8,
+and every registered upgrade route ends there. New graphs use
+`__id`/`__src`/`__dst` and stamp 9. The stamp is a storage-format fence for
+older binaries; the vintage itself is read from the schema IR's feature set.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -39,19 +44,26 @@ are both 8.
   expose retired branches; they must refuse v8 graphs before reading or
   reclaiming their storage. Qualified v7 graphs have an explicit metadata-only
   upgrade to v8.
+- v9 preserves v8's `__manifest` layout and retirement metadata and marks the
+  RFC 0040 system column spellings `__id`/`__src`/`__dst` in every node and
+  edge table. A v8 graph retains its stamp. RFC 0040 defines an in-place
+  upgrade in Rollout step 3, which is not available in this build.
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
   and are not supported migration inputs. Reuse of a numeric stamp by another
-  design does not make an experimental graph compatible. Such graphs require
-  export with the build that wrote them and rebuild at a fresh root.
+  design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
+  compatible. Such graphs require export with the build that wrote them and
+  rebuild at a fresh root.
 
-Normal open refuses lower and higher stamps before recovery or table decoding.
+Normal open refuses lower and higher stamps before recovery or table decoding;
+neither served stamp is rewritten on open.
 `omnigraph upgrade` defaults to v8: qualified standalone v6 graphs run the
-registered v6 → v7 → v8 route, and qualified v7 graphs run v7 → v8.
-Original retained snapshots remain unchanged; historical v6 registrations use
-an explicit legacy decoder after main-root admission. A pending upgrade marker
-refuses normal opens until every branch validates and main activation completes.
-Explicit `--to-format 7` retains the intermediate target for a v7-compatible
-executable; the current binary still refuses normal open of that result.
+registered v6 → v7 → v8 route, and qualified v7 graphs run v7 → v8. No route
+targets v9. Original retained snapshots remain unchanged; historical v6
+registrations use an explicit legacy decoder after main-root admission. A
+pending upgrade marker refuses normal opens until every branch validates and
+main activation completes. Explicit `--to-format 7` retains the intermediate
+target for a v7-compatible executable; the current binary still refuses normal
+open of that result.
 See [RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) for the offline protocol.
 
 ## Recovery version
@@ -87,7 +99,8 @@ effects. Operators must stop all writers and maintenance and preserve a
 restorable backup before execution.
 Cluster-managed conversion is refused until its admission protocol is qualified.
 
-Other source formats still require export with the source executable, fresh
+Other source formats still require export with the source executable,
+relocation of each record's `data.id` into top-level `id`, fresh
 initialization and load. Rebuild preserves logical values but intentionally
 restarts physical history and identities. See
 [the upgrade guide](../user/operations/upgrade.md).
@@ -107,11 +120,12 @@ see the [admission limits](../user/operations/upgrade.md).
 | 0.9.0 / v6 | Refused | v6 → v7 → v8 | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history` |
 | 0.10.0 / v6 | Refused | v6 → v7 → v8 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
 | Qualified development / v7 | Refused | v7 → v8 | Engine storage-upgrade tests: metadata-only conversion, history and retry |
-| Current / v8 | Accepted | Already-current no-op | Both predecessor journeys after conversion; engine retired-ref admission tests |
+| Legacy vintage / v8 | Accepted | Already-current no-op | Both predecessor journeys after conversion; engine retired-ref admission tests |
+| Current / v9 | Accepted | No route; already the newest vintage | Engine legacy-column and stamp tests (`legacy_columns.rs`, `migrations.rs`) |
 | Older, future or unqualified experimental format | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
 
 Source v6/v7 admission rejects any reserved native-ref retirement metadata.
-Current v8 no-op admission validates retirement markers and excludes valid
+v8 no-op admission validates retirement markers and excludes valid
 retired refs from the logical branch census while preserving physical ancestry.
 An active v7-to-v8 attempt cannot be resumed as target v7.
 
@@ -158,7 +172,9 @@ GitHub Releases, and the TypeScript SDK ships through npm. Do not document
 ### Graph storage
 
 1. Write an RFC for the irreversible format decision.
-2. Bump the manifest stamp and keep normal-open `MIN_SUPPORTED == CURRENT`.
+2. Bump the manifest stamp. Raise `MIN_SUPPORTED` with it unless every lower
+   served stamp keeps a meaning the binary reads (as v8 and v9 do for the
+   system column vintages); never lower the floor without a real converter.
    Register explicit conversion separately from serving admission.
 3. Refuse old/future formats before decoding.
 4. Add genuine predecessor evidence for every declared direct or migration route,

@@ -366,7 +366,7 @@ impl Omnigraph {
     /// system column vintage, producing physically legacy-shaped tables
     /// (`id`/`src`/`dst`). Exists so integration suites can exercise a real
     /// pre-RFC-0040 graph end to end.
-    #[cfg(feature = "failpoints")]
+    #[cfg(any(test, feature = "failpoints"))]
     pub async fn init_with_legacy_system_columns_for_tests(
         uri: &str,
         schema_source: &str,
@@ -413,11 +413,26 @@ impl Omnigraph {
         // `init` can mutate a populated graph root.
         preflight_init_target(&root, storage.as_ref(), options).await?;
 
-        let schema_shape = read_schema_shape_from_source(schema_source)?;
-        let resolution = initialize_schema_ir(
-            SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid()),
-            &schema_shape,
-        )
+        let system_columns = if legacy_system_columns {
+            omnigraph_compiler::SYSTEM_COLUMNS_LEGACY
+        } else {
+            omnigraph_compiler::SYSTEM_COLUMNS_V3
+        };
+        let schema_shape = read_schema_shape_for_vintage(schema_source, system_columns)?;
+        let domain = SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid());
+        let resolution = if legacy_system_columns {
+            let empty_shape = read_schema_shape_from_source("")?;
+            let mut accepted = initialize_schema_ir(domain, &empty_shape)
+                .map_err(|error| OmniError::manifest(error.to_string()))?
+                .schema_ir;
+            accepted
+                .features
+                .remove(omnigraph_compiler::FEATURE_SYSTEM_COLUMNS);
+            accepted.ir_version = omnigraph_compiler::required_ir_version(&accepted.features);
+            omnigraph_compiler::resolve_schema_ir(&accepted, &schema_shape)
+        } else {
+            initialize_schema_ir(domain, &schema_shape)
+        }
         .map_err(|error| OmniError::manifest(error.to_string()))?;
         for diagnostic in &resolution.diagnostics {
             tracing::warn!(
@@ -428,15 +443,7 @@ impl Omnigraph {
                 "schema identity hint is inert during graph initialization"
             );
         }
-        let mut schema_ir = resolution.schema_ir;
-        if legacy_system_columns {
-            schema_ir
-                .features
-                .remove(omnigraph_compiler::FEATURE_SYSTEM_COLUMNS);
-            schema_ir.ir_version = omnigraph_compiler::required_ir_version(&schema_ir.features);
-            omnigraph_compiler::validate_schema_ir(&schema_ir)
-                .map_err(|error| OmniError::manifest(error.to_string()))?;
-        }
+        let schema_ir = resolution.schema_ir;
         let accepted_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&schema_ir)
             .map_err(|error| OmniError::manifest(error.to_string()))?;
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
@@ -505,7 +512,7 @@ impl Omnigraph {
             true
         };
 
-        let genesis_attempt = match GenesisManifestAttempt::mint() {
+        let genesis_attempt = match GenesisManifestAttempt::mint(catalog.system_columns) {
             Ok(attempt) => attempt,
             Err(err) => {
                 best_effort_cleanup_owned_init_artifacts(&root, storage.as_ref(), &init_claim)
@@ -689,15 +696,20 @@ impl Omnigraph {
         // storage format this binary does not read — rebuild via export/import).
         // Both open modes refuse: there is no in-place migration, and the check is
         // a stamp read with no object-store writes, so it is safe under ReadOnly.
-        crate::db::manifest::refuse_if_internal_schema_unsupported(&root).await?;
+        let internal_schema_version =
+            crate::db::manifest::read_supported_internal_schema_version(&root).await?;
         // Hold the same schema gate through format preflight and contract
         // capture. A v3 live or staged IR must refuse before the local write
         // probe, coordinator open, or either recovery sweep can change files.
         let schema_contract_guard = write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        crate::db::schema_state::refuse_unsupported_schema_versions(&root, storage.as_ref())
-            .await?;
+        crate::db::schema_state::refuse_unsupported_schema_versions(
+            &root,
+            storage.as_ref(),
+            internal_schema_version,
+        )
+        .await?;
         // Read-write opens write before the first user mutation (recovery
         // sweeps, schema-stamp migration), and every write needs atomic
         // create-if-absent; read-only opens perform no writes.
@@ -780,6 +792,12 @@ impl Omnigraph {
         validate_schema_ir_against_snapshot(&accepted_ir, &coordinator.snapshot())?;
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
+        let required_stamp = crate::db::manifest::stamp_for_system_columns(catalog.system_columns);
+        if internal_schema_version < required_stamp {
+            return Err(OmniError::manifest(format!(
+                "graph internal schema v{internal_schema_version} cannot serve the accepted system columns; expected at least v{required_stamp}"
+            )));
+        }
         fixup_physical_schemas(&mut catalog)?;
 
         let session = lance_access.data_session();
@@ -2515,7 +2533,6 @@ impl Omnigraph {
             filter,
             to_resolved.branch.clone().or(from_resolved.branch.clone()),
             to_resolved.graph_commit_id.clone(),
-            self.catalog().system_columns,
         )
         .await
     }
@@ -2561,7 +2578,6 @@ impl Omnigraph {
             filter,
             to_snap.branch.clone().or(from_snap.branch.clone()),
             to_snap.graph_commit_id.clone(),
-            self.catalog().system_columns,
         )
         .await
     }
@@ -2655,7 +2671,6 @@ impl Omnigraph {
             resume.as_ref(),
             &mut budget,
             &mut changes,
-            self.catalog().system_columns,
         )
         .await
         .map_err(map_gap)?;
@@ -2780,7 +2795,6 @@ impl Omnigraph {
             &graph_identity,
             &cut,
             &request,
-            self.catalog().system_columns,
         )
         .await
     }
@@ -3759,7 +3773,11 @@ pub(crate) fn read_schema_shape_for_vintage(
         schema_source,
         system_columns,
     )?;
-    compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+    let shape =
+        compile_schema_shape(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))?;
+    Ok(shape
+        .canonicalized_for_system_columns(system_columns)
+        .into_owned())
 }
 
 /// Root-scoped durable ownership for graph initialization.

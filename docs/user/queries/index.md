@@ -87,6 +87,20 @@ free-text String index accelerates exact prefix or substring filters.
 Use [full-text search](../search/index.md) for tokenization, fuzzy matching, and
 relevance ranking.
 
+### System fields
+
+A node's identity and an edge's endpoints are system fields, read through
+`@`-prefixed meta-fields that no user property can shadow: `$p.@id` is the
+identity of any binding, `$e.@src` and `$e.@dst` the endpoints of a bound
+edge. They work in filters, projections, and orderings (`$p.@id = $who`,
+`return { $p.@id }`, `order { $p.@id asc }`) and answer on every graph,
+whatever the stored column is called. In a mutation predicate, which carries
+no binding, the bare form serves: `delete Person where @id = $who`,
+`delete Knows where @src = $who`. A bare `id` (`$p.id`, `where id = ...`)
+always names a user property called `id`; where none is declared it is the
+unknown-property error, which names the meta-field. Edge inserts keep
+addressing endpoints as `from` and `to`.
+
 ## Return, order, and limit
 
 ```gq
@@ -102,13 +116,13 @@ column and return the column's own type; `Bool` orders `false` before `true`,
 dates and datetimes chronologically. When no row matches, a query whose
 projections are all aggregates returns one row: `count` is 0 and every other
 aggregate is null; a query that also projects a group value returns no rows.
-A bare node variable returns the node as one object: its `id` and every
+A bare node variable returns the node as one object: its `@id` and every
 property except `Blob` and `Vector` ones, so `return { $p }` gives a column
-`p` holding `{"id": "alice", "name": "alice", "age": 30}`; project a property
+`p` holding `{"@id": "alice", "name": "alice", "age": 30}`; project a property
 (`$p.name`, `$p.embedding`) for a single field. `count($p)` counts rows; the
 other aggregates take a property, not a bare node binding (`T8`). Each
 projection produces one result column, named by its alias or, without one,
-by its expression (`$p.name` gives `p.name`). Two projections that would
+by its expression (`$p.name` gives `p.name`, `$p.@id` gives `p.@id`). Two projections that would
 produce the same column name are refused at compile time (`T25`); give each
 its own alias.
 Search expressions are documented in [Search](../search/index.md).

@@ -17,7 +17,7 @@ use super::layout::{
     open_manifest_dataset_with_identifier_with_session, open_manifest_dataset_with_session,
 };
 use super::metadata::TableVersionMetadata;
-use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, current_stamp_entry, guard_stamp};
+use super::migrations::{guard_stamp, stamp_entry, stamp_for_system_columns};
 use super::state::{
     DatasetEntry, GraphLineageRow, ManifestState, entries_to_batch, graph_lineage_row_parts,
     manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
@@ -38,12 +38,13 @@ const GENESIS_MANIFEST_VERSION: u64 = 1;
 #[derive(Debug, Clone)]
 pub(crate) struct GenesisManifestAttempt {
     lineage: GraphLineageRow,
+    stamp: u32,
 }
 
 impl GenesisManifestAttempt {
     /// Mint the receipt before invoking the manifest Create operation so the
     /// caller retains enough information to classify a lost acknowledgement.
-    pub(crate) fn mint() -> Result<Self> {
+    pub(crate) fn mint(system_columns: SystemColumns) -> Result<Self> {
         Ok(Self {
             lineage: GraphLineageRow {
                 graph_commit_id: crate::dst_ids::new_ulid().to_string(),
@@ -54,6 +55,7 @@ impl GenesisManifestAttempt {
                 actor_id: None,
                 created_at: crate::db::now_micros()?,
             },
+            stamp: stamp_for_system_columns(system_columns),
         })
     }
 
@@ -120,7 +122,7 @@ pub(super) async fn init_manifest_graph(
     // with nothing failable after it. (A `table_version_management` config
     // key is deliberately not written: neither the pinned Lance substrate nor
     // this crate reads it.)
-    let (stamp_key, stamp_value) = current_stamp_entry();
+    let (stamp_key, stamp_value) = stamp_entry(attempt.stamp);
     let schema: SchemaRef = Arc::new(
         manifest_schema()
             .as_ref()
@@ -185,11 +187,12 @@ pub(super) async fn open_exact_genesis_manifest(
         .map_err(OmniError::storage)?;
 
     let stamp = guard_stamp(&dataset)?;
-    if stamp != INTERNAL_MANIFEST_SCHEMA_VERSION {
+    if stamp != attempt.stamp {
         return Err(genesis_probe_mismatch(
             root_uri,
             format!(
-                "internal-schema stamp is v{stamp}, expected v{INTERNAL_MANIFEST_SCHEMA_VERSION}"
+                "internal-schema stamp is v{stamp}, expected v{}",
+                attempt.stamp
             ),
         ));
     }

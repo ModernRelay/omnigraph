@@ -284,7 +284,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Standalone `enum Foo { ... }` block | `parse error: expected EOI or schema_decl` | Inline: `kind: enum(a, b)` |
 | `[Category]` (list of enum) | compile error | Use `[String]`; lists must contain scalars |
 | Assuming `@embed` must quote its source | unnecessary schema churn | `@embed(text)` and `@embed("text")` are both valid; quoted form is canonical |
-| `@unique(src)` on edge without body block | parse error | `@card(1..1) { @unique(src) }` |
+| `@unique(@src)` on edge without body block | parse error | `@card(1..1) { @unique(@src) }` |
 | Expecting `@embed` to populate vectors during load | missing/stale vectors | `@embed` is metadata; run the offline `omnigraph embed ... --reembed-all` file pipeline, then load its output |
 | `schema apply` with feature branches open | rejected | Merge or delete branches first |
 | `nearest(...)` / `rrf(...)` without `limit` | compile error | Add `limit N`; a BM25-only query may omit it, though bounded output is recommended |

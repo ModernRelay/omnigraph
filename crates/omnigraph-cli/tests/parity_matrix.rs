@@ -527,6 +527,11 @@ fn parity_load() {
 fn parity_export() {
     let p = parity();
     let (l, r) = p.run(&["export"]);
+    assert!(
+        r.status.success(),
+        "export remote arm failed: {r:?}\nserver stderr:\n{}",
+        p.server.stderr()
+    );
     // export emits a JSONL STREAM, not a single `--json` document, so the
     // scrubbed-single-doc `assert_parity` doesn't apply — compare line-wise.
     // The twin graphs are byte-copies of one loaded fixture, so rows carry

@@ -1,0 +1,372 @@
+# issue: none
+# notes: RFC 0040 Query language: `$p.@id`, `$e.@src`, `$e.@dst` and a bare `@id` in a mutation predicate resolve to the system columns by role; a bare `id` is a user property (declared here on `Doc`) or the unknown-property error.
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+node Doc {
+    id: String @key
+    title: String?
+}
+edge Knows: Person -> Person {
+    since: I32?
+    id: String?
+    src: String?
+    dst: String?
+}
+
+edge Bare: Person -> Person {}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":25}}
+{"type":"Doc","data":{"id":"d1","title":"spec"}}
+{"edge":"Knows","id":"knows-alice-bob","from":"alice","to":"bob","data":{"since":2020,"id":"edge-data","src":"source-data","dst":"target-data"}}
+
+--- query
+query identities() {
+    match { $p: Person }
+    return { $p.@id, $p.name }
+}
+
+--- expect unordered
+{"p.@id": "alice", "p.name": "alice"}
+{"p.@id": "bob", "p.name": "bob"}
+
+--- expect shape
+p.@id: String
+p.name: String
+
+--- query
+query endpoints() {
+    match {
+        $p: Person
+        $p $e:knows $f
+    }
+    return { $e.@src as from, $e.@dst as to, $e.since }
+}
+
+--- expect unordered
+{"from": "alice", "to": "bob", "e.since": 2020}
+
+--- expect shape
+from: String
+to: String
+e.since: I32?
+
+--- query
+query edge_properties_beside_endpoints() {
+    match { $p: Person
+        $p $e:knows $f }
+    return { $e.id, $e.src, $e.dst, $e.@src, $e.@dst }
+}
+
+--- expect unordered
+{"e.id":"edge-data","e.src":"source-data","e.dst":"target-data","e.@src":"alice","e.@dst":"bob"}
+
+--- expect shape
+e.id: String?
+e.src: String?
+e.dst: String?
+e.@src: String
+e.@dst: String
+
+--- query
+query count_identities() {
+    match { $p: Person }
+    return { count($p.@id) }
+}
+
+--- expect unordered
+{"p.@id":2}
+
+--- expect shape
+p.@id: I64
+
+--- query
+query minimum_identity() {
+    match { $p: Person }
+    return { min($p.@id) }
+}
+
+--- expect unordered
+{"p.@id":"alice"}
+
+--- expect shape
+p.@id: String?
+
+--- query
+query minimum_endpoint() {
+    match { $p: Person
+        $p $e:knows $f }
+    return { min($e.@src), max($e.@dst) }
+}
+
+--- expect unordered
+{"e.@src":"alice","e.@dst":"bob"}
+
+--- expect shape
+e.@src: String?
+e.@dst: String?
+
+--- query
+query grouped_identity_order() {
+    match { $p: Person }
+    return { $p.@id, count($p.name) as n }
+    order { $p.@id desc }
+}
+
+--- expect unordered
+{"p.@id":"bob","n":1}
+{"p.@id":"alice","n":1}
+
+--- expect shape
+p.@id: String
+n: I64
+
+--- query
+query grouped_endpoint_order() {
+    match { $p: Person
+        $p $e:knows $f }
+    return { $e.@src, count($e.@id) as n }
+    order { $e.@src }
+}
+
+--- expect unordered
+{"e.@src":"alice","n":1}
+
+--- expect shape
+e.@src: String
+n: I64
+
+--- query
+query aggregate_identity_order() {
+    match { $p: Person }
+    return { count($p.@id) }
+    order { $p.@id }
+}
+
+--- expect unordered
+{"p.@id":2}
+
+--- expect shape
+p.@id: I64
+
+--- query
+query user_id_beside_identity() {
+    match { $d: Doc }
+    return { $d.id, $d.@id }
+}
+
+--- expect unordered
+{"d.id": "d1", "d.@id": "d1"}
+
+--- expect shape
+d.id: String
+d.@id: String
+
+--- query
+query by_identity($who: String) {
+    match {
+        $p: Person
+        $p.@id = $who
+    }
+    return { $p.name }
+}
+
+--- params
+{"who": "bob"}
+
+--- expect unordered
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- query
+query last_identity() {
+    match { $p: Person }
+    return { $p.@id }
+    order { $p.@id desc }
+    limit 1
+}
+
+--- expect unordered
+{"p.@id": "bob"}
+
+--- expect shape
+p.@id: String
+
+--- query
+query filter_endpoint() {
+    match { $p: Person
+        $p $e:knows $f
+        $e.@dst = "bob"
+    }
+    return { $e.@id, $f.@id }
+}
+
+--- expect unordered
+{"e.@id":"knows-alice-bob","f.@id":"bob"}
+
+--- expect shape
+e.@id: String
+f.@id: String
+
+--- mutate
+query birthday() { update Person set { age: 26 } where @id = "bob" }
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query updated() { match { $p: Person
+    $p.@id = "bob" } return { $p.age } }
+
+--- expect unordered
+{"p.age":26}
+
+--- expect shape
+p.age: I32?
+
+--- mutate
+query absent_edge_identity() { delete Knows where @id = "absent" }
+
+--- expect affected: nodes=0 edges=0
+
+--- mutate
+query absent_edge_endpoint() { delete Knows where @dst = "absent" }
+
+--- expect affected: nodes=0 edges=0
+
+--- query
+query q() { match { $p: Person } return { $p.@src } }
+
+--- expect error: T6: binding `$p` has no meta-field `@src`; its meta-fields are `@id`
+
+--- query
+query q() { match { $p: Person } return { $p.@owner } }
+
+--- expect error: T6: binding `$p` has no meta-field `@owner`; its meta-fields are `@id`
+
+--- query
+query q() { match { $p: Person { id: "alice" } } return { $p.name } }
+
+--- expect error: T2: type `Person` has no property `id`; filter the system identity with `$p.@id = ...` in the match block
+
+--- query
+query q() { match { $p: Person
+ $p $e:bare $f } return { $e.id } }
+
+--- expect error: T6: edge `Bare` has no property `id`; the system identity is `$e.@id`
+
+--- query
+query q() { match { $p: Person
+ $p $e:bare $f } return { $e.src } }
+
+--- expect error: T6: edge `Bare` has no property `src`; the system endpoint is `$e.@src`
+
+--- query
+query q() { match { $p: Person
+ $p $e:bare $f } return { $e.dst } }
+
+--- expect error: T6: edge `Bare` has no property `dst`; the system endpoint is `$e.@dst`
+
+--- query
+query q() { match { $p: Person } return { $p.salary } }
+
+--- expect error: T6: type `Person` has no property `salary`
+
+--- mutate
+query q() { insert Person { name: "x", id: "x" } }
+
+--- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
+
+--- mutate
+query q() { update Person set { id: "x" } where @id = "alice" }
+
+--- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
+
+--- mutate
+query q() { insert Bare { from: "alice", to: "bob", id: "x" } }
+
+--- expect error: T11: type `Bare` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
+
+--- mutate
+query q() { delete Bare where src = "alice" }
+
+--- expect error: T11: type `Bare` has no property `src`; the system endpoint is `@src`
+
+--- mutate
+query q() { delete Bare where dst = "bob" }
+
+--- expect error: T11: type `Bare` has no property `dst`; the system endpoint is `@dst`
+
+--- mutate
+query q() { delete Person where @src = "alice" }
+
+--- expect error: T11: type `Person` has no meta-field `@src`; the meta-fields of this type are `@id`
+
+--- mutate
+query q() { delete Knows where @owner = "alice" }
+
+--- expect error: T11: type `Knows` has no meta-field `@owner`; the meta-fields of this type are `@id`, `@src`, `@dst`
+
+--- mutate
+query wrong_identity_type($n: I32) { delete Person where @id = $n }
+
+--- params
+{"n":1}
+
+--- expect error: T7: cannot assign/compare I32 with String for property `@id`
+
+--- query
+query bare_id_is_not_the_identity() {
+    match { $p: Person }
+    return { $p.id }
+}
+
+--- expect error: T6: type `Person` has no property `id`; the system identity is `$p.@id`
+
+--- mutate
+query unlink($who: String) {
+    delete Knows where @src = $who
+}
+
+--- params
+{"who": "alice"}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query forget($who: String) {
+    delete Person where @id = $who
+}
+
+--- params
+{"who": "bob"}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query forget_by_bare_id($who: String) {
+    delete Person where id = $who
+}
+
+--- params
+{"who": "alice"}
+
+--- expect error: T11: type `Person` has no property `id`; the system identity is `@id`
+
+--- query
+query remaining() {
+    match { $p: Person }
+    return { $p.@id }
+}
+
+--- expect unordered
+{"p.@id": "alice"}
+
+--- expect shape
+p.@id: String

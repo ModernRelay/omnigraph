@@ -1494,6 +1494,7 @@ async fn finalize_proven_pure_insert_adopt(
     table_key: &str,
     mut proven: ProvenPureInsertAdopt,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
+    system_columns: SystemColumns,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
     let Some(chunk_rows) = plan_proven_pure_insert_chunks(
         db,
@@ -1503,6 +1504,7 @@ async fn finalize_proven_pure_insert_adopt(
         proven.source_version,
         proven.inserted_rows,
         external_preflight,
+        system_columns,
     )
     .await?
     else {
@@ -1517,15 +1519,27 @@ async fn try_proven_pure_insert_adopt(
     table_key: &str,
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
-    id_col: &'static str,
+    system_columns: SystemColumns,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
-    let Some(proven) =
-        try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot, id_col).await?
+    let Some(proven) = try_proven_pure_insert_history(
+        table_key,
+        base_snapshot,
+        source_snapshot,
+        system_columns.id,
+    )
+    .await?
     else {
         return Ok(None);
     };
     let empty_external_preflight = crate::table_store::ExternalBlobPreflight::default();
-    finalize_proven_pure_insert_adopt(db, table_key, proven, &empty_external_preflight).await
+    finalize_proven_pure_insert_adopt(
+        db,
+        table_key,
+        proven,
+        &empty_external_preflight,
+        system_columns,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1773,6 +1787,7 @@ async fn plan_proven_pure_insert_chunks(
     end_version: u64,
     expected_rows: u64,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
+    system_columns: SystemColumns,
 ) -> Result<Option<Vec<usize>>> {
     let scan_timing = crate::instrumentation::start_merge_timing(
         crate::instrumentation::MergeTimingPhase::ProvenInsertPlanScan,
@@ -1786,7 +1801,7 @@ async fn plan_proven_pure_insert_chunks(
             begin_version,
             end_version,
             external_preflight,
-            db.catalog().system_columns,
+            system_columns,
         )
         .await?;
     let mut chunk_rows = Vec::new();
@@ -4025,7 +4040,7 @@ async fn classify_adopt(
             table_key,
             base_snapshot,
             source_snapshot,
-            catalog.system_columns.id,
+            catalog.system_columns,
         )
         .await?
     {
@@ -4763,6 +4778,7 @@ async fn publish_rewritten_merge_table(
             planned_transactions,
             &mut planned_index,
             None,
+            target_txn.catalog.system_columns,
         )
         .await?;
         if semantics == KeyedWriteSemantics::StrictInsert {
@@ -4901,6 +4917,7 @@ async fn commit_staged_keyed_chunks(
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
     planned_index: &mut usize,
     between_chunk_failpoint: Option<&str>,
+    system_columns: SystemColumns,
 ) -> Result<SnapshotHandle> {
     let source = SnapshotHandle::new(table.dataset.clone());
     let stream = target_db
@@ -4920,6 +4937,7 @@ async fn commit_staged_keyed_chunks(
         planned_transactions,
         planned_index,
         between_chunk_failpoint,
+        system_columns,
     )
     .await
 }
@@ -4946,6 +4964,7 @@ async fn commit_keyed_stream_chunks(
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
     planned_index: &mut usize,
     between_chunk_failpoint: Option<&str>,
+    system_columns: SystemColumns,
 ) -> Result<SnapshotHandle> {
     let mut carry = None;
     let mut observed_rows = 0_u64;
@@ -4961,13 +4980,7 @@ async fn commit_keyed_stream_chunks(
             KeyedChunkStage::General(semantics) => {
                 target_db
                     .storage()
-                    .stage_keyed_write(
-                        current.clone(),
-                        table_key,
-                        batch,
-                        semantics,
-                        target_db.catalog().system_columns,
-                    )
+                    .stage_keyed_write(current.clone(), table_key, batch, semantics, system_columns)
                     .await?
             }
             KeyedChunkStage::ProvenStrictInsert => {
@@ -4979,11 +4992,7 @@ async fn commit_keyed_stream_chunks(
                 )?;
                 target_db
                     .storage()
-                    .stage_proven_strict_insert(
-                        current.clone(),
-                        chunk,
-                        target_db.catalog().system_columns,
-                    )
+                    .stage_proven_strict_insert(current.clone(), chunk, system_columns)
                     .await?
             }
         };
@@ -5044,6 +5053,7 @@ async fn publish_proven_pure_insert_adopt(
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     prepared_target: PreparedExistingMergeTarget,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
+    system_columns: SystemColumns,
 ) -> Result<crate::db::DatasetUpdate> {
     let (current, full_path, table_branch) = prepared_target.into_parts();
     let source = SnapshotHandle::new(proven.source.clone());
@@ -5055,7 +5065,7 @@ async fn publish_proven_pure_insert_adopt(
             proven.base_version,
             proven.source_version,
             external_preflight,
-            target_db.catalog().system_columns,
+            system_columns,
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
@@ -5072,6 +5082,7 @@ async fn publish_proven_pure_insert_adopt(
         planned_transactions,
         &mut planned_index,
         Some(crate::failpoints::names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+        system_columns,
     )
     .await?;
     if let Some(unused) = planned_transactions.get(planned_index) {
@@ -5144,6 +5155,7 @@ async fn publish_adopted_delta(
             planned_transactions,
             &mut planned_index,
             Some(crate::failpoints::names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+            target_txn.catalog.system_columns,
         )
         .await?;
     }
@@ -5174,6 +5186,7 @@ async fn publish_adopted_delta(
             planned_transactions,
             &mut planned_index,
             None,
+            target_txn.catalog.system_columns,
         )
         .await?;
     }
@@ -5780,6 +5793,7 @@ impl Omnigraph {
                             table_key,
                             proven,
                             &external_preflight,
+                            catalog.system_columns,
                         )
                         .await?
                         {
@@ -6383,6 +6397,7 @@ impl Omnigraph {
                             &external_preflight,
                             prepared_target,
                             planned,
+                            catalog.system_columns,
                         )
                         .await?
                     }

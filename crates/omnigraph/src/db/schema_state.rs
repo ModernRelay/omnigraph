@@ -34,10 +34,16 @@ const SCHEMA_IDENTITY_VERSION: u32 = 2;
 pub(crate) async fn refuse_unsupported_schema_versions(
     root_uri: &str,
     storage: &dyn StorageAdapter,
+    internal_schema_version: u32,
 ) -> Result<()> {
     #[derive(Deserialize)]
     struct VersionEnvelope {
         ir_version: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct FeatureEnvelope {
+        features: std::collections::BTreeSet<String>,
     }
 
     for filename in [SCHEMA_IR_FILENAME, SCHEMA_IR_STAGING_FILENAME] {
@@ -47,15 +53,27 @@ pub(crate) async fn refuse_unsupported_schema_versions(
         else {
             continue;
         };
-        if let Ok(envelope) = serde_json::from_str::<VersionEnvelope>(&text)
-            && !omnigraph_compiler::is_supported_ir_version(envelope.ir_version)
-        {
+        let Ok(envelope) = serde_json::from_str::<VersionEnvelope>(&text) else {
+            continue;
+        };
+        if !omnigraph_compiler::is_supported_ir_version(envelope.ir_version) {
             return Err(schema_lock_conflict(format!(
                 "unsupported ir_version {} in {filename} (supported {}, {} and {}); open will not recover or migrate this schema",
                 envelope.ir_version,
                 omnigraph_compiler::SCHEMA_IR_VERSION,
                 omnigraph_compiler::SCHEMA_IR_VERSION_EDGE_KEYS,
                 omnigraph_compiler::SCHEMA_IR_VERSION_FEATURES,
+            )));
+        }
+        let Ok(envelope) = serde_json::from_str::<FeatureEnvelope>(&text) else {
+            continue;
+        };
+        let required_stamp = crate::db::manifest::stamp_for_system_columns(
+            omnigraph_compiler::system_columns_for_features(&envelope.features),
+        );
+        if internal_schema_version < required_stamp {
+            return Err(schema_lock_conflict(format!(
+                "graph internal schema v{internal_schema_version} cannot serve the system columns in {filename}; expected at least v{required_stamp}; open will not recover or migrate this schema"
             )));
         }
     }
@@ -184,7 +202,7 @@ pub(crate) fn validate_schema_contract_text(
     let current_source_shape = compile_schema_source(&text.source)?;
     let (ir, state) = parse_schema_contract(&text.ir_json, &text.state_json)?;
     validate_persisted_schema_contract(&ir, &state)?;
-    validate_current_source_matches(&state, &current_source_shape)?;
+    validate_current_source_matches(&state, &current_source_shape, &ir)?;
     Ok((ir, state))
 }
 
@@ -514,8 +532,12 @@ fn validate_persisted_schema_contract(ir: &SchemaIR, state: &SchemaState) -> Res
 fn validate_current_source_matches(
     state: &SchemaState,
     current_source_shape: &SchemaShape,
+    ir: &SchemaIR,
 ) -> Result<()> {
-    let current_hash = schema_shape_hash(current_source_shape)
+    let current_source_shape = current_source_shape.canonicalized_for_system_columns(
+        omnigraph_compiler::system_columns_for_features(&ir.features),
+    );
+    let current_hash = schema_shape_hash(&current_source_shape)
         .map_err(|err| schema_lock_conflict(err.to_string()))?;
     if current_hash != state.schema_shape_hash {
         return Err(schema_lock_conflict(
@@ -700,7 +722,7 @@ pub(crate) async fn recover_schema_state_files(
         let selected_ir = read_schema_ir_at(storage.as_ref(), &selected_ir_uri).await?;
         let selected_state = read_schema_state_at(storage.as_ref(), &selected_state_uri).await?;
         validate_persisted_schema_contract(&selected_ir, &selected_state)?;
-        validate_current_source_matches(&selected_state, &live_shape)?;
+        validate_current_source_matches(&selected_state, &live_shape, &selected_ir)?;
         warn!(
             "completing partial schema-file rename (manifest v{})",
             snapshot.graph_manifest_version()
@@ -717,6 +739,11 @@ pub(crate) async fn recover_schema_state_files(
     let live_source = storage.read_text(&schema_source_uri(root_uri)).await?;
     let live_shape = compile_schema_source(&live_source)?;
 
+    let live_ir = read_schema_ir_at(storage.as_ref(), &schema_ir_uri(root_uri)).await?;
+    validate_schema_ir(&live_ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
+    let system_columns = omnigraph_compiler::system_columns_for_features(&live_ir.features);
+    let staging_shape = staging_shape.canonicalized_for_system_columns(system_columns);
+    let live_shape = live_shape.canonicalized_for_system_columns(system_columns);
     let staging_hash =
         schema_shape_hash(&staging_shape).map_err(|err| schema_lock_conflict(err.to_string()))?;
     let live_hash =
@@ -854,7 +881,7 @@ pub(crate) async fn validate_exact_schema_staging_target(
     };
     let state = read_schema_state_at(storage, &state_uri).await?;
     validate_persisted_schema_contract(&ir, &state)?;
-    validate_current_source_matches(&state, &source_shape)?;
+    validate_current_source_matches(&state, &source_shape, &ir)?;
     if state.schema_ir_hash != target_schema_ir_hash {
         return Err(schema_lock_conflict(format!(
             "schema identity at '{}' does not belong to the exact SchemaApply intent",
@@ -876,7 +903,7 @@ pub(crate) async fn promote_exact_schema_staging(
     let live_ir = read_schema_ir_at(storage, &schema_ir_uri(root_uri)).await?;
     let live = read_schema_state_at(storage, &schema_state_uri(root_uri)).await?;
     validate_persisted_schema_contract(&live_ir, &live)?;
-    validate_current_source_matches(&live, &live_shape)?;
+    validate_current_source_matches(&live, &live_shape, &live_ir)?;
     let live_ir_hash =
         schema_ir_hash(&live_ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
     if live.schema_ir_hash != target_schema_ir_hash || live_ir_hash != target_schema_ir_hash {
@@ -957,10 +984,19 @@ async fn validate_present_exact_schema_staging_artifacts(
         validate_persisted_schema_contract(ir, state)?;
     }
     if let (Some(shape), Some(state)) = (&source_shape, &staged_state) {
-        validate_current_source_matches(state, shape)?;
+        if let Some(ir) = &staged_ir {
+            validate_current_source_matches(state, shape, ir)?;
+        } else {
+            let ir = read_schema_ir_at(storage, &schema_ir_uri(root_uri)).await?;
+            validate_persisted_schema_contract(&ir, state)?;
+            validate_current_source_matches(state, shape, &ir)?;
+        }
     } else if let (Some(shape), Some(ir)) = (&source_shape, &staged_ir) {
+        let shape = shape.canonicalized_for_system_columns(
+            omnigraph_compiler::system_columns_for_features(&ir.features),
+        );
         let source_hash =
-            schema_shape_hash(shape).map_err(|error| schema_lock_conflict(error.to_string()))?;
+            schema_shape_hash(&shape).map_err(|error| schema_lock_conflict(error.to_string()))?;
         let ir_shape_hash = schema_shape_hash_from_ir(ir)
             .map_err(|error| schema_lock_conflict(error.to_string()))?;
         if source_hash != ir_shape_hash {

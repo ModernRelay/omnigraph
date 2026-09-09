@@ -49,10 +49,10 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 {"type":"Chunk","data":{"slug":"chunk-17","text":"needle needle needle filler"}}
 {"type":"Chunk","data":{"slug":"chunk-18","text":"needle needle filler"}}
 {"type":"Chunk","data":{"slug":"chunk-19","text":"needle filler"}}
-{"edge":"ChunkOfArtifact","from":"chunk-08","to":"art-0","data":{"id":"e-08","label":"of"}}
-{"edge":"ChunkOfArtifact","from":"chunk-09","to":"art-0","data":{"id":"e-09","label":"of"}}
-{"edge":"ChunkOfArtifact","from":"chunk-10","to":"art-0","data":{"id":"e-10","label":"of"}}
-{"edge":"ChunkOfArtifact","from":"chunk-11","to":"art-0","data":{"id":"e-11","label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-08","from":"chunk-08","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-09","from":"chunk-09","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-10","from":"chunk-10","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-11","from":"chunk-11","to":"art-0","data":{"label":"of"}}
 
 --- query
 query recall($q: String) {

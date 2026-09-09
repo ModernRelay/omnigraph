@@ -5,11 +5,9 @@ use arrow_schema::Fields;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::NodeType;
 
-/// Node type per pipeline binding, for projecting a bare `$p` as one struct,
-/// plus the graph's system column spellings every identity read resolves by.
+/// Node type per pipeline binding, for projecting a bare `$p` as one struct.
 pub(super) struct ProjectionContext<'a> {
     node_bindings: HashMap<String, &'a NodeType>,
-    system_columns: SystemColumns,
 }
 
 impl<'a> ProjectionContext<'a> {
@@ -25,10 +23,7 @@ impl<'a> ProjectionContext<'a> {
                     .map(|node_type| (variable, node_type))
             })
             .collect();
-        Self {
-            node_bindings,
-            system_columns: catalog.system_columns,
-        }
+        Self { node_bindings }
     }
 }
 
@@ -483,7 +478,7 @@ fn evaluate_projection(
             let wide_schema = wide_batch.schema();
             let mut fields: Vec<Field> = Vec::new();
             let mut columns: Vec<ArrayRef> = Vec::new();
-            for field in node_type.node_object_fields() {
+            for (member, field) in node_type.node_object_members() {
                 let col_name = format!("{}.{}", name, field.name());
                 let (idx, wide_field) =
                     wide_schema.column_with_name(&col_name).ok_or_else(|| {
@@ -493,14 +488,6 @@ fn evaluate_projection(
                         ))
                     })?;
                 let col = wide_batch.column(idx).clone();
-                // The identity member is the logical meta-field `@id` on every
-                // vintage (RFC 0040 Wire surfaces); the physical spelling stays
-                // in the bucket and a declared `id` property keeps its own name.
-                let member = if field.name() == ctx.system_columns.id {
-                    "@id"
-                } else {
-                    field.name()
-                };
                 fields.push(Field::new(
                     member,
                     col.data_type().clone(),
