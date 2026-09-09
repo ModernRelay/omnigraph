@@ -144,7 +144,14 @@ pub async fn plan_config_dir_with_options(
     config_dir: impl AsRef<Path>,
     options: PlanOptions,
 ) -> PlanOutput {
-    plan_config_dir_impl(config_dir.as_ref(), options, None, &mut None).await
+    // Keep the shared implementation off the forwarding caller's stack.
+    Box::pin(plan_config_dir_impl(
+        config_dir.as_ref(),
+        options,
+        None,
+        &mut None,
+    ))
+    .await
 }
 
 /// Plan using the current applied policy for an already authenticated actor.
@@ -155,12 +162,12 @@ pub async fn plan_config_dir_authorized(
     identity: &IdentityAuthorization,
 ) -> AuthorizedPlanOutput {
     let mut authorization = None;
-    let plan = plan_config_dir_impl(
+    let plan = Box::pin(plan_config_dir_impl(
         config_dir.as_ref(),
         options,
         Some(identity),
         &mut authorization,
-    )
+    ))
     .await;
     AuthorizedPlanOutput {
         plan,
@@ -428,7 +435,15 @@ pub async fn apply_config_dir_with_options(
     config_dir: impl AsRef<Path>,
     options: ApplyOptions,
 ) -> ApplyOutput {
-    apply_config_dir_impl(config_dir.as_ref(), options, None, &mut None).await
+    // Preserve the existing embedded caller's stack budget when forwarding
+    // into the shared implementation and nested graph recovery operations.
+    Box::pin(apply_config_dir_impl(
+        config_dir.as_ref(),
+        options,
+        None,
+        &mut None,
+    ))
+    .await
 }
 
 /// Apply the exact authorized candidate after rechecking current applied policy
@@ -441,12 +456,12 @@ pub async fn apply_config_dir_authorized(
     expected: &PlanAuthorization,
 ) -> AuthorizedApplyOutput {
     let mut authorization = None;
-    let apply = apply_config_dir_impl(
+    let apply = Box::pin(apply_config_dir_impl(
         config_dir.as_ref(),
         options,
         Some((identity, expected)),
         &mut authorization,
-    )
+    ))
     .await;
     AuthorizedApplyOutput {
         apply,
