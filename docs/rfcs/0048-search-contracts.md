@@ -7,13 +7,14 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-09
+updated: 2026-09-10
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
 blocked_on:
   - "RFC 0047 plan-truth guarantees reconciled with named stages; its interim Option<RetrievalIR> shape and scan-root restriction are not permanent dependencies"
   - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
+  - "Language evolution contract: shared expressions, contextual keywords, explicit rank-block output, scope transitions, and compatibility fixtures before syntax stabilization"
   - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
   - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
   - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
@@ -49,6 +50,12 @@ probes preserve the tested optimized stage boundaries, but confirm that Arrow
 buffer tracking and Lance I/O buffering are not hard admission limits. Native
 cancellation also differs by scheduler. These are Phase 1 resource gates;
 table-provider registration alone cannot close them.
+
+The [language evolution contract](#language-evolution-and-compatibility)
+keeps this a single typed graph language. It specifies extension boundaries
+without requiring every future operator now. The current sketches' implicit
+last-source output remains provisional; explicit block output and a shared
+expression grammar must be resolved before the public syntax is frozen.
 
 The immediate problem is correctness. Today, the same text can match before an
 index is built and stop matching afterward; fuzzy indexed and uncovered rows
@@ -498,7 +505,10 @@ query find_organizations($q: String)
 This sketch selects distinct `$o` identities. The source declarations read
 the rank block's incoming eligible population; a fusion declaration reads its
 named preceding inputs **within the same rank block**. The final declaration
-is the block's output. Source aliases are unique across the query; duplicate
+is the prototype's block output. That shorthand is provisional: the stable
+form must explicitly identify the output, as required by the
+[language evolution contract](#language-evolution-and-compatibility).
+Source aliases are unique across the query; duplicate
 aliases, duplicate arm references, and forward references are errors.
 Referencing an earlier block's arm in a new fusion is rejected: that arm's
 population precedes any intervening graph filter, and reusing its candidates
@@ -573,6 +583,143 @@ query organization_names($q: String) {
 No adjacent source inherits that edit budget. `lexical` with exact terms
 continues to select only its own exact matches; fuzzy retrieval must consume
 an explicitly tolerant query. Both resolve the same default scoring policy.
+
+### Language evolution and compatibility
+
+The goal is a small, composable typed property-graph language. A query declares
+bindings, constrains them, deliberately selects candidates, follows graph
+relationships and returns values. Search adds explicit selection boundaries
+to that language. It does not create a second query system with different
+variables, grouping rules or entity identities.
+
+The current production grammar has one `match` block, fixed expression
+variants and terminal aggregate projection. The staged prototype adds repeated
+`match`, `rank` and `take`; its separate `probe_value` grammar is experimental.
+Neither is a complete stable grammar for the logical algebra above. The rules
+below are acceptance requirements for the coordinated pre-stable cutover;
+they do not claim that the deferred operators are implemented.
+
+**Keep one stage sequence and one result tail.** Model the query body as typed
+stages followed by the existing `return`, with optional final `order` and
+`limit`. `match` keeps declarative graph-pattern semantics within its scope;
+stage boundaries determine where populations change. Source text is not a
+physical scan/join schedule. Future operators extend the stage sequence rather
+than adding flags to `match`, hidden retrieval to `order`, or a second
+query-body representation. The concrete AST/IR changes belong in the compiler.
+
+**Use one expression language with context-sensitive typing.** Properties,
+parameters, literals, aliases and metrics must use the same expression model
+wherever their types and scopes permit them. Adding `metric(...)` only to
+projection/order grammar leaves filters and future scoring with a different
+language. Share expression parsing and resolve supported constructors through
+typed signatures; retain dedicated graph-pattern and stage nodes. A retriever
+is not a scalar merely because its source declaration looks like a call.
+Unknown constructors/options fail explicitly. This does not require arbitrary
+functions, closures, or relation-valued parameters.
+
+Before stabilizing that expression core, fix precedence, associativity, null
+behavior, name resolution and positional/named argument rules. These permit
+later Boolean composition, null tests, computed values and typed scoring
+constructors without reinterpreting existing expressions. A graph `not` block
+remains correlated pattern absence; a scalar Boolean operator must not silently
+acquire its binding or multiplicity behavior. Cross-domain score arithmetic
+continues to require the explicit typed policy described above.
+
+**Make scope and identity changes explicit.** Row-preserving predicates keep
+bindings and metric origins. Traversal extends bindings using the established
+endpoint/edge-instance semantics; ranking does not turn bounded reachability
+into enumeration of every path. `rank` selects distinct target identities
+and preserves their incoming bindings; `take` selects target/group pairs.
+Aggregation establishes a new group scope and requires explicit reductions
+for values that vary within it. It cannot carry an arbitrary member's score,
+source membership or graph identity into the group. Future branch/optional
+operators must declare exported bindings and their types/nullability.
+
+Terminal aggregate-return syntax may remain convenient shorthand. A future
+intermediate group/reduction stage must use the same grouping equality,
+null treatment and duplicate rules, while making its output bindings explicit.
+Adding a projected non-aggregate value to today's aggregate return can change
+its grouping; ordinary projection's row-preservation law does not apply there.
+Do not extend that implicit grouping to every intermediate projection.
+
+**Name a rank block's output explicitly before freezing it.** In the current
+sketch, appending another source changes the output because the last
+declaration wins. The stable form must select a named output independently of
+declaration position; choose and qualify its spelling in Phase 0. Source
+declarations retain the common incoming population and explicit named fusion
+dependencies. Adding an unconsumed source must not select a different output
+population or comparator. Validation and the cost of requested additional
+metrics still apply. Earlier-block metrics remain readable with their original
+scope; reusing earlier candidates requires explicit remapping/intersection.
+
+**Keep identifiers usable as the language grows.** Keywords are contextual
+and have token boundaries. Adding a clause or constructor must not reserve
+an ordinary property, edge, parameter or alias name everywhere. Preserve the
+existing `$binding.property` namespace, the proposed `$binding.@id` system
+namespace, and explicit source/metric references. A future nested scope must
+declare imports/exports and shadowing rules; it must not start capturing
+previously unrelated bindings. User-defined function or recipe namespaces,
+if introduced, need an explicit collision rule with built-ins.
+
+**Separate semantic bounds from execution policy.** Use consistent integer
+literal/parameter admission for counts while retaining their distinct units:
+source targets, target/group pairs and final binding rows. Candidate windows
+are positive; the existing zero-result meaning remains valid for final limits
+and group quotas. Physical effort, memory, I/O and output bytes remain separate
+budgets. A new optimization or projection cannot reinterpret one count as
+another. Extending final-limit parameters is additive to existing literal
+queries; it does not make limits row-dependent.
+
+These future capabilities fit the same core and may be deferred independently:
+
+| Future capability | Consistent extension point | Semantics that must remain explicit |
+|---|---|---|
+| Optional graph enrichment | Graph-pattern/stage operator | Preserve unmatched incoming bindings; export nullable new bindings; distinguish predicates inside the optional scope from later filters. |
+| Existence without fan-out | Correlated pattern predicate | Test whether a match exists without multiplying outer rows; keep ordinary traversal multiplicity unchanged. |
+| Reusable parent-level features and bounded evidence lists | Intermediate grouping/reduction over graph bindings | Name the new target/group identity, reduce child features explicitly, bound retained evidence, and establish fresh ranks before fusion. |
+| Global all-node discovery | Typed binding union, snapshot-resolved type scope and type narrowing | Preserve original type/entity identity and define legal common/type-specific projections; searchable representations remain separate from node-type scope. |
+| Top-N inside each group or row-dependent retrieval | Explicit partitioned/correlated source operator | Define each source population and query input, empty-group behavior and a shared total budget. This is not global top-K followed by `take`. |
+| Reranking or richer lexical queries | Typed scoring stage and typed lexical-query variants | Declare input population, output domain, missing-value behavior and semantic version; retain the same terms consumer distinction. |
+| Branch reuse and bounded subqueries | Lexically scoped stage inputs/outputs | Name the reused population and snapshot; no implicit reuse of stale candidate arms or re-execution with fresh defaults. |
+
+Some narrower workflows already compose: `take` can select parent bindings
+using an explicit reduction of child metrics within each target/group pair.
+The deferred grouping extension makes reduced values and bounded evidence
+available as reusable output, with a new scope suitable for later operations;
+it is not required merely to traverse from a child to its parent.
+
+Stored queries provide small agent-facing interfaces over these same operators.
+They can hide a deliberate source/window policy, but cannot compensate for an
+operator absent from the language. An agent should not need to fetch an
+unbounded relation and reproduce grouping, union or graph identity rules in
+client code. Unsupported advanced shapes should remain explicit limitations
+until their operators and budgets are qualified.
+
+After the coordinated cutover, an additive grammar change must preserve the
+parse/name resolution, typing, logical population, metric meaning and selected
+output schema of previously valid queries under the same accepted semantic
+identities. Exact operations retain their declared results; ANN retains its
+declared approximation/effort contract, not necessarily identical candidates.
+Expanded all-node scope after a schema change is part of that explicit scope
+contract, not a silent reinterpretation at the same snapshot.
+
+Changing an analyzer, score formula, missing-value rule, default source window,
+encoding recipe or ANN effort mapping is a semantic change even if the text
+still parses. Use an explicit versioned policy/accepted binding and preserve
+existing resolved choices. A future unavoidable language or format break needs
+an explicit version boundary and migration; this design does not promise that
+all unknown future changes can be made compatible. Wire-envelope evolution
+still follows the separate client-compatibility requirements above.
+
+Before freezing syntax, extend the existing compiler/GQT owners with a small
+compatibility corpus: old queries whose identifiers resemble new keywords;
+mixed expressions and nulls; source/result alias collisions; an added unused
+source with unchanged selected output; projection changes that do not resize
+candidate windows; filters on either side of a cut; and group/union scope
+transitions that reject discarded metrics. Record each deferred workflow as
+either expressible through existing operators or requiring a named extension
+with the contract above. These are design/compatibility gates, not a requirement
+to implement every future operator in the initial release.
 
 ### Vector behavior and agent recipes
 
@@ -2472,6 +2619,10 @@ Settle the grammar and metric namespace, target/binding multiplicity, per-group
 semantics, complete tie comparators, and the relationship to RFC 0047. Qualify
 the unified BM25 reference, its pinned numeric kernel, and snapshot-visible
 live-row statistics; freeze vector numeric rules and checked fusion arithmetic.
+Apply the [language evolution contract](#language-evolution-and-compatibility):
+replace the prototype's implicit last-source output before stabilization,
+unify expression contexts, and fix scope/keyword/argument rules. A deferred
+operator needs a coherent extension point, not an implementation in Phase 0.
 Resolve encoding/provider identity and the shared schema-version decisions
 with RFCs 0040/0043/0044.
 Prototype the schema-wide default-recipe declaration and its omission/override
@@ -2679,6 +2830,12 @@ release. Each extension retains its stated semantic and qualification boundary.
    cannot satisfy cross-type global discovery.
 
 ## Decision log
+
+- 2026-09-10 — added the language evolution contract: one stage sequence and
+  expression model, explicit scope/identity changes, contextual keywords and
+  versioned semantic defaults. Kept advanced operators deferred while naming
+  their extension boundaries. Marked the prototype's last-source block output
+  provisional and required explicit output before syntax stabilization.
 
 - 2026-08-20 — initial design draft from a source audit of OmniGraph 0.10.0,
   motivated by measured silent false negatives in production use.
