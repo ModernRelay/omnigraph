@@ -1041,7 +1041,11 @@ payloads from the corresponding pinned datasets after selection. For an exact
 source split into disjoint physical partitions, local top-k followed by a
 global top-k is valid only when every partition uses the same score and total
 comparator as the global source. A partition cannot substitute local corpus
-statistics or a different tie rule. ANN remains explicitly approximate.
+statistics or a different tie rule. Complete per-target field reduction and
+deduplication before such a cut. If a target's score still depends on
+contributions from several partitions, pruning those contributions requires a
+valid global-score bound; ordinary local top-k is insufficient. ANN remains
+explicitly approximate.
 
 Qualification must cover two unrelated node types, an explicitly selected
 edge type, equal id strings across types, multiple searchable fields,
@@ -1154,6 +1158,11 @@ do not add a parallel snapshot-token mechanism. `target.snapshot` echoes the
 request and is not automatically a resolved token for a branch read. A
 synthetic identity for a graph with no commit is not a replayable commit id.
 The initial result contract must make unavailable replay identity explicit.
+Verify the actual output renderers as well as their shared response type:
+JSON and JSONL outputs used for continuation must preserve that same-read
+identity. The current JSONL renderer omits `graph_commit_id` from its metadata
+line even when the read envelope contains it. Qualify both known and unavailable
+identity through the CLI; a passing JSON response does not cover JSONL.
 
 Identity-based follow-up also depends on RFC 0040's typed meta-field access
 and logical result identity. Today a projected node object includes its id,
@@ -1409,6 +1418,27 @@ duplicate-heavy early-payload fixture while dedup does not; both avoid spill
 with late payload there. This supports retaining both physical alternatives.
 Compilation overlapped this run, so its timings are not comparative latency
 evidence; the result and native I/O/spill records remain useful qualification.
+
+A subsequent controlled rerun used the same source and binary after competing
+compilation finished. All 48 samples again passed the oracle and cleanup.
+With partitioned hash joins, dynamic join filters disabled, no repeated cutoff,
+four partitions, a 128 MiB operator pool and 1 GiB scratch, the three-sample
+execution medians were:
+
+| Targets / paths each / groups | Eligible fraction / source window / quota / payload bytes | Dedup, early payload | Dedup, late payload | Dense, early payload | Dense, late payload |
+|---|---|---|---|---|---|
+| 10,000 / 8 / 64 | 0.1 / 100 / 2 / 2,048 | 33.85 ms | 27.07 ms | 27.33 ms | 17.31 ms |
+| 5,000 / 8 / 64 | 0.5 / 1,500 / 8 / 2,048 | 53.68 ms | 23.67 ms | 42.68 ms | 18.61 ms |
+| 10,000 / 1 / 64 | 0.5 / 1,000 / 4 / 32 | 7.60 ms | 7.92 ms | 6.65 ms | 5.75 ms |
+| 3,000 / 64 / 4 | 0.8 / 2,000 / 2 / 32 | 122.83 ms | 57.28 ms | 81.43 ms | 68.00 ms |
+
+Late hydration avoided spill in all four shapes, eliminating the observed
+spills in the broad-window wide-payload case and dense duplicate-heavy case.
+Dense read fewer native bytes in every paired cell,
+yet dedup with late payload executed faster in the duplicate-heavy case.
+These local exploratory medians support retaining both alternatives; they
+do not establish significance, an optimal rule or full-query latency. The
+measurement boundaries below still apply.
 
 `--late-payload true` adds a third comparison: carry the dataset's native
 `_rowid` through the narrow selection plan, then attach the projected payload
