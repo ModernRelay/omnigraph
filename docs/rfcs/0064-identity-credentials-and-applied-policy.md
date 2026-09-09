@@ -55,6 +55,12 @@ omnigraph --graph knowledge query list_people
 omnigraph graphs list
 ```
 
+The implicit connected-folder list uses minimal discovery with a cached
+version 2 credential. Explicit addressing keeps its existing catalog behavior;
+select the new minimal endpoint with
+`omnigraph graphs list --discovery --server <server>`.
+No JWT-shaped static token is reinterpreted to select a different command.
+
 Explicit legacy `--actions` requests retain version 1 restrictions. Existing
 cached restricted credentials never become identity-only credentials through
 renewal, permission denial, or omission of a field. Unsupported profiles
@@ -67,6 +73,9 @@ unavailable graphs. No policy group or `graph_list` permit is required. Graph
 data, schema, query bodies, roots, diagnostics and topology are absent.
 The existing `/graphs` response and authorization retain their contract.
 Version 1 credentials cannot use discovery to evade their existing filters.
+Display names currently equal graph IDs. Inventory availability presumes a
+running server; an invalid cluster policy can still fail existing boot
+validation rather than silently disabling that validation.
 
 Protected operations still require applied policy. Missing policy or missing
 principal membership denies them. An activated policy change governs the
@@ -130,6 +139,30 @@ the pristine imported base. Missing policy on an initialized cluster,
 including one with zero graphs, never reopens bootstrap. Adding a graph
 later requires the previously applied cluster management policy.
 
+The additive Core entry points are `plan_config_dir_authorized`,
+`authorize_apply_plan`, `apply_config_dir_authorized`, and
+`authorize_plan_read`, using `IdentityAuthorization` and `PlanAuthorization`.
+The read-only apply preflight supports callers that must adapt destructive
+resource artifacts; apply repeats the check under the Core lock. An apply
+result with absent authorization proves that this invocation stopped before
+recovery, graph or catalog effects. Present evidence means those effects may
+have begun; callers must also account for their own earlier effects.
+
+Applied policy loading permits at most 4,096 resources, 1 MiB per policy
+bundle, and 8 MiB in total. Identity-authorized apply refuses outstanding
+recovery records before sweeping; existing explicit storage-holder recovery
+must resolve them before a fresh authorized plan. This path does not grant
+new recovery authority or claim automatic recovery.
+
+Before protected schema previews and apply effects, the Core invokes the
+engine-owned `Omnigraph::ensure_no_pending_recovery` probe for affected existing
+graphs. It reads no object bodies and refuses any recovery JSON or staged
+schema artifact, including malformed or unsupported residue. Inventory is
+bounded to one matching entry, 1,024 unrelated entries and 128 KiB of URI
+bytes; limit or storage failures also refuse. This additive observation changes
+no storage format or recovery behavior. It does not fence graph writers:
+callers retain the existing writer-exclusion requirement through apply.
+
 Stored plan and history details containing protected schema information are
 not transferable read grants. Consumers must authorize the current requesting
 principal against current applied policy before exposing those details.
@@ -150,7 +183,9 @@ documented trust boundary, never an automatic fallback from identity denial.
 
 Version 1 tokens retain their ceilings, filtered catalog and schema exclusion.
 Existing static/unauthenticated modes, direct APIs and public version 1 data
-types retain their behavior. New authorized entry points are additive. Policy
+types retain their behavior. New authorized entry points are additive.
+The public exhaustive policy enums gain `ConfigManage`/`Cluster` variants;
+embedders with exhaustive matches must add the corresponding arms. Policy
 configuration using `config_manage` requires a supporting binary; old binaries
 refuse unknown actions rather than granting permission.
 
