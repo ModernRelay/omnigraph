@@ -56,9 +56,9 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
         "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [knowledge]\n  management:\n    file: ./cluster.policy.yaml\n    applies_to: [cluster]\n",
     )
     .unwrap();
-    let imported = import_config_dir(dir.path()).await;
+    let imported = Box::pin(import_config_dir(dir.path())).await;
     assert!(imported.ok, "{:?}", imported.diagnostics);
-    let applied = apply_config_dir(dir.path()).await;
+    let applied = Box::pin(apply_config_dir(dir.path())).await;
     assert!(applied.ok && applied.converged, "{:?}", applied.diagnostics);
 
     fs::write(
@@ -67,8 +67,12 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     )
     .unwrap();
     let caller = IdentityAuthorization::authenticated("principal:schema").unwrap();
-    let planned =
-        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &caller).await;
+    let planned = Box::pin(plan_config_dir_authorized(
+        dir.path(),
+        PlanOptions { observe: true },
+        &caller,
+    ))
+    .await;
     assert!(planned.plan.ok, "{:?}", planned.plan.diagnostics);
     let expected = planned.authorization.unwrap();
 
@@ -76,20 +80,19 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     // The table transaction has committed while the graph manifest is unchanged.
     let graph = dir.path().join("graphs/knowledge.omni");
     let uri = graph.to_str().unwrap();
-    let writer = Omnigraph::open(uri).await.unwrap();
+    let writer = Box::pin(Omnigraph::open(uri)).await.unwrap();
     {
         let _failpoint =
             ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
-        let error = writer
-            .mutate_as(
-                "main",
-                "query add() { insert Person { name: \"interrupted\" } }",
-                "add",
-                &Default::default(),
-                Some("principal:writer"),
-            )
-            .await
-            .unwrap_err();
+        let error = Box::pin(writer.mutate_as(
+            "main",
+            "query add() { insert Person { name: \"interrupted\" } }",
+            "add",
+            &Default::default(),
+            Some("principal:writer"),
+        ))
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("injected failpoint"), "{error}");
     }
     drop(writer);
@@ -98,20 +101,29 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     let ledger = dir.path().join("__cluster/state.json");
     let before_ledger = fs::read(&ledger).unwrap();
 
-    let preview =
-        plan_config_dir_authorized(dir.path(), PlanOptions { observe: true }, &caller).await;
+    let preview = Box::pin(plan_config_dir_authorized(
+        dir.path(),
+        PlanOptions { observe: true },
+        &caller,
+    ))
+    .await;
     assert!(
         !preview.plan.ok,
         "pending data recovery must block a new plan"
     );
     assert!(preview.authorization.is_none());
     assert!(
-        authorize_apply_plan(dir.path(), &caller, &expected)
+        Box::pin(authorize_apply_plan(dir.path(), &caller, &expected))
             .await
             .is_err()
     );
-    let refused =
-        apply_config_dir_authorized(dir.path(), ApplyOptions::default(), &caller, &expected).await;
+    let refused = Box::pin(apply_config_dir_authorized(
+        dir.path(),
+        ApplyOptions::default(),
+        &caller,
+        &expected,
+    ))
+    .await;
     assert!(
         !refused.apply.ok,
         "pending data recovery must block schema apply"
@@ -131,20 +143,19 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     );
 
     // The existing explicit storage-holder path keeps its recovery behavior.
-    let legacy = apply_config_dir(dir.path()).await;
+    let legacy = Box::pin(apply_config_dir(dir.path())).await;
     assert!(legacy.ok && legacy.converged, "{:?}", legacy.diagnostics);
     assert_eq!(fs::read_dir(graph.join("__recovery")).unwrap().count(), 0);
-    let recovered = Omnigraph::open_read_only(uri).await.unwrap();
+    let recovered = Box::pin(Omnigraph::open_read_only(uri)).await.unwrap();
     assert!(recovered.schema_source().contains("email"));
-    let result = recovered
-        .query(
-            "main",
-            "query names() { match { $p: Person } return { $p.name } }",
-            "names",
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+    let result = Box::pin(recovered.query(
+        "main",
+        "query names() { match { $p: Person } return { $p.name } }",
+        "names",
+        &Default::default(),
+    ))
+    .await
+    .unwrap();
     assert_eq!(
         result.num_rows(),
         1,
