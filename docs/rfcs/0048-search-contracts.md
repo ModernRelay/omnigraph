@@ -993,6 +993,25 @@ query identity. Adding a searchable type can then change that explicitly
 defined population. Ordinary unindexed or non-searchable fields do not acquire
 an implicit text conversion or embedding recipe.
 
+An all-node selector must expand to every accepted node type without requiring
+applications to enumerate the alternatives. Keep this type scope separate from
+the representation selector: the latter resolves analyzed properties, field
+reductions and compatible embedding spaces. A node type with no selected usable
+representation remains in the declared scope but cannot contribute a ranked
+hit. Coverage must distinguish this absence from an evaluated non-match;
+unknown counts remain explicit unless exact coverage was requested. An index
+is not what makes a property searchable, and missing indexes must not remove a
+type from the logical scope. All-edge scope is a separate explicit choice.
+
+Resolve both selectors against the query's accepted snapshot and include their
+expanded identities in execution identity. A newly added node type is therefore
+included in a subsequent all-node query, while a read pinned to an older snapshot
+retains that snapshot's type and representation scope. This automatic scope
+expansion does not authorize implicit stringification, mixing vector spaces, or
+resetting resource allowances per type. The wildcard spelling and typed
+representation-selector grammar remain part of the general query-language
+extension; a wildcard alone does not make `$hit.title` valid on every type.
+
 The current compiler binds a variable to one concrete node type. Schema
 interfaces provide declarations and inheritance, but the query binder does
 not yet execute polymorphic scans or a heterogeneous union. The initial
