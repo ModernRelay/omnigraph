@@ -17,6 +17,7 @@ protection.
 - `Lint (clippy)`
 - `GQ Logic Tests`
 - `Fix Regression Gate`
+- `Storage Upgrade Compatibility`
 
 Checks are strict, so a PR must be current with `main`. `Graph Vocabulary
 Guard` remains as an always-reporting context but reports a successful skip on
@@ -25,7 +26,11 @@ audit runs after merge, on tags, and by manual dispatch. User documentation is
 intentionally outside this exact-occurrence audit and is validated by the
 documentation structure check.
 Documentation-only PRs still receive every required context; work-heavy steps
-may report as skipped.
+may report as skipped. `Storage Upgrade Compatibility` is an explicit exception:
+both genuine predecessor migration journeys execute on every change, including
+documentation-only pull requests. Its fixture availability and required-context
+contract are checked by `scripts/check-storage-upgrade-ci.py`. The repository
+policy change must still be applied by an administrator to affect GitHub.
 
 `Test Workspace` runs on pull requests as a reporting context and is
 deliberately not required: with strict checks every merge invalidates every

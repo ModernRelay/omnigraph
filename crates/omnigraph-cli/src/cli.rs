@@ -17,7 +17,7 @@ COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
 URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show/apply.\n  \
 served — require a server: graphs (registry scope).\n  \
-direct — direct storage access; reject --server (init, optimize, rebuild-full-text-indexes, \
+direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
 repair, cleanup, schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
 --cluster).\n  \
@@ -294,6 +294,19 @@ pub(crate) enum Command {
         /// overwrites an initialized graph or purges its Lance datasets.
         #[arg(long)]
         force: bool,
+    },
+    /// Upgrade graph storage offline using registered migration handlers
+    Upgrade {
+        /// Standalone graph storage URI; alternatively use --store
+        uri: Option<String>,
+        /// Run read-only preflight without conversion or recovery writes
+        #[arg(long)]
+        check: bool,
+        /// Requested storage format (defaults to the binary's declared target)
+        #[arg(long, value_name = "N")]
+        to_format: Option<u32>,
+        #[arg(long)]
+        json: bool,
     },
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize {

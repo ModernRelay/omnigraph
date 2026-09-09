@@ -10,13 +10,13 @@ version axes. Never derive one axis from another.
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
 | CLI ↔ server wire | Prefer additive changes; documented breaking release boundaries require coordinated upgrades. No global version handshake. | Shared DTOs, OpenAPI drift tests, and release-specific migration guidance. |
-| Graph storage | Strict single version; rebuild across an incompatible change. | Main-manifest stamp with `MIN_SUPPORTED == CURRENT`. |
+| Graph storage | Current-format serving; explicit registered upgrades, otherwise rebuild. | Main-manifest stamp with `MIN_SUPPORTED == CURRENT`. |
 | Recovery sidecar | Independently versioned persisted protocol. | Sidecar grammar/version refusal before classification. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
 
-The current binary reads and writes exactly **internal manifest schema v7**.
+Normal graph open and new writes require **internal manifest schema v7**.
 `INTERNAL_MANIFEST_SCHEMA_VERSION` and `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`
 are both 7.
 
@@ -38,9 +38,12 @@ are both 7.
   "upgrade omnigraph" advice cannot be satisfied for it, and such a graph is
   rebuilt from an export taken with the build that wrote it.
 
-A lower stamp is refused with export/rebuild guidance. A higher stamp is
-refused before recovery or table decoding. There is no in-place migration
-dispatcher.
+Normal open refuses lower and higher stamps before recovery or table decoding.
+`omnigraph upgrade` explicitly converts supported standalone v6 graphs to v7.
+It preserves original retained snapshots and decodes their v6 registrations
+explicitly after main-root admission. A pending upgrade marker refuses normal
+opens until every branch validates and main activation completes.
+See [RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) for the offline protocol.
 
 ## Recovery version
 
@@ -61,16 +64,40 @@ or a behavior that changes persisted graph meaning does.
 Current compatibility fences and the required upstream reading set are in
 [lance.md](lance.md).
 
-## Why rebuild instead of migrate
+## Registered conversion and rebuild fallback
 
-An in-place migration permanently adds legacy readers, crash windows, and
-version-pair tests. The present strand model keeps one readable physical shape:
-export the old logical graph with the old binary, initialize a fresh current
-graph, and load the export. Rows, vectors, Blob values, and schema meaning are
-preserved; physical histories and stable identities intentionally restart.
+The registered v6-to-v7 handler appends manifest metadata and retains table
+files, branch ancestry, commit IDs and historical locators. Operators must stop
+all writers and maintenance and preserve a restorable backup before execution.
+Cluster-managed conversion is refused until its admission protocol is qualified.
 
-The operator procedure is documented in
+Other source formats still require export with the source executable, fresh
+initialization and load. Rebuild preserves logical values but intentionally
+restarts physical history and identities. See
 [the upgrade guide](../user/operations/upgrade.md).
+
+## Storage upgrade support matrix
+
+The `storage_upgrade_compatibility` CI job (Storage Upgrade Compatibility)
+requires genuine predecessor migration and admission regressions, engine
+conversion/recovery tests, Lance version qualification and protocol guards on
+every change. Missing binaries, missing test cases, empty runs and skipped
+required cases fail the job. The binaries are version-checked before fixture
+creation. Branch naming without a post-fork logical-name witness is refused;
+see the [admission limits](../user/operations/upgrade.md).
+
+| Source executable / format | Normal open | Explicit route | Required case in `crossversion_upgrade.rs` |
+|---|---|---|---|
+| 0.9.0 / v6 | Refused | v6 → v7 | `genuine_v09_explicit_storage_upgrade_preserves_history` |
+| 0.10.0 / v6 | Refused | v6 → v7 | `genuine_v010_explicit_storage_upgrade_preserves_history` |
+| Current / v7 | Accepted | Already-current no-op | Both migration journeys, after conversion |
+| Older or unknown / not v6 or v7 | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
+
+These journeys cover local standalone roots. Object-store backend qualification
+and deployment branch-protection configuration require their own environment
+evidence; a local pass is not evidence for those gates. Cluster-managed entry
+points remain refused. Changing a declared route requires updating its fixture,
+refusal expectations and this matrix together, with storage-maintainer review.
 
 ## Wire compatibility
 
@@ -109,10 +136,11 @@ GitHub Releases, and the TypeScript SDK ships through npm. Do not document
 ### Graph storage
 
 1. Write an RFC for the irreversible format decision.
-2. Bump the manifest stamp and keep `MIN_SUPPORTED == CURRENT` unless a real
-   converter is implemented.
+2. Bump the manifest stamp and keep normal-open `MIN_SUPPORTED == CURRENT`.
+   Register explicit conversion separately from serving admission.
 3. Refuse old/future formats before decoding.
-4. Add genuine old-binary/new-binary refusal and rebuild evidence.
+4. Add genuine predecessor evidence for every declared direct or migration route,
+   plus refusal and rebuild fallback evidence.
 5. Update the upgrade guide and release notes.
 
 ### Recovery

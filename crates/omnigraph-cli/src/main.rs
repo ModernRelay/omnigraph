@@ -55,6 +55,7 @@ mod managed_http_fixture;
 mod output;
 mod planes;
 mod scope;
+mod upgrade;
 use cli::*;
 use helpers::*;
 use output::*;
@@ -1356,6 +1357,23 @@ async fn main() -> Result<()> {
                     print_policy_explain(&decision, &actor, &request);
                 }
             }
+        }
+        Command::Upgrade {
+            uri,
+            check,
+            to_format,
+            json,
+        } => {
+            upgrade::run(
+                &cli.profile,
+                &cli.store,
+                uri,
+                check,
+                to_format,
+                json,
+                cli.quiet,
+            )
+            .await?;
         }
         Command::Optimize { uri, json } => {
             let uri = resolve_maintenance_uri(

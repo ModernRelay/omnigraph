@@ -161,6 +161,9 @@ jobs:
       - name: Enforce release vocabulary gates
         run: python3 scripts/check-release-vocabulary-gates.py
 
+      - name: Check required storage upgrade coverage
+        run: python3 scripts/check-storage-upgrade-ci.py --self-test
+
   azure_contract_guards:
     name: Azure Contract Guards
     runs-on: ubuntu-latest
@@ -601,6 +604,86 @@ jobs:
           grep -Eq "test current_v7_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v7 \\.\\.\\. ok" "$test_log" \
             || { echo "::error::exact v6 format fence did not pass"; exit 1; }
 
+
+
+  storage_upgrade_compatibility:
+    name: Storage Upgrade Compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+      OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: Check storage compatibility gate configuration
+        run: python3 scripts/check-storage-upgrade-ci.py --self-test
+
+      - name: Install genuine v0.9 and v0.10 migration predecessors
+        run: |
+          set -euo pipefail
+          v09_dir="$RUNNER_TEMP/omnigraph-v09"
+          v6_dir="$RUNNER_TEMP/omnigraph-v010"
+          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.9.0 INSTALL_DIR="$v09_dir" \
+            bash scripts/install.sh
+          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.10.0 INSTALL_DIR="$v6_dir" \
+            bash scripts/install.sh
+          test -x "$v09_dir/omnigraph"
+          test -x "$v6_dir/omnigraph"
+          [[ "$("$v09_dir/omnigraph" --version)" == "omnigraph 0.9.0" ]] \
+            || { echo "::error::storage upgrade requires the genuine v0.9.0 CLI"; exit 1; }
+          [[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \
+            || { echo "::error::storage upgrade requires the genuine v0.10.0 CLI"; exit 1; }
+          echo "OMNIGRAPH_V09_BIN=$v09_dir/omnigraph" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
+
+      - name: Run required storage upgrade crossversion tests
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/storage-upgrade-crossversion.log"
+          cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
+          python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log"
+
+      - name: Run required storage upgrade engine tests
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
+          cargo test --locked -p omnigraph-engine --lib --features failpoints db::manifest::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
+          python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
+
+      - name: Run required storage upgrade lance tests
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/storage-upgrade-lance.log"
+          cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1 2>&1 | tee "$test_log"
+          python3 scripts/check-storage-upgrade-ci.py --check-log lance "$test_log"
+
+      - name: Run required storage upgrade protocol tests
+        run: |
+          set -euo pipefail
+          test_log="$RUNNER_TEMP/storage-upgrade-protocol.log"
+          cargo test --locked -p omnigraph-engine --test forbidden_apis --features failpoints -- --test-threads=1 2>&1 | tee "$test_log"
+          python3 scripts/check-storage-upgrade-ci.py --check-log protocol "$test_log"
 
   v5_v7_format_fence:
     name: V5 ↔ V7 Format Fence

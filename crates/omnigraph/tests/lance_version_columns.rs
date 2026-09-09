@@ -281,3 +281,51 @@ async fn lance_merge_insert_update_preserves_created_at_version() {
         "bob updated_at must bump to the commit version on a merge_insert UPDATE"
     );
 }
+
+#[tokio::test]
+async fn metadata_upgrade_preserves_historical_stamps_and_row_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("test.lance");
+    let uri = uri.to_str().unwrap();
+    let mut main = create_test_dataset(uri).await;
+    let stamp_key = "omnigraph:internal_schema_version";
+    main.update_schema_metadata([(stamp_key, "6")])
+        .await
+        .unwrap();
+    let source_version = main.version().version;
+    let source_rows = scan_with_versions(&main).await;
+    let mut feature = main
+        .create_branch("feature", source_version, None)
+        .await
+        .unwrap();
+    let feature_source_version = feature.version().version;
+    assert_eq!(scan_with_versions(&feature).await, source_rows);
+
+    main.update_schema_metadata([(stamp_key, "7")])
+        .await
+        .unwrap();
+    let current_main = Dataset::open(uri).await.unwrap();
+    let current_feature = current_main.checkout_branch("feature").await.unwrap();
+    assert_eq!(current_main.schema().metadata[stamp_key], "7");
+    assert_eq!(current_feature.schema().metadata[stamp_key], "6");
+    assert_eq!(current_feature.version().version, feature_source_version);
+    assert_eq!(scan_with_versions(&current_main).await, source_rows);
+
+    feature
+        .update_schema_metadata([(stamp_key, "7")])
+        .await
+        .unwrap();
+    let current_feature = current_main.checkout_branch("feature").await.unwrap();
+    assert_eq!(current_feature.schema().metadata[stamp_key], "7");
+    assert_eq!(scan_with_versions(&current_feature).await, source_rows);
+
+    let historical_main = current_main.checkout_version(source_version).await.unwrap();
+    let historical_feature = current_feature
+        .checkout_version(feature_source_version)
+        .await
+        .unwrap();
+    for historical in [historical_main, historical_feature] {
+        assert_eq!(historical.schema().metadata[stamp_key], "6");
+        assert_eq!(scan_with_versions(&historical).await, source_rows);
+    }
+}

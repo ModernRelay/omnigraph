@@ -162,6 +162,18 @@ pub(super) fn manifest_schema() -> SchemaRef {
     ]))
 }
 
+pub(super) async fn read_manifest_state_with_registration_clocks(
+    dataset: &Dataset,
+) -> Result<ManifestState> {
+    if super::migrations::read_stamp(dataset) != Some(6) {
+        return Err(OmniError::manifest_internal(
+            "registration-clock conversion requires a v6 source".to_string(),
+        ));
+    }
+    let scan = read_manifest_scan_with_clocks(dataset, false, None, true).await?;
+    manifest_state_from_scan(dataset.version().version, scan)
+}
+
 pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
     let version = dataset.version().version;
     // The table-state hot path never needs lineage, so don't pay its JSON decode.
@@ -673,6 +685,30 @@ fn require_clock_at_or_below(clock: u64, dataset: &Dataset, table_key: &str) -> 
     Ok(())
 }
 
+fn registration_clock(
+    dataset: &Dataset,
+    legacy: bool,
+    key_version: u64,
+    table_version: u64,
+    update_versions: Option<&UInt64Array>,
+    row: usize,
+    table_key: &str,
+) -> Result<u64> {
+    if legacy && key_version != table_version {
+        return Err(OmniError::manifest_internal(format!(
+            "v6 manifest row for {table_key} has key version {key_version}, expected table version {table_version}"
+        )));
+    }
+    let clock = match update_versions {
+        Some(versions) => required_u64(versions, row, "_row_last_updated_at_version")?,
+        None => key_version,
+    };
+    if !legacy || update_versions.is_some() {
+        require_clock_at_or_below(clock, dataset, table_key)?;
+    }
+    Ok(clock)
+}
+
 async fn read_manifest_scan(dataset: &Dataset, collect_lineage: bool) -> Result<ManifestScan> {
     read_manifest_scan_fragments(dataset, collect_lineage, None).await
 }
@@ -686,12 +722,22 @@ async fn read_manifest_scan_fragments(
     collect_lineage: bool,
     fragments: Option<Vec<lance_table::format::Fragment>>,
 ) -> Result<ManifestScan> {
+    read_manifest_scan_with_clocks(dataset, collect_lineage, fragments, false).await
+}
+
+async fn read_manifest_scan_with_clocks(
+    dataset: &Dataset,
+    collect_lineage: bool,
+    fragments: Option<Vec<lance_table::format::Fragment>>,
+    use_row_update_versions: bool,
+) -> Result<ManifestScan> {
+    let legacy = super::migrations::read_stamp(dataset) == Some(6);
     crate::instrumentation::record_manifest_scan();
     // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The
     // `object_id` is needed for the bounded graph-head authority decode on every
     // path; `base_objects` remains reserved/unused. Mirrors Lance's own
     // directory-catalog `__manifest` reads, which project only needed columns.
-    let projection: Vec<&str> = vec![
+    let mut projection: Vec<&str> = vec![
         "object_id",
         "object_type",
         "location",
@@ -703,6 +749,9 @@ async fn read_manifest_scan_fragments(
         "table_branch",
         "row_count",
     ];
+    if use_row_update_versions {
+        projection.push("_row_last_updated_at_version");
+    }
     let is_delta_scan = fragments.is_some();
     let mut scanner = dataset.scan();
     scanner.project(&projection).map_err(OmniError::storage)?;
@@ -736,6 +785,9 @@ async fn read_manifest_scan_fragments(
         let versions = u64_column(batch, "table_version")?;
         let branches = string_column(batch, "table_branch")?;
         let row_counts = u64_column(batch, "row_count")?;
+        let update_versions = use_row_update_versions
+            .then(|| u64_column(batch, "_row_last_updated_at_version"))
+            .transpose()?;
         // `object_id` is needed for the exact graph-head authority even on the
         // table-state path. We still skip every `graph_commit` decode there, so
         // the added work is bounded by the number of branch-head rows rather
@@ -795,12 +847,20 @@ async fn read_manifest_scan_fragments(
                         OBJECT_TYPE_TABLE_VERSION,
                     )?;
                     let table_version = required_u64(versions, row, "table_version")?;
-                    let manifest_version = manifest_version_from_object_id(
+                    let key_version = manifest_version_from_object_id(
                         object_ids.value(row),
                         identity,
                         OBJECT_TYPE_TABLE_VERSION,
                     )?;
-                    require_clock_at_or_below(manifest_version, dataset, &table_key)?;
+                    let manifest_version = registration_clock(
+                        dataset,
+                        legacy,
+                        key_version,
+                        table_version,
+                        update_versions,
+                        row,
+                        &table_key,
+                    )?;
                     let row_count = required_u64(row_counts, row, "row_count")?;
                     if metadata.is_null(row) {
                         return Err(OmniError::manifest_internal(format!(
@@ -832,12 +892,20 @@ async fn read_manifest_scan_fragments(
                         OBJECT_TYPE_TABLE_TOMBSTONE,
                     )?;
                     let tombstone_version = required_u64(versions, row, "table_version")?;
-                    let manifest_version = manifest_version_from_object_id(
+                    let key_version = manifest_version_from_object_id(
                         object_ids.value(row),
                         identity,
                         OBJECT_TYPE_TABLE_TOMBSTONE,
                     )?;
-                    require_clock_at_or_below(manifest_version, dataset, &table_key)?;
+                    let manifest_version = registration_clock(
+                        dataset,
+                        legacy,
+                        key_version,
+                        tombstone_version,
+                        update_versions,
+                        row,
+                        &table_key,
+                    )?;
                     tombstones.push(TableTombstoneEntry {
                         identity,
                         table_key,
@@ -900,7 +968,7 @@ async fn read_manifest_scan_fragments(
                     .map(|tombstone| (tombstone.identity, tombstone.manifest_version)),
             )
         {
-            if !clocks.insert((identity, clock)) {
+            if !clocks.insert((identity, clock)) && (!legacy || use_row_update_versions) {
                 return Err(OmniError::manifest_internal(format!(
                     "manifest has two rows for identity {identity} at manifest version {clock}"
                 )));

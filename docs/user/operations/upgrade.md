@@ -1,19 +1,90 @@
 # Upgrading OmniGraph
 
-OmniGraph intentionally supports one storage format per binary. When a release
-changes that format, the new binary refuses the old graph and tells you which
-release line can export it. Upgrade by rebuilding at a new URI:
+Normal open accepts the current storage format. Use explicit storage migration
+for a registered route, or export/import with a source-compatible binary when
+no route exists. Storage formats, release versions and full-text index formats
+are separate; check the [release notes](../../releases/) before upgrading.
 
-1. export the schema and one branch with a compatible old binary;
-2. initialize a new graph with the new binary;
-3. load the export;
-4. verify and cut over;
-5. retire the old graph only after the cutover is proven.
+## Explicit v6 to v7 storage migration
 
-Ordinary patch/minor upgrades that keep the same storage format do not require
-this export/import procedure. Derived indexes may still need rebuilding, as
-below, and CLI/API compatibility is independent of graph storage. Check the
-[release notes](../../releases/) before upgrading.
+`omnigraph upgrade` converts standalone v6 graphs created by the 0.9.x/0.10.x
+release lines to v7 in the same location. It appends manifest metadata and reuses
+table data. It preserves branch ancestry, IDs, property values, schema identity,
+retained commit IDs and numeric snapshots. Historical v6 snapshots keep their
+original metadata and use an explicit legacy decoder after root admission.
+
+1. Stop every server, embedded writer, maintenance process and cluster apply
+   that could touch the graph or its shared dependencies. A process-local lock
+   cannot stop an already-open old binary in another process.
+2. Preserve and verify a restorable backup of the entire root, including branch
+   references and historical data. Keep the source-compatible executable.
+3. Run preflight with the new binary:
+
+   ```bash
+   omnigraph upgrade ./graph.omni --check --to-format 7 --json
+   ```
+
+4. Inspect `outcome`, `findings`, `route` and `work`. A passing check is advisory;
+   execution repeats validation. Resolve source recovery with the compatible
+   source executable before retrying. Shared Lance files outside the root refuse.
+   `work.external_blob_exclusions` lists external URI bytes whose immutability
+   and backup are outside the migration guarantee; their descriptors are retained.
+   `work.historical_blob_identity_limits` lists pre-0.10 Blob fields without
+   stable property IDs. Their bytes are preserved, but existing historical
+   delivery restrictions remain after their current physical entry changes;
+   migration cannot invent missing property-lifetime evidence. See
+   [Blob identity](../../releases/v0.10.0.md#blob-identity-and-rollback).
+   Validation-read bytes may be unknown and are reported as JSON `null`.
+5. Execute while the graph remains offline:
+
+   ```bash
+   omnigraph upgrade ./graph.omni --to-format 7 --json
+   ```
+
+6. Verify reads on every branch and retained snapshot, then start only the new
+   fleet. Keep the backup for rollback. Restore the complete pre-upgrade backup
+   with the old executable; old bytes remaining in the upgraded root do not
+   make downgrading safe. Post-upgrade writes are absent from that backup.
+
+`--to-format` defaults to the binary's declared target, currently 7. Unsupported
+sources and targets refuse; there is no automatic data-moving fallback. Both
+check and execution return zero only for success (`check_passed`, `completed`
+or `already_current`). Repeated successful execution is a no-write no-op.
+
+After the early fence, ordinary opens refuse until every branch is converted
+and validated. If interrupted, retain the backup and rerun the same command
+with `--to-format 7`, without `--check`, using this upgrade-capable executable.
+The report identifies the last durable boundary and required recovery action.
+Unknown ownership or foreign branch movement requires investigation; never
+delete the pending marker to force serving or point the source executable at it.
+
+Branch naming must also be unambiguous. A native name ending in a ULID-shaped
+suffix could be either a v0.9 logical name or a newer branch incarnation. The
+handler requires a logical-head commit written after that native branch's fork
+to prove the interpretation. Otherwise it refuses before writing, including
+unused suffixed branches without that evidence. Duplicate logical names and
+incarnation-shaped inner path segments also refuse. Resolve the branch naming
+with the source executable or use the export/rebuild fallback; do not rename
+native Lance refs or edit their metadata manually.
+
+This initial handler bounds each retained manifest to 1,000,000 rows and 64 MiB
+of decoded batch metadata, 1,024 native branches and 100,000 retained versions
+per branch. Version references are counted before historical manifests are
+loaded. Exceeding a bound refuses before conversion. Payload bytes copied
+and rewritten are zero; managed Blob validation can still read substantial data.
+
+Server and cluster selectors, cluster profiles and recognized cluster-layout
+roots refuse until a cluster upgrade protocol is qualified. Local paths, file
+URIs and symlink aliases are resolved before the cluster ownership check. Direct path access
+is an operator interface; it cannot prove that an arbitrary root is unmanaged.
+Embedded callers must supply exclusive control and, where installed, the policy
+checker to `upgrade_storage_as`, which checks `SchemaApply` for every branch.
+
+The genuine predecessor CI journeys cover local standalone roots. Other backend
+qualification is separate; see the [support matrix](../../dev/versioning.md#storage-upgrade-support-matrix).
+Storage migration does not rebuild full-text indexes. Use the procedure below
+when old index analyzers are incompatible. Formats without a registered route
+still use the export/import rebuild procedure later in this guide.
 
 ## v0.9 to v0.10
 

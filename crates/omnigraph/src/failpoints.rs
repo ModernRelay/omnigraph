@@ -132,6 +132,11 @@ pub(crate) fn maybe_fail_retryable_contention(name: &str) -> Result<()> {
 /// reference these constants instead of bare string literals, so a typo is a
 /// compile error rather than a silently-never-firing failpoint.
 pub mod names {
+    pub const UPGRADE_AFTER_FENCE: &str = "upgrade.after_fence";
+    pub const UPGRADE_AFTER_STAGE: &str = "upgrade.after_stage";
+    pub const UPGRADE_AFTER_BRANCH: &str = "upgrade.after_branch";
+    pub const UPGRADE_BEFORE_ACTIVATION: &str = "upgrade.before_activation";
+    pub const UPGRADE_AFTER_ACTIVATION: &str = "upgrade.after_activation";
     /// After Lance returns success from its two-phase native create, before
     /// OmniGraph acknowledges it. Recovery must classify the matching
     /// BranchContents as a completed create (lost acknowledgement).

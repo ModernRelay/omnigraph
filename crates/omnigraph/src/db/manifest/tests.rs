@@ -3558,3 +3558,185 @@ async fn projection_refresh_matches_clean_full_reopen() {
             .any(|row| row.graph_commit_id == unacknowledged.graph_commit_id)
     );
 }
+
+async fn legacy_manifest_fixture(
+    uri: &str,
+    source: &DatasetEntry,
+    table_version: u64,
+    key_version: u64,
+    mode: lance::dataset::WriteMode,
+) -> Dataset {
+    let mut entry = source.clone();
+    entry.published_dataset_version = table_version;
+    entry.manifest_version = key_version;
+    let metadata = HashMap::from([(
+        entry.identity,
+        entry.version_metadata.to_json_string().unwrap(),
+    )]);
+    let batch = super::state::entries_to_batch(&[entry], &metadata, &[]).unwrap();
+    let batch = if matches!(mode, lance::dataset::WriteMode::Append) {
+        batch.slice(1, 1)
+    } else {
+        batch
+    };
+    let schema = Arc::new(
+        batch
+            .schema()
+            .as_ref()
+            .clone()
+            .with_metadata(HashMap::from([(
+                "omnigraph:internal_schema_version".to_string(),
+                "6".to_string(),
+            )])),
+    );
+    let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(lance::dataset::WriteParams {
+            mode,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn legacy_manifest_decoder_preserves_data_version_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mc = ManifestCoordinator::init(
+        dir.path().join("graph").to_str().unwrap(),
+        &build_test_catalog(),
+    )
+    .await
+    .unwrap();
+    let source = mc.known_state.entries[0].clone();
+    let fixture = dir.path().join("legacy");
+    let uri = fixture.to_str().unwrap();
+    legacy_manifest_fixture(uri, &source, 40, 40, lance::dataset::WriteMode::Create).await;
+    let dataset =
+        legacy_manifest_fixture(uri, &source, 20, 20, lance::dataset::WriteMode::Append).await;
+    let legacy = super::state::read_manifest_state(&dataset).await.unwrap();
+    assert_eq!(legacy.entries[0].published_dataset_version, 40);
+    let by_update = super::state::read_manifest_state_with_registration_clocks(&dataset)
+        .await
+        .unwrap();
+    assert_eq!(by_update.entries[0].published_dataset_version, 20);
+    assert_eq!(by_update.entries[0].manifest_version, 2);
+    let historical = dataset.checkout_version(1).await.unwrap();
+    assert_eq!(
+        super::state::read_manifest_state(&historical)
+            .await
+            .unwrap()
+            .entries[0]
+            .published_dataset_version,
+        40
+    );
+    assert!(super::migrations::guard_stamp(&dataset).is_err());
+}
+
+#[tokio::test]
+async fn legacy_manifest_decoder_refuses_key_pointer_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mc = ManifestCoordinator::init(
+        dir.path().join("graph").to_str().unwrap(),
+        &build_test_catalog(),
+    )
+    .await
+    .unwrap();
+    let source = mc.known_state.entries[0].clone();
+    let dataset = legacy_manifest_fixture(
+        dir.path().join("legacy").to_str().unwrap(),
+        &source,
+        40,
+        41,
+        lance::dataset::WriteMode::Create,
+    )
+    .await;
+    let error = super::state::read_manifest_state(&dataset)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("expected table version 40"));
+    let error = super::state::read_manifest_state_with_registration_clocks(&dataset)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("expected table version 40"));
+}
+
+#[tokio::test]
+async fn legacy_manifest_decoder_preserves_equal_version_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mc = ManifestCoordinator::init(
+        dir.path().join("graph").to_str().unwrap(),
+        &build_test_catalog(),
+    )
+    .await
+    .unwrap();
+    let mut source = mc.known_state.entries[0].clone();
+    source.published_dataset_version = 40;
+    source.manifest_version = 40;
+    let fixture = dir.path().join("legacy");
+    let uri = fixture.to_str().unwrap();
+    let original =
+        legacy_manifest_fixture(uri, &source, 40, 40, lance::dataset::WriteMode::Create).await;
+    let metadata = HashMap::from([(
+        source.identity,
+        source.version_metadata.to_json_string().unwrap(),
+    )]);
+    let batch = super::state::entries_to_batch(std::slice::from_ref(&source), &metadata, &[])
+        .unwrap()
+        .slice(1, 1);
+    let mut columns = batch.columns().to_vec();
+    columns[0] = Arc::new(StringArray::from(vec![super::layout::tombstone_object_id(
+        source.identity,
+        40,
+    )]));
+    columns[1] = Arc::new(StringArray::from(vec![OBJECT_TYPE_TABLE_TOMBSTONE]));
+    let schema = Arc::new(
+        batch
+            .schema()
+            .as_ref()
+            .clone()
+            .with_metadata(original.schema().metadata.clone()),
+    );
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(lance::dataset::WriteParams {
+            mode: lance::dataset::WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        super::state::read_manifest_state(&dataset)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    assert!(
+        super::state::read_manifest_state_with_registration_clocks(&dataset)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    dataset
+        .update_schema_metadata([("omnigraph:internal_schema_version", "7")])
+        .await
+        .unwrap();
+    let error = super::state::read_manifest_state(&dataset)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("above the scanned dataset version")
+    );
+}
