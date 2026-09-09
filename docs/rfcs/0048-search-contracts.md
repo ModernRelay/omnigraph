@@ -39,6 +39,10 @@ inputs, selection limits and result identity. The draft includes executable
 qualification evidence, but the complete production feature is not implemented.
 The frontmatter status refers to that production feature.
 
+The [CI checkpoint](#ci-checkpoint-and-regression-disposition) has four failing
+GQT search regressions. They reproduce the defects this design must resolve;
+passing native probes and the completed agent pilot do not close those failures.
+
 The immediate problem is correctness. Today, the same text can match before an
 index is built and stop matching afterward; fuzzy indexed and uncovered rows
 can disagree. Retrieval hidden inside `order` also makes a final output limit
@@ -1925,6 +1929,44 @@ membership inclusion at edit budgets zero through two. Its passing numerical
 checks do not assert bit-for-bit equivalence with native scores or validate a
 streaming, indexed, or resource-bounded evaluator. The fixture's source strings
 already represent analyzed tokens; NFC/tokenizer coverage remains separate.
+
+#### CI checkpoint and regression disposition
+
+The 2026-09-09 GitHub Actions runs for PR head
+`bf5a77e55bc1dcd8415f28d5900d0a9cd218d78e` confirm the same four failures in
+both [GQ Logic Tests](https://github.com/ModernRelay/omnigraph/actions/runs/34371510788/job/102533700021)
+and [Test Workspace](https://github.com/ModernRelay/omnigraph/actions/runs/34371511424/job/102534255348):
+67 of 71 cases pass, and all 127 runner self-tests pass. The workspace job
+tests GitHub's merge candidate `f4ce7e895eb5c29b34c70cb1dbfbf95fba2f8a27`,
+which combines that PR head with base `ed3ea5006f55ef703a3331f29ac45a2262f13300`.
+This identifies the tested source; it does not claim validation against a
+later `main` revision.
+
+| Existing GQT owner | First observed failure | Required implementation and migration proof |
+|---|---|---|
+| [`fuzzy_query_bypasses_index_analyzer`](../../crates/omnigraph-gqt/cases/fuzzy_query_bypasses_index_analyzer.gqt) | Step 2: capitalized `Introductio` returns no rows; `intro` is expected. | Phase 2 must apply the accepted field analyzer at every edit budget. Retain the lowercase and zero-edit controls and reach the later assertions. |
+| [`index_state_changes_text_matches`](../../crates/omnigraph-gqt/cases/index_state_changes_text_matches.gqt) | Step 5, including the two mutation steps: `running` finds only the appended row and loses the indexed row. | Phase 2 must use one matching definition for indexed and uncovered rows. Complete the later `beto` assertion as well; passing the first repaired step is insufficient. |
+| [`search_on_traversal_target_is_dropped`](../../crates/omnigraph-gqt/cases/search_on_traversal_target_is_dropped.gqt) | Step 2: traversal returns B, C and D where only B and D match. | Phase 3 must retain the target predicate and rank the traversal target. The later ranking assertion must return D, rather than fail for a missing score column. |
+| [`unindexed_search_is_case_sensitive`](../../crates/omnigraph-gqt/cases/unindexed_search_is_case_sensitive.gqt) | Step 3: unindexed `deep` finds only the lowercase row; both rows are expected. | Phase 2 must preserve matching with and without an index. Migrate both field declarations to the intended accepted analyzer, and run both query-case controls. |
+
+These cases were added in `b1df2041` and remain active regressions. During the
+coordinated query migration, rewrite their legacy `search`, `fuzzy` and `bm25`
+forms through the new typed terms and ranking constructs while preserving
+their expected membership and ordering. Declare analyzer intent in the schema;
+index presence cannot provide it. Removing the old syntax, blessing the
+incorrect rows, or running only the isolated staged case does not close these
+regressions. A passing implementation needs every step and the full corpus to
+run through the production parser and engine.
+
+The same workspace run passes 361 compiler tests, 42 Lance surface guards,
+56 search tests, 13 RRF/prefilter tests, 88 CLI data tests and 23 CLI parity
+tests before failing at GQT. These counts describe the PR's checked-in code;
+the archived integration experiment has different test counts and is outside
+this CI build. Environment-specific skips inside native guards retain their
+existing limitations. The workspace process stops on the GQT failure, so
+later workspace test targets are not established by this run. Format and
+Clippy checks pass independently. The PR still has failing CI and requires
+the implementation above before its executable regression suite is green.
 
 ### Implementation handoff and validation checkpoint
 
