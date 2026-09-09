@@ -23,10 +23,84 @@ blocked_on:
   - "Snapshot-visible live-row statistics, canonical float64/log1p implementation, and full boundary-tie handling"
   - "Whole-query admission and accounting for token construction, graph fan-out, coverage, sorting, scoring, fallback, and output bytes"
   - "Snapshot-coherent follow-up read and stored-query fingerprint contracts through the existing read surface"
+  - "All-node scope, representation selection, typed union/narrowing grammar, and an explicit disposition for cross-type search in the initial release"
   - "Checked-in retrieval judgments and agent-task evaluation corpus; bounded ann_default_v1 recall/latency qualification per index family"
 ---
 
 # RFC 0048: Search contracts and retrieval algebra
+
+## Maintainer briefing
+
+This RFC proposes the search contract OmniGraph should carry into its stable
+API. It is under review in PR #606 alongside
+[RFC 0047](0047-search-plan-truth.md). The decision is whether bounded search
+should become an explicit operation in the graph language, with its own
+inputs, selection limits and result identity. The draft includes executable
+qualification evidence, but the complete production feature is not implemented.
+The frontmatter status refers to that production feature.
+
+The immediate problem is correctness. Today, the same text can match before an
+index is built and stop matching afterward; fuzzy indexed and uncovered rows
+can disagree. Retrieval hidden inside `order` also makes a final output limit
+double as a vector candidate limit, while lexical fusion inputs are uncapped.
+These are observable differences in which facts a query returns.
+
+The proposed model follows one distinction: a predicate decides eligibility;
+a retriever selects and ranks eligible targets. For example, searching for the
+best incidents within one organization differs from searching globally and
+then discarding other organizations' incidents. Once an earlier stage drops
+a candidate, a later filter, grouping operation or reranker cannot recover it.
+
+The language therefore needs explicit stages:
+
+```text
+graph scope → lexical/vector candidates → fusion → graph expansion
+            → selection per group → selective source reads
+```
+
+Their placement is semantic. Candidate windows, physical search effort and
+final output size are separate controls. Named metrics retain the target and
+source that produced them; traversal duplicates cannot create extra fusion
+votes. One typed `terms` query supplies both Boolean matching and lexical
+retrieval, including fuzzy ranking. Exact vector `knn` and approximate `ann`
+make different promises. Small typed stored queries can expose useful defaults
+to agents through the existing query surface.
+
+Applications retain their graph model. A document or passage is an ordinary
+application node, and evidence uses the original entity identity, source
+properties and graph snapshot. There is no required `Document` or
+`EvidenceReference` wrapper. Cross-type discovery preserves each hit's actual
+type. An all-node scope must expand from the accepted schema, separately from
+the selection of searchable representations. Its union, type narrowing and
+projection grammar still need a release-scope decision; a wildcard alone does
+not implement global search.
+
+Lance continues to own versioned datasets and indexes. DataFusion supplies
+relational operators where they fit, and OmniGraph owns graph scope, coherent
+publication, typed stages and query-wide resource ownership. The experiments
+favor narrow intermediate rows and fetching payloads after selection. They
+also expose limits that the implementation must respect: native BM25 needs
+shared live statistics before cross-table cuts, native buffers can sit outside
+the DataFusion pool, and a graph snapshot does not freeze an external encoder.
+No universal best physical plan or retrieval default has been established.
+
+The migration is deliberately breaking because the API is pre-stable. Search
+queries and representation declarations move together in one cutover; the
+accepted-schema change requires the existing export/init/load rebuild. Ordinary
+graph-query syntax keeps its role, but even graphs without search cross that
+format boundary. Old histories and snapshot references do not survive the
+rebuild. The [migration table](#user-facing-changes-and-migration) names the
+changes, unchanged behavior and wire-compatibility questions.
+
+Maintainers need to resolve the stage/type contract, representation and schema
+version identities, whole-query resource protocol, cross-type release scope,
+and the read/error envelope before calling the design accepted. The
+[implementation handoff](#implementation-handoff-and-validation-checkpoint)
+separates checked-in tests from isolated experiments and unfinished evaluation.
+The [phases](#implementation-phases) specify what each implementation must
+prove. Sparse/multivector representations, learned reranking and stable ranked
+pagination retain extension contracts; they are not prerequisites for the
+initial complete lexical/vector/graph path.
 
 ## Summary
 
@@ -1847,6 +1921,164 @@ checks do not assert bit-for-bit equivalence with native scores or validate a
 streaming, indexed, or resource-bounded evaluator. The fixture's source strings
 already represent analyzed tokens; NFC/tokenizer coverage remains separate.
 
+### Implementation handoff and validation checkpoint
+
+This checkpoint records the 2026-09-09 investigation for implementers who did
+not participate in the review. Read the normative Design and Rollout sections
+before porting experimental code. The
+[validation inventory](assets/0048-validation-checkpoint.json) records source
+identities, tested boundaries and the frozen agent-pilot configuration. Its
+[isolated integration patch](assets/0048-staged-integration.patch) applies to
+`b1df2041c93e03aa13cee8308a0a574689baf210`; it is archived experiment code,
+outside the production build of this PR. It must be reviewed and integrated
+through the existing owners, rather than treated as a completed implementation.
+
+The experiment connects the real parser, typechecker, lowered pipeline, engine,
+GQT runner, stored-query server and CLI. It supports scalar String fields with
+bare `@analyzed`, repeated lexical rank blocks with one source per block,
+edit budgets zero through two, named lexical metrics, and `take` using typed
+DataFusion selection. It does not implement the complete proposed analyzer
+catalog, Boolean matching contract, vector/fusion stages, polymorphic scans,
+representation serialization, general metrics or resource protocol.
+
+| Validation workstream | Evidence obtained | Boundary still to implement or qualify |
+|---|---|---|
+| Actual staged graph query | A real GQT case and CLI/TCP journey execute graph scope, lexical rank, traversal, group quota and projection. Named metrics, retained duplicate paths, null groups, limits and invalid inputs have assertions. Current focused checks pass. | Broader grammar, edge targets, multi-source fusion, vector stages, aggregate/result typing and every stage's read descriptor remain production responsibilities. |
+| Independent graph evaluator | Forty generated real-graph cases use an independent scalar/Decimal evaluator for eligibility, ranking, traversal, grouping and retained binding rows. The generated comparison passed. | This finite generator does not cover every graph shape or replace owned GQT regressions and minimized counterexamples. |
+| Numerical and lifecycle oracle | Twelve independently generated Decimal fixtures pass through the experimental scorer across absent/indexed data, tails, updates, deletes, compaction and pinned/reopened snapshots. The current search owner passes 57 tests. | Qualify every accepted analyzer and accelerated scorer, canonical ties, cross-type live statistics and native numeric differences. |
+| Shared admission and resources | Empty terms are refused even on empty populations. A later invalid source is rejected before an earlier source reads an oversized field. A graph suffix with 100,200 bindings fails despite final `limit 1`. Arrow-view and CPU-cooperation regressions pass. | Preallocation/native decode, queued work, analyzed maps, serialization, cancellation propagation and complete cleanup are not bounded by these probes. |
+| Accepted identities and follow-up | Actual stored-query and CLI journeys distinguish current from pinned reads after changes, check unavailable snapshots and revoked access, and preserve JSON/JSONL snapshot metadata. A controlled provider/export test proves that a model label does not freeze encoding. | Persist resolved schema recipes/defaults, coordinate the format fence, complete system-ID lookup for entities without an application key, and qualify execution/definition fingerprints and transport errors. |
+| Actual agent utility | Public repository passages, questions, model settings and budgets were frozen before held-out runs. Development runs exposed accounting and repeated-comparison defects; the revised executable was frozen before held-out evaluation. | The held-out pilot is not fully adjudicated at this checkpoint. No modality winner, production default or broad task-quality conclusion is established. |
+| Physical plan choice | Native same-oracle comparisons cover join strategies, target/pair selection, duplicate paths, null keys, early/late hydration, spill and cleanup. The measured choices and limits are recorded above. | There is no universal winning plan. Production optimizer choices need the full graph pipeline, workload dimensions and shared-resource evidence. |
+
+The distinction between checked-in and experimental tests matters. This PR's
+native `lance_surface_guards` and actual CLI embedding/export owner pass 42 and
+88 tests respectively, with focused Clippy. Environment-dependent guards do
+not establish an unconfigured S3/Azure path. In the archived experiment, the
+latest rerun passes four staged unit tests (one diagnostic instrument remains
+ignored), the 57-test search owner, the staged GQT case, focused Clippy and
+`parity_staged_search`. The complete CLI parity owner previously passed 24
+tests and the server stored-query owner 17; these broader runs predate the
+last internal scorer changes. Do not describe them as fresh full-workspace CI.
+
+To inspect the experiment, create a separate checkout at the recorded base
+and apply the archived patch there. These focused commands exercise its main
+owners; the experimental names are not expected to exist in the production
+checkout of this PR:
+
+```sh
+cargo test -p omnigraph-compiler --lib --locked
+cargo test -p omnigraph-engine --lib exec::query::staged::tests --locked
+cargo test -p omnigraph-engine --test search --locked
+cargo test -p omnigraph-gqt --test gq_logic_tests staged_lexical --locked
+cargo test -p omnigraph-server --test stored_queries staged_search_replays --locked
+cargo test -p omnigraph-cli --test parity_matrix parity_staged_search --locked
+```
+
+Inspect the matched test count: a green zero-test filtered run is not evidence.
+The current [testing guide](../dev/testing.md) owns the full baseline, feature,
+environment and transport checks required when the implementation is ported.
+
+#### Lessons the implementation must retain
+
+Column demand, graph-read descriptors and GQT construct detection must walk
+every pipeline stage. Ordinary graph optimization stays within segments
+separated by candidate cuts. The integrated experiment proves that a narrow
+path can work; it does not permit a later traversal to escape analysis or
+resource ownership. Keep the four known baseline GQT failures listed above as
+expected-behavior regressions; do not bless their incorrect current results.
+
+Separate processed input from live allocations. On the frozen 1,439-passage
+corpus, 2,811,241 bytes of text arrived in 256 native batches whose reported
+array allocations summed to 620,776,344 bytes. Retaining the buffers proved
+that batches shared backing storage. The prototype now charges consumed UTF-8
+input cumulatively and replaces reservations for live relations/current scan
+batches. This fixes repeated charging but still admits native batches after
+decoding and leaves analyzed maps and output outside complete ownership.
+Its 16 MiB input allowance, 50 million work units, 100,000 binding-row cap,
+128 MiB participating-operator pool and disabled spilling are experimental
+settings, not proposed product defaults or a hard process-memory limit.
+
+Avoid repeating vocabulary work. The first actual development-agent run
+exhausted the work allowance because the reference scorer recomputed edit
+matrices per document, even for zero edits. Exact search now uses term lookup;
+fuzzy search caches each token-pair distance within the query term's accepted
+corpus. A repeated-vocabulary regression fails before that change and passes
+afterward, while the numerical oracle remains unchanged. Cache construction,
+lookups, ownership and cancellation still need accounting. Full DP remains a
+reference mechanism; automata, bounded-distance matching and indexed paths
+must preserve complete membership and scores before replacing it.
+
+Preserve native refusal information. A DataFusion memory refusal can currently
+become a generic engine error and HTTP 400 in the experimental path; that is
+not the proposed typed resource contract. Dropping an output stream alone may
+retain a join's build allocation until its plan is dropped. Zero scratch
+allowance can still write before refusal; disable spilling for a no-write
+policy. The source-backed details and guards are in
+[physical execution](#lance-datafusion-and-graph-execution).
+
+Accepted SchemaIR currently carries raw annotations and an optional model
+label, not the complete resolved recipes proposed here. Versions 2 and 4 are
+recognized at this baseline; version 3 is burned. Recheck current ownership
+before assigning a new version. An older writer must not accept a schema and
+then encode using runtime defaults it was never authorized to substitute.
+Schema export/reapplication must preserve the accepted choices, and unresolved
+legacy encodings require explicit resolution or regeneration.
+
+The follow-up experiment uses declared application keys. It does not close
+RFC 0040's general system-ID lookup. The archived CLI change adds the existing
+`graph_commit_id` envelope field to JSONL output; migrate that change through
+the transport owner and compatibility review rather than introducing another
+snapshot carrier. Stored queries should continue through the ordinary engine.
+
+Global discovery also needs language work. Implement general typed unions,
+representation selection and type narrowing before advertising all-node
+search. Physical tables sharing one logical source must use a common scorer
+and complete target reduction before a cut; they must not receive independent
+fusion votes merely because they are separate tables. Missing indexes cannot
+remove types from scope. The full rules and required counterexamples live in
+[graph-wide discovery](#graph-wide-discovery-across-entity-types).
+
+#### Agent-pilot interpretation and remaining work
+
+The frozen pilot uses all 109 tracked Markdown documents under `docs/` at
+`bf1e5ca15868c9ce2444062e9d9d02b539d786e3`, split into 1,439 passages of at most
+3,000 UTF-8 bytes. It has one development question and eleven held-out
+questions across exact lexical, one-edit lexical, dense and hybrid arms.
+Questions and required source facts were fixed before retrieval results;
+required facts and support quotes are never sent to the answering model.
+
+The answering model is `gpt-5.4-mini-2026-03-17`. Persisted
+`text-embedding-3-small` vectors have 1,536 dimensions; saving their exact
+values avoids treating the provider alias as immutable identity. Unindexed
+Lance nearest search uses its Float32 L2 default, and all twenty development
+candidates agree with an independent exhaustive squared-L2 calculation.
+Each source has twenty candidates and exposes ten previews. The hybrid arm
+performs application-level RRF with equal weights and `k=60` over two actual
+engine queries. It does not qualify future staged fusion, one native budget
+for both queries, or heterogeneous graph search.
+The lexical arms use the proposed `terms` default, `mode: all`; an agent's
+keyword rewrite must therefore match every analyzed query term. Results from
+that recipe cannot be generalized to an `any`-term lexical recipe or to lexical
+retrieval as a whole. Query interpretation belongs in the frozen configuration.
+
+Each trial allows two searches, four single-passage reads, six tool calls,
+seven model responses, 60,000 evidence bytes and 180 seconds. Its 80-byte
+search-input cap is a harness constraint. Observed input refusals, deadline or
+provider failures, abstentions and citations to preview-only passages must
+stay visible in the results; they are not interchangeable with engine defects
+or failed relevance. Debug binaries, variable host load, API calls and process
+startup prevent physical-performance conclusions from these latencies.
+
+Finish all trials and separately review required claims, source entailment and
+whether each citation was actually read. Report failures in the denominator,
+actual model/embedding/engine calls, bytes and latency. Known supporting quotes
+are incomplete relevance labels; they cannot establish NDCG or Recall@100.
+No hold-out tuning or selective retry may be reported as fresh held-out
+evidence. This pilot is a diagnostic starting point for Phase 5; a maintained,
+broader corpus and reproducible production configuration remain required
+before freezing retrieval defaults.
+
 ### Research context and required qualification
 
 The broader motivation is consistent with
@@ -2197,6 +2429,10 @@ release. Each extension retains its stated semantic and qualification boundary.
 6. Initial ANN effort mappings and agent recipe defaults, chosen by the owned
    fixed-corpus evaluation. Further multilingual profiles require matched-set
    evidence and new versioned identities.
+7. General all-node/type-union selection, compatible representation expansion,
+   type narrowing and heterogeneous projection. Explicitly decide its initial
+   release scope in Phase 0; the same-binding fusion implementation alone
+   cannot satisfy cross-type global discovery.
 
 ## Decision log
 
@@ -2284,6 +2520,14 @@ release. Each extension retains its stated semantic and qualification boundary.
   Decimal fixtures now exercise the reference. The exact two-pass route and
   native adapter requirements are explicit; runtime and task-quality
   qualification remain required.
+
+- 2026-09-09 — added a maintainer briefing and implementation handoff with an
+  archived, source-identified integration patch and validation inventory.
+  Recorded the real compiler/engine/GQT/transport path, resource and encoder
+  counterexamples, repeated-vocabulary fix, physical-plan boundaries and
+  unfinished agent-pilot protocol. Cross-type grammar and release scope remain
+  explicit decisions. Experimental settings and partial results do not become
+  product defaults or completed implementation phases.
 
 ## Appendix: implementation evidence (non-normative)
 

@@ -17,6 +17,13 @@ blocked_on:
 
 # RFC 0047: Search plan truth: projectable ranking, deterministic order, and loud search failures
 
+PR #606 reviews this correctness slice together with RFC 0048's final search
+contract. Start with its [maintainer briefing](0048-search-contracts.md#maintainer-briefing)
+for the combined design, migration tradeoffs and decisions still needed.
+The [implementation handoff](0048-search-contracts.md#implementation-handoff-and-validation-checkpoint)
+records the validated experiments and remaining gates; the interim mechanisms
+in this RFC do not require a separate public release.
+
 ## Summary
 
 Ranked reads become honest about what they executed, and search constructs
