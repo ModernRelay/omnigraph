@@ -2241,6 +2241,117 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
 }
 
 #[test]
+fn remote_json_errors_preserve_server_codes_and_details() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (arguments, status, body, exit) in [
+        (
+            vec!["query", "restricted"],
+            403,
+            serde_json::json!({"error":"read denied by current policy","code":"forbidden"}),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted"],
+            403,
+            serde_json::json!({"error":"change denied by current policy","code":"forbidden"}),
+            1,
+        ),
+        (
+            vec!["schema", "show"],
+            403,
+            serde_json::json!({"error":"schema read denied by current policy","code":"forbidden"}),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted"],
+            409,
+            serde_json::json!({
+                "error":"request exceeds the write budget",
+                "resource_limit":{"resource":"entities","limit":100,"actual":101}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"graph head changed",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            4,
+        ),
+    ] {
+        let server = IntentApiFixture::new(vec![IntentReply::json(status, body.clone())]);
+        let output = cli()
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .args(["--server", &server.origin, "--graph", "knowledge"])
+            .args(&arguments)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{arguments:?}: {output:?}"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+                panic!("{arguments:?} lost structured HTTP {status}: {error}; {output:?}")
+            }),
+            body,
+            "{arguments:?} must preserve the server's complete error contract"
+        );
+        assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+        server.assert_complete();
+    }
+}
+
+#[test]
+fn remote_human_and_invalid_json_errors_remain_diagnostics() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (json, body, expected) in [
+        (
+            false,
+            r#"{"error":"read denied by current policy","code":"forbidden"}"#,
+            "read denied by current policy",
+        ),
+        (
+            true,
+            "upstream temporarily unavailable",
+            "server returned 403",
+        ),
+    ] {
+        let server = IntentApiFixture::new(vec![IntentReply {
+            status: 403,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }]);
+        let mut command = cli();
+        command.env_remove("OMNIGRAPH_BEARER_TOKEN").args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "query",
+            "restricted",
+        ]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{output:?}"
+        );
+        server.assert_complete();
+    }
+}
+
+#[test]
 fn change_resolves_uri_and_default_branch_from_store_scope() {
     // RFC-011: a mutate resolves its graph from `--store` and defaults the
     // branch to main (no omnigraph.yaml cli.graph / cli.branch).

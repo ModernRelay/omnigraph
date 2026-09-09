@@ -50,14 +50,27 @@ impl IntentApiFixture {
     }
 
     fn start(replies: Vec<IntentReply>, session: Option<Value>) -> Self {
+        Self::start_with_origin(|_| replies, session)
+    }
+
+    /// Build replies after binding the exact origin, for origin-bound signed claims.
+    pub fn with_origin(replies: impl FnOnce(&str) -> Vec<IntentReply>) -> Self {
+        Self::start_with_origin(replies, None)
+    }
+
+    fn start_with_origin(
+        replies: impl FnOnce(&str) -> Vec<IntentReply>,
+        session: Option<Value>,
+    ) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
         use std::sync::{Arc, Mutex};
 
-        let reply_count = replies.len();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
+        let replies = replies(&origin);
+        let reply_count = replies.len();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let received = requests.clone();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));

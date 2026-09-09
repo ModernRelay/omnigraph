@@ -366,6 +366,8 @@ pub struct ApproveOutput {
 pub(crate) struct DesiredCluster {
     pub(crate) config_dir: PathBuf,
     pub(crate) config_digest: String,
+    /// Canonical parsed source semantics, excluding referenced resource bytes.
+    pub(crate) config_semantics: String,
     /// The declared `storage:` root, if any (None ⇒ the config dir itself).
     pub(crate) storage_root: Option<String>,
     pub(crate) state_lock: bool,

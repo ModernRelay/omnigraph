@@ -136,7 +136,7 @@ fn installed_file_is_current(installed: &fs::File, path: &std::path::Path) -> Re
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    let cli = {
+    let (cli, json) = {
         let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
@@ -147,8 +147,32 @@ async fn main() -> Result<()> {
                     .help("Print version"),
             )
             .get_matches_from(raw_args);
-        Cli::from_arg_matches(&matches)?
+        let mut command_matches = &matches;
+        while let Some((_, child)) = command_matches.subcommand() {
+            command_matches = child;
+        }
+        let json = command_matches
+            .try_get_one::<bool>("json")
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false);
+        (Cli::from_arg_matches(&matches)?, json)
     };
+    match run(cli).await {
+        Err(error) if json => {
+            if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
+                print_json(&remote.output)?;
+                std::io::stdout().flush()?;
+                std::process::exit(1);
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     if let Some(result) = managed::dispatch(&cli).await {
         let code = result.emit()?;
         if code != 0 {
@@ -1722,14 +1746,36 @@ async fn main() -> Result<()> {
             }
         },
         Command::Graphs { command } => match command {
-            GraphsCommand::List { json } => {
-                // Registry scope (RFC-011): the bare server base URL, resolved
-                // synchronously — the async D7 require-graph probe cannot run
-                // here, and no `/graphs/<id>` is ever appended.
-                let client = client::GraphClient::resolve_registry(
-                    cli.server.as_deref(),
-                    cli.profile.as_deref(),
-                )?;
+            GraphsCommand::List { json, discovery } => {
+                let (client, discovery) = if let Some(client) = managed_data {
+                    (client, true)
+                } else {
+                    // Explicit operator addressing retains the legacy catalog
+                    // unless discovery is explicitly requested. Token bytes do
+                    // not choose configuration or change static-token behavior.
+                    (
+                        client::GraphClient::resolve_registry(
+                            cli.server.as_deref(),
+                            cli.profile.as_deref(),
+                        )?,
+                        discovery,
+                    )
+                };
+                if discovery {
+                    let payload = client.discover_graphs().await?;
+                    if json {
+                        print_json(&payload)?;
+                    } else {
+                        for entry in payload.graphs {
+                            if entry.display_name == entry.graph_id {
+                                println!("{}", entry.graph_id);
+                            } else {
+                                println!("{}\t{}", entry.graph_id, entry.display_name);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
                 let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;

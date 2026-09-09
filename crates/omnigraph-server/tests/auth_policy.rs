@@ -23,6 +23,112 @@ mod support;
 use support::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let identity = tokens.identity_token();
+    let restricted = tokens.token(json!([{"graph_id":"default","actions":["read","graph_list"]}]));
+    let state = AppState::open_with_bearer_tokens(
+        graph.to_string_lossy().to_string(),
+        vec![("breakglass".into(), "static-token".into())],
+    )
+    .await
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone())
+    .with_boot_witness(
+        omnigraph_server::BootWitness {
+            applied_graphs: vec!["default".into(), "unavailable".into()],
+            ..Default::default()
+        },
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::time::Duration::from_secs(30),
+    );
+    let app = build_app(state);
+    let (status, catalog) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        catalog,
+        json!({"graphs":[
+            {"graph_id":"default","display_name":"default"},
+            {"graph_id":"unavailable","display_name":"unavailable"}
+        ]})
+    );
+    for token in [&restricted, "static-token"] {
+        let (status, _) = json_response(&app, get_request("/graphs/discovery", token)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "legacy credentials cannot escape their catalog contract"
+        );
+    }
+    for path in [
+        "/graphs",
+        "/graphs/default/schema",
+        "/graphs/default/snapshot",
+    ] {
+        let (status, _) = json_response(&app, get_request(path, &identity)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "existence is not permission: {path}"
+        );
+    }
+    let (status, _) = json_response(
+        &app,
+        get_request("/graphs/discovery", "invalid.jwt.signature"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let policy_path = temp.path().join("policy.yaml");
+    for actors in [vec!["someone-else"], vec![tokens.actor.as_str()]] {
+        fs::write(&policy_path, permit_all_policy_yaml(&actors)).unwrap();
+        let state = AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            Vec::new(),
+            Some(&policy_path),
+        )
+        .await
+        .unwrap()
+        .with_data_token_trust(tokens.trust.clone());
+        let app = build_app(state);
+        let expected = if actors[0] == tokens.actor {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        let (status, _) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "policy enrollment cannot hide existence"
+        );
+        let (status, _) =
+            json_response(&app, get_request("/graphs/default/schema", &identity)).await;
+        assert_eq!(status, expected, "the same token follows activated policy");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(g("/schema/apply"))
+            .header("authorization", format!("Bearer {identity}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&SchemaApplyRequest {
+                    schema_source: fs::read_to_string(fixture("test.pg")).unwrap(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let (status, _) = json_response(&app, request).await;
+        assert_eq!(
+            status, expected,
+            "identity credentials neither grant nor ban schema apply"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;

@@ -23,6 +23,7 @@ use ulid::Ulid;
 
 pub mod failpoints;
 
+mod authorization;
 mod config;
 mod diff;
 mod serve;
@@ -30,6 +31,11 @@ mod state_lock;
 mod store;
 mod sweep;
 mod types;
+pub use authorization::{
+    AuthorizedApplyOutput, AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization,
+    PlanAuthorization, PlanReadAuthorization, PolicyAuthorizationCheck, authorize_apply_plan,
+    authorize_plan_read,
+};
 use config::{
     QueriesDecl, graph_address, initial_import_state, load_desired, observe_declared_graphs,
     parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests,
@@ -137,12 +143,49 @@ pub async fn plan_config_dir_with_options(
     config_dir: impl AsRef<Path>,
     options: PlanOptions,
 ) -> PlanOutput {
+    // Keep the shared implementation off the forwarding caller's stack.
+    Box::pin(plan_config_dir_impl(
+        config_dir.as_ref(),
+        options,
+        None,
+        &mut None,
+    ))
+    .await
+}
+
+/// Plan using the current applied policy for an already authenticated actor.
+/// Existing storage-holder entry points retain their explicit trust boundary.
+pub async fn plan_config_dir_authorized(
+    config_dir: impl AsRef<Path>,
+    options: PlanOptions,
+    identity: &IdentityAuthorization,
+) -> AuthorizedPlanOutput {
+    let mut authorization = None;
+    let plan = Box::pin(plan_config_dir_impl(
+        config_dir.as_ref(),
+        options,
+        Some(identity),
+        &mut authorization,
+    ))
+    .await;
+    AuthorizedPlanOutput {
+        plan,
+        authorization,
+    }
+}
+
+async fn plan_config_dir_impl(
+    config_dir: &Path,
+    options: PlanOptions,
+    identity: Option<&IdentityAuthorization>,
+    authorization: &mut Option<PlanAuthorization>,
+) -> PlanOutput {
     let mut authority = if options.observe {
         LedgerAuthority::Observed
     } else {
         LedgerAuthority::Locked
     };
-    let outcome = load_desired(config_dir.as_ref());
+    let outcome = load_desired(config_dir);
     let mut diagnostics = outcome.diagnostics;
     let storage_root = outcome
         .desired
@@ -261,6 +304,28 @@ pub async fn plan_config_dir_with_options(
         &approved,
     );
 
+    if !has_errors(&diagnostics) {
+        if let Some(identity) = identity {
+            match authorization::authorize_candidate(
+                &backend,
+                &desired,
+                prior_state.as_ref(),
+                &observations,
+                &changes,
+                identity,
+                false,
+            )
+            .await
+            {
+                Ok((evidence, _)) => *authorization = Some(evidence),
+                Err(diagnostic) => {
+                    diagnostics.push(diagnostic);
+                    changes.clear();
+                }
+            }
+        }
+    }
+
     // Embed real migration steps for schema updates so plan is a data-aware
     // preview; failures degrade to the digest diff with a warning.
     for change in &mut changes {
@@ -337,7 +402,51 @@ pub async fn apply_config_dir_with_options(
     config_dir: impl AsRef<Path>,
     options: ApplyOptions,
 ) -> ApplyOutput {
-    let outcome = load_desired(config_dir.as_ref());
+    // Preserve the existing embedded caller's stack budget when forwarding
+    // into the shared implementation and nested graph recovery operations.
+    Box::pin(apply_config_dir_impl(
+        config_dir.as_ref(),
+        options,
+        None,
+        &mut None,
+    ))
+    .await
+}
+
+/// Apply the exact authorized candidate after rechecking current applied policy
+/// for the initiating identity under the existing cluster lock. The receipt is
+/// a base/effect precondition, not transferable authorization.
+pub async fn apply_config_dir_authorized(
+    config_dir: impl AsRef<Path>,
+    options: ApplyOptions,
+    identity: &IdentityAuthorization,
+    expected: &PlanAuthorization,
+) -> AuthorizedApplyOutput {
+    let mut authorization = None;
+    let apply = Box::pin(apply_config_dir_impl(
+        config_dir.as_ref(),
+        options,
+        Some((identity, expected)),
+        &mut authorization,
+    ))
+    .await;
+    AuthorizedApplyOutput {
+        apply,
+        authorization,
+    }
+}
+
+async fn apply_config_dir_impl(
+    config_dir: &Path,
+    mut options: ApplyOptions,
+    identity: Option<(&IdentityAuthorization, &PlanAuthorization)>,
+    authorization: &mut Option<PlanAuthorization>,
+) -> ApplyOutput {
+    if let Some((identity, _)) = identity {
+        // Attribution comes from authenticated identity on this entry point.
+        options.actor = Some(identity.actor().to_string());
+    }
+    let outcome = load_desired(config_dir);
     let mut diagnostics = outcome.diagnostics;
     let storage_root = outcome
         .desired
@@ -469,6 +578,49 @@ pub async fn apply_config_dir_with_options(
             state.resource_statuses,
             diagnostics,
         );
+    }
+
+    // Authenticate every exact candidate effect against the as-read applied
+    // revision BEFORE recovery cleanup, sidecars, graph opens or payload writes.
+    // Pending recovery refuses; a new caller cannot inherit its original actor.
+    let mut applied_policies = None;
+    if let Some((identity, expected)) = identity {
+        let mut candidate_changes =
+            diff_resources(&state_resource_digests(&state), &desired.resource_digests);
+        append_policy_binding_changes(&mut candidate_changes, Some(&state), &desired);
+        append_embedding_profile_changes(&mut candidate_changes, Some(&state), &desired);
+        match authorization::authorize_candidate(
+            &backend,
+            &desired,
+            Some(&state),
+            &observations,
+            &candidate_changes,
+            identity,
+            true,
+        )
+        .await
+        {
+            Ok((evidence, policies)) => {
+                match authorization::compare_authorization(expected, &evidence) {
+                    Ok(()) => {
+                        *authorization = Some(evidence);
+                        applied_policies = policies;
+                    }
+                    Err(diagnostic) => diagnostics.push(diagnostic),
+                }
+            }
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+        if has_errors(&diagnostics) {
+            return early_return(
+                display_path(&desired.config_dir),
+                Some(desired.config_digest),
+                observations,
+                Vec::new(),
+                state.resource_statuses,
+                diagnostics,
+            );
+        }
     }
 
     // Snapshot the as-read state BEFORE the sweep so sweep mutations count as
@@ -718,6 +870,13 @@ pub async fn apply_config_dir_with_options(
                 graph_moving_aborted = true;
                 continue;
             }
+        };
+        let db = match applied_policies
+            .as_ref()
+            .and_then(|policies| policies.graph(graph_id))
+        {
+            Some(policy) => db.with_policy(policy),
+            None => db,
         };
         // Re-read + digest-verify the desired schema source before the
         // cluster sidecar exists. Parser/planner rejections cannot have
@@ -2361,12 +2520,19 @@ fn desired_config_digest(
     raw: &RawClusterConfig,
     resource_digests: &BTreeMap<String, String>,
 ) -> String {
-    let mut input = String::from("cluster-config\0");
     // Hash parsed semantics, not raw YAML bytes, so comments and formatting do
     // not create a new desired revision and the digest cannot drift from parse.
     let config_semantics =
         serde_json::to_string(raw).expect("raw cluster config must serialize deterministically");
-    input.push_str(&config_semantics);
+    desired_config_digest_from_semantics(&config_semantics, resource_digests)
+}
+
+fn desired_config_digest_from_semantics(
+    config_semantics: &str,
+    resource_digests: &BTreeMap<String, String>,
+) -> String {
+    let mut input = String::from("cluster-config\0");
+    input.push_str(config_semantics);
     input.push('\0');
     for (address, digest) in resource_digests {
         input.push_str(address);
