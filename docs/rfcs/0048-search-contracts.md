@@ -982,6 +982,70 @@ scope does not include a dedicated range-search operator. A raw relevance
 score threshold likewise requires an explicit source/domain contract and must
 never be presented as a probability that an answer is correct.
 
+### Graph-wide discovery across entity types
+
+Here, global search means discovery across eligible entity types in one
+logical graph at one accepted snapshot. Its scope includes the target types,
+searchable properties, representation policies and authorization rules. A
+convenience stored query can own that scope; schema-driven expansion must
+resolve it against the accepted catalog and include the resolved scope in its
+query identity. Adding a searchable type can then change that explicitly
+defined population. Ordinary unindexed or non-searchable fields do not acquire
+an implicit text conversion or embedding recipe.
+
+The current compiler binds a variable to one concrete node type. Schema
+interfaces provide declarations and inheritance, but the query binder does
+not yet execute polymorphic scans or a heterogeneous union. The initial
+same-binding fusion contract alone therefore does not provide a single
+cross-type global search query. This is an expressiveness gap to resolve
+before advertising that capability.
+
+The preferred extension is a general typed union of graph bindings. Each
+branch preserves the entity kind, accepted type/incarnation identity and
+entity id; a hit remains its original node or edge. Common projections and
+type-specific property access need ordinary query-language typing and type
+narrowing. No synthetic stored `Document` entity or separate search registry
+is needed. Source metrics and matched-property attribution remain attached to
+their producing source. Two types with equal id strings are still different
+targets. Passage-to-owner mapping remains the separate explicit graph mapping
+and reduction problem described above.
+
+Ranking this union requires a declared cross-type policy:
+
+- A lexical source over a common logical text representation needs compatible
+  analysis, a defined treatment of multiple fields per target, and statistics
+  over that logical corpus. Per-table BM25 scores cannot be merged as if each
+  table had used those shared statistics. Multiple property hits must not
+  accidentally duplicate a target or let traversal fan-out add relevance.
+- Compatible vector representations can share a distance comparator when
+  space/revision, query encoding, dimensions, metric and numeric rules agree.
+  Different spaces remain separate named sources, with their query encoding
+  calls included in the shared execution budget.
+- Fusion can combine sources that now name this same typed target universe.
+  RRF over disjoint per-type lists is also a possible explicit policy, but it
+  gives each equally weighted type's first result the same contribution. It
+  is a source-balancing choice, not proof of comparable relevance. A common
+  scorer or qualified reranker is needed when the product requires a single
+  relevance ordering that those source ranks do not supply.
+
+Physically, Lance remains responsible for each version-pinned dataset and
+qualified index/scan path. DataFusion can union narrow candidate relations,
+group by the full typed identity, rank/fuse and apply the global cut; hydrate
+payloads from the corresponding pinned datasets after selection. For an exact
+source split into disjoint physical partitions, local top-k followed by a
+global top-k is valid only when every partition uses the same score and total
+comparator as the global source. A partition cannot substitute local corpus
+statistics or a different tie rule. ANN remains explicitly approximate.
+
+Qualification must cover two unrelated node types, an explicitly selected
+edge type, equal id strings across types, multiple searchable fields,
+incompatible vector spaces, empty/unavailable sources, snapshot changes,
+policy and shared-resource refusal. Compare the physical fan-out plan with an
+independent evaluator over the full logical union. Include disjoint-source
+RRF behavior in the retrieval-task evaluation. The grammar, typed result and
+global-corpus rules require an explicit extension; this section records its
+design direction and does not claim implemented support.
+
 ### Representation identity and source attribution
 
 Accepted SchemaIR owns resolved analyzer/default-scorer fingerprints,
