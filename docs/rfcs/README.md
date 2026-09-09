@@ -212,3 +212,4 @@ then dated RFCs by date.
 | [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |
 | [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |
 | [2026-09-14](2026-09-14-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
+| [0064](0064-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | draft | in-progress |
