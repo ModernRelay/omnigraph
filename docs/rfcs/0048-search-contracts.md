@@ -159,7 +159,9 @@ queries to adopt ranking. Existing search queries still need the rewrites above.
   score or distance available for projection. Missing arm membership remains
   distinguishable from a computed score.
 - Ranking within a graph-defined population, further traversal of selected
-  targets, and selection with per-group quotas.
+  targets, and `take` selection with per-group quotas. Local and final ordering
+  can explicitly place missing values with `nulls first` or `nulls last`;
+  omitting the modifier retains current ascending/descending defaults.
 - Inspectable query definitions and plans, retrieval/coverage metadata, and
   completion of snapshot-coherent selective reads through existing read and
   stored-query facilities. Stable ranked pagination remains deferred.
@@ -703,7 +705,44 @@ A later rank stage establishes a new active order while earlier metrics keep
 their origin. Aggregation does not implicitly inherit a constituent target's
 rank. These ordering rules require golden plans and fan-out fixtures.
 
-Selection per group consumes a bounded candidate relation, partitions by an
+Selection per group uses a `take` stage, with a named node/edge target, a
+nonempty `per` key tuple, an optional local `order`, and a required `limit`:
+
+```gq
+query incidents_per_organization($q: String) {
+  match { $o: Organization $o hasIncident $i }
+  rank $i {
+    lexical($i.title, terms($q), candidates: 100) as incidents
+  }
+  take $i { per { $o.slug } limit 2 }
+  return { $o.slug, $i.slug, metric(incidents, rank) as rank }
+  order { $o.slug asc, rank asc, $i.@id }
+  limit 20
+}
+```
+
+Here the source selects up to 100 distinct incidents globally from the graph
+population, the quota retains at most two of those incidents per organization,
+and the final limit returns at most 20 binding rows. Neither later limit refills
+the source. `per { $o.slug, $o.category }` illustrates a composite group key.
+
+An omitted local `order` uses the latest ranking stage's rank. An explicit
+local order, such as `order { metric(incidents, rank) asc nulls last }`, chooses
+the pair winners without establishing a new global output order. With no
+ranking stage in scope, a local comparator is required; this also permits
+ordinary graph selection such as latest events per entity. Such input remains
+subject to whole-query budgets rather than requiring a synthetic search stage.
+Quota `limit` takes a non-null integer literal or parameter, must be nonnegative,
+and permits zero, consistent with ordinary limit semantics. It does not impose
+a source candidate-window cap; resource admission and checked arithmetic still
+apply. Without a final order or an earlier ranking, output remains unordered.
+
+Ordering expressions in either location may append `nulls first` or
+`nulls last`. Omission preserves current GQ defaults: ascending puts nulls first,
+descending puts them last. A missing arm metric remains null; choosing its
+placement never gives that target source membership or a computed score.
+
+Selection per group consumes the admitted incoming relation, partitions by an
 explicit bound key tuple, and takes at most N distinct targets per group under
 a declared total order. Its selection unit is `(target identity, group key)`:
 
@@ -723,7 +762,15 @@ a declared total order. Its selection unit is `(target identity, group key)`:
 - A selection comparator must have one value per target/group pair. If an
   expression varies across the pair's binding rows, require an explicit
   supported reduction or reject it; never choose the first path's value.
-  Append stable target identity to break ties within each group.
+  The inherited default comparator follows this same rule. Identity, complete
+  non-null key/unique tuples, and enforced relationship cardinalities can prove
+  constancy; partial composite keys and nullable unique values cannot. Cardinality
+  is per native edge source, so a maximum of one does not imply a unique reverse
+  endpoint. Directed one-hop edge identity fixes both endpoints; undirected
+  same-type endpoints can still exchange roles. Unproved cases require an
+  explicit reduction. Reductions operate over the pair's incoming binding rows
+  using ordinary aggregate null and duplicate semantics. Append stable target
+  identity to break ties within each group.
 - Quota selection preserves metric values and their origins. Removing a
   higher-ranked pair does not renumber surviving source ranks or create a
   new source-membership vote. By default it filters the incoming active order;
@@ -742,8 +789,8 @@ there is no implied refill. Retrieving top-N within every group of the full
 population is a different, separately bounded shape. Selecting a global set
 of targets subject to quotas on *all* their overlapping memberships is also
 a different optimization problem; independent per-group winners do not claim
-that guarantee. The initial surface must express selection per group; exact
-spelling and enforcement of these rules are parser/typechecker acceptance gates.
+that guarantee. The prototype checks this spelling and a subset of the type
+rules; full compiler/lowering enforcement remains an acceptance gate.
 
 Per-group quotas and identity deduplication address concentration, but do not
 establish complementary reasoning coverage. Semantic diversification and
@@ -1194,13 +1241,17 @@ typed DataFrame plans for distinct targets, ordered limits, distinct
 target/group pairs, per-group `row_number`, and left semi-joins back to the
 binding rows. It checks both filter placements and shows that a quota after
 a cutoff cannot refill from discarded targets. The fixture includes multiple
-memberships, duplicate paths, a nullable string group key, and quotas of one
-and two. `LogicalPlanBuilder::join_detailed` with
+memberships, duplicate paths, nullable string keys, a mixed string/integer key
+tuple, and quotas of one and two. A separate comparator column exercises
+per-pair `min`, all-null reductions and explicit null placement.
+`LogicalPlanBuilder::join_detailed` with
 `NullEquality::NullEqualsNull` retains exactly the winning pairs' bindings,
 including null-key paths. Controls demonstrate that a target-only join
-exceeds a group's quota, ordinary equality drops the null group, and counting
-paths before deduplication excludes eligible targets. These checks pass with
-reversed input and one/four partitions, using actual one-row input batches.
+exceeds a group's quota, omitting a tuple component restores a losing path,
+ordinary equality drops the null group, and counting paths before deduplication
+excludes eligible targets. Reversing null placement changes the selected target
+as expected. These checks pass with reversed input and one/four partitions,
+using actual one-row input batches.
 
 The successful route sets DataFusion's byte and row
 `hash_join_single_partition_threshold` options to zero to select partitioned
@@ -1214,10 +1265,10 @@ qualify distribution enforcement with the actual graph/Lance sources before
 choosing a planner policy, and remove the refusal fence if upstream fixes it.
 
 This is concrete relational execution evidence, not GQ lowering or a
-graph/search integration test. Composite keys and other key types, ambiguous
-per-pair comparator expressions, real metric carriage, spill, and whole-query
-budgets remain separate qualification work. Existing aggregate execution
-groups nulls together; its display-based key encoding is not a new adapter
+graph/search integration test. Other key types (including floating-point
+equality), graph-derived comparator dependencies, real metric carriage, spill,
+and whole-query budgets remain separate qualification work. Existing aggregate
+execution groups nulls together; its display-based key encoding is not a new adapter
 interface or a substitute for typed key equivalence.
 
 Existing bounded ordered-scan support can supply memory/scratch ownership.
@@ -1479,12 +1530,17 @@ while the experimental plan retains the separate stages and incoming
 population references. It exercises the GQ examples in this RFC, multi-stage
 node and edge targets, non-leaking negation scopes, alias namespaces, metric
 domains/origins, aggregate output identity, final order/window separation,
-and rejection cases for inputs, bounds and references.
+and rejection cases for inputs, bounds and references. Its `take` plan retains
+the incoming stage, target, typed key tuple, comparator/reduction, quota bound
+and proven binding dependencies. Tests cover composite and nullable keys,
+non-null uniqueness, directed one-hop cardinality, explicit null ordering,
+graph-only selection, zero quotas, and metric/order preservation.
 
 This is partial compiler evidence, not completed staged AST/IR or execution.
-It does not qualify per-group syntax, complete result-shape/nullability
-inference, resolved analyzer/encoding identities, runtime parameter admission,
-resource bounds, or graph/Lance lowering. Its aggregate-order prototype uses
+It does not qualify complete result-shape/metric-nullability inference,
+every key type or comparator dependency, resolved analyzer/encoding identities,
+runtime parameter admission, resource bounds, or graph/Lance lowering.
+Its aggregate-order prototype uses
 explicit projected aliases; the final compiler must also preserve valid
 ordinary grouping-key expressions. Migrate or remove the experiment when the
 production compiler owns these constructs; do not maintain a second compiler
@@ -1736,8 +1792,8 @@ release. Each extension retains its stated semantic and qualification boundary.
 ## Unresolved questions
 
 1. Complete grammar/typechecker/lowering qualification for the stated stage
-   and metric scopes, per-group clause spelling, admitted key types and tuple
-   ordering, and any user-defined selection tie keys. The partial compiler
+   and metric scopes, per-group key types and tuple ordering, and any
+   user-defined selection tie keys. The partial compiler
    prototype does not close the full result-schema and aggregation contract.
    Null-bucket and multiple-membership semantics are specified above; prove
    their lowering and retain RFC 0040 namespace coordination.

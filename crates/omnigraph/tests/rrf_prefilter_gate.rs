@@ -62,6 +62,7 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::NullEquality;
     use datafusion::dataframe::DataFrame;
+    use datafusion::functions_aggregate::expr_fn::min;
     use datafusion::functions_window::row_number::row_number;
     use datafusion::logical_expr::{ExprFunctionExt, JoinType, LogicalPlanBuilder, Partitioning};
     use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
@@ -91,6 +92,8 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
         Field::new("group_key", DataType::Utf8, true),
         Field::new("score", DataType::Int64, false),
         Field::new("binding_id", DataType::Utf8, false),
+        Field::new("group_part", DataType::Int64, false),
+        Field::new("pair_rank", DataType::Int64, true),
     ]));
     for partitions in [1, 4] {
         for reverse in [false, true] {
@@ -122,6 +125,28 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                     )),
                     Arc::new(StringArray::from(
                         rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter()
+                            .map(|r| {
+                                if matches!(r.3, "path-3" | "path-4") {
+                                    2
+                                } else {
+                                    1
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter()
+                            .map(|r| match r.3 {
+                                "path-1" | "path-2" => Some(2),
+                                "path-3" => Some(4),
+                                "path-4" => Some(3),
+                                "path-6" | "path-7" => None,
+                                _ => Some(1),
+                            })
+                            .collect::<Vec<_>>(),
                     )),
                 ],
             )
@@ -368,6 +393,82 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 )
                 .await,
                 ["d", "d"]
+            );
+
+            // A composite key must survive both window partitioning and
+            // reattachment. Here a wins (g2, 1), but loses (g2, 2) to b.
+            // Explicit min is over each pair's paths; all-null d sorts last.
+            let composite = bindings
+                .clone()
+                .aggregate(
+                    vec![col("id"), col("group_key"), col("group_part")],
+                    vec![min(col("pair_rank")).alias("best_rank")],
+                )
+                .unwrap();
+            let composite_winners = |nulls_first| {
+                composite
+                    .clone()
+                    .window(vec![
+                        row_number()
+                            .partition_by(vec![col("group_key"), col("group_part")])
+                            .order_by(vec![
+                                col("best_rank").sort(true, nulls_first),
+                                col("id").sort(true, false),
+                            ])
+                            .build()
+                            .unwrap()
+                            .alias("position"),
+                    ])
+                    .unwrap()
+                    .filter(col("position").eq(lit(1u64)))
+                    .unwrap()
+            };
+            let composite_join = |selected: DataFrame, complete_key: bool| {
+                let right = selected
+                    .select(vec![
+                        col("id").alias("winner_id"),
+                        col("group_key").alias("winner_group"),
+                        col("group_part").alias("winner_part"),
+                    ])
+                    .unwrap();
+                let mut left_keys = vec!["id", "group_key"];
+                let mut right_keys = vec!["winner_id", "winner_group"];
+                if complete_key {
+                    left_keys.push("group_part");
+                    right_keys.push("winner_part");
+                }
+                let plan = LogicalPlanBuilder::from(bindings.clone().into_unoptimized_plan())
+                    .join_detailed(
+                        right.into_unoptimized_plan(),
+                        JoinType::LeftSemi,
+                        (left_keys, right_keys),
+                        None,
+                        NullEquality::NullEqualsNull,
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                DataFrame::new(ctx.state(), plan)
+                    .sort(vec![col("binding_id").sort(true, false)])
+                    .unwrap()
+            };
+            assert_eq!(
+                strings(composite_join(composite_winners(false), true), "binding_id").await,
+                ["path-2", "path-4", "path-5", "path-8", "path-9"]
+            );
+            // Red controls distinguish a missing tuple component and the
+            // opposite null ordering; both otherwise produce plausible rows.
+            assert_eq!(
+                strings(
+                    composite_join(composite_winners(false), false),
+                    "binding_id"
+                )
+                .await,
+                ["path-2", "path-3", "path-4", "path-5", "path-8", "path-9"]
+            );
+            assert_eq!(
+                strings(composite_join(composite_winners(true), true), "binding_id").await,
+                ["path-2", "path-4", "path-5", "path-6", "path-7", "path-9"]
             );
 
             // Red control: counting paths as candidates makes d consume both

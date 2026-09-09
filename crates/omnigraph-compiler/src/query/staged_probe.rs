@@ -1,8 +1,8 @@
 //! RFC 0048 syntax/scope experiment, not a second production compiler.
 //! Reuses the real graph parser and typechecker. Prefix queries below are
 //! typed AST values used only for scope checks; execution stages stay separate.
-//! Representation certification, parameter admission, physical lowering and
-//! per-group syntax are not implemented by this experiment.
+//! Representation certification, parameter admission and physical lowering
+//! are not implemented by this experiment.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,7 +12,7 @@ use super::*;
 use crate::catalog::{Catalog, build_catalog};
 use crate::query::typecheck::{BoundVariable, ResolvedType, TypeContext, typecheck_query};
 use crate::schema::parser::parse_schema;
-use crate::types::{PropType, ScalarType};
+use crate::types::{Direction, PropType, ScalarType};
 
 type Options = BTreeMap<String, Expr>;
 type ProbeResult<T> = std::result::Result<T, String>;
@@ -65,9 +65,18 @@ enum Stage {
         target: String,
         declarations: Vec<Declaration>,
     },
+    Take(Take),
 }
 
 #[derive(Debug, Clone)]
+struct Take {
+    target: String,
+    keys: Vec<Value>,
+    order: Vec<OrderingSpec<Value>>,
+    count: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum Value {
     Core(Expr),
     Identity(String),
@@ -75,12 +84,19 @@ enum Value {
     Aggregate { function: String, value: Box<Value> },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct OrderingSpec<T> {
+    value: T,
+    descending: bool,
+    nulls_first: bool,
+}
+
 #[derive(Debug)]
 struct Query {
     header: QueryDecl,
     stages: Vec<Stage>,
     projections: Vec<(Value, Option<String>)>,
-    order: Vec<(Value, bool)>,
+    order: Vec<OrderingSpec<Value>>,
 }
 
 fn core(pair: Pair<Rule>) -> ProbeResult<Expr> {
@@ -169,6 +185,32 @@ fn value(pair: Pair<Rule>) -> ProbeResult<Value> {
     }
 }
 
+fn order(pair: Pair<Rule>) -> ProbeResult<Vec<OrderingSpec<Value>>> {
+    pair.into_inner()
+        .map(|ordering| {
+            let mut parts = ordering.into_inner();
+            let value = value(parts.next().unwrap())?;
+            let mut descending = false;
+            let mut explicit_nulls = None;
+            for part in parts {
+                match part.as_rule() {
+                    Rule::order_dir => descending = part.as_str() == "desc",
+                    Rule::probe_nulls => {
+                        explicit_nulls = Some(part.into_inner().next().unwrap().as_str() == "first")
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // Preserve current GQ ordering defaults when no modifier is given.
+            Ok(OrderingSpec {
+                value,
+                descending,
+                nulls_first: explicit_nulls.unwrap_or(!descending),
+            })
+        })
+        .collect()
+}
+
 fn parse(input: &str) -> ProbeResult<Query> {
     let file = QueryParser::parse(Rule::probe_file, input)
         .map_err(|e| e.to_string())?
@@ -233,6 +275,28 @@ fn parse(input: &str) -> ProbeResult<Query> {
                     declarations: parts.map(declaration).collect::<ProbeResult<_>>()?,
                 });
             }
+            Rule::probe_take => {
+                let mut parts = item.into_inner();
+                let target = parts.next().unwrap().as_str()[1..].to_string();
+                let keys = parts
+                    .next()
+                    .unwrap()
+                    .into_inner()
+                    .map(value)
+                    .collect::<ProbeResult<_>>()?;
+                let next = parts.next().unwrap();
+                let (order, count) = if next.as_rule() == Rule::probe_order {
+                    (order(next)?, core(parts.next().unwrap())?)
+                } else {
+                    (Vec::new(), core(next)?)
+                };
+                query.stages.push(Stage::Take(Take {
+                    target,
+                    keys,
+                    order,
+                    count,
+                }));
+            }
             Rule::probe_return => {
                 for p in item.into_inner() {
                     let mut parts = p.into_inner();
@@ -243,13 +307,7 @@ fn parse(input: &str) -> ProbeResult<Query> {
                 }
             }
             Rule::probe_order => {
-                for o in item.into_inner() {
-                    let mut parts = o.into_inner();
-                    query.order.push((
-                        value(parts.next().unwrap())?,
-                        parts.next().is_some_and(|p| p.as_str() == "desc"),
-                    ));
-                }
+                query.order = order(item)?;
             }
             Rule::limit_clause => {
                 query.header.limit = Some(
@@ -332,7 +390,7 @@ impl ValueType {
 #[derive(Debug, PartialEq)]
 enum OutputOrder {
     Ranked(SourceId),
-    Explicit(Vec<(ValueType, bool)>),
+    Explicit(Vec<OrderingSpec<ValueType>>),
     Unordered,
 }
 
@@ -343,9 +401,21 @@ enum OutputScope {
 }
 
 #[derive(Debug)]
+struct CheckedTake {
+    input_stage: usize,
+    target: String,
+    key_types: Vec<ValueType>,
+    order: Vec<OrderingSpec<ValueType>>,
+    count: Bound,
+    // Bindings whose identity is proved constant within each target/key pair.
+    determined: BTreeSet<String>,
+}
+
+#[derive(Debug)]
 struct Plan {
     query: Query,
     sources: BTreeMap<String, CheckedSource>,
+    selections: BTreeMap<usize, CheckedTake>,
     scopes: Vec<BTreeMap<String, String>>,
     projection_types: Vec<ValueType>,
     output_order: OutputOrder,
@@ -695,9 +765,196 @@ fn value_type(
     }
 }
 
+fn orderable(ty: &ValueType) -> bool {
+    match ty {
+        ValueType::Identity(_) | ValueType::Metric { .. } => true,
+        ValueType::Core(ResolvedType::Scalar(ty)) => !ty.list && ty.scalar.is_orderable(),
+        ValueType::Reduced {
+            function: AggFunc::Count,
+            ..
+        } => true,
+        ValueType::Reduced { input, .. } => orderable(input),
+        _ => false,
+    }
+}
+
+fn pair_bindings(catalog: &Catalog, ctx: &TypeContext, take: &Take) -> BTreeSet<String> {
+    let mut determined = BTreeSet::from([take.target.clone()]);
+    let mut grouped_properties: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for key in &take.keys {
+        match key {
+            Value::Identity(variable) => {
+                determined.insert(variable.clone());
+            }
+            Value::Core(Expr::PropAccess { variable, property }) => {
+                grouped_properties
+                    .entry(variable)
+                    .or_default()
+                    .insert(property);
+            }
+            _ => {}
+        }
+    }
+    // A complete non-null key/unique tuple determines the entity too. A
+    // partial composite key or nullable unique tuple does not: the null bucket
+    // can contain several identities even when all non-null values are unique.
+    for (variable, properties) in grouped_properties {
+        let (key, unique, schema) = match &ctx.bindings[variable] {
+            BoundVariable::Node { type_name } => {
+                let node = &catalog.node_types[type_name];
+                (&node.key, &node.unique_constraints, &node.properties)
+            }
+            BoundVariable::Edge { type_name } => {
+                let edge = catalog.lookup_edge_by_name(type_name).unwrap();
+                (&edge.key, &edge.unique_constraints, &edge.properties)
+            }
+        };
+        if key.iter().chain(unique.iter()).any(|members| {
+            !members.is_empty()
+                && members.iter().all(|member| {
+                    properties.contains(member.as_str())
+                        && schema.get(member).is_some_and(|ty| !ty.nullable)
+                })
+        }) {
+            determined.insert(variable.to_string());
+        }
+    }
+    // Close over proven one-hop relationships, using native edge direction.
+    // An undirected edge identity alone does not fix the orientation of two
+    // same-type endpoint variables, and a hop range can have several targets.
+    loop {
+        let before = determined.len();
+        for traversal in &ctx.traversals {
+            if traversal.min_hops != 1 || traversal.max_hops != Some(1) {
+                continue;
+            }
+            let (from, to) = match traversal.direction {
+                Direction::Out => (&traversal.src, &traversal.dst),
+                Direction::In => (&traversal.dst, &traversal.src),
+                Direction::Both => continue,
+            };
+            if traversal
+                .edge_binding
+                .as_ref()
+                .is_some_and(|edge| determined.contains(edge))
+            {
+                determined.insert(from.clone());
+                determined.insert(to.clone());
+            }
+            let edge = catalog.lookup_edge_by_name(&traversal.edge_type).unwrap();
+            if edge.cardinality.max == Some(1) && determined.contains(from) {
+                determined.insert(to.clone());
+                if let Some(binding) = &traversal.edge_binding {
+                    determined.insert(binding.clone());
+                }
+            }
+        }
+        if determined.len() == before {
+            return determined;
+        }
+    }
+}
+
+fn pair_constant(
+    value: &Value,
+    prefix: &QueryDecl,
+    take: &Take,
+    determined: &BTreeSet<String>,
+    sources: &BTreeMap<String, CheckedSource>,
+) -> bool {
+    if take.keys.contains(value) {
+        return true;
+    }
+    match value {
+        Value::Core(Expr::Literal(_) | Expr::Now) => true,
+        Value::Core(Expr::Variable(name)) => prefix.params.iter().any(|p| p.name == *name),
+        Value::Core(Expr::PropAccess { variable, .. }) | Value::Identity(variable) => {
+            determined.contains(variable)
+        }
+        Value::Metric { source, .. } => determined.contains(&sources[source].target),
+        Value::Aggregate { .. } => true, // value_type already validates the explicit per-pair reduction.
+        _ => false,
+    }
+}
+
+fn check_take(
+    catalog: &Catalog,
+    prefix: &QueryDecl,
+    index: usize,
+    take: &Take,
+    active_order: Option<SourceId>,
+    sources: &BTreeMap<String, CheckedSource>,
+) -> ProbeResult<CheckedTake> {
+    let ctx = context(catalog, prefix)?;
+    if take.target == "_" || !ctx.bindings.contains_key(&take.target) {
+        return Err("take requires an existing named node or edge target".into());
+    }
+    let aliases = BTreeMap::new();
+    let mut key_types = Vec::new();
+    for key in &take.keys {
+        let ty = value_type(catalog, prefix, key, sources, &aliases)?;
+        if !orderable(&ty) || matches!(ty, ValueType::Reduced { .. }) {
+            return Err(
+                "group key requires an identity or orderable scalar, without aggregation".into(),
+            );
+        }
+        key_types.push(ty);
+    }
+    let determined = pair_bindings(catalog, &ctx, take);
+    let raw_order = if take.order.is_empty() {
+        let source =
+            active_order.ok_or("take needs an explicit order when no ranking order is in scope")?;
+        let alias = sources
+            .iter()
+            .find(|(_, s)| s.id == source)
+            .unwrap()
+            .0
+            .clone();
+        vec![OrderingSpec {
+            value: Value::Metric {
+                source: alias,
+                field: "rank".into(),
+            },
+            descending: false,
+            nulls_first: false,
+        }]
+    } else {
+        take.order.clone()
+    };
+    let mut order = Vec::new();
+    for comparator in raw_order {
+        let ty = value_type(catalog, prefix, &comparator.value, sources, &aliases)?;
+        if !orderable(&ty) {
+            return Err("take comparator must be orderable".into());
+        }
+        if !pair_constant(&comparator.value, prefix, take, &determined, sources) {
+            return Err("cannot prove comparator constant within each target/group pair; request an explicit reduction".into());
+        }
+        order.push(OrderingSpec {
+            value: ty,
+            descending: comparator.descending,
+            nulls_first: comparator.nulls_first,
+        });
+    }
+    order.push(OrderingSpec {
+        value: ValueType::Identity(take.target.clone()),
+        descending: false,
+        nulls_first: false,
+    });
+    Ok(CheckedTake {
+        input_stage: index - 1,
+        target: take.target.clone(),
+        key_types,
+        order,
+        count: bound(prefix, &take.count, 0, None)?,
+        determined,
+    })
+}
+
 fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
     let mut prefix = query.header.clone();
     let mut sources = BTreeMap::new();
+    let mut selections = BTreeMap::new();
     let mut scopes = Vec::new();
     let mut active_order = None;
     for (index, stage) in query.stages.iter().enumerate() {
@@ -741,6 +998,12 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
                     active_order = Some(id);
                 }
             }
+            Stage::Take(take) => {
+                selections.insert(
+                    index,
+                    check_take(catalog, &prefix, index, take, active_order, &sources)?,
+                );
+            }
         }
         scopes.push(
             context(catalog, &prefix)?
@@ -772,17 +1035,18 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
         projection_types.push(ty);
     }
     let mut explicit_order = Vec::new();
-    for (value, descending) in &query.order {
-        if aggregate && !matches!(value, Value::Core(Expr::AliasRef(_))) {
+    for ordering in &query.order {
+        if aggregate && !matches!(ordering.value, Value::Core(Expr::AliasRef(_))) {
             return Err(
                 "aggregate ordering must reference a projected result alias in this prototype"
                     .into(),
             );
         }
-        explicit_order.push((
-            value_type(catalog, &prefix, value, &sources, &aliases)?,
-            *descending,
-        ));
+        explicit_order.push(OrderingSpec {
+            value: value_type(catalog, &prefix, &ordering.value, &sources, &aliases)?,
+            descending: ordering.descending,
+            nulls_first: ordering.nulls_first,
+        });
     }
     if aggregate {
         active_order = None;
@@ -810,6 +1074,7 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
     Ok(Plan {
         query,
         sources,
+        selections,
         scopes,
         projection_types,
         output_order,
@@ -817,18 +1082,14 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
     })
 }
 
-fn catalog() -> Catalog {
-    build_catalog(
-        &parse_schema(
-            r#"
-node Organization { slug: String @key name: String embedding: Vector(3) }
-node Incident { slug: String @key title: String severity: I32 embedding: Vector(3) }
+const SCHEMA: &str = r#"
+node Organization { slug: String @key name: String category: String? embedding: Vector(3) }
+node Incident { slug: String @key title: String severity: I32 labels: [String] embedding: Vector(3) }
 edge HasIncident: Organization -> Incident { note: String }
-"#,
-        )
-        .unwrap(),
-    )
-    .unwrap()
+"#;
+
+fn catalog() -> Catalog {
+    build_catalog(&parse_schema(SCHEMA).unwrap()).unwrap()
 }
 
 const STAGED: &str = r#"
@@ -894,10 +1155,27 @@ fn staged_probe_preserves_scopes_populations_and_metric_origins() {
     let OutputOrder::Explicit(order) = &plan.output_order else {
         panic!("final order overrides stage order");
     };
-    assert_eq!(order[0], (plan.projection_types[2].clone(), false));
-    assert_eq!(order[1], (plan.projection_types[3].clone(), true));
-    assert_eq!(order[0].0.metric_origins(), [words.id]);
-    assert_eq!(order[1].0.metric_origins(), [plan.sources["incidents"].id]);
+    assert_eq!(
+        order[0],
+        OrderingSpec {
+            value: plan.projection_types[2].clone(),
+            descending: false,
+            nulls_first: true
+        }
+    );
+    assert_eq!(
+        order[1],
+        OrderingSpec {
+            value: plan.projection_types[3].clone(),
+            descending: true,
+            nulls_first: false
+        }
+    );
+    assert_eq!(order[0].value.metric_origins(), [words.id]);
+    assert_eq!(
+        order[1].value.metric_origins(),
+        [plan.sources["incidents"].id]
+    );
     assert_eq!(plan.query.header.limit, Some(3));
     assert_eq!(plan.output_scope, OutputScope::Bindings);
     assert_eq!(plan.sources["incidents"].declaration.alias, "incidents");
@@ -1095,7 +1373,7 @@ query grouped($q: String) {
     let OutputOrder::Explicit(order) = plan.output_order else {
         panic!("expected aggregate order");
     };
-    assert_eq!(order[0].0, plan.projection_types[1]);
+    assert_eq!(order[0].value, plan.projection_types[1]);
     let unordered = input.replace("order { best asc, organization asc }", "");
     assert_eq!(
         check(&catalog, parse(&unordered).unwrap())
@@ -1165,6 +1443,282 @@ fn staged_probe_final_projection_and_limit_do_not_resize_sources() {
 }
 
 #[test]
+fn staged_probe_take_preserves_population_metrics_and_global_order() {
+    let input = STAGED.replace(
+        "  return {",
+        "  take $i { per { $o.slug, $o.category } limit $window }\n  return {",
+    );
+    let plan = check(&catalog(), parse(&input).unwrap()).unwrap();
+    let selection = &plan.selections[&4];
+    assert_eq!(selection.input_stage, 3);
+    assert_eq!(selection.target, "i");
+    assert_eq!(
+        selection.determined,
+        BTreeSet::from(["i".into(), "o".into()])
+    );
+    assert_eq!(
+        selection.key_types,
+        [false, true].map(|nullable| {
+            ValueType::Core(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::String,
+                nullable,
+            )))
+        })
+    );
+    assert_eq!(
+        selection.count,
+        Bound::Parameter {
+            name: "window".into(),
+            min: 0,
+            max: None
+        }
+    );
+    assert_eq!(
+        selection.order,
+        [
+            OrderingSpec {
+                value: ValueType::Metric {
+                    source: plan.sources["incidents"].id,
+                    domain: MetricDomain::Rank
+                },
+                descending: false,
+                nulls_first: false,
+            },
+            OrderingSpec {
+                value: ValueType::Identity("i".into()),
+                descending: false,
+                nulls_first: false
+            },
+        ]
+    );
+    assert_eq!(plan.scopes[4], plan.scopes[3]);
+    assert_eq!(plan.sources["incidents"].candidates, Bound::Literal(5));
+    assert_eq!(plan.query.header.limit, Some(3));
+    assert_eq!(plan.output_scope, OutputScope::Bindings);
+
+    // A local comparator chooses winners, without becoming a global order.
+    // The full organization key makes its earlier metric constant per pair.
+    let explicit = input
+        .replace(
+            "limit $window }",
+            "order { metric(words, rank) asc nulls last } limit $window }",
+        )
+        .replace("  order { words asc, score desc, $i.@id }", "");
+    let explicit_plan = check(&catalog(), parse(&explicit).unwrap()).unwrap();
+    assert_eq!(
+        explicit_plan.selections[&4].order[0].value.metric_origins(),
+        [plan.sources["words"].id]
+    );
+    assert!(!explicit_plan.selections[&4].order[0].nulls_first);
+    assert_eq!(
+        explicit_plan.output_order,
+        OutputOrder::Ranked(plan.sources["incidents"].id)
+    );
+
+    let after = input.replace(
+        "  return {",
+        "  rank $i { lexical($i.title, terms($q), candidates: 2) as after_take }\n  return {",
+    );
+    let after_plan = check(&catalog(), parse(&after).unwrap()).unwrap();
+    assert_eq!(after_plan.sources["after_take"].input_stage, 4);
+    assert_ne!(
+        after_plan.sources["after_take"].id,
+        plan.sources["incidents"].id
+    );
+}
+
+#[test]
+fn staged_probe_take_validates_pairs_and_explicit_reductions() {
+    let input = STAGED.replace("  return {", "  take $o { per { $o.category } order { min(metric(incidents, rank)) asc nulls last } limit 2 }\n  return {");
+    let plan = check(&catalog(), parse(&input).unwrap()).unwrap();
+    assert_eq!(
+        plan.selections[&4].order[0].value,
+        ValueType::Reduced {
+            function: AggFunc::Min,
+            input: Box::new(ValueType::Metric {
+                source: plan.sources["incidents"].id,
+                domain: MetricDomain::Rank
+            }),
+        }
+    );
+    for (from, to, error) in [
+        (
+            "min(metric(incidents, rank))",
+            "metric(incidents, rank)",
+            "cannot prove comparator constant",
+        ),
+        (
+            "order { min(metric(incidents, rank)) asc nulls last }",
+            "",
+            "cannot prove comparator constant",
+        ),
+        ("take $o", "take $unknown", "existing named"),
+        ("take $o", "take $_", "existing named"),
+        ("per { $o.category }", "per { $o }", "group key requires"),
+        (
+            "per { $o.category }",
+            "per { $i.embedding }",
+            "group key requires",
+        ),
+        (
+            "per { $o.category }",
+            "per { $i.labels }",
+            "group key requires",
+        ),
+        (
+            "per { $o.category }",
+            "per { count($i) }",
+            "group key requires",
+        ),
+        ("limit 2 }", "limit -1 }", "expected expr"),
+        (
+            "limit 2 }",
+            "limit 1.5 }",
+            "integer literal or query parameter",
+        ),
+        ("limit 2 }", "limit $q }", "non-null integer"),
+        (
+            "limit 2 }",
+            "limit $i.severity }",
+            "integer literal or query parameter",
+        ),
+        (
+            "min(metric(incidents, rank))",
+            "min(count($i))",
+            "nested aggregates",
+        ),
+        (
+            "min(metric(incidents, rank))",
+            "sum(metric(incidents, rank))",
+            "no domain contract",
+        ),
+    ] {
+        let changed = input.replace(from, to);
+        assert_ne!(changed, input);
+        let actual = parse(&changed)
+            .and_then(|query| check(&catalog(), query))
+            .unwrap_err();
+        assert!(actual.contains(error), "{from} -> {to}: {actual}");
+    }
+    let nullable = input
+        .replace("$window: I64", "$window: I64?")
+        .replace("limit 2 }", "limit $window }");
+    assert!(
+        check(&catalog(), parse(&nullable).unwrap())
+            .unwrap_err()
+            .contains("non-null integer")
+    );
+}
+
+#[test]
+fn staged_probe_take_uses_complete_nonnull_keys_and_directed_cardinality() {
+    let input = STAGED.replace(
+        "  return {",
+        "  take $i { per { $o.slug } order { metric(words, rank) } limit 2 }\n  return {",
+    );
+    let composite = SCHEMA.replace(
+        "slug: String @key name:",
+        "slug: String region: String @key(region, slug) name:",
+    );
+    let composite_catalog = build_catalog(&parse_schema(&composite).unwrap()).unwrap();
+    assert!(
+        check(&composite_catalog, parse(&input).unwrap())
+            .unwrap_err()
+            .contains("cannot prove comparator constant")
+    );
+    let full = input.replace("per { $o.slug }", "per { $o.region, $o.slug }");
+    assert!(
+        check(&composite_catalog, parse(&full).unwrap())
+            .unwrap()
+            .selections[&4]
+            .determined
+            .contains("o")
+    );
+
+    for nullable in [false, true] {
+        let schema = SCHEMA.replace(
+            "category: String?",
+            if nullable {
+                "category: String? @unique"
+            } else {
+                "category: String @unique"
+            },
+        );
+        let catalog = build_catalog(&parse_schema(&schema).unwrap()).unwrap();
+        let by_unique = input.replace("per { $o.slug }", "per { $o.category }");
+        let checked = check(&catalog, parse(&by_unique).unwrap());
+        assert_eq!(
+            checked.is_ok(),
+            !nullable,
+            "nullable unique bucket may contain multiple identities"
+        );
+    }
+
+    let schema = SCHEMA.replace("-> Incident {", "-> Incident @card(0..1) {");
+    let cardinality_catalog = build_catalog(&parse_schema(&schema).unwrap()).unwrap();
+    let by_source = input
+        .replace("take $i", "take $o")
+        .replace("per { $o.slug }", "per { $o.category }")
+        .replace(
+            "order { metric(words, rank) }",
+            "order { metric(incidents, rank) }",
+        );
+    let plan = check(&cardinality_catalog, parse(&by_source).unwrap()).unwrap();
+    assert!(plan.selections[&4].determined.contains("i"));
+    let reverse = input.replace("per { $o.slug }", "per { $i.slug }");
+    assert!(
+        check(&cardinality_catalog, parse(&reverse).unwrap())
+            .unwrap_err()
+            .contains("cannot prove comparator constant")
+    );
+
+    // A directed, bound edge fixes its endpoints even without a max-one edge.
+    let edge = input
+        .replace("$o hasIncident $i", "$o $link:hasIncident $i")
+        .replace("take $i", "take $link")
+        .replace("per { $o.slug }", "per { $o.category }");
+    assert_eq!(
+        check(&catalog(), parse(&edge).unwrap()).unwrap().selections[&4].determined,
+        BTreeSet::from(["i".into(), "link".into(), "o".into()])
+    );
+}
+
+#[test]
+fn staged_probe_take_graph_only_zero_quota_and_null_placement() {
+    let input = r#"
+query graph_only() {
+  match { $o: Organization $o hasIncident $i }
+  take $i { per { $o.category } order { $i.severity desc nulls first } limit 0 }
+  return { $i.slug }
+}
+"#;
+    let plan = check(&catalog(), parse(input).unwrap()).unwrap();
+    assert!(plan.sources.is_empty());
+    assert_eq!(plan.output_order, OutputOrder::Unordered);
+    assert_eq!(plan.selections[&1].count, Bound::Literal(0));
+    assert!(plan.selections[&1].order[0].nulls_first);
+    let missing = input.replace("order { $i.severity desc nulls first }", "");
+    assert!(
+        check(&catalog(), parse(&missing).unwrap())
+            .unwrap_err()
+            .contains("explicit order when no ranking")
+    );
+    let final_order = input.replace(
+        "return { $i.slug }",
+        "return { $i.slug } order { $o.category asc nulls last }",
+    );
+    let OutputOrder::Explicit(order) = check(&catalog(), parse(&final_order).unwrap())
+        .unwrap()
+        .output_order
+    else {
+        panic!("expected explicit order")
+    };
+    assert!(!order[0].nulls_first);
+    assert!(!order[0].descending);
+    assert!(parse_query(input).is_err());
+}
+
+#[test]
 fn staged_probe_checks_the_rfc_examples_directly() {
     let rfc = include_str!("../../../../docs/rfcs/0048-search-contracts.md");
     let catalog = catalog();
@@ -1175,7 +1729,7 @@ fn staged_probe_checks_the_rfc_examples_directly() {
         .collect();
     assert_eq!(
         examples.len(),
-        2,
+        3,
         "review new examples when extending the prototype"
     );
     for example in examples {

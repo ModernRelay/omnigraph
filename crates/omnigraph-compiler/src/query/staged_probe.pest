@@ -2,7 +2,7 @@
 // Reuse current tokens, graph patterns and scalar expressions; query_file
 // remains the production root and cannot reach any of these rules.
 probe_file = { SOI ~ probe_decl ~ EOI }
-probe_decl = { "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{" ~ probe_match ~ (probe_rank | probe_match)* ~ probe_return ~ probe_order? ~ limit_clause? ~ "}" }
+probe_decl = { "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{" ~ probe_match ~ (probe_rank | probe_match | probe_take)* ~ probe_return ~ probe_order? ~ limit_clause? ~ "}" }
 probe_match = { "match" ~ "{" ~ (probe_match_terms | clause)+ ~ "}" }
 probe_match_terms = { "match_terms" ~ "(" ~ expr ~ "," ~ probe_terms ~ ")" }
 probe_rank = { "rank" ~ variable ~ "{" ~ probe_source+ ~ "}" }
@@ -14,10 +14,14 @@ probe_vector_kind = { "knn" | "ann" }
 probe_fusion = { "rrf" ~ "(" ~ probe_arm ~ ("," ~ probe_arm)+ ~ ("," ~ probe_option)* ~ ")" }
 probe_arm = { "arm" ~ "(" ~ ident ~ ("," ~ probe_option)* ~ ")" }
 probe_option = { ident ~ ":" ~ expr }
+probe_take = { "take" ~ variable ~ "{" ~ probe_per ~ probe_order? ~ "limit" ~ expr ~ "}" }
+probe_per = { "per" ~ "{" ~ probe_value ~ ("," ~ probe_value)* ~ "}" }
 probe_return = { "return" ~ "{" ~ probe_projection+ ~ "}" }
 probe_projection = { probe_value ~ ("as" ~ ident)? ~ ","? }
 probe_order = { "order" ~ "{" ~ probe_ordering ~ ("," ~ probe_ordering)* ~ "}" }
-probe_ordering = { probe_value ~ order_dir? }
+probe_ordering = { probe_value ~ order_dir? ~ probe_nulls? }
+probe_nulls = { "nulls" ~ probe_null_placement }
+probe_null_placement = { "first" | "last" }
 probe_value = { probe_metric | probe_identity | probe_aggregate | expr }
 probe_metric = { "metric" ~ "(" ~ ident ~ "," ~ ident ~ ")" }
 probe_identity = { variable ~ ".@id" }
