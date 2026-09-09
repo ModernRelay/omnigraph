@@ -82,6 +82,8 @@ lance-namespace-impls = { workspace = true }
 lance-io = { version = "11.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
+# RFC 0048 numerical oracle: pin the scalar log1p kernel, not platform libm.
+libm = "=0.2.16"
 syn = { version = "2", features = ["full", "visit"] }
 toml = "0.9"
 # benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.

@@ -1,0 +1,119 @@
+# issue: none
+# notes: two rows are seeded and indexed, two identical-shaped rows are inserted after the index
+# notes: build and sit in an uncovered fragment. `search` finds both "beta" rows for "beta" and for
+# notes: "Beta" (steps 1 and 2, controls: with an index present the uncovered fragment is searched
+# notes: with the index analyzer). "running" at one edit finds the appended row (bare token
+# notes: "running") and misses the indexed one (stored stem "run"), step 3. "beto" at one edit finds
+# notes: the indexed "beta" row and misses the appended one (no fuzzy expansion on the uncovered
+# notes: fragment), step 4. The contract stated here is one matched set per query across index
+# notes: states (RFC 0048 law: matches(indexed) = matches(unindexed)).
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"beta-indexed","title":"beta release"}}
+{"type":"Doc","data":{"slug":"run-indexed","title":"running fast"}}
+
+--- mutate
+query ins($s: String, $t: String) {
+    insert Doc { slug: $s, title: $t }
+}
+
+--- params
+{"s": "beta-appended", "t": "beta build"}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query ins($s: String, $t: String) {
+    insert Doc { slug: $s, title: $t }
+}
+
+--- params
+{"s": "run-appended", "t": "running late"}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query search_lowercase($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "beta"}
+
+--- expect ordered
+{"d.slug": "beta-appended"}
+{"d.slug": "beta-indexed"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query search_capitalized($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "Beta"}
+
+--- expect ordered
+{"d.slug": "beta-appended"}
+{"d.slug": "beta-indexed"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query stemmed_one_edit($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 1)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "running"}
+
+--- expect ordered
+{"d.slug": "run-appended"}
+{"d.slug": "run-indexed"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query typo_one_edit($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 1)
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"q": "beto"}
+
+--- expect ordered
+{"d.slug": "beta-appended"}
+{"d.slug": "beta-indexed"}
+
+--- expect shape
+d.slug: String

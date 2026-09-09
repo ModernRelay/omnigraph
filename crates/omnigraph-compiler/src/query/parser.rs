@@ -10,6 +10,7 @@ use super::ast::*;
 
 #[derive(Parser)]
 #[grammar = "query/query.pest"]
+#[cfg_attr(test, grammar = "query/staged_probe.pest")]
 struct QueryParser;
 
 pub fn parse_query(input: &str) -> Result<QueryFile> {
@@ -917,3 +918,7 @@ fn parse_nearest_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
 #[cfg(test)]
 #[path = "parser_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "staged_probe.rs"]
+mod staged_probe;

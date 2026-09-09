@@ -111,6 +111,146 @@ async fn fresh_dataset(uri: &str) -> Dataset {
     Dataset::write(reader, uri, Some(params)).await.unwrap()
 }
 
+/// RFC 0048: the public provider composes with the caller's DataFusion session,
+/// but the session pool is not a bound on all Lance/Arrow allocations. Retain
+/// a decoded scan batch while inspecting the pool, then use a real aggregate
+/// to prove that the same pool is enforced for a reserving DataFusion operator.
+#[tokio::test]
+async fn lance_provider_scan_payloads_need_accounting_beyond_the_session_pool() {
+    use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::{SessionConfig, SessionContext, col};
+    use lance::datafusion::LanceTableProvider;
+
+    let directory = tempfile::tempdir().unwrap();
+    let uri = directory.path().join("source.lance");
+    let dataset = Arc::new(fresh_dataset(uri.to_str().unwrap()).await);
+    let provider = Arc::new(LanceTableProvider::new(Arc::clone(&dataset), false, false));
+    let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()
+        .unwrap();
+    let ctx =
+        SessionContext::new_with_config_rt(SessionConfig::new().with_target_partitions(1), runtime);
+    assert!(Arc::ptr_eq(&pool, ctx.task_ctx().memory_pool()));
+    let frame = ctx.read_table(provider).unwrap();
+    let batches = frame.clone().collect().await.unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let retained_bytes = batches
+        .iter()
+        .map(RecordBatch::get_array_memory_size)
+        .sum::<usize>();
+    assert!(retained_bytes > 1);
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "retained scan payload is outside reservations"
+    );
+
+    let failure = frame
+        .aggregate(vec![col("id")], vec![])
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("Resources exhausted"), "{failure}");
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "failed aggregate must release its reservations"
+    );
+    assert!(
+        batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>()
+            > 1
+    );
+    println!(
+        "Lance scan retained {retained_bytes} bytes with zero reserved against a one-byte pool; aggregate refused"
+    );
+
+    // Wide variable-length values exercise native adaptive batching; the
+    // original two tiny values decode into separate buffers at a one-row cap.
+    let mut wide = dataset.as_ref().clone();
+    let schema = Arc::new(Schema::from(wide.schema()));
+    let mut random = 606_u32;
+    let values: Vec<String> = (0..512)
+        .map(|i| {
+            let body: String = (0..128 + (i % 17) * 129)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    char::from(b'a' + (random % 26) as u8)
+                })
+                .collect();
+            format!("wide-{i}-{body}")
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(values)),
+            Arc::new(Int32Array::from_iter_values(0..512)),
+        ],
+    )
+    .unwrap();
+    wide.append(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Hold every batch so allocator address reuse cannot mimic shared native
+    // buffers. This is allocation evidence, not a peak-RSS measurement.
+    let mut scanner = wide.scan();
+    scanner.project(&["id"]).unwrap();
+    scanner.batch_size(256);
+    scanner.batch_size_bytes(65536);
+    let slices: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(slices.iter().map(RecordBatch::num_rows).sum::<usize>(), 514);
+    let strings: Vec<&StringArray> = slices
+        .iter()
+        .map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+        })
+        .collect();
+    let unique_buffers: HashSet<_> = strings
+        .iter()
+        .map(|array| array.values().data_ptr())
+        .collect();
+    assert!(
+        unique_buffers.len() < strings.len(),
+        "native output must actually share buffers"
+    );
+    let repeated_backing_bytes: usize = strings.iter().map(|array| array.values().len()).sum();
+    let logical_id_bytes: usize = strings
+        .iter()
+        .flat_map(|array| array.iter().flatten())
+        .map(str::len)
+        .sum();
+    assert!(repeated_backing_bytes > logical_id_bytes);
+}
+
 /// Append one uniquely keyed row while preserving the V2_2/stable-row-id shape
 /// used by the production tables. Tag/cleanup guards use this to create exact,
 /// distinguishable versions without introducing a graph-level writer.
@@ -4384,4 +4524,386 @@ async fn fts_prefilter_does_not_change_covered_fragment_scores() {
         "every eligible doc scored identically against subset-only statistics — \
          the fixture cannot detect filter-dependent scoring and this guard is vacuous"
     );
+}
+
+/// RFC 0048 decision probe: eligibility and the scoring corpus are independent.
+/// Rebuilding an eligible subset changes IDF and can reverse the winner; an
+/// external row mask changes eligibility while retaining the original scores.
+#[tokio::test]
+async fn fts_statistics_scope_can_reverse_ranking() {
+    use lance::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
+    use lance::index::prefilter::DatasetPreFilter;
+    use lance::index::scalar::open_scalar_index;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::prefilter::PreFilter;
+    use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
+    use lance_index::scalar::inverted::tokenizer::document_tokenizer::DocType;
+    use lance_index::scalar::inverted::{InvertedIndex, MemBM25Scorer};
+
+    fn ranked(batch: &RecordBatch) -> Vec<(String, f32)> {
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        let mut rows: Vec<_> = (0..batch.num_rows())
+            .map(|i| (ids.value(i).to_string(), scores.value(i)))
+            .collect();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows
+    }
+
+    let query = || {
+        FullTextSearchQuery::new("alpha beta".to_string())
+            .with_column("text".to_string())
+            .unwrap()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let params = InvertedIndexParams::default()
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false)
+        .max_token_length(None);
+    let mut rankings = Vec::new();
+    let mut datasets = Vec::new();
+    let mut full_corpus_scores = HashMap::new();
+    for (name, offset, texts) in [
+        (
+            "field",
+            0,
+            vec![
+                "alpha", "alpha", "alpha", "beta", "beta", "beta", "beta", "beta", "beta", "beta",
+            ],
+        ),
+        ("eligible", 0, vec!["alpha", "alpha", "alpha", "beta"]),
+        ("other_type", 4, vec!["beta"; 6]),
+    ] {
+        let ids: Vec<_> = (offset..offset + texts.len())
+            .map(|i| format!("d-{i:02}"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(texts)),
+            ],
+        )
+        .unwrap();
+        let uri = dir.path().join(name);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        let mut scan = dataset.scan();
+        scan.full_text_search(query()).unwrap();
+        scan.project(&["id"]).unwrap();
+        if name == "field" {
+            full_corpus_scores = ranked(&scan.try_into_batch().await.unwrap())
+                .into_iter()
+                .collect();
+            assert_eq!(full_corpus_scores.len(), 10);
+        }
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            0u64, 1, 2, 3,
+        ])));
+        scan.project(&["id"]).unwrap();
+        let rows = ranked(&scan.try_into_batch().await.unwrap());
+        assert_eq!(rows.len(), 4);
+        if name == "field" {
+            for (id, score) in &rows {
+                assert_eq!(score.to_bits(), full_corpus_scores[id].to_bits());
+            }
+        }
+        println!("{name} statistics: {rows:?}");
+        rankings.push(rows);
+        datasets.push(Arc::new(dataset));
+    }
+    assert_eq!(
+        rankings[0][0].0, "d-00",
+        "alpha is rarer in the full field corpus"
+    );
+    assert_eq!(
+        rankings[1][0].0, "d-03",
+        "beta is rarer in the eligible corpus"
+    );
+
+    // Treat the two disjoint subsets as physical type tables. Native local
+    // top-1 loses every globally winning alpha row before a global rescorer
+    // gets to see them. This is an actual scanner limit, not Vec truncation.
+    let mut shortlisted = Vec::new();
+    for dataset in &datasets[1..] {
+        let mut scan = dataset.scan();
+        scan.full_text_search(query().limit(Some(1))).unwrap();
+        scan.project(&["id"]).unwrap();
+        let rows = ranked(&scan.try_into_batch().await.unwrap());
+        assert_eq!(rows.len(), 1);
+        shortlisted.push(rows[0].0.clone());
+    }
+    assert_eq!(shortlisted[0], "d-03");
+    assert!(
+        shortlisted
+            .iter()
+            .all(|id| { full_corpus_scores[id] < full_corpus_scores["d-00"] })
+    );
+
+    // A lower public Lance surface accepts caller-supplied corpus statistics.
+    // Aggregate them from both opened indexes, then give the SAME scorer to
+    // both searches before either local cut. This only qualifies native f32
+    // exact-term scoring over complete, deletion-free index coverage; it is
+    // not the RFC's f64 fuzzy-group scorer or a global entity tie contract.
+    let terms = vec!["alpha".to_string(), "beta".to_string()];
+    let mut shared = MemBM25Scorer::new(0, 0, HashMap::new());
+    let mut opened = Vec::new();
+    for dataset in &datasets[1..] {
+        let metadata = dataset.load_indices().await.unwrap();
+        assert_eq!(metadata.len(), 1);
+        let index = open_scalar_index(dataset, "text", &metadata[0], &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        let (tokens, documents, frequencies) =
+            inverted.bm25_stats_for_terms(&terms, None).await.unwrap();
+        shared.total_tokens += tokens;
+        shared.num_docs += documents;
+        for (term, frequency) in terms.iter().zip(frequencies) {
+            *shared.token_docs.entry(term.clone()).or_default() += frequency;
+        }
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &metadata, None));
+        prefilter.wait_for_ready().await.unwrap();
+        opened.push((index, prefilter));
+    }
+    assert_eq!(shared.total_tokens, 10);
+    assert_eq!(shared.num_docs, 10);
+    assert_eq!(
+        shared.token_docs,
+        HashMap::from([("alpha".into(), 3), ("beta".into(), 7)])
+    );
+
+    // Every document has one token, hence BM25's document weight is exactly
+    // one. These independent closed-form IDFs pin the expected score bands.
+    let alpha = libm::log1p(7.5 / 3.5);
+    let beta = libm::log1p(3.5 / 7.5);
+    assert!(alpha > beta);
+    let tokens = Arc::new(Tokens::new(terms, DocType::Text));
+    for (partition, (index, prefilter)) in opened.iter().enumerate() {
+        let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        let (row_ids, scores) = inverted
+            .bm25_search(
+                tokens.clone(),
+                Arc::new(FtsSearchParams::new().with_limit(Some(1))),
+                Operator::Or,
+                prefilter.clone(),
+                Arc::new(NoOpMetricsCollector),
+                Some(&shared),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), 1);
+        assert_eq!(scores.len(), 1);
+        let expected = if partition == 0 { alpha } else { beta };
+        assert!((f64::from(scores[0]) - expected).abs() < 1e-6);
+        if partition == 0 {
+            assert!(row_ids[0] < 3, "shared statistics recover an alpha winner");
+        }
+    }
+
+    // Index statistics describe immutable postings, not necessarily the live
+    // accepted corpus. A deletion mask suppresses the row but does not repair
+    // those statistics. A global adapter must reconcile this difference.
+    let mut changed = datasets[2].as_ref().clone();
+    changed.delete("id = 'd-09'").await.unwrap();
+    assert_eq!(changed.count_rows(None).await.unwrap(), 5);
+    assert_eq!(datasets[2].count_rows(None).await.unwrap(), 6);
+    let metadata = changed.load_indices().await.unwrap();
+    assert_eq!(metadata.len(), 1);
+    let index = open_scalar_index(&changed, "text", &metadata[0], &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+    let stale_stats = inverted
+        .bm25_stats_for_terms(&["beta".to_string()], None)
+        .await
+        .unwrap();
+    assert_eq!(stale_stats, (6, 6, vec![6]));
+    let mut scan = changed.scan();
+    scan.full_text_search(query()).unwrap();
+    scan.project(&["id"]).unwrap();
+    let remaining = ranked(&scan.try_into_batch().await.unwrap());
+    assert_eq!(remaining.len(), 5);
+    assert!(remaining.iter().all(|(id, _)| id != "d-09"));
+}
+
+/// RFC 0048 qualification probe. The public tokenizer can be reused after
+/// NFC, but neither a token filter nor an ignored training-JSON field adds
+/// the necessary preprocessing to the native index builder.
+#[test]
+fn nfc_preprocessing_requires_an_explicit_bounded_integration() {
+    use std::cell::Cell;
+    use unicode_normalization::UnicodeNormalization;
+
+    let params = InvertedIndexParams::default()
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false)
+        .max_token_length(None);
+    let tokens = |text: &str| {
+        let mut tokenizer = params.build().unwrap();
+        let mut stream = tokenizer.token_stream_for_doc(text);
+        let mut terms = Vec::new();
+        while stream.advance() {
+            terms.push(stream.token().text.clone());
+        }
+        terms
+    };
+    let composed = "résumé";
+    let decomposed = "re\u{301}sume\u{301}";
+    assert_ne!(tokens(composed), tokens(decomposed));
+    assert_eq!(
+        tokens(&composed.nfc().collect::<String>()),
+        tokens(&decomposed.nfc().collect::<String>())
+    );
+
+    let mut json = serde_json::to_value(&params).unwrap();
+    json["normalization"] = serde_json::json!("NFC");
+    let decoded: InvertedIndexParams = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        decoded, params,
+        "the pin ignores this unknown field; it must not count as NFC support"
+    );
+
+    // Output cannot be budgeted solely from input bytes: composition
+    // exclusions can make even NFC larger, without compatibility folding.
+    let expanding = "\u{0344}";
+    let normalized: String = expanding.nfc().collect();
+    assert_eq!(expanding.len(), 2);
+    assert_eq!(normalized.len(), 4);
+
+    // Checking cancellation only after yielded normalized characters misses
+    // the buffering and canonical ordering of a long nonstarter sequence.
+    let input = format!("a{}\u{0300}", "\u{0315}".repeat(8192));
+    let consumed = Cell::new(0);
+    let mut normalized = input
+        .chars()
+        .inspect(|_| consumed.set(consumed.get() + 1))
+        .nfc();
+    assert_eq!(normalized.next(), Some('à'));
+    assert!(consumed.get() >= 8194);
+    println!(
+        "NFC: 2 input bytes expand to 4; {} input scalars consumed before first output scalar",
+        consumed.get()
+    );
+}
+
+/// RFC 0048 scorer-selection probe. Native fuzzy BM25 can give a rare
+/// expansion more weight than the exact query term. This is a characterization
+/// of the pin, not the proposed fuzzy scorer's intended ordering.
+#[tokio::test]
+async fn native_fuzzy_bm25_rewards_a_rare_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+    let texts: Vec<_> = std::iter::repeat_n("beta", 90)
+        .chain(["beto"])
+        .chain(std::iter::repeat_n("gamma", 9))
+        .collect();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(texts))]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.path().join("fuzzy").to_str().unwrap(),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .stem(false)
+                .remove_stop_words(false)
+                .ascii_folding(false)
+                .max_token_length(None),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut results = HashMap::new();
+    for (name, query, expected_rows) in [
+        ("exact", FullTextSearchQuery::new("beta".into()), 90),
+        (
+            "fuzzy",
+            FullTextSearchQuery::new_fuzzy("beta".into(), Some(1)),
+            91,
+        ),
+        (
+            "repeat",
+            FullTextSearchQuery::new_fuzzy("beta beta".into(), Some(1)),
+            91,
+        ),
+    ] {
+        let mut scan = dataset.scan();
+        scan.full_text_search(query.with_column("text".into()).unwrap())
+            .unwrap();
+        scan.project(&["text"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        let texts = batch.column_by_name("text").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        let mut grouped = HashMap::new();
+        for i in 0..batch.num_rows() {
+            if let Some(previous) = grouped.insert(texts.value(i).to_string(), scores.value(i)) {
+                assert_eq!(previous, scores.value(i), "identical field values must tie");
+            }
+        }
+        println!("{name}: {grouped:?}");
+        results.insert(name, grouped);
+    }
+    assert!(results["fuzzy"]["beto"] > results["fuzzy"]["beta"]);
+    assert_eq!(results["exact"]["beta"], results["fuzzy"]["beta"]);
+    for term in ["beta", "beto"] {
+        assert_eq!(results["repeat"][term], 2.0 * results["fuzzy"][term]);
+    }
+}
+
+/// A positive mathematical IDF can round to zero in the native f32 kernel.
+/// No large dataset is needed to exercise the public statistics/scorer API.
+#[test]
+fn native_bm25_idf_can_round_a_common_term_to_zero() {
+    use lance_index::scalar::inverted::{MemBM25Scorer, Scorer};
+
+    let count = 1_usize << 24;
+    let scorer = MemBM25Scorer::new(
+        count as u64,
+        count,
+        HashMap::from([("beta".to_string(), count)]),
+    );
+    let native = scorer.query_weight("beta");
+    let stable = libm::log1p(0.5 / (count as f64 + 0.5));
+    println!("common-term IDF at N={count}: native={native}, log1p/f64={stable}");
+    assert_eq!(native, 0.0);
+    assert!(stable > 0.0);
 }

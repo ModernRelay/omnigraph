@@ -576,6 +576,186 @@ fn blob_commands_reject_positional_and_cluster_scope_addressing() {
     );
 }
 
+/// RFC 0048 qualification: a recorded model label is not an immutable encoder.
+/// Actual CLI processes and a bounded provider fixture are needed to observe
+/// network calls, reopen behavior, schema/data export and query-time encoding.
+#[test]
+fn recorded_model_label_does_not_freeze_provider_output_at_a_snapshot() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let schema = temp.path().join("encoding.pg");
+    let seed = temp.path().join("encoding.jsonl");
+    fs::write(
+        &schema,
+        r#"node Doc {
+    slug: String @key
+    title: String
+    embedding: Vector(4) @embed("title", model="test-model-a")
+}
+"#,
+    )
+    .unwrap();
+    write_jsonl(
+        &seed,
+        r#"{"type":"Doc","data":{"slug":"alpha","title":"alpha","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"beta","title":"beta","embedding":[0.0,1.0,0.0,0.0]}}"#,
+    );
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+    output_success(
+        cli()
+            .args(["load", "--mode", "overwrite", "--data"])
+            .arg(&seed)
+            .arg(&graph),
+    );
+    let snapshot = resolved_snapshot_id(&graph, "main");
+    let source = r#"query lookup() {
+    match { $d: Doc }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, "alpha") }
+    limit 1
+}"#;
+    let explicit = r#"query lookup() {
+    match { $d: Doc }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, [1.0, 0.0, 0.0, 0.0]) }
+    limit 1
+}"#;
+    let provider = IntentApiFixture::new(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ]
+        .into_iter()
+        .map(|vector| {
+            IntentReply::json(
+                200,
+                serde_json::json!({
+                    "model": "test-model-a",
+                    "data": [{"index": 0, "embedding": vector}]
+                }),
+            )
+        })
+        .collect(),
+    );
+    let command = |store: &std::path::Path, text: &str, pin: Option<&str>, model: &str| {
+        let mut command = cli();
+        command
+            .current_dir(temp.path())
+            .env_remove("OMNIGRAPH_EMBEDDINGS_MOCK")
+            .env("OMNIGRAPH_EMBED_PROVIDER", "openai-compatible")
+            .env("OMNIGRAPH_EMBED_MODEL", model)
+            .env(
+                "OMNIGRAPH_EMBED_BASE_URL",
+                format!("{}/v1", provider.origin),
+            )
+            .env("OPENROUTER_API_KEY", "fixture-only")
+            .env("OMNIGRAPH_EMBED_RETRY_ATTEMPTS", "1")
+            .env("OMNIGRAPH_EMBED_TIMEOUT_MS", "3000")
+            .env("OMNIGRAPH_EMBED_DEADLINE_MS", "5000")
+            .args(["query", "-e", text, "--json", "--store"])
+            .arg(store);
+        if let Some(pin) = pin {
+            command.args(["--snapshot", pin]);
+        }
+        command
+    };
+    let mut outputs = Vec::new();
+    for expected in ["alpha", "beta"] {
+        let output = parse_stdout_json(&output_success(&mut command(
+            &graph,
+            source,
+            Some(&snapshot),
+            "test-model-a",
+        )));
+        assert_eq!(output["rows"], serde_json::json!([{"slug": expected}]));
+        assert_eq!(output["graph_commit_id"], snapshot);
+        assert_eq!(resolved_snapshot_id(&graph, "main"), snapshot);
+        outputs.push(output);
+    }
+    assert_ne!(outputs[0]["rows"], outputs[1]["rows"]);
+
+    // The same stored vectors and explicit query vector still give alpha:
+    // it is the external encoder that changed, not the graph snapshot.
+    let control = parse_stdout_json(&output_success(&mut command(
+        &graph,
+        explicit,
+        Some(&snapshot),
+        "test-model-a",
+    )));
+    assert_eq!(control["rows"], serde_json::json!([{"slug": "alpha"}]));
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "explicit vectors need no provider call"
+    );
+
+    // Export/reapply carries the model label and stored vector values, but it
+    // cannot turn that label into a fixed remote encoding recipe.
+    let exported_schema = output_success(cli().args(["schema", "show"]).arg(&graph));
+    let exported_data = output_success(cli().arg("export").arg(&graph));
+    let reapply_schema = temp.path().join("reapply.pg");
+    let reapply_data = temp.path().join("reapply.jsonl");
+    let reapplied = temp.path().join("reapplied");
+    fs::write(&reapply_schema, &exported_schema.stdout).unwrap();
+    fs::write(&reapply_data, &exported_data.stdout).unwrap();
+    assert!(stdout_string(&exported_schema).contains("model=\"test-model-a\""));
+    output_success(
+        cli()
+            .args(["init", "--schema"])
+            .arg(&reapply_schema)
+            .arg(&reapplied),
+    );
+    output_success(
+        cli()
+            .args(["load", "--mode", "overwrite", "--data"])
+            .arg(&reapply_data)
+            .arg(&reapplied),
+    );
+    let reapplied_snapshot = resolved_snapshot_id(&reapplied, "main");
+    let after_reapply = parse_stdout_json(&output_success(&mut command(
+        &reapplied,
+        source,
+        Some(&reapplied_snapshot),
+        "test-model-a",
+    )));
+    assert_eq!(after_reapply["rows"], serde_json::json!([{"slug": "beta"}]));
+    assert_eq!(after_reapply["graph_commit_id"], reapplied_snapshot);
+    let explicit_after_reapply = parse_stdout_json(&output_success(&mut command(
+        &reapplied,
+        explicit,
+        Some(&reapplied_snapshot),
+        "test-model-a",
+    )));
+    assert_eq!(explicit_after_reapply["rows"], control["rows"]);
+
+    let refused = output_failure(&mut command(
+        &reapplied,
+        source,
+        Some(&reapplied_snapshot),
+        "test-model-b",
+    ));
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    assert!(diagnostic.contains("test-model-a") && diagnostic.contains("test-model-b"));
+    assert_eq!(resolved_snapshot_id(&reapplied, "main"), reapplied_snapshot);
+    provider.assert_complete();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/embeddings");
+        assert_eq!(request.body["model"], "test-model-a");
+        assert_eq!(request.body["input"], serde_json::json!(["alpha"]));
+        assert_eq!(request.body["dimensions"], 4);
+    }
+    assert_eq!(
+        requests[0].body, requests[1].body,
+        "identical encoder requests"
+    );
+}
+
 #[test]
 fn embed_seed_fills_missing_and_preserves_existing_vectors_by_default() {
     let temp = tempdir().unwrap();

@@ -166,6 +166,14 @@ Commit the generated file with the API change. CI checks drift; it never updates
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
 
+The engine's `--bench scenarios` also owns native search decision instruments.
+`--scenario search-selection` compares typed DataFusion plans over persisted
+Lance binding relations against an independent scalar oracle; its executable
+compatibility fence lives in `benchmark_scenario_contract.rs`. Controls,
+measurement boundaries and current qualification findings belong in
+[RFC 0048](../rfcs/0048-search-contracts.md#lance-datafusion-and-graph-execution).
+These native fixtures do not replace GQT coverage of the query language.
+
 The current runner executes the narrow, fail-closed local envelope documented
 in `crates/omnigraph-bench/README.md`. It requires a release binary, restores
 every repetition at the fixture's stable path from a never-opened APFS

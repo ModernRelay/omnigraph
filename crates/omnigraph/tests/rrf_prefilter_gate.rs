@@ -49,6 +49,524 @@ use omnigraph_compiler::result::QueryResult;
 
 use helpers::*;
 
+/// RFC 0048's relational selection prototype. This checks DataFusion's
+/// public operators, not the unimplemented GQ stage lowering. Graph paths
+/// are represented by repeated target rows so deduplication must precede
+/// target windows. Global cuts restore all winning target bindings; quotas
+/// restore only winning target/group pairs, using null-safe group equality.
+#[tokio::test]
+async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::NullEquality;
+    use datafusion::dataframe::DataFrame;
+    use datafusion::functions_aggregate::expr_fn::min;
+    use datafusion::functions_window::row_number::row_number;
+    use datafusion::logical_expr::{ExprFunctionExt, JoinType, LogicalPlanBuilder, Partitioning};
+    use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
+    use lance::Dataset;
+    use lance::datafusion::LanceTableProvider;
+    use lance::dataset::WriteParams;
+    use lance_file::version::LanceFileVersion;
+
+    async fn strings(frame: DataFrame, column: &str) -> Vec<String> {
+        frame
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name(column)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                ids.iter()
+                    .map(|id| id.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("group_key", DataType::Utf8, true),
+        Field::new("score", DataType::Int64, false),
+        Field::new("binding_id", DataType::Utf8, false),
+        Field::new("group_part", DataType::Int64, false),
+        Field::new("pair_rank", DataType::Int64, true),
+    ]));
+    for (source, partitions) in [
+        ("memory", 1),
+        ("memory", 4),
+        ("lance-ordered", 1),
+        ("lance-ordered", 4),
+        ("lance-unordered", 1),
+        ("lance-unordered", 4),
+    ] {
+        for reverse in [false, true] {
+            let mut rows = vec![
+                ("a", Some("g1"), 10, "path-1"),
+                ("a", Some("g2"), 10, "path-2"),
+                ("a", Some("g2"), 10, "path-3"),
+                ("b", Some("g2"), 9, "path-4"),
+                ("c", Some("g1"), 11, "path-5"),
+                ("d", None, 12, "path-6"),
+                ("d", None, 12, "path-7"),
+                ("e", None, 11, "path-8"),
+                ("f", Some("g3"), 8, "path-9"),
+            ];
+            if reverse {
+                rows.reverse();
+            }
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter()
+                            .map(|r| {
+                                if matches!(r.3, "path-3" | "path-4") {
+                                    2
+                                } else {
+                                    1
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter()
+                            .map(|r| match r.3 {
+                                "path-1" | "path-2" => Some(2),
+                                "path-3" => Some(4),
+                                "path-4" => Some(3),
+                                "path-6" | "path-7" => None,
+                                _ => Some(1),
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let mut config = SessionConfig::new()
+                .with_target_partitions(partitions)
+                .with_batch_size(1);
+            // Qualify a partitioned hash-join route. Default CollectLeft fails
+            // distribution validation for the memory source at four partitions;
+            // the real Lance sources below must be qualified independently.
+            config
+                .options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold = 0;
+            config
+                .options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold_rows = 0;
+            let ctx = SessionContext::new_with_config(config.clone());
+            let directory = tempfile::tempdir().unwrap();
+            let source_frame = if source == "memory" {
+                ctx.read_batches((0..batch.num_rows()).map(|row| batch.slice(row, 1)))
+                    .unwrap()
+            } else {
+                let uri = directory.path().join("bindings.lance");
+                let dataset = Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    uri.to_str().unwrap(),
+                    Some(WriteParams {
+                        max_rows_per_file: 3,
+                        enable_stable_row_ids: true,
+                        data_storage_version: Some(LanceFileVersion::V2_2),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+                assert_eq!(dataset.get_fragments().len(), 3);
+                ctx.read_table(Arc::new(
+                    LanceTableProvider::new_with_ordering(
+                        Arc::new(dataset),
+                        false,
+                        false,
+                        source == "lance-ordered",
+                    )
+                    .with_batch_size(1),
+                ))
+                .unwrap()
+            };
+            let bindings = source_frame
+                .repartition(Partitioning::RoundRobinBatch(partitions))
+                .unwrap();
+            let target_fields = || vec![col("id"), col("score")];
+            let pair_fields = || vec![col("id"), col("group_key"), col("score")];
+            let targets = bindings
+                .clone()
+                .select(target_fields())
+                .unwrap()
+                .distinct()
+                .unwrap();
+            let order = || vec![col("score").sort(false, false), col("id").sort(true, false)];
+            assert_eq!(
+                strings(targets.clone().sort(order()).unwrap(), "id").await,
+                ["d", "c", "e", "a", "b", "f"]
+            );
+            let top_two = targets
+                .clone()
+                .sort(order())
+                .unwrap()
+                .limit(0, Some(2))
+                .unwrap();
+            assert_eq!(strings(top_two.clone(), "id").await, ["d", "c"]);
+
+            let selected_bindings = bindings
+                .clone()
+                .join(
+                    top_two.select(vec![col("id")]).unwrap(),
+                    JoinType::LeftSemi,
+                    &["id"],
+                    &["id"],
+                    None,
+                )
+                .unwrap();
+            let binding_order = || {
+                let mut keys = order();
+                keys.push(col("group_key").sort(true, true));
+                keys.push(col("binding_id").sort(true, false));
+                keys
+            };
+            assert_eq!(
+                strings(
+                    selected_bindings.clone().sort(binding_order()).unwrap(),
+                    "binding_id",
+                )
+                .await,
+                ["path-6", "path-7", "path-5"]
+            );
+
+            // Filtering after the global cut cannot refill from f; filtering
+            // before selection has a different logical population.
+            assert!(
+                strings(
+                    selected_bindings
+                        .clone()
+                        .filter(col("group_key").eq(lit("g3")))
+                        .unwrap(),
+                    "id"
+                )
+                .await
+                .is_empty()
+            );
+            assert_eq!(
+                strings(
+                    bindings
+                        .clone()
+                        .filter(col("group_key").eq(lit("g3")))
+                        .unwrap()
+                        .select(target_fields())
+                        .unwrap()
+                        .distinct()
+                        .unwrap()
+                        .sort(order())
+                        .unwrap()
+                        .limit(0, Some(2))
+                        .unwrap(),
+                    "id"
+                )
+                .await,
+                ["f"]
+            );
+
+            // Deduplicate within each group. A may compete in g1 and g2,
+            // but its two paths in g2 consume only one slot there.
+            let pairs = bindings
+                .clone()
+                .select(pair_fields())
+                .unwrap()
+                .distinct()
+                .unwrap();
+            let quota = |input: DataFrame, count: u64| {
+                input
+                    .window(vec![
+                        row_number()
+                            .partition_by(vec![col("group_key")])
+                            .order_by(order())
+                            .build()
+                            .unwrap()
+                            .alias("within_group"),
+                    ])
+                    .unwrap()
+                    .filter(col("within_group").lt_eq(lit(count)))
+                    .unwrap()
+                    .sort(order())
+                    .unwrap()
+            };
+            let winners = quota(pairs.clone(), 1);
+            assert_eq!(strings(winners.clone(), "id").await, ["d", "c", "a", "f"]);
+            let cut_pairs = selected_bindings
+                .select(pair_fields())
+                .unwrap()
+                .distinct()
+                .unwrap();
+            assert_eq!(strings(quota(cut_pairs, 1), "id").await, ["d", "c"]);
+
+            let reattach = |selected: DataFrame, null_equality: NullEquality| {
+                let right = selected
+                    .select(vec![
+                        col("id").alias("selected_id"),
+                        col("group_key").alias("selected_group"),
+                    ])
+                    .unwrap();
+                let plan = LogicalPlanBuilder::from(bindings.clone().into_unoptimized_plan())
+                    .join_detailed(
+                        right.into_unoptimized_plan(),
+                        JoinType::LeftSemi,
+                        (
+                            vec!["id", "group_key"],
+                            vec!["selected_id", "selected_group"],
+                        ),
+                        None,
+                        null_equality,
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                DataFrame::new(ctx.state(), plan)
+                    .sort(binding_order())
+                    .unwrap()
+            };
+            let selected_pairs = reattach(winners.clone(), NullEquality::NullEqualsNull);
+            let expected_paths = ["path-6", "path-7", "path-5", "path-2", "path-3", "path-9"];
+            let hash_plan = selected_pairs.clone().create_physical_plan().await.unwrap();
+            let hash_summary = datafusion::physical_plan::displayable(hash_plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(hash_summary.contains("HashJoinExec"), "{hash_summary}");
+            if partitions == 4 {
+                assert!(hash_summary.contains("mode=Partitioned"), "{hash_summary}");
+            }
+            if source != "memory" {
+                assert!(
+                    hash_summary.contains("Lance"),
+                    "native source was lost: {hash_summary}"
+                );
+            }
+            assert_eq!(
+                strings(selected_pairs.clone(), "binding_id").await,
+                expected_paths
+            );
+
+            // Qualify the alternate physical join against the same typed
+            // logical plan and pair oracle, including null-safe equality.
+            // prefer_hash_join=false selects sort-merge only when target
+            // partitions > 1; the native planner still chooses hash at one.
+            config.options_mut().optimizer.prefer_hash_join = false;
+            let merge_ctx = SessionContext::new_with_config(config);
+            let merge_join = DataFrame::new(
+                merge_ctx.state(),
+                selected_pairs.clone().into_unoptimized_plan(),
+            );
+            let physical = merge_join.clone().create_physical_plan().await.unwrap();
+            let summary = datafusion::physical_plan::displayable(physical.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                summary.contains(if partitions == 1 {
+                    "HashJoinExec"
+                } else {
+                    "SortMergeJoinExec"
+                }),
+                "{source}/{partitions}: {summary}"
+            );
+            assert_eq!(strings(merge_join, "binding_id").await, expected_paths);
+
+            // Default planning succeeds for these real Lance sources at both
+            // partition counts. Only the memory source exposes CollectLeft's
+            // distribution defect at four. Keep that refusal fence, without
+            // inferring that a global planner override is needed for Lance.
+            let default_ctx = SessionContext::new_with_config(
+                SessionConfig::new()
+                    .with_target_partitions(partitions)
+                    .with_batch_size(1),
+            );
+            let default_join =
+                DataFrame::new(default_ctx.state(), selected_pairs.into_unoptimized_plan());
+            if source == "memory" && partitions == 4 {
+                let error = default_join.collect().await.unwrap_err().to_string();
+                assert!(error.contains("CollectLeft"), "{error}");
+                assert!(
+                    error.contains("does not satisfy distribution requirements: SinglePartition"),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(strings(default_join, "binding_id").await, expected_paths);
+            }
+            // With quota two, a wins both groups; e and b remain eligible
+            // despite duplicate paths for higher-ranked targets d and a.
+            assert_eq!(
+                strings(
+                    reattach(quota(pairs, 2), NullEquality::NullEqualsNull),
+                    "binding_id"
+                )
+                .await,
+                [
+                    "path-6", "path-7", "path-5", "path-8", "path-1", "path-2", "path-3", "path-4",
+                    "path-9"
+                ]
+            );
+
+            // Red control: joining winners by target alone restores a's
+            // losing g1 path, making g1 exceed its quota of one.
+            let wrong_target_join = bindings
+                .clone()
+                .join(
+                    winners.clone().select(vec![col("id")]).unwrap(),
+                    JoinType::LeftSemi,
+                    &["id"],
+                    &["id"],
+                    None,
+                )
+                .unwrap()
+                .sort(binding_order())
+                .unwrap();
+            assert_eq!(
+                strings(wrong_target_join, "binding_id").await,
+                [
+                    "path-6", "path-7", "path-5", "path-1", "path-2", "path-3", "path-9"
+                ]
+            );
+
+            // Red control: ordinary equality drops the winning null group.
+            assert_eq!(
+                strings(
+                    reattach(winners, NullEquality::NullEqualsNothing),
+                    "binding_id"
+                )
+                .await,
+                ["path-5", "path-2", "path-3", "path-9"]
+            );
+
+            // Red control: applying the quota to paths excludes e from the
+            // null group's two slots, although there are two distinct targets.
+            assert_eq!(
+                strings(
+                    quota(
+                        bindings.clone().filter(col("group_key").is_null()).unwrap(),
+                        2
+                    ),
+                    "id"
+                )
+                .await,
+                ["d", "d"]
+            );
+
+            // A composite key must survive both window partitioning and
+            // reattachment. Here a wins (g2, 1), but loses (g2, 2) to b.
+            // Explicit min is over each pair's paths; all-null d sorts last.
+            let composite = bindings
+                .clone()
+                .aggregate(
+                    vec![col("id"), col("group_key"), col("group_part")],
+                    vec![min(col("pair_rank")).alias("best_rank")],
+                )
+                .unwrap();
+            let composite_winners = |nulls_first| {
+                composite
+                    .clone()
+                    .window(vec![
+                        row_number()
+                            .partition_by(vec![col("group_key"), col("group_part")])
+                            .order_by(vec![
+                                col("best_rank").sort(true, nulls_first),
+                                col("id").sort(true, false),
+                            ])
+                            .build()
+                            .unwrap()
+                            .alias("position"),
+                    ])
+                    .unwrap()
+                    .filter(col("position").eq(lit(1u64)))
+                    .unwrap()
+            };
+            let composite_join = |selected: DataFrame, complete_key: bool| {
+                let right = selected
+                    .select(vec![
+                        col("id").alias("winner_id"),
+                        col("group_key").alias("winner_group"),
+                        col("group_part").alias("winner_part"),
+                    ])
+                    .unwrap();
+                let mut left_keys = vec!["id", "group_key"];
+                let mut right_keys = vec!["winner_id", "winner_group"];
+                if complete_key {
+                    left_keys.push("group_part");
+                    right_keys.push("winner_part");
+                }
+                let plan = LogicalPlanBuilder::from(bindings.clone().into_unoptimized_plan())
+                    .join_detailed(
+                        right.into_unoptimized_plan(),
+                        JoinType::LeftSemi,
+                        (left_keys, right_keys),
+                        None,
+                        NullEquality::NullEqualsNull,
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                DataFrame::new(ctx.state(), plan)
+                    .sort(vec![col("binding_id").sort(true, false)])
+                    .unwrap()
+            };
+            assert_eq!(
+                strings(composite_join(composite_winners(false), true), "binding_id").await,
+                ["path-2", "path-4", "path-5", "path-8", "path-9"]
+            );
+            // Red controls distinguish a missing tuple component and the
+            // opposite null ordering; both otherwise produce plausible rows.
+            assert_eq!(
+                strings(
+                    composite_join(composite_winners(false), false),
+                    "binding_id"
+                )
+                .await,
+                ["path-2", "path-3", "path-4", "path-5", "path-8", "path-9"]
+            );
+            assert_eq!(
+                strings(composite_join(composite_winners(true), true), "binding_id").await,
+                ["path-2", "path-4", "path-5", "path-6", "path-7", "path-9"]
+            );
+
+            // Red control: counting paths as candidates makes d consume both
+            // slots. The oracle must distinguish that implementation.
+            let wrong = bindings
+                .sort(order())
+                .unwrap()
+                .limit(0, Some(2))
+                .unwrap()
+                .select(target_fields())
+                .unwrap()
+                .distinct()
+                .unwrap();
+            assert_eq!(strings(wrong, "id").await, ["d"]);
+            println!(
+                "staged selection passed: source={source}, partitions={partitions}, reversed={reverse}"
+            );
+        }
+    }
+}
+
 const GATE_SCHEMA: &str = r#"
 node Chunk {
     slug: String @key

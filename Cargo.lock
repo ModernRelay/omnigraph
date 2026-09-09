@@ -5604,6 +5604,7 @@ dependencies = [
  "lance-table",
  "lance-tokenizer",
  "libc",
+ "libm",
  "object_store",
  "omnigraph-compiler",
  "omnigraph-policy",

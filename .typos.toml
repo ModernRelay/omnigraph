@@ -35,3 +35,15 @@ nmae = "nmae"         # deliberately wrong parameter name (stored_queries.rs, vo
 pn = "pn"             # external-id prefix ("pn:12345") in a consistency fixture
 propert = "propert"   # deliberate substring assertion on a typecheck error message
 referenc = "referenc" # deliberate substring match on Lance's error text (table_ops.rs, branch_control.rs)
+
+# Preserve the intentionally misspelled input in the frozen retrieval pilot.
+[type.search_checkpoint]
+extend-glob = ["0048-validation-checkpoint.json"]
+
+[type.search_checkpoint.extend-words]
+colum = "colum" # deliberate typo in the null-column question; not a prose exemption
+
+[type.search_pilot_results]
+extend-glob = ["0048-agent-pilot-results.json"]
+# Passage identities are frozen 20-digit hexadecimal hashes, including citations.
+extend-ignore-re = ['\b[0-9a-f]{20}\b']
