@@ -58,7 +58,7 @@ use helpers::*;
 async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::NullEquality;
     use datafusion::dataframe::DataFrame;
@@ -66,6 +66,10 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
     use datafusion::functions_window::row_number::row_number;
     use datafusion::logical_expr::{ExprFunctionExt, JoinType, LogicalPlanBuilder, Partitioning};
     use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
+    use lance::Dataset;
+    use lance::datafusion::LanceTableProvider;
+    use lance::dataset::WriteParams;
+    use lance_file::version::LanceFileVersion;
 
     async fn strings(frame: DataFrame, column: &str) -> Vec<String> {
         frame
@@ -95,7 +99,14 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
         Field::new("group_part", DataType::Int64, false),
         Field::new("pair_rank", DataType::Int64, true),
     ]));
-    for partitions in [1, 4] {
+    for (source, partitions) in [
+        ("memory", 1),
+        ("memory", 4),
+        ("lance-ordered", 1),
+        ("lance-ordered", 4),
+        ("lance-unordered", 1),
+        ("lance-unordered", 4),
+    ] {
         for reverse in [false, true] {
             let mut rows = vec![
                 ("a", Some("g1"), 10, "path-1"),
@@ -154,9 +165,9 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
             let mut config = SessionConfig::new()
                 .with_target_partitions(partitions)
                 .with_batch_size(1);
-            // Qualify a partitioned hash-join route. The default CollectLeft
-            // route fails distribution validation for this multi-batch source
-            // at four partitions; retain that fence below until requalified.
+            // Qualify a partitioned hash-join route. Default CollectLeft fails
+            // distribution validation for the memory source at four partitions;
+            // the real Lance sources below must be qualified independently.
             config
                 .options_mut()
                 .optimizer
@@ -165,10 +176,38 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 .options_mut()
                 .optimizer
                 .hash_join_single_partition_threshold_rows = 0;
-            let ctx = SessionContext::new_with_config(config);
-            let bindings = ctx
-                .read_batches((0..batch.num_rows()).map(|row| batch.slice(row, 1)))
+            let ctx = SessionContext::new_with_config(config.clone());
+            let directory = tempfile::tempdir().unwrap();
+            let source_frame = if source == "memory" {
+                ctx.read_batches((0..batch.num_rows()).map(|row| batch.slice(row, 1)))
+                    .unwrap()
+            } else {
+                let uri = directory.path().join("bindings.lance");
+                let dataset = Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    uri.to_str().unwrap(),
+                    Some(WriteParams {
+                        max_rows_per_file: 3,
+                        enable_stable_row_ids: true,
+                        data_storage_version: Some(LanceFileVersion::V2_2),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+                assert_eq!(dataset.get_fragments().len(), 3);
+                ctx.read_table(Arc::new(
+                    LanceTableProvider::new_with_ordering(
+                        Arc::new(dataset),
+                        false,
+                        false,
+                        source == "lance-ordered",
+                    )
+                    .with_batch_size(1),
+                ))
                 .unwrap()
+            };
+            let bindings = source_frame
                 .repartition(Partitioning::RoundRobinBatch(partitions))
                 .unwrap();
             let target_fields = || vec![col("id"), col("score")];
@@ -310,15 +349,53 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
             };
             let selected_pairs = reattach(winners.clone(), NullEquality::NullEqualsNull);
             let expected_paths = ["path-6", "path-7", "path-5", "path-2", "path-3", "path-9"];
+            let hash_plan = selected_pairs.clone().create_physical_plan().await.unwrap();
+            let hash_summary = datafusion::physical_plan::displayable(hash_plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(hash_summary.contains("HashJoinExec"), "{hash_summary}");
+            if partitions == 4 {
+                assert!(hash_summary.contains("mode=Partitioned"), "{hash_summary}");
+            }
+            if source != "memory" {
+                assert!(
+                    hash_summary.contains("Lance"),
+                    "native source was lost: {hash_summary}"
+                );
+            }
             assert_eq!(
                 strings(selected_pairs.clone(), "binding_id").await,
                 expected_paths
             );
 
-            // Same logical plan, default optimizer policy: single-partition
-            // execution succeeds, but four partitions expose a native plan
-            // defect rather than different logical results. An upstream fix
-            // should remove this refusal fence and requalify default planning.
+            // Qualify the alternate physical join against the same typed
+            // logical plan and pair oracle, including null-safe equality.
+            // prefer_hash_join=false selects sort-merge only when target
+            // partitions > 1; the native planner still chooses hash at one.
+            config.options_mut().optimizer.prefer_hash_join = false;
+            let merge_ctx = SessionContext::new_with_config(config);
+            let merge_join = DataFrame::new(
+                merge_ctx.state(),
+                selected_pairs.clone().into_unoptimized_plan(),
+            );
+            let physical = merge_join.clone().create_physical_plan().await.unwrap();
+            let summary = datafusion::physical_plan::displayable(physical.as_ref())
+                .indent(true)
+                .to_string();
+            assert!(
+                summary.contains(if partitions == 1 {
+                    "HashJoinExec"
+                } else {
+                    "SortMergeJoinExec"
+                }),
+                "{source}/{partitions}: {summary}"
+            );
+            assert_eq!(strings(merge_join, "binding_id").await, expected_paths);
+
+            // Default planning succeeds for these real Lance sources at both
+            // partition counts. Only the memory source exposes CollectLeft's
+            // distribution defect at four. Keep that refusal fence, without
+            // inferring that a global planner override is needed for Lance.
             let default_ctx = SessionContext::new_with_config(
                 SessionConfig::new()
                     .with_target_partitions(partitions)
@@ -326,7 +403,7 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
             );
             let default_join =
                 DataFrame::new(default_ctx.state(), selected_pairs.into_unoptimized_plan());
-            if partitions == 4 {
+            if source == "memory" && partitions == 4 {
                 let error = default_join.collect().await.unwrap_err().to_string();
                 assert!(error.contains("CollectLeft"), "{error}");
                 assert!(
@@ -483,7 +560,9 @@ async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
                 .distinct()
                 .unwrap();
             assert_eq!(strings(wrong, "id").await, ["d"]);
-            println!("staged selection passed: partitions={partitions}, reversed={reverse}");
+            println!(
+                "staged selection passed: source={source}, partitions={partitions}, reversed={reverse}"
+            );
         }
     }
 }

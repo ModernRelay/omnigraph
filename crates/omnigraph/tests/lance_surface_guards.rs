@@ -111,6 +111,68 @@ async fn fresh_dataset(uri: &str) -> Dataset {
     Dataset::write(reader, uri, Some(params)).await.unwrap()
 }
 
+/// RFC 0048: the public provider composes with the caller's DataFusion session,
+/// but the session pool is not a bound on all Lance/Arrow allocations. Retain
+/// a decoded scan batch while inspecting the pool, then use a real aggregate
+/// to prove that the same pool is enforced for a reserving DataFusion operator.
+#[tokio::test]
+async fn lance_provider_scan_payloads_need_accounting_beyond_the_session_pool() {
+    use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::prelude::{SessionConfig, SessionContext, col};
+    use lance::datafusion::LanceTableProvider;
+
+    let directory = tempfile::tempdir().unwrap();
+    let uri = directory.path().join("source.lance");
+    let dataset = fresh_dataset(uri.to_str().unwrap()).await;
+    let provider = Arc::new(LanceTableProvider::new(Arc::new(dataset), false, false));
+    let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1));
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::clone(&pool))
+        .build_arc()
+        .unwrap();
+    let ctx =
+        SessionContext::new_with_config_rt(SessionConfig::new().with_target_partitions(1), runtime);
+    assert!(Arc::ptr_eq(&pool, ctx.task_ctx().memory_pool()));
+    let frame = ctx.read_table(provider).unwrap();
+    let batches = frame.clone().collect().await.unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    let retained_bytes = batches
+        .iter()
+        .map(RecordBatch::get_array_memory_size)
+        .sum::<usize>();
+    assert!(retained_bytes > 1);
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "retained scan payload is outside reservations"
+    );
+
+    let failure = frame
+        .aggregate(vec![col("id")], vec![])
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("Resources exhausted"), "{failure}");
+    assert_eq!(
+        pool.reserved(),
+        0,
+        "failed aggregate must release its reservations"
+    );
+    assert!(
+        batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>()
+            > 1
+    );
+    println!(
+        "Lance scan retained {retained_bytes} bytes with zero reserved against a one-byte pool; aggregate refused"
+    );
+}
+
 /// Append one uniquely keyed row while preserving the V2_2/stable-row-id shape
 /// used by the production tables. Tag/cleanup guards use this to create exact,
 /// distinguishable versions without introducing a graph-level writer.

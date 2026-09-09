@@ -1,4 +1,4 @@
-//! Keep the RFC-023 decision instrument aligned with production safety caps.
+//! Keep decision instruments aligned with their result and resource contracts.
 //! The pure planner lives beside the bench and is included here so the normal
 //! test suite exercises its row, byte, and recovery-chain boundaries.
 
@@ -7,6 +7,130 @@ mod rfc023_limits;
 
 #[path = "../benches/scenarios/child_protocol.rs"]
 mod child_protocol;
+
+#[path = "../benches/scenarios/search_selection.rs"]
+mod search_selection;
+
+#[test]
+fn native_scratch_refusal_removes_file_but_leaves_stale_usage() {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let manager = Arc::new(
+        DiskManagerBuilder::default()
+            .with_max_temp_directory_size(0)
+            .build()
+            .unwrap(),
+    );
+    let mut file = manager.create_tmp_file("RFC 0048 scratch refusal").unwrap();
+    let path = file.path().to_owned();
+    file.inner().as_file().write_all(b"scratch").unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 7);
+    assert!(
+        file.update_disk_usage()
+            .unwrap_err()
+            .to_string()
+            .contains("allowable limit")
+    );
+    assert_eq!(file.current_disk_usage(), 0);
+    assert_eq!(manager.used_disk_space(), 7);
+    drop(file);
+    assert!(!path.exists());
+    assert_eq!(manager.spilling_progress().active_files_count, 0);
+    assert_eq!(
+        manager.used_disk_space(),
+        7,
+        "native error path loses the local refund amount"
+    );
+    let disabled = Arc::new(
+        DiskManagerBuilder::default()
+            .with_mode(DiskManagerMode::Disabled)
+            .build()
+            .unwrap(),
+    );
+    assert!(disabled.create_tmp_file("no-spill policy").is_err());
+    assert_eq!(disabled.used_disk_space(), 0);
+    assert_eq!(disabled.spilling_progress().active_files_count, 0);
+    assert!(disabled.temp_dir_paths().is_empty());
+}
+
+/// The selection instrument uses the same scalar oracle for every native
+/// physical route. This is mechanism coverage: staged GQ is not executable yet.
+#[tokio::test]
+async fn selection_instrument_preserves_null_pairs_and_qualifies_join_filters() {
+    let mut tuning = search_selection::Tuning {
+        fanout: 4,
+        groups: 7,
+        quota: 2,
+        ..Default::default()
+    };
+    // A reduced counterexample from the 64-target comparison: native hash
+    // dynamic bounds silently remove two winning null-group bindings.
+    tuning.plan = "hash".into();
+    let raw = search_selection::run(16, 42, 0.7, 6, 32, &tuning).await;
+    assert_eq!(raw["oracle_pass"], false);
+    assert_eq!(raw["expected_rows"], 20);
+    assert_eq!(raw["output_rows"], 18);
+    assert!(
+        raw["physical_plan"]
+            .as_str()
+            .unwrap()
+            .contains("DynamicFilter")
+    );
+    tuning.group_select = "dense".into();
+    let dense = search_selection::run(16, 42, 0.7, 6, 32, &tuning).await;
+    assert_eq!(dense["oracle_pass"], true, "{dense}");
+    assert_eq!(dense["output_rows"], 20);
+    assert_eq!(
+        dense["physical_plan"]
+            .as_str()
+            .unwrap()
+            .matches("HashJoinExec")
+            .count(),
+        1,
+        "dense selection retains only the non-null target-cut join"
+    );
+
+    tuning.join_filters = false;
+    for group_select in ["dedup", "dense"] {
+        tuning.group_select = group_select.into();
+        for partitions in [1, 4] {
+            tuning.partitions = partitions;
+            for plan in ["default", "hash", "merge"] {
+                tuning.plan = plan.into();
+                let result = search_selection::run(64, 42, 0.7, 25, 32, &tuning).await;
+                assert_eq!(result["oracle_pass"], true, "{result}");
+                assert_eq!(result["output_rows"], 28);
+                assert_eq!(result["pool_reserved_after"], 0);
+                assert_eq!(result["scratch_bytes_after"], 0);
+            }
+        }
+    }
+    tuning.group_select = "dedup".into();
+    tuning.reattach_cut = true;
+    tuning.plan = "hash".into();
+    let repeated_cut = search_selection::run(64, 42, 0.7, 25, 32, &tuning).await;
+    assert_eq!(repeated_cut["oracle_pass"], true);
+    tuning.reattach_cut = false;
+    tuning.late_payload = true;
+    for group_select in ["dedup", "dense"] {
+        tuning.group_select = group_select.into();
+        for plan in ["default", "hash", "merge"] {
+            tuning.plan = plan.into();
+            let late = search_selection::run(64, 42, 0.7, 25, 1024, &tuning).await;
+            assert_eq!(late["oracle_pass"], true, "{late}");
+            assert_eq!(late["output_rows"], 28);
+            assert!(late["physical_plan"].as_str().unwrap().starts_with("Take:"));
+        }
+    }
+    for (selectivity, k, quota) in [(0.0, 25, 2), (0.7, 0, 2), (0.7, 25, 0)] {
+        tuning.quota = quota;
+        let empty = search_selection::run(64, 42, selectivity, k, 32, &tuning).await;
+        assert_eq!(empty["oracle_pass"], true, "{empty}");
+        assert_eq!(empty["output_rows"], 0);
+    }
+}
 
 fn product_const(source: &str, name: &str) -> u64 {
     let marker = format!("const {name}:");

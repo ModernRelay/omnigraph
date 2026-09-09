@@ -79,6 +79,10 @@ mod branch_control;
 #[cfg(unix)]
 mod fixture_controls;
 
+#[path = "scenarios/search_selection.rs"]
+#[cfg(unix)]
+mod search_selection;
+
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::time::Instant;
@@ -114,6 +118,8 @@ struct Args {
     /// overflow-scale corpus, ~2 KiB the wide variant, and a tiny value turns
     /// the same scenario into the in-list build + BTREE probe microbench.
     text_bytes: usize,
+    /// Native relational selection qualification; controls are scenario-local.
+    selection: search_selection::Tuning,
     /// How many already-committed rows the source branch MODIFIES, for
     /// `general-merge-updates`. This is the branch delta; `--rows` is the
     /// target size. Holding this small while `--rows` grows is the whole
@@ -171,6 +177,7 @@ impl Args {
             ann_partitions: 100,
             ann_probes: 20,
             text_bytes: 2048,
+            selection: search_selection::Tuning::default(),
             delta_rows: 50,
             source_mode: "update".to_string(),
             branches: 8,
@@ -212,6 +219,37 @@ impl Args {
                 }
                 "--text-bytes" => {
                     args.text_bytes = take("--text-bytes").parse().expect("--text-bytes")
+                }
+                "--selection-plan" => args.selection.plan = take("--selection-plan"),
+                "--group-select" => args.selection.group_select = take("--group-select"),
+                "--late-payload" => {
+                    args.selection.late_payload = take("--late-payload")
+                        .parse()
+                        .expect("--late-payload true|false")
+                }
+                "--reattach-cut" => {
+                    args.selection.reattach_cut = take("--reattach-cut")
+                        .parse()
+                        .expect("--reattach-cut true|false")
+                }
+                "--join-filters" => {
+                    args.selection.join_filters = take("--join-filters")
+                        .parse()
+                        .expect("--join-filters true|false")
+                }
+                "--fanout" => args.selection.fanout = take("--fanout").parse().expect("--fanout"),
+                "--groups" => args.selection.groups = take("--groups").parse().expect("--groups"),
+                "--quota" => args.selection.quota = take("--quota").parse().expect("--quota"),
+                "--partitions" => {
+                    args.selection.partitions = take("--partitions").parse().expect("--partitions")
+                }
+                "--query-memory-mb" => {
+                    args.selection.memory_mb = take("--query-memory-mb")
+                        .parse()
+                        .expect("--query-memory-mb")
+                }
+                "--scratch-mb" => {
+                    args.selection.scratch_mb = take("--scratch-mb").parse().expect("--scratch-mb")
                 }
                 "--delta-rows" => {
                     args.delta_rows = take("--delta-rows").parse().expect("--delta-rows")
@@ -275,6 +313,28 @@ impl Args {
             self.ann_probes.to_string(),
             "--text-bytes".into(),
             self.text_bytes.to_string(),
+            "--selection-plan".into(),
+            self.selection.plan.clone(),
+            "--group-select".into(),
+            self.selection.group_select.clone(),
+            "--late-payload".into(),
+            self.selection.late_payload.to_string(),
+            "--reattach-cut".into(),
+            self.selection.reattach_cut.to_string(),
+            "--join-filters".into(),
+            self.selection.join_filters.to_string(),
+            "--fanout".into(),
+            self.selection.fanout.to_string(),
+            "--groups".into(),
+            self.selection.groups.to_string(),
+            "--quota".into(),
+            self.selection.quota.to_string(),
+            "--partitions".into(),
+            self.selection.partitions.to_string(),
+            "--query-memory-mb".into(),
+            self.selection.memory_mb.to_string(),
+            "--scratch-mb".into(),
+            self.selection.scratch_mb.to_string(),
             "--delta-rows".into(),
             self.delta_rows.to_string(),
             "--source-mode".into(),
@@ -331,13 +391,16 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
-             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|rrf-gate> [--rows N] [--dims D] \
+             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|rrf-gate|search-selection> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
              [--ann-probes N] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \
              [--history-commits N (even, 0..256)] [--retired-branches N (0..32)]\n\
              [--cache-state cold|warm] [--manifest-layout uncompacted|compacted]\n\
-             Age flags apply only to branch controls and general-merge-updates."
+             Age flags apply only to branch controls and general-merge-updates.\n\
+             search-selection also uses --selection-plan default|hash|merge, --group-select dedup|dense, --fanout N,\n\
+             --groups N, --quota N, --partitions N, --query-memory-mb N, --scratch-mb N,\n\
+             --join-filters true|false, --reattach-cut true|false, --late-payload true|false."
         );
         // `cargo bench` with no args must exit 0 so the target stays inert in
         // any blanket `cargo bench` invocation.
@@ -349,6 +412,17 @@ fn main() {
         Err("--runs must be greater than zero".to_string())
     } else if branch_control::is_scenario(&args.scenario) {
         branch_control::validate_args(&args)
+    } else if args.scenario == "search-selection" {
+        if args.baseline {
+            Err("search-selection uses --selection-plan, --group-select and --reattach-cut for comparisons, not --baseline".into())
+        } else {
+            search_selection::validate(
+                &args.selection,
+                args.rows,
+                args.selectivity,
+                args.text_bytes,
+            )
+        }
     } else {
         rfc023_scenarios::validate_args(&args)
     };
@@ -588,6 +662,7 @@ fn run_once(args: &Args, run: usize) -> serde_json::Value {
             "ann_partitions": args.ann_partitions,
             "ann_probes": args.ann_probes,
             "text_bytes": args.text_bytes,
+            "selection": args.selection,
             "history_commits": args.history_commits,
             "retired_branches": args.retired_branches,
             "cache_state": args.cache_state,
@@ -917,11 +992,29 @@ fn run_child(args: &Args) {
             ("nearest-prefilter", None) => nearest_prefilter(args).await,
             ("ann-probe-budget", None) => ann_probe_budget(args).await,
             ("rrf-gate", None) => rrf_gate(args).await,
+            ("search-selection", None) => {
+                search_selection::run(
+                    args.rows,
+                    args.seed,
+                    args.selectivity,
+                    args.k,
+                    args.text_bytes,
+                    &args.selection,
+                )
+                .await
+            }
             ("fenced-small-upsert", None) => rfc023_scenarios::fenced_small_upsert(args).await,
             (other, phase) => panic!("unknown scenario/phase '{other}/{phase:?}'"),
         }
     });
+    let oracle_failed = args.scenario == "search-selection"
+        && (metrics["oracle_pass"] == false
+            || metrics["cleanup_complete"] == false
+            || metrics["scratch_accounting_clear"] == false);
     emit_child_record(serde_json::json!({ "scenario_metrics": metrics }));
+    if oracle_failed {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(unix)]

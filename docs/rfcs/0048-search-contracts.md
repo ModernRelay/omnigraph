@@ -1215,7 +1215,7 @@ plan. The design reuses the right owner for each operation:
 | Lexical ranking | Structured Lance FTS where qualified; exact scoring fallback | Declared corpus statistics, fuzzy formula, numeric parity, complete boundaries |
 | Fusion | Explicit arm ranks, union, aggregate and sort | Common identity, missing-arm semantics, one snapshot, shared budgets |
 | Target selection and binding preservation | Distinct target stream for ranking; semi-join selected identities back to the incoming bindings | Deduplicate before candidate cuts; preserve every surviving graph binding and its metric origin |
-| Selection per group | DataFusion distinct target/group pairs, `row_number`, filter, null-safe semi-join, ordered merge | Pair quotas, binding multiplicity, key equality, total comparator, metric preservation |
+| Selection per group | DataFusion `dense_rank` over bindings, or distinct pairs plus `row_number` and a null-safe semi-join | Pair-constant comparator, explicit target tie key, pair quotas, binding multiplicity, key equality, metric and incoming-order preservation |
 | Graph expansion | Existing CSR/CSC and indexed edge paths | Retain traversal/path semantics, bound fan-out, carry metric origin |
 | Learned reranking | Future bounded scoring/model operator | Model identity, batched input, cancellation, resource and failure contracts |
 
@@ -1253,16 +1253,135 @@ excludes eligible targets. Reversing null placement changes the selected target
 as expected. These checks pass with reversed input and one/four partitions,
 using actual one-row input batches.
 
-The successful route sets DataFusion's byte and row
-`hash_join_single_partition_threshold` options to zero to select partitioned
-hash joins. The same logical plan with default optimizer policy succeeds at
-one partition but fails at four: the resulting `CollectLeft` join receives a
-four-partition build input where `SinglePartition` is required, and the native
-plan sanity check refuses execution. The probe pins that failure as well as
-the successful route. The earlier single-batch fixture did not expose it.
-This test configuration is not a production-wide tuning recommendation;
-qualify distribution enforcement with the actual graph/Lance sources before
-choosing a planner policy, and remove the refusal fence if upstream fixes it.
+The fixture now runs from memory and from real V2_2 Lance datasets with stable
+row IDs and three fragments, using both ordered and unordered native scans.
+All twelve source/partition/input-order configurations preserve the expected
+bindings. The explicit hash route sets DataFusion's byte and row
+`hash_join_single_partition_threshold` options to zero; physical-plan assertions
+confirm partitioned hash joins at four partitions. Setting `prefer_hash_join`
+to false selects sort-merge at four partitions and produces the same winners;
+the pinned planner still selects hash at one partition.
+
+Default optimizer policy also succeeds for both real Lance source variants at
+one and four partitions. Only the memory source fails at four: the resulting
+`CollectLeft` join receives a four-partition build input where `SinglePartition`
+is required, and the native plan sanity check refuses execution. The probe
+retains that refusal fence. It does not justify a global planner override for
+Lance. The earlier single-batch memory fixture did not expose the failure,
+while the later multi-batch memory fixture could not establish native-source
+behavior. Qualify each source/plan combination rather than generalizing either
+result; remove the refusal fence if upstream fixes it. These nine-row checks
+establish result parity for the tested shapes, not relative speed or cost.
+
+A larger independent scalar oracle in the existing
+[scenario instrument](../../crates/omnigraph/benches/scenarios/search_selection.rs)
+exposes another boundary: nullable integer group keys can lose winning bindings
+under both default and partitioned hash plans when join dynamic filters are
+enabled. The reduced case has 16 targets and 64 bindings; the expected 20
+bindings become 18. Disabling
+`enable_join_dynamic_filter_pushdown` restores them; sort-merge also preserves
+the tested result. The pinned DataFusion hash-join filter constructs ordinary
+min/max range predicates without carrying null equality into those predicates.
+`NullEquality::NullEqualsNull` on the join therefore does not by itself qualify
+the complete optimized path. Keep the compatibility fence in
+[benchmark scenario contracts](../../crates/omnigraph/tests/benchmark_scenario_contract.rs).
+Staged sessions containing these nullable joins must disable that optimization
+until an upstream fix and the adapter pass the oracle. This does not require
+disabling ordinary property-filter, top-K or aggregate pushdown.
+
+The instrument compares default, partitioned hash and sort-merge choices, plus
+two equivalent reattachment plans. Winning pairs are already a subset of the
+target cutoff, so reattaching them directly to the incoming bindings preserves
+the cutoff without repeating it on the probe side. Compare that form against
+reattachment to the cut bindings before introducing a materialized stage cache.
+The corpus includes score ties, duplicate paths, multiple memberships and a
+null group. Its scalar evaluator checks exact binding identities and order,
+independently of DataFusion. This remains a persisted binding-relation probe;
+it does not execute graph traversal, lexical scoring or the GQ compiler.
+
+There is also a join-free implementation of the per-group cut. If each
+ordering value is constant for a target/group pair, partition the incoming
+bindings by the group-key tuple and compute `dense_rank` over the local
+comparator with target identity as its final tie key. Duplicate paths then
+share one rank. Filtering by the quota retains every winning pair's bindings
+without deduplicating and joining them back. Omitting target identity instead
+groups different equally scored targets together and can exceed the quota;
+using `row_number` directly on bindings instead counts paths. A varying
+per-path comparator requires its declared per-pair reduction before this
+rewrite is valid. Restore incoming binding order after the physical window;
+its partition/sort order must not replace the logical active order.
+
+The instrument's `--group-select dense` compares this route with
+`--group-select dedup`. Both use the same independent binding/payload oracle
+and the same target cutoff. The dense route removes the nullable pair join
+and passes the reduced null-group counterexample with dynamic filters still
+enabled; its remaining cutoff join has a non-null target key. This does not
+qualify dynamic filters for other nullable joins. The dense window may sort
+many duplicate bindings, while the distinct-pair route can rank fewer rows;
+compare fan-out, payload width and candidate windows before choosing a plan.
+`--reattach-cut` applies only to the dedup route.
+
+An additional optimized comparison covers both algorithms, early/late payload
+and four workload shapes, including 3,000 targets with 64 paths each and four
+groups. All 48 trials pass exact binding/payload verification and cleanup.
+At a 128 MiB operator pool and 1 GiB scratch, the dense route spills in that
+duplicate-heavy early-payload fixture while dedup does not; both avoid spill
+with late payload there. This supports retaining both physical alternatives.
+Compilation overlapped this run, so its timings are not comparative latency
+evidence; the result and native I/O/spill records remain useful qualification.
+
+`--late-payload true` adds a third comparison: carry the dataset's native
+`_rowid` through the narrow selection plan, then attach the projected payload
+with Lance's public `TakeExec`. The terminal take executes under the same
+caller task context; it does not create another per-arm session or infer native
+row IDs from logical identities. The oracle checks both payload values and
+final binding order. Take's output ordering metadata still needs qualification
+before another optimizer stage can rely on it. This route reduces intermediate
+payload materialization, but does not repair native decoder/output accounting.
+
+Reproduce the comparison through the existing harness, varying
+`--selection-plan default|hash|merge`, `--group-select dedup|dense`,
+`--reattach-cut true|false`, selectivity,
+fan-out, source window, quota, payload width, partitions and memory/scratch.
+Payloads use reproducible varied ASCII rather than one repeated value:
+
+```sh
+cargo bench -p omnigraph-engine --bench scenarios -- \
+  --scenario search-selection --rows 10000 --fanout 8 --groups 64 \
+  --selectivity 0.1 --k 100 --quota 2 --text-bytes 2048 \
+  --selection-plan hash --group-select dense --join-filters false --reattach-cut false \
+  --late-payload true \
+  --partitions 4 --query-memory-mb 128 --scratch-mb 1024
+```
+
+An oracle mismatch exits nonzero and retains its record. A resource refusal
+has no successful oracle verdict. Records distinguish planning/execution time,
+operator spills and native scan I/O from object-store wrapper counts: local
+Lance data reads can bypass that wrapper. Parent peak RSS includes fixture
+setup and the scalar oracle; it is not query-only memory. OS page-cache state
+is uncontrolled. These boundaries must accompany any comparison; the mere
+presence of a benchmark does not establish an optimal plan.
+
+The 2026-09-09 local optimized-build comparison ran 20 cells three times each
+on macOS/aarch64: three join choices, early/late payload, three workload shapes,
+and two repeated-cut controls. All 60 trials passed exact binding/payload
+verification and cleanup/accounting checks. With four partitions, a 128 MiB
+operator pool and 1 GiB scratch, the partitioned-hash comparisons were:
+
+| Binding workload | Source window / group quota | Native scheduled bytes, early → late payload | Diagnostic execution median, early → late |
+|---|---|---|---|
+| 10,000 targets, eight paths each, 10% eligible, 2 KiB payload | 100 / 2 | 16.57 MB → 1.24 MB | 34.90 ms → 20.92 ms |
+| 5,000 targets, eight paths each, 50% eligible, 2 KiB payload | 1,500 / 8 | 39.87 MB → 2.85 MB | 51.49 ms → 22.93 ms |
+| 10,000 targets, one path each, 50% eligible, 32-byte payload | 1,000 / 4 | 0.32 MB → 0.30 MB | 8.86 ms → 5.47 ms |
+
+All three workloads use 64 groups.
+The alternative join choices also pass, and their relative timings vary by
+shape. Reattaching to the incoming relation avoids the repeated cut and reduces
+native reads in both wide-payload controls. These local diagnostic medians use
+the measurement boundaries above and an uncommitted instrument build; they are
+not authoritative performance records or evidence for a universal join policy.
+They support narrow intermediates and late hydration as the next implementation
+candidate, while the optimizer, resource, snapshot and full-query gates remain.
 
 This is concrete relational execution evidence, not GQ lowering or a
 graph/search integration test. Other key types (including floating-point
@@ -1271,7 +1390,57 @@ and whole-query budgets remain separate qualification work. Existing aggregate
 execution groups nulls together; its display-based key encoding is not a new adapter
 interface or a substitute for typed key equivalence.
 
-Existing bounded ordered-scan support can supply memory/scratch ownership.
+Existing bounded ordered-scan support supplies a per-operation runtime and
+memory/scratch limits. Staged execution must share query-owned allowances;
+creating one such runtime per arm would not establish a whole-query limit.
+The native `lance_provider_scan_payloads_need_accounting_beyond_the_session_pool`
+guard makes the other boundary concrete: a real Lance scan retains 304 bytes
+of Arrow arrays while a one-byte DataFusion pool reports zero reservations.
+An aggregate through the same session fails resource admission and releases its
+reservations. The pool is enforced for participating operators but is not an
+account of all decoded input or retained output. This is a reservation-boundary
+probe, not a process-memory measurement or proof that transient decoding is
+bounded. The storage adapter must qualify scan/decode buffering and downstream
+ownership alongside operator, spill, fallback and output accounting.
+
+Preserve resource refusal as a typed outcome through native error wrappers
+and the engine/API boundary. A fair-share consumer may be refused while total
+pool usage is below the configured limit. Do not fabricate an `actual` byte
+count from a native error string or classify an operator-memory refusal as an
+unrelated storage failure. Distinguish the configured allowance, measured
+usage where available, and the refusing operation. Verify this classification
+and cleanup through the owning query and transport tests.
+
+The selection instrument also observes reservations retained by a collected
+hash join after its stream finishes. They are released when the owning
+physical plan is dropped. A query's cleanup boundary must include its plan
+and shared build state, not only the output stream; capture diagnostic metrics
+before releasing that state. The probe requires pool/scratch release within
+one second, which is a test boundary rather than a proposed product timeout.
+
+Scratch refusal needs a separate fence. DataFusion 54 updates global usage
+after writing a spill file, but on limit failure returns before recording the
+new size for that file's eventual refund. A seven-byte native test proves that
+dropping the file removes it and clears the active-file count while global
+usage remains seven. The scenario instrument records actual file cleanup and
+counter cleanup separately and rejects stale accounting as qualification
+evidence. A failed query must dispose of its query-owned runtime; do not reuse
+that manager for another query or reset its allowance for a fallback. A zero
+scratch limit is not a no-write guarantee: use disabled spilling for that
+policy. Positive limits also need bounded spill-write admission/overshoot
+qualification; a native after-write size check alone is not a strict filesystem
+quota. This is an upstream resource-accounting limitation, not evidence of
+orphaned files in the measured refusal cases.
+
+Fifteen additional optimized resource trials used 2,048 targets, eight paths,
+50% eligibility, a 1,024-target window, quota two and 2 KiB payloads. The three
+late-payload plans completed under a 128 MiB pool and 1 GiB scratch; the twelve
+1/16 MiB trials returned resource errors. Several zero-scratch refusals exposed
+the stale counter above. Errors also identify the native 10 MiB external-sort
+merge reservation: shared-pool admission must account for concurrent operators,
+partitions and their minimum reservations, alongside qualified input batch
+sizes. These refusal trials do not establish complete query resource bounds.
+
 These operator tests do not establish whole-query memory or cancellation
 bounds. Registering fully materialized batches in `MemTable` would leave the
 materialization cost intact. Graph traversal must not be replaced with eager
@@ -1455,7 +1624,8 @@ The 2026-09-09 prototypes extend existing test owners:
   and consumption of 8,194 input scalars before the first output scalar.
 - [RRF and prefilter gates](../../crates/omnigraph/tests/rrf_prefilter_gate.rs):
   `staged_target_selection_preserves_cutoffs_and_binding_rows` exercises the
-  typed DataFusion plan described above in four input/partition configurations.
+  typed DataFusion plan described above in twelve source/input/partition
+  configurations, including real Lance scans.
 
 All three focused probes passed against the lockfile pins. They are small
 mechanism tests; they do not measure production performance, retrieval quality,
@@ -1464,11 +1634,21 @@ User-visible stage behavior belongs in `.gqt` cases as its grammar and runner
 support lands; native mechanisms and resource/cost contracts retain their
 existing Rust owners.
 
-The current GQT baseline passed all 60 cases and 127 runner self-tests with
+The initial GQT baseline passed all 60 cases and 127 runner self-tests with
 `RUST_MIN_STACK=16777216 cargo test -p omnigraph-gqt --locked -- --test-threads=2`.
 This uses CI's thread-stack setting; the initial local run without it aborted
 on a runner self-test's stack overflow. These cases qualify the current
 language, not the proposed stages.
+
+After incorporating PR head `b1df2041` on 2026-09-09, the clean baseline passes
+127 runner self-tests and 67 of 71 cases. Four newly added search cases fail:
+`fuzzy_query_bypasses_index_analyzer`, `index_state_changes_text_matches`,
+`search_on_traversal_target_is_dropped`, and `unindexed_search_is_case_sensitive`.
+They assert intended analyzer, coverage and traversal behavior through existing
+syntax and reproduce current defects. Preserve their expected results during
+the migration; these failures are additional implementation requirements, not
+evidence that the replacement has passed. Each case stops at its first failing
+step, so later assertions in those cases remain unexecuted in this baseline.
 
 The later scorer experiment adds two native guards and
 `lexical_scoring_v1_reference_oracle`, whose twelve cases are independently
@@ -1647,6 +1827,15 @@ rules; qualify the NFC implementation and profile fingerprint before fixing
 the analyzer definitions.
 Specify resource units and admission limits, follow-up/retention behavior,
 and the proposed response changes before their implementations diverge.
+Pull one minimal integrated query through the actual compiler, engine and GQT
+forward into this qualification work. Exercise shared-resource refusal as well
+as successful results before broadening the operator set. Isolated parser and
+native-plan prototypes do not establish that the complete path composes.
+The integration must also walk every stage when deriving column demand,
+conservative graph-read descriptors, and GQT construct/traversal detection.
+Keep filter movement within graph segments separated by selection barriers;
+an executable query alone does not prove its descriptor or test harness sees
+all later reads. Admit parameter bounds before the first data scan.
 
 Completion requires parser/typechecker prototypes and golden plans for both
 graph-scope-first and retrieval-first queries, independent numerical score
@@ -1690,6 +1879,11 @@ failure. Exercise append/update/delete, compaction, and different index states
 through the exact path. The Boolean fuzzy predicate and fuzzy ranked source
 must agree on membership before the cutoff; shipping only the predicate does
 not complete this phase. Native acceleration remains separately qualified.
+Lifecycle fixtures must assert that their physical index/coverage and
+compaction states were actually reached. For snapshot follow-up, make the
+current answer differ from the pinned answer before reading the old snapshot;
+restoring identical data before that assertion cannot detect an accidental
+read of the current head. Reopening the handle should preserve the same result.
 
 #### Phase 3: compose graph scope, fusion, and selection
 
