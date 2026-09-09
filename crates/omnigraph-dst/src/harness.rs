@@ -172,7 +172,8 @@ pub struct FaultPlan {
     /// an empty-delta merge. The retry's error surface is held to
     /// `is_legal_rejection` STRICTLY: any novel
     /// retry-after-own-success error shape is a first-contact verdict, not
-    /// a tolerated blur. Reconcile still arbitrates the settled world.
+    /// a tolerated blur. Reconcile accounts for both attempts; unkeyed
+    /// edge inserts can apply twice.
     pub client_retry: bool,
     /// CORRUPTION AXIS (read tier) — READ-TIME BIT ROT: this % of successful
     /// content-read calls (adapter realm) return MUTATED text — the store
@@ -1149,7 +1150,7 @@ pub struct UniverseReport {
     /// deferred (`crash:<window>@op<i>`, `crash-state:write#k@op<i>`,
     /// `fault@op<i>`, `watch-interrupt@op<i>` for a watch-ending op judged
     /// inside the resolution, `keep-serving-deferred@op<i>`),
-    /// verdict is `Applied` / `ForkOnly` / `NotApplied` — the
+    /// verdict is `Applied` / `AppliedTwice` / `ForkOnly` / `NotApplied`; the
     /// keep-serving-deferred rows append ` matched=<composition>`
     /// provenance (e.g. `Applied matched=A+E`), a human-triage surface,
     /// deliberately unasserted (lance-realm compositions are
@@ -1165,7 +1166,7 @@ pub struct UniverseReport {
     /// Known-defect encounters AND experiment bookkeeping this universe
     /// had — carve-outs and by-design behaviors firing during workload
     /// ops, each tagged with its tracking reference (e.g.
-    /// `reopen-heals-barrier@op12`, `recovery-barrier-on-retry@op9`),
+    /// `reopen-heals-barrier@op12`),
     /// plus the keep-serving rows: `keep-serving-defer@op<i>:<id>` (or
     /// `:recovery-barrier` for the clean-recovery-state spelling that
     /// names no id; consumed by the pinned panel's shape assert) and the
@@ -3477,6 +3478,8 @@ enum ReconcileOutcome {
     ForkOnly,
     /// The op survived recovery (rolled forward / was already durable).
     Applied,
+    /// Both the original unkeyed edge insert and its retry survived.
+    AppliedTwice,
 }
 
 impl ReconcileOutcome {
@@ -3487,6 +3490,110 @@ impl ReconcileOutcome {
             ReconcileOutcome::NotApplied => {}
             ReconcileOutcome::ForkOnly => apply_fork_only(world, wop),
             ReconcileOutcome::Applied => apply_world(world, wop),
+            ReconcileOutcome::AppliedTwice => {
+                assert!(
+                    matches!(
+                        wop,
+                        WorldOp::Data {
+                            op: Op::AddFriend { .. },
+                            ..
+                        }
+                    ),
+                    "only an unkeyed edge insert has a distinct two-application state"
+                );
+                apply_world(world, wop);
+                apply_world(world, wop);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryEffect {
+    None,
+    Possible,
+    Applied,
+}
+
+impl RetryEffect {
+    fn from_result(original: &OmniError, retry: &OmniResult<()>) -> Self {
+        let Err(error) = retry else {
+            return Self::Applied;
+        };
+        if let OmniError::RecoveryRequired { operation_id, .. } = error {
+            return if matches!(original, OmniError::RecoveryRequired {
+                operation_id: original_id, ..
+            } if original_id == operation_id)
+            {
+                Self::None
+            } else {
+                Self::Possible
+            };
+        }
+        let text = format!("{error:?}");
+        if [ACK_LOSS_MARKER, FAULT_MARKER, LATENT_MARKER]
+            .iter()
+            .any(|marker| text.contains(marker))
+        {
+            Self::Possible
+        } else {
+            Self::None
+        }
+    }
+
+    fn reconcile_edges(
+        self,
+        before: Option<&[EdgePair]>,
+        after: &[EdgePair],
+        [absent, once, twice]: [&[EdgePair]; 3],
+        label: &str,
+        at_op: usize,
+    ) -> ReconcileOutcome {
+        let judge = |rows: &[EdgePair]| {
+            self.edge_outcome(rows, absent, once, twice)
+                .unwrap_or_else(|| detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
+                    at_op,
+                    format!(
+                        "{label}: bound rows match no permitted attempt outcome \
+                         (retry={self:?}, bound={rows:?}, applied={once:?}, \
+                         twice={twice:?}, not_applied={absent:?})"
+                    ),
+                    "bound rows must match the effects permitted by the original attempt and retry",
+                ))
+        };
+        let outcome = judge(after);
+        if let Some(before) = before {
+            judge(before);
+            if after.len() < before.len() {
+                detectors::violation(
+                    DET_CRASH_CONTRACT,
+                    at_op,
+                    format!(
+                        "{label}: recovery demoted a visible edge insertion: before={before:?}, after={after:?}"
+                    ),
+                    "recovery must preserve every visible insertion, including the retry",
+                );
+            }
+        }
+        outcome
+    }
+
+    fn edge_outcome(
+        self,
+        actual: &[EdgePair],
+        absent: &[EdgePair],
+        once: &[EdgePair],
+        twice: &[EdgePair],
+    ) -> Option<ReconcileOutcome> {
+        if actual == once {
+            Some(ReconcileOutcome::Applied)
+        } else if self != Self::None && actual == twice {
+            Some(ReconcileOutcome::AppliedTwice)
+        } else if self != Self::Applied && actual == absent {
+            Some(ReconcileOutcome::NotApplied)
+        } else {
+            None
         }
     }
 }
@@ -3682,21 +3789,21 @@ async fn assert_no_recovery_residue(
     }
 }
 
-/// After ANY failed op (crash window or injected fault): assert atomicity,
-/// reopen over the same storage (= the recovery sweep; a
-/// fault-killed mutation arms a recovery sidecar and the engine BLOCKS
-/// further writes behind a recovery barrier until a read-write reopen), then
-/// assert recovery monotonicity and report how the op settled. World-level:
-/// the hypotheses (op invisible
-/// XOR op applied, plus the fork-survives third state for `LoadFork`) cover
-/// branch existence and every branch's state, so torn branch
-/// creates/deletes/merges violate atomicity exactly like torn mutations.
-///
-/// INPUT CONTRACT — at most ONE unjudged op: `world` must hold the settled
-/// truth of every op except `wop`, whose fate is the single open question
-/// the hypotheses cover. A keep-serving resolution violates that contract
-/// (two ops unjudged: the deferred op and the interrupting op) and uses
-/// [`reconcile_watch_resolution`] instead.
+fn insertion_branch<'a>(wop: &'a WorldOp, world: &WorldModel) -> Option<&'a str> {
+    if let WorldOp::Data {
+        branch,
+        op: Op::AddFriend { .. },
+    } = wop
+        && op_targets_live(world, wop)
+    {
+        Some(branch)
+    } else {
+        None
+    }
+}
+
+/// Judge the failed op and its optional retry, then reopen and enforce
+/// recovery monotonicity. Unrelated unjudged ops require watch reconciliation.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_after_failure(
     db: Omnigraph,
@@ -3707,6 +3814,7 @@ async fn reconcile_after_failure(
     label: &str,
     at_op: usize,
     recovery_crash: Option<&'static str>,
+    retry: RetryEffect,
 ) -> (Omnigraph, ReconcileOutcome, &'static str) {
     // Stale-capture rule on [`resolve_keep_serving_watch`]: a ruling can
     // remove the op's target between its sampling and this judgment. A
@@ -3733,7 +3841,9 @@ async fn reconcile_after_failure(
         _ => None,
     };
     let legal = |state: &WorldState| {
-        *state == as_model || *state == as_with || as_fork_only.as_ref() == Some(state)
+        *state == as_with
+            || (retry != RetryEffect::Applied
+                && (*state == as_model || as_fork_only.as_ref() == Some(state)))
     };
     if !legal(&visible) {
         detectors::violation(
@@ -3743,6 +3853,12 @@ async fn reconcile_after_failure(
             "atomicity: the post-failure world renders as base, applied, or fork-only",
         );
     }
+    let insertion_branch = insertion_branch(wop, world);
+    let visible_edge_rows = if let Some(branch) = insertion_branch {
+        Some(Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await)
+    } else {
+        None
+    };
     let committed = visible == as_with;
     let fork_was_visible = as_fork_only.as_ref() == Some(&visible);
 
@@ -3790,18 +3906,7 @@ async fn reconcile_after_failure(
     // Which channel the ruling rests on — recorded so the run tables carry
     // observed provenance, never an assumption (canary lesson).
     let mut channel: &'static str = "query";
-    // BOUND-ROW TIE-BREAK (the physical-channel oracle's first catch,
-    // found in its first full-suite run, 2026-08-11): an op whose ONLY effect
-    // is on ghost rows (a failed self-loop add_friend; a remove-from touching
-    // nothing but ghosts) or on row COUNT (a re-add of a pair the branch
-    // already holds, issue 681's shape) is invisible to every query-channel read — the
-    // two hypotheses render identically, and the judgment above silently
-    // guesses. Before the physical-channel oracle existed, that guess quietly
-    // recorded ghosts that never landed (caught at final audit). The raw
-    // channel is the one read that can resolve it: consult it for the
-    // touched branch. `target_live` gate: a dead-target collapse also makes
-    // the renders equal, but its branch is gone — nothing to consult.
-    if target_live && as_model == as_with {
+    if target_live && (as_model == as_with || insertion_branch.is_some()) {
         let touched = match wop {
             WorldOp::Data { branch, .. } => Some(branch),
             _ => None,
@@ -3813,22 +3918,20 @@ async fn reconcile_after_failure(
                 channel = "query+bound";
                 let knows =
                     Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
-                outcome = if knows == expect_with {
-                    ReconcileOutcome::Applied
-                } else if knows == expect_world {
-                    ReconcileOutcome::NotApplied
+                let expect_twice = if insertion_branch.is_some() && retry != RetryEffect::None {
+                    let mut twice = with.clone();
+                    apply_world(&mut twice, wop);
+                    twice.state_of(branch).physical_rows()
                 } else {
-                    detectors::violation(
-                        DET_ARBITRATION_PHYSICAL,
-                        at_op,
-                        format!(
-                            "{label}: bound rows match NEITHER hypothesis \
-                             (op={wop:?}, bound={knows:?}, applied={expect_with:?}, \
-                             not_applied={expect_world:?})"
-                        ),
-                        "the bound-row tie-break resolves query-invisible effects to one hypothesis",
-                    )
+                    expect_with.clone()
                 };
+                outcome = retry.reconcile_edges(
+                    visible_edge_rows.as_deref(),
+                    &knows,
+                    [&expect_world, &expect_with, &expect_twice],
+                    label,
+                    at_op,
+                );
             }
         }
     }
@@ -4109,6 +4212,7 @@ async fn crash_op(
         &format!("crash window '{failpoint}'"),
         at_op,
         recovery_crash,
+        RetryEffect::None,
     ))
     .await;
     if let Some(f) = failing {
@@ -4445,6 +4549,7 @@ impl CompositionHypothesis {
             ReconcileOutcome::NotApplied => None,
             ReconcileOutcome::ForkOnly => Some(format!("fork({tag})")),
             ReconcileOutcome::Applied => Some(tag.to_string()),
+            ReconcileOutcome::AppliedTwice => Some(format!("{tag}+retry({tag})")),
         };
         let a = name(self.a, "A");
         let e = if has_interrupt {
@@ -5416,6 +5521,7 @@ pub fn run_universe_caught(
                         "crash-state death",
                         i,
                         None,
+                        RetryEffect::None,
                     ))
                     .await;
                     db = new_db;
@@ -5764,59 +5870,25 @@ pub fn run_universe_caught(
                         if is_recovery_barrier_rejection(&wop, &err) {
                             known_issues.push(format!("reopen-heals-barrier@op{i}"));
                         }
-                        // CLIENT RETRY after ack-loss — semantics on
-                        // `FaultPlan::client_retry`. Reconcile below still
-                        // arbitrates the settled world either way. Skipped
-                        // when the watch resolution already judged this op:
-                        // its reopen superseded the state the op failed
-                        // under, and a retry would execute against a world
-                        // the ruling already installed in the model
-                        // (keep-serving scenarios do not set client_retry;
-                        // the combination is scoped out, not exercised).
+                        let mut retry_effect = RetryEffect::None;
                         if interrupt_judged.is_none()
                             && format!("{err:?}").contains(ACK_LOSS_MARKER)
-                            && sc
-                                .faults
-                                .as_ref()
-                                .map(|p| p.client_retry)
-                                .unwrap_or(false)
+                            && sc.faults.as_ref().is_some_and(|p| p.client_retry)
                         {
                             client_retries += 1;
-                            // Boxed: a SECOND exec_world_op future in this
-                            // frame (2 MiB test stack; overflowed inline on
-                            // first run).
-                            if let Err(retry_err) = Box::pin(exec_world_op(&mut db, &wop)).await {
-                                // FIRST-CONTACT VERDICT (2026-08-12): a
-                                // retry after an ack-lost mutation meets the
-                                // RECOVERY BARRIER — typed `RecoveryRequired`
-                                // naming the remedy ("reopen read-write
-                                // before retrying"). By design; the reconcile
-                                // below performs that reopen. One lost ack
-                                // costs the handle write capability until
-                                // reopen.
-                                let retry_text = format!("{retry_err:?}");
-                                if retry_text.contains("RecoveryRequired") {
-                                    known_issues
-                                        .push(format!("recovery-barrier-on-retry@op{i}"));
-                                }
-                                if !(retry_text.contains("RecoveryRequired")
-                                    || is_legal_rejection(
-                                        &retry_err,
-                                        &world,
-                                        &wop,
-                                        expected_conflict,
-                                    ))
-                                {
-                                    detectors::violation(
-                                        DET_ACK_LOSS,
-                                        i,
-                                        format!(
-                                            "illegal RETRY failure after ack-loss (op={wop:?}): {retry_err:?}"
-                                        ),
-                                        "a retry against the client's own durable success fails only in cataloged shapes",
-                                    );
-                                }
+                            let retry = Box::pin(exec_world_op(&mut db, &wop)).await;
+                            if let Err(retry_err) = &retry
+                                && !(matches!(retry_err, OmniError::RecoveryRequired { .. })
+                                    || is_legal_rejection(retry_err, &world, &wop, expected_conflict))
+                            {
+                                detectors::violation(
+                                    DET_ACK_LOSS,
+                                    i,
+                                    format!("illegal RETRY failure after ack-loss (op={wop:?}): {retry_err:?}"),
+                                    "a retry against the client's own durable success fails only in cataloged shapes",
+                                );
                             }
+                            retry_effect = RetryEffect::from_result(&err, &retry);
                         }
                         // ack-loss failures MUST reconcile —
                         // their effects are usually durable, and only the
@@ -5859,6 +5931,7 @@ pub fn run_universe_caught(
                                     "injected-fault failure",
                                     i,
                                     None,
+                                    retry_effect,
                                 ))
                                 .await;
                                 db = new_db;
@@ -6374,5 +6447,178 @@ mod corruption_verb_tests {
             "shared-memory://r/__recovery/dstm-op123.json"
         );
         assert_eq!(super::misdirect_uri("bare"), "dstm-bare");
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{ACK_LOSS_MARKER, EdgePair, OmniError, ReconcileOutcome, RetryEffect};
+
+    #[test]
+    fn retry_effect_distinguishes_pending_original_from_new_attempt() {
+        let pending = |id: &str| OmniError::RecoveryRequired {
+            operation_id: id.into(),
+            reason: ACK_LOSS_MARKER.into(),
+        };
+        let original = pending("original");
+        assert_eq!(
+            RetryEffect::from_result(&original, &Ok(())),
+            RetryEffect::Applied
+        );
+        assert_eq!(
+            RetryEffect::from_result(&original, &Err(pending("original"))),
+            RetryEffect::None
+        );
+        assert_eq!(
+            RetryEffect::from_result(&original, &Err(pending("retry"))),
+            RetryEffect::Possible
+        );
+        assert_eq!(
+            RetryEffect::from_result(
+                &original,
+                &Err(OmniError::manifest_internal(ACK_LOSS_MARKER))
+            ),
+            RetryEffect::Possible
+        );
+        assert_eq!(
+            RetryEffect::from_result(&original, &Err(OmniError::manifest_internal("rejected"))),
+            RetryEffect::None
+        );
+    }
+
+    #[test]
+    fn retry_row_oracle_rejects_lost_success_and_excess_or_foreign_rows() {
+        let pair = ("Alice".into(), "Charlie".into());
+        for existing in [0, 1] {
+            let rows: Vec<Vec<EdgePair>> = (existing..=existing + 3)
+                .map(|n| vec![pair.clone(); n])
+                .collect();
+            for (effect, expected) in [
+                (
+                    RetryEffect::None,
+                    [
+                        Some(ReconcileOutcome::NotApplied),
+                        Some(ReconcileOutcome::Applied),
+                        None,
+                        None,
+                    ],
+                ),
+                (
+                    RetryEffect::Possible,
+                    [
+                        Some(ReconcileOutcome::NotApplied),
+                        Some(ReconcileOutcome::Applied),
+                        Some(ReconcileOutcome::AppliedTwice),
+                        None,
+                    ],
+                ),
+                (
+                    RetryEffect::Applied,
+                    [
+                        None,
+                        Some(ReconcileOutcome::Applied),
+                        Some(ReconcileOutcome::AppliedTwice),
+                        None,
+                    ],
+                ),
+            ] {
+                for (actual, expected) in rows.iter().zip(expected) {
+                    assert_eq!(
+                        effect.edge_outcome(actual, &rows[0], &rows[1], &rows[2]),
+                        expected,
+                        "retry={effect:?}, actual={actual:?}"
+                    );
+                }
+                let foreign = vec![pair.clone(), ("Bob".into(), "Diana".into())];
+                assert_eq!(
+                    effect.edge_outcome(&foreign, &rows[0], &rows[1], &rows[2]),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_reconciliation_preserves_visible_insertions() {
+        let pair: EdgePair = ("Alice".into(), "Charlie".into());
+        for existing in [0, 1] {
+            let rows: Vec<Vec<EdgePair>> = (existing..=existing + 2)
+                .map(|n| vec![pair.clone(); n])
+                .collect();
+            let expected = [rows[0].as_slice(), rows[1].as_slice(), rows[2].as_slice()];
+            for before in 0..=2 {
+                for after in 0..=2 {
+                    let result = std::panic::catch_unwind(|| {
+                        RetryEffect::Possible.reconcile_edges(
+                            Some(&rows[before]),
+                            &rows[after],
+                            expected,
+                            "retry test",
+                            7,
+                        )
+                    });
+                    if after < before {
+                        let panic =
+                            result.expect_err("recovery must reject lost visible insertions");
+                        let violation = panic
+                            .downcast::<super::detectors::Violation>()
+                            .expect("recovery loss must report a detector violation");
+                        assert_eq!(violation.detector, super::DET_CRASH_CONTRACT);
+                        assert_eq!(violation.at_op, 7);
+                    } else {
+                        assert_eq!(
+                            result.unwrap(),
+                            [
+                                ReconcileOutcome::NotApplied,
+                                ReconcileOutcome::Applied,
+                                ReconcileOutcome::AppliedTwice
+                            ][after]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_retry_preserves_the_original_visible_insertion() {
+        let original = OmniError::RecoveryRequired {
+            operation_id: "original".into(),
+            reason: ACK_LOSS_MARKER.into(),
+        };
+        let refused = OmniError::RecoveryRequired {
+            operation_id: "original".into(),
+            reason: "pending recovery".into(),
+        };
+        let retry = RetryEffect::from_result(&original, &Err(refused));
+        assert_eq!(retry, RetryEffect::None);
+        let wop = super::WorldOp::Data {
+            branch: "main".into(),
+            op: super::Op::AddFriend {
+                from: "Alice".into(),
+                to: "Charlie".into(),
+            },
+        };
+        let world = super::WorldModel::default();
+        let pair: EdgePair = ("Alice".into(), "Charlie".into());
+        let absent = vec![pair.clone()];
+        let once = vec![pair.clone(), pair.clone()];
+        let twice = vec![pair.clone(), pair.clone(), pair];
+        let before = super::insertion_branch(&wop, &world).map(|_| once.as_slice());
+        let result = std::panic::catch_unwind(|| {
+            retry.reconcile_edges(
+                before,
+                &absent,
+                [&absent, &once, &twice],
+                "refused retry",
+                7,
+            )
+        });
+        let violation = result
+            .expect_err("refused retry must retain the original visible insertion")
+            .downcast::<super::detectors::Violation>()
+            .expect("lost insertion must report a detector violation");
+        assert_eq!(violation.detector, super::DET_CRASH_CONTRACT);
+        assert_eq!(retry.edge_outcome(&twice, &absent, &once, &twice), None);
     }
 }

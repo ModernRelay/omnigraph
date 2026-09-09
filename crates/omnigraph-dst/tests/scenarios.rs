@@ -1496,56 +1496,47 @@ fn dst_ack_loss_bite_and_replay() {
     assert!(a.verified > 0);
 }
 
-/// CLIENT RETRY after ack-loss: the harness plays the real
-/// client and retries each ack-lost op once, AGAINST ITS OWN durable
-/// success. End-to-end retry idempotency, first contact: upserts must
-/// converge, a delete may find nothing, a re-merge is an empty-delta merge
-/// (the version-collision shape — the carve-out names it if the retry trips it).
-/// The retry's error surface is held STRICTLY to `is_legal_rejection`;
-/// reconcile arbitrates every settled world; strict replay identity.
-///
-/// Ignored: a retry on the same handle re-executes after the write-entry
-/// heal publishes the first attempt, so a multiset edge insert lands twice
-/// while the model counts one row (the fleet's ack-retry arm shows the same
-/// on main, 4 of 40 seeds). Re-enable once the model admits a re-executed
-/// retry.
+/// Both ack-lost insert attempts may survive; the row-count oracle and
+/// strict replay must agree with the model for both pinned failure signatures.
 #[test]
 #[serial]
-#[ignore = "known: same-handle retry re-executes after the write-entry heal; the model counts one row"]
 fn dst_ack_loss_client_retry() {
-    let sc = Scenario {
-        seed: 79,
-        ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 7900,
-            error_pct: 0,
-            read_error_pct: 0,
-            latency_pct: 0,
-            max_latency_ms: 1,
-            lance_realm: false,
-            ack_loss_pct: 20,
-            client_retry: true,
+    for (seed, fault_seed, ack_loss_pct, ops) in [(226251, 23303853, 15, 1), (79, 7900, 20, 30)] {
+        let sc = Scenario {
+            seed,
+            ops,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: fault_seed,
+                error_pct: 0,
+                read_error_pct: 0,
+                latency_pct: 0,
+                max_latency_ms: 1,
+                lance_realm: false,
+                ack_loss_pct,
+                client_retry: true,
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-ackretry-a", &sc);
-    let b = run_universe("shared-memory://dst-ackretry-b", &sc);
-    println!(
-        "dst ack-loss client-retry: {} acks lost, {} retries, {} legal rejections",
-        a.acks_lost, a.client_retries, a.legal_rejections
-    );
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &b,
-        "client-retry universes must replay identically",
-    );
-    assert!(
-        a.client_retries > 0,
-        "retries should actually happen (client_retries={})",
-        a.client_retries
-    );
-    assert!(a.verified > 0);
+        };
+        let a = run_universe(&format!("shared-memory://dst-ackretry-{seed}-a"), &sc);
+        let b = run_universe(&format!("shared-memory://dst-ackretry-{seed}-b"), &sc);
+        omnigraph_dst::harness::assert_strict_replay(
+            &a,
+            &b,
+            "client-retry universes must replay identically",
+        );
+        assert!(
+            a.client_retries > 0,
+            "seed {seed} must exercise a client retry"
+        );
+        assert!(
+            a.reconcile_verdicts
+                .iter()
+                .any(|(_, verdict, channel)| verdict == "AppliedTwice" && channel == "query+bound"),
+            "seed {seed} must account for both inserts using physical rows: {:?}",
+            a.reconcile_verdicts,
+        );
+    }
 }
 
 /// CORRUPTION AXIS (read tier): the store LIES (read-time bit rot,
