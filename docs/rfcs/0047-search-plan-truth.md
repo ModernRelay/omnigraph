@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-08
+updated: 2026-09-09
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
@@ -38,8 +38,8 @@ that silently do nothing become errors or warnings:
    (first use: full-text search on a column with no FTS index serves through
    the case-sensitive flat fallback — now loud), `metrics` (descriptors for
    projected rank columns), and `retrievals` (every executed source, with
-   exact ready/pending embedding coverage for `@embed`-backed vector
-   retrievals over the prefiltered population).
+   known/unknown representation coverage for `@embed`-backed vector retrievals
+   over the prefiltered population, with exact counts when requested).
 
 Boundaries that do not change: no schema surface or storage-format change, no
 change to BM25/vector scoring math, the deprecated `POST /read` envelope stays
@@ -159,8 +159,8 @@ discovers the same candidates; RFC 0048 keeps stable ranked pagination separate.
                  "recall": "exact" }],
 "retrievals": [{ "variable": "d", "property": "embedding", "kind": "nearest",
                  "recall": "approximate",
-                 "embedding_coverage": { "ready": 934, "pending": 66,
-                                          "complete": false } }]
+                 "embedding_coverage": { "state": "known", "ready": 934,
+                                         "pending": 66, "missing": 0 } }]
 ```
 
 - `warnings` never change rows, membership, or order. Human CLI formats print
@@ -170,10 +170,17 @@ discovers the same candidates; RFC 0048 keeps stable ranked pagination separate.
 - `recall` reports the source *contract*: an index-accelerated `nearest`
   reports `approximate` even when execution happened to be exact, so clients
   do not acquire a guarantee that disappears when an index is built.
-- `embedding_coverage` counts the **prefiltered** population exactly at the
-  pinned snapshot: `pending` rows have source text but no derived vector —
-  data the ranking could not see. A zero-row ranked result with nonzero
-  pending is therefore visibly incomplete rather than confidently wrong.
+- `embedding_coverage` reports either exact counts over the **prefiltered**
+  population at the pinned snapshot, or an explicit unknown state such as
+  `{ "state": "unknown", "reason": "not_computed" }`. `pending` rows have
+  usable source text but no derived vector; `missing` rows have neither a
+  usable vector nor a source that can currently produce one. Known pending
+  data and unknown coverage must not be presented as complete representation.
+  Query completion remains a separate fact. By default, do not scan the full
+  population solely to compute these counts. A typed exact-coverage request
+  requires exact counts or failure within the query budget; it cannot degrade
+  to unknown. RFC 0048's [result metadata contract](0048-search-contracts.md#result-metadata-coherent-continuation-and-budgets)
+  owns the shared semantics and read-surface qualification.
 - The deprecated `POST /read` envelope carries none of these fields, by
   construction.
 
@@ -208,12 +215,14 @@ maintenance surface is added.
   span the entire candidate population; retention must stay within explicit
   memory/work budgets, with spill or a typed failure if necessary. Its width
   is not itself a fixed resource bound.
-- **Coverage.** Ready/pending counts reuse the scan's own structured
-  predicate through a sealed, streaming count on the storage boundary — no
-  SQL strings, no retained batches, computed only for `@embed`-backed vector
-  retrievals. Streaming bounds retained batches, not rows examined: exact
-  coverage may still scan the whole prefiltered population and must be
-  charged to the query's work budget.
+- **Coverage.** Default descriptors use exact counts already established by
+  required execution or qualified snapshot-bound metadata, otherwise explicit
+  unknown. Requested exact ready/pending/missing counts reuse the scan's own
+  structured predicate through a sealed, streaming count on the storage
+  boundary — no SQL strings or retained batches. Streaming bounds retained
+  batches, not rows examined: exact coverage may still scan the whole
+  prefiltered population and must be charged to the query's work budget.
+  Shared count results require the same population and representation identity.
 
 ## Invariants
 
@@ -230,8 +239,8 @@ maintenance surface is added.
   analysis and exact evaluation across index states. This RFC's notices are
   transitional visibility, not an exception to the invariant. Recall
   reporting is contractual, not plan-derived.
-- **Bounded, observable resource use (11):** coverage counts stream; retries,
-  complete tie handling, and exact coverage share explicit query budgets.
+- **Bounded, observable resource use (11):** requested coverage counts stream;
+  retries, complete tie handling, and exact coverage share explicit query budgets.
   Streaming and finite tie plateaus alone do not prove bounded work or a
   bounded memory footprint. Their qualification remains an implementation
   requirement.
@@ -399,6 +408,10 @@ language release or duplicate execution path.
   blanket claim that all RRF arm windows follow the output limit: BM25 arms
   are uncapped; vector arms inherit that limit. Distinguished historical
   prototype results from current evidence and total ordering from ANN replay.
+- 2026-09-09 — aligned representation coverage with RFC 0048: known counts or
+  explicit unknown by default, exact counts when explicitly requested. This
+  keeps query completion separate from representation knowledge and avoids
+  mandatory exhaustive counting solely for default discovery metadata.
 
 ## Appendix: agent context (non-normative)
 

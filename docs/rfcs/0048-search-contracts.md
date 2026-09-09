@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-08
+updated: 2026-09-09
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
@@ -139,7 +139,7 @@ graphs still cross the storage-format upgrade described below.
 | Vector candidate depth inherited from final `limit`, while BM25 fusion arms scan uncapped | Each source and fusion stage has its own candidate window. Final `limit` counts output rows; graph fan-out can produce several rows per selected target. Stage comparators determine selection before final ordering. | Choose source/fusion windows explicitly and review tie keys and expected row counts. A migration cannot infer the intended recall/cost tradeoff from the old limit. |
 | `@index` or `@key` implicitly makes a String searchable by analyzed text | Analyzed matching requires `@analyzed`, which enables BM25-family ranking by default. Exact key/index annotations keep their separate meaning. | Declare `@analyzed` on searchable text, choose another analyzer when needed, or explicitly opt out of ranking with `scorer="none"`. An exact-only slug does not need an analyzer. |
 | Implicit vector geometry or an unresolved `@embed` model | A field's encoding recipe and geometry must resolve at schema acceptance. The model may inherit a schema-owned default recipe; distance may inherit that recipe's declared default. Raw vectors require explicit distance. | Declare the source and dimensions, then resolve a compatible recipe and geometry. A new default cannot identify how old vectors were produced; unresolved legacy vectors still need operator resolution or regeneration. |
-| Existing search rows, scores, or ordering survive a spelling-only rewrite | `terms` defaults to all terms and zero edits. Schema-owned analysis, complete fuzzy matching, long-token handling, scoring policies, and explicit selection boundaries can change results. | Review analyzer choices, fuzzy scoring, relevance expectations, score thresholds, and tie fixtures. The rewrite does not promise equivalent results to legacy search. |
+| Existing search rows, scores, or ordering survive a spelling-only rewrite | `terms` defaults to all terms and zero edits. Schema-owned analysis, complete fuzzy matching, long-token handling, scoring policies, and explicit selection boundaries can change results. Lexical statistics use the snapshot-visible field corpus independently of graph eligibility. | Review analyzer choices, fuzzy scoring, relevance expectations, score thresholds, and tie fixtures. The rewrite does not promise equivalent results to legacy search. |
 | Queries relying on silently ignored search constructs or permissive parameter handling | Invalid shapes, incompatible representations, token-empty queries, and exhausted budgets produce typed failures. A successful partial candidate set cannot stand in for an exact result. | Handle the declared errors and size queries explicitly; do not interpret a failure as an empty successful search. |
 | Existing graph files open directly after the upgrade | The accepted-schema change requires an export/init/load rebuild. Compatible values and logical graph content are carried over; commit history, branches, and physical indexes are not preserved by that rebuild. | Plan the data upgrade even if no query uses search. Retain the predecessor graph if its history is needed, rebuild indexes explicitly, and obtain fresh snapshot references from the rebuilt graph. |
 
@@ -712,24 +712,43 @@ the evaluator must not ignore the requested tolerance. A fuzzy policy used
 with zero edits must satisfy its declared exact-scorer reduction.
 
 The statistics population is part of source identity, independently of its
-candidate window. The initial proposed population is distinct, policy-visible
-eligible targets with nonempty analyzed values for that field at the stage's
-snapshot, before applying that source's lexical query. Graph fan-out contributes
-one target, not repeated field values. No index segment or physical shard
-chooses its own corpus. Null/token-empty field handling, deleted/updated rows,
-scorer arithmetic, and this population choice require a checked-in score
-oracle before acceptance. A native whole-table scorer cannot substitute for
-these graph-scoped statistics without equivalence evidence.
+eligible population and candidate window. The initial contract uses the
+snapshot-visible field corpus: distinct, policy-visible targets owning that
+accepted type/property identity with nonempty analyzed values, before ordinary
+graph or property filters and the source's lexical query. Null and token-empty
+values contribute neither a document nor tokens. Graph fan-out contributes one
+target, not repeated field values. A physical dataset, index segment, or shard
+cannot choose a different logical corpus. Polymorphic fields must resolve
+their corpus identities explicitly before that source shape is supported.
 
-This proposed population is a consequential design choice, not behavior
-obtained by adding a Lance prefilter. The existing
-`fts_prefilter_does_not_change_covered_fragment_scores` guard asserts that
-covered-index scores retain their corpus statistics under a prefilter.
-Eligibility and scoring corpus must therefore remain separate plan facts.
-Before selecting the initial population contract, compare graph-scoped
-statistics with a snapshot-visible field corpus for usefulness, query
-composability, and scan cost. Either choice still needs deletion/overlay and
-index-state parity; the scanner's mask alone supplies neither proof.
+At one snapshot, with the same query, analyzer, and scoring policy, narrowing
+eligibility therefore leaves a surviving target's lexical score unchanged.
+This makes scoring compose with graph filters and keeps it independent of
+candidate windows. Selection still depends on eligibility: filtering before
+top-k and filtering after top-k are different operations. Scores may change
+across snapshots or policy-visible corpora; this is not a globally calibrated
+score or a reason to compare unrelated source instances.
+
+The existing `fts_prefilter_does_not_change_covered_fragment_scores` guard
+confirms that a native prefilter does not rescope covered-index statistics.
+The new `fts_statistics_scope_can_reverse_ranking` probe goes further: with
+the same four eligible targets, an alpha/beta query ranks an alpha target
+first using the full ten-target corpus, but the beta target first using an
+index containing only those four eligible targets. Eligibility and statistics
+must remain separate typed plan facts. Implicitly recomputing statistics for
+each match block would change score meaning with graph scope. An explicit
+alternative corpus could be a future contract; it is not an initial query
+option.
+
+This choice does not qualify native BM25 or make field statistics free.
+Deleted/updated rows, unindexed tails, null/token-empty handling, arithmetic,
+and complete boundary ties still require a checked-in score oracle and
+scan/index parity. Reusable statistics must be derived from the accepted
+snapshot and representation; a stale aggregate is not authority. Exact
+statistics work consumes the query budget and may require a corpus scan.
+The prefilter probe proves neither live-row statistics parity nor a cost
+advantage for every query. Policy constrains the corpus before statistics;
+ordinary query filters do not replace the access-control boundary.
 
 Fuzzy ranked retrieval is required for the first complete path. The sketch
 names its policy `fuzzy_bm25_v1`, compatible with a field declaring the BM25
@@ -838,17 +857,44 @@ wire types and namespace choices must be checked before implementation:
 | Fact | Required meaning |
 |---|---|
 | Completion | Every declared stage completed, or a typed failure; a delivered prefix is not complete success |
-| Representation coverage | Distinct eligible targets with usable representation, pending derivation, or no usable source/value, under that source's snapshot |
+| Representation coverage | Explicitly known counts or an unknown state for usable representation, pending derivation, and missing source/value among distinct eligible targets at that source's snapshot |
 | Selection | Stage/input identities, semantic windows, actual returned counts, comparator and exact/approximate source contract |
 | Metric origin | Named source instance, target, domain, scoring/encoding fingerprints, and missing-arm membership |
 | Attribution | Graph snapshot context, graph binding identities, and selected properties; application-defined source relationships remain ordinary data |
 | Follow-up | A supported way to read/expand those bindings at that snapshot, or an explicit expired/unavailable outcome |
 
-Exact ready/pending counts require work over the eligible population and are
-charged to the same budget as retrieval. Counts and statistics obey policy;
-metadata must not disclose hidden rows. Representation absence is separate
-from a lagging index and from approximate candidate selection. Retrieval
-quality and answer confidence are not inferred from these descriptors.
+Coverage knowledge is separate from query completion. By default, report exact
+counts only when required retrieval work or qualified snapshot-bound metadata
+establishes them; otherwise report `unknown` with a reason such as
+`not_computed`. Do not add an exhaustive population scan solely to fill the
+default descriptor. A sampled candidate set does not establish representation
+coverage, and unknown is neither zero pending nor complete coverage. An empty
+successful retrieval with unknown coverage cannot establish that the graph
+contains no relevant unrepresented data.
+
+Callers can explicitly require exact coverage through a typed read-execution
+option shared by embedded, CLI, inline-query, and stored-query surfaces. It
+changes the requested metadata work, not eligibility, score meaning, or
+candidate windows. Its wire spelling remains part of the read-envelope gate.
+In exact mode, every representation-consuming source must produce exact
+ready/pending/missing counts over its distinct eligible population or the query
+fails; resource exhaustion cannot silently downgrade the request to unknown. Counts share the
+retrieval budget. Reuse a count only when snapshot, policy, population, and
+representation identities agree across sources. Fusion reports its input
+sources rather than inventing one combined representation count. A source
+without derivation has zero pending; null or token-empty values without usable
+representation are missing. An invalid present representation remains a typed
+error, not a missing or pending value.
+
+Lance's unfiltered row count has a metadata path; its filtered count builds a
+scanner. Neither a total row count nor an ANN result supplies exact counts for
+arbitrary graph-defined eligibility and representation status. Metadata-only
+or index-assisted counting needs its own equivalence proof. This is a
+structural cost distinction, not a measured latency claim. Counts and
+statistics obey policy; metadata must not disclose hidden rows. Representation
+absence is separate from a lagging index and from approximate candidate
+selection. Retrieval quality and answer confidence are not inferred from
+these descriptors. RFC 0047 uses the same known/unknown coverage contract.
 
 The inline and stored-query request types already accept `snapshot`, mutually
 exclusive with `branch`, and canonical reads already return a same-read
@@ -923,8 +969,13 @@ the pin. Boolean evaluation introduces no dictionary or posting storage.
 The implementation must bound query bytes, distinct terms, individual
 materialized values, matching state, and execution work. Enforce admission
 before allocations that can exceed the budget, including Unicode normalization
-and token construction. Checking only between returned tokens is insufficient
-for one huge token or combining-mark sequence.
+and token construction. NFC can expand UTF-8 bytes: the pinned normalizer turns
+the two-byte U+0344 into four bytes. It can also consume a long combining-mark
+sequence before yielding its first output scalar. Bound source consumption,
+internal normalization buffers/work, and output capacity; an input-byte limit
+or cancellation checks only between emitted characters or tokens are
+insufficient. A bounded implementation must enforce these limits at the
+normalizer's input and internal work boundaries.
 Use a bounded exact edit matcher, with cancellation checkpoints. The pinned
 `fst` Levenshtein automaton agrees with the declared scalar-value distance,
 but construction can consume substantial memory and hit its state limit.
@@ -982,6 +1033,7 @@ plan. The design reuses the right owner for each operation:
 | Analyzed matching | Qualified NFC preprocessing, public Lance tokenizer, and typed Boolean evaluation | One accepted pipeline through query/scan/index construction, complete edit matching, admission and cancellation |
 | Lexical ranking | Structured Lance FTS where qualified; exact scoring fallback | Declared corpus statistics, fuzzy formula, numeric parity, complete boundaries |
 | Fusion | Explicit arm ranks, union, aggregate and sort | Common identity, missing-arm semantics, one snapshot, shared budgets |
+| Target selection and binding preservation | Distinct target stream for ranking; semi-join selected identities back to the incoming bindings | Deduplicate before candidate cuts; preserve every surviving graph binding and its metric origin |
 | Selection per group | DataFusion `row_number` window, filter, ordered merge | Correct partitioning, total comparator, distinct target and group semantics |
 | Graph expansion | Existing CSR/CSC and indexed edge paths | Retain traversal/path semantics, bound fan-out, carry metric origin |
 | Learned reranking | Future bounded scoring/model operator | Model identity, batched input, cancellation, resource and failure contracts |
@@ -1002,12 +1054,23 @@ integration opportunity, not a completed graph-scoped retriever.
 
 DataFusion 54 provides sort, union, aggregation, joins, windows and limits.
 Its filter optimizer preserves limit boundaries; the new graph/search nodes
-must also encode semantic barriers. Existing bounded ordered-scan support can
-supply memory/scratch ownership. Operator availability does not establish
-whole-query memory or cancellation bounds. Registering fully materialized
-batches in `MemTable` would leave the materialization cost intact. Graph
-traversal must not be replaced with eager Cartesian products merely to fit a
-relational plan.
+must also encode semantic barriers. The
+`staged_target_selection_preserves_cutoffs_and_binding_rows` prototype executes
+typed DataFrame plans for distinct targets, ordered limits, per-group
+`row_number`, and a left semi-join back to the binding rows. It checks both
+filter placements, shows that a quota after a cutoff cannot refill from
+discarded targets, and preserves duplicate graph paths for selected targets.
+The fixture passes with reversed input and one/four partitions; a control
+that limits bindings before target deduplication produces the wrong target
+set. This is concrete relational execution evidence, not GQ lowering or a
+graph/search integration test. Null or multiple group keys, metric carriage,
+spill, and whole-query budgets remain separate qualification work.
+
+Existing bounded ordered-scan support can supply memory/scratch ownership.
+These operator tests do not establish whole-query memory or cancellation
+bounds. Registering fully materialized batches in `MemTable` would leave the
+materialization cost intact. Graph traversal must not be replaced with eager
+Cartesian products merely to fit a relational plan.
 
 Lance vector refinement rescans retrieved vectors; it is not a learned
 cross-encoder reranker. Native fuzzy expansion and shared FTS scorer helpers
@@ -1061,12 +1124,19 @@ requires another explicit rebuild.
   typed failure is required; a larger cap is not a completeness proof.
 - **Empty indexes as analyzer authority.** Artifact removal cannot erase
   logical matching semantics. Accepted SchemaIR owns the analyzer.
+- **Implicitly rescope lexical statistics with every graph filter.** This can
+  reverse the ordering of the same eligible targets and couples score meaning
+  to match-block placement. A snapshot-visible field corpus gives filtering
+  and scoring separate meanings; qualified statistics still have a cost.
 - **Implicit score blending or a blanket ban on all feature combination.**
   Named domains prevent accidental mixing while explicit normalized/model
   stages can define valid combinations. Geometric range predicates remain
   distinct from calibrated relevance judgments.
 - **Treat grouping as semantic diversity.** A quota constrains concentration;
   it cannot establish that the selected facts cover a reasoning task.
+- **Require exact population coverage on every discovery query.** Truthful
+  reporting can state that coverage is unknown. Exact counting remains an
+  explicit, budgeted request; a candidate sample must not impersonate a count.
 - **Infer stable pagination from a snapshot.** A snapshot fixes source data,
   not an approximate candidate execution. Preserve that execution or defer
   the stable cursor promise.
@@ -1137,14 +1207,16 @@ does not make the proposed operators implemented behavior.
 |---|---|
 | Grammar and IR | Current `.gq` has one match block and fixed expression variants. The proposed rank/lexical/metric syntax still requires parser/typechecker and lowered-plan fixtures. |
 | Current fusion windows | Corrected: vector arms inherit the final limit; BM25 arms scan uncapped. Named windows are a new semantic contract. |
-| BM25 statistics | The covered-index prefilter guard passes with unchanged corpus scores. Eligibility and scoring corpus are distinct; choosing graph-scoped statistics requires separate implementation and cost evidence. |
+| BM25 statistics | Native covered-index prefiltering retains corpus scores. A real Lance fixture reverses the winner when only the statistics corpus changes. The initial contract now fixes the snapshot-visible field corpus independently of ordinary eligibility; live-row statistics and score parity still need qualification. |
 | Fuzzy matching | The pin still has the nonzero-edit analyzer bypass, per-segment query-wide expansion cap and incomplete flat behavior. The tokenizer/edit-distance probe passed 73,008 comparisons again; it does not qualify the revised NFC pipeline, scanner parity, or query budgets. |
 | Schema defaults | Bare analyzed fields now propose BM25-family capability; embedding model/distance omissions resolve through accepted schema metadata. The current grammar has no schema-wide recipe declaration. Its syntax, persistence, reapplication, and no-drift behavior require new fixtures. |
+| NFC integration | Native tokenization differs for composed/decomposed input; explicit NFC preprocessing equalizes the fixture. A serialized `normalization: "NFC"` option is silently ignored by the pinned index parameters. The pinned normalizer can expand bytes and buffer a long sequence before yielding; pipeline integration and internal resource accounting are required. |
 | Vector arithmetic and encoding | Verified squared L2, cosine and shifted-dot kernels, current generated-vector normalization, and Gemini query/document roles. Added explicit formulas and requirements for invalid values, numeric parity and revision identity. |
 | Fusion arithmetic | Reproduced overflow with 16 finite maximum weights and `k=1`. Added checked arithmetic and explicit failure requirements. |
 | Graph scope through native masks | The public mask uses the same dataset's `_rowid` space. A graph-ID mapping and adapter qualification are still required. |
-| DataFusion composition | Required relational operators and limit-preserving optimizer behavior exist. Search construction, graph semantics and whole-query resource integration remain OmniGraph work. |
+| DataFusion composition | Typed DataFrame plans preserve target deduplication, cutoff/filter order, quotas after a cutoff, and binding multiplicity across shuffled input and multiple partitions. GQ lowering, graph/search operators, general group semantics, metric carriage and shared resource integration remain OmniGraph work. |
 | Snapshot follow-up | Existing requests accept `snapshot`; reads return `graph_commit_id` when available. Reuse those carriers and complete replay-identity, retention and failure guarantees. A snapshot does not freeze ANN candidates. |
+| Representation counts | The pin distinguishes metadata-based unfiltered counts from scanner-based filtered counts. Exact graph-scoped ready/pending/missing counts need separate work or qualified metadata. Default reporting now permits explicit unknown; exact requested counts must complete within the shared budget or fail. This is a source-level cost distinction, not a benchmark. |
 | Authorization | Current read/invoke gates are graph/branch-level. The staged design must preserve them; this RFC adds no row-level security engine. |
 | Stored queries | The registry already reuses ordinary query execution. Definition fingerprints and resolved input/encoding identity remain additions; a mutable name alone does not pin semantics. |
 | Research and utility | Primary sources support staged retrieval and task-level evaluation. They do not establish an optimal OmniGraph pipeline, default, recall/latency profile or complementary-coverage result. |
@@ -1155,13 +1227,42 @@ the filter returns two, and assigning ranks to expanded rows changes a later
 target's RRF contribution. These validate the need for explicit boundaries
 and target identity, not the unimplemented physical plan.
 
-The fresh existing-code baseline passed 350 compiler tests, all 37
-`lance_surface_guards` tests and all 55 `search` tests, with no failures or
-ignored tests. These include
+The earlier existing-code baseline reported 350 compiler tests, 37
+`lance_surface_guards` tests and 55 `search` tests passing. These include
 `fts_prefilter_does_not_change_covered_fragment_scores` and
 `rrf_arms_scan_uncapped_in_one_pass`. These results qualify the tested current
 boundaries, not fuzzy ranked scoring, staged execution, new encoding identities
-or defaults, NFC pipeline parity, or end-to-end resource bounds.
+or defaults, NFC pipeline parity, or end-to-end resource bounds. The S3
+same-version ABA guard returns success after an environment skip when
+`OMNIGRAPH_S3_TEST_BUCKET` is absent, as it did in the 2026-09-09 local run;
+the reported passing count does not establish that remote-storage proof.
+
+The 2026-09-09 prototypes extend existing test owners:
+
+- [Lance surface guards](../../crates/omnigraph/tests/lance_surface_guards.rs):
+  `fts_statistics_scope_can_reverse_ranking` creates two real indexed Lance
+  datasets and searches identical eligible native row IDs. The first alpha
+  target scores approximately 1.145 versus beta's 0.383 under field statistics;
+  under eligible-only statistics beta scores 1.204 versus alpha's 0.357.
+  `nfc_preprocessing_requires_an_explicit_bounded_integration` checks native
+  tokenizer behavior, the ignored unknown parameter, normalization expansion,
+  and consumption of 8,194 input scalars before the first output scalar.
+- [RRF and prefilter gates](../../crates/omnigraph/tests/rrf_prefilter_gate.rs):
+  `staged_target_selection_preserves_cutoffs_and_binding_rows` exercises the
+  typed DataFusion plan described above in four input/partition configurations.
+
+All three focused probes passed against the lockfile pins. They are small
+mechanism tests; they do not measure production performance, retrieval quality,
+or resource enforcement, and do not implement the proposed query language.
+User-visible stage behavior belongs in `.gqt` cases as its grammar and runner
+support lands; native mechanisms and resource/cost contracts retain their
+existing Rust owners.
+
+The current GQT baseline passed all 60 cases and 127 runner self-tests with
+`RUST_MIN_STACK=16777216 cargo test -p omnigraph-gqt --locked -- --test-threads=2`.
+This uses CI's thread-stack setting; the initial local run without it aborted
+on a runner self-test's stack overflow. These cases qualify the current
+language, not the proposed stages.
 
 ### Research context and required qualification
 
@@ -1191,6 +1292,17 @@ Extend existing test owners rather than creating a parallel search harness:
 | Snapshot / policy / transport | `point_in_time.rs`, policy owners, server `data_routes`/`stored_queries`/`openapi`, and CLI parity for coherent follow-up, expiry/refusal, metadata, policy-safe counts and resolved query identity |
 | Format | Existing schema/rebuild and cross-version owners for resolved-default persistence/export/reapplication, stamp refusal, rewrite idempotence, unresolved encoding refusal, and representation compatibility |
 | Resource bounds | Checked-in cost instruments for NFC normalization, token construction, matching/scoring, coverage/statistics scans, graph fan-out, sort/spill, output bytes, cancellation, and shared fallback accounting |
+
+Each `.gqt` case already exercises a real temporary graph through the compiler
+and public engine API, with result-shape checks and ordered or unordered row
+expectations. It is the preferred owner for the new language's observable
+behavior. The runner's construct detection and refusal rules must evolve with
+the AST: it currently prepares indexes for search cases and refuses some
+embedding and ranked shapes. Do not infer absent-index, external-model, native
+plan, or resource coverage from a passing golden query. Extend the runner only
+where needed for a logical case; keep native index lifecycle, arithmetic near
+ties, and execution-cost assertions in their existing Rust owners. Compiler
+goldens and API/CLI contract tests still cover boundaries GQT does not invoke.
 
 Default resolution requires its own compiler/schema and query fixtures:
 
@@ -1284,8 +1396,8 @@ Refresh the compiler/engine baseline and identify the remaining RFC 0047
 guarantees before porting any prototype code.
 Settle the grammar and metric namespace, target/binding multiplicity, per-group
 semantics, complete tie comparators, and the relationship to RFC 0047. Freeze
-the exact and fuzzy scoring specifications, statistics population, vector
-numeric rules, and checked fusion arithmetic. Resolve encoding/provider
+the exact and fuzzy scoring specifications, snapshot-visible field-statistics
+accounting, vector numeric rules, and checked fusion arithmetic. Resolve encoding/provider
 identity and the shared schema-version decisions with RFCs 0040/0043/0044.
 Prototype the schema-wide default-recipe declaration and its omission/override
 rules; qualify the NFC implementation and profile fingerprint before fixing
@@ -1439,8 +1551,8 @@ release. Each extension retains its stated semantic and qualification boundary.
 1. Final clause and stage/metric spelling, symbol scope, per-group null and
    multiple-key behavior, and any user-defined selection tie keys. Settle with
    parser/typechecker prototypes and RFC 0040 namespace coordination.
-2. The numerical fuzzy scoring policy, exact BM25 term/numeric accounting,
-   and approval of the proposed eligible-population statistics definition.
+2. The numerical fuzzy scoring policy and exact BM25 term/numeric accounting,
+   including live-row statistics and polymorphic field-corpus resolution.
    These are acceptance gates, not optional future enhancements.
 3. Resolved representation serialization and immutable encoding revisions,
    schema-wide default declaration syntax and migration integration,
@@ -1519,6 +1631,20 @@ release. Each extension retains its stated semantic and qualification boundary.
   scan, index, fingerprint and budget qualification remain required. Updated
   migration, evidence and implementation phases so earlier tokenizer probes
   do not claim qualification of the revised defaults or normalization pipeline.
+
+- 2026-09-09 — selected snapshot-visible field statistics independently of
+  graph eligibility after a native Lance experiment reversed ranking when
+  only the scoring corpus changed. Added typed DataFusion execution evidence
+  for target deduplication, selection barriers, quotas, and binding preservation.
+  Confirmed that NFC requires explicit integration and accounting for byte
+  expansion and normalization work before output. The small probes qualify
+  these mechanisms, not the staged language, full resource protocol, or
+  retrieval quality; logical query cases remain owned by GQT.
+- 2026-09-09 — separated coverage knowledge from query completion. Default
+  metadata reports known counts when established and otherwise explicit
+  unknown; exact coverage is a typed, budgeted request with no silent
+  downgrade. Reconciled RFC 0047 so observability does not unconditionally
+  force exhaustive counting into bounded discovery.
 
 ## Appendix: implementation evidence (non-normative)
 

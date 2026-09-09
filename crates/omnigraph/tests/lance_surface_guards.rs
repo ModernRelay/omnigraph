@@ -4385,3 +4385,151 @@ async fn fts_prefilter_does_not_change_covered_fragment_scores() {
          the fixture cannot detect filter-dependent scoring and this guard is vacuous"
     );
 }
+
+/// RFC 0048 decision probe: eligibility and the scoring corpus are independent.
+/// Rebuilding an eligible subset changes IDF and can reverse the winner; an
+/// external row mask changes eligibility while retaining the original scores.
+#[tokio::test]
+async fn fts_statistics_scope_can_reverse_ranking() {
+    use lance::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let params = InvertedIndexParams::default()
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false)
+        .max_token_length(None);
+    let mut rankings = Vec::new();
+    for (name, texts) in [
+        (
+            "field",
+            vec![
+                "alpha", "alpha", "alpha", "beta", "beta", "beta", "beta", "beta", "beta", "beta",
+            ],
+        ),
+        ("eligible", vec!["alpha", "alpha", "alpha", "beta"]),
+    ] {
+        let ids: Vec<_> = (0..texts.len()).map(|i| format!("d-{i:02}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(texts)),
+            ],
+        )
+        .unwrap();
+        let uri = dir.path().join(name);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        let mut scan = dataset.scan();
+        scan.full_text_search(
+            FullTextSearchQuery::new("alpha beta".to_string())
+                .with_column("text".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            0u64, 1, 2, 3,
+        ])));
+        scan.project(&["id"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("_score")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        let mut ranked: Vec<_> = (0..batch.num_rows())
+            .map(|i| (ids.value(i).to_string(), scores.value(i)))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        assert_eq!(ranked.len(), 4);
+        println!("{name} statistics over identical eligible rows: {ranked:?}");
+        rankings.push(ranked);
+    }
+    assert_eq!(
+        rankings[0][0].0, "d-00",
+        "alpha is rarer in the full field corpus"
+    );
+    assert_eq!(
+        rankings[1][0].0, "d-03",
+        "beta is rarer in the eligible corpus"
+    );
+}
+
+/// RFC 0048 qualification probe. The public tokenizer can be reused after
+/// NFC, but neither a token filter nor an ignored training-JSON field adds
+/// the necessary preprocessing to the native index builder.
+#[test]
+fn nfc_preprocessing_requires_an_explicit_bounded_integration() {
+    use std::cell::Cell;
+    use unicode_normalization::UnicodeNormalization;
+
+    let params = InvertedIndexParams::default()
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false)
+        .max_token_length(None);
+    let tokens = |text: &str| {
+        let mut tokenizer = params.build().unwrap();
+        let mut stream = tokenizer.token_stream_for_doc(text);
+        let mut terms = Vec::new();
+        while stream.advance() {
+            terms.push(stream.token().text.clone());
+        }
+        terms
+    };
+    let composed = "résumé";
+    let decomposed = "re\u{301}sume\u{301}";
+    assert_ne!(tokens(composed), tokens(decomposed));
+    assert_eq!(
+        tokens(&composed.nfc().collect::<String>()),
+        tokens(&decomposed.nfc().collect::<String>())
+    );
+
+    let mut json = serde_json::to_value(&params).unwrap();
+    json["normalization"] = serde_json::json!("NFC");
+    let decoded: InvertedIndexParams = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        decoded, params,
+        "the pin ignores this unknown field; it must not count as NFC support"
+    );
+
+    // Output cannot be budgeted solely from input bytes: composition
+    // exclusions can make even NFC larger, without compatibility folding.
+    let expanding = "\u{0344}";
+    let normalized: String = expanding.nfc().collect();
+    assert_eq!(expanding.len(), 2);
+    assert_eq!(normalized.len(), 4);
+
+    // Checking cancellation only after yielded normalized characters misses
+    // the buffering and canonical ordering of a long nonstarter sequence.
+    let input = format!("a{}\u{0300}", "\u{0315}".repeat(8192));
+    let consumed = Cell::new(0);
+    let mut normalized = input
+        .chars()
+        .inspect(|_| consumed.set(consumed.get() + 1))
+        .nfc();
+    assert_eq!(normalized.next(), Some('à'));
+    assert!(consumed.get() >= 8194);
+    println!(
+        "NFC: 2 input bytes expand to 4; {} input scalars consumed before first output scalar",
+        consumed.get()
+    );
+}

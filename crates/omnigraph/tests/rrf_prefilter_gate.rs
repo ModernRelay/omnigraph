@@ -49,6 +49,182 @@ use omnigraph_compiler::result::QueryResult;
 
 use helpers::*;
 
+/// RFC 0048's relational selection prototype. This checks DataFusion's
+/// public operators, not the unimplemented GQ stage lowering. Graph paths
+/// are represented by repeated target rows so deduplication must precede
+/// target windows; a semi-join then restores every selected binding row.
+#[tokio::test]
+async fn staged_target_selection_preserves_cutoffs_and_binding_rows() {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::dataframe::DataFrame;
+    use datafusion::functions_window::row_number::row_number;
+    use datafusion::logical_expr::{ExprFunctionExt, JoinType, Partitioning};
+    use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
+
+    async fn ids(frame: DataFrame) -> Vec<String> {
+        frame
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                ids.iter()
+                    .map(|id| id.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("group_key", DataType::Utf8, false),
+        Field::new("score", DataType::Int64, false),
+        Field::new("binding_id", DataType::Utf8, false),
+    ]));
+    for partitions in [1, 4] {
+        for reverse in [false, true] {
+            let mut rows = vec![
+                ("a", "x", 10, "path-1"),
+                ("a", "x", 10, "path-2"),
+                ("a", "x", 10, "path-3"),
+                ("b", "x", 9, "path-4"),
+                ("c", "y", 8, "path-5"),
+            ];
+            if reverse {
+                rows.reverse();
+            }
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let ctx = SessionContext::new_with_config(
+                SessionConfig::new()
+                    .with_target_partitions(partitions)
+                    .with_batch_size(1),
+            );
+            let bindings = ctx
+                .read_batch(batch)
+                .unwrap()
+                .repartition(Partitioning::RoundRobinBatch(partitions))
+                .unwrap();
+            let target_fields = || vec![col("id"), col("group_key"), col("score")];
+            let targets = bindings
+                .clone()
+                .select(target_fields())
+                .unwrap()
+                .distinct()
+                .unwrap();
+            let order = || vec![col("score").sort(false, false), col("id").sort(true, false)];
+            let top_two = targets
+                .clone()
+                .sort(order())
+                .unwrap()
+                .limit(0, Some(2))
+                .unwrap();
+            assert_eq!(ids(top_two.clone()).await, ["a", "b"]);
+
+            // Filtering after the global cut cannot refill from c; filtering
+            // before selection has a different logical population.
+            assert!(
+                ids(top_two
+                    .clone()
+                    .filter(col("group_key").eq(lit("y")))
+                    .unwrap())
+                .await
+                .is_empty()
+            );
+            assert_eq!(
+                ids(targets
+                    .clone()
+                    .filter(col("group_key").eq(lit("y")))
+                    .unwrap()
+                    .sort(order())
+                    .unwrap()
+                    .limit(0, Some(2))
+                    .unwrap())
+                .await,
+                ["c"]
+            );
+
+            // Quotas apply to distinct targets, not graph paths. The full
+            // population has one winner in each group; the cut input only x.
+            let quota = |input: DataFrame| {
+                input
+                    .window(vec![
+                        row_number()
+                            .partition_by(vec![col("group_key")])
+                            .order_by(order())
+                            .build()
+                            .unwrap()
+                            .alias("within_group"),
+                    ])
+                    .unwrap()
+                    .filter(col("within_group").lt_eq(lit(1_u64)))
+                    .unwrap()
+                    .sort(order())
+                    .unwrap()
+            };
+            assert_eq!(ids(quota(targets.clone())).await, ["a", "c"]);
+            assert_eq!(ids(quota(top_two.clone())).await, ["a"]);
+
+            let selected_ids = top_two.select(vec![col("id")]).unwrap();
+            let selected_bindings = bindings
+                .clone()
+                .join(selected_ids, JoinType::LeftSemi, &["id"], &["id"], None)
+                .unwrap()
+                .sort(order())
+                .unwrap();
+            assert_eq!(ids(selected_bindings.clone()).await, ["a", "a", "a", "b"]);
+            assert_eq!(
+                ids(selected_bindings
+                    .select(vec![col("binding_id").alias("id")])
+                    .unwrap()
+                    .sort(vec![col("id").sort(true, false)])
+                    .unwrap())
+                .await,
+                ["path-1", "path-2", "path-3", "path-4"]
+            );
+
+            // Red control: counting paths as candidates makes a consume both
+            // slots. The oracle must distinguish that implementation.
+            let wrong = bindings
+                .sort(order())
+                .unwrap()
+                .limit(0, Some(2))
+                .unwrap()
+                .select(target_fields())
+                .unwrap()
+                .distinct()
+                .unwrap();
+            assert_eq!(ids(wrong).await, ["a"]);
+            println!("staged selection passed: partitions={partitions}, reversed={reverse}");
+        }
+    }
+}
+
 const GATE_SCHEMA: &str = r#"
 node Chunk {
     slug: String @key
