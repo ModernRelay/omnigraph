@@ -17,7 +17,16 @@ cargo bench --locked -p omnigraph-engine --bench scenarios -- \
 ```
 
 Use `branch-create`, `branch-create-from`, `branch-list`, or `branch-delete`.
-`--branches` counts existing siblings, excluding `main` and the delete target;
+
+The same setup/operation/verify owner also provides:
+
+- `branch-pointer-adopt-lazy`: fast-forward a changed source into a lazy named target.
+- `branch-pointer-adopt-owned`: fast-forward a descendant source into a named target that already owns a table fork.
+- `branch-first-write`: append one row to a target that inherits its source's table fork.
+- `branch-cleanup`: collect retired forks while preserving a native table parent required by a live child.
+
+These four scenarios verify complete rows, exact published table pins and physical table refs outside the timed operation. Pointer scenarios require zero instrumented table writes and verify a later isolated target write in the separate verification child. Cleanup creates collectible work even with `--retired-branches 0`; its effective collectible count is recorded separately. The age/cache/layout controls remain available, and the full-row fixtures are bounded to 16,384 rows, 16 dimensions and eight branches/tables. A larger cold fixture with a one-row delta can use `--rows 4096 --dims 4`; warm/compacted controls retain their smaller limits. Setup and the verification child's isolation write are never included in operation latency.
+`--branches` counts existing siblings, excluding `main` and scenario-specific targets or cleanup parent/child branches;
 `--tables` counts populated tables. One table contains `--rows` vectors of
 `--dims` dimensions, and each remaining table contains one scalar row.
 Create-from uses a named source with data distinct from main. The delete
@@ -28,8 +37,8 @@ Each repetition prepares a fresh fixture, measures one public operation, and
 verifies the resulting branch registry and pinned table views in separate
 processes. Operation time excludes graph open. Operation-process peak RSS
 includes runtime initialization and graph open, but excludes setup and final
-verification. Delete reports acknowledgement and completed reclamation
-separately. Compare identical parameters, builds, and machines; these JSONL
+verification. Delete leaves table forks for explicit cleanup and reports no
+reclaim wait. Compare identical parameters, builds, and machines; these JSONL
 records are diagnostic evidence and do not enter the durable archive.
 
 `fenced-adopt-all-new` measures an insertion-only merge into an unchanged
@@ -47,8 +56,9 @@ to a single-path throughput sample.
 forking, then restores its original embedding. The accepted row count and
 content stay fixed while graph commits, table versions, and deletion history
 accumulate. N defaults to zero and must be even, at most 256.
-`--retired-branches N` creates, writes, deletes, and awaits reclamation of N
-temporary branches before the measured workload, at most 32. This is a
+`--retired-branches N` creates, writes and deletes N temporary graph branches
+before the measured workload, at most 32. Their table forks remain until
+explicit cleanup. This is a
 separate churn dimension; retired branches do not add reachable main history.
 Both options apply to branch controls and `general-merge-updates` only.
 The setup records and checks actual history growth and content restoration.
@@ -114,8 +124,9 @@ memory pool, and three-second pauses between points. These are recorded
 runtime settings, not a hard CPU or process-memory cap. Each point has a
 180-second whole-process watchdog. All child phases and fixture parameters
 must verify before a sample is accepted. Counters cover foreground operation
-I/O; deferred reclaim I/O is outside their task-local scope. Open time and
-delete completion time remain separate from acknowledgement latency.
+I/O through instrumented handles, including the exported table-write count;
+they do not represent all storage requests or deletes. Explicit cleanup is
+a separate scenario. Open time remains separate from operation latency.
 Explicit age runs of create/create-from additionally time the first accepted
 snapshot, pinned opens, and one payload row per inherited table after the fork.
 Those reads have separate counters and do not enter acknowledgement or

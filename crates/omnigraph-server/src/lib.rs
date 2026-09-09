@@ -2101,7 +2101,6 @@ async fn serve_config(
         Arc::clone(&draining),
         shutdown_grace,
     );
-    let registry = Arc::clone(&state.routing.registry);
     let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {
@@ -2112,12 +2111,6 @@ async fn serve_config(
             }
         })
         .await;
-    // The drain finishes in-flight requests, but branch_delete's fork
-    // reclaims run as detached tasks; join them on both exit paths so
-    // shutdown does not strand leftovers.
-    for graph in registry.list() {
-        graph.engine.wait_for_fork_reclaims().await;
-    }
     served?;
     Ok(())
 }

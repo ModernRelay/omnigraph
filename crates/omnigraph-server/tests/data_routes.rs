@@ -2763,7 +2763,7 @@ async fn remote_branch_delete_flow_works() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn branch_merge_delete_branch_deletes_source_after_merge() {
+async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let (_temp, app) = app_for_loaded_graph().await;
 
     let create = BranchCreateRequest {
@@ -2800,6 +2800,22 @@ async fn branch_merge_delete_branch_deletes_source_after_merge() {
     .await;
     assert_eq!(change_status, StatusCode::OK);
 
+    let create_child = BranchCreateRequest {
+        from: Some("feature".to_string()),
+        name: "feature-child".to_string(),
+    };
+    let (create_child_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create_child).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(create_child_status, StatusCode::OK);
+
     let merge = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
@@ -2830,38 +2846,32 @@ async fn branch_merge_delete_branch_deletes_source_after_merge() {
     )
     .await;
     assert_eq!(list_status, StatusCode::OK);
-    assert_eq!(list_body["branches"], json!(["main"]));
+    assert_eq!(list_body["branches"], json!(["feature-child", "main"]));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     let (_temp, app) = app_for_loaded_graph().await;
 
-    for (from, name) in [("main", "feature"), ("feature", "feature-child")] {
-        let create = BranchCreateRequest {
-            from: Some(from.to_string()),
-            name: name.to_string(),
-        };
-        let (create_status, _) = json_response(
-            &app,
-            Request::builder()
-                .uri(g("/branches"))
-                .method(Method::POST)
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&create).unwrap()))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(create_status, StatusCode::OK);
-    }
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "feature".to_string(),
+    };
+    let (create_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK);
 
-    // No writes on `feature`, so the merge is `already_up_to_date` — the
-    // deletion must still be attempted (the "already merged, clean me up"
-    // case) and its refusal (a dependent descendant branch) must be reported
-    // without failing the request.
     let merge = BranchMergeRequest {
-        source: "feature".to_string(),
-        target: Some("main".to_string()),
+        source: "main".to_string(),
+        target: Some("feature".to_string()),
         delete_branch: true,
     };
     let (merge_status, merge_body) = json_response(
@@ -2881,7 +2891,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
         merge_body["branch_delete_error"]
             .as_str()
             .unwrap()
-            .contains("feature-child")
+            .contains("cannot delete branch 'main'")
     );
 
     let (list_status, list_body) = json_response(
@@ -2894,10 +2904,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     )
     .await;
     assert_eq!(list_status, StatusCode::OK);
-    assert_eq!(
-        list_body["branches"],
-        json!(["feature", "feature-child", "main"])
-    );
+    assert_eq!(list_body["branches"], json!(["feature", "main"]));
 }
 
 #[tokio::test(flavor = "multi_thread")]

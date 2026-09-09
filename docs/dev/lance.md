@@ -1,6 +1,7 @@
 # Lance documentation index
 
-**Pinned dependency:** Lance 11.0.0, complete package family
+**Pinned dependency:** unmodified crates.io Lance 11.0.0, complete package
+family. OmniGraph does not vendor or patch Lance.
 **Purpose:** required upstream reading and current OmniGraph compatibility
 fences
 
@@ -162,21 +163,72 @@ history of dependency bumps.
 | Surface | Current fence | Test owner |
 |---|---|---|
 | File format | Every production write explicitly selects stable V2_2; experimental V2_3 is not part of the graph contract. | `lifecycle.rs`, write-site source guards |
-| Graph keys | Every v6 node/edge table has exact non-null `id` as its unenforced primary key. Strict insert/upsert uses the sealed filter-bearing adapter; raw keyed Append is forbidden. | `lance_surface_guards.rs`, staged-table tests, `forbidden_apis.rs` |
+| Graph keys | Current schema-v8 node/edge tables retain the exact non-null `id` unenforced primary key introduced in v6. Strict insert/upsert uses the sealed filter-bearing adapter; raw keyed Append is forbidden. | `lance_surface_guards.rs`, staged-table tests, `forbidden_apis.rs` |
 | Stable row IDs | Graph tables use stable row IDs; delete/update/index maintenance must retain their mapping. Overwrite allocates fresh IDs and restore retains the allocation high-water marks. Staged-view IDs are provisional, not committed identity. | `lance_surface_guards.rs`, staged-table tests, `writes.rs` |
 | KNN result order | A late payload-hydration plan can lose global ordering metadata, so nearest requests one final output partition. Internal reads remain parallel. | `lance_surface_guards.rs`, `search.rs` |
 | KNN probe budget | A `nearest` scan sets `maximum_nprobes` per index delta and widens it from Lance's execution summary (`partitions_searched` / `partitions_ranked`, read through `scan_stats_callback`); a prefilter admitting fewer rows than `k` makes Lance emit the unreached rows at `_distance = +inf`, which the engine resolves with a flat exact rescan (`use_index(false)`); `count_rows(None)` is the live row count (deletions excluded), read for the ladder's exhaustion stop and as the overfetch loop's exact-pass `k`. A renamed counter or marker turns the ladder fail-closed. | `lance_surface_guards.rs`, `search.rs` |
 | Full-text analyzer | Every selected FTS segment needs artifact-scoped compatibility proof. Explicit branch rebuilds replace all segments from rows; old snapshots may refuse FTS. | staged-table tests, `search.rs`, `maintenance.rs` |
 | Blob v2 | Null, valid empty, non-empty, selector cardinality, neighboring bytes, and 3→1 compaction are pinned on Lance 11. | `lance_surface_guards.rs`, `maintenance.rs` |
 | Index coverage | Indexes are derived. Rewrites and compaction may leave an uncovered tail; reads must combine indexed and scan paths until explicit reconciliation. | `scalar_indexes.rs`, `search.rs`, `maintenance.rs` |
-| Branches/tags | Native refs are per dataset. Every graph-branch life is a ref named `{logical}.{ULID}` (bare names are legacy lives), so a recreated branch never shares a `tree/` path or cache key with its predecessor; the `__manifest` ref list is the branch registry. OmniGraph validates ref incarnation and coordinates graph-level authority through `__manifest`. Lance also refuses force deletion while a tag targets that native branch. | `branching.rs`, `lance_surface_guards.rs` |
-| Cleanup | Lance protects native refs/tags; OmniGraph additionally computes graph-wide lazy-branch and recovery floors before invoking cleanup. | `maintenance.rs` |
+| Inherited index files | An engine `CommitHandler` adapter repairs stock Lance's nested-clone index origins within the existing clone commit. Exact source metadata preserves inherited `Some(base_id)` values and assigns the immediate-source base only to source-local indexes. External fragment-reuse details are read from their original base and converted to validated inline details. Invalid details fail closed before native creation. | `storage_layer::lance_clone` tests; `lance_surface_guards.rs::stock_lance_nested_clone_overwrites_inherited_index_base_issue_7840` |
+| Branches/tags | Each graph-branch lifetime is `{logical}.{ULID}`; bare names identify legacy lifetimes. Native `__manifest/_refs/branches/` entries without retirement metadata define logical branches. Deletion writes an identity-bound retirement marker through public `Branches::replace_metadata`; the same physical ref remains readable to native descendants. A native `__manifest` tag still blocks logical deletion. This does not add graph-wide tagged snapshot retention. | `branching.rs`, `lance_surface_guards.rs` |
+| Cleanup | Explicit cleanup discovers table identities through canonical manifest registrations, including tombstoned registrations, before inventorying native refs and trees. It protects exact live table refs, native ancestry, path dependencies, tags, and recovery pins. Only unprotected forks and retired leaves are reclaimed before version floors apply. Unreadable live roots abort cleanup; an invalid table inventory preserves that dataset and reports the failure. Writes and branch deletion defer physical reclamation. | `maintenance.rs`, `branching.rs` |
+| Table forks | First touch uses `fork.{incarnation}.m{base_version}.{commit_ULID}`, at most 80 ASCII bytes, independently of logical-name length. Legacy owners use `legacy` in the incarnation position. The existing commit ULID distinguishes attempts; registration metadata proves ownership, and source-pointer adoption preserves it. Missing legacy ownership requires exact ref equality. Naming and the existing live-only write identifier lookup add no storage requests. | `long_branch_names_first_touch.gqt`, `branching.rs`, `failpoints.rs`, metadata tests |
 | MemWAL | Upstream support exists, but OmniGraph's RFC 0018 and RFC 0026 experiments were removed. No stream profile, token ledger, hidden stream column, or `_mem_wal` path is current. | `lifecycle.rs`, cluster removed-field diagnostics |
+
+The clone adapter is installed during normal dataset opens and initial dataset
+creation, preserving configured commit handlers without an additional reopen.
+Exact, version-pinned source context scopes native branch creation. The adapter
+validates the clone target, source bases and index metadata, then delegates the
+existing manifest writer and transaction to the original handler. Ordinary
+commits pass through without capturing index metadata; indexed fork preparation
+reads the source's immutable index section, while an absent section skips that
+read. The adapter adds no separate index-object write or manifest publication.
+
+External fragment-reuse details are read through the index's original
+`base_id`, using checked offset/size arithmetic and the actual file length.
+Public typed decoding validates the payload before embedding it in the same
+clone manifest. Missing, malformed or out-of-bounds details refuse native
+creation. Reads, memory and the resulting inline manifest bytes scale with
+that payload; this is not constant-cost metadata work. Current stable-row-ID
+compaction does not produce external fragment-reuse details, but the adapter
+preserves this stock Lance representation. The existing adapter tests cover
+successive mixed-base clones, cold full-text/vector queries, and local and
+inherited external fragment-reuse origins.
+
+Schema v8 defines native-ref retirement metadata. Normal open requires v8;
+qualified v6/v7 graphs have explicit offline routes to it. The v7 → v8 handler
+changes only manifest configuration metadata and does not infer fork ownership
+or retire branches. Source v6/v7 graphs with reserved retirement metadata refuse;
+current v8 no-op admission validates markers and counts only live logical refs
+while retaining physical ancestors. Older binaries must not expose retired refs
+as live branches. This stamp is separate from recovery-sidecar protocol versions.
+See [versioning](versioning.md).
+
+Stock `Branches::get` and `list` include every physical ref. OmniGraph's logical
+manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
+version-1 JSON value binding the exact native name and identifier. An absent
+marker means live; malformed, unsupported, or mismatched metadata fails closed.
+The metadata update publishes retirement without removing native ancestry.
+It preserves unrelated metadata and resolves a lost acknowledgement by reading
+back the exact marker. Native branch controls rely on OmniGraph's existing
+process-local serialization. Cold logical enumeration reads retained refs too;
+cached named-write admission checks the existing ref lookup without an added
+request. Cleanup reclaims only unneeded physical leaves.
+
+`--keep N` bounds version pruning within retained datasets; it does not count
+graph commits or retain unused forks indefinitely. `--older-than` also gates
+whole-fork collection using tree and native ref object timestamps before
+closing over dependencies. Any recent object retains the fork, including a
+fresh retirement metadata update over an old tree. Ref metadata listings for this age
+check occur only during cleanup with an explicit age policy.
 
 ## Dependency bump checklist
 
 1. Fetch every full page in every affected domain.
-2. Inspect the complete upstream tag/source and dependency delta.
+2. Inspect the complete upstream release/source and dependency delta. Re-audit
+   the public API assumptions behind every engine compatibility adapter;
+   preserve unmodified crates.io dependencies.
 3. Run `lance_surface_guards` first; a red guard is a required design review,
    not a test to weaken.
 4. Run focused write, merge, search, maintenance, Blob, branch, and recovery

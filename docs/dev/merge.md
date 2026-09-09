@@ -37,16 +37,18 @@ An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
 
-On the adopt route a source on main is adopted as a pointer switch onto main's
-lineage, even when the target branch owns a table ref and whatever the numeric
-versions say: the route is chosen by ownership shape, and the registration
-carries the manifest version (RFC 0062). The owned ref is detached, not
-written to. Children that pinned it keep reading it, because
-reclamation counts every live branch's pins; the former owner's next
-first-touch write on that table reports `detached native lineage` instead of
-recreating the ref. A source on a branch merging into a target that owns the
-table applies its delta onto the target's ref; an empty delta keeps the
-complete target entry.
+On the adopt route, every named target selects the source's exact table ref,
+version, and metadata, including when the target already owns a fork. Main
+keeps its data-delta route for a source on a named ref. Numeric table versions
+are not compared across refs: the publication's manifest version orders the
+registration within the graph branch (RFC 0062).
+
+The source's owner metadata stays with an adopted pointer. A later target
+write creates a unique target-owned fork from the accepted source version.
+Old target forks remain available to other branches and native descendants;
+explicit cleanup reclaims only forks outside that protection set. Pointer
+adoption still computes any required validation delta and runs the shared
+constraint evaluator.
 
 ## Proven insertion route
 
@@ -116,7 +118,7 @@ versions, and `C` the bounded publish chunks.
 
 | Route | Classification | Publication |
 |---|---|---|
-| Pointer adoption | Metadata-only when no validation delta is needed; otherwise the delta may require base/source ordered scans | Native-ref or manifest-pointer change; no row copy |
+| Pointer adoption | Metadata-only when no validation delta is needed; otherwise the delta may require base/source ordered scans | Manifest-pointer change; no table fork or row copy |
 | Proven insertion replay | Walk `K <= 1,024` transaction records and scan only the certified source interval | `C <= 1,024` join-free fenced inserts; no target ID preflight or MergeInsert join |
 | Adopt with delta | At least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
 | General three-way | Lineage candidate discovery and filtered reads when proven; otherwise at least three full ordered scans | New rows use preflighted fenced inserts; existing rows use `KnownPresentUpdate`; deletes are chunked |
@@ -204,8 +206,8 @@ ordered-cursor counts do not measure. Other useful signals are:
 - high `ProvenInsertHistory` means the retained transaction walk dominates;
 - high `ProvenInsertPlanScan` means scanning or materializing the certified
   source interval dominates;
-- any ordered cursor on an insert-only merge means the provenance proof missed
-  and classification fell back;
+- ordered cursors on a named-target pointer adoption can be required for
+  validation; on a main-target insert replay they indicate a provenance miss;
 - high `KeyedStage` means target lookup/join or Blob materialization dominates;
 - high `ManifestPublish` with a tiny delta points to manifest history or CAS
   retries;
@@ -233,9 +235,11 @@ structured result to its public 409 representation.
 
 ## Publication and recovery
 
-All productive table routes feed one BranchMerge recovery sidecar. Pointer
-changes, table effects, target authority, and pre-minted graph lineage are fixed
-before the first effect. The target becomes visible through one manifest CAS.
+A merge with physical table effects uses one BranchMerge recovery sidecar.
+Its complete intended delta includes pointer-only siblings as well as the
+physical effects. Unique first-touch names and owners are fixed in that sidecar
+before native creation. A merge containing only pointer changes needs no table
+effect sidecar. Both routes publish the target through one manifest CAS.
 
 After recovery arm, a failed table link or publish retains recovery ownership
 and returns `RecoveryRequired`. Merge does not re-run semantic classification

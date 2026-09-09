@@ -5,13 +5,16 @@ for a registered route, or export/import with a source-compatible binary when
 no route exists. Storage formats, release versions and full-text index formats
 are separate; check the [release notes](../../releases/) before upgrading.
 
-## Explicit v6 to v7 storage migration
+## Explicit storage migration
 
-`omnigraph upgrade` converts standalone v6 graphs created by the 0.9.x/0.10.x
-release lines to v7 in the same location. It appends manifest metadata and reuses
-table data. It preserves branch ancestry, IDs, property values, schema identity,
-retained commit IDs and numeric snapshots. Historical v6 snapshots keep their
-original metadata and use an explicit legacy decoder after root admission.
+`omnigraph upgrade` defaults to storage format v8 in the same location.
+Qualified standalone v6 graphs from the 0.9.x/0.10.x release lines run v6 → v7
+registration conversion followed by metadata-only v7 → v8 conversion. Qualified
+v7 development graphs run only the final step. Both reuse table data and preserve
+branch ancestry, IDs, property values, schema identity, retained commit IDs and
+numeric snapshots. Historical v6 snapshots keep their original metadata and use
+an explicit legacy decoder after root admission; historical v7 snapshots keep
+their registration-clock interpretation.
 
 1. Stop every server, embedded writer, maintenance process and cluster apply
    that could touch the graph or its shared dependencies. A process-local lock
@@ -21,12 +24,15 @@ original metadata and use an explicit legacy decoder after root admission.
 3. Run preflight with the new binary:
 
    ```bash
-   omnigraph upgrade ./graph.omni --check --to-format 7 --json
+   omnigraph upgrade ./graph.omni --check --to-format 8 --json
    ```
 
 4. Inspect `outcome`, `findings`, `route` and `work`. A passing check is advisory;
-   execution repeats validation. Resolve source recovery with the compatible
-   source executable before retrying. Shared Lance files outside the root refuse.
+   execution repeats validation. For v6 → v8, `work.deferred_checks` identifies
+   checks requiring the intermediate v7 output. Execution validates these before
+   the v7 → v8 handler has effects; a passing check does not pre-approve them.
+   Resolve source recovery with the compatible source executable before retrying.
+   Shared Lance files outside the root refuse.
    `work.external_blob_exclusions` lists external URI bytes whose immutability
    and backup are outside the migration guarantee; their descriptors are retained.
    `work.historical_blob_identity_limits` lists pre-0.10 Blob fields without
@@ -38,7 +44,7 @@ original metadata and use an explicit legacy decoder after root admission.
 5. Execute while the graph remains offline:
 
    ```bash
-   omnigraph upgrade ./graph.omni --to-format 7 --json
+   omnigraph upgrade ./graph.omni --to-format 8 --json
    ```
 
 6. Verify reads on every branch and retained snapshot, then start only the new
@@ -46,17 +52,28 @@ original metadata and use an explicit legacy decoder after root admission.
    with the old executable; old bytes remaining in the upgraded root do not
    make downgrading safe. Post-upgrade writes are absent from that backup.
 
-`--to-format` defaults to the binary's declared target, currently 7. Unsupported
-sources and targets refuse; there is no automatic data-moving fallback. Both
-check and execution return zero only for success (`check_passed`, `completed`
-or `already_current`). Repeated successful execution is a no-write no-op.
+`--to-format` defaults to 8. Explicit `--to-format 7` stops at v7 for a
+v7-compatible executable; the current binary accepts only v8 for normal open
+and will refuse that intermediate result. Unsupported sources and targets
+refuse; there is no automatic data-moving fallback. Both check and execution
+return zero only for success (`check_passed`, `completed` or `already_current`).
+Repeated successful execution is a no-write no-op after admission checks.
 
-After the early fence, ordinary opens refuse until every branch is converted
-and validated. If interrupted, retain the backup and rerun the same command
-with `--to-format 7`, without `--check`, using this upgrade-capable executable.
-The report identifies the last durable boundary and required recovery action.
-Unknown ownership or foreign branch movement requires investigation; never
-delete the pending marker to force serving or point the source executable at it.
+After each handler's early fence, ordinary opens refuse until every branch is
+converted and validated and main activates that handler's target. If interrupted,
+retain the backup and rerun the same requested target without `--check`, using
+this upgrade-capable executable. An earlier pending v6 → v7 attempt keeps its
+exact original protocol, target and attempt identity; requesting v8 first
+finishes that attempt, then runs v7 → v8. Requesting v7 cannot downgrade or
+resume a pending v7 → v8 attempt. The report identifies the last durable boundary
+and required recovery action. Unknown ownership or foreign branch movement
+requires investigation; never delete the pending marker to force serving or
+point the source executable at it.
+
+Source v6/v7 graphs containing reserved native-ref retirement metadata refuse
+conversion. On a current v8 graph, admission validates that metadata and excludes
+valid retired refs from logical branch enumeration while retaining their physical
+ancestry. Upgrade neither retires branches nor reclaims their storage.
 
 Branch naming must also be unambiguous. A native name ending in a ULID-shaped
 suffix could be either a v0.9 logical name or a newer branch incarnation. The
@@ -67,7 +84,7 @@ incarnation-shaped inner path segments also refuse. Resolve the branch naming
 with the source executable or use the export/rebuild fallback; do not rename
 native Lance refs or edit their metadata manually.
 
-This initial handler bounds each retained manifest to 1,000,000 rows and 64 MiB
+Upgrade admission bounds each retained manifest to 1,000,000 rows and 64 MiB
 of decoded batch metadata, 1,024 native branches and 100,000 retained versions
 per branch. Version references are counted before historical manifests are
 loaded. Exceeding a bound refuses before conversion. Payload bytes copied
@@ -101,9 +118,9 @@ upgrade is proven. See the [v0.10 compatibility notes](../../releases/v0.10.0.md
 
 ## Full-text index upgrade
 
-The Lance 11 upgrade keeps graph storage format v6, entities, branches, and
-history. It changes the English stemmer used by full-text search. Old indexes
-cannot safely be searched by the new analyzer, so OmniGraph explicitly refuses
+The v0.9-to-v0.10 Lance 11 transition keeps graph storage format v6, entities,
+branches, and history. It changes the English stemmer used by full-text search.
+Old indexes cannot safely be searched by the new analyzer, so OmniGraph explicitly refuses
 full-text queries until the selected indexes have been rebuilt.
 
 1. Stop application readers and writers. Using the old CLI, inventory the live
@@ -214,7 +231,8 @@ mapping is:
 | v4 | latest 0.8.x |
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
-| v7 | current 0.11.x line; entity export/import normally not required within this generation |
+| v7 | the exact unreleased development build that wrote it |
+| v8 | current 0.11.x line; entity export/import normally not required within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary rather
 than rebuilding with it.

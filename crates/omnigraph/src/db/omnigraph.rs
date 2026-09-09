@@ -5,7 +5,6 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
-use futures::StreamExt;
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::scanner::ColumnOrdering;
@@ -30,10 +29,6 @@ use crate::storage::{
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
 
-// Bound independent control-plane reads and per-table reclaim without
-// multiplying the existing branch/table gate envelope.
-const BRANCH_CONTROL_IO_CONCURRENCY: usize = 8;
-
 mod export;
 mod optimize;
 mod repair;
@@ -48,10 +43,7 @@ pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
-pub(crate) use table_ops::{
-    DeferredTableFork, ForkRefStatus, OpenedForMutation, classify_fork_ref_with_references,
-    force_delete_orphan_ref,
-};
+pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
 use super::commit_graph::GraphCommit;
@@ -265,11 +257,6 @@ pub struct Omnigraph {
     /// The mutex serializes captures — the schema serial queue already
     /// serializes merges and branch controls at capture time.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
-    /// In-flight background fork reclaims spawned by `branch_delete`, keyed
-    /// by the deleted branch name; joined by
-    /// [`Self::wait_for_fork_reclaims`]. Dispatch prunes settled entries, so
-    /// the vec is bounded by concurrent deletes.
-    fork_reclaims: std::sync::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>,
     /// Optional policy checker for engine-layer enforcement (MR-722).
     /// `None` = no enforcement; mutating methods are unconditionally
     /// allowed (this is the embedded/dev default). `Some` = every
@@ -600,7 +587,6 @@ impl Omnigraph {
             })),
             write_queue,
             merge_authority_cache: tokio::sync::Mutex::new(None),
-            fork_reclaims: std::sync::Mutex::new(Vec::new()),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -792,7 +778,6 @@ impl Omnigraph {
             })),
             write_queue,
             merge_authority_cache: tokio::sync::Mutex::new(None),
-            fork_reclaims: std::sync::Mutex::new(Vec::new()),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -2984,317 +2969,12 @@ impl Omnigraph {
         Ok(())
     }
 
-    async fn ensure_branch_delete_safe(
-        &self,
-        control: &GraphCoordinator,
-        branch: &str,
-        branches: &[String],
-        natives: &[String],
-        descendants: &[String],
-    ) -> Result<()> {
-        // Surviving branches inherit forks by native ref, so dependency
-        // detection compares against the delete target's native name.
-        let delete_target_native = control.native_branch().ok_or_else(|| {
-            OmniError::manifest_internal(format!("branch '{branch}' resolved without a native ref"))
-        })?;
-        let path_prefix = format!("{branch}/");
-        if let Some(child) = branches
-            .iter()
-            .find(|candidate| candidate.starts_with(&path_prefix))
-        {
-            return Err(OmniError::manifest_conflict(format!(
-                "cannot delete branch '{branch}' while live branch '{child}' shares its physical \
-                 Lance path; delete the child branch first"
-            )));
-        }
-
-        if let Some(descendant) = descendants.first() {
-            return Err(OmniError::manifest_conflict(format!(
-                "cannot delete branch '{}' because descendant branch '{}' still depends on it",
-                branch, descendant
-            )));
-        }
-
-        // Dependency detection reads ONLY each surviving branch's manifest
-        // `table_branch` entries. The schema-control gate held by the caller
-        // serializes native branch create/delete, while the target branch and
-        // table gates prevent a writer from creating new target-owned state.
-        // An ordinary write to a surviving branch can only replace an inherited
-        // target fork with that branch's own fork, so a concurrent write can
-        // make this check conservatively stale-true, never stale-false. The
-        // cold proof therefore does not need a discarded full incarnation
-        // capture. Reusing an already loaded snapshot does require a fresh
-        // incarnation probe, which replaces the cold manifest reconstruction.
-        // General coordinator/OCC/feed opens retain the coherent incarnation
-        // capture required by RFC-030.
-        let session = self.control_session();
-        let candidates = branches
-            .iter()
-            .filter(|candidate| candidate.as_str() != branch)
-            .cloned()
-            .collect::<Vec<_>>();
-        let checks = candidates.into_iter().map(|other_branch| {
-                let session = &session;
-                async move {
-                let candidate_branch = Self::normalize_branch_name(&other_branch)?;
-                let candidate_native = match candidate_branch.as_deref() {
-                    None => None,
-                    Some(logical) => Some(
-                        crate::branch_names::resolve_native_branch(
-                            natives.iter().map(String::as_str),
-                            logical,
-                        )?
-                        .ok_or_else(|| OmniError::BranchNotFound {
-                            branch: logical.to_string(),
-                        })?,
-                    ),
-                };
-                let depends = match self
-                    .verified_dependency_snapshot_under_control_gates(
-                        candidate_branch.as_deref(),
-                        candidate_native.as_deref(),
-                    )
-                    .await?
-                {
-                    Some(snapshot) => snapshot.datasets().any(|entry| {
-                        entry.native_dataset_branch.as_deref() == Some(delete_target_native)
-                    }),
-                    None => crate::db::manifest::ManifestCoordinator::branch_depends_on_delete_target_under_control_gates(
-                        self.uri(),
-                        candidate_native.as_deref(),
-                        delete_target_native,
-                        session,
-                    )
-                    .await?,
-                };
-                if depends {
-                    return Err(OmniError::manifest_conflict(format!(
-                        "cannot delete branch '{}' because branch '{}' still depends on it",
-                        branch, other_branch
-                    )));
-                }
-                Ok(())
-                }
-            });
-        // Keep the existing deterministic refusal order while overlapping a
-        // bounded number of independent manifest reads. The gates remain held
-        // until every dependency proof succeeds and publication completes.
-        let mut checks = futures::stream::iter(checks).buffered(BRANCH_CONTROL_IO_CONCURRENCY);
-        while let Some(check) = checks.next().await {
-            check?;
-        }
-
-        Ok(())
-    }
-
-    /// Reuse an already loaded dependency view only inside deletion's control
-    /// envelope. Its native ref must be the one just listed, and its complete
-    /// incarnation must still be current. Stale/missing views use the existing
-    /// manifest-only proof; unreadable authority still fails closed. This does
-    /// not populate or refresh the cache while surveying surviving branches.
-    async fn verified_dependency_snapshot_under_control_gates(
-        &self,
-        branch: Option<&str>,
-        native: Option<&str>,
-    ) -> Result<Option<Snapshot>> {
-        {
-            let coord = self.coordinator.read().await;
-            if coord.current_branch() == branch && coord.native_branch() == native {
-                let held = coord.manifest_incarnation();
-                if coord.probe_latest_incarnation().await?.matches(&held) {
-                    return Ok(Some(coord.snapshot()));
-                }
-            }
-        }
-        let cache = self.merge_authority_cache.lock().await;
-        if let Some((_, coord)) = cache.as_ref()
-            && coord.current_branch() == branch
-            && coord.native_branch() == native
-        {
-            let held = coord.manifest_incarnation();
-            if coord.probe_latest_incarnation().await?.matches(&held) {
-                return Ok(Some(coord.snapshot()));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Best-effort reclaim of the per-table Lance forks a just-deleted branch
-    /// owned. Runs AFTER the manifest authority flip, so the forks are
-    /// unreachable orphans; failures are logged and swallowed, with the
-    /// `cleanup` reconciler as the backstop that converges any leftover.
-    /// `force_delete_branch` keeps a partially-reclaimed retry idempotent.
-    /// Owned arguments let the post-flip background task run it.
-    async fn cleanup_deleted_branch_tables(
-        store: TableStore,
-        branch: String,
-        owned_tables: Vec<(String, String)>,
-    ) {
-        let mut seen_paths = HashSet::new();
-        let mut cleanup_targets = owned_tables
-            .into_iter()
-            .filter(|(_, table_path)| seen_paths.insert(table_path.clone()))
-            .collect::<Vec<_>>();
-        cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
-
-        futures::stream::iter(cleanup_targets)
-            .for_each_concurrent(BRANCH_CONTROL_IO_CONCURRENCY, |(table_key, table_path)| {
-                let store = &store;
-                let branch = &branch;
-                async move {
-                    let dataset_uri = store.dataset_uri(&table_path);
-                    let outcome = match crate::failpoints::maybe_fail(
-                        crate::failpoints::names::BRANCH_DELETE_BEFORE_TABLE_CLEANUP,
-                    ) {
-                        Ok(()) => store.force_delete_branch(&dataset_uri, branch).await,
-                        Err(injected) => Err(injected),
-                    };
-                    if let Err(err) = outcome {
-                        tracing::warn!(
-                            target: "omnigraph::branch_delete::cleanup",
-                            branch = %branch,
-                            table = %table_key,
-                            error = %err,
-                            "best-effort fork reclaim failed; cleanup will reconcile the orphan",
-                        );
-                    }
-                }
-            })
-            .await;
-    }
-
-    /// Run the post-flip fork reclaim in a background task that holds the
-    /// request's schema, branch, and table gates until it settles, so
-    /// concurrent branch controls serialize behind the reclaim (the schema
-    /// gate is the load-bearing one for path-prefix creates and `cleanup`'s
-    /// reconciler). The export-destructive permit is deliberately NOT
-    /// carried: the reclaim removes only the deleted branch's fork trees,
-    /// which no live export cut can reference (cuts serve live branches, and
-    /// forks reference parent files, never the reverse), and the export gate
-    /// is a try-lock, so holding it would turn a post-response export into a
-    /// spurious resource-limit error instead of a wait. A reclaim that
-    /// exceeds its watchdog bound is abandoned; leftovers converge via
-    /// `cleanup` (ref still listed) or the next same-name branch create (ref
-    /// already removed, tree residue only). Without a tokio runtime the
-    /// reclaim runs inline (unbounded; the caller waits).
-    async fn dispatch_fork_reclaim(
-        &self,
-        branch: String,
-        owned_tables: Vec<(String, String)>,
-        schema_guard: crate::db::write_queue::QueueGuard,
-        branch_guard: crate::db::write_queue::QueueGuard,
-        table_guards: Vec<crate::db::write_queue::QueueGuard>,
-    ) {
-        // A branch that never forked a table has nothing to reclaim; return
-        // so the gates release at the response instead of on a task schedule.
-        if owned_tables.is_empty() {
-            return;
-        }
-        // Bounds how long a wedged object store can pin the carried gates;
-        // on expiry the reclaim future drops and the gates release.
-        const FORK_RECLAIM_ABANDON_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
-        let store = self.table_store.clone();
-        // Keeps the root write-queue manager alive (the process registry
-        // holds it Weak), so the carried gate slots keep excluding even if
-        // every Omnigraph handle for this root drops mid-reclaim.
-        let queue_manager = self.write_queue();
-        let reclaim_branch = branch.clone();
-        let reclaim = async move {
-            let _queue_manager = queue_manager;
-            let _schema_guard = schema_guard;
-            let _branch_guard = branch_guard;
-            let _table_guards = table_guards;
-            Self::cleanup_deleted_branch_tables(store, branch, owned_tables).await;
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                let watchdog_branch = reclaim_branch.clone();
-                let task = runtime.spawn(async move {
-                    if tokio::time::timeout(FORK_RECLAIM_ABANDON_AFTER, reclaim)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            target: "omnigraph::branch_delete::cleanup",
-                            branch = %watchdog_branch,
-                            timeout_secs = FORK_RECLAIM_ABANDON_AFTER.as_secs(),
-                            "background fork reclaim abandoned at the watchdog bound; \
-                             a later cleanup or same-name branch create converges the leftovers",
-                        );
-                    }
-                });
-                let settled = {
-                    let mut pending = self
-                        .fork_reclaims
-                        .lock()
-                        .expect("fork reclaim registry poisoned");
-                    let held = std::mem::take(&mut *pending);
-                    let (settled, live): (Vec<_>, Vec<_>) = held
-                        .into_iter()
-                        .partition(|(_, reclaim_task)| reclaim_task.is_finished());
-                    *pending = live;
-                    pending.push((reclaim_branch, task));
-                    settled
-                };
-                // Settled handles join without blocking; joining (instead of
-                // dropping) surfaces a panicked reclaim task's JoinError.
-                for (settled_branch, settled_task) in settled {
-                    Self::join_fork_reclaim(settled_branch, settled_task).await;
-                }
-            }
-            Err(_) => reclaim.await,
-        }
-    }
-
-    /// Join one fork reclaim task, logging a panic's JoinError (watchdog
-    /// expiry completes the task normally and logs its own warn).
-    async fn join_fork_reclaim(branch: String, task: tokio::task::JoinHandle<()>) {
-        if let Err(join_error) = task.await {
-            tracing::warn!(
-                target: "omnigraph::branch_delete::cleanup",
-                branch = %branch,
-                error = %join_error,
-                "background fork reclaim task did not run to completion; \
-                 a later cleanup or same-name branch create converges the leftovers",
-            );
-        }
-    }
-
-    /// Wait for the background fork reclaims dispatched through THIS handle
-    /// by [`Self::branch_delete`] to settle. Reclaim failures are logged,
-    /// never surfaced. Call it before process exit (the CLI does), before
-    /// dropping a current-thread runtime, or in tests that assert on fork
-    /// state.
-    ///
-    /// Intended for a single waiter: it drains the registry, so a concurrent
-    /// second caller may return before the drained reclaims settle. Must not
-    /// be called while holding write-queue gates: the joined tasks hold the
-    /// schema, branch, and dataset gates until they finish.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the fork reclaim registry mutex is poisoned.
-    pub async fn wait_for_fork_reclaims(&self) {
-        let pending = {
-            let mut tasks = self
-                .fork_reclaims
-                .lock()
-                .expect("fork reclaim registry poisoned");
-            std::mem::take(&mut *tasks)
-        };
-        for (branch, task) in pending {
-            Self::join_fork_reclaim(branch, task).await;
-        }
-    }
-
-    /// Flip the manifest branch authority and return the deleted
-    /// incarnation's native ref with its owned `(type_key, dataset_path)`
-    /// forks for the caller's post-flip reclaim.
+    /// Remove the captured manifest branch authority; cleanup owns table forks.
     async fn delete_captured_branch_storage(
         &self,
         branch: &str,
         target: &mut GraphCoordinator,
-    ) -> Result<(String, Vec<(String, String)>)> {
+    ) -> Result<()> {
         let active = self
             .coordinator
             .read()
@@ -3308,15 +2988,6 @@ impl Omnigraph {
             )));
         }
 
-        let native = target.native_branch().map(str::to_string).ok_or_else(|| {
-            OmniError::manifest_internal(format!("branch '{branch}' resolved without a native ref"))
-        })?;
-        let branch_snapshot = target.snapshot();
-        let owned_tables = branch_snapshot
-            .datasets()
-            .filter(|entry| entry.native_dataset_branch.as_deref() == Some(native.as_str()))
-            .map(|entry| (entry.type_key.clone(), entry.dataset_path.clone()))
-            .collect::<Vec<_>>();
         let expected_identifier = target.branch_identifier().await?;
 
         // Authority removal is the logical branch deletion. Lance tree cleanup
@@ -3331,10 +3002,7 @@ impl Omnigraph {
         // old branch-incarnation handles/topology can never leak into a later
         // recreation, while a failed control leaves warm state untouched.
         self.invalidate_read_caches().await;
-        // The reclaim happens post-flip in the caller's background task,
-        // addressed by this incarnation's native ref: a late-settling delete
-        // can only ever touch dead bytes.
-        Ok((native, owned_tables))
+        Ok(())
     }
 
     pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
@@ -3533,9 +3201,8 @@ impl Omnigraph {
     /// deletion of protected branches (e.g. deny BranchDelete against
     /// `main`).
     ///
-    /// Returns at the manifest authority flip, the logical deletion; the
-    /// best-effort reclaim of the branch's per-dataset Lance forks continues
-    /// in a background task joined by [`Self::wait_for_fork_reclaims`].
+    /// Returns after the manifest authority flip. Per-table Lance forks remain
+    /// available until explicit cleanup proves they are unused.
     pub async fn branch_delete_as(&self, name: &str, actor: Option<&str>) -> Result<()> {
         self.enforce(
             omnigraph_policy::PolicyAction::BranchDelete,
@@ -3552,11 +3219,11 @@ impl Omnigraph {
         crate::failpoints::maybe_fail(
             crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
         )?;
-        let schema_guard = self
+        let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        let branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
+        let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await;
         // Purge only after taking the branch gate. Merge capture takes the
         // same branch-gate -> cache-lock order, so no later insert for this
         // incarnation can race between invalidation and deletion.
@@ -3572,7 +3239,7 @@ impl Omnigraph {
         let control_catalog = self.build_accepted_catalog_with_schema_gate_held().await?;
         let table_queue_keys =
             self.table_queue_keys_for_branches(&[Some(branch.clone())], &control_catalog);
-        let table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
+        let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_branch_delete_recovery_safe_under_gates(&branch)
             .await?;
         crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_TABLE_GATES)?;
@@ -3582,43 +3249,8 @@ impl Omnigraph {
             .open_coordinator_for_branch(Some(branch.as_str()))
             .await?;
         validate_bound_catalog_against_snapshot(&control_catalog, &target_control.snapshot())?;
-        // One ref listing serves existence, namespace, ancestry and every
-        // candidate's native ref for the dependency probe.
-        let (natives, descendants) = target_control
-            .native_branches_and_descendants(&branch)
-            .await?;
-        let branches: Vec<String> = std::iter::once("main".to_string())
-            .chain(
-                natives
-                    .iter()
-                    .map(|native| crate::branch_names::logical_branch_name(native).to_string())
-                    .filter(|logical| !crate::db::is_internal_system_branch(logical)),
-            )
-            .collect();
-        if !branches.iter().any(|candidate| candidate == &branch) {
-            return Err(OmniError::manifest_not_found(format!(
-                "branch '{}' not found",
-                branch
-            )));
-        }
-
-        self.ensure_branch_delete_safe(&target_control, &branch, &branches, &natives, &descendants)
-            .await?;
-        let (native, owned_tables) = self
-            .delete_captured_branch_storage(&branch, &mut target_control)
-            .await?;
-        // Post-flip: hand the request's gates to the background reclaim.
-        // Forks are named by the deleted incarnation's native ref, so the
-        // reclaim addresses that name, never the reusable logical one.
-        self.dispatch_fork_reclaim(
-            native,
-            owned_tables,
-            schema_guard,
-            branch_guard,
-            table_guards,
-        )
-        .await;
-        Ok(())
+        self.delete_captured_branch_storage(&branch, &mut target_control)
+            .await
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
@@ -3713,9 +3345,18 @@ impl Omnigraph {
         source_branch: Option<&str>,
         source_version: u64,
         active_branch: &str,
-        operation_id: Option<&str>,
+        _operation_id: Option<&str>,
     ) -> Result<SnapshotHandle> {
-        match table_ops::fork_dataset_from_entry_state(
+        let canonical_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
+        let canonical_full_path = self.storage().dataset_uri(&canonical_path);
+        if full_path != canonical_full_path {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("fork_target_dataset_path:{identity}"),
+                Some(canonical_full_path),
+                Some(full_path.to_string()),
+            ));
+        }
+        table_ops::fork_dataset_from_entry_state(
             self,
             table_key,
             full_path,
@@ -3723,23 +3364,7 @@ impl Omnigraph {
             source_version,
             active_branch,
         )
-        .await?
-        {
-            crate::storage_layer::ForkOutcome::Created(ds) => Ok(ds),
-            crate::storage_layer::ForkOutcome::RefAlreadyExists => {
-                table_ops::reclaim_orphaned_fork_and_refork(
-                    self,
-                    table_key,
-                    identity,
-                    full_path,
-                    source_branch,
-                    source_version,
-                    active_branch,
-                    operation_id,
-                )
-                .await
-            }
-        }
+        .await
     }
 
     pub(crate) async fn reopen_for_mutation(
@@ -4987,7 +4612,9 @@ edge WorksAt: Person -> Company
             published_dataset_version: state.version,
             native_dataset_branch: table_branch,
             entity_count: state.row_count,
-            version_metadata: state.version_metadata,
+            version_metadata: state
+                .version_metadata
+                .with_table_fork_owner(db.snapshot().await.native_branch()),
         }])
         .await
         .unwrap();

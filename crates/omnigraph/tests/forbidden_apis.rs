@@ -145,6 +145,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "instrumentation.rs",          // The instrumented dataset opener.
     "db/manifest/upgrade.rs",
     "db/manifest/upgrade/tests.rs",
+    "storage_layer/lance_clone.rs",
 ];
 
 /// Out-of-line test modules are parsed as standalone files, so their enclosing
@@ -279,9 +280,6 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "graph_index"),
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
-    // Joins already-dispatched branch_delete reclaims; performs no durable
-    // calls itself (the reclaim tasks' call sites are inventoried per-file).
-    ("db/omnigraph.rs", "wait_for_fork_reclaims"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
     ("exec/query.rs", "query"),
@@ -347,11 +345,6 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "all_branches",
-    ),
-    (
-        "db/graph_coordinator.rs",
-        "GraphCoordinator",
-        "native_branches_and_descendants",
     ),
     (
         "db/graph_coordinator.rs",
@@ -427,6 +420,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/manifest.rs",
         "ManifestCoordinator",
+        "table_registrations_under_control_gates",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
         "refresh_with_lineage",
     ),
     (
@@ -449,16 +447,6 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/manifest.rs",
         "ManifestCoordinator",
         "list_graph_branches",
-    ),
-    (
-        "db/manifest.rs",
-        "ManifestCoordinator",
-        "native_branches_and_descendants",
-    ),
-    (
-        "db/manifest.rs",
-        "ManifestCoordinator",
-        "branch_depends_on_delete_target_under_control_gates",
     ),
 ];
 
@@ -826,13 +814,13 @@ durable_calls! {
     ("db/graph_coordinator.rs", ".create_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch_with_expected(", 1, WriteProtocol::NativeRefControl),
-    ("branch_control.rs", ".create_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
-    ("branch_control.rs", ".delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
+    ("branch_control.rs", ".create_branch(", 2, WriteProtocol::Composed("graph/data native refs")),
+    ("storage_layer/lance_clone.rs", ".create_branch(", 1, WriteProtocol::Composed("scoped native clone index-origin forwarding")),
+    ("storage_layer/lance_clone.rs", ".commit(", 1, WriteProtocol::Composed("Lance commit-handler publication forwarding")),
+    ("storage_layer/lance_clone.rs", ".delete(", 1, WriteProtocol::Composed("Lance commit-handler deletion forwarding")),
+    ("branch_control.rs", ".replace_metadata(", 1, WriteProtocol::NativeRefControl),
     ("branch_control.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
-    ("db/omnigraph.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
-    ("db/omnigraph/table_ops.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("first-touch reclaim")),
     ("db/omnigraph/optimize.rs", ".force_delete_branch(", 1, WriteProtocol::PhysicalOnly),
-    ("db/manifest/recovery.rs", ".force_delete_branch(", 2, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish_with_precondition(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
@@ -849,11 +837,9 @@ durable_calls! {
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     // First-touch merge: enumerate native refs before arming recovery; no mutation.
-    ("exec/merge.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // First-touch write: enumerate native refs before arming recovery; no mutation.
-    ("exec/staging.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/table_ops.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/export.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     // Blob live-branch recheck: lists the table's refs to prove a vanished
     // fork before the incarnation refusal; read-only access to the handle.
@@ -874,7 +860,7 @@ durable_calls! {
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 6, WriteProtocol::Composed("Optimize v9 planning + read-only coverage status + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 9, WriteProtocol::Composed("Optimize v9 planning + read-only coverage and native-fork inventory + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
@@ -887,6 +873,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "confirm_schema_apply_sidecar_v9(",
     "confirm_ensure_indices_sidecar_v9(",
     "delete_sidecar(",
+    ".commit(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",
     ".commit_staged(",
@@ -930,6 +917,7 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".create_branch(",
     ".delete_branch(",
     ".delete_branch_with_expected(",
+    ".replace_metadata(",
     ".force_delete_branch(",
     "TableStore::create_empty_dataset(",
     "TableStore::append_or_create_batch(",

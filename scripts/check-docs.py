@@ -73,7 +73,7 @@ def tracked_markdown() -> list[Path]:
         {
             ROOT / line
             for line in result.stdout.splitlines()
-            if line and (ROOT / line).is_file()
+            if line and (ROOT / line).is_file() and not line.startswith("vendor/lance/")
         }
     )
 

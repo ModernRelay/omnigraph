@@ -101,8 +101,8 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        7,
-        "fresh graphs must use the v7 manifest format (RFC 0062 manifest clock)"
+        8,
+        "fresh graphs must use v8 so old binaries refuse retired native refs"
     );
     assert!(snap.dataset("node:Person").is_some());
     assert!(snap.dataset("node:Company").is_some());

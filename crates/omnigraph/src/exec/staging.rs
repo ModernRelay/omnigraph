@@ -1103,7 +1103,7 @@ impl StagedMutation {
         // manifest on the happy path.
         let mut queue_keys: Vec<(String, Option<String>)> = Vec::with_capacity(staged.len());
         for entry in &staged {
-            queue_keys.push((entry.table_key.clone(), entry.path.table_branch.clone()));
+            queue_keys.push((entry.table_key.clone(), branch.map(str::to_string)));
         }
         // Total order shared with schema apply: schema gate, branch gate, then
         // sorted per-table gates. Hold the full set through manifest publish.
@@ -1161,20 +1161,6 @@ impl StagedMutation {
         // the target branch fresh on any mismatch, returning the snapshot from
         // that same authority view. No prepared table pin is patched forward.
         let snapshot = db.revalidate_write_txn(txn).await?;
-        // A merge from main detaches the target's former ref while a child may
-        // still pin it; a first-touch fork must not reclaim that history, and
-        // the recovery envelope cannot represent reseeding an existing lineage,
-        // so the proof runs before arming.
-        let fork_references = if staged
-            .iter()
-            .any(|entry| entry.path.deferred_fork.is_some())
-        {
-            Some(Box::pin(crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
-                db.root_uri(), &db.control_session(),
-            )).await?)
-        } else {
-            None
-        };
         for entry in &staged {
             let current = snapshot
                 .dataset(&entry.table_key)
@@ -1199,56 +1185,13 @@ impl StagedMutation {
                 ));
             }
 
-            // A deferred fork is intentionally staged from the exact inherited
-            // source entry. The source ref (often main) may advance after the
-            // graph branch was cut; that is unrelated to this branch's pinned
-            // snapshot. The liveness proof above excludes borrowed target refs;
-            // any remaining orphan collision is checked under the same gates.
-            if let Some(fork) = entry.path.deferred_fork.as_ref() {
-                if fork_references
-                    .as_ref()
-                    .expect("deferred-fork liveness proof")
-                    .contains(entry.path.identity, &fork.target_branch)
-                {
-                    return Err(crate::db::manifest::detached_native_lineage_error(
-                        &entry.table_key,
-                        &fork.target_branch,
-                    ));
-                }
+            if entry.path.deferred_fork.is_some() {
                 if entry.dataset.version() != current {
                     return Err(OmniError::manifest_read_set_changed(
                         format!("published_dataset_version:{}", entry.table_key),
                         Some(current.to_string()),
                         Some(entry.dataset.version().to_string()),
                     ));
-                }
-                let branches =
-                    crate::branch_control::list_branch_contents(entry.dataset.dataset()).await?;
-                if branches.contains_key(&fork.target_branch) {
-                    match crate::db::classify_fork_ref_with_references(
-                        db,
-                        entry.path.identity,
-                        &fork.target_branch,
-                        None,
-                        fork_references
-                            .as_ref()
-                            .expect("deferred-fork liveness proof"),
-                    )
-                    .await
-                    {
-                        crate::db::ForkRefStatus::Orphan => {
-                            crate::db::force_delete_orphan_ref(
-                                db,
-                                &entry.table_key,
-                                &entry.path.full_path,
-                                &fork.target_branch,
-                            )
-                            .await?;
-                        }
-                        crate::db::ForkRefStatus::Borrowed
-                        | crate::db::ForkRefStatus::Legitimate
-                        | crate::db::ForkRefStatus::Indeterminate => {}
-                    }
                 }
                 continue;
             }
@@ -1280,6 +1223,25 @@ impl StagedMutation {
             });
         }
 
+        let table_fork_owner = match txn.branch.as_deref() {
+            None => None,
+            Some(branch) => Some(txn.base.native_branch().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "branch '{branch}' has no captured native fork owner"
+                ))
+            })?),
+        };
+        for entry in &mut staged {
+            if let Some(fork) = entry.path.deferred_fork.as_mut() {
+                fork.target_branch = crate::branch_names::table_fork_name(
+                    &fork.target_branch,
+                    txn.base.graph_manifest_version(),
+                    &lineage_intent.graph_commit_id,
+                );
+                entry.path.table_branch = Some(fork.target_branch.clone());
+            }
+        }
+
         // Sidecar protocol: build the per-table pin list and write the
         // sidecar BEFORE any `commit_staged` advances Lance HEAD, so any
         // commit→publish residual is recoverable on the next open. Deletes
@@ -1298,6 +1260,7 @@ impl StagedMutation {
                 post_commit_pin: entry.expected_version + 1,
                 confirmed_version: None,
                 table_branch: entry.path.table_branch.clone(),
+                table_fork_owner: table_fork_owner.map(str::to_string),
             });
         }
 
@@ -1388,11 +1351,6 @@ impl StagedMutation {
                     {
                         Ok(staged_write) => staged_write,
                         Err(error) => {
-                            // Strict preflight can discover an inherited match
-                            // only after the first-touch target ref exists. The
-                            // sidecar is already Armed, so return KeyConflict
-                            // only after exact classification removes the
-                            // untouched fork and retires the empty intent.
                             if matches!(&error, OmniError::KeyConflict { .. }) {
                                 match crate::db::manifest::finalize_effect_free_occ_sidecar(
                                     db.root_uri(),
@@ -1430,14 +1388,6 @@ impl StagedMutation {
                     entry.staged_write = Some(staged_write);
                 }
                 Err(error) => {
-                    // Once the intent is durable, a fork error is not proof that
-                    // no physical effect occurred. Lance may have created the ref
-                    // successfully and then failed while reopening/verifying it;
-                    // reclaim-and-refork can likewise fail after deleting or
-                    // recreating a ref. Keep the sidecar for exact Full recovery
-                    // even when this is the first table. A future typed storage
-                    // outcome may recover the pre-effect retry optimization only
-                    // when it can *prove* the ref was never changed.
                     return Err(OmniError::recovery_required(
                         operation_id,
                         format!(
@@ -1584,7 +1534,9 @@ impl StagedMutation {
                 published_dataset_version: state.version,
                 native_dataset_branch: path.table_branch.clone(),
                 entity_count: state.row_count,
-                version_metadata: state.version_metadata,
+                version_metadata: state
+                    .version_metadata
+                    .with_table_fork_owner(table_fork_owner),
             });
             crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_TABLE_COMMIT)
                 .map_err(|error| {

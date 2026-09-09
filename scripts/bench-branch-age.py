@@ -93,8 +93,8 @@ def admit(records, point, runs, identity, binary_hash):
             require(metrics.get(f"setup_{label}_requested") == point["params"][parameter]
                     == metrics.get(f"setup_{label}_applied"), "Fixture aging was not applied")
         require(metrics.get("setup_age_content_verified") is True, "Missing age content proof")
-        require(metrics.get("setup_retired_native_refs_reclaimed") == point["params"]["retired_branches"],
-                "Retired fixture refs were not reclaimed")
+        require(metrics.get("setup_retired_native_refs_retained") == point["params"]["retired_branches"],
+                "Retired fixture refs were not retained until cleanup")
         require(metrics["setup_main_history_after_age"] - metrics["setup_main_history_before_age"]
                 == point["params"]["history_commits"], "Actual reachable history did not match")
         require(isinstance(metrics.get("operation_io_manifest_reads"), int), "Missing manifest I/O evidence")

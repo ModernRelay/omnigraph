@@ -13,8 +13,6 @@
 //! `(entity kind: nodes first, opaque type identity, id, operation rank)`;
 //! the continuation key inside a page token names a position in that order.
 
-use std::collections::BTreeSet;
-
 use lance::Dataset;
 
 use super::candidate_scan::{CandidatePlan, EmitSource};
@@ -314,8 +312,6 @@ async fn plan_intervals(
     crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_PRE_TABLE_OPEN)?;
 
     let mut plans = Vec::with_capacity(intervals.len());
-    let mut parent_branches: BTreeSet<String> = BTreeSet::new();
-    let mut child_branches: BTreeSet<String> = BTreeSet::new();
     for interval in intervals {
         let table_key = interval.type_key();
         match (interval.from, interval.to) {
@@ -332,12 +328,6 @@ async fn plan_intervals(
             (Some(from), Some(to)) => {
                 let from_dataset = store.open_at_entry_verified(from).await?;
                 let to_dataset = store.open_at_entry_verified(to).await?;
-                if let Some(branch) = from.native_dataset_branch.as_deref() {
-                    parent_branches.insert(branch.to_string());
-                }
-                if let Some(branch) = to.native_dataset_branch.as_deref() {
-                    child_branches.insert(branch.to_string());
-                }
                 if user_schema_fingerprint(&from_dataset) != user_schema_fingerprint(&to_dataset) {
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
@@ -374,22 +364,8 @@ async fn plan_intervals(
             (None, None) => unreachable!("changed intervals have at least one endpoint"),
         }
     }
-    // The load-bearing second-window witness. The per-table opens above happen
-    // AFTER the commit's manifest-head proof and are keyed only by (branch
-    // path, numeric version), so a named branch deleted and recreated in that
-    // window retargets them to the replacement branch's rows. Re-prove each
-    // opened named branch LOGICALLY after all opens: a fresh, cache-bypassing
-    // manifest snapshot at the same pinned version must still report the same
-    // `graph_head` this enumeration's snapshot captured. A recreated fork's
-    // manifest at that version carries different lineage commit ids (or lacks
-    // the version entirely), so this fails closed on every store — including
-    // one that persists no table e_tags; the per-open e_tag comparison is
-    // defense-in-depth, not the witness. Ordering makes this sound: a
-    // recreation before any table open is detected here, and a recreation
-    // after this proof cannot have affected the already-opened handles. Main
-    // cannot undergo branch-name ABA and pays no extra manifest resolution.
-    reprove_named_branch_heads(store, parent, &parent_branches).await?;
-    reprove_named_branch_heads(store, child, &child_branches).await?;
+    reprove_named_branch_heads(store, parent).await?;
+    reprove_named_branch_heads(store, child).await?;
     // Nothing after this witness may read the branch's numeric-path history
     // live: version manifests sit at replaceable numeric paths (unlike
     // UUID-named data and transaction files), so a later live read would see a
@@ -407,32 +383,24 @@ async fn plan_intervals(
     Ok(plans)
 }
 
-/// Fail closed unless every named branch whose tables this enumeration just
-/// opened still resolves — via a fresh manifest open at the snapshot's pinned
-/// version — to the same `graph_head` the captured snapshot carries. See the
-/// call site in [`plan_intervals`] for the window this closes.
-async fn reprove_named_branch_heads(
-    store: &TableStore,
-    snapshot: &Snapshot,
-    branches: &BTreeSet<String>,
-) -> Result<()> {
-    for branch in branches {
-        // `branches` holds native fork refs; graph heads are keyed by the
-        // logical branch those forks belong to.
-        let branch = crate::branch_names::logical_branch_name(branch);
-        let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
-            store.root_uri(),
-            Some(branch),
-            snapshot.graph_manifest_version(),
-        )
-        .await?;
-        if fresh.graph_head(Some(branch)) != snapshot.graph_head(Some(branch)) {
-            return Err(OmniError::manifest(format!(
-                "change feed branch '{branch}' has no persisted native-branch \
-                 incarnation witness after the per-table opens; the branch was \
-                 deleted and recreated during the poll"
-            )));
-        }
+/// Reprove the captured graph branch after table opens, including on stores
+/// without table ETags. Table-fork ownership does not identify this graph branch.
+async fn reprove_named_branch_heads(store: &TableStore, snapshot: &Snapshot) -> Result<()> {
+    let Some(branch) = snapshot.graph_branch() else {
+        return Ok(());
+    };
+    let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
+        store.root_uri(),
+        Some(branch),
+        snapshot.graph_manifest_version(),
+    )
+    .await?;
+    if fresh.graph_head(Some(branch)) != snapshot.graph_head(Some(branch)) {
+        return Err(OmniError::manifest(format!(
+            "change feed branch '{branch}' has no persisted native-branch \
+             incarnation witness after the per-table opens; the branch was \
+             deleted and recreated during the poll"
+        )));
     }
     Ok(())
 }

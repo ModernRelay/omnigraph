@@ -1,10 +1,8 @@
-# issue: none
-# red_on: 2026-09-07, main @ ad425c68: reading b1 after b0 took a fast-forward from main and wrote once fails with `historical published dataset version 3 was reclaimed`.
-# notes: The Steps block of https://github.com/ModernRelay/omnigraph/issues/683 verbatim; this case
-# notes: pins the refusal, not a fix. The fast-forward from main points b0
-# notes: at main's lineage and leaves b0's former ref to b1. b0's next write refuses (detached
-# notes: native lineage) instead of recreating that ref and destroying b1's rows; b1 keeps a and
-# notes: n1 across a restart, b0 reads main's lineage.
+# red_on: 5c4ca700d9dc5470bac4fd8d6a7f534699a2b137
+# issue: 683
+# notes: After main fast-forwards into b0, b0 writes on a fresh table fork.
+# notes: The lazy child b1 keeps its former b0 rows across a restart;
+# notes: the new b0 write remains isolated from both b1 and main.
 
 --- schema
 node Person {
@@ -53,7 +51,7 @@ query b0_n2() {
     insert Person { name: "n2" }
 }
 
---- expect error: detached native lineage
+--- expect affected: nodes=1 edges=0
 
 --- restart
 
@@ -71,7 +69,22 @@ query b1_persons() {
 p.name: String
 
 --- query branch: b0
-query b0_reads_main_lineage() {
+query b0_reads_its_fresh_fork() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"a"}
+{"p.name":"n1"}
+{"p.name":"n0"}
+{"p.name":"n2"}
+
+--- expect shape
+p.name: String
+
+--- query branch: main
+query main_kept_its_rows() {
     match { $p: Person }
     return { $p.name }
 }

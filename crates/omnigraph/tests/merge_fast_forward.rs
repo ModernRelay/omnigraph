@@ -166,12 +166,10 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
     assert_single_physical_publish_encloses_keyed_work(&probes);
 }
 
-/// A lazy graph branch pins an immutable table version while continuing to
-/// share the native main ref. Advancing main after two graph branches fork is
-/// therefore not drift on either branch: first touch must fork the target from
-/// its old graph pin, even though the inherited native ref's HEAD is newer.
+/// A lazy target adopts the exact source endpoint after main advances.
+/// A subsequent target write must fork independently from that source pin.
 #[tokio::test]
-async fn lazy_target_ref_only_fast_forward_uses_pin_after_main_advances() {
+async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
@@ -210,6 +208,8 @@ async fn lazy_target_ref_only_fast_forward_uses_pin_after_main_advances() {
         .await
         .unwrap();
 
+    let source_before = snapshot_branch(&source, "source").await.unwrap();
+    let source_entry = source_before.dataset("node:Person").unwrap();
     let merger = Omnigraph::open(uri).await.unwrap();
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge("source", "target"))
@@ -219,7 +219,7 @@ async fn lazy_target_ref_only_fast_forward_uses_pin_after_main_advances() {
     assert_eq!(
         probes.stage_fenced_insert_calls(),
         0,
-        "a lazy target adopts the source state by an exact-version native ref fork"
+        "a lazy target adopts the exact source ref and version"
     );
     assert_eq!(probes.stage_merge_insert_calls(), 0);
     assert_eq!(probes.strict_insert_preflight_calls(), 0);
@@ -234,8 +234,63 @@ async fn lazy_target_ref_only_fast_forward_uses_pin_after_main_advances() {
     assert!(names.iter().any(|name| name == "source-only"));
     assert!(
         !names.iter().any(|name| name == "main-after-fork"),
-        "first touch must fork the lazy target's pinned version, not the inherited ref's newer HEAD"
+        "adoption must preserve the source pin despite main advancing"
     );
+    let adopted = snapshot_branch(&merger, "target").await.unwrap();
+    let adopted_entry = adopted.dataset("node:Person").unwrap();
+    assert_eq!(
+        (
+            &adopted_entry.type_key,
+            &adopted_entry.dataset_path,
+            adopted_entry.published_dataset_version,
+            &adopted_entry.native_dataset_branch,
+            adopted_entry.entity_count,
+        ),
+        (
+            &source_entry.type_key,
+            &source_entry.dataset_path,
+            source_entry.published_dataset_version,
+            &source_entry.native_dataset_branch,
+            source_entry.entity_count,
+        ),
+        "the lazy target must adopt the exact source table pointer"
+    );
+    merger
+        .load(
+            "target",
+            r#"{"type":"Person","data":{"name":"target-only","age":42}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    let written = snapshot_branch(&merger, "target").await.unwrap();
+    assert_ne!(
+        written
+            .dataset("node:Person")
+            .unwrap()
+            .native_dataset_branch,
+        source_entry.native_dataset_branch
+    );
+    let source_after = snapshot_branch(&merger, "source").await.unwrap();
+    assert!(
+        source_after
+            .dataset("node:Person")
+            .unwrap()
+            .same_registration(source_entry)
+    );
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    for branch in ["source", "target"] {
+        let names = collect_column_strings(
+            &read_table_branch(&reopened, branch, "node:Person").await,
+            "name",
+        );
+        assert_eq!(
+            names.iter().any(|name| name == "target-only"),
+            branch == "target"
+        );
+        assert!(names.iter().any(|name| name == "source-only"));
+        assert!(!names.iter().any(|name| name == "main-after-fork"));
+    }
 }
 
 /// The fast-forward validation shortcut is deliberately narrower than the
@@ -289,12 +344,10 @@ node Person {
     );
 }
 
-/// The proven publisher re-mints the same insertion-absence certificate on
-/// its target-owned transaction. A later merge must be able to consume that
-/// output as one link in a longer complete source-history proof; otherwise the
-/// optimization would work for only one branch generation.
+/// Pointer adoption preserves the complete certified insertion history.
+/// A later merge into main must still admit that history through the proven publisher.
 #[tokio::test]
-async fn proven_fast_forward_certificate_composes_across_merge_generation() {
+async fn proven_fast_forward_certificate_survives_pointer_adoption() {
     const SCHEMA: &str = r#"
 node Person {
     name: String @key
@@ -339,15 +392,43 @@ node Person {
         .await
         .unwrap();
 
+    let leaf_snapshot = snapshot_branch(&source, "leaf").await.unwrap();
+    let leaf_entry = leaf_snapshot.dataset("node:Person").unwrap();
     let first_probes = MergeWriteProbes::default();
     let first =
         with_merge_write_probes(first_probes.clone(), source.branch_merge("leaf", "source"))
             .await
             .unwrap();
     assert_eq!(first, MergeOutcome::FastForward);
-    assert_eq!(first_probes.stage_fenced_insert_rows(), 1);
+    assert_eq!(first_probes.stage_fenced_insert_rows(), 0);
+    assert_eq!(first_probes.stage_merge_insert_calls(), 0);
+    assert_eq!(first_probes.stage_append_calls(), 0);
     assert_eq!(first_probes.strict_insert_preflight_calls(), 0);
+    assert_eq!(first_probes.proven_insert_history_read_calls(), 1);
     assert_eq!(first_probes.ordered_cursor_scan_calls(), 0);
+    let adopted = snapshot_branch(&source, "source").await.unwrap();
+    let adopted_entry = adopted.dataset("node:Person").unwrap();
+    assert_eq!(
+        (
+            &adopted_entry.type_key,
+            &adopted_entry.dataset_path,
+            adopted_entry.published_dataset_version,
+            &adopted_entry.native_dataset_branch,
+            adopted_entry.entity_count,
+        ),
+        (
+            &leaf_entry.type_key,
+            &leaf_entry.dataset_path,
+            leaf_entry.published_dataset_version,
+            &leaf_entry.native_dataset_branch,
+            leaf_entry.entity_count,
+        ),
+        "the owning target must adopt the exact leaf table pointer"
+    );
+    assert_eq!(
+        count_rows_branch(&source, "source", "node:Person").await,
+        base_count + 2
+    );
 
     let final_probes = MergeWriteProbes::default();
     let final_outcome =
@@ -356,12 +437,17 @@ node Person {
             .unwrap();
     assert_eq!(final_outcome, MergeOutcome::FastForward);
     assert_eq!(final_probes.stage_fenced_insert_rows(), 2);
+    assert_eq!(
+        final_probes.proven_insert_history_read_calls(),
+        2,
+        "each certified insertion must be read once from its owning native lineage"
+    );
     assert_eq!(final_probes.stage_merge_insert_calls(), 0);
     assert_eq!(final_probes.strict_insert_preflight_calls(), 0);
     assert_eq!(
         final_probes.ordered_cursor_scan_calls(),
         0,
-        "the second merge must accept the earlier proven publisher's certificate as part of the complete chain"
+        "the final merge must accept the insertion certificates preserved by pointer adoption"
     );
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
 }
@@ -409,7 +495,7 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
         base_entry.dataset_path.trim_start_matches('/')
     );
     let base_table = Dataset::open(&person_uri).await.unwrap();
-    let source_table = helpers::open_dataset_head(&person_uri, Some("feature")).await;
+    let source_table = helpers::open_published_dataset_head(&main, "feature", "node:Person").await;
     let base_identifier = base_table.branch_identifier().await.unwrap();
     let source_identifier = source_table.branch_identifier().await.unwrap();
     assert_eq!(
@@ -501,11 +587,12 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
         .branch_identifier()
         .await
         .unwrap();
-    let source_identifier = helpers::open_dataset_head(&person_uri, Some("experiment"))
-        .await
-        .branch_identifier()
-        .await
-        .unwrap();
+    let source_identifier =
+        helpers::open_published_dataset_head(&main, "experiment", "node:Person")
+            .await
+            .branch_identifier()
+            .await
+            .unwrap();
     assert!(
         source_identifier.version_mapping.len() >= base_identifier.version_mapping.len() + 2,
         "fixture must contain at least two native descendant hops"
@@ -526,75 +613,142 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
     assert!(names.iter().any(|name| name == "nested-experiment"));
 }
 
-/// Cleaned history must disable only the provenance shortcut. Immutable
-/// snapshot rows remain sufficient for the bounded ordered-diff fallback, so a
-/// missing intermediate Lance manifest is not a merge correctness failure.
+/// Cleaned source or ancestor history disables only the provenance shortcut.
+/// Immutable snapshot rows remain sufficient for the bounded ordered diff;
+/// missing intermediate Lance manifests must not cause a merge failure.
 #[tokio::test]
 async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let main = init_and_load(&dir).await;
-    let base_count = count_rows(&main, "node:Person").await;
-    main.branch_create("feature").await.unwrap();
+    for ancestor_history in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let main = if ancestor_history {
+            let main = Omnigraph::init(uri, "node Person {\n name: String @key\n age: I32\n }")
+                .await
+                .unwrap();
+            main.load(
+                "main",
+                r#"{"type":"Person","data":{"name":"base","age":30}}"#,
+                LoadMode::Overwrite,
+            )
+            .await
+            .unwrap();
+            main
+        } else {
+            init_and_load(&dir).await
+        };
+        let base_count = count_rows(&main, "node:Person").await;
+        main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    append_new_persons(&mut feature, "feature", 2).await;
+        let mut feature = Omnigraph::open(uri).await.unwrap();
+        append_new_persons(&mut feature, "feature", 2).await;
 
-    let base_snapshot = snapshot_main(&main).await.unwrap();
-    let base_entry = base_snapshot.dataset("node:Person").unwrap();
-    let person_uri = format!(
-        "{}/{}",
-        main.uri().trim_end_matches('/'),
-        base_entry.dataset_path.trim_start_matches('/')
-    );
-    let source = helpers::open_dataset_head(&person_uri, Some("feature")).await;
-    let missing_version = source
-        .version()
-        .version
-        .checked_sub(1)
-        .expect("source fixture must have an intermediate version");
-    assert!(
-        missing_version > base_entry.published_dataset_version,
-        "fixture needs at least two source transactions above the merge base"
-    );
-    let versions_dir = std::path::Path::new(&person_uri)
-        .join("tree")
-        .join(graph_native_ref(uri, "feature").await)
-        .join("_versions");
-    let v1_path = versions_dir.join(format!("{missing_version}.manifest"));
-    let v2_path = versions_dir.join(format!("{:020}.manifest", u64::MAX - missing_version));
-    let manifest_path = [v1_path, v2_path]
-        .into_iter()
-        .find(|path| path.exists())
-        .expect("intermediate source manifest must exist before cleanup");
-    std::fs::remove_file(&manifest_path).unwrap();
-    drop(source);
-    drop(feature);
+        let base_snapshot = snapshot_main(&main).await.unwrap();
+        let base_entry = base_snapshot.dataset("node:Person").unwrap();
+        let person_uri = format!(
+            "{}/{}",
+            main.uri().trim_end_matches('/'),
+            base_entry.dataset_path.trim_start_matches('/')
+        );
+        let source = helpers::open_published_dataset_head(&main, "feature", "node:Person").await;
+        if ancestor_history {
+            feature
+                .branch_create_from(ReadTarget::branch("feature"), "leaf")
+                .await
+                .unwrap();
+            feature
+                .load(
+                    "leaf",
+                    r#"{"type":"Person","data":{"name":"leaf-new","age":31}}"#,
+                    LoadMode::Append,
+                )
+                .await
+                .unwrap();
+            feature.branch_merge("leaf", "feature").await.unwrap();
+            let adopted =
+                helpers::open_published_dataset_head(&main, "feature", "node:Person").await;
+            assert_ne!(adopted.manifest.branch, source.manifest.branch);
+            assert_eq!(
+                adopted
+                    .branch_identifier()
+                    .await
+                    .unwrap()
+                    .find_referenced_version(&source.branch_identifier().await.unwrap()),
+                Some(source.version().version)
+            );
+        }
+        let missing_version = source
+            .version()
+            .version
+            .checked_sub(1)
+            .expect("source fixture must have an intermediate version");
+        assert!(
+            missing_version > base_entry.published_dataset_version,
+            "fixture needs at least two source transactions above the merge base"
+        );
+        let versions_dir = std::path::Path::new(&person_uri)
+            .join("tree")
+            .join(source.manifest.branch.as_deref().unwrap())
+            .join("_versions");
+        let v1_path = versions_dir.join(format!("{missing_version}.manifest"));
+        let v2_path = versions_dir.join(format!("{:020}.manifest", u64::MAX - missing_version));
+        let manifest_path = [v1_path, v2_path]
+            .into_iter()
+            .find(|path| path.exists())
+            .expect("intermediate source manifest must exist before cleanup");
+        std::fs::remove_file(&manifest_path).unwrap();
+        drop(source);
+        drop(feature);
 
-    let probes = MergeWriteProbes::default();
-    let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
-        .await
-        .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
-    assert!(
-        probes.ordered_cursor_scan_calls() >= 2,
-        "missing provenance must enter the ordered base/source fallback"
-    );
-    assert_eq!(probes.stage_append_calls(), 0);
-    assert_eq!(probes.strict_insert_preflight_calls(), 1);
-    assert_eq!(probes.stage_fenced_insert_calls(), 1);
-    assert_eq!(
-        probes.stage_merge_insert_calls(),
-        0,
-        "ordered-diff insert fallback must reuse the join-free StrictInsert adapter"
-    );
-    assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
+        let probes = MergeWriteProbes::default();
+        let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+            .await
+            .unwrap();
+        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert!(
+            probes.ordered_cursor_scan_calls() >= 2,
+            "missing provenance must enter the ordered base/source fallback"
+        );
+        assert_eq!(probes.stage_append_calls(), 0);
+        assert_eq!(probes.strict_insert_preflight_calls(), 1);
+        assert_eq!(probes.stage_fenced_insert_calls(), 1);
+        assert_eq!(
+            probes.stage_merge_insert_calls(),
+            0,
+            "ordered-diff insert fallback must reuse the join-free StrictInsert adapter"
+        );
+        assert_eq!(
+            count_rows(&main, "node:Person").await,
+            base_count + 2 + usize::from(ancestor_history)
+        );
+        let names = collect_column_strings(&read_table(&main, "node:Person").await, "name");
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "ff_new_0")
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "ff_new_1")
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "leaf-new")
+                .count(),
+            usize::from(ancestor_history)
+        );
 
-    let recovery_dir = dir.path().join("__recovery");
-    assert!(
-        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
-        "successful fallback merge must remove its recovery sidecar"
-    );
+        let recovery_dir = dir.path().join("__recovery");
+        assert!(
+            !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+            "successful fallback merge must remove its recovery sidecar"
+        );
+    }
 }
 
 /// When the target still equals the merge base, the ordered adopt classifier

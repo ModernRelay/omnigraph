@@ -1,6 +1,6 @@
 //! The full crash-window catalog for the hunt
 //! (`dst_hunt_crash_window_sweep`): the engine's `src/failpoints.rs`
-//! name set, 72 windows at the pinned engine version. A window added to
+//! name set, 70 windows at the pinned engine version. A window added to
 //! the engine enters here as never-reached until its workload exists.
 //!
 //! Kept honest by `catalog_names_are_engine_failpoints` below: every
@@ -10,11 +10,10 @@
 //! `names::*` consts directly would be stronger still; the guard covers
 //! the failure mode until then.)
 
-pub const CRASH_WINDOWS: [&str; 72] = [
+pub const CRASH_WINDOWS: [&str; 70] = [
     "blob_read.post_capture",
     "branch_control.post_recovery_barrier",
     "branch_create.post_native",
-    "branch_delete.before_table_cleanup",
     "branch_delete.post_native",
     "branch_delete.post_table_gates",
     "branch_merge.adopt_after_append_pre_upsert",
@@ -39,7 +38,6 @@ pub const CRASH_WINDOWS: [&str; 72] = [
     "ensure_indices.post_stage_pre_commit_btree",
     "ensure_indices.post_table_effect",
     "fork.before_classify",
-    "fork.before_reclaim",
     "fork.post_create_pre_open",
     "graph_publish.after_manifest_commit",
     "graph_publish.before_commit_append",

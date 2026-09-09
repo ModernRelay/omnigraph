@@ -58,9 +58,10 @@ fn maint_concurrency() -> usize {
 /// time cutoff AND the version cutoff are removed).
 #[derive(Debug, Clone, Default)]
 pub struct CleanupPolicyOptions {
-    /// Keep this many most-recent versions per dataset.
+    /// Keep this many most-recent versions when pruning retained datasets.
+    /// This count does not retain wholly unused forks or count graph commits.
     pub keep_versions: Option<u32>,
-    /// Only remove versions older than this duration.
+    /// Only remove versions and unused fork objects older than this duration.
     pub older_than: Option<Duration>,
 }
 
@@ -318,6 +319,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         let pins = prepared
             .iter()
             .map(|work| crate::db::manifest::SidecarTablePin {
+                table_fork_owner: None,
                 identity: work.identity,
                 table_key: work.table_key.clone(),
                 table_path: work.full_path.clone(),
@@ -1210,26 +1212,6 @@ pub async fn cleanup_all_datasets(
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
-    // Reclaim orphaned branch forks (from an incomplete prior `branch_delete`)
-    // before version GC. Authority-derived and idempotent; the eager
-    // best-effort reclaim in `branch_delete` covers the common case, this is
-    // the guaranteed backstop. Logged for observability.
-    let reconciled = reconcile_orphaned_branches_with_catalog(db, &cleanup_catalog).await?;
-    if !reconciled.reclaimed.is_empty() {
-        tracing::info!(
-            count = reconciled.reclaimed.len(),
-            reclaimed = ?reconciled.reclaimed,
-            "cleanup reconciled orphaned branch forks"
-        );
-    }
-    if !reconciled.failures.is_empty() {
-        tracing::warn!(
-            count = reconciled.failures.len(),
-            failures = ?reconciled.failures,
-            "cleanup could not reconcile some orphaned forks; will retry next cleanup"
-        );
-    }
-
     let table_tasks: Vec<_> = all_table_keys(&cleanup_catalog)
         .into_iter()
         .filter_map(|table_key| {
@@ -1239,21 +1221,7 @@ pub async fn cleanup_all_datasets(
         })
         .collect();
 
-    // Schema gate stability means no native branch create/delete can change this
-    // set between enumeration and acquisition. Include main canonically as None;
-    // `all_branches` returns the user-facing "main" spelling.
-    let mut graph_branches = db
-        .coordinator
-        .read()
-        .await
-        .all_branches()
-        .await?
-        .into_iter()
-        .map(|branch| if branch == "main" { None } else { Some(branch) })
-        .collect::<Vec<_>>();
-    graph_branches.push(None);
-    graph_branches.sort();
-    graph_branches.dedup();
+    let graph_branches = cleanup_graph_branches(db).await?;
     let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await;
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
     let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
@@ -1297,10 +1265,7 @@ pub async fn cleanup_all_datasets(
                     "cleanup could not classify live branch '{branch_label}'; refusing version GC: {err}"
                 ))
             })?;
-        for entry in branch_snapshot
-            .datasets()
-            .filter(|entry| entry.native_dataset_branch.is_none())
-        {
+        for entry in branch_snapshot.datasets() {
             // Validate that the exact protected version is still openable
             // before GC starts. This catches pre-existing damage from an older
             // cleanup implementation and keeps the sweep fail-closed instead
@@ -1311,6 +1276,9 @@ pub async fn cleanup_all_datasets(
                     dataset_subject(&entry.type_key), entry.published_dataset_version
                 ))
             })?;
+            if entry.native_dataset_branch.is_some() {
+                continue;
+            }
             let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
             if branch_target.is_none() {
                 let head = db.storage().open_dataset_head(&full_path, None).await?;
@@ -1332,6 +1300,22 @@ pub async fn cleanup_all_datasets(
     }
 
     let before_timestamp = options.older_than.map(|d| crate::dst_clock::now_utc() - d);
+    let reconciled = reconcile_orphaned_branches_under_control_gates(db, before_timestamp).await?;
+    if !reconciled.reclaimed.is_empty() {
+        tracing::info!(
+            count = reconciled.reclaimed.len(),
+            reclaimed = ?reconciled.reclaimed,
+            "cleanup reconciled orphaned branch forks"
+        );
+    }
+    if !reconciled.failures.is_empty() {
+        tracing::warn!(
+            count = reconciled.failures.len(),
+            failures = ?reconciled.failures,
+            "cleanup could not reconcile some orphaned forks; will retry next cleanup"
+        );
+    }
+
     let keep_versions = options.keep_versions;
     let table_tasks = table_tasks
         .into_iter()
@@ -1444,94 +1428,281 @@ pub struct BranchReconcileStats {
     pub failures: Vec<(String, String)>,
 }
 
-/// Drop every per-table Lance branch fork the manifest does not reference.
-/// Graph lineage lives in `__manifest`; the retired standalone commit datasets
-/// have no branch-ref cleanup path here.
-///
-/// Two origins produce a manifest-unreferenced fork:
-///   1. A `branch_delete` flips the manifest authority (atomic) but a
-///      downstream best-effort reclaim does not complete — the whole branch is
-///      gone from the manifest, but a `tree/{branch}/` ref lingers.
-///   2. A first-write fork (or a merge fork) creates the branch ref before the
-///      manifest publish, then the writer dies / is cancelled — the branch is
-///      still a live manifest branch, but the manifest's snapshot of it does
-///      not place *this table* on the branch.
-///
-/// The write path self-heals (2) on the next write to the table
-/// (`reclaim_orphaned_fork_and_refork`); this is the guaranteed-convergence
-/// backstop that also covers (1) and any table the write path never revisits.
-///
-/// Liveness is graph-wide and keyed by immutable table identity plus native
-/// ref: any live snapshot or pending recovery pin protects the whole ref,
-/// including lazy children of a branch whose owner adopted another pointer.
-/// `main` and internal/system branches are never candidates. Lance refuses to
-/// force-delete a branch with referencing descendants, so children are dropped
-/// before parents (longest name first). The proof is derived under cleanup's
-/// schema-control gate; no separate registry or persistent authority is added.
+/// Collect unreferenced table forks under cleanup's complete writer gates.
 #[cfg(all(test, feature = "failpoints"))]
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
+    let _schema = db
+        .write_queue()
+        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .await;
     let catalog = db.catalog();
-    reconcile_orphaned_branches_with_catalog(db, &catalog).await
+    let graph_branches = cleanup_graph_branches(db).await?;
+    let _branches = db.write_queue().acquire_branches(&graph_branches).await;
+    let table_keys = db.table_queue_keys_for_branches(&graph_branches, &catalog);
+    let _tables = db.write_queue().acquire_many(&table_keys).await;
+    reconcile_orphaned_branches_under_control_gates(db, None).await
 }
 
-async fn reconcile_orphaned_branches_with_catalog(
+async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
+    let mut branches = db
+        .coordinator
+        .read()
+        .await
+        .all_branches()
+        .await?
+        .into_iter()
+        .map(|branch| if branch == "main" { None } else { Some(branch) })
+        .collect::<Vec<_>>();
+    branches.push(None);
+    branches.sort();
+    branches.dedup();
+    Ok(branches)
+}
+
+struct NativeForkInventory {
+    refs: std::collections::HashMap<String, lance::dataset::refs::BranchContents>,
+    trees: std::collections::BTreeSet<String>,
+    tagged: std::collections::HashSet<String>,
+    age_retained: std::collections::HashSet<String>,
+}
+
+impl NativeForkInventory {
+    fn depends_on(&self, child: &str, ancestor: &str) -> bool {
+        if child == ancestor {
+            return false;
+        }
+        if child
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return true;
+        }
+        let Some(child_ref) = self.refs.get(child) else {
+            return false;
+        };
+        child_ref.parent_branch.as_deref() == Some(ancestor)
+            || self.refs.get(ancestor).is_some_and(|ancestor_ref| {
+                child_ref
+                    .identifier
+                    .find_referenced_version(&ancestor_ref.identifier)
+                    .is_some()
+            })
+    }
+
+    fn retain_dependencies(&self, retained: &mut std::collections::HashSet<String>) {
+        loop {
+            let ancestors = self
+                .trees
+                .iter()
+                .filter(|candidate| {
+                    !retained.contains(*candidate)
+                        && retained.iter().any(|root| self.depends_on(root, candidate))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if ancestors.is_empty() {
+                break;
+            }
+            retained.extend(ancestors);
+        }
+    }
+}
+
+fn is_native_layout_directory(part: &str) -> bool {
+    matches!(
+        part,
+        "_versions" | "_transactions" | "data" | "_deletions" | "_indices"
+    )
+}
+
+fn native_tree_prefix(relative: &str) -> Result<String> {
+    let segments = relative.split('/').collect::<Vec<_>>();
+    segments
+        .iter()
+        .enumerate()
+        .find_map(|(index, part)| {
+            if index == 0 || index + 1 == segments.len() || !is_native_layout_directory(part) {
+                return None;
+            }
+            let branch = segments[..index].join("/");
+            lance::dataset::refs::check_valid_branch(&branch)
+                .is_ok()
+                .then_some(branch)
+        })
+        .ok_or_else(|| {
+            OmniError::manifest_conflict(format!(
+                "cleanup cannot identify a native fork tree for '{relative}'"
+            ))
+        })
+}
+
+async fn native_fork_inventory(
+    dataset: &lance::Dataset,
+    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<NativeForkInventory> {
+    let refs = crate::branch_control::list_all_branch_contents(dataset).await?;
+    let tagged = dataset
+        .tags()
+        .list()
+        .await
+        .map_err(OmniError::storage)?
+        .into_values()
+        .filter_map(|tag| tag.branch)
+        .collect();
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?
+        .path;
+    let tree = root.clone().join("tree");
+    let prefix = format!("{tree}/");
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let mut files = store.read_dir_all(&tree, None);
+    let mut trees = refs
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut age_retained = std::collections::HashSet::new();
+    while let Some(file) = files.next().await {
+        let file = file.map_err(OmniError::storage)?;
+        let relative = file
+            .location
+            .as_ref()
+            .strip_prefix(&prefix)
+            .ok_or_else(|| {
+                OmniError::manifest_conflict(format!(
+                    "cleanup listed native tree object outside '{tree}'"
+                ))
+            })?;
+        let matching_refs = refs
+            .keys()
+            .filter(|branch| {
+                relative
+                    .strip_prefix(branch.as_str())
+                    .is_some_and(|suffix| {
+                        suffix.strip_prefix('/').is_some_and(|path| {
+                            path.split('/')
+                                .next()
+                                .is_some_and(is_native_layout_directory)
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let recent = before_timestamp.is_some_and(|cutoff| file.last_modified >= cutoff);
+        if !matching_refs.is_empty() {
+            if recent {
+                age_retained.extend(matching_refs.into_iter().cloned());
+            }
+            continue;
+        }
+        let branch = native_tree_prefix(relative)?;
+        if recent {
+            age_retained.insert(branch.clone());
+        }
+        trees.insert(branch);
+    }
+    if let Some(cutoff) = before_timestamp {
+        let mut observed_refs = std::collections::HashSet::new();
+        {
+            let directory = root.clone().join("_refs").join("branches");
+            let expected = refs
+                .keys()
+                .map(|name| (directory.clone().join(format!("{name}.json")), name))
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut objects = store.read_dir_all(&directory, None);
+            while let Some(object) = objects.next().await {
+                let object = object.map_err(OmniError::storage)?;
+                if !object.location.as_ref().ends_with(".json") {
+                    continue;
+                }
+                let name = expected.get(&object.location).ok_or_else(|| {
+                    OmniError::manifest_conflict(format!(
+                        "cleanup age census found an unclassified native ref '{}'",
+                        object.location
+                    ))
+                })?;
+                observed_refs.insert((*name).clone());
+                if object.last_modified >= cutoff {
+                    age_retained.insert((*name).clone());
+                }
+            }
+        }
+        if let Some(missing) = refs.keys().find(|name| !observed_refs.contains(*name)) {
+            return Err(OmniError::manifest_conflict(format!(
+                "cleanup age census cannot locate native ref '{missing}'"
+            )));
+        }
+    }
+    Ok(NativeForkInventory {
+        refs,
+        trees,
+        tagged,
+        age_retained,
+    })
+}
+
+async fn reconcile_orphaned_branches_under_control_gates(
     db: &Omnigraph,
-    catalog: &omnigraph_compiler::catalog::Catalog,
+    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<BranchReconcileStats> {
     let resolved = db.resolved_branch_target(None).await?;
-    let snapshot = resolved.snapshot;
-    let table_targets: Vec<(crate::db::manifest::TableIdentity, String, String)> =
-        all_table_keys(catalog)
-            .into_iter()
-            .filter_map(|table_key| {
-                let entry = snapshot.dataset(&table_key)?;
-                let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
-                Some((entry.identity, table_key, full_path))
-            })
-            .collect();
-
+    let live_identities = resolved
+        .snapshot
+        .datasets()
+        .map(|entry| entry.identity)
+        .collect::<std::collections::HashSet<_>>();
+    let mut registrations =
+        crate::db::manifest::ManifestCoordinator::table_registrations_under_control_gates(
+            db.root_uri(),
+            &db.control_session(),
+        )
+        .await?;
+    registrations.sort_by_key(|registration| registration.identity);
+    let table_targets = registrations.into_iter().map(|registration| {
+        let full_path = format!("{}/{}", db.root_uri, registration.table_path);
+        (registration.identity, registration.table_key, full_path)
+    });
     let mut stats = BranchReconcileStats::default();
-    // Capture one complete proof only when a native table ref needs checking.
-    // The held schema gate keeps it valid for the rest of this sweep, including
-    // lazy borrowers whose logical owner no longer uses their pinned ref.
     let mut references = None;
-
-    // Per-table fault isolation: one table's transient failure is recorded and
-    // logged, never aborting the rest of the sweep.
+    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
     let storage = db.storage();
     for (identity, table_key, full_path) in table_targets {
-        let listed = match storage.list_native_branches(&full_path).await {
-            Ok(listed) => listed,
-            Err(err) => {
-                tracing::warn!(
-                    target: "omnigraph::cleanup",
-                    table = %table_key,
-                    error = %err,
-                    "listing branches failed during reconcile; skipping dataset",
-                );
-                stats.failures.push((table_key.clone(), err.to_string()));
+        let inventory = async {
+            let handle = match storage.open_dataset_head(&full_path, None).await {
+                Ok(handle) => handle,
+                Err(error)
+                    if !live_identities.contains(&identity)
+                        && error.storage_failure().is_some_and(|failure| {
+                            failure.kind == omnigraph_storage::StorageFailureKind::NotFound
+                        }) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            native_fork_inventory(handle.dataset(), before_timestamp)
+                .await
+                .map(Some)
+        }
+        .await;
+        let inventory = match inventory {
+            Ok(Some(inventory)) => inventory,
+            Ok(None) => continue,
+            Err(error) => {
+                stats.failures.push((table_key.clone(), error.to_string()));
                 continue;
             }
         };
-
-        // Main and internal refs cannot be reclaimed. An empty candidate
-        // iterator needs no graph-wide liveness reads and consumes no proof hook.
-        let mut listed = listed
-            .into_iter()
-            .filter(|branch| {
-                branch != "main"
-                    && !crate::db::is_internal_system_branch(
-                        crate::branch_names::logical_branch_name(branch),
-                    )
-            })
-            .peekable();
-        if listed.peek().is_none() {
+        if inventory.trees.is_empty() {
             continue;
         }
         if references.is_none() {
             let captured = match crate::failpoints::maybe_fail(
                 crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
-            ) {
+            ).and_then(|()| crate::failpoints::maybe_fail(crate::failpoints::names::CLASSIFY_FRESH_READ)) {
                 Ok(()) => {
                     crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
                         db.root_uri(),
@@ -1551,85 +1722,137 @@ async fn reconcile_orphaned_branches_with_catalog(
                 }
             }
         }
-        let references = references.as_ref().expect("candidate refs require a proof");
+        let references = references
+            .as_ref()
+            .expect("native trees require live roots");
+        let mut retained = inventory.tagged.clone();
+        retained.extend(
+            inventory
+                .trees
+                .iter()
+                .filter(|native| {
+                    native.as_str() == "main"
+                        || crate::db::is_internal_system_branch(native)
+                        || references.contains_tree(identity, native)
+                        || sidecars.iter().any(|sidecar| {
+                            sidecar.tables.iter().any(|pin| {
+                                pin.identity == identity
+                                    && pin.table_branch.as_deref() == Some(native.as_str())
+                            })
+                        })
+                })
+                .cloned(),
+        );
+        collect_native_forks(db, &full_path, &table_key, inventory, retained, &mut stats).await;
+    }
+    reconcile_retired_manifest_forks(db, before_timestamp, &mut stats).await;
+    Ok(stats)
+}
 
-        // Decide per (table, branch) whether the fork is an orphan.
-        let mut orphans: Vec<String> = Vec::new();
-        for branch in listed {
-            if !references.contains(identity, &branch) {
-                orphans.push(branch);
-            }
+async fn collect_native_forks(
+    db: &Omnigraph,
+    full_path: &str,
+    table_key: &str,
+    mut inventory: NativeForkInventory,
+    mut retained: std::collections::HashSet<String>,
+    stats: &mut BranchReconcileStats,
+) {
+    retained.extend(inventory.age_retained.iter().cloned());
+    inventory.retain_dependencies(&mut retained);
+    let protected_zombie_roots = retained
+        .iter()
+        .filter(|branch| !inventory.refs.contains_key(*branch))
+        .filter_map(|branch| branch.split('/').next().map(str::to_string))
+        .collect::<std::collections::HashSet<_>>();
+    retained.extend(
+        inventory
+            .trees
+            .iter()
+            .filter(|branch| {
+                branch
+                    .split('/')
+                    .next()
+                    .is_some_and(|root| protected_zombie_roots.contains(root))
+            })
+            .cloned(),
+    );
+    inventory.retain_dependencies(&mut retained);
+    let mut candidates = inventory
+        .trees
+        .iter()
+        .filter(|branch| !retained.contains(*branch))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    loop {
+        let leaves = candidates
+            .iter()
+            .filter(|candidate| {
+                !inventory
+                    .trees
+                    .iter()
+                    .any(|other| inventory.depends_on(other, candidate))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if leaves.is_empty() {
+            break;
         }
-        // Children before parents (longest name first) so Lance's referenced-
-        // parent RefConflict cannot block reclamation.
-        orphans.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-
-        for branch in orphans {
-            // Serialize against in-process live writers before destroying a ref.
-            // A first-write fork holds the per-(table, branch) write queue from
-            // before the fork through the manifest publish; on a LIVE branch its
-            // in-flight fork looks exactly like an origin-2 orphan (manifest not
-            // yet advanced). Acquire the same queue so cleanup waits for any such
-            // writer, then RE-VALIDATE under the queue with a fresh read: if the
-            // writer published in the meantime (table now placed on the branch),
-            // it is no longer an orphan — skip it. (Cross-process writers remain
-            // the documented one-winner-CAS gap.) One key held at a time → no
-            // lock-order inversion against multi-table `acquire_many` writers.
-            let _guard = db
-                .write_queue()
-                .acquire(&(
-                    table_key.clone(),
-                    Some(crate::branch_names::logical_branch_name(&branch).to_string()),
-                ))
-                .await;
-            // The schema gate keeps the graph-wide proof valid; re-check
-            // pending recovery ownership under the table queue before deletion.
-            match super::table_ops::classify_fork_ref_with_references(
-                db, identity, &branch, None, references,
-            )
-            .await
-            {
-                super::table_ops::ForkRefStatus::Orphan => {}
-                super::table_ops::ForkRefStatus::Legitimate
-                | super::table_ops::ForkRefStatus::Borrowed => continue,
-                super::table_ops::ForkRefStatus::Indeterminate => {
-                    tracing::warn!(
-                        target: "omnigraph::cleanup",
-                        table = %table_key,
-                        branch = %branch,
-                        "fresh re-check inconclusive during reconcile; skipping to avoid \
-                         destroying a possibly-live fork (will retry next cleanup)",
-                    );
-                    stats.failures.push((
-                        table_key.clone(),
-                        format!("indeterminate fork status for {branch}"),
-                    ));
-                    continue;
-                }
-            }
+        for branch in leaves {
+            candidates.remove(&branch);
             let outcome = match crate::failpoints::maybe_fail(
                 crate::failpoints::names::CLEANUP_RECONCILE_FORK,
             ) {
-                Ok(()) => storage.force_delete_branch(&full_path, &branch).await,
+                Ok(()) => db.storage().force_delete_branch(full_path, &branch).await,
                 Err(injected) => Err(injected),
             };
             match outcome {
-                Ok(()) => stats.reclaimed.push((table_key.clone(), branch)),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "omnigraph::cleanup",
-                        table = %table_key,
-                        branch = %branch,
-                        error = %err,
-                        "reclaiming orphaned fork failed; will retry next cleanup",
-                    );
-                    stats.failures.push((table_key.clone(), err.to_string()));
+                Ok(()) => {
+                    inventory.trees.remove(&branch);
+                    inventory.refs.remove(&branch);
+                    stats.reclaimed.push((table_key.to_string(), branch));
+                }
+                Err(error) => {
+                    stats
+                        .failures
+                        .push((table_key.to_string(), format!("{branch}: {error}")));
                 }
             }
         }
     }
+    for branch in candidates {
+        stats.failures.push((
+            table_key.to_string(),
+            format!("cleanup retained '{branch}' because a native dependency remains"),
+        ));
+    }
+}
 
-    Ok(stats)
+async fn reconcile_retired_manifest_forks(
+    db: &Omnigraph,
+    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    stats: &mut BranchReconcileStats,
+) {
+    let full_path = crate::db::manifest::manifest_uri(db.root_uri());
+    let captured = async {
+        let handle = db.storage().open_dataset_head(&full_path, None).await?;
+        let mut retained =
+            crate::branch_control::list_live_manifest_branch_contents(handle.dataset())
+                .await?
+                .into_keys()
+                .collect::<std::collections::HashSet<_>>();
+        let inventory = native_fork_inventory(handle.dataset(), before_timestamp).await?;
+        retained.extend(inventory.tagged.iter().cloned());
+        Ok::<_, OmniError>((inventory, retained))
+    }
+    .await;
+    match captured {
+        Ok((inventory, retained)) => {
+            collect_native_forks(db, &full_path, "__manifest", inventory, retained, stats).await;
+        }
+        Err(error) => stats
+            .failures
+            .push(("__manifest".to_string(), error.to_string())),
+    }
 }
 
 pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {

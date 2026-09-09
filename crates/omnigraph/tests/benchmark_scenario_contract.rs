@@ -407,6 +407,15 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     }
     assert!(source.contains("args.branches == 0 || args.tables == 0 || args.runs == 0"));
     assert!(source.contains("if args.baseline"));
+    for scenario in [
+        "branch-pointer-adopt-lazy",
+        "branch-pointer-adopt-owned",
+        "branch-first-write",
+        "branch-cleanup",
+    ] {
+        assert!(source.contains(scenario));
+        assert!(harness.contains(scenario));
+    }
     let operation = source
         .split_once("pub(super) async fn operation")
         .unwrap()
@@ -421,6 +430,9 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
         "db.branch_create_from(",
         "db.branch_list()",
         "db.branch_delete(TARGET)",
+        "db.branch_merge(SOURCE, TARGET)",
+        "db.load(TARGET, &payload, LoadMode::Append)",
+        "db.cleanup(CleanupPolicyOptions",
     ] {
         assert!(operation.find(call).unwrap() > timer);
     }
@@ -429,9 +441,9 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(operation.contains("\"completed_operations\": 1"));
     assert!(operation.contains("\"rss_boundary\""));
     let acknowledgement = operation.find("let operation_wall_us").unwrap();
-    let reclaim_join = operation.find("db.wait_for_fork_reclaims().await").unwrap();
     let completion = operation.find("let operation_complete_wall_us").unwrap();
-    assert!(acknowledgement < reclaim_join && reclaim_join < completion);
+    assert!(acknowledgement < completion);
+    assert!(!operation.contains("wait_for_fork_reclaims"));
     assert!(operation.contains("\"post_ack_reclaim_wait_us\""));
     assert!(operation.contains("\"operation_complete_wall_us\""));
     let prewarm = operation
@@ -447,8 +459,19 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
             > operation.find("let operation_wall_us").unwrap()
     );
     assert!(source.contains("created.tables, fixture.branches[parent].tables"));
-    assert!(source.contains("!refs.contains_key(native_ref)"));
-    assert!(source.contains("assert_eq!(verified_reclaimed_table_refs, args.tables)"));
+    assert!(
+        source
+            .split_whitespace()
+            .collect::<String>()
+            .contains("assert_eq!(io.data_writes,0,")
+    );
+    assert!(source.contains("same_registration(entry)"));
+    assert!(source.contains("verify_required_parent(db, fixture).await"));
+    assert!(source.contains("verified_exact_rows"));
+    assert!(source.contains("verified_post_adopt_isolation"));
+    assert!(source.contains("refs.contains_key(native_ref)"));
+    assert!(!source.contains("!refs.contains_key(native_ref)"));
+    assert!(source.contains("assert_eq!(verified_deferred_table_refs, args.tables)"));
     let compact = source
         .chars()
         .filter(|ch| !ch.is_whitespace())
@@ -508,8 +531,8 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     assert!(age.contains("after.checked_sub(before)"));
     assert!(age.contains("Some(args.history_commits)"));
     assert!(age.contains("verify_fixture_row(&table, \"base\", 0, args.dims, args.seed)"));
-    assert!(age.contains("db.wait_for_fork_reclaims().await"));
-    assert!(age.contains("retired native fork was not reclaimed"));
+    assert!(!age.contains("wait_for_fork_reclaims"));
+    assert!(age.contains("retired native fork must remain until cleanup"));
     assert!(age.contains("retirement must not publish on main"));
     assert!(!age.contains("Dataset::write"));
     for field in [
@@ -519,6 +542,7 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
         "setup_age_content_verified",
         "operation_io_manifest_reads",
         "operation_io_data_reads",
+        "operation_io_data_writes",
         "operation_io_boundary",
     ] {
         assert!(aging.contains(field), "missing age/IO evidence {field}");

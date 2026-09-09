@@ -65,7 +65,7 @@ use crate::db::manifest::TableVersionMetadata;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::storage_layer::{
-    ForkOutcome, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
+    IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
     PendingScanBudget, ProvenInsertChunk,
 };
 
@@ -1246,8 +1246,7 @@ impl TableStore {
     /// live physical path-child is NOT tolerated: those are real ordering
     /// errors. The graph namespace prevents new path-prefix overlaps; surfacing
     /// legacy ones keeps cleanup from falsely reporting a reclaim Lance skipped.
-    /// Used by the eager best-effort reclaim in `cleanup_deleted_branch_tables`
-    /// and the `cleanup` orphan reconciler.
+    /// Used by the explicit `cleanup` orphan reconciler.
     pub async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
         let mut ds = crate::instrumentation::open_dataset(
             dataset_uri,
@@ -1300,7 +1299,7 @@ impl TableStore {
         type_key: &str,
         source_version: u64,
         target_branch: &str,
-    ) -> Result<ForkOutcome<Dataset>> {
+    ) -> Result<Dataset> {
         let mut source_ds = self
             .open_dataset_head(dataset_uri, source_branch)
             .await?
@@ -1309,18 +1308,12 @@ impl TableStore {
             .map_err(OmniError::storage)?;
         self.ensure_expected_version(&source_ds, type_key, source_version)?;
 
-        let created = match crate::branch_control::create_branch_recoverably(
+        let created = crate::branch_control::create_unique_table_fork(
             &mut source_ds,
             target_branch,
             source_version,
         )
-        .await?
-        {
-            crate::branch_control::BranchCreateOutcome::Created(dataset) => *dataset,
-            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {
-                return Ok(ForkOutcome::RefAlreadyExists);
-            }
-        };
+        .await?;
 
         // The ref is now independently durable. Any error from this point is an
         // ambiguous/post-effect outcome to the caller and must retain an armed
@@ -1335,7 +1328,7 @@ impl TableStore {
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;
         self.ensure_expected_version(&ds, type_key, source_version)?;
-        Ok(ForkOutcome::Created(ds))
+        Ok(ds)
     }
 
     pub async fn scan_batches(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
@@ -2484,6 +2477,9 @@ impl TableStore {
                     session: Some(control_session),
                     ..Default::default()
                 };
+                let params = crate::storage_layer::lance_clone::write_params(dataset_uri, params)
+                    .await
+                    .map_err(OmniError::storage)?;
                 Dataset::write(reader, dataset_uri, Some(params))
                     .await
                     .map_err(OmniError::storage)
@@ -3698,7 +3694,15 @@ impl TableStore {
         }
 
         let store_params = crate::storage::lance_store_params_for_uri(dataset_uri)?;
+        let handler = crate::storage_layer::lance_clone::configured_commit_handler(
+            dataset_uri,
+            &Some(store_params.clone()),
+            None,
+        )
+        .await
+        .map_err(OmniError::storage)?;
         let dataset = CommitBuilder::new(dataset_uri)
+            .with_commit_handler(handler)
             .use_stable_row_ids(true)
             .with_storage_format(LanceFileVersion::V2_2)
             .enable_v2_manifest_paths(true)
@@ -4533,6 +4537,9 @@ impl TableStore {
             session: Some(control_session),
             ..Default::default()
         };
+        let params = crate::storage_layer::lance_clone::write_params(dataset_uri, params)
+            .await
+            .map_err(OmniError::storage)?;
         Dataset::write(reader, dataset_uri, Some(params))
             .await
             .map_err(OmniError::storage)

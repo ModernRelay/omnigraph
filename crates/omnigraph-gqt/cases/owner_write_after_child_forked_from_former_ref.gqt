@@ -1,9 +1,7 @@
 # issue: none
-# red_on: 2026-09-08, PR 662 @ 2850d86f with the pointer switch: the owner's write armed recovery, its reclaim failed on the former ref's dependent fork, and the next open failed with `cannot discard unpublished fork … parent version is 2, expected exact fork point 4`.
-# notes: After the switch, a child that writes the table forks from the former ref, so that ref
-# notes: is no longer pinned but is the parent of the child's fork. The owner's next write must
-# notes: refuse before arming, name the dependent child, and leave the graph openable; deleting
-# notes: the child is the exit, after which the owner's write reclaims the ref and succeeds.
+# notes: After a pointer switch, child's write forks from feature's former fork.
+# notes: Feature writes successfully while that ancestor is still required by child.
+# notes: Both branches retain independent rows after restart and further writes.
 
 --- schema
 node Person {
@@ -60,7 +58,7 @@ query owner_writes_after_child_wrote() {
     update Person set { age: 34 } where name = "alice"
 }
 
---- expect error: dependent child branches
+--- expect affected: nodes=1 edges=0
 
 --- restart
 
@@ -85,7 +83,7 @@ query feature_reads_after_restart() {
 }
 
 --- expect unordered
-{"p.name":"alice","p.age":32}
+{"p.name":"alice","p.age":34}
 
 --- expect shape
 p.name: String
@@ -98,6 +96,21 @@ query child_writes_again() {
 
 --- expect affected: nodes=1 edges=0
 
+--- query branch: child
+query child_reads_its_second_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"carol","p.age":1}
+{"p.name":"dave","p.age":2}
+
+--- expect shape
+p.name: String
+p.age: I32
+
 --- mutate
 branch delete child
 
@@ -105,7 +118,7 @@ branch delete child
 
 --- mutate branch: feature
 query owner_writes_after_child_deleted() {
-    update Person set { age: 34 } where name = "alice"
+    update Person set { age: 35 } where name = "alice"
 }
 
 --- expect affected: nodes=1 edges=0
@@ -117,7 +130,7 @@ query feature_reads_own_write() {
 }
 
 --- expect unordered
-{"p.name":"alice","p.age":34}
+{"p.name":"alice","p.age":35}
 
 --- expect shape
 p.name: String

@@ -127,16 +127,20 @@ when it changed unrelated data. A mismatch has no effect and exits with code
 ## Storage upgrade
 
 ```bash
-omnigraph upgrade ./graph.omni --check --to-format 7 --json
-omnigraph upgrade ./graph.omni --to-format 7 --json
+omnigraph upgrade ./graph.omni --check --to-format 8 --json
+omnigraph upgrade ./graph.omni --to-format 8 --json
 ```
 
 `--store` is an alternative to the positional storage URI. Target format defaults
-to 7. `--check` performs read-only preflight; execution requires stopped writers,
-stopped maintenance and a verified whole-root backup. A failed check, refusal or
+to 8: qualified v6 inputs run v6 → v7 → v8, and v7 inputs run v7 → v8.
+Explicit target 7 remains available, but the current binary refuses normal open
+of v7. `--check` performs read-only preflight and reports output-dependent checks
+in `work.deferred_checks`; execution validates those before the affected handler
+has effects. Execution requires stopped writers, stopped maintenance and a
+verified whole-root backup. A failed check, refusal or
 required recovery exits 1. JSON reports the route, formats, findings, durable
 boundary, recovery action and work categories. Server and cluster addressing
-are refused. See [storage migration](../operations/upgrade.md#explicit-v6-to-v7-storage-migration).
+are refused. See [storage migration](../operations/upgrade.md#explicit-storage-migration).
 
 ## Load modes
 

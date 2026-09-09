@@ -1937,7 +1937,6 @@ async fn run_control_step(
             expect,
         } => {
             let outcome = db.branch_delete_as(branch, None).await;
-            db.wait_for_fork_reclaims().await;
             check_write_expect(name, expect, outcome).map_err(fail)
         }
         ControlWrite::Merge {

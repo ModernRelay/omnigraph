@@ -16,7 +16,7 @@
 //! ## Explicit conversion and normal-open contract
 //!
 //! Normal open accepts only CURRENT and refuses an active storage-upgrade intent.
-//! The explicit offline upgrade entry point converts supported v6 graphs before
+//! The explicit offline upgrade entry point converts supported v6/v7 graphs before
 //! serving. Retained v6 snapshots use the legacy decoder after root admission;
 //! normal open never runs conversion or lowers MIN_SUPPORTED.
 //! Fresh graphs receive their stamp atomically in the manifest Create commit.
@@ -57,9 +57,12 @@ use crate::error::{OmniError, Result};
 ///   greatest per-native-ref Lance version. The unreleased v7–v19 stamps of the
 ///   rejected MemWAL experiment never shipped; v7 is reused.
 ///
-/// v1–v6 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// - v8 — native graph refs retain ancestry through versioned retirement metadata.
+///   Old readers must refuse rather than expose retired refs as live branches.
+///
+/// v1–v7 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 7;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 8;
 
 /// The oldest main-manifest stamp accepted by normal open.
 /// Explicit conversion and retained-snapshot decoding do not lower this gate.
@@ -84,6 +87,7 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
             "built from unreleased final-v5 source commit 46b6d9084fb629b88d4ac9e8c546e0a30d213d19"
         }
         6 => "0.9.x or 0.10.x",
+        7 => "an unreleased v7 development build",
         // Unreachable today (1–6 are mapped; > CURRENT is caught by the ceiling
         // guard before this is consulted). Worded to read naturally after
         // "created by omnigraph " if a future bump ever leaves a gap.
@@ -143,9 +147,9 @@ pub(crate) fn guard_stamp(dataset: &Dataset) -> Result<u32> {
         .metadata
         .contains_key(super::upgrade::UPGRADE_PENDING_KEY)
     {
-        return Err(OmniError::manifest(
-            "storage upgrade recovery required: stop all writers and maintenance, then rerun the same `omnigraph upgrade <graph> --to-format 7` command with the upgrade-capable executable",
-        ));
+        return Err(OmniError::manifest(super::upgrade::recovery_guidance(
+            dataset,
+        )));
     }
     match dataset.schema().metadata.get(INTERNAL_SCHEMA_VERSION_KEY) {
         Some(value) => match value.parse::<u32>() {
@@ -203,8 +207,8 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
         )));
     }
     if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
-        let explicit_upgrade = if stamp == 6 {
-            " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check --to-format 7` before execution."
+        let explicit_upgrade = if matches!(stamp, 6 | 7) {
+            " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check --to-format 8` before execution."
         } else {
             ""
         };
@@ -276,8 +280,8 @@ mod tests {
     use super::*;
 
     /// The guard accepts exactly the single served version and refuses anything
-    /// below the floor or above the ceiling. With `MIN == CURRENT == 7` the live
-    /// range is exactly `[7, 7]`.
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 8` the live
+    /// range is exactly `[8, 8]`.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
@@ -294,10 +298,10 @@ mod tests {
         }
         let future_stamp = INTERNAL_MANIFEST_SCHEMA_VERSION + 1;
         let future = refuse_if_stamp_unsupported(future_stamp)
-            .expect_err("the first abandoned post-v7 stamp must be refused")
+            .expect_err("the first unsupported future stamp must be refused")
             .to_string();
-        assert!(future.contains("internal schema v8"), "got: {future}");
-        assert!(future.contains("expects v7"), "got: {future}");
+        assert!(future.contains("internal schema v9"), "got: {future}");
+        assert!(future.contains("expects v8"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 

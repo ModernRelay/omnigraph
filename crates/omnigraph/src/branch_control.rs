@@ -1,12 +1,8 @@
-//! Crash classification for Lance's native branch controls.
+//! Crash classification for Lance's public native branch controls.
 //!
-//! Lance branch creation is deliberately two-phase: it first commits a shallow
-//! clone under `tree/{branch}` and then writes authoritative `BranchContents`.
-//! Deletion removes `BranchContents` before reclaiming that tree.  These helpers
-//! keep OmniGraph on Lance's public APIs while making both operations bounded
-//! and idempotent under the documented single-writer-process branch-control
-//! boundary. Live graph names are path-prefix-disjoint because Lance cannot
-//! recursively reclaim an ancestor tree while a path-child branch remains.
+//! Graph retirement marks logical authority in branch metadata while preserving
+//! native refs and trees for explicit cleanup. Controls remain serialized by
+//! OmniGraph's single-writer-process schema, branch, and table gates.
 
 use std::collections::HashMap;
 
@@ -18,8 +14,7 @@ use crate::error::{OmniError, Result};
 /// Result of a recoverable native create attempt.
 pub(crate) enum BranchCreateOutcome {
     /// The requested branch is durably authoritative and its dataset opens.
-    /// Boxed: `Dataset` is ~336 bytes and `RefAlreadyExists` carries none.
-    Created(Box<Dataset>),
+    Created,
     /// The target ref existed before this invocation. Callers classify its
     /// ownership at their own logical layer; this helper never deletes it.
     /// A ref that appears after target absence was captured is instead a typed
@@ -51,6 +46,156 @@ pub(crate) async fn list_branch_contents(
         }
     }
     unreachable!("the bounded branch-enumeration loop always returns")
+}
+
+/// Enumerate physical native lifetimes, including retired graph manifests.
+pub(crate) async fn list_all_branch_contents(
+    dataset: &Dataset,
+) -> Result<HashMap<String, BranchContents>> {
+    list_branch_contents(dataset).await
+}
+
+const RETIRED_MANIFEST_BRANCH_KEY: &str = "omnigraph.retired_manifest_branch";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredManifestBranch {
+    version: u32,
+    native_branch: String,
+    identifier: BranchIdentifier,
+}
+
+fn manifest_branch_is_live(branch: &str, contents: &BranchContents) -> Result<bool> {
+    let Some(value) = contents.metadata.get(RETIRED_MANIFEST_BRANCH_KEY) else {
+        return Ok(true);
+    };
+    let record: RetiredManifestBranch = serde_json::from_str(value).map_err(|error| {
+        OmniError::manifest_conflict(format!(
+            "native manifest branch '{branch}' has invalid retirement metadata: {error}"
+        ))
+    })?;
+    if record.version != 1
+        || branch == "main"
+        || record.native_branch != branch
+        || record.identifier != contents.identifier
+        || record.identifier == BranchIdentifier::main()
+        || record.identifier == BranchIdentifier::missing_identifier_sentinel()
+    {
+        return Err(OmniError::manifest_conflict(format!(
+            "native manifest branch '{branch}' has unsupported or mismatched retirement metadata"
+        )));
+    }
+    Ok(false)
+}
+
+/// Validate all physical refs before selecting live graph incarnations.
+pub(crate) async fn list_live_manifest_branch_contents(
+    dataset: &Dataset,
+) -> Result<HashMap<String, BranchContents>> {
+    let mut live = HashMap::new();
+    for (branch, contents) in list_branch_contents(dataset).await? {
+        if manifest_branch_is_live(&branch, &contents)? {
+            live.insert(branch, contents);
+        }
+    }
+    Ok(live)
+}
+
+/// Read exact native authority and refuse retired or malformed graph refs.
+pub(crate) async fn get_live_manifest_branch_contents(
+    dataset: &Dataset,
+    branch: &str,
+) -> Result<BranchContents> {
+    let not_found = || OmniError::BranchNotFound {
+        branch: crate::branch_names::logical_branch_name(branch).to_string(),
+    };
+    let contents = match dataset.branches().get(branch).await {
+        Ok(contents) => contents,
+        Err(lance::Error::RefNotFound { .. }) => {
+            return Err(not_found());
+        }
+        Err(error) => return Err(OmniError::storage(error)),
+    };
+    if !manifest_branch_is_live(branch, &contents)? {
+        return Err(not_found());
+    }
+    Ok(contents)
+}
+
+/// Retire logical authority through public metadata; cleanup owns physical refs.
+/// Callers hold schema, branch, and table gates in one writer process.
+/// The metadata replacement is one-object publication, without a native CAS.
+pub(crate) async fn retire_branch_recoverably(
+    dataset: &Dataset,
+    branch: &str,
+    expected_identifier: &BranchIdentifier,
+) -> Result<()> {
+    if branch == "main" {
+        return Err(OmniError::manifest_conflict("cannot retire branch 'main'"));
+    }
+    let contents = dataset
+        .branches()
+        .get(branch)
+        .await
+        .map_err(OmniError::storage)?;
+    if contents.identifier != *expected_identifier {
+        return Err(OmniError::manifest_conflict(format!(
+            "branch '{branch}' changed before retirement"
+        )));
+    }
+    if !manifest_branch_is_live(branch, &contents)? {
+        return Ok(());
+    }
+    if expected_identifier == &BranchIdentifier::main()
+        || expected_identifier == &BranchIdentifier::missing_identifier_sentinel()
+    {
+        return Err(OmniError::manifest_conflict(format!(
+            "branch '{branch}' has no exact retirement identity"
+        )));
+    }
+    let tags = dataset.tags().list().await.map_err(OmniError::storage)?;
+    if let Some((tag, _)) = tags
+        .iter()
+        .find(|(_, tag)| tag.branch.as_deref() == Some(branch))
+    {
+        return Err(OmniError::storage(lance::Error::RefConflict {
+            message: format!(
+                "cannot retire graph branch '{branch}' while native manifest tag '{tag}' pins it; remove the tag first"
+            ),
+        }));
+    }
+    let record = RetiredManifestBranch {
+        version: 1,
+        native_branch: branch.to_string(),
+        identifier: expected_identifier.clone(),
+    };
+    let value = serde_json::to_string(&record).map_err(|error| {
+        OmniError::manifest_internal(format!("failed to encode branch retirement: {error}"))
+    })?;
+    let mut metadata = contents.metadata;
+    metadata.insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), value);
+    let result = match dataset.branches().replace_metadata(branch, metadata).await {
+        Ok(()) => {
+            crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_NATIVE)
+        }
+        Err(error) => Err(OmniError::storage(error)),
+    };
+    let Err(error) = result else { return Ok(()) };
+    let observed = dataset
+        .branches()
+        .get(branch)
+        .await
+        .map_err(OmniError::storage)?;
+    if observed.identifier != *expected_identifier {
+        return Err(OmniError::manifest_conflict(format!(
+            "branch '{branch}' changed during retirement"
+        )));
+    }
+    if manifest_branch_is_live(branch, &observed)? {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph
@@ -144,6 +289,11 @@ pub(crate) async fn reclaim_ref_absent_tree(dataset: &mut Dataset, branch: &str)
     if branches.contains_key(branch) {
         return Ok(false);
     }
+    match dataset.branches().get(branch).await {
+        Ok(_) => return Ok(false),
+        Err(lance::Error::RefNotFound { .. }) => {}
+        Err(error) => return Err(OmniError::storage(error)),
+    }
     if let Some(child) = path_descendant(&branches, branch) {
         return Err(OmniError::manifest_conflict(format!(
             "cannot reclaim absent branch '{branch}' while live branch '{child}' shares its \
@@ -179,6 +329,28 @@ fn matches_create_expectation(
         && mapping
             .last()
             .is_some_and(|(version, uuid)| *version == parent_version && !uuid.is_empty())
+}
+
+/// Create a fresh table fork once; the caller's persisted intent owns any effects.
+/// Errors retain recovery ownership until classification. Cleanup reclaims garbage.
+pub(crate) async fn create_unique_table_fork(
+    source: &mut Dataset,
+    branch: &str,
+    source_version: u64,
+) -> Result<Dataset> {
+    check_valid_branch(branch).map_err(OmniError::storage)?;
+    if source.version().version != source_version {
+        return Err(OmniError::manifest_conflict(format!(
+            "table fork source moved: expected version {}, current {}",
+            source_version,
+            source.version().version,
+        )));
+    }
+    let created = crate::storage_layer::lance_clone::create_branch(source, branch, source_version)
+        .await
+        .map_err(OmniError::storage)?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_CREATE_POST_NATIVE)?;
+    Ok(created)
 }
 
 /// Create a branch with a bounded recovery classifier.
@@ -226,19 +398,19 @@ pub(crate) async fn create_branch_recoverably(
     }
 
     for attempt in 0..2 {
-        let native_error = match source
-            .create_branch(branch, source_version, None)
-            .await
-            .map_err(OmniError::storage)
-        {
-            Ok(created) => match crate::failpoints::maybe_fail(
-                crate::failpoints::names::BRANCH_CREATE_POST_NATIVE,
-            ) {
-                Ok(()) => return Ok(BranchCreateOutcome::Created(Box::new(created))),
+        let native_error =
+            match crate::storage_layer::lance_clone::create_branch(source, branch, source_version)
+                .await
+                .map_err(OmniError::storage)
+            {
+                Ok(_) => match crate::failpoints::maybe_fail(
+                    crate::failpoints::names::BRANCH_CREATE_POST_NATIVE,
+                ) {
+                    Ok(()) => return Ok(BranchCreateOutcome::Created),
+                    Err(error) => error,
+                },
                 Err(error) => error,
-            },
-            Err(error) => error,
-        };
+            };
 
         let observed = branch_contents(source, branch).await.map_err(|classifier_error| {
             OmniError::manifest_internal(format!(
@@ -259,14 +431,14 @@ pub(crate) async fn create_branch_recoverably(
                     Some(encode_identifier(&contents.identifier)?),
                 ));
             }
-            let created = source.checkout_branch(branch).await.map_err(|error| {
+            source.checkout_branch(branch).await.map_err(|error| {
                 OmniError::manifest_internal(format!(
                     "branch '{}' has matching authoritative metadata after an ambiguous create, \
                      but its branch dataset cannot be opened: {}; original native error: {}",
                     branch, error, native_error
                 ))
             })?;
-            return Ok(BranchCreateOutcome::Created(Box::new(created)));
+            return Ok(BranchCreateOutcome::Created);
         }
 
         match reclaim_ref_absent_tree(source, branch).await {
@@ -288,97 +460,6 @@ pub(crate) async fn create_branch_recoverably(
     }
 
     unreachable!("bounded native branch-create loop returns from every attempt")
-}
-
-/// Delete a branch and classify Lance's authority-removal → tree-cleanup gap.
-///
-/// A missing ref after an error is logical success. Tree reclamation is derived
-/// state and is retried best-effort; a recreated identifier is never deleted.
-pub(crate) async fn delete_branch_recoverably(
-    dataset: &mut Dataset,
-    branch: &str,
-    expected_identifier: &BranchIdentifier,
-) -> Result<()> {
-    let initial = list_branch_contents(dataset).await?;
-    let Some(initial_contents) = initial.get(branch) else {
-        match reclaim_ref_absent_tree(dataset, branch).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(authority_appeared_after_absence(dataset, branch).await?);
-            }
-            Err(cleanup_error) => {
-                tracing::warn!(
-                    target: "omnigraph::branch_control",
-                    branch,
-                    error = %cleanup_error,
-                    "branch authority is already deleted; derived tree reclaim remains pending",
-                );
-            }
-        }
-        return Ok(());
-    };
-    if initial_contents.identifier != *expected_identifier {
-        return Err(OmniError::manifest_read_set_changed(
-            format!("branch_identifier:{branch}"),
-            Some(encode_identifier(expected_identifier)?),
-            Some(encode_identifier(&initial_contents.identifier)?),
-        ));
-    }
-    if let Some(child) = path_descendant(&initial, branch) {
-        return Err(OmniError::manifest_conflict(format!(
-            "cannot delete branch '{branch}' while live branch '{child}' shares its physical \
-             Lance path; delete the child branch first"
-        )));
-    }
-
-    let native_result = match dataset
-        .delete_branch(branch)
-        .await
-        .map_err(OmniError::storage)
-    {
-        Ok(()) => {
-            crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_NATIVE)
-        }
-        Err(error) => Err(error),
-    };
-    let native_error = match native_result {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-
-    let observed = branch_contents(dataset, branch)
-        .await
-        .map_err(|classifier_error| {
-            OmniError::manifest_internal(format!(
-                "native delete of branch '{branch}' returned an ambiguous error ({native_error}); \
-             reading BranchContents to classify it also failed ({classifier_error})"
-            ))
-        })?;
-    match observed {
-        None => {
-            match reclaim_ref_absent_tree(dataset, branch).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(authority_appeared_after_absence(dataset, branch).await?);
-                }
-                Err(cleanup_error) => {
-                    tracing::warn!(
-                        target: "omnigraph::branch_control",
-                        branch,
-                        error = %cleanup_error,
-                        "branch authority is deleted; derived tree reclaim remains pending",
-                    );
-                }
-            }
-            Ok(())
-        }
-        Some(contents) if contents.identifier == *expected_identifier => Err(native_error),
-        Some(contents) => Err(OmniError::manifest_read_set_changed(
-            format!("branch_identifier:{branch}"),
-            Some(encode_identifier(expected_identifier)?),
-            Some(encode_identifier(&contents.identifier)?),
-        )),
-    }
 }
 
 #[cfg(test)]
@@ -683,8 +764,11 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "failpoints")]
     #[tokio::test]
-    async fn delete_accepts_absent_authority_and_reclaims_remaining_tree() {
+    #[serial_test::serial]
+    async fn retire_classifies_durable_metadata_after_lost_ack_and_retries() {
+        let _scenario = crate::failpoints::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let mut dataset = test_dataset(&dir).await;
         let version = dataset.version().version;
@@ -692,69 +776,59 @@ mod tests {
             .create_branch("feature", version, None)
             .await
             .unwrap();
-        let identifier = dataset
-            .list_branches()
-            .await
-            .unwrap()
-            .get("feature")
-            .unwrap()
-            .identifier
-            .clone();
-        std::fs::remove_file(
-            dir.path()
-                .join("_refs")
-                .join("branches")
-                .join("feature.json"),
-        )
-        .unwrap();
-
-        delete_branch_recoverably(&mut dataset, "feature", &identifier)
+        let mut metadata = HashMap::new();
+        metadata.insert("external".to_string(), "preserved".to_string());
+        dataset
+            .branches()
+            .replace_metadata("feature", metadata)
             .await
             .unwrap();
-        assert!(!dir.path().join("tree").join("feature").exists());
-    }
-
-    #[tokio::test]
-    async fn delete_preserves_native_error_while_same_identifier_remains() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut dataset = test_dataset(&dir).await;
-        let version = dataset.version().version;
-        let mut feature = dataset
-            .create_branch("feature", version, None)
-            .await
-            .unwrap();
-        let identifier = dataset
-            .list_branches()
-            .await
-            .unwrap()
-            .get("feature")
-            .unwrap()
-            .identifier
-            .clone();
-        let feature_version = feature.version().version;
-        feature
-            .create_branch("dependent", feature_version, None)
-            .await
-            .unwrap();
-
-        let error = delete_branch_recoverably(&mut dataset, "feature", &identifier)
-            .await
-            .expect_err("a lineage-dependent ref must preserve Lance's delete refusal");
-        assert!(error.to_string().contains("referenc"));
+        let original = dataset.branches().get("feature").await.unwrap();
+        {
+            let _lost_ack = crate::failpoints::ScopedFailPoint::new(
+                crate::failpoints::names::BRANCH_DELETE_POST_NATIVE,
+                "return",
+            );
+            retire_branch_recoverably(&dataset, "feature", &original.identifier)
+                .await
+                .unwrap();
+        }
+        let retired = dataset.branches().get("feature").await.unwrap();
+        assert_eq!(retired.identifier, original.identifier);
         assert_eq!(
-            dataset
-                .list_branches()
+            retired.metadata.get("external").map(String::as_str),
+            Some("preserved")
+        );
+        assert!(!manifest_branch_is_live("feature", &retired).unwrap());
+        assert!(
+            list_branch_contents(&dataset)
                 .await
                 .unwrap()
-                .get("feature")
+                .contains_key("feature")
+        );
+        assert!(
+            !list_live_manifest_branch_contents(&dataset)
+                .await
                 .unwrap()
-                .identifier,
-            identifier
+                .contains_key("feature")
+        );
+        assert!(matches!(
+            get_live_manifest_branch_contents(&dataset, "feature").await,
+            Err(OmniError::BranchNotFound { .. })
+        ));
+        let historical = dataset.checkout_branch("feature").await.unwrap();
+        assert_eq!(historical.version().version, version);
+        retire_branch_recoverably(&dataset, "feature", &original.identifier)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(dataset.branches().get("feature").await.unwrap()).unwrap(),
+            serde_json::to_value(retired).unwrap(),
         );
     }
 
     #[tokio::test]
-    async fn delete_rejects_recreated_identifier_without_removing_it() {
+    async fn retire_rejects_recreated_identifier_without_removing_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut dataset = test_dataset(&dir).await;
         let version = dataset.version().version;
@@ -785,24 +859,10 @@ mod tests {
             .clone();
         assert_ne!(original, recreated);
 
-        let error = delete_branch_recoverably(&mut dataset, "feature", &original)
+        let error = retire_branch_recoverably(&dataset, "feature", &original)
             .await
             .expect_err("a recreated target must be fenced by its identifier");
-        let OmniError::Manifest(error) = error else {
-            panic!("expected typed manifest conflict");
-        };
-        match error.details {
-            Some(crate::error::ManifestConflictDetails::ReadSetChanged {
-                member,
-                expected: Some(expected),
-                actual: Some(actual),
-            }) => {
-                assert_eq!(member, "branch_identifier:feature");
-                assert_eq!(expected, serde_json::to_string(&original).unwrap());
-                assert_eq!(actual, serde_json::to_string(&recreated).unwrap());
-            }
-            other => panic!("expected identifier ReadSetChanged, got {other:?}"),
-        }
+        assert!(error.to_string().contains("changed"), "{error}");
         assert_eq!(
             dataset
                 .list_branches()

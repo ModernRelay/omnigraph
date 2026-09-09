@@ -2888,7 +2888,7 @@ fn branch_merge_supports_explicit_target() {
 }
 
 #[test]
-fn branch_merge_delete_branch_deletes_source() {
+fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -2921,6 +2921,17 @@ fn branch_merge_delete_branch_deletes_source() {
             .arg(&graph),
     );
 
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--from")
+            .arg("feature")
+            .arg("feature-child"),
+    );
+
     let merge_output = output_success(
         cli()
             .arg("branch")
@@ -2945,7 +2956,10 @@ fn branch_merge_delete_branch_deletes_source() {
             .arg("--json"),
     );
     let list_payload: Value = serde_json::from_slice(&list_output.stdout).unwrap();
-    assert_eq!(list_payload["branches"], serde_json::json!(["main"]));
+    assert_eq!(
+        list_payload["branches"],
+        serde_json::json!(["feature-child", "main"])
+    );
 }
 
 #[test]
@@ -2955,28 +2969,25 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
     init_graph(&graph);
     load_fixture(&graph);
 
-    for (from, name) in [("main", "feature"), ("feature", "feature-child")] {
-        output_success(
-            cli()
-                .arg("branch")
-                .arg("create")
-                .arg("--uri")
-                .arg(&graph)
-                .arg("--from")
-                .arg(from)
-                .arg(name),
-        );
-    }
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--from")
+            .arg("main")
+            .arg("feature"),
+    );
 
-    // `feature` has a dependent descendant, so the post-merge deletion is
-    // refused — the merge (already_up_to_date: deletion is still attempted)
-    // must succeed with exit code 0 and a stderr warning.
     let merge_output = output_success(
         cli()
             .arg("branch")
             .arg("merge")
             .arg("--uri")
             .arg(&graph)
+            .arg("main")
+            .arg("--into")
             .arg("feature")
             .arg("--delete-branch")
             .arg("--json"),
@@ -2988,10 +2999,10 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
         merge_payload["branch_delete_error"]
             .as_str()
             .unwrap()
-            .contains("feature-child")
+            .contains("cannot delete branch 'main'")
     );
     let stderr = String::from_utf8_lossy(&merge_output.stderr);
-    assert!(stderr.contains("could not delete branch 'feature'"));
+    assert!(stderr.contains("could not delete branch 'main'"));
 
     let list_output = output_success(
         cli()
@@ -3004,7 +3015,7 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
     let list_payload: Value = serde_json::from_slice(&list_output.stdout).unwrap();
     assert_eq!(
         list_payload["branches"],
-        serde_json::json!(["feature", "feature-child", "main"])
+        serde_json::json!(["feature", "main"])
     );
 }
 

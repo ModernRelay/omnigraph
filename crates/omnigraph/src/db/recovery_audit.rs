@@ -200,6 +200,9 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
         session: Some(control_session),
         ..Default::default()
     };
+    let params = crate::storage_layer::lance_clone::write_params(&uri, params)
+        .await
+        .map_err(OmniError::storage)?;
     match Dataset::write(reader, &uri as &str, Some(params)).await {
         Ok(dataset) => Ok(dataset),
         // Create-or-open idempotency — match the typed `DatasetAlreadyExists`

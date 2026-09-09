@@ -37,7 +37,7 @@ pub(super) async fn resolve_native_manifest_branch(
     dataset: &Dataset,
     logical: &str,
 ) -> Result<String> {
-    let branches = crate::branch_control::list_branch_contents(dataset).await?;
+    let branches = crate::branch_control::list_live_manifest_branch_contents(dataset).await?;
     crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), logical)?
         .ok_or_else(|| OmniError::BranchNotFound {
             branch: logical.to_string(),

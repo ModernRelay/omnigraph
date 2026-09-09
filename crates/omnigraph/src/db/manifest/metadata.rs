@@ -14,6 +14,7 @@ use super::layout::table_id_to_key;
 
 pub(super) const OMNIGRAPH_ROW_COUNT_KEY: &str = "omnigraph.row_count";
 const OMNIGRAPH_TABLE_BRANCH_KEY: &str = "omnigraph.table_branch";
+const OMNIGRAPH_TABLE_FORK_OWNER_KEY: &str = "omnigraph.table_fork_owner";
 
 pub(super) fn namespace_version_metadata(
     row_count: u64,
@@ -54,6 +55,7 @@ pub(super) fn parse_namespace_version_request(
         manifest_size: request.manifest_size.map(|size| size as u64),
         e_tag: request.e_tag.clone(),
         naming_scheme: request.naming_scheme.clone(),
+        table_fork_owner: metadata.get(OMNIGRAPH_TABLE_FORK_OWNER_KEY).cloned(),
     };
 
     Ok((
@@ -71,6 +73,8 @@ pub(crate) struct TableVersionMetadata {
     manifest_size: Option<u64>,
     e_tag: Option<String>,
     naming_scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    table_fork_owner: Option<String>,
 }
 
 impl TableVersionMetadata {
@@ -88,7 +92,23 @@ impl TableVersionMetadata {
             manifest_size: dataset.manifest_location().size,
             e_tag: dataset.manifest_location().e_tag.clone(),
             naming_scheme: Some(format!("{:?}", dataset.manifest_location().naming_scheme)),
+            table_fork_owner: None,
         })
+    }
+
+    pub(crate) fn table_fork_owner(&self) -> Option<&str> {
+        self.table_fork_owner.as_deref()
+    }
+
+    pub(crate) fn with_table_fork_owner(mut self, owner: Option<&str>) -> Self {
+        self.table_fork_owner = owner.map(str::to_string);
+        self
+    }
+
+    pub(crate) fn is_table_fork_of(&self, fork: &str, owner: &str) -> bool {
+        self.table_fork_owner
+            .as_deref()
+            .map_or(fork == owner, |recorded| recorded == owner)
     }
 
     pub(super) fn from_json_str(value: &str) -> Result<Self> {
@@ -135,7 +155,11 @@ impl TableVersionMetadata {
         request.manifest_size = self.manifest_size.map(|size| size as i64);
         request.e_tag = self.e_tag.clone();
         request.naming_scheme = self.naming_scheme.clone();
-        request.metadata = Some(namespace_version_metadata(row_count, table_branch));
+        let mut metadata = namespace_version_metadata(row_count, table_branch);
+        if let Some(owner) = &self.table_fork_owner {
+            metadata.insert(OMNIGRAPH_TABLE_FORK_OWNER_KEY.to_string(), owner.clone());
+        }
+        request.metadata = Some(metadata);
         request
     }
 
@@ -152,6 +176,9 @@ impl TableVersionMetadata {
         metadata: Option<HashMap<String, String>>,
     ) -> TableVersion {
         let mut metadata = metadata.unwrap_or_default();
+        if let Some(owner) = &self.table_fork_owner {
+            metadata.insert(OMNIGRAPH_TABLE_FORK_OWNER_KEY.to_string(), owner.clone());
+        }
         if let Some(naming_scheme) = &self.naming_scheme {
             metadata.insert("naming_scheme".to_string(), naming_scheme.clone());
         }
@@ -279,4 +306,129 @@ pub(super) async fn table_version_metadata_for_state(
         .await
         .map_err(OmniError::storage)?;
     TableVersionMetadata::from_dataset(root_uri, table_path, &ds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEGACY_JSON: &str = r#"{
+        "manifest_path":"graph/nodes/person/_versions/7.manifest",
+        "manifest_size":321,
+        "e_tag":"version-etag",
+        "naming_scheme":"V2"
+    }"#;
+    const OWNER: &str = "source.01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const TARGET: &str = "target.01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    const FORK: &str = "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAX";
+
+    /// GQT cannot inject absent owner metadata or inspect its serialized omission.
+    #[test]
+    fn legacy_metadata_owns_only_the_exact_native_ref() {
+        let metadata = TableVersionMetadata::from_json_str(LEGACY_JSON).unwrap();
+        assert_eq!(metadata.table_fork_owner(), None);
+        for legacy_ref in ["foo", OWNER, "foo.m42.01ARZ3NDEKTSV4RRFFQ69G5FAV"] {
+            assert!(metadata.is_table_fork_of(legacy_ref, legacy_ref));
+            assert!(!metadata.is_table_fork_of(legacy_ref, TARGET));
+        }
+        assert!(!metadata.is_table_fork_of("foo.m42.01ARZ3NDEKTSV4RRFFQ69G5FAV", "foo"));
+        assert!(!metadata.is_table_fork_of(FORK, OWNER));
+        let encoded = metadata.to_json_string().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert!(value.get("table_fork_owner").is_none());
+        assert_eq!(
+            TableVersionMetadata::from_json_str(&encoded).unwrap(),
+            metadata
+        );
+    }
+
+    /// GQT cannot forge legacy refs and metadata markers independently.
+    #[test]
+    fn explicit_owner_distinguishes_a_new_fork_from_a_legacy_lookalike() {
+        let legacy = TableVersionMetadata::from_json_str(LEGACY_JSON).unwrap();
+        let marked = legacy.clone().with_table_fork_owner(Some("foo"));
+        let lookalike = "foo.m42.01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        assert!(!legacy.is_table_fork_of(lookalike, "foo"));
+        assert!(marked.is_table_fork_of(lookalike, "foo"));
+        assert!(!marked.is_table_fork_of(lookalike, lookalike));
+        assert!(!marked.is_table_fork_of(lookalike, TARGET));
+    }
+
+    /// GQT does not expose physical version metadata serialization.
+    #[test]
+    fn owner_metadata_json_roundtrip_preserves_physical_version_fields() {
+        let metadata = TableVersionMetadata::from_json_str(LEGACY_JSON)
+            .unwrap()
+            .with_table_fork_owner(Some(OWNER));
+        let encoded = metadata.to_json_string().unwrap();
+        let decoded = TableVersionMetadata::from_json_str(&encoded).unwrap();
+        assert_eq!(decoded, metadata);
+        assert_eq!(decoded.table_fork_owner(), Some(OWNER));
+        assert!(decoded.is_table_fork_of(FORK, OWNER));
+        assert!(!decoded.is_table_fork_of(FORK, TARGET));
+
+        let main = decoded.with_table_fork_owner(None);
+        assert_eq!(
+            main,
+            TableVersionMetadata::from_json_str(LEGACY_JSON).unwrap()
+        );
+    }
+
+    /// GQT does not expose the namespace registration request and response metadata.
+    #[test]
+    fn namespace_pointer_roundtrip_keeps_source_ownership() {
+        let source = TableVersionMetadata::from_json_str(LEGACY_JSON)
+            .unwrap()
+            .with_table_fork_owner(Some(OWNER));
+        let request = source.to_create_table_version_request("node:Person", 7, 3, Some(FORK));
+        assert_eq!(
+            request
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get(OMNIGRAPH_TABLE_FORK_OWNER_KEY)
+                .map(String::as_str),
+            Some(OWNER)
+        );
+        let (table_key, version, rows, native_ref, target_registration) =
+            parse_namespace_version_request(&request).unwrap();
+        assert_eq!(table_key, "node:Person");
+        assert_eq!(version, 7);
+        assert_eq!(rows, 3);
+        assert_eq!(native_ref.as_deref(), Some(FORK));
+        assert_eq!(target_registration, source);
+        assert!(target_registration.is_table_fork_of(FORK, OWNER));
+        assert!(!target_registration.is_table_fork_of(FORK, TARGET));
+
+        let response = target_registration.to_namespace_version_with_details(
+            7,
+            Some(123),
+            Some(HashMap::from([(
+                "producer".to_string(),
+                "test".to_string(),
+            )])),
+        );
+        let metadata = response.metadata.unwrap();
+        assert_eq!(
+            metadata
+                .get(OMNIGRAPH_TABLE_FORK_OWNER_KEY)
+                .map(String::as_str),
+            Some(OWNER)
+        );
+        assert_eq!(metadata.get("producer").map(String::as_str), Some("test"));
+    }
+
+    /// GQT cannot inject malformed persisted owner JSON types.
+    #[test]
+    fn malformed_owner_json_types_are_rejected() {
+        for owner in [
+            serde_json::json!(42),
+            serde_json::json!({"name": OWNER}),
+            serde_json::json!([OWNER]),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(LEGACY_JSON).unwrap();
+            value["table_fork_owner"] = owner;
+            assert!(TableVersionMetadata::from_json_str(&value.to_string()).is_err());
+        }
+    }
 }

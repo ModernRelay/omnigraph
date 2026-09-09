@@ -505,12 +505,15 @@ mod tests {
 
         let original = object_store.read_one_all(&path).await.unwrap();
 
-        let clone_uri = directory.path().join("clone.lance");
+        let clone_uri = directory.path().join("source.lance/tree/certificate-clone");
         let version = dataset.version().version;
-        dataset
-            .shallow_clone(clone_uri.to_str().unwrap(), version, None)
-            .await
-            .unwrap();
+        crate::storage_layer::lance_clone::create_branch(
+            &mut dataset,
+            "certificate-clone",
+            version,
+        )
+        .await
+        .unwrap();
         let mut cloned =
             // forbidden-api-allow: test-only same-session clone proves certificate ownership cannot alias by UUID.
             lance::dataset::builder::DatasetBuilder::from_uri(clone_uri.to_str().unwrap())

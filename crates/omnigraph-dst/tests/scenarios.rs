@@ -1278,29 +1278,9 @@ fn assert_resolution_row(report: &omnigraph_dst::harness::UniverseReport, seed: 
     );
 }
 
-/// ISSUE #554 CATCH: a lance-realm write fault fails one mutation between
-/// arming its v9 recovery sidecar and its table commit; the stranded Armed
-/// intent is effect-free, yet the write-entry heal defers it and every
-/// later write on the live handle is refused with the same operation id.
-/// With the keep-serving budget armed this test is RED at engine HEAD
-/// (detector=Store(Session)/LiveWriteAvailability) and goes green when the
-/// live heal retires provably effect-free Armed mutation/load intents.
-///
-/// PANEL, not a single pin: lance-realm universes sit outside the strict
-/// replay envelope (pool threads race the entropy shim), so any ONE seed's
-/// strand can evaporate or reappear with process context — observed in
-/// both directions on seed 0 even at `error_pct: 80`. Every member is a
-/// verified flip seed, and the panel verdict is robust: RED if ANY member
-/// wedges, green only when ALL heal — jitter would have to erase every
-/// member at once to fake a pass, and the shape assert catches even that
-/// as a loud wrong-reason failure.
-///
-/// Re-pinning after upstream drift is a two-step protocol: run
-/// `dst_keep_serving_wedge_seed_search` (deliberately broader parameters —
-/// ops 30, `error_pct: 15` — to survey the wedge population), then screen
-/// its wedge seeds at THIS test's parameters against the engine fix: a
-/// panel member must strand-and-wedge (or strand harmlessly) at HEAD and
-/// heal under the fix.
+/// Exercises live retirement of effect-free Armed mutation/load intents with a short fault panel.
+/// Seed 21 strands Optimize, which lacks exact transaction ownership and requires Full recovery.
+/// Every eligible seed must stay available, and at least one must exercise deferred recovery.
 #[test]
 #[serial]
 fn dst_keep_serving_wedge_issue_554() {
@@ -1317,7 +1297,7 @@ fn dst_keep_serving_wedge_issue_554() {
     // (effectful / excluded-class intents the engine correctly refuses to
     // retire live — the detector's precision boundary, observed in the
     // wild; not panel material).
-    const PANEL: [u64; 14] = [0, 4, 10, 11, 14, 15, 17, 20, 21, 22, 23, 25, 26, 28];
+    const PANEL: [u64; 13] = [0, 4, 10, 11, 14, 15, 17, 20, 22, 23, 25, 26, 28];
     let mut wedged: Vec<String> = Vec::new();
     let mut defer_rows = 0usize;
     for seed in PANEL {
@@ -1501,7 +1481,7 @@ fn dst_ack_loss_bite_and_replay() {
 #[test]
 #[serial]
 fn dst_ack_loss_client_retry() {
-    for (seed, fault_seed, ack_loss_pct, ops) in [(226251, 23303853, 15, 1), (79, 7900, 20, 30)] {
+    for (seed, fault_seed, ack_loss_pct, ops) in [(226251, 23303853, 15, 1), (79, 7912, 20, 30)] {
         let sc = Scenario {
             seed,
             ops,
@@ -1754,28 +1734,16 @@ fn dst_stale_sidecar_bricks_recovery() {
     println!("dst sidecar-weather finding pin: stale-sidecar recovery brick reproduced: {a}");
 }
 
-/// CORRUPT-WRITE FIRST CONTACT (attended):
-/// sidecar contents stored MUTATED, plus injected errors forcing deaths so
-/// recovery must PARSE the garbage it wrote. The open question this
-/// universe asks the engine: a corrupted sidecar met by
-/// `heal_pending_sidecars_roll_forward` — detected (typed error, sidecar
-/// quarantined) or swallowed or wedged? Reconcile's reopen-retry asserts
-/// non-injected failures loudly ("reopen failed for a NON-injected
-/// reason"), so a wedge shows as that panic naming the serde error — the
-/// first red here is the likeliest find of the whole persisted-tier effort.
+/// Pins consumed persisted corruption and an attributed refusal, with strict replay.
+/// Malformed sidecars can stop recovery; this specimen is not a fleet availability guarantee.
 #[test]
 #[serial]
 fn dst_corrupt_write_first_contact() {
-    // Seed re-pinned 101 -> 112 (2026-09-01), for the same reason as the
-    // stale-sidecar pin above. Seed 112 reproduces the pinned intent
-    // (corrupt writes bite, recovery parses stored garbage, a detection
-    // row is recorded); found by the bounded 100..150 search at these
-    // exact parameters.
     let sc = Scenario {
         seed: 112,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 11200,
+            seed: 11204,
             error_pct: 12,
             corrupt_write_pct: 25,
             ..Default::default()
@@ -1797,6 +1765,20 @@ fn dst_corrupt_write_first_contact() {
         a.writes_corrupted > 0,
         "corrupt-write should actually bite (writes_corrupted={})",
         a.writes_corrupted
+    );
+    assert!(
+        a.persisted_consumed > 0,
+        "an engine read must consume persisted damage, not merely leave an unobserved write"
+    );
+    assert!(
+        !a.corruption_detections.is_empty(),
+        "the first-contact specimen must record a refusal attributed to consumed corruption"
+    );
+    let replay = run_universe("shared-memory://dst-s11b-corrupt-replay", &sc);
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &replay,
+        "adapter-realm persisted corruption must strictly replay",
     );
 }
 
@@ -2083,14 +2065,7 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
 ///   post_finalize = any recovery pass for the list/audit steps).
 fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
     match window {
-        // Orphan-ref manufacture: the branch delete's post-flip table cleanup
-        // SWALLOWS injected failures (branch gone, fork refs leak; the engine
-        // doc names the cleanup reconciler as the backstop) — the leaked refs
-        // are then walked by cleanup (reconcile_fork, classify) or collided
-        // with on a re-created branch's first write (before_reclaim).
-        "classify.fresh_read" | "cleanup.reconcile_fork" | "fork.before_reclaim" => {
-            Some(("branch_delete.before_table_cleanup", 0))
-        }
+        "classify.fresh_read" | "cleanup.reconcile_fork" => None,
         "recovery.before_roll_forward_publish" => {
             Some(("branch_merge.post_phase_b_pre_manifest_commit", 0))
         }
