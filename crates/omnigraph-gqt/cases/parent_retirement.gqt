@@ -1,6 +1,7 @@
 # issue: none
 # notes: Retiring a parent keeps the child's exact rows through writes, restart,
-# notes: and logical parent-name reuse. Cleanup and native storage assertions live
+# notes: and reuse of both ancestor names across two retired generations.
+# notes: Cleanup and native storage assertions live
 # notes: in branching.rs::branch_delete_retires_native_parent_and_cleanup_preserves_live_child.
 
 --- schema
@@ -92,3 +93,115 @@ query new_parent_rows() {
 --- expect shape
 p.name: String
 p.age: I32
+
+--- mutate
+branch create grandchild from child
+
+--- expect ok
+
+--- mutate
+branch delete child
+
+--- expect ok
+
+--- mutate branch: parent
+query recreated_parent_writes() {
+    update Person set { age: 90 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create child from parent
+
+--- expect ok
+
+--- restart
+
+--- query branch: grandchild
+query grandchild_keeps_retired_ancestors_rows() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate branch: grandchild
+query grandchild_writes_after_both_ancestor_names_are_reused() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: grandchild
+query grandchild_keeps_its_own_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: child
+query recreated_child_keeps_its_new_ancestry() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":90}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: parent
+query recreated_parent_stays_isolated() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":90}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query
+query main_stays_isolated_from_all_generations() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":30}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query
+branch list
+
+--- expect unordered
+{"name":"child"}
+{"name":"grandchild"}
+{"name":"main"}
+{"name":"parent"}
+
+--- expect shape
+name: String
