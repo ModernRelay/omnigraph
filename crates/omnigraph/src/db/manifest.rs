@@ -32,6 +32,12 @@ mod publisher;
 mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
+#[path = "manifest/upgrade.rs"]
+mod upgrade;
+pub use upgrade::{
+    UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
+    UpgradeWork, upgrade_storage, upgrade_storage_as,
+};
 
 pub(crate) use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{

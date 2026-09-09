@@ -265,6 +265,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         Command::Queries { .. } => Plane::Control,
         Command::Policy { .. } => Plane::Control,
         Command::Init { .. }
+        | Command::Upgrade { .. }
         | Command::Optimize { .. }
         | Command::RebuildFullTextIndexes { .. }
         | Command::Repair { .. }
@@ -320,6 +321,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Mutate { .. } => "mutate",
         Command::Alias { .. } => "alias",
         Command::Policy { .. } => "policy",
+        Command::Upgrade { .. } => "upgrade",
         Command::Optimize { .. } => "optimize",
         Command::RebuildFullTextIndexes { .. } => "rebuild-full-text-indexes",
         Command::Repair { .. } => "repair",

@@ -13,27 +13,13 @@
 //! - One guard `refuse_if_stamp_unsupported` rejects any graph this binary
 //!   cannot serve — in either direction — with a clear, actionable error.
 //!
-//! ## Single-version contract (strand + export/import)
+//! ## Explicit conversion and normal-open contract
 //!
-//! This binary reads exactly ONE internal-schema version (`MIN_SUPPORTED ==
-//! CURRENT`). There is no in-place migration: a graph stamped below CURRENT is
-//! refused on open with a "rebuild via `omnigraph export` + `init`/`load`"
-//! message, not silently upgraded. This is the deliberate pre-release contract —
-//! storage-format changes are a cutover, not a rolling in-place migration (see
-//! `docs/user/operations/upgrade.md` and the versioning policy in `docs/dev`).
-//! Fresh graphs are stamped at CURRENT *inside* the init `Dataset::write`
-//! Create commit (`current_stamp_entry` rides the write's schema metadata), so
-//! the stamp is atomic with manifest birth: no crash can leave `__manifest`
-//! durable but unstamped.
-//!
-//! ## If an in-place migration is ever needed
-//!
-//! The stamp + `refuse_if_stamp_unsupported` are the seam a future migration
-//! would plug into: re-introduce a dispatcher that walks the stamp forward and
-//! lower `MIN_SUPPORTED` below CURRENT for exactly the versions it can upgrade.
-//! Until a concrete graph demands it, that machinery is unearned complexity and
-//! is deliberately absent. A future converter is best shaped as a standalone
-//! one-shot tool, not a framework baked into the open path.
+//! Normal open accepts only CURRENT and refuses an active storage-upgrade intent.
+//! The explicit offline upgrade entry point converts supported v6 graphs before
+//! serving. Retained v6 snapshots use the legacy decoder after root admission;
+//! normal open never runs conversion or lowers MIN_SUPPORTED.
+//! Fresh graphs receive their stamp atomically in the manifest Create commit.
 //!
 //! ## Forward-version protection
 //!
@@ -75,14 +61,8 @@ use crate::error::{OmniError, Result};
 /// is kept for provenance and to document what each stamp value meant.
 pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 7;
 
-/// The oldest on-disk internal-schema stamp this binary will open. With no
-/// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
-/// stamped below it is refused (`refuse_if_stamp_unsupported`) with a
-/// rebuild-via-export/import message rather than silently upgraded.
-///
-/// Lowering this below CURRENT only makes sense alongside a re-introduced
-/// migration dispatcher that can actually walk those versions forward (see the
-/// module doc).
+/// The oldest main-manifest stamp accepted by normal open.
+/// Explicit conversion and retained-snapshot decoding do not lower this gate.
 pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_SCHEMA_VERSION;
 
 /// The omnigraph release or exact development build that wrote a given
@@ -111,7 +91,7 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     }
 }
 
-const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
+pub(super) const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 
 /// The schema-metadata entry stamping a fresh manifest at CURRENT. Folded into
 /// the Arrow schema of init's `Dataset::write` so the stamp lands in the same
@@ -158,6 +138,15 @@ pub(crate) fn read_stamp(dataset: &Dataset) -> Option<u32> {
 ///   treated as v1 and refused through the ordinary sub-floor message naming
 ///   the 0.3.1 export path.
 pub(crate) fn guard_stamp(dataset: &Dataset) -> Result<u32> {
+    if dataset
+        .schema()
+        .metadata
+        .contains_key(super::upgrade::UPGRADE_PENDING_KEY)
+    {
+        return Err(OmniError::manifest(
+            "storage upgrade recovery required: stop all writers and maintenance, then rerun the same `omnigraph upgrade <graph> --to-format 7` command with the upgrade-capable executable",
+        ));
+    }
     match dataset.schema().metadata.get(INTERNAL_SCHEMA_VERSION_KEY) {
         Some(value) => match value.parse::<u32>() {
             Ok(stamp) => {
@@ -214,6 +203,11 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
         )));
     }
     if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
+        let explicit_upgrade = if stamp == 6 {
+            " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check --to-format 7` before execution."
+        } else {
+            ""
+        };
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{stamp}, but this omnigraph reads only v{current}. \
              This graph was created by omnigraph {release}. Rebuild it: with an omnigraph {release} binary run \
@@ -221,7 +215,7 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
              `omnigraph init --schema <schema.pg> <new-graph>` and \
              `omnigraph load --mode overwrite --data graph.jsonl <new-graph>`. \
              (Data, vectors, and blobs are preserved; commit history and branches are not.) \
-             See docs/user/operations/upgrade.md.",
+             See docs/user/operations/upgrade.md.{explicit_upgrade}",
             current = INTERNAL_MANIFEST_SCHEMA_VERSION,
             release = release_for_internal_schema_version(stamp),
         )));

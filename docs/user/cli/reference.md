@@ -54,6 +54,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
+| `upgrade` | Check or execute a registered offline storage migration | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Preview or publish classified storage drift | direct |
@@ -122,6 +123,20 @@ commit. Any intervening commit on the branch invalidates the condition, even
 when it changed unrelated data. A mismatch has no effect and exits with code
 4; JSON output includes `precondition_failure` with `expected` and optional
 `actual` commit ids. Re-read and decide again instead of retrying blindly.
+
+## Storage upgrade
+
+```bash
+omnigraph upgrade ./graph.omni --check --to-format 7 --json
+omnigraph upgrade ./graph.omni --to-format 7 --json
+```
+
+`--store` is an alternative to the positional storage URI. Target format defaults
+to 7. `--check` performs read-only preflight; execution requires stopped writers,
+stopped maintenance and a verified whole-root backup. A failed check, refusal or
+required recovery exits 1. JSON reports the route, formats, findings, durable
+boundary, recovery action and work categories. Server and cluster addressing
+are refused. See [storage migration](../operations/upgrade.md#explicit-v6-to-v7-storage-migration).
 
 ## Load modes
 

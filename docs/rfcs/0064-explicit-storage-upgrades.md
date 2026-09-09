@@ -3,7 +3,7 @@ rfc: "0064"
 title: "Explicit storage upgrades"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - Azim Afroozeh
 created: 2026-09-09
@@ -12,8 +12,8 @@ discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Qualify in-place append-only publication, clocks, locators, cleanup, and cluster admission"
-  - "Record prototype evidence for retained history, publication, recovery, and genuine v6-binary compatibility before acceptance"
+  - "Qualify object-store backends and deferred orphan reclamation before expanding local standalone support"
+  - "Storage-maintainer review of the implemented protocol and genuine v0.9/v0.10 compatibility evidence before acceptance"
 ---
 
 # RFC 0064: Explicit storage upgrades
@@ -165,7 +165,10 @@ snapshot data or explicitly equivalent query semantics, not query bugs or wire
 representations. Release-level query changes need separate expectations and
 cannot hide conversion damage. Lost history is not recreated; unavailable
 full-text history retains existing index-compatibility restrictions without an
-inline rebuild. Physical version changes require validated resolution of every
+inline rebuild. The same rule applies to pre-0.10 Blob property-lifetime
+restrictions: retained bytes and descriptors are preserved, but missing identity
+evidence is not fabricated. Preflight reports affected fields and tests read
+retained bytes independently of the delivery guard. Physical version changes require validated resolution of every
 exposed locator and dependent reference; no implicit renumbering.
 
 For registration-order damage, distinguish preservation, explicit repair, and
@@ -175,27 +178,53 @@ representation changes.
 
 ### Physical protocol and dependencies
 
-Use the existing graph location. The proposed default protocol is:
+The v6-to-v7 implementation uses the existing graph location and a sealed
+manifest publication gateway. It requires exclusive operator control: stop all
+servers, embedded writers, cluster reconciliation and maintenance. Process-local
+root exclusion does not fence other processes or already-open old handles.
 
-1. Read source metadata and append converted metadata under durable attempt
-   ownership, preserving existing objects and table data.
-2. Validate the staged result, branch/history references, and publication plan.
-   Partial staging must remain invisible to normal readers.
-3. Publish the complete converted state through one graph-content publication
-   boundary. Qualify any required earlier writer fence and its recovery; old
-   binaries must not write incompatible state afterward.
-4. Return success after correctness and durable visibility are established.
-   Leave obsolete metadata and abandoned-attempt artifacts for later cleanup.
+1. Preflight reads exact source versions, branch lifetime identities and the
+   schema identity. It refuses ambiguous logical branch names before fencing:
+   a suffixed native ref needs its own post-fork logical-head witness, not an
+   inherited head. It counts version references before loading history. It compares the legacy data-version fold with the proposed
+   registration-clock fold and refuses changes in logical state.
+2. A main-manifest UpdateConfig commit atomically sets format 7 and
+   `omnigraph:storage_upgrade_pending`. Its versioned intent contains an attempt
+   ULID, source/target formats, schema identity and every native branch's source
+   version and lifetime identity. Old executables reject the new stamp; new
+   normal opens reject the pending intent before recovery or decoding.
+3. With main still fenced, each native branch and then main appends converted
+   manifest fragments from its pinned v6 source. Only registration/tombstone key
+   suffixes change. Publication includes `omnigraph:storage_upgrade_receipt`,
+   binding that branch to the attempt and source. Main keeps the pending intent.
+   Publication has no automatic retry or cleanup; a changed head refuses.
+4. Validate all converted branches against their source state. Only then append
+   a main UpdateConfig commit removing the pending intent. This is activation;
+   success requires it. No new serving pointer, locator map or generic ledger
+   is introduced. Durable authority remains the main manifest.
 
-Append-only writes alone prove neither atomic visibility nor speed. Branch-local
-commits are not whole-graph publication; head-only conversion leaves historical
-v6 metadata. The prototype must prove all-branch activation, retained decoding,
-and interruption recovery using Lance and the existing publication path.
-Before activation, readers see the old state or an explicit recovery refusal;
-after activation, they see the complete new state, never partial staging.
-An early writer fence may prevent old-binary access even though old bytes remain.
-Any new serving pointer, version map, or completion record requires an amendment
-defining authority, alternatives, and crash cases before acceptance.
+Released v0.9 creates two unstamped bootstrap snapshots before stamping v6.
+Preflight accepts those only at versions 1 and 2 with the exact empty-table,
+version-one-pointer, single-parentless-genesis contract. Their registration keys
+are already clock 1; normal root admission still rejects unstamped graphs.
+
+Retained source snapshots are deliberately not rewritten. After normal root
+admission, an explicit v6 decoder preserves their original data-version ordering;
+v7 snapshots use registration clocks. Numeric locators, commit IDs and table
+pointers remain unchanged. Current registration clocks come from the pinned
+source row provenance and precede subsequent publication versions.
+
+Retry validates the exact branch inventory, lifetime identities, source versions
+and receipts. Completed branch publications are reused; unpublished staging is
+recreated from immutable source evidence. Unknown ownership or foreign movement
+refuses. A failure after activation is an already-current no-op on retry. The
+pending main intent owns manifest staging for the attempt; cleanup is excluded
+throughout the operation and remains a later retention-controlled activity.
+
+This is an explicit amendment to the head-only proposal: legacy historical
+decoding and main-owned intent/receipts are necessary protocol state. The
+alternative of rewriting historical snapshots would require a locator map and
+would break the existing numeric version contract without further machinery.
 
 Every staged artifact needs attributable ownership before effects. Cleanup must
 distinguish abandoned/obsolete artifacts from active graph data, retained history,

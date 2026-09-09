@@ -9,6 +9,10 @@ pub(crate) mod write_queue;
 pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{DatasetEntry, DatasetUpdate, Snapshot, SnapshotDataset, SnapshotScanner};
+pub use manifest::{
+    UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
+    UpgradeWork, upgrade_storage, upgrade_storage_as,
+};
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
     CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,

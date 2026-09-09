@@ -143,6 +143,8 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "db/manifest/recovery.rs",     // Recovery executor; exactly inventoried below.
     "db/manifest/tests.rs",        // Out-of-line tests for the trusted gateways.
     "instrumentation.rs",          // The instrumented dataset opener.
+    "db/manifest/upgrade.rs",
+    "db/manifest/upgrade/tests.rs",
 ];
 
 /// Out-of-line test modules are parsed as standalone files, so their enclosing
@@ -156,6 +158,7 @@ const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     // source walk cannot see that attribute.
     "db/manifest/namespace.rs",
     "db/manifest/tests.rs",
+    "db/manifest/upgrade/tests.rs",
 ];
 
 const SENTINEL: &str = "// forbidden-api-allow:";
@@ -698,6 +701,9 @@ macro_rules! durable_calls {
 // manifest implementations are included; only standalone test-only sources
 // whose parent cfg is invisible to this file walker are excluded.
 durable_calls! {
+    ("db/manifest/upgrade.rs", "CommitBuilder::new(", 3, WriteProtocol::Exact("offline storage upgrade with main-owned intent")),
+    ("db/manifest/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion under durable upgrade ownership")),
+    ("db/manifest/upgrade.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Exact("manifest-only conversion under durable upgrade ownership")),
     ("table_store/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
     // The `__manifest` Create write is the manifest's entire birth: entries,
     // genesis lineage, and the internal-schema stamp all ride the one commit,
