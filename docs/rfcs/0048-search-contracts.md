@@ -1028,6 +1028,12 @@ Ranking this union requires a declared cross-type policy:
   scorer or qualified reranker is needed when the product requires a single
   relevance ordering that those source ranks do not supply.
 
+Logical source count and physical table count are separate. Compatible tables
+can be partitions of one logical source with one global candidate window.
+Creating an independent fusion vote for every table would let physical schema
+layout influence relevance. All partition scans and merges still consume the
+same query budget; a small logical source count does not bound physical work.
+
 Physically, Lance remains responsible for each version-pinned dataset and
 qualified index/scan path. DataFusion can union narrow candidate relations,
 group by the full typed identity, rank/fuse and apply the global cut; hydrate
@@ -1148,6 +1154,16 @@ do not add a parallel snapshot-token mechanism. `target.snapshot` echoes the
 request and is not automatically a resolved token for a branch read. A
 synthetic identity for a graph with no commit is not a replayable commit id.
 The initial result contract must make unavailable replay identity explicit.
+
+Identity-based follow-up also depends on RFC 0040's typed meta-field access
+and logical result identity. Today a projected node object includes its id,
+but `$p.id` resolves only declared properties and does not address the system
+identity. Returning an id and a snapshot therefore does not by itself prove
+that `.gq` can follow that id. Qualify `$p.@id` projection and filtering through
+the compiler, embedded, inline, stored-query and CLI paths once the shared
+namespace is available. A declared-key lookup can validate snapshot coherence
+now, but does not establish arbitrary entity-id lookup. Cross-type follow-up
+must also retain the accepted type/incarnation identity described above.
 
 Follow-up reads must preserve the relevant graph snapshot across participating
 tables using the existing snapshot/retention machinery. They recheck access
@@ -1972,6 +1988,8 @@ definition/execution fingerprints, inspectable plans, named metrics, and
 truthful completion, coverage, and selection metadata. Carry graph identities
 and resolved snapshot context into selective property reads and further graph
 queries. Reuse existing request fields and recheck authorization on follow-up.
+Integrate RFC 0040's identity projection and lookup, including entities without
+a declared application key; a journey using only keyed entities is insufficient.
 Resolve the combined HTTP/CLI compatibility questions and regenerate OpenAPI.
 
 Completion requires an end-to-end discovery → source read → graph expansion →
