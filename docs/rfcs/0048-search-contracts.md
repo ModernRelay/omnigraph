@@ -1222,8 +1222,12 @@ Query budgets account for input/value bytes, analyzer and edit state, eligible
 population scans, graph fan-out, all candidate windows, coverage/statistics,
 sort/spill, model calls, cancellation, and result bytes. Fallback spends the
 remaining budget; it does not receive a fresh allowance. A small final `limit`
-is not proof of bounded intermediate work. Output byte limits fail explicitly
-or use a separately declared partial-result protocol; they never silently
+is not proof of bounded intermediate work. Admission must cover graph stages
+after the final ranking/selection stage as well as stages between sources.
+Keep the same resource context alive through projection and output; charging
+a decoded batch afterward cannot establish a bound on its allocation peak.
+Output byte limits fail explicitly or use a separately declared partial-result
+protocol; they never silently
 truncate returned properties. Compact discovery and selective property reads
 support context control initially. Token-budget packing and source snippets
 are deferred, with encoding/source attribution requirements retained.
@@ -1276,8 +1280,13 @@ internal normalization buffers/work, and output capacity; an input-byte limit
 or cancellation checks only between emitted characters or tokens are
 insufficient. A bounded implementation must enforce these limits at the
 normalizer's input and internal work boundaries.
-Use a bounded exact edit matcher, with cancellation checkpoints. The pinned
-`fst` Levenshtein automaton agrees with the declared scalar-value distance,
+Use a bounded exact edit matcher, with cancellation checkpoints inside large
+comparisons and across successive small comparisons. A work quantum that
+resets for every token pair does not bound uninterrupted aggregate work.
+Executor cooperation, cancellation propagation from the request boundary,
+and cleanup of native tasks are separate qualification obligations. Marking a
+function async or adding a yield does not establish end-to-end cancellation.
+The pinned `fst` Levenshtein automaton agrees with the declared scalar-value distance,
 but construction can consume substantial memory and hit its state limit.
 Its default per-automaton cap is not a whole-query resource protocol. Numeric
 limits, accounting units, and fallback charging must be specified and
