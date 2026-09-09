@@ -1,7 +1,7 @@
 //! Cached data credentials have a separate keychain namespace and transport.
 use super::auth::{self, Store};
 use super::{Api, Context, Failure, Method, Output, Result, canonical_origin, json};
-use crate::cli::{Cli, Command, GraphsCommand};
+use crate::cli::{Cli, Command, CommitCommand, GraphsCommand};
 use crate::client::GraphClient;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -392,10 +392,7 @@ pub(super) async fn token(
         }
         None
     };
-    let api = Api::new(
-        context.api.clone(),
-        Some(auth::credential(&auth::CONTROL_STORE, &context.api)?),
-    )?;
+    let api = Api::authenticated(context.api.clone())?;
     match grant {
         Some(grant) => mint(&auth::DATA_STORE, context, &api, grant, ttl.unwrap_or(3600)).await,
         None => mint_profile(&auth::DATA_STORE, context, &api, None, ttl.unwrap_or(3600)).await,
@@ -462,6 +459,11 @@ fn skips_context(cli: &Cli) -> bool {
                 | Command::Mutate { .. }
                 | Command::Graphs {
                     command: GraphsCommand::List { .. }
+                }
+                | Command::Load { uri: None, .. }
+                | Command::Commit {
+                    command: CommitCommand::List { uri: None, .. }
+                        | CommitCommand::Show { uri: None, .. }
                 }
         )
         || cli.server.is_some()
@@ -530,18 +532,38 @@ fn resolve(
                 )
             });
     }
-    let (action, named) = match &cli.command {
+    let required = match &cli.command {
         Command::Query {
             query,
             query_string,
             ..
-        } => ("read", query.is_none() && query_string.is_none()),
+        } => {
+            if query.is_none() && query_string.is_none() {
+                vec!["read", "invoke_query"]
+            } else {
+                vec!["read"]
+            }
+        }
         Command::Mutate {
             query,
             query_string,
             ..
-        } => ("change", query.is_none() && query_string.is_none()),
-        _ => unreachable!("only implicit query/mutate consult data context"),
+        } => {
+            if query.is_none() && query_string.is_none() {
+                vec!["change", "invoke_query"]
+            } else {
+                vec!["change"]
+            }
+        }
+        Command::Load { from, .. } => {
+            if from.is_some() {
+                vec!["change", "branch_create"]
+            } else {
+                vec!["change"]
+            }
+        }
+        Command::Commit { .. } => vec!["read"],
+        _ => unreachable!("only implicit query/mutate/load and commit reads consult data context"),
     };
     scope(cli)?;
     let graph = cli
@@ -549,11 +571,6 @@ fn resolve(
         .as_deref()
         .ok_or_else(|| Failure::refused("graph_required", "managed data requires --graph"))?;
     graph_id(graph)?;
-    let required = if named {
-        vec![action, "invoke_query"]
-    } else {
-        vec![action]
-    };
     load(store, &context, graph, &required).map(Some)
 }
 
@@ -565,7 +582,10 @@ pub(crate) fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Outp
         Command::Query { json, format, .. } => {
             *json || matches!(format, Some(crate::read_format::ReadOutputFormat::Json))
         }
-        Command::Mutate { json, .. } => *json,
+        Command::Mutate { json, .. } | Command::Load { json, .. } => *json,
+        Command::Commit {
+            command: CommitCommand::List { json, .. } | CommitCommand::Show { json, .. },
+        } => *json,
         Command::Graphs {
             command: GraphsCommand::List { json, .. },
         } => *json,

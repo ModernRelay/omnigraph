@@ -14,6 +14,18 @@ The desired bundle is input, not runtime authority. A server reads the applied r
 
 The storage root defaults to the configuration directory and may instead be a local path, `file://`, `s3://`, or `az://` root. Graph roots are derived as `graphs/<graph_id>.omni` beneath it.
 
+## Managed CLI sessions
+
+The CLI's managed HTTP adapter obtains current access before each new request,
+including status polls. A rotating credential pair lives only in the OS
+keychain, independently of configuration directories and graph credentials.
+Local origin-scoped locking and a persisted pending marker prevent duplicate
+client exchanges; the API owns verification, revocation and single-use
+exchange authority. An uncertain exchange never authorizes a write replay.
+The protocol and cache compatibility boundaries are specified in
+[RFC 0052](../rfcs/0052-managed-control-plane-cli.md); user behavior and limits
+are in the [CLI reference](../user/cli/reference.md#managed-cluster-commands).
+
 ## Durable layout
 
 | Path | Role |

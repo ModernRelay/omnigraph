@@ -21,7 +21,7 @@ impl Store for MemoryStore {
     }
 }
 
-fn saved(token: &str, seconds: i64) -> String {
+pub(in crate::managed::auth) fn saved(token: &str, seconds: i64) -> String {
     serde_json::to_string(&Session {
         version: 1,
         access_token: token.into(),
@@ -74,7 +74,7 @@ fn origin_bound_automation_never_reads_human_or_data_plane_credentials() {
 fn expired_and_unbounded_sessions_are_refused_without_secret_diagnostics() {
     for value in [
         saved("opaque-secret", -1),
-        saved("opaque-secret", 901),
+        saved("opaque-secret", 1000),
         "opaque-secret".into(),
     ] {
         let failure = session(&value).err().unwrap();
@@ -97,6 +97,9 @@ fn device_poll_intervals_are_bounded_and_secrets_are_scrubbed() {
         "secret-code",
     );
     assert!(!failure.body.to_string().contains("secret-code"));
+    let mut reflected_keys = json!({"secret-code":{"nested-secret-code":"value"}});
+    scrub_value(&mut reflected_keys, "secret-code");
+    assert!(!reflected_keys.to_string().contains("secret-code"));
     assert!(verification_uri("https://auth.example/device?user_code=ABCD").is_ok());
     assert!(verification_uri("javascript:alert(1)").is_err());
     assert!(verification_uri("http://127.0.0.1/verify").is_err());
@@ -117,6 +120,29 @@ fn logged_in() -> IntentReply {
 }
 
 #[tokio::test]
+async fn login_reuses_a_valid_cached_session_without_device_authorization() {
+    let api = IntentApiFixture::new(vec![IntentReply::json(
+        200,
+        json!({"data":{"expires_at":(OffsetDateTime::now_utc()+time::Duration::seconds(120)).format(&Rfc3339).unwrap(),"principal_id":"principal-one","subject":"actor-one","account_id":"account-one","scopes":{}},"meta":{"assurance":"verified_human"}}),
+    )]);
+    let store = MemoryStore::default();
+    store
+        .put(&api.origin, &saved("cached-secret", 120))
+        .unwrap();
+    let output = login_with(&store, &MemoryStore::default(), api.origin.clone())
+        .await
+        .unwrap();
+    assert_eq!(output["data"]["principal_id"], "principal-one");
+    assert_eq!(api.requests()[0].path, "/v1/auth/session");
+    assert_eq!(
+        api.requests()[0].headers["authorization"],
+        "Bearer cached-secret"
+    );
+    assert!(!output.to_string().contains("cached-secret"));
+    api.assert_complete();
+}
+
+#[tokio::test]
 async fn device_login_pending_slowdown_then_opaque_keychain_session() {
     let api = IntentApiFixture::new(vec![
         device(60),
@@ -126,7 +152,9 @@ async fn device_login_pending_slowdown_then_opaque_keychain_session() {
     ]);
     let store = MemoryStore::default();
     let started = Instant::now();
-    let output = login_with(&store, api.origin.clone()).await.unwrap();
+    let output = login_with(&store, &MemoryStore::default(), api.origin.clone())
+        .await
+        .unwrap();
     assert!(started.elapsed() >= Duration::from_secs(20));
     assert_eq!(output["data"]["principal_id"], "principal-one");
     for secret in [
@@ -161,7 +189,9 @@ async fn uncertain_device_consumption_and_expiry_require_fresh_login() {
         IntentReply::json(409, json!({"type":"device_poll_in_progress","interval":5})),
     ]);
     let store = MemoryStore::default();
-    let failure = login_with(&store, api.origin.clone()).await.unwrap_err();
+    let failure = login_with(&store, &MemoryStore::default(), api.origin.clone())
+        .await
+        .unwrap_err();
     assert_eq!(failure.body["type"], "device_poll_in_progress");
     assert!(
         failure.body["detail"]
@@ -173,7 +203,7 @@ async fn uncertain_device_consumption_and_expiry_require_fresh_login() {
     api.assert_complete();
     let expired = IntentApiFixture::new(vec![device(1)]);
     assert_eq!(
-        login_with(&store, expired.origin.clone())
+        login_with(&store, &MemoryStore::default(), expired.origin.clone())
             .await
             .unwrap_err()
             .body["type"],
@@ -202,7 +232,7 @@ async fn keychain_failure_revokes_the_unstored_session_without_plaintext_fallbac
         IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
     ]);
     assert_eq!(
-        login_with(&Unwritable, api.origin.clone())
+        login_with(&Unwritable, &MemoryStore::default(), api.origin.clone())
             .await
             .unwrap_err()
             .body["type"],
@@ -217,7 +247,7 @@ async fn keychain_failure_revokes_the_unstored_session_without_plaintext_fallbac
 }
 
 #[tokio::test]
-async fn logout_removes_only_selected_origin_even_when_revocation_fails() {
+async fn logout_preserves_cached_sessions_when_revocation_is_unconfirmed() {
     let api = IntentApiFixture::new(vec![IntentReply::json(
         503,
         json!({"type":"provider_unavailable","detail":"temporary"}),
@@ -229,10 +259,12 @@ async fn logout_removes_only_selected_origin_even_when_revocation_fails() {
     store
         .put("https://other.example", &saved("other-secret", 60))
         .unwrap();
-    let failure = logout_with(&store, api.origin.clone()).await.unwrap_err();
-    assert_eq!(failure.body["local_credential_removed"], true);
+    let failure = renewal::logout(&store, &MemoryStore::default(), &api.origin)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.body["local_credential_removed"], false);
     assert_eq!(failure.body["revocation_confirmed"], false);
-    assert!(store.get(&api.origin).unwrap().is_none());
+    assert!(store.get(&api.origin).unwrap().is_some());
     assert!(store.get("https://other.example").unwrap().is_some());
     assert_eq!(
         api.requests()[0].headers["authorization"],

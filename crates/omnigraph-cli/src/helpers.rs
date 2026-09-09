@@ -531,11 +531,12 @@ pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwn
         bearer_token,
         expected_commit,
         None,
+        None,
     )
     .await
 }
 
-/// Same typed graph protocol with an optional response limit for managed data access.
+/// Same typed graph protocol with managed response and per-request deadline bounds.
 pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     client: &reqwest::Client,
     method: Method,
@@ -544,6 +545,7 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     bearer_token: Option<&str>,
     expected_commit: Option<&str>,
     response_limit: Option<usize>,
+    request_timeout: Option<std::time::Duration>,
 ) -> Result<T> {
     let request = apply_bearer_token(client.request(method, url), bearer_token);
     let request = if let Some(commit_id) = expected_commit {
@@ -559,7 +561,21 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     } else {
         request
     };
-    let mut response = request.send().await?;
+    let request = if let Some(timeout) = request_timeout {
+        request.timeout(timeout)
+    } else {
+        request
+    };
+    remote_response_json_bounded(request.send().await?, bearer_token, response_limit).await
+}
+
+/// Decode either JSON requests or raw NDJSON loads through the same bounded,
+/// credential-safe response path. The request owner chooses its deadline.
+pub(crate) async fn remote_response_json_bounded<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    bearer_token: Option<&str>,
+    response_limit: Option<usize>,
+) -> Result<T> {
     let status = response.status();
     let text = if let Some(limit) = response_limit {
         if status.is_redirection() {
