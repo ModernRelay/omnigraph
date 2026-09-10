@@ -7,6 +7,12 @@
 # notes: three-way merge whose target side is unchanged. bob, written on main before the switch,
 # notes: is visible on feature only if the reclaimed fork starts from main's lineage.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

@@ -1,6 +1,12 @@
 # issue: none
 # notes: the node object from a search scan and from an rrf-fused batch carries no `_score`, `_distance` or vector column.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Chunk {
     slug: String @key

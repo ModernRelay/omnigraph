@@ -142,7 +142,25 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
-      - name: Run GQ logic tests
+      - name: Test unavailable DST runtime refusal
         if: needs.classify_changes.outputs.run_full_ci == 'true'
-        # The corpus crate: format self-tests, corpus layout check, one test per case.
+        run: cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch -- --nocapture
+
+      - name: Clippy GQT with DST
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        # Crate-local Cargo configuration enables the seeded Tokio runtime.
+        working-directory: crates/omnigraph-gqt
+        run: cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro
+
+      - name: Run complete GQ logic tests with DST
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        working-directory: crates/omnigraph-gqt
         run: cargo test -p omnigraph-gqt --locked -- --nocapture
+
+      - name: Retain GQT invocation reports
+        if: always() && needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gqt-invocation-reports
+          path: target/gqt-artifacts/*.json
+          if-no-files-found: error

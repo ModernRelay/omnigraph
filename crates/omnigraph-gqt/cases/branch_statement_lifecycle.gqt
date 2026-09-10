@@ -6,6 +6,12 @@
 # notes: The merge of b0 is a three-way merge (both sides wrote after the
 # notes: fork), so the outcome is `merged` rather than a fast forward.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

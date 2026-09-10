@@ -4,6 +4,12 @@
 # notes: outer variable inside not {} whose filter was dropped; one outgoing
 # notes: edge per source keeps each step at one row per source.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

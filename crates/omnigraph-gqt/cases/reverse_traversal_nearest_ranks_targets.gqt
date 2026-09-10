@@ -4,6 +4,12 @@
 # notes: prefilters from the incoming adjacency), limit 2 (3 > 2): d010, d020. An
 # notes: engine reading the outgoing side answers d009, d019.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

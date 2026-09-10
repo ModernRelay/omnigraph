@@ -2,6 +2,12 @@
 # notes: two rows of one self-loop pair (unkeyed type): the gated traversal returns the pair once, the bound
 # notes: traversal counts both rows. The DST model's membership oracles rely on this grain.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

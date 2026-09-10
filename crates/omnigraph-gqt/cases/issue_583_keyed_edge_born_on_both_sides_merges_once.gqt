@@ -5,6 +5,12 @@
 # notes: one logical edge changed identically and main holds it once: the bound
 # notes: traversal returns one row and counts 1. Unkeyed edge types keep both rows (multiset default, RFC 0044).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

@@ -8,6 +8,12 @@
 # notes: Rust twin (probes: one overfetch, no exact pass):
 # notes: issue_567_nearest_gate_falls_back_above_the_ratio.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

@@ -3,6 +3,12 @@
 # notes: same order as nearest from -0.3: both arms agree, so the fused top-3 is
 # notes: rows 0..2 (unordered set: rrf refuses ordered expects).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

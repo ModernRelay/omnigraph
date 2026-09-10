@@ -543,11 +543,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
-      # Own step so compile and run wall clock read apart in the log; the
-      # run step reuses these binaries (same flags, features, and env).
+      # GQ Logic Tests owns GQT in both build shapes, including its DST runtime.
+      # The run step reuses these binaries (same flags, features, and env).
       - name: Compile the workspace and failpoint test graph
         run: |
-          cargo test --workspace --locked --no-run \
+          cargo test --workspace --exclude omnigraph-gqt --locked --no-run \
             --features "$FAILPOINT_FEATURES"
 
       - name: Install genuine v0.9 release for upgrade regression
@@ -586,7 +586,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             no_fail_fast+=(--no-fail-fast)
           fi
-          cargo test --workspace --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
+          cargo test --workspace --exclude omnigraph-gqt --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
             --features "$FAILPOINT_FEATURES" \
             -- --nocapture 2>&1 | tee "$test_log"
           if grep -Fq "skipping v0.9 upgrade e2e:" "$test_log"; then

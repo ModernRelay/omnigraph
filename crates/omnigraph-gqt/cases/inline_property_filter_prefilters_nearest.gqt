@@ -3,6 +3,12 @@
 # notes: `$d.n = 7` clause (I64 literal). One row matches (1 < 3), outside the
 # notes: unfiltered top-3; the answer is that row alone.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

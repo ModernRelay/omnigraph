@@ -3,6 +3,12 @@
 # notes: it is the 8th nearest, outside the unfiltered top-3 (rows 0..2). The
 # notes: answer is that one row, no padding from non-matching rows.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

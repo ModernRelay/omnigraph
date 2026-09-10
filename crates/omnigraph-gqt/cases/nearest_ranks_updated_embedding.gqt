@@ -4,6 +4,12 @@
 # notes: SECOND by its new vector (0.7, between d000 at 0.3 and d001 at 1.3) and
 # notes: exactly 5 rows come back, so its old position is gone, not a sixth row.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

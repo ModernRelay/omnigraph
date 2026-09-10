@@ -18,10 +18,13 @@ Branch protection currently requires these reporting contexts:
 - `GQ Logic Tests`
 - `Fix Regression Gate`
 
-`GQ Logic Tests` (`gq-logic-tests.yml`) runs the `.gqt` logic-test corpus on
-every pull request as its own required context; `Test Workspace` runs the same
-target again inside the full workspace suite, also on every pull request but as
-a reporting context. `GQ Logic Tests` takes the documentation-only skip the way
+`GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
+required context. It first checks unit tests and unavailable-DST refusal from
+the workspace root, then runs the whole package and Clippy from
+`crates/omnigraph-gqt`, whose Cargo configuration enables the seeded Tokio
+runtime. Every corpus case is enrolled, including cases whose required graph
+behavior currently fails. `Test Workspace` excludes this separately tested
+package; it does not silently skip DST cases. `GQ Logic Tests` takes the documentation-only skip the way
 the AWS job does and reports success without building; its workflow carries a
 verbatim copy of the `Classify Changes` job under the name
 `Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
@@ -115,10 +118,10 @@ Container entrypoint and Azure deployment-validation jobs test argument composit
 
 ## Full correctness graphs
 
-The full workspace suite (`Test Workspace`) runs on every non-documentation pull request, on every push to `main`, on release tags, and by manual dispatch. The `main`, tag, and dispatch form (a pull request drops `--no-fail-fast`):
+The workspace suite (`Test Workspace`) runs on every non-documentation pull request, on every push to `main`, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request drops `--no-fail-fast`):
 
 ```bash
-cargo test --workspace --locked --no-fail-fast \
+cargo test --workspace --exclude omnigraph-gqt --locked --no-fail-fast \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
@@ -169,7 +172,7 @@ CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intenti
 
 ## DST tiers
 
-Two workflows own deterministic simulation testing; both set
+Two workflows own the simulator's pinned tests and generated fleets; both set
 `RUSTFLAGS: --cfg tokio_unstable` themselves (the `omnigraph-dst` crate
 compiles empty without it, so the default jobs are unaffected):
 
@@ -184,6 +187,10 @@ compiles empty without it, so the default jobs are unaffected):
   seed intervals. Failures are logs with seed rows, not required contexts;
   the concurrent fleet's `wild` mode makes no replay claim.
 
+`gq-logic-tests.yml` separately owns authored GQT execution through DST. Its
+configured step runs from `crates/omnigraph-gqt` to load `tokio_unstable`.
+An unavailable-runtime refusal test does not replace executing the DST cases.
+
 ## Local pre-push checks
 
 For Rust changes:
@@ -194,8 +201,16 @@ cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_ma
 cargo clippy --workspace --all-targets --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
   -- -D warnings -W clippy::dbg_macro
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
+```
+
+From `crates/omnigraph-gqt`, also run the complete configured package:
+
+```bash
+cargo test -p omnigraph-gqt --locked
+cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro
 ```
 
 For repository metadata and workflow changes:

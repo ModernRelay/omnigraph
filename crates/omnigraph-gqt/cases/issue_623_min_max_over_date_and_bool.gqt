@@ -1,6 +1,12 @@
 # issue: 623
 # red_on: 2026-09-04, main @ 8ca9b12c: refused at typecheck (min requires numeric or string type, got Date?); the Bool and DateTime columns are refused by the same rule.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

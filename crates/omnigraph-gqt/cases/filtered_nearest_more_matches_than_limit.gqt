@@ -4,6 +4,12 @@
 # notes: filter, so the answer is the top-3 of the MATCHING rows, d004 (1.7),
 # notes: d005 (2.7), d006 (3.7), never the unfiltered top-3 filtered afterwards.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

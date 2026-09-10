@@ -1,0 +1,49 @@
+# issue: none
+# notes: An effect-free mutation failure leaves the same Omnigraph writable.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- known_failure
+step: 4
+match:
+  error: RecoveryRequired
+  reason: "pending Mutation recovery operation on branch 'work' blocks the synchronous write/control recovery barrier (datasets dataset for node type 'Person'); reopen the graph read-write before retrying"
+
+--- schema
+node Person {
+    name: String @key
+}
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+--- mutate
+branch create work
+--- expect ok
+--- fault
+at: mutation.post_sidecar_pre_fork
+occurrence: 1
+action: return_error
+scope: next_step
+
+--- mutate branch: work
+query add() { insert Person { name: "bob" } }
+--- expect error: injected failpoint triggered: mutation.post_sidecar_pre_fork
+--- query branch: work
+query unchanged() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+--- expect shape
+p.name: String
+--- mutate branch: work
+query retry() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+--- query branch: work
+query after_write() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String

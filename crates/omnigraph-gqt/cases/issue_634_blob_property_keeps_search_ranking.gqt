@@ -9,6 +9,12 @@
 # notes: expected orders are the reverse of the id tie-break order, so a
 # notes: present-but-constant ranking column fails the step.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Chunk {
     slug: String @key

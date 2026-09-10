@@ -10,6 +10,12 @@
 # notes: issue_567_nearest_traversal_prefilters_then_overfetches (tests/search.rs),
 # notes: forced-postfilter half.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

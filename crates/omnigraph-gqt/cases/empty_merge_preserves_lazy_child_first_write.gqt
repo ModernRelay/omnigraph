@@ -3,6 +3,12 @@
 # notes: Parent writes successfully; child's first write after restart starts from its old pin.
 # notes: Both writes stay isolated across a second restart.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

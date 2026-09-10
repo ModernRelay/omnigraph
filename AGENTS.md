@@ -121,8 +121,9 @@ its Cargo package is `omnigraph-engine`.
 cargo build --workspace --locked
 
 # Canonical CI test graph
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
 # Focused examples
 cargo test -p omnigraph-engine --test traversal
@@ -138,6 +139,12 @@ python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
+
+The separate `GQ Logic Tests` context owns the complete GQT corpus. From
+`crates/omnigraph-gqt`, also run `cargo test -p omnigraph-gqt --locked` and
+`cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`.
+Its crate-local Cargo configuration enables DST; an unconfigured build must
+refuse requested DST execution, not skip those cases.
 
 S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`
 environment. Azure suites require `OMNIGRAPH_AZURE_TEST_CONTAINER` and the

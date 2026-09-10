@@ -3,6 +3,12 @@
 # notes: matches (0 < 2), so the prefilter admits nothing and the answer is
 # notes: empty, no error, no unfiltered rows.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
