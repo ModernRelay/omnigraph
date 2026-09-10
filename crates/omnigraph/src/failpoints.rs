@@ -141,7 +141,6 @@ pub mod names {
     /// OmniGraph acknowledges it. Recovery must classify the matching
     /// BranchContents as a completed create (lost acknowledgement).
     pub const BRANCH_CREATE_POST_NATIVE: &str = "branch_create.post_native";
-    pub const BRANCH_DELETE_BEFORE_TABLE_CLEANUP: &str = "branch_delete.before_table_cleanup";
     /// After Lance returns success from native delete, before OmniGraph
     /// acknowledges it. Recovery must classify the absent BranchContents as a
     /// completed logical deletion.
@@ -237,7 +236,6 @@ pub mod names {
     pub const ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE: &str =
         "ensure_indices.post_stage_pre_commit_btree";
     pub const FORK_BEFORE_CLASSIFY: &str = "fork.before_classify";
-    pub const FORK_BEFORE_RECLAIM: &str = "fork.before_reclaim";
     /// After Lance durably creates a target table ref, before the caller can
     /// reopen and verify it. An error here is post-effect and must retain the
     /// recovery sidecar.

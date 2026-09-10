@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::branch_control::list_branch_contents;
+use crate::branch_control::list_live_manifest_branch_contents;
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use datafusion::logical_expr::Expr;
 use lance::Dataset;
@@ -193,10 +193,10 @@ pub struct Snapshot {
     /// resolving the head separately (e.g. via `CommitGraph`) could pair this
     /// snapshot's datasets with a different version's head.
     graph_heads: HashMap<String, String>,
-    /// The native Lance ref this branch snapshot was served from, when it came
-    /// from a live branch coordinator (`None` on main, for time-travel reads,
-    /// and for directly built test snapshots). Writers fork tables under this
-    /// exact name so every fork of one incarnation shares one physical name.
+    /// Logical graph branch used to capture this snapshot, including historical reads.
+    graph_branch: Option<String>,
+    /// Native ref of the live branch coordinator; named writes record it as fork owner.
+    /// `None` on main, time-travel reads, and directly built test snapshots.
     native_branch: Option<String>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so dataset opens reuse
@@ -214,21 +214,25 @@ pub(crate) struct NativeForkReferences {
 }
 
 impl NativeForkReferences {
+    #[cfg(test)]
     pub(crate) fn contains(&self, identity: TableIdentity, native: &str) -> bool {
         self.referenced.contains(&(identity, native.to_string()))
     }
 
+    pub(crate) fn contains_tree(&self, identity: TableIdentity, tree: &str) -> bool {
+        self.referenced.iter().any(|(table, native)| {
+            *table == identity
+                && (native == tree
+                    || native
+                        .strip_prefix(tree)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn owner_contains(&self, identity: TableIdentity, native: &str) -> bool {
         self.owned.contains(&(identity, native.to_string()))
     }
-}
-
-pub(crate) fn detached_native_lineage_error(table_key: &str, native: &str) -> OmniError {
-    OmniError::manifest(format!(
-        "table '{table_key}' has detached native lineage '{native}' still pinned by another graph branch; \
-         writing would destroy that branch's history. Create a new branch from this branch's current \
-         snapshot and write there"
-    ))
 }
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
@@ -422,6 +426,10 @@ impl SnapshotDataset {
 }
 
 impl Snapshot {
+    pub(crate) fn graph_branch(&self) -> Option<&str> {
+        self.graph_branch.as_deref()
+    }
+
     /// The native Lance ref this branch snapshot was served from (`None` on
     /// main, for time-travel reads, and for directly built snapshots).
     pub(crate) fn native_branch(&self) -> Option<&str> {
@@ -649,10 +657,13 @@ async fn probe_dataset_latest_incarnation(
             .latest_version_id()
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
-        let branch_identifier = dataset
-            .branch_identifier()
-            .await
-            .map_err(|error| branch_ref_error(error, branch))?;
+        let native = dataset.manifest().branch.as_deref().ok_or_else(|| {
+            OmniError::manifest_internal("named coordinator has no native manifest ref")
+        })?;
+        let branch_identifier =
+            crate::branch_control::get_live_manifest_branch_contents(dataset, native)
+                .await?
+                .identifier;
         Ok::<_, OmniError>(ManifestIncarnation {
             version,
             e_tag: None,
@@ -671,7 +682,7 @@ async fn probe_dataset_latest_incarnation(
     // name through the live registry: the replacement's identity is a
     // guaranteed mismatch, and a deleted branch is a typed absence. Only a
     // registry that still names the held ref makes the miss a real failure.
-    let live = crate::branch_control::list_branch_contents(dataset).await?;
+    let live = crate::branch_control::list_live_manifest_branch_contents(dataset).await?;
     let Some(native) =
         crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), branch)?
     else {
@@ -1031,6 +1042,7 @@ impl ManifestCoordinator {
                 .map(|entry| (entry.type_key.clone(), entry))
                 .collect(),
             graph_heads: state.graph_heads,
+            graph_branch: None,
             native_branch: None,
             read_caches: None,
         }
@@ -1229,41 +1241,12 @@ impl ManifestCoordinator {
         version: u64,
     ) -> Result<Snapshot> {
         let root = root_uri.trim_end_matches('/');
-        Ok(Self::snapshot_from_state(
-            root,
-            snapshot_state_at(root, branch, version).await?,
-        ))
-    }
-
-    /// Test whether one live graph branch still inherits a table fork from a
-    /// branch being deleted, without capturing the candidate branch's native
-    /// incarnation.
-    ///
-    /// This deliberately narrow predicate is valid only while the caller holds
-    /// branch-delete's complete control envelope: the schema-control gate, the
-    /// delete-target branch gate, and every accepted-catalog table gate for the
-    /// target. The schema gate serializes native branch create/delete in the
-    /// supported single-writer process, and an ordinary writer can only replace
-    /// an inherited `table_branch` with its own branch; it cannot make a live
-    /// branch newly inherit the held delete target. A raced write can therefore
-    /// make this snapshot conservatively report an old dependency, never hide a
-    /// new one.
-    ///
-    /// General coordinator, OCC, and live-read/feed opens must not use this
-    /// path: they need the BranchIdentifier captured with their manifest
-    /// projection to fence delete/recreate ABA.
-    pub(super) async fn branch_depends_on_delete_target_under_control_gates(
-        root_uri: &str,
-        candidate_native: Option<&str>,
-        delete_target_native: &str,
-        control_session: &Arc<lance::session::Session>,
-    ) -> Result<bool> {
-        let snapshot =
-            Self::snapshot_native_under_control_gates(root_uri, candidate_native, control_session)
-                .await?;
-        Ok(snapshot
-            .datasets()
-            .any(|entry| entry.native_dataset_branch.as_deref() == Some(delete_target_native)))
+        let mut snapshot =
+            Self::snapshot_from_state(root, snapshot_state_at(root, branch, version).await?);
+        snapshot.graph_branch = branch
+            .filter(|branch| *branch != "main")
+            .map(str::to_string);
+        Ok(snapshot)
     }
 
     /// Read one exact native manifest ref for a control-plane liveness proof.
@@ -1282,10 +1265,12 @@ impl ManifestCoordinator {
         let dataset =
             open_manifest_dataset_native_with_session(root, candidate_native, control_session)
                 .await?;
-        Ok(Self::snapshot_from_state(
-            root,
-            read_manifest_state(&dataset).await?,
-        ))
+        let mut snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
+        snapshot.graph_branch = candidate_native
+            .filter(|branch| *branch != "main")
+            .map(crate::branch_names::logical_branch_name)
+            .map(str::to_string);
+        Ok(snapshot)
     }
 
     /// Prove native-table liveness from main and every live branch, including
@@ -1298,7 +1283,7 @@ impl ManifestCoordinator {
     ) -> Result<NativeForkReferences> {
         let root = root_uri.trim_end_matches('/');
         let main = open_manifest_dataset_native_with_session(root, None, control_session).await?;
-        let mut branches: Vec<_> = list_branch_contents(&main)
+        let mut branches: Vec<_> = list_live_manifest_branch_contents(&main)
             .await?
             .into_keys()
             .filter(|name| name != "main")
@@ -1313,7 +1298,9 @@ impl ManifestCoordinator {
                 if let Some(table_native) = entry.native_dataset_branch.as_deref() {
                     let key = (entry.identity, table_native.to_string());
                     references.referenced.insert(key.clone());
-                    if native == Some(table_native) {
+                    if native.is_some_and(|owner| {
+                        entry.version_metadata.is_table_fork_of(table_native, owner)
+                    }) {
                         references.owned.insert(key);
                     }
                 }
@@ -1333,10 +1320,21 @@ impl ManifestCoordinator {
         Ok(references)
     }
 
+    /// Inventory registered table lifetimes, including soft-dropped tables, under cleanup's gates.
+    pub(crate) async fn table_registrations_under_control_gates(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Vec<TableRegistration>> {
+        let main =
+            open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
+        state::read_manifest_table_registrations(&main).await
+    }
+
     /// Return a Snapshot from the known manifest state. No storage I/O.
     pub fn snapshot(&self) -> Snapshot {
         let mut snapshot = Self::snapshot_from_state(&self.root_uri, self.known_state.clone());
         snapshot.native_branch = self.native_branch.clone();
+        snapshot.graph_branch = self.active_branch.clone();
         snapshot
     }
 
@@ -1805,7 +1803,7 @@ impl ManifestCoordinator {
     pub(crate) async fn create_branch(&mut self, name: &str) -> Result<()> {
         crate::branch_names::ensure_logical_branch_name(name)?;
         let mut ds = self.dataset.clone();
-        let live = list_branch_contents(&ds).await?;
+        let live = list_live_manifest_branch_contents(&ds).await?;
         if crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), name)?
             .is_some()
         {
@@ -1819,7 +1817,7 @@ impl ManifestCoordinator {
         match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
             .await?
         {
-            crate::branch_control::BranchCreateOutcome::Created(_) => Ok(()),
+            crate::branch_control::BranchCreateOutcome::Created => Ok(()),
             crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
                 OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
             ),
@@ -1838,8 +1836,8 @@ impl ManifestCoordinator {
     }
 
     pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
-        let mut ds = self.open_branch_control_dataset().await?;
-        let branches = list_branch_contents(&ds).await?;
+        let ds = self.open_branch_control_dataset().await?;
+        let branches = list_live_manifest_branch_contents(&ds).await?;
         let native =
             crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), name)?
                 .ok_or_else(|| {
@@ -1850,7 +1848,7 @@ impl ManifestCoordinator {
             .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
             .identifier
             .clone();
-        crate::branch_control::delete_branch_recoverably(&mut ds, &native, &expected_identifier)
+        crate::branch_control::retire_branch_recoverably(&ds, &native, &expected_identifier)
             .await?;
         Ok(())
     }
@@ -1868,16 +1866,15 @@ impl ManifestCoordinator {
         name: &str,
         expected_identifier: &lance::dataset::refs::BranchIdentifier,
     ) -> Result<()> {
-        let mut ds = self.open_branch_control_dataset().await?;
+        let ds = self.open_branch_control_dataset().await?;
         let native = resolve_native_manifest_branch(&ds, name).await?;
-        crate::branch_control::delete_branch_recoverably(&mut ds, &native, expected_identifier)
-            .await
+        crate::branch_control::retire_branch_recoverably(&ds, &native, expected_identifier).await
     }
 
     /// Logical graph branches, `main` first. Each live native ref maps to
     /// exactly one logical name; a duplicate incarnation fails loudly.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
-        let branches = list_branch_contents(&self.dataset).await?;
+        let branches = list_live_manifest_branch_contents(&self.dataset).await?;
         let mut names = Vec::with_capacity(branches.len());
         let mut seen = HashSet::with_capacity(branches.len());
         for native in branches.keys().filter(|name| *name != "main") {
@@ -1894,57 +1891,6 @@ impl ManifestCoordinator {
         let mut all = vec!["main".to_string()];
         all.extend(names);
         Ok(all)
-    }
-
-    /// One operation-local branch listing for deletion's namespace and
-    /// ancestry checks. The caller holds the schema-control gate, so no native
-    /// branch create/delete can intervene in the supported control envelope.
-    pub(crate) async fn native_branches_and_descendants(
-        &self,
-        name: &str,
-    ) -> Result<(Vec<String>, Vec<String>)> {
-        let branches = list_branch_contents(&self.dataset).await?;
-        let descendants = Self::descendants_from_branch_contents(name, &branches)?;
-        let mut natives = branches
-            .into_keys()
-            .filter(|native| native != "main")
-            .collect::<Vec<_>>();
-        natives.sort();
-        Ok((natives, descendants))
-    }
-
-    /// Walk Lance's native parents and return logical descendant names.
-    fn descendants_from_branch_contents(
-        name: &str,
-        branches: &HashMap<String, lance::dataset::refs::BranchContents>,
-    ) -> Result<Vec<String>> {
-        let Some(native) =
-            crate::branch_names::resolve_native_branch(branches.keys().map(String::as_str), name)?
-        else {
-            return Ok(Vec::new());
-        };
-        let mut frontier = vec![native];
-        let mut descendants = Vec::new();
-        let mut seen = HashSet::new();
-
-        while let Some(parent) = frontier.pop() {
-            let mut children = branches
-                .iter()
-                .filter_map(|(branch, contents)| {
-                    (contents.parent_branch.as_deref() == Some(parent.as_str()))
-                        .then_some(branch.clone())
-                })
-                .collect::<Vec<_>>();
-            children.sort();
-            for child in children {
-                if seen.insert(child.clone()) {
-                    descendants.push(crate::branch_names::logical_branch_name(&child).to_string());
-                    frontier.push(child);
-                }
-            }
-        }
-
-        Ok(descendants)
     }
 }
 

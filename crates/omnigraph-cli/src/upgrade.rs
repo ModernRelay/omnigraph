@@ -116,6 +116,9 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
             .validation_bytes
             .map_or_else(|| "unknown".into(), |v| v.to_string())
     );
+    for check in &report.work.deferred_checks {
+        println!("validation deferred until the preceding conversion completes: {check}");
+    }
     for exclusion in &report.work.external_blob_exclusions {
         println!("external bytes excluded from preservation: {exclusion}");
     }
@@ -152,12 +155,12 @@ mod tests {
             "graph.omni",
             "--check",
             "--to-format",
-            "7",
+            "8",
             "--json",
         ])
         .unwrap();
         assert!(
-            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(7), json: true } if uri == "graph.omni")
+            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(8), json: true } if uri == "graph.omni")
         );
         assert_eq!(
             planes::command_capability(&cli.command),

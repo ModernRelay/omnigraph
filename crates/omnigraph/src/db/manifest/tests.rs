@@ -2976,7 +2976,26 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     // version and exact graph-head absence can repeat; only Lance's native
     // branch identifier distinguishes the incarnation.
     mc.delete_branch("feature").await.unwrap();
+    assert!(
+        matches!(
+            probe_dataset_latest_incarnation(&old_branch, Some("feature")).await,
+            Err(OmniError::BranchNotFound { .. })
+        ),
+        "a cached native handle must reject retired live authority"
+    );
+    assert_eq!(
+        old_branch.branch_identifier().await.unwrap(),
+        old_identifier
+    );
     mc.create_branch("feature").await.unwrap();
+    assert_ne!(
+        probe_dataset_latest_incarnation(&old_branch, Some("feature"))
+            .await
+            .unwrap()
+            .branch_identifier,
+        old_identifier,
+        "the freshness probe must resolve the replacement incarnation"
+    );
     let recreated = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     let recreated_identifier = recreated.branch_identifier().await.unwrap();
     assert_ne!(old_identifier, recreated_identifier);

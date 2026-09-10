@@ -477,7 +477,12 @@ pub(super) fn vector_json_patterns(dims: usize, seed: u64) -> Vec<String> {
         .collect()
 }
 
-fn graph_jsonl_chunk(prefix: &str, start: usize, end: usize, vector_patterns: &[String]) -> String {
+pub(super) fn graph_jsonl_chunk(
+    prefix: &str,
+    start: usize,
+    end: usize,
+    vector_patterns: &[String],
+) -> String {
     let approximate_row_bytes = vector_patterns
         .first()
         .map_or(128, |vector| vector.len().saturating_add(128));
@@ -545,6 +550,7 @@ pub(super) async fn age_fixture(db: &Omnigraph, args: &Args) -> serde_json::Valu
         .await
         .expect("capture aged main head");
     let mut retired = 0;
+    let mut retired_table_refs = Vec::new();
     for index in 0..args.retired_branches {
         let branch = format!("age-retired-{index}");
         db.branch_create(&branch)
@@ -575,12 +581,17 @@ pub(super) async fn age_fixture(db: &Omnigraph, args: &Args) -> serde_json::Valu
             args.rows + 1,
             "retired append must add one row"
         );
+        retired_table_refs.push(serde_json::json!({
+            "path": entry.dataset_path,
+            "native_ref": native,
+            "version": entry.published_dataset_version,
+            "rows": entry.entity_count,
+        }));
         drop(table);
         drop(snapshot);
         db.branch_delete(&branch)
             .await
             .expect("retire fixture branch");
-        db.wait_for_fork_reclaims().await;
         assert!(
             !db.branch_list().await.unwrap().contains(&branch),
             "retired graph branch remains live"
@@ -590,12 +601,12 @@ pub(super) async fn age_fixture(db: &Omnigraph, args: &Args) -> serde_json::Valu
             .await
             .expect("open surviving table after retirement");
         assert!(
-            !physical
+            physical
                 .list_branches()
                 .await
                 .unwrap()
                 .contains_key(&native),
-            "retired native fork was not reclaimed"
+            "retired native fork must remain until cleanup"
         );
         retired += 1;
     }
@@ -625,7 +636,8 @@ pub(super) async fn age_fixture(db: &Omnigraph, args: &Args) -> serde_json::Valu
         "setup_main_history_after_age": after,
         "setup_retired_branches_requested": args.retired_branches,
         "setup_retired_branches_applied": retired,
-        "setup_retired_native_refs_reclaimed": retired,
+        "setup_retired_native_refs_retained": retired,
+        "setup_retired_table_refs": retired_table_refs,
         "setup_age_content_verified": true,
         "setup_age_wall_us": started.elapsed().as_micros() as u64,
         "setup_age_semantics": "paired current-format main updates restore exact first-row content; retired branch commits are not reachable main history",
@@ -637,12 +649,13 @@ pub(super) fn operation_io_metrics(io: &super::helpers::cost::IoCounts) -> serde
         "operation_io_manifest_reads": io.manifest_reads,
         "operation_io_manifest_read_bytes": io.manifest_read_bytes,
         "operation_io_data_reads": io.data_reads,
+        "operation_io_data_writes": io.data_writes,
         "operation_io_data_opener_reads": io.data_opener_reads,
         "operation_io_data_scan_reads": io.data_scan_reads,
         "operation_io_internal_open_count": io.internal_open_count,
         "operation_io_data_open_count": io.data_open_count,
         "operation_io_manifest_scan_count": io.manifest_scan_count,
-        "operation_io_boundary": "shared cost_harness installed before open; measure resets before operation and collects after timing; task-local foreground probes exclude spawned reclaim and unwrapped warm data handles; not all filesystem I/O",
+        "operation_io_boundary": "shared cost_harness installed before open; measure resets before operation and collects after timing; task-local foreground probes exclude unwrapped warm data handles; data_writes counts instrumented node/edge object-store writes, not total storage requests or deletes; not all filesystem I/O",
     })
 }
 

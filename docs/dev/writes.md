@@ -154,33 +154,38 @@ or add a separate migration publisher. See
 
 ## First-touch tables and lazy branches
 
-A named graph branch may inherit a main-table version without owning a native
-table ref. The first write stages against the inherited snapshot, records the
-intended ref/table ownership in recovery, and creates the physical branch only
-inside the protected effect window. Recovery may delete only a ref or dataset
-whose exact creation it owns. Table forks are named by the branch's native ref;
-sidecar table pins carry that native name while the sidecar's `branch` stays
-logical.
+A named graph branch can read an exact table version owned by another branch.
+Its first write stages against that inherited snapshot and prepares a fresh
+native name, `fork.{owner incarnation ULID}.m{base manifest version}.{graph commit ULID}`.
+A legacy owner without an incarnation uses `legacy` in that position.
+The name has at most 80 ASCII bytes, independent of the logical branch name;
+the existing unique commit ID separates attempts across legacy owners.
+The base manifest version and graph commit ID already belong to the captured
+attempt. Name construction adds no storage request, version reservation, or
+rename. The existing recovery sidecar persists the exact name and owner before
+the native fork is created from the captured source ref and version.
 
-Reclamation checks the current table pins of every live graph branch, not just
-the fork's original owner. A detached native ref can still hold a child's
-accepted snapshot. Cleanup and recovery retain such refs, and a first-touch
-writer refuses to recreate them before arming recovery. A first-touch merge
-classifies a pre-existing target native ref the same way: a ref another branch
-pins is refused as detached lineage, a ref a pending operation claims or whose
-liveness cannot be verified is refused as a conflict, and an orphan is deleted
-before the operation arms, on the write path as on the merge path, so the
-armed fork starts from a clean name and a crash between arming and forking
-leaves nothing recovery must explain. The deletes run table by table before
-the refusal check of the next table, so a refusal may follow a completed
-delete; nothing referenced the deleted ref, so no state is lost. This liveness view is derived under the
-control gates and is not persisted as another authority.
-Deletion derives native refs and descendants from one registry listing. It
-reuses already loaded borrower snapshots only when their native ref matches
-that listing and their manifest incarnation matches a fresh probe; other
-branches use the bounded manifest-only proof. Unreadable candidates still
-prevent deletion. This reduces repeated work under the existing gates without
-changing their scope.
+`TableVersionMetadata.table_fork_owner` records ownership in the existing
+manifest metadata. Existing owned writes retain the actual physical ref;
+pointer adoption preserves the source owner. Missing owner metadata uses only
+exact native-ref equality for legacy ownership. Parsing a name cannot establish
+ownership, because older legal names can resemble the new spelling.
+
+First-touch writes and merges leave old forks alone. A new attempt gets a new
+commit ID, while recovery of the same intent reuses its saved name. Correctness
+gates, exact effect identity, and baseline checks remain in place. The name's
+base version is preparation context; the successful manifest publication orders
+the new registration within that graph branch.
+
+Explicit `cleanup` protects every live table endpoint, relevant recovery, tags,
+and native ancestry before reclaiming unused forks. Branch deletion starts no
+background table reclamation. Branch deletion records retirement metadata on
+its exact native `__manifest` ref, so descendants keep their physical parent
+history while the logical name becomes unavailable. Cleanup reclaims unused
+retired leaves after proving their dependencies. Cached write admission checks
+the ref's identifier and retirement metadata through the existing lookup, with
+no additional storage request. Cold branch enumeration includes retained refs
+and filters retirement metadata; explicit cleanup reclaims unneeded refs.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, pointer, or recovery effect belongs to the

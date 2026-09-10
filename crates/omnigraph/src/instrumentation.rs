@@ -1494,13 +1494,20 @@ pub(crate) async fn open_dataset(
         .cloned()
         .unwrap_or_else(crate::lance_access::control_session);
     builder = builder.with_session(session);
+    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
     if let Some(wrapper) = wrapper {
-        let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
         store_params.object_store_wrapper = Some(wrapper);
-        builder = builder.with_store_params(store_params);
-    } else {
-        builder = builder.with_store_params(crate::storage::lance_store_params_for_uri(uri)?);
     }
+    let handler = crate::storage_layer::lance_clone::configured_commit_handler(
+        uri,
+        &Some(store_params.clone()),
+        None,
+    )
+    .await
+    .map_err(OmniError::storage)?;
+    builder = builder
+        .with_store_params(store_params)
+        .with_commit_handler(handler);
     builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a
         // pinned historical read count as reclaimed history:

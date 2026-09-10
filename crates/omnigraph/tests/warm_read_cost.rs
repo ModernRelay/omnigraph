@@ -308,10 +308,9 @@ async fn cold_other_branch_resolution_uses_one_coherent_manifest_open() {
     .await;
 }
 
-/// Branch controls reuse a verified current view or take one coherent capture
-/// on a miss. The owned source cannot change the handle's branch binding.
-/// Deletion reuses a verified surviving-main view and still opens its target
-/// plus the native main ref for the exact BranchIdentifier-fenced classifier.
+/// Branch controls reuse a verified current view or take one coherent capture on a miss.
+/// The owned source cannot change the handle's branch binding.
+/// Deletion captures its target and native refs without scanning surviving table borrowers.
 #[tokio::test]
 async fn native_branch_controls_use_one_post_gate_manifest_capture() {
     cost_harness(async {
@@ -326,7 +325,7 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
         Box::pin(assert_non_bound_branch_control_cost(&db, &mut writer)).await;
         Box::pin(assert_branch_control_source_incarnation(&db, &mut writer)).await;
         #[cfg(feature = "failpoints")]
-        Box::pin(assert_cached_borrower_blocks_branch_delete(
+        Box::pin(assert_cached_borrower_survives_branch_delete(
             &db,
             &mut writer,
         ))
@@ -353,12 +352,11 @@ async fn assert_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnigraph
     assert_eq!(
         (delete_io.internal_open_count, delete_io.manifest_scan_count),
         (2, 1),
-        "branch delete needs one coherent target capture and one native-ref \
-         opener; surviving main is already loaded and freshly verified"
+        "branch delete needs one coherent target capture and one native-ref opener"
     );
     assert_eq!(
-        delete_io.version_probes, 1,
-        "dependency reuse must prove freshness"
+        delete_io.version_probes, 0,
+        "deletion does not probe surviving branch snapshots"
     );
 
     db.branch_create("cold_delete").await.unwrap();
@@ -377,9 +375,10 @@ async fn assert_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnigraph
             stale_delete_io.internal_open_count,
             stale_delete_io.manifest_scan_count
         ),
-        (3, 2),
-        "a stale surviving-main view must fall back to its fresh manifest-only proof"
+        (2, 1),
+        "a stale surviving-main view must not add work to target deletion"
     );
+    assert_eq!(stale_delete_io.version_probes, 0);
     let (created, stale_create_io) = measure(db.branch_create("main_fresh")).await;
     created.unwrap();
     assert_eq!(
@@ -485,7 +484,6 @@ async fn assert_branch_control_source_incarnation(db: &Omnigraph, writer: &mut O
         writer.branch_delete(child).await.unwrap();
     }
     writer.branch_delete("feature").await.unwrap();
-    writer.wait_for_fork_reclaims().await;
     writer.branch_create("feature").await.unwrap();
     mutate_branch(
         writer,
@@ -531,20 +529,12 @@ async fn assert_branch_control_source_incarnation(db: &Omnigraph, writer: &mut O
 }
 
 #[cfg(feature = "failpoints")]
-async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mut Omnigraph) {
-    // Reuse the same fixture and the existing legacy-pointer test seam. A
-    // sibling whose manifest was forked from main can still borrow feature's
-    // table ref; native ancestry alone cannot prove that deleting it is safe.
+async fn assert_cached_borrower_survives_branch_delete(db: &Omnigraph, writer: &mut Omnigraph) {
     for branch in ["main_fresh", "review_recreated"] {
         writer.branch_delete(branch).await.unwrap();
     }
-    writer.wait_for_fork_reclaims().await;
     writer
-        .failpoint_publish_table_head_without_index_rebuild_for_test(
-            "binding_check",
-            "node:Person",
-            Some("feature"),
-        )
+        .branch_merge("feature", "binding_check")
         .await
         .unwrap();
     db.sync_branch("binding_check").await.unwrap();
@@ -559,23 +549,25 @@ async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mu
     );
     let source = db.snapshot_of("feature").await.unwrap();
     let source_entry = source.dataset("node:Person").unwrap();
+    let source_native = helpers::graph_native_ref(db.uri(), "feature").await;
+    let source_fork = source_entry.native_dataset_branch.as_deref().unwrap();
     let borrower = db.snapshot_of("binding_check").await.unwrap();
     let borrowed_entry = borrower.dataset("node:Person").unwrap();
     assert_eq!(
         borrowed_entry.native_dataset_branch, source_entry.native_dataset_branch,
-        "legacy sibling must retain the target's exact table ref"
+        "the sibling must retain the source's exact table ref"
     );
     assert_eq!(
         borrowed_entry.published_dataset_version,
         source_entry.published_dataset_version
     );
-    assert!(source_entry.native_dataset_branch.is_some());
+    assert_eq!(borrowed_entry.entity_count, source_entry.entity_count);
 
     let table_uri = format!("{}/{}", db.uri(), source_entry.dataset_path);
     let table = lance::Dataset::open(&table_uri).await.unwrap();
     let table_refs_before = table.list_branches().await.unwrap();
     let mut before = std::collections::BTreeMap::new();
-    for branch in ["main", "binding_check", "feature"] {
+    for branch in ["main", "binding_check"] {
         let snapshot = db.snapshot_of(branch).await.unwrap();
         let mut entries = snapshot.datasets().collect::<Vec<_>>();
         entries.sort_by(|a, b| a.type_key.cmp(&b.type_key));
@@ -591,36 +583,55 @@ async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mu
     }
 
     let (deleted, io) = measure(db.branch_delete("feature")).await;
-    let error = deleted.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("because branch 'binding_check' still depends on it"),
-        "must refuse at the table-borrower proof, not native ancestry: {error}"
-    );
+    deleted.expect("table borrowers must remain valid after logical owner deletion");
     assert_eq!(
         (
             io.internal_open_count,
             io.manifest_scan_count,
             io.version_probes
         ),
-        (2, 2, 1),
-        "only target capture and cold-main proof may scan; the bound borrower \
-         must refuse from its freshly verified cache, before the delete classifier"
+        (2, 1, 0),
+        "cached table-borrower deletion must stay within its measured control cost"
     );
-    db.wait_for_fork_reclaims().await;
 
-    assert_eq!(
-        serde_json::to_value(manifest.list_branches().await.unwrap()).unwrap(),
-        serde_json::to_value(refs_before).unwrap(),
-        "refused deletion must preserve every graph branch incarnation"
+    assert!(
+        !refs_before[&source_native]
+            .metadata
+            .contains_key("omnigraph.retired_manifest_branch")
     );
+    let mut refs_after = manifest.list_branches().await.unwrap();
+    let retirement = refs_after
+        .get_mut(&source_native)
+        .expect("logical deletion retains the exact native ref")
+        .metadata
+        .remove("omnigraph.retired_manifest_branch")
+        .expect("logical deletion publishes retirement metadata");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&retirement).unwrap(),
+        serde_json::json!({
+            "version": 1,
+            "native_branch": source_native,
+            "identifier": refs_before[&source_native].identifier,
+        }),
+        "retirement must bind the exact captured native lifetime"
+    );
+    assert_eq!(
+        serde_json::to_value(refs_after).unwrap(),
+        serde_json::to_value(refs_before).unwrap(),
+        "deletion must change only the target's retirement metadata"
+    );
+    assert!(
+        helpers::native_ref_for(&manifest, "feature")
+            .await
+            .is_none()
+    );
+    assert!(db.snapshot_of("feature").await.is_err());
     assert_eq!(
         serde_json::to_value(table.list_branches().await.unwrap()).unwrap(),
         serde_json::to_value(table_refs_before).unwrap(),
-        "refused deletion must preserve the borrowed native table ref"
+        "logical deletion must preserve every physical table ref"
     );
-    for (branch, (version, head, pins, rows)) in before {
+    for (branch, (version, head, pins, rows)) in before.clone() {
         let snapshot = db.snapshot_of(branch).await.unwrap();
         assert_eq!(
             snapshot.graph_manifest_version(),
@@ -639,6 +650,84 @@ async fn assert_cached_borrower_blocks_branch_delete(db: &Omnigraph, writer: &mu
             helpers::read_table_branch(db, branch, "node:Person").await,
             rows,
             "{branch} payload changed"
+        );
+    }
+    writer
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        lance::Dataset::open(&table_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(source_fork)
+    );
+    let reopened = Omnigraph::open(db.uri()).await.unwrap();
+    let borrower_after = reopened.snapshot_of("binding_check").await.unwrap();
+    assert!(
+        borrower_after
+            .dataset("node:Person")
+            .unwrap()
+            .same_registration(borrowed_entry)
+    );
+    for (branch, (_, _, _, rows)) in &before {
+        assert_eq!(
+            &helpers::read_table_branch(&reopened, branch, "node:Person").await,
+            rows
+        );
+    }
+
+    writer.branch_create("feature").await.unwrap();
+    writer
+        .mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "after-owner-recreation")], &[("$age", 34)]),
+        )
+        .await
+        .unwrap();
+    let recreated = writer.snapshot_of("feature").await.unwrap();
+    let recreated_fork = recreated
+        .dataset("node:Person")
+        .unwrap()
+        .native_dataset_branch
+        .as_deref()
+        .unwrap();
+    assert_ne!(recreated_fork, source_fork);
+    writer
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    let refs = lance::Dataset::open(&table_uri)
+        .await
+        .unwrap()
+        .list_branches()
+        .await
+        .unwrap();
+    assert!(refs.contains_key(source_fork));
+    assert!(refs.contains_key(recreated_fork));
+    let reopened = Omnigraph::open(db.uri()).await.unwrap();
+    let borrower_after = reopened.snapshot_of("binding_check").await.unwrap();
+    assert!(
+        borrower_after
+            .dataset("node:Person")
+            .unwrap()
+            .same_registration(borrowed_entry)
+    );
+    for (branch, (_, _, _, rows)) in before {
+        assert_eq!(
+            helpers::read_table_branch(&reopened, branch, "node:Person").await,
+            rows
         );
     }
 }

@@ -1858,11 +1858,9 @@ async fn branch_merge_applies_node_insert_to_main() {
 
 /// Rust because the pins are native table versions, the target ref's physical
 /// HEAD, and the entry retained on an empty delta; the row-visible half is
-/// `merge_adopt_*.gqt`. The lazy iteration stops after its reads (RFC 0062, decision log 2026-09-08).
+/// `merge_adopt_*.gqt`. Both named targets adopt the exact source registration.
 #[tokio::test]
 async fn branch_merge_preserves_state_when_native_versions_differ() {
-    // The route ignores version order; the lazy arm adds recovery-owned
-    // first-touch forking without changing the indexed schema.
     for lazy_target in [false, true] {
         assert_native_version_case(8, lazy_target).await;
     }
@@ -1919,11 +1917,6 @@ fn assert_native_version_case(
             )
             .await
             .unwrap();
-            // Inherit main's root-owned indexed table. Cloning feature's
-            // already-cloned indexes would hit the separate Lance #7840
-            // bug pinned by second_generation_branch_index_reads_fail_upstream
-            // in lance_surface_guards.rs. This first-generation fork still
-            // exercises the merge's lazy-target recovery route.
             main.branch_create_from(ReadTarget::branch("main"), "child")
                 .await
                 .unwrap();
@@ -1943,7 +1936,6 @@ fn assert_native_version_case(
             .unwrap();
             ("main", "feature")
         };
-        let target_native = graph_native_ref(uri, target).await;
         let source_entry = snapshot_branch(&main, source)
             .await
             .unwrap()
@@ -1976,10 +1968,7 @@ fn assert_native_version_case(
             source_entry.native_dataset_branch,
             target_entry.native_dataset_branch
         );
-        assert_eq!(
-            target_entry.native_dataset_branch.as_deref() == Some(target_native.as_str()),
-            !lazy_target
-        );
+        assert_eq!(target_entry.native_dataset_branch.is_some(), !lazy_target);
         assert_eq!(
             main.branch_merge(source, target).await.unwrap(),
             MergeOutcome::FastForward
@@ -1990,18 +1979,16 @@ fn assert_native_version_case(
             .dataset("node:Person")
             .unwrap()
             .clone();
-        let expected_ref = if lazy_target {
-            Some(target_native.as_str())
-        } else {
-            source_entry.native_dataset_branch.as_deref()
-        };
         assert_eq!(
             (
                 merged_entry.published_dataset_version,
                 merged_entry.native_dataset_branch.as_deref()
             ),
-            (source_entry.published_dataset_version, expected_ref),
-            "{target}, {branch_updates} updates: the adopt registers the source's version, as a pointer switch onto the source ref or a fork onto the target's own ref, ordered by the manifest clock (RFC 0062)"
+            (
+                source_entry.published_dataset_version,
+                source_entry.native_dataset_branch.as_deref()
+            ),
+            "{target}, {branch_updates} updates: adoption preserves the exact source ref and version"
         );
         let reopened = Omnigraph::open(uri).await.unwrap();
         for handle in [&main, &reopened] {
@@ -2073,7 +2060,7 @@ fn assert_native_version_case(
             .clone();
         let table_uri = format!("{uri}/{}", before_empty.dataset_path);
         let head_before =
-            open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+            open_dataset_head_exact(&table_uri, before_empty.native_dataset_branch.as_deref())
                 .await
                 .version()
                 .version;
@@ -2106,7 +2093,7 @@ fn assert_native_version_case(
             );
         }
         assert_eq!(
-            open_dataset_head(&table_uri, before_empty.native_dataset_branch.as_deref())
+            open_dataset_head_exact(&table_uri, before_empty.native_dataset_branch.as_deref())
                 .await
                 .version()
                 .version,
@@ -2121,22 +2108,31 @@ fn assert_native_version_case(
             })
             .await
             .unwrap();
-        let error = main
-            .mutate(
-                target,
-                MUTATION_QUERIES,
-                "set_age",
-                &mixed_params(&[("$name", "Alice")], &[("$age", 51)]),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("detached native lineage"),
-            "{target}, {branch_updates} updates: the pointer switch detached the target's former ref and its borrower still pins it, so the owner's next write must refuse instead of recreating the ref: {error}"
+        main.mutate(
+            target,
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 51)]),
+        )
+        .await
+        .unwrap();
+        let written = snapshot_branch(&main, target).await.unwrap();
+        let written = written.dataset("node:Person").unwrap();
+        assert_ne!(
+            written.native_dataset_branch,
+            before_empty.native_dataset_branch
+        );
+        assert_ne!(
+            written.native_dataset_branch,
+            target_entry.native_dataset_branch
         );
         let reopened = Omnigraph::open(uri).await.unwrap();
         for handle in [&main, &reopened] {
-            for (branch, age) in [("borrower", 39 + branch_updates as i32), (target, 50)] {
+            for (branch, age) in [
+                ("borrower", 39 + branch_updates as i32),
+                (target, 51),
+                ("main", 50),
+            ] {
                 let result = handle
                     .query(
                         ReadTarget::branch(branch),
@@ -2155,7 +2151,7 @@ fn assert_native_version_case(
                         .unwrap()
                         .value(0),
                     age,
-                    "{branch}: cleanup and the refused write must leave every pin readable"
+                    "{branch}: cleanup and a fresh target fork preserve independent branch values"
                 );
             }
         }
@@ -2163,7 +2159,7 @@ fn assert_native_version_case(
 }
 
 #[tokio::test]
-async fn branch_write_refuses_detached_native_lineage_before_arming() {
+async fn branch_write_after_adoption_keeps_borrowers_and_uses_fresh_forks() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
@@ -2205,7 +2201,7 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
     let owner_before = snapshot_branch(&db, "feature").await.unwrap();
     let table_uri = format!("{}/{}", db.uri(), borrowed.dataset_path);
     let native = borrowed.native_dataset_branch.as_deref().unwrap();
-    let head_before = open_dataset_head(&table_uri, Some(native))
+    let head_before = open_dataset_head_exact(&table_uri, Some(native))
         .await
         .version()
         .version;
@@ -2216,33 +2212,30 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
         .await
         .unwrap();
 
-    let error = db
-        .load_as(
-            "feature",
-            None,
-            r#"{"type":"Company","data":{"name":"NewCo"}}"#,
-            LoadMode::Merge,
-            None,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&error, OmniError::Manifest(error)
-        if error.kind == ManifestErrorKind::BadRequest),
-        "{error}"
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Company","data":{"name":"NewCo"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    let owner_after = snapshot_branch(&db, "feature").await.unwrap();
+    let written = owner_after.dataset("node:Company").unwrap();
+    assert_ne!(
+        written.native_dataset_branch,
+        borrowed.native_dataset_branch
     );
-    assert!(
-        error.to_string().contains("detached native lineage"),
-        "{error}"
-    );
-    assert!(error.to_string().contains("Create a new branch"), "{error}");
-    let recovery_dir = dir.path().join("__recovery");
-    assert!(
-        !recovery_dir.exists() || fs::read_dir(recovery_dir).unwrap().next().is_none(),
-        "refusal must precede durable recovery intent"
+    assert_ne!(
+        written.native_dataset_branch,
+        owner_before
+            .dataset("node:Company")
+            .unwrap()
+            .native_dataset_branch
     );
     assert_eq!(
-        open_dataset_head(&table_uri, Some(native))
+        open_dataset_head_exact(&table_uri, Some(native))
             .await
             .version()
             .version,
@@ -2257,7 +2250,7 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
     assert_eq!(
         branches_after.get(native).unwrap().identifier,
         branches_before.get(native).unwrap().identifier,
-        "native ref must not be recreated"
+        "a fresh write must not recreate the borrowed native ref"
     );
     db.branch_create_from(ReadTarget::branch("feature"), "replacement")
         .await
@@ -2265,22 +2258,86 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
     db.load_as(
         "replacement",
         None,
-        r#"{"type":"Company","data":{"name":"NewCo"}}"#,
+        r#"{"type":"Company","data":{"name":"ReplacementCo"}}"#,
         LoadMode::Merge,
         None,
     )
     .await
     .unwrap();
-    let merge_error = db.branch_merge("replacement", "feature").await.unwrap_err();
-    assert!(
-        merge_error.to_string().contains("detached native lineage"),
-        "{merge_error}"
+    let replacement = snapshot_branch(&db, "replacement").await.unwrap();
+    let replacement_entry = replacement.dataset("node:Company").unwrap();
+    assert_eq!(
+        db.branch_merge("replacement", "feature").await.unwrap(),
+        MergeOutcome::FastForward
     );
-    let recovery_dir = dir.path().join("__recovery");
-    assert!(
-        !recovery_dir.exists() || fs::read_dir(recovery_dir).unwrap().next().is_none(),
-        "merge refusal must precede durable recovery intent"
+    let adopted = snapshot_branch(&db, "feature").await.unwrap();
+    let adopted_entry = adopted.dataset("node:Company").unwrap();
+    assert_eq!(
+        (
+            &adopted_entry.type_key,
+            &adopted_entry.dataset_path,
+            adopted_entry.published_dataset_version,
+            &adopted_entry.native_dataset_branch,
+            adopted_entry.entity_count,
+        ),
+        (
+            &replacement_entry.type_key,
+            &replacement_entry.dataset_path,
+            replacement_entry.published_dataset_version,
+            &replacement_entry.native_dataset_branch,
+            replacement_entry.entity_count,
+        ),
+        "adoption must preserve the exact replacement table pointer"
     );
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Company","data":{"name":"AfterAdoptCo"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    let after_adopt_write = snapshot_branch(&db, "feature").await.unwrap();
+    let after_adopt_entry = after_adopt_write.dataset("node:Company").unwrap();
+    assert_ne!(
+        after_adopt_entry.native_dataset_branch,
+        replacement_entry.native_dataset_branch
+    );
+    assert_ne!(
+        after_adopt_entry.native_dataset_branch,
+        written.native_dataset_branch
+    );
+    let replacement_after = snapshot_branch(&db, "replacement").await.unwrap();
+    assert!(
+        replacement_after
+            .dataset("node:Company")
+            .unwrap()
+            .same_registration(replacement_entry)
+    );
+    let reopened = Omnigraph::open(db.uri()).await.unwrap();
+    for handle in [&db, &reopened] {
+        for branch in ["child", "main", "replacement", "feature"] {
+            let names = collect_column_strings(
+                &read_table_branch(handle, branch, "node:Company").await,
+                "name",
+            );
+            assert_eq!(
+                names.iter().any(|name| name == "AfterAdoptCo"),
+                branch == "feature"
+            );
+            assert_eq!(
+                names.iter().any(|name| name == "ReplacementCo"),
+                matches!(branch, "replacement" | "feature")
+            );
+            assert_eq!(
+                names.iter().any(|name| name == "NewCo"),
+                matches!(branch, "replacement" | "feature")
+            );
+            assert_eq!(names.iter().any(|name| name == "MainCo"), branch != "child");
+            assert!(names.iter().any(|name| name == "BorrowedCo"));
+        }
+    }
     let child = snapshot_branch(&db, "child").await.unwrap();
     let child = child.dataset("node:Company").unwrap();
     assert_eq!(child.native_dataset_branch, borrowed.native_dataset_branch);
@@ -2288,7 +2345,7 @@ async fn branch_write_refuses_detached_native_lineage_before_arming() {
         child.published_dataset_version,
         borrowed.published_dataset_version
     );
-    assert_eq!(
+    assert_ne!(
         snapshot_branch(&db, "feature")
             .await
             .unwrap()
@@ -3002,17 +3059,16 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     experiment.ensure_indices_on("experiment").await.unwrap();
 
     let experiment_snap = snapshot_branch(&experiment, "experiment").await.unwrap();
-    assert!(
-        is_incarnation_of(
-            experiment_snap
-                .dataset("node:Person")
-                .unwrap()
-                .native_dataset_branch
-                .as_deref()
-                .unwrap_or(""),
-            "feature"
-        ),
-        "index reconciliation must not manufacture a ref-only first-touch effect"
+    assert_eq!(
+        experiment_snap
+            .dataset("node:Person")
+            .unwrap()
+            .native_dataset_branch,
+        experiment_inherited
+            .dataset("node:Person")
+            .unwrap()
+            .native_dataset_branch,
+        "index reconciliation must preserve the exact inherited table ref when no work is needed"
     );
     assert_eq!(
         experiment_snap
@@ -3164,6 +3220,8 @@ async fn branch_merge_into_non_main_target_works() {
         .into_iter()
         .map(|commit| commit.graph_commit_id)
         .collect::<Vec<_>>();
+    let source_before = snapshot_branch(&feature, "feature").await.unwrap();
+    let source_entry = source_before.dataset("node:Person").unwrap();
     let outcome = main.branch_merge("feature", "experiment").await.unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
     assert_eq!(
@@ -3206,13 +3264,23 @@ async fn branch_merge_into_non_main_target_works() {
     .unwrap();
     assert_eq!(eve.num_rows(), 1);
     let experiment_snap = snapshot_branch(&experiment, "experiment").await.unwrap();
-    helpers::assert_native_branch_of(
-        experiment_snap
-            .dataset("node:Person")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        "experiment",
+    let adopted_entry = experiment_snap.dataset("node:Person").unwrap();
+    assert_eq!(
+        (
+            &adopted_entry.type_key,
+            &adopted_entry.dataset_path,
+            adopted_entry.published_dataset_version,
+            &adopted_entry.native_dataset_branch,
+            adopted_entry.entity_count,
+        ),
+        (
+            &source_entry.type_key,
+            &source_entry.dataset_path,
+            source_entry.published_dataset_version,
+            &source_entry.native_dataset_branch,
+            source_entry.entity_count,
+        ),
+        "the named target must adopt the exact source table pointer"
     );
 
     let mut reopened_main = Omnigraph::open(uri).await.unwrap();
@@ -3491,7 +3559,7 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
 }
 
 #[tokio::test]
-async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
+async fn branch_delete_defers_owned_fork_cleanup_and_allows_recreate() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
@@ -3508,25 +3576,35 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
     .await
     .unwrap();
 
-    let first_native = graph_native_ref(uri, "feature").await;
-    assert!(
-        is_incarnation_of(&first_native, "feature") && first_native != "feature",
-        "an engine-created branch owns an incarnation-suffixed native ref, got '{first_native}'"
-    );
-
+    let first_fork = snapshot_branch(&main, "feature")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .native_dataset_branch
+        .clone()
+        .unwrap();
+    let person_path = snapshot_branch(&main, "feature")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .dataset_path
+        .clone();
+    let person_uri = format!("{uri}/{person_path}");
     main.branch_delete("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main"]);
-    // Join the background fork reclaim so the recreate below starts from a
-    // physically clean namespace (it would otherwise serialize behind the
-    // reclaim's gates and self-heal any leftover orphan).
-    main.wait_for_fork_reclaims().await;
-
-    main.branch_create("feature").await.unwrap();
-    let second_native = graph_native_ref(uri, "feature").await;
-    assert_ne!(
-        first_native, second_native,
-        "a recreated branch mints a new incarnation; it never reuses the dead one's path"
+    let branches = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .list_branches()
+        .await
+        .unwrap();
+    assert!(
+        branches.contains_key(&first_fork),
+        "delete defers physical fork collection"
     );
+    main.branch_create("feature").await.unwrap();
     mutate_branch(
         &mut main,
         "feature",
@@ -3536,23 +3614,51 @@ async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
     )
     .await
     .unwrap();
-
+    let second_fork = snapshot_branch(&main, "feature")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .native_dataset_branch
+        .clone()
+        .unwrap();
+    assert_ne!(first_fork, second_fork);
     assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
-    let recreated = snapshot_branch(&main, "feature").await.unwrap();
-    assert_eq!(
-        recreated
-            .dataset("node:Person")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        Some(second_native.as_str()),
-        "the recreated branch's fork is named by its own incarnation"
+    let branches = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .list_branches()
+        .await
+        .unwrap();
+    assert!(
+        branches.contains_key(&first_fork),
+        "recreated writes leave the former fork intact"
     );
-    assert_eq!(
-        main.branch_list().await.unwrap(),
-        vec!["main", "feature"],
-        "branch listing shows logical names only"
+    assert!(branches.contains_key(&second_fork));
+    main.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    let branches = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .list_branches()
+        .await
+        .unwrap();
+    assert!(!branches.contains_key(&first_fork));
+    assert!(
+        branches.contains_key(&second_fork),
+        "cleanup preserves the recreated branch's fork"
     );
+    drop(feature);
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(
+        count_rows_branch(&reopened, "feature", "node:Person").await,
+        5
+    );
+    assert_eq!(main.branch_list().await.unwrap(), vec!["main", "feature"]);
 }
 
 #[tokio::test]
@@ -3604,29 +3710,54 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
         "prefix admission must reject before Lance creates the target clone"
     );
 
+    let manifest = lance::Dataset::open(&format!("{}/__manifest", dir.path().display()))
+        .await
+        .unwrap();
+    let ancestor_native = helpers::native_ref_for(&manifest, "feature").await.unwrap();
+    let ancestor = manifest.branches().get(&ancestor_native).await.unwrap();
     db.branch_delete("feature").await.unwrap();
     db.branch_create("feature/child").await.unwrap();
+    let refs_before_refusal = manifest.list_branches().await.unwrap();
+    assert_eq!(
+        refs_before_refusal[&ancestor_native].identifier,
+        ancestor.identifier
+    );
+    let retirement: serde_json::Value = serde_json::from_str(
+        &refs_before_refusal[&ancestor_native].metadata["omnigraph.retired_manifest_branch"],
+    )
+    .unwrap();
+    assert_eq!(
+        retirement,
+        serde_json::json!({
+            "version": 1,
+            "native_branch": ancestor_native,
+            "identifier": ancestor.identifier,
+        })
+    );
     let err = db.branch_create("feature").await.unwrap_err();
     assert!(
         err.to_string().contains("physical Lance path")
             && err.to_string().contains("feature/child"),
         "ancestor creation must reject the inverse prefix collision; got: {err}"
     );
+    assert_eq!(
+        serde_json::to_value(manifest.list_branches().await.unwrap()).unwrap(),
+        serde_json::to_value(refs_before_refusal).unwrap(),
+        "inverse admission refusal must preserve the retired ancestor and create no ref"
+    );
     assert!(
-        !lance::Dataset::open(&format!("{}/__manifest", dir.path().display()))
+        helpers::native_ref_for(&manifest, "feature")
             .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .keys()
-            .any(|name| helpers::is_incarnation_of(name, "feature")),
-        "inverse admission refusal must not create an ancestor ref"
+            .is_none()
+    );
+    assert_eq!(
+        db.branch_list().await.unwrap(),
+        vec!["main", "feature/child"]
     );
 }
 
 #[tokio::test]
-async fn branch_delete_refuses_legacy_physical_path_children() {
+async fn branch_delete_retires_legacy_physical_path_parents() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = init_and_load(&dir).await;
@@ -3644,36 +3775,26 @@ async fn branch_delete_refuses_legacy_physical_path_children() {
         .await
         .unwrap();
 
-    let err = db.branch_delete("feature").await.unwrap_err();
-    assert!(
-        err.to_string().contains("feature/child")
-            && err.to_string().contains("delete the child branch first"),
-        "legacy prefix collisions must be deleted leaf-first; got: {err}"
-    );
-    assert!(
-        manifest
-            .list_branches()
-            .await
-            .unwrap()
-            .keys()
-            .any(|name| helpers::is_incarnation_of(name, "feature")),
-        "refusal must not remove ancestor authority"
-    );
-
-    db.branch_delete("feature/child").await.unwrap();
     db.branch_delete("feature").await.unwrap();
-    assert_eq!(
-        db.branch_list().await.unwrap(),
-        vec!["main"],
-        "legacy overlap must converge when deleted leaf-first"
+    assert!(
+        helpers::native_ref_for(&manifest, "feature")
+            .await
+            .is_none()
     );
+    assert!(manifest.branches().get("feature").await.is_ok());
+    assert_eq!(
+        count_rows_branch(&db, "feature/child", "node:Person").await,
+        4
+    );
+    db.branch_delete("feature/child").await.unwrap();
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
 }
 
 #[tokio::test]
-async fn branch_delete_rejects_branches_still_referenced_by_descendants() {
+async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = init_and_load(&dir).await;
+    let mut main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -3691,8 +3812,219 @@ async fn branch_delete_rejects_branches_still_referenced_by_descendants() {
         .await
         .unwrap();
 
-    let err = main.branch_delete("feature").await.unwrap_err();
-    assert!(err.to_string().contains("still depends on it"));
+    let manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    let live = manifest.list_branches().await.unwrap();
+    let native = live
+        .keys()
+        .find(|name| helpers::is_incarnation_of(name, "feature"))
+        .unwrap()
+        .clone();
+    let identifier = live[&native].identifier.clone();
+    let retained = manifest.checkout_branch(&native).await.unwrap();
+
+    let changed_metadata = [("external-owner".to_string(), "preserved".to_string())]
+        .into_iter()
+        .collect();
+    manifest
+        .branches()
+        .replace_metadata(&native, changed_metadata)
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest.list_branches().await.unwrap()[&native].metadata["external-owner"],
+        "preserved"
+    );
+    assert!(
+        Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature".to_string())
+    );
+    let tagged_snapshot = snapshot_branch(&main, "feature").await.unwrap();
+    let tagged_entry = tagged_snapshot.dataset("node:Person").unwrap();
+    manifest
+        .tags()
+        .create(
+            "retirement-pin",
+            (native.as_str(), retained.version().version),
+        )
+        .await
+        .unwrap();
+    let refused = main.branch_delete("feature").await.expect_err(
+        "native graph tags retain the deletion fence until graph-wide tagged table pins exist",
+    );
+    assert!(
+        refused.to_string().contains("native manifest tag"),
+        "{refused}"
+    );
+    assert_eq!(
+        manifest.branches().get(&native).await.unwrap().identifier,
+        identifier
+    );
+    let after_refusal = snapshot_branch(&main, "feature").await.unwrap();
+    let current_entry = after_refusal.dataset("node:Person").unwrap();
+    assert_eq!(
+        current_entry.native_dataset_branch,
+        tagged_entry.native_dataset_branch
+    );
+    assert_eq!(
+        current_entry.published_dataset_version,
+        tagged_entry.published_dataset_version
+    );
+    assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
+    assert_eq!(
+        count_rows_branch(&main, "experiment", "node:Person").await,
+        5
+    );
+    manifest.tags().delete("retirement-pin").await.unwrap();
+    main.branch_delete("feature").await.unwrap();
+    assert!(
+        helpers::native_ref_for(&manifest, "feature")
+            .await
+            .is_none()
+    );
+    assert!(
+        !main
+            .branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature".to_string())
+    );
+    assert_eq!(
+        manifest.branches().get(&native).await.unwrap().identifier,
+        identifier
+    );
+    assert_eq!(
+        manifest.branches().get(&native).await.unwrap().metadata["external-owner"],
+        "preserved"
+    );
+    assert_eq!(retained.branch_identifier().await.unwrap(), identifier);
+    let ref_path = dir
+        .path()
+        .join("__manifest/_refs/branches")
+        .join(format!("{native}.json"));
+    let retired_bytes = std::fs::read(&ref_path).unwrap();
+    let retired_contents: serde_json::Value = serde_json::from_slice(&retired_bytes).unwrap();
+    let marker = &retired_contents["metadata"]["omnigraph.retired_manifest_branch"];
+    let retirement: serde_json::Value = serde_json::from_str(marker.as_str().unwrap()).unwrap();
+    assert_eq!(retirement["version"], serde_json::json!(1));
+    assert_eq!(retirement["native_branch"], serde_json::json!(native));
+    assert_eq!(
+        retirement["identifier"],
+        serde_json::to_value(&identifier).unwrap()
+    );
+    for invalid in [
+        "missing_identifier",
+        "identifier",
+        "version",
+        "native_branch",
+        "unknown_field",
+    ] {
+        let mut broken_marker = retirement.clone();
+        match invalid {
+            "missing_identifier" => {
+                broken_marker.as_object_mut().unwrap().remove("identifier");
+            }
+            "version" => broken_marker["version"] = serde_json::json!(99),
+            "identifier" => {
+                let foreign = live
+                    .values()
+                    .find(|contents| contents.identifier != identifier)
+                    .unwrap();
+                broken_marker["identifier"] = serde_json::to_value(&foreign.identifier).unwrap();
+            }
+            "native_branch" => broken_marker["native_branch"] = serde_json::json!("foreign"),
+            "unknown_field" => broken_marker["unknown"] = serde_json::json!(true),
+            _ => unreachable!(),
+        }
+        let mut broken = retired_contents.clone();
+        broken["metadata"]["omnigraph.retired_manifest_branch"] =
+            serde_json::json!(serde_json::to_string(&broken_marker).unwrap());
+        std::fs::write(&ref_path, serde_json::to_vec(&broken).unwrap()).unwrap();
+        assert!(manifest.branches().get(&native).await.is_ok());
+        assert!(main.branch_list().await.is_err(), "{invalid}");
+        assert!(
+            snapshot_branch(&main, "feature").await.is_err(),
+            "{invalid}"
+        );
+        assert!(
+            main.cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            })
+            .await
+            .is_err(),
+            "{invalid}"
+        );
+        assert!(
+            ref_path.exists(),
+            "invalid retirement must preserve physical authority"
+        );
+        assert!(dir.path().join("__manifest/tree").join(&native).exists());
+    }
+    std::fs::write(&ref_path, retired_bytes).unwrap();
+    assert!(snapshot_branch(&feature, "feature").await.is_err());
+    assert_eq!(
+        count_rows_branch(&feature, "experiment", "node:Person").await,
+        5
+    );
+
+    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    reopened.branch_create("feature").await.unwrap();
+    assert_eq!(
+        count_rows_branch(&reopened, "feature", "node:Person").await,
+        4
+    );
+    mutate_branch(
+        &mut reopened,
+        "experiment",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+    reopened
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        manifest.branches().get(&native).await.is_ok(),
+        "a live child retains its native ancestor"
+    );
+    assert_eq!(
+        count_rows_branch(&reopened, "experiment", "node:Person").await,
+        6
+    );
+    reopened.branch_delete("experiment").await.unwrap();
+    reopened
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        manifest.branches().get(&native).await.is_err(),
+        "cleanup reclaims unreferenced retired parents"
+    );
+    assert_eq!(
+        count_rows_branch(
+            &Omnigraph::open(uri).await.unwrap(),
+            "feature",
+            "node:Person"
+        )
+        .await,
+        4
+    );
 }
 
 // ─── Step 9b: Surgical merge publish tests ──────────────────────────────────

@@ -142,6 +142,9 @@ pub(super) async fn init_manifest_graph(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
+    let params = crate::storage_layer::lance_clone::write_params(&manifest_path, params)
+        .await
+        .map_err(OmniError::storage)?;
     let dataset = Dataset::write(reader, &manifest_path, Some(params))
         .await
         .map_err(|e| ManifestInitError::ManifestCreateOutcomeUnknown(OmniError::storage(e)))?;
@@ -406,6 +409,9 @@ async fn create_empty_dataset(
         session: Some(Arc::clone(control_session)),
         ..Default::default()
     };
+    let params = crate::storage_layer::lance_clone::write_params(uri, params)
+        .await
+        .map_err(OmniError::storage)?;
     let dataset = Dataset::write(reader, uri, Some(params))
         .await
         .map_err(OmniError::storage)?;

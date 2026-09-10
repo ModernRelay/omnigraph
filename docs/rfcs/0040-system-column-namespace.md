@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-08-23
-updated: 2026-09-08
+updated: 2026-09-09
 discussion: https://github.com/ModernRelay/omnigraph/issues/529
 supersedes: []
 superseded_by: []
@@ -420,14 +420,14 @@ of the unified write protocol (RFC 0022): a `SchemaApply` intent is
 persisted in the `__recovery/` sidecar before the first effect, and the
 effects run in this order.
 
-1. The `__manifest` internal-schema stamp on main advances from 7 to 8, by a
+1. The `__manifest` internal-schema stamp on main advances from 8 to 9, by a
    schema-metadata commit on the `__manifest` dataset (today only init writes
    the stamp, inside its Create commit), recorded in the intent with the
    dataset version before and after, so the publish in (3) validates its read
    set against the post-stamp version. It publishes no graph content
    (RFC 0022 §3.5), and internal system branch refs keep their forked stamp,
    which
-   the publisher's per-branch guard accepts within {7, 8}. Every binary
+   the publisher's per-branch guard accepts within {8, 9}. Every binary
    that predates this RFC refuses the graph at its next open from here on,
    and a process already holding it refuses its next publish (`guard_stamp`
    in `crates/omnigraph/src/db/manifest/migrations.rs`, run by the
@@ -557,16 +557,20 @@ identity from field IDs is answered the same way.
 
 ## Compatibility and reversibility
 
+The proposed stamp is provisionally 9 after RFC 0042's schema v8. Recheck the
+next available stamp when this draft is activated.
+
 Two fences keep a new-vintage graph away from binaries that predate this
 RFC, and they act at different depths. The `__manifest` internal-schema
-stamp advances from 7 to 8 on every new-vintage graph, at creation or as
+stamp advances from 8 to 9 on every new-vintage graph, at creation or as
 the upgrade's first effect; `refuse_if_internal_schema_unsupported` reads
 it as the first object-store read of both open modes, before the recovery
 sweeps a read-write open runs, so every binary that predates this RFC,
-whether it reads v6 (0.9.x, 0.10.x) or v7 (the 0.11.x line, RFC 0062),
+whether it reads v6 (0.9.x, 0.10.x), development v7, or v8
+(the 0.11.x line, RFCs 0042 and 0062),
 refuses the graph before it can write anything,
 with the existing ceiling refusal ("`__manifest` is stamped at internal
-schema v8 but this binary expects v7", from `refuse_if_stamp_unsupported` in
+schema v9 but this binary expects v8", from `refuse_if_stamp_unsupported` in
 `crates/omnigraph/src/db/manifest/migrations.rs`; a v6 reader names v6),
 whose remedy
 is the newer binary, never a rebuild. The feature set in the schema IR is
@@ -580,10 +584,10 @@ physical columns are a storage-format change (`docs/dev/versioning.md`
 §Changing an axis) and because the publisher's per-branch `guard_stamp` is
 the one gate a process already holding the graph re-runs, where the envelope
 check does not run.
-Old-vintage graphs stay stamped 7 permanently, as they never gain
+Old-vintage graphs stay stamped 8 permanently, as they never gain
 `system-columns`: the stamp is a storage-format fence, not a migration floor,
-so `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` stays 7 while
-`INTERNAL_MANIFEST_SCHEMA_VERSION` becomes 8, and this RFC's binary is the
+so `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` stays 8 while
+`INTERNAL_MANIFEST_SCHEMA_VERSION` becomes 9, and this RFC's binary is the
 first to serve two stamps. That retires the single-version contract stated
 in `crates/omnigraph/src/db/manifest/migrations.rs` (its module doc, the
 sub-floor refusal text, `release_for_internal_schema_version`, and the
@@ -592,7 +596,7 @@ format per binary", including its export-binary table), in
 `docs/dev/versioning.md` (the storage row of its policy table, §Current
 storage contract, and §Changing an axis), and in the doc comment on
 `refuse_if_internal_schema_unsupported` in
-`crates/omnigraph/src/db/manifest.rs` (every branch at CURRENT): 7 is the
+`crates/omnigraph/src/db/manifest.rs` (every branch at CURRENT): 8 is the
 one stamp
 this binary can upgrade in place, through the explicit operation rather than
 an open-time dispatcher. Rollout step 2 owns those rewrites.
@@ -717,7 +721,7 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   node object), and a graph with no schema apply keeps its
   IR bytes and hash identical to today's (Per-graph role resolution).
 - Refusal: the {2, 4} generation (today's main) refuses an old-vintage
-  `ir_version` 5 graph, stamped 7, with the existing hard "unsupported
+  `ir_version` 5 graph, stamped 8, with the existing hard "unsupported
   ir_version" error at `refuse_unsupported_schema_versions`, before any
   write; the 2-only generation never reaches the IR, refusing at the stamp
   (Early fence); a set-carrying graph
@@ -773,7 +777,7 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   graphs).
 - Upgrade effects: after the upgrade every table spells `__id`/`__src`/
   `__dst`, the IR carries `system-columns` at `ir_version` 5, `_schema.pg`
-  constraint references read `@id`/`@src`/`@dst`, the stamp reads 8, and a
+  constraint references read `@id`/`@src`/`@dst`, the stamp reads 9, and a
   query valid before the upgrade returns the same rows after it (The
   upgrade).
 - Upgrade recovery: under the DST harness, a crash at every schema-apply
@@ -819,8 +823,8 @@ per-test enumeration.
 2. Resolution and admission (the draft implementation, #548): system
    columns resolve by role through the accepted vintage, live and
    historical (Historical reads), new graphs admit under the prefix rule,
-   spell `__id`/`__src`/`__dst`, and stamp `__manifest` 8 (this binary
-   serves {7, 8}), the meta-field namespace lands in `.gq` and in `.pg`
+   spell `__id`/`__src`/`__dst`, and stamp `__manifest` 9 (this binary
+   serves {8, 9}), the meta-field namespace lands in `.gq` and in `.pg`
    constraint references, the wire envelope moves the identity beside
    `type`/`edge` on export and load, and the versioning machinery ships
    whole: the feature-set field, {2, 4, 5} acceptance (4 with the
@@ -855,7 +859,7 @@ per-test enumeration.
    one-writer boundary being operator-owned
    (`docs/dev/control-plane.md` §Concurrency); servers do not hot-reload, so
    the restart is one the control plane already requires. Completion is the
-   stamp reading 8 in `omnigraph snapshot` (which opens read-write and
+   stamp reading 9 in `omnigraph snapshot` (which opens read-write and
    completes a pending roll-forward first) and the new-vintage spellings in
    `GET /schema`'s system-column field, and the
    boot-time registry check validates the stored queries against the
@@ -963,3 +967,7 @@ None.
   rejected on the grounds #593 gave for 3: a merged binary already stamps
   each (main since #593 and #686), and a number once stamped is never
   reinterpreted.
+
+- 2026-09-09: RFC 0042 native retirement uses internal schema v8. This draft
+  provisionally serves {8, 9}, with 9 reserved for its new-vintage storage
+  meaning; historical stamp choices in earlier decision entries are unchanged.

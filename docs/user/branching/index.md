@@ -62,19 +62,17 @@ prevent `omnigraph cleanup` from reclaiming old data.
 
 Branch names may contain `/`, but live names must not be path prefixes of one
 another. For example, `review` and `review/alice` cannot coexist. `main` is
-reserved. A branch with descendants must be deleted leaf-first. A path segment
+reserved. A parent branch can be deleted while descendants remain. A path segment
 may not end in `.` followed by 26 upper-case letters and digits: that shape is
 reserved for OmniGraph's internal per-life branch identity. Ordinary dotted
 names such as `release.1.2` are fine.
 
 Deleting a branch and creating another with the same name yields a fresh
-branch: it shares no storage with the deleted one, and readers that captured
-the deleted branch fail with a typed error rather than seeing the new data.
-`branch delete` returns once the branch is logically deleted; its per-dataset
-storage is reclaimed in the background (bounded by a 600-second watchdog), and
-branch operations that would conflict with that reclaim wait for it. The CLI
-and server join in-flight reclaims before exit, and `omnigraph cleanup`
-remains the backstop for anything abandoned.
+branch lifetime. Readers that captured the deleted branch fail with a typed
+error rather than seeing the replacement. Deletion retires the logical name
+and leaves native manifest history and table storage for explicit `omnigraph cleanup`; it starts no background table-reclaim work and
+does not wait for table-fork reclamation. Cleanup preserves data still needed by
+other branches and their underlying histories.
 
 Branch-control operations are safe across handles in one writer process. Do not
 run branch create/delete control concurrently from separate writer processes

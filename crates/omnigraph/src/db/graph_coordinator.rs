@@ -377,22 +377,6 @@ impl GraphCoordinator {
         self.manifest.native_branch()
     }
 
-    /// Capture deletion's native registry and descendants from one listing
-    /// while the caller holds the schema-control gate.
-    pub(crate) async fn native_branches_and_descendants(
-        &self,
-        name: &str,
-    ) -> Result<(Vec<String>, Vec<String>)> {
-        let (natives, descendants) = self.manifest.native_branches_and_descendants(name).await?;
-        Ok((
-            natives,
-            descendants
-                .into_iter()
-                .filter(|branch| !is_internal_system_branch(branch))
-                .collect(),
-        ))
-    }
-
     pub(crate) async fn branch_create(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
@@ -414,11 +398,6 @@ impl GraphCoordinator {
             )));
         }
 
-        // Removing manifest BranchContents is the logical visibility point.
-        // Lance reclaims the branch tree afterward, so an error may still mean
-        // logical deletion succeeded; the manifest coordinator reclassifies
-        // that outcome from fresh authority. Per-table data forks remain
-        // derived state and are reclaimed by the engine afterward.
         self.manifest.delete_branch(&branch).await
     }
 

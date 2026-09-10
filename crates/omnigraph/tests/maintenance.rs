@@ -1996,6 +1996,46 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
         let mut ds = Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
         ds.create_branch("ghost", base, None).await.unwrap();
+        let mut parent = ds
+            .create_branch("long-orphan-parent", base, None)
+            .await
+            .unwrap();
+        parent.create_branch("z", base, None).await.unwrap();
+        ds.create_branch("zombie", base, None).await.unwrap();
+        std::fs::remove_file(format!("{person_uri}/_refs/branches/zombie.json")).unwrap();
+        assert!(!ds.list_branches().await.unwrap().contains_key("zombie"));
+        let partial = std::path::Path::new(&person_uri).join("tree/partial/_transactions");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(
+            partial.join("remaining.txn"),
+            b"interrupted deletion residue",
+        )
+        .unwrap();
+        for directory in [
+            "data",
+            "_versions",
+            "_transactions",
+            "_deletions",
+            "_indices",
+        ] {
+            let branch = format!("team/{directory}/topic");
+            ds.create_branch(&branch, base, None).await.unwrap();
+            let encoded = branch.replace('/', "%2F");
+            std::fs::remove_file(format!("{person_uri}/_refs/branches/{encoded}.json")).unwrap();
+        }
+        ds.create_branch("protected/data/topic", base, None)
+            .await
+            .unwrap();
+        ds.tags()
+            .create("nested-keep", ("protected/data/topic", base))
+            .await
+            .unwrap();
+        std::fs::remove_file(format!(
+            "{person_uri}/_refs/branches/protected%2Fdata%2Ftopic.json"
+        ))
+        .unwrap();
+        ds.create_branch("tagged", base, None).await.unwrap();
+        ds.tags().create("keep", ("tagged", base)).await.unwrap();
         assert!(
             ds.list_branches()
                 .await
@@ -2025,6 +2065,32 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
             "cleanup should reconcile the orphaned 'ghost' fork away"
         );
     }
+    for branch in [
+        "ghost",
+        "long-orphan-parent",
+        "z",
+        "zombie",
+        "partial",
+        "team",
+    ] {
+        assert!(
+            !std::path::Path::new(&person_uri)
+                .join("tree")
+                .join(branch)
+                .exists(),
+            "cleanup must reclaim native tree {branch}"
+        );
+    }
+    let ds = Dataset::open(&person_uri).await.unwrap();
+    assert!(ds.list_branches().await.unwrap().contains_key("tagged"));
+    ds.tags().delete("keep").await.unwrap();
+    assert!(
+        std::path::Path::new(&person_uri)
+            .join("tree/protected/data/topic")
+            .exists(),
+        "a tag must protect its ambiguous ref-absent native tree"
+    );
+    ds.tags().delete("nested-keep").await.unwrap();
     assert_eq!(
         count_rows(&db, "node:Person").await,
         people_before,
@@ -2038,6 +2104,17 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     })
     .await
     .unwrap();
+    assert!(
+        !std::path::Path::new(&person_uri)
+            .join("tree/tagged")
+            .exists()
+    );
+    assert!(
+        !std::path::Path::new(&person_uri)
+            .join("tree/protected")
+            .exists(),
+        "removing the last tag must let cleanup converge on the ambiguous root"
+    );
 }
 
 // cleanup must reclaim a manifest-unreferenced fork even when the BRANCH is
@@ -2076,13 +2153,29 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
             ds.list_branches()
                 .await
                 .unwrap()
-                .keys()
-                .any(|name| helpers::is_incarnation_of(name, "feature")),
+                .contains_key(&feature_native),
             "precondition: forged orphan Person fork present on the live branch"
         );
     }
 
     let company_uri = node_table_uri(&db, "Company").await;
+    let company_entry = helpers::snapshot_branch(&db, "feature")
+        .await
+        .unwrap()
+        .dataset("node:Company")
+        .unwrap()
+        .clone();
+    let company_fork = company_entry.native_dataset_branch.as_deref().unwrap();
+    let feature_companies = count_rows_branch(&db, "feature", "node:Company").await;
+    assert!(
+        Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(company_fork)
+    );
     let main_people = count_rows(&db, "node:Person").await;
     let main_companies = count_rows(&db, "node:Company").await;
 
@@ -2100,8 +2193,7 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
             !ds.list_branches()
                 .await
                 .unwrap()
-                .keys()
-                .any(|name| helpers::is_incarnation_of(name, "feature")),
+                .contains_key(&feature_native),
             "cleanup must reclaim the manifest-unreferenced Person fork on the live branch"
         );
     }
@@ -2109,40 +2201,46 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
     {
         let ds = Dataset::open(&company_uri).await.unwrap();
         assert!(
-            ds.list_branches()
-                .await
-                .unwrap()
-                .keys()
-                .any(|name| helpers::is_incarnation_of(name, "feature")),
+            ds.list_branches().await.unwrap().contains_key(company_fork),
             "cleanup must NOT reclaim a legitimately-forked table on a live branch"
         );
     }
     // main is untouched.
     assert_eq!(count_rows(&db, "node:Person").await, main_people);
     assert_eq!(count_rows(&db, "node:Company").await, main_companies);
+    let reopened = Omnigraph::open(db.uri()).await.unwrap();
+    let after = helpers::snapshot_branch(&reopened, "feature")
+        .await
+        .unwrap();
+    assert_same_dataset_entry(&company_entry, after.dataset("node:Company").unwrap());
+    assert_eq!(
+        count_rows_branch(&reopened, "feature", "node:Company").await,
+        feature_companies
+    );
 }
 
+/// Retention crosses a published pointer switch while its graph branch remains live.
+/// Native fork existence and exact historical query targets require the Rust owner.
 #[tokio::test]
-async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
+async fn cleanup_age_window_preserves_recent_detached_fork_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
-    let main_companies = count_rows(&db, "node:Company").await;
+    let base_count = count_rows(&db, "node:Company").await;
     db.branch_create("feature").await.unwrap();
     db.load_as(
         "feature",
         None,
-        r#"{"type":"Company","data":{"name":"BorrowedCo"}}"#,
+        r#"{"type":"Company","data":{"name":"RecentCo"}}"#,
         LoadMode::Merge,
         None,
     )
     .await
     .unwrap();
-    db.branch_create_from(ReadTarget::branch("feature"), "child")
-        .await
-        .unwrap();
-    let before = db.snapshot_of(ReadTarget::branch("child")).await.unwrap();
-    let borrowed = before.dataset("node:Company").unwrap().clone();
-
+    let saved = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+    let saved_commit = omnigraph::db::SnapshotId::new(saved.graph_head(Some("feature")).unwrap());
+    let saved_entry = saved.dataset("node:Company").unwrap();
+    let native = saved_entry.native_dataset_branch.as_ref().unwrap().clone();
+    let company_uri = node_table_uri(&db, "Company").await;
     assert_eq!(
         db.branch_merge("feature", "main").await.unwrap(),
         MergeOutcome::FastForward
@@ -2150,7 +2248,7 @@ async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
     db.load_as(
         "main",
         None,
-        r#"{"type":"Company","data":{"name":"MainCo"}}"#,
+        r#"{"type":"Company","data":{"name":"LaterCo"}}"#,
         LoadMode::Merge,
         None,
     )
@@ -2160,52 +2258,412 @@ async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
         db.branch_merge("main", "feature").await.unwrap(),
         MergeOutcome::FastForward
     );
-    let switched = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     assert_eq!(
-        switched
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
             .dataset("node:Company")
             .unwrap()
             .native_dataset_branch,
         None,
-        "the merge from main must switch feature's Company to main's lineage, detaching its fork"
     );
-    assert_eq!(
-        count_rows_branch(&db, "feature", "node:Company").await,
-        main_companies + 2
-    );
-    assert_eq!(
-        count_rows_branch(&db, "child", "node:Company").await,
-        main_companies + 1
-    );
-
+    let query = "query companies() { match { $c: Company } return { $c.name } }";
+    let before = db
+        .query(
+            ReadTarget::snapshot(saved_commit.clone()),
+            query,
+            "companies",
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before.num_rows(), base_count + 1);
     db.cleanup(CleanupPolicyOptions {
         keep_versions: Some(1),
-        older_than: None,
+        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
     })
     .await
     .unwrap();
-
+    assert!(
+        Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(&native),
+        "an exact endpoint inside the explicit age window must survive pointer detachment",
+    );
     let reopened = Omnigraph::open(db.uri()).await.unwrap();
-    for handle in [&db, &reopened] {
-        let after = handle
-            .snapshot_of(ReadTarget::branch("child"))
+    let after = reopened
+        .query(
+            ReadTarget::snapshot(saved_commit),
+            query,
+            "companies",
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.num_rows(), base_count + 1);
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    assert!(
+        !Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(&native),
+        "an unused fork becomes reclaimable once every age observation is outside the window",
+    );
+    assert_eq!(
+        count_rows_branch(&reopened, "feature", "node:Company").await,
+        base_count + 2
+    );
+}
+
+/// A ref-absent path can contain both aged residue and a new descendant object.
+/// Filesystem modification times and physical grouped deletion require the Rust owner.
+#[tokio::test]
+async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let grouped = std::path::Path::new(&person_uri).join("tree/team");
+    let old_file = grouped.join("data/topic/_transactions/old.txn");
+    let recent_file = grouped.join("data/topic/_transactions/recent.txn");
+    std::fs::create_dir_all(old_file.parent().unwrap()).unwrap();
+    std::fs::write(&old_file, b"old interrupted residue").unwrap();
+    std::fs::File::open(&old_file)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+    std::fs::write(&recent_file, b"recent interrupted residue").unwrap();
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+    })
+    .await
+    .unwrap();
+    assert!(
+        old_file.exists(),
+        "a retained descendant protects its whole deletion prefix"
+    );
+    assert!(
+        recent_file.exists(),
+        "a missing ref is not permission to discard a recent object"
+    );
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    assert!(
+        !grouped.exists(),
+        "expired ref-absent residue must still converge"
+    );
+}
+
+/// Retirement of an old tree must use the updated native ref object's age.
+/// Native lifecycle contents and filesystem timestamps require the Rust owner.
+#[tokio::test]
+async fn cleanup_age_window_preserves_recent_retirement_of_old_manifest_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let manifest_uri = dir.path().join("__manifest");
+    let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
+    let native = manifest
+        .list_branches()
+        .await
+        .unwrap()
+        .into_keys()
+        .find(|name| name.starts_with("feature."))
+        .unwrap();
+    let live_ref = manifest_uri
+        .join("_refs/branches")
+        .join(format!("{native}.json"));
+    let mut contents: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&live_ref).unwrap()).unwrap();
+    contents["create_at"] = serde_json::json!(0);
+    std::fs::write(&live_ref, serde_json::to_vec(&contents).unwrap()).unwrap();
+    let tree = manifest_uri.join("tree").join(&native);
+    let mut paths = vec![tree.clone(), live_ref.clone()];
+    while let Some(path) = paths.pop() {
+        if path.is_dir() {
+            paths.extend(
+                std::fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+    }
+    db.branch_delete("feature").await.unwrap();
+    assert!(live_ref.exists());
+    let retired = manifest.branches().get(&native).await.unwrap();
+    assert!(
+        retired
+            .metadata
+            .contains_key("omnigraph.retired_manifest_branch")
+    );
+    assert!(
+        helpers::native_ref_for(&manifest, "feature")
+            .await
+            .is_none()
+    );
+    assert!(
+        std::fs::metadata(&live_ref).unwrap().modified().unwrap()
+            > std::time::SystemTime::UNIX_EPOCH,
+        "retirement refreshes the native ref timestamp even when the tree is old"
+    );
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+    })
+    .await
+    .unwrap();
+    assert!(
+        live_ref.exists(),
+        "an old branch's recent retirement starts its explicit age window"
+    );
+    assert!(
+        tree.exists(),
+        "the recent retirement metadata must protect the aged physical tree"
+    );
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    assert!(!live_ref.exists());
+    assert!(!tree.exists());
+}
+
+/// Recent immutable data protects an aged native ancestor even without a graph owner.
+/// Backdated native refs and physical ancestry are observable only in the Rust owner.
+#[tokio::test]
+async fn cleanup_age_window_preserves_recent_native_mutation_and_aged_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let mut main = Dataset::open(&person_uri).await.unwrap();
+    let base = main.version().version;
+    let mut parent = main.create_branch("aged-parent", base, None).await.unwrap();
+    let mut child = parent
+        .create_branch("aged-child", base, None)
+        .await
+        .unwrap();
+    for native in ["aged-parent", "aged-child"] {
+        let live_ref = std::path::Path::new(&person_uri)
+            .join("_refs/branches")
+            .join(format!("{native}.json"));
+        let mut contents: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&live_ref).unwrap()).unwrap();
+        contents["create_at"] = serde_json::json!(0);
+        std::fs::write(&live_ref, serde_json::to_vec(&contents).unwrap()).unwrap();
+        let mut paths = vec![
+            std::path::Path::new(&person_uri).join("tree").join(native),
+            live_ref,
+        ];
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                paths.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else {
+                std::fs::File::open(path)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    let changed = child.delete("name = 'Alice'").await.unwrap();
+    assert_eq!(changed.num_deleted_rows, 1);
+    let latest = changed.new_dataset.version().version;
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+    })
+    .await
+    .unwrap();
+    let branches = Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .list_branches()
+        .await
+        .unwrap();
+    assert!(
+        branches.contains_key("aged-child"),
+        "later data must override initial creation age"
+    );
+    assert!(
+        branches.contains_key("aged-parent"),
+        "a recently mutated child protects its older ancestor"
+    );
+    let retained = Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .checkout_version(("aged-child", Some(latest)))
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.branch_location().branch.as_deref(),
+        Some("aged-child")
+    );
+    assert_eq!(retained.version().version, latest);
+    assert_eq!(
+        retained.count_rows(None).await.unwrap(),
+        count_rows(&db, "node:Person").await - 1
+    );
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    let branches = Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .list_branches()
+        .await
+        .unwrap();
+    assert!(!branches.contains_key("aged-child"));
+    assert!(!branches.contains_key("aged-parent"));
+}
+
+#[tokio::test]
+async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
+    for child_writes in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = init_and_load(&dir).await;
+        let main_companies = count_rows(&db, "node:Company").await;
+        db.branch_create("feature").await.unwrap();
+        db.load_as(
+            "feature",
+            None,
+            r#"{"type":"Company","data":{"name":"BorrowedCo"}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+        db.branch_create_from(ReadTarget::branch("feature"), "child")
             .await
             .unwrap();
-        assert_same_dataset_entry(&borrowed, after.dataset("node:Company").unwrap());
+        let before = db.snapshot_of(ReadTarget::branch("child")).await.unwrap();
+        let borrowed = before.dataset("node:Company").unwrap().clone();
+
         assert_eq!(
-            count_rows_branch(handle, "child", "node:Company").await,
-            main_companies + 1
+            db.branch_merge("feature", "main").await.unwrap(),
+            MergeOutcome::FastForward
+        );
+        db.load_as(
+            "main",
+            None,
+            r#"{"type":"Company","data":{"name":"MainCo"}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.branch_merge("main", "feature").await.unwrap(),
+            MergeOutcome::FastForward
+        );
+        let switched = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
+        assert_eq!(
+            switched
+                .dataset("node:Company")
+                .unwrap()
+                .native_dataset_branch,
+            None,
+            "the merge from main must switch feature's Company to main's lineage, detaching its fork"
         );
         assert_eq!(
-            count_rows_branch(handle, "feature", "node:Company").await,
+            count_rows_branch(&db, "feature", "node:Company").await,
             main_companies + 2
         );
+        assert_eq!(
+            count_rows_branch(&db, "child", "node:Company").await,
+            main_companies + 1
+        );
+
+        if child_writes {
+            db.load_as(
+                "child",
+                None,
+                r#"{"type":"Company","data":{"name":"ChildCo"}}"#,
+                LoadMode::Merge,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let expected_child = db
+            .snapshot_of(ReadTarget::branch("child"))
+            .await
+            .unwrap()
+            .dataset("node:Company")
+            .unwrap()
+            .clone();
+        db.cleanup(CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+
+        let company_uri = node_table_uri(&db, "Company").await;
+        assert!(
+            Dataset::open(&company_uri)
+                .await
+                .unwrap()
+                .list_branches()
+                .await
+                .unwrap()
+                .contains_key(borrowed.native_dataset_branch.as_deref().unwrap()),
+            "the written child still needs its ancestor's native fork"
+        );
+        let reopened = Omnigraph::open(db.uri()).await.unwrap();
+        for handle in [&db, &reopened] {
+            let after = handle
+                .snapshot_of(ReadTarget::branch("child"))
+                .await
+                .unwrap();
+            assert_same_dataset_entry(&expected_child, after.dataset("node:Company").unwrap());
+            assert_eq!(
+                count_rows_branch(handle, "child", "node:Company").await,
+                main_companies + 1 + usize::from(child_writes)
+            );
+            assert_eq!(
+                count_rows_branch(handle, "feature", "node:Company").await,
+                main_companies + 2
+            );
+        }
     }
 }
 
-// A fork named by a dead incarnation of a LIVE logical branch is garbage:
-// the live incarnation's forks are named by its own suffix, so nothing can
-// resolve to the dead one. Cleanup reclaims it and keeps the live fork.
+/// Reclaims dead table forks across branch retirement and type drop/re-add.
+/// Requires native ref and path inspection beyond GQT's observable results.
 #[tokio::test]
 async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
     let dir = tempfile::tempdir().unwrap();
@@ -2220,9 +2678,11 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
     )
     .await
     .unwrap();
-    let live_native = helpers::graph_native_ref(db.uri(), "feature").await;
+    let published = helpers::snapshot_branch(&db, "feature").await.unwrap();
+    let live_entry = published.dataset("node:Company").unwrap().clone();
+    let live_native = live_entry.native_dataset_branch.as_ref().unwrap();
     let dead_native = "feature.01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
-    assert_ne!(live_native, dead_native);
+    assert_ne!(live_native, &dead_native);
     let companies_before = count_rows_branch(&db, "feature", "node:Company").await;
 
     let company_uri = node_table_uri(&db, "Company").await;
@@ -2250,7 +2710,7 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
         "cleanup must reclaim a dead incarnation's fork while the logical branch is live"
     );
     assert!(
-        branches.contains_key(&live_native),
+        branches.contains_key(live_native),
         "cleanup must keep the live incarnation's fork"
     );
     assert_eq!(
@@ -2258,6 +2718,52 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
         companies_before,
         "cleanup must not disturb the live branch's rows"
     );
+    let reopened = Omnigraph::open(db.uri()).await.unwrap();
+    let after = helpers::snapshot_branch(&reopened, "feature")
+        .await
+        .unwrap();
+    assert_same_dataset_entry(&live_entry, after.dataset("node:Company").unwrap());
+    assert_eq!(
+        count_rows_branch(&reopened, "feature", "node:Company").await,
+        companies_before
+    );
+
+    db.branch_delete("feature").await.unwrap();
+    let old_tree = std::path::Path::new(&company_uri)
+        .join("tree")
+        .join(live_native);
+    assert!(
+        old_tree.exists(),
+        "branch deletion must defer table fork reclamation"
+    );
+    db.apply_schema(
+        "node Person { name: String @key age: I32? } edge Knows: Person -> Person { since: Date? }",
+    )
+    .await
+    .unwrap();
+    assert!(
+        old_tree.exists(),
+        "soft drop must preserve the old physical incarnation"
+    );
+    db.apply_schema(TEST_SCHEMA).await.unwrap();
+    let replacement_uri = node_table_uri(&db, "Company").await;
+    assert_ne!(replacement_uri, company_uri);
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        !old_tree.exists(),
+        "cleanup must discover forks of a dropped table incarnation"
+    );
+    assert!(
+        Dataset::open(&company_uri).await.is_ok(),
+        "soft-dropped main history remains readable"
+    );
+    assert_eq!(count_rows(&db, "node:Company").await, 0);
+    assert!(Dataset::open(&replacement_uri).await.is_ok());
 }
 
 // Regression (iss-848): a table with rows but NULL vectors (the load-before-

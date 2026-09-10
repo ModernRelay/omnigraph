@@ -892,16 +892,24 @@ impl GraphNamespacePublisher {
                     "failed to encode expected Lance branch identifier: {e}"
                 ))
             })?;
-        let actual_branch_identifier = match dataset.branch_identifier().await {
+        let observed_identifier = match dataset.manifest().branch.as_deref() {
+            Some(native) => {
+                crate::branch_control::get_live_manifest_branch_contents(dataset, native)
+                    .await
+                    .map(|contents| contents.identifier)
+            }
+            None => Ok(lance::dataset::refs::BranchIdentifier::main()),
+        };
+        let actual_branch_identifier = match observed_identifier {
             Ok(identifier) => identifier,
-            Err(LanceError::RefNotFound { .. }) => {
+            Err(OmniError::BranchNotFound { .. }) => {
                 return Err(OmniError::manifest_read_set_changed(
                     branch_identity_member,
                     Some(expected_branch_identifier),
                     None,
                 ));
             }
-            Err(err) => return Err(OmniError::storage(err)),
+            Err(err) => return Err(err),
         };
         if actual_branch_identifier != expected.branch_identifier {
             let actual = serde_json::to_string(&actual_branch_identifier).map_err(|e| {

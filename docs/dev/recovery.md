@@ -12,13 +12,13 @@ commit protocol, not an offline repair convenience.
 
 Active writers emit identity-aware recovery sidecar schema **v9**. Manifest
 schema and recovery schema are independent version spaces; the current
-manifest is v7.
+manifest is v8.
 
 Every owned table slot carries:
 
 - non-zero stable table and incarnation identity;
 - diagnostic alias and physical dataset URI;
-- graph and physical branch identity;
+- graph and physical branch identity, including the intended table-fork owner;
 - expected manifest-visible Lance version;
 - the planned transaction or bounded maintenance outcome;
 - fixed manifest delta and graph lineage where applicable.
@@ -78,8 +78,8 @@ the graph quiescent, Full recovery may:
 
 - roll a complete owned effect set forward;
 - restore/compensate an owned partial set to the pinned graph state;
-- remove an owned unpublished first-touch ref or dataset, unless a live branch
-  pins it;
+- retire recovery ownership of a proven unpublished private first-touch fork,
+  leaving its storage for explicit cleanup;
 - promote or discard owned schema staging;
 - refuse an invariant violation or ambiguous effect.
 
@@ -137,13 +137,32 @@ schema contract or racing delayed cleanup.
 ## Graph branch controls
 
 Native branch create/delete residue is different from a data-table effect.
-When `BranchContents` proves a ref absent, an unreferenced clone-only tree can
-be reclaimed as derived state. A sidecar owning a real graph-table effect may
+An unreferenced clone-only tree is reclaimable only when no physical
+`BranchContents` exists, including a logically retired native ref. A sidecar owning a real graph-table effect may
 not be discarded merely because its target branch was deleted; the complete
-effect/compensation proof still applies. Because every branch life has its own
-native ref, a recreated branch never becomes the target of a stale sidecar's
-fork: the dead life's native name resolves to nothing, and its forks are
-orphans for `cleanup`.
+effect/compensation proof still applies. Each first-touch table effect names
+its prepared unique native ref. Recovery never substitutes a newly generated
+name or a recreated logical branch. Physical pin owners and confirmed table
+metadata preserve the captured owner through roll-forward and rollback.
+
+Private unreachable forks may remain after recovery retires their sidecars.
+Explicit cleanup still proves that live table pins, recovery, tags, and Lance
+ancestry no longer require them before deletion. An old owner's absence from
+the logical branch list alone is not proof.
+
+Graph deletion writes the reserved `omnigraph.retired_manifest_branch`
+metadata value through Lance's public `Branches::replace_metadata`. That
+single native-ref update removes logical authority while preserving the exact
+physical ref and unrelated metadata. The versioned marker binds the native
+name and identifier; unknown fields, versions, or mismatched identity fail
+closed. A lost acknowledgement is classified by reading the same ref and
+validating its retirement marker. Absence is not proof of completed retirement.
+Native history remains readable for descendants, while branch-name reads and
+writes require an unretired ref. The existing process-local branch controls
+serialize this read/replace protocol; they are not distributed fencing.
+Explicit cleanup alone reclaims retired lifetimes after proving their native
+descendants, paths, tags and current table references no longer need them.
+The v8 storage fence keeps older binaries from exposing retired branches.
 
 ## Maintenance boundary
 

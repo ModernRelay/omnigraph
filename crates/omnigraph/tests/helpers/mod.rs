@@ -130,6 +130,31 @@ pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Datase
     }
 }
 
+/// Open a physical HEAD using an exact native ref, without name discovery.
+pub async fn open_dataset_head_exact(uri: &str, branch: Option<&str>) -> lance::Dataset {
+    let dataset = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+        .with_session(test_session())
+        .load()
+        .await
+        .unwrap();
+    match branch {
+        Some(native) => dataset.checkout_branch(native).await.unwrap(),
+        None => dataset,
+    }
+}
+
+/// Open the physical HEAD selected by a published graph table entry.
+pub async fn open_published_dataset_head(
+    db: &Omnigraph,
+    logical: &str,
+    table_key: &str,
+) -> lance::Dataset {
+    let snapshot = snapshot_branch(db, logical).await.unwrap();
+    let entry = snapshot.dataset(table_key).unwrap();
+    let uri = format!("{}/{}", db.uri().trim_end_matches('/'), entry.dataset_path);
+    open_dataset_head_exact(&uri, entry.native_dataset_branch.as_deref()).await
+}
+
 /// Whether `name` is `{logical}` itself or `{logical}.{ULID}` — one
 /// incarnation of the logical branch.
 pub fn is_incarnation_of(name: &str, logical: &str) -> bool {
@@ -157,11 +182,24 @@ pub fn is_incarnation_of(name: &str, logical: &str) -> bool {
 /// bug — fail loudly rather than pick one.
 pub async fn native_ref_for(ds: &lance::Dataset, logical: &str) -> Option<String> {
     let branches = ds.list_branches().await.unwrap();
-    let mut lives: Vec<String> = branches
-        .keys()
-        .filter(|name| is_incarnation_of(name, logical))
-        .cloned()
-        .collect();
+    let mut lives = Vec::new();
+    for (name, contents) in branches {
+        if let Some(marker) = contents.metadata.get("omnigraph.retired_manifest_branch") {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Retirement {
+                version: u32,
+                native_branch: String,
+                identifier: lance::dataset::refs::BranchIdentifier,
+            }
+            let retirement: Retirement = serde_json::from_str(marker).unwrap();
+            assert_eq!(retirement.version, 1);
+            assert_eq!(retirement.native_branch, name);
+            assert_eq!(retirement.identifier, contents.identifier);
+        } else if is_incarnation_of(&name, logical) {
+            lives.push(name);
+        }
+    }
     assert!(
         lives.len() <= 1,
         "ambiguous incarnations for logical branch '{logical}': {lives:?}"
@@ -169,22 +207,29 @@ pub async fn native_ref_for(ds: &lance::Dataset, logical: &str) -> Option<String
     lives.pop()
 }
 
-/// Assert a persisted `native_dataset_branch` names an incarnation of
-/// `logical`: the native ref `{logical}.{ULID}`, or the bare name for a
-/// legacy fork.
+/// Check the naming shape of an already selected published table ref.
+/// This assertion does not discover refs or establish write ownership.
 #[track_caller]
 pub fn assert_native_branch_of(native: Option<&str>, logical: &str) {
     let native = native.unwrap_or_else(|| panic!("expected a fork of '{logical}', got None"));
+    let unique_fork = native.rsplit_once(".m").is_some_and(|(owner, suffix)| {
+        let Some((base, commit)) = suffix.split_once('.') else {
+            return false;
+        };
+        (is_incarnation_of(owner, logical)
+            || owner == "fork.legacy"
+            || is_incarnation_of(owner, "fork"))
+            && base.parse::<u64>().is_ok()
+            && is_incarnation_of(&format!("commit.{commit}"), "commit")
+    });
     assert!(
-        is_incarnation_of(native, logical),
-        "expected an incarnation of '{logical}', got '{native}'"
+        is_incarnation_of(native, logical) || unique_fork,
+        "expected a table fork for '{logical}', got '{native}'"
     );
 }
 
-/// The current incarnation's native ref of a LOGICAL graph branch, read from
-/// the `__manifest` dataset's live refs. Fixtures that forge or inspect
-/// per-table state colliding with the engine's own fork targets must address
-/// this name, not the logical one.
+/// Resolve a logical graph branch in `__manifest`.
+/// Table refs come from their published entry or saved recovery pin.
 pub async fn graph_native_ref(root_uri: &str, logical: &str) -> String {
     let manifest_uri = format!("{}/__manifest", root_uri.trim_end_matches('/'));
     let ds = lance::dataset::builder::DatasetBuilder::from_uri(&manifest_uri)

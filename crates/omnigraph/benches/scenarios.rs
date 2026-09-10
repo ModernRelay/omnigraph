@@ -331,7 +331,7 @@ fn main() {
     if args.scenario.is_empty() {
         eprintln!(
             "usage: --scenario <merge-all-changed|nearest-prefilter|ann-probe-budget|fenced-small-upsert|\
-             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|rrf-gate> [--rows N] [--dims D] \
+             fenced-adopt-all-new|general-merge-updates|branch-create|branch-create-from|branch-list|branch-delete|branch-pointer-adopt-lazy|branch-pointer-adopt-owned|branch-first-write|branch-cleanup|rrf-gate> [--rows N] [--dims D] \
              [--seed S] [--runs K] [--selectivity F] [--k K] [--ann-partitions N] \
              [--ann-probes N] [--text-bytes B] [--delta-rows N] \
              [--source-mode update|insert] [--branches N] [--tables N] [--memory-cap-mb M] \

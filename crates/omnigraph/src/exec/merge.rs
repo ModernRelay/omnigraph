@@ -23,17 +23,10 @@ const PURE_INSERT_HISTORY_READ_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 enum CandidateTableState {
-    /// Adopt the source's table state via a pointer switch or a branch fork —
-    /// no data HEAD advance, so nothing to pin for recovery. `validation_delta`
-    /// carries the source-vs-target row delta (added/changed/deleted) for the
-    /// evaluator ONLY — the publish is still a pointer/fork — so a pointer-adopt
-    /// whose source diverged is still validated (RI/uniqueness/cardinality)
-    /// against the merged state instead of being silently published. `None` when
-    /// the source matched the target (nothing to validate). Decoupling the
-    /// validation delta from the publish mechanism keeps the publish O(1) while
-    /// closing the unvalidated-adopt gap.
+    /// Publish the source endpoint without advancing table HEAD.
+    /// `validation_delta` holds changed rows for constraint checks; `None` means equal rows.
     AdoptSourceState {
-        validation_delta: Option<AdoptDelta>,
+        validation_delta: Option<AdoptValidation>,
     },
     /// The target table still equals the merge base and Lance's complete source
     /// transaction interval proves that every logical change was an exact-id
@@ -47,6 +40,12 @@ enum CandidateTableState {
     /// its publish advances Lance HEAD before the manifest commit.
     AdoptWithDelta(AdoptDelta),
     RewriteMerged(StagedMergeResult),
+}
+
+#[derive(Debug)]
+enum AdoptValidation {
+    RowDelta(Box<AdoptDelta>),
+    PureInserts(Box<ProvenPureInsertAdopt>),
 }
 
 /// An existing target ref opened and verified against the target manifest pin
@@ -94,12 +93,18 @@ async fn prepare_existing_merge_target(
     let entry = txn.base.dataset(table_key).ok_or_else(|| {
         OmniError::manifest_internal(format!("captured merge target lacks '{table_key}'"))
     })?;
-    let native = captured_merge_target_ref(txn)?;
-    if native.is_some() && entry.native_dataset_branch.as_deref() != native {
+    let owner = captured_merge_target_ref(txn)?;
+    if owner.is_some_and(|owner| {
+        !entry
+            .native_dataset_branch
+            .as_deref()
+            .is_some_and(|native| entry.version_metadata.is_table_fork_of(native, owner))
+    }) {
         return Err(OmniError::manifest_internal(format!(
             "merge target '{table_key}' requires a recovery-owned first touch"
         )));
     }
+    let native = entry.native_dataset_branch.as_deref();
     let full_path = db.storage().dataset_uri(&entry.dataset_path);
     let current = db.storage().open_dataset_head(&full_path, native).await?;
     Ok(PreparedExistingMergeTarget {
@@ -109,31 +114,37 @@ async fn prepare_existing_merge_target(
     })
 }
 
-/// Create a first-touch target only inside the armed merge effect phase. The
-/// captured inherited entry selects the source; the captured target ref and
-/// current sidecar identity fence reclaim of any leftover native fork.
+/// Create the exact first-touch ref persisted by the armed merge intent.
+/// The captured inherited entry fixes its source ref and version.
 async fn open_first_touch_merge_target(
     db: &Omnigraph,
     txn: &WriteTxn,
     table_key: &str,
     recovery_operation_id: Option<&str>,
+    first_touch_branch: Option<&str>,
 ) -> Result<(SnapshotHandle, String, Option<String>)> {
     let operation_id = recovery_operation_id.ok_or_else(|| {
         OmniError::manifest_internal("first-touch merge target has no armed recovery intent")
     })?;
-    let native = captured_merge_target_ref(txn)?.ok_or_else(|| {
+    let owner = captured_merge_target_ref(txn)?.ok_or_else(|| {
         OmniError::manifest_internal("first-touch merge target must be a named branch")
+    })?;
+    let native = first_touch_branch.ok_or_else(|| {
+        OmniError::manifest_internal("first-touch merge target lacks its armed native ref")
     })?;
     let entry = txn.base.dataset(table_key).ok_or_else(|| {
         OmniError::manifest_internal(format!("captured merge target lacks '{table_key}'"))
     })?;
-    if entry.native_dataset_branch.as_deref() == Some(native) {
+    if entry
+        .native_dataset_branch
+        .as_deref()
+        .is_some_and(|fork| entry.version_metadata.is_table_fork_of(fork, owner))
+    {
         return Err(OmniError::manifest_internal(format!(
             "first-touch merge target '{table_key}' already owns its captured table"
         )));
     }
     let full_path = db.storage().dataset_uri(&entry.dataset_path);
-    crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_CLASSIFY)?;
     let current = db
         .fork_dataset_from_entry_state_under_intent(
             table_key,
@@ -1226,6 +1237,64 @@ fn sanitize_table_key(table_key: &str) -> String {
         .collect()
 }
 
+/// Partition history at native fork boundaries, whose Clone transaction replaces
+/// the parent's transaction at the same numeric version. Parent names locate
+/// records; exact identifier prefixes establish their authority.
+async fn proven_insert_history_segments(
+    source: &Dataset,
+    source_identifier: &lance::dataset::refs::BranchIdentifier,
+    begin_version: u64,
+) -> Option<Vec<(Dataset, std::ops::RangeInclusive<u64>)>> {
+    let mut dataset = source.clone();
+    let mut identifier = source_identifier.clone();
+    let mut end_version = source.version().version;
+    let mut segments = Vec::new();
+    let mut crossed_boundaries = 0_u64;
+    loop {
+        let fork_version = identifier.version_mapping.last().map_or(0, |entry| entry.0);
+        if fork_version > end_version {
+            return None;
+        }
+        if fork_version <= begin_version {
+            if begin_version < end_version {
+                segments.push((dataset, (begin_version + 1)..=end_version));
+            }
+            segments.reverse();
+            return Some(segments);
+        }
+        crossed_boundaries += 1;
+        if crossed_boundaries > PURE_INSERT_HISTORY_MAX_VERSIONS {
+            return None;
+        }
+        let branch = dataset.manifest.branch.as_deref()?;
+        let contents = dataset.branches().get(branch).await.ok()?;
+        if contents.identifier != identifier || contents.parent_version != fork_version {
+            return None;
+        }
+        let parent = dataset
+            .checkout_version(lance::dataset::refs::Ref::Version(
+                contents.parent_branch.clone(),
+                Some(fork_version),
+            ))
+            .await
+            .ok()?;
+        let parent_identifier = parent.branch_identifier().await.ok()?;
+        if parent.manifest.branch != contents.parent_branch
+            || parent.version().version != fork_version
+            || parent_identifier.version_mapping.as_slice()
+                != &identifier.version_mapping[..identifier.version_mapping.len() - 1]
+        {
+            return None;
+        }
+        if fork_version < end_version {
+            segments.push((dataset, (fork_version + 1)..=end_version));
+        }
+        dataset = parent;
+        identifier = parent_identifier;
+        end_version = fork_version;
+    }
+}
+
 /// Try to prove that `(base, source]` contains only exact-id fenced inserts.
 ///
 /// Missing/cleaned transaction files and every unfamiliar operation are a
@@ -1324,21 +1393,24 @@ async fn try_proven_pure_insert_history(
     else {
         return Ok(None);
     };
-    // Lance 11 reads each manifest/transaction transiently without constructing
-    // historical Datasets or populating their index/metadata caches. Keep only
-    // a bounded ordered window of records, rather than collecting the interval.
-    // The pinned endpoint incarnation checks above still own lineage proof.
-    let mut transactions = futures::stream::iter(
-        (base_entry.published_dataset_version + 1)..=source_entry.published_dataset_version,
+    let Some(segments) = proven_insert_history_segments(
+        &source,
+        &source_identifier,
+        base_entry.published_dataset_version,
     )
-    .map(|version| {
-        let source = &source;
-        async move {
+    .await
+    else {
+        return Ok(None);
+    };
+    let mut transactions =
+        futures::stream::iter(segments.into_iter().flat_map(|(dataset, versions)| {
+            versions.map(move |version| (dataset.clone(), version))
+        }))
+        .map(|(dataset, version)| async move {
             crate::instrumentation::record_proven_insert_history_read();
-            (version, source.read_version_transaction(version).await)
-        }
-    })
-    .buffered(PURE_INSERT_HISTORY_READ_CONCURRENCY);
+            (version, dataset.read_version_transaction(version).await)
+        })
+        .buffered(PURE_INSERT_HISTORY_READ_CONCURRENCY);
     let mut proven_inserted_rows = 0_u64;
     while let Some((version, record)) = transactions.next().await {
         let record = match record {
@@ -3521,14 +3593,24 @@ fn retain_deleted_ids_for_validation(
     Ok(())
 }
 
-/// Build the per-table [`ChangeSet`](crate::validate::ChangeSet) for a merge from
-/// the classified candidates — the new/changed rows (from the staged deltas) and
-/// removed ids the validator evaluates, instead of re-scanning whole tables.
-/// `AdoptSourceState` is published as a pointer/fork but still carries a
-/// `validation_delta` (the source-vs-target rows) when its source diverged, so
-/// it is validated like `AdoptWithDelta`; only an empty-delta adopt is skipped.
-/// `AdoptPureInserts` projects the proven source interval directly, avoiding a
-/// temporary delta table while retaining the same constraint evaluation.
+async fn scan_adopt_delta_for_validation(
+    db: &Omnigraph,
+    delta: &AdoptDelta,
+    projection: &[&str],
+    budget: &mut MergeValidationBudget,
+    change: &mut crate::validate::TableChange,
+) -> Result<()> {
+    if let Some(table) = &delta.inserts {
+        scan_staged_for_validation(db, table, projection, budget, &mut change.added).await?;
+    }
+    if let Some(table) = &delta.upserts {
+        scan_staged_for_validation(db, table, projection, budget, &mut change.changed).await?;
+    }
+    retain_deleted_ids_for_validation(&delta.deleted_ids, budget, &mut change.deleted_ids)?;
+    Ok(())
+}
+
+/// Build the validator's per-table changes from candidate deltas and proven inserts.
 async fn build_merge_changeset(
     db: &Omnigraph,
     catalog: &Catalog,
@@ -3554,42 +3636,43 @@ async fn build_merge_changeset(
         let projection: Vec<&str> = projection.iter().map(String::as_str).collect();
         let mut change = crate::validate::TableChange::default();
         match candidate {
-            // Pointer/fork adopt whose source matched the target: nothing to
-            // validate. A pointer/fork adopt whose source diverged carries a
-            // `validation_delta` and is validated exactly like `AdoptWithDelta`
-            // (only the publish differs — pointer vs HEAD-advancing).
             CandidateTableState::AdoptSourceState {
                 validation_delta: None,
             } => continue,
             CandidateTableState::AdoptSourceState {
-                validation_delta: Some(delta),
-            }
-            | CandidateTableState::AdoptWithDelta(delta) => {
-                if let Some(table) = &delta.inserts {
-                    scan_staged_for_validation(
-                        db,
-                        table,
-                        &projection,
-                        &mut validation_budget,
-                        &mut change.added,
-                    )
-                    .await?;
-                }
-                if let Some(table) = &delta.upserts {
-                    scan_staged_for_validation(
-                        db,
-                        table,
-                        &projection,
-                        &mut validation_budget,
-                        &mut change.changed,
-                    )
-                    .await?;
-                }
-                retain_deleted_ids_for_validation(
-                    &delta.deleted_ids,
+                validation_delta: Some(AdoptValidation::RowDelta(delta)),
+            } => {
+                scan_adopt_delta_for_validation(
+                    db,
+                    delta,
+                    &projection,
                     &mut validation_budget,
-                    &mut change.deleted_ids,
-                )?;
+                    &mut change,
+                )
+                .await?;
+            }
+            CandidateTableState::AdoptWithDelta(delta) => {
+                scan_adopt_delta_for_validation(
+                    db,
+                    delta,
+                    &projection,
+                    &mut validation_budget,
+                    &mut change,
+                )
+                .await?;
+            }
+            CandidateTableState::AdoptSourceState {
+                validation_delta: Some(AdoptValidation::PureInserts(proven)),
+            } => {
+                scan_proven_pure_inserts_for_validation(
+                    db,
+                    table_key,
+                    proven,
+                    &projection,
+                    &mut validation_budget,
+                    &mut change.added,
+                )
+                .await?;
             }
             CandidateTableState::AdoptPureInserts(proven) => {
                 scan_proven_pure_inserts_for_validation(
@@ -3853,23 +3936,13 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
 fn adopt_advances_head(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
-    target_entry: Option<&crate::db::DatasetEntry>,
 ) -> bool {
-    match (target_active, source_entry.native_dataset_branch.as_deref()) {
-        // Source on a branch, target on main — delta applied onto main's lineage.
-        (None, Some(_)) => true,
-        // Both on branches, target owns this table — delta applied onto it.
-        (Some(target_branch), Some(_)) => {
-            target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
-                == Some(target_branch)
-        }
-        _ => false,
-    }
+    target_active.is_none() && source_entry.native_dataset_branch.is_some()
 }
 
 /// Classify a table whose target equals base: a proven insertion-only descendant
 /// is `AdoptPureInserts`, any other HEAD-advancing delta is `AdoptWithDelta`, a
-/// pointer switch or fork is `AdoptSourceState` (RFC 0062 orders the switch).
+/// pointer switch is `AdoptSourceState` (RFC 0062 orders the switch).
 async fn classify_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -3893,17 +3966,21 @@ async fn classify_adopt(
         Some(source_entry.identity),
         target_entry.map(|entry| entry.identity),
     )?;
-    let advances_head = adopt_advances_head(target_active, source_entry, target_entry);
-    // A complete Lance transaction interval can prove the common all-new-row
-    // case without re-scanning and sorting base + source.  The proof is accepted
-    // only for a HEAD-advancing publish; pointer/fork adoption still uses the
-    // general delta as its validation input.
+    let advances_head = adopt_advances_head(target_active, source_entry);
     if advances_head
         && let Some(proven) =
             try_proven_pure_insert_adopt(target_db, table_key, base_snapshot, source_snapshot)
                 .await?
     {
         return Ok(Some(CandidateTableState::AdoptPureInserts(proven)));
+    }
+    if target_active.is_some()
+        && let Some(proven) =
+            try_proven_pure_insert_history(table_key, base_snapshot, source_snapshot).await?
+    {
+        return Ok(Some(CandidateTableState::AdoptSourceState {
+            validation_delta: Some(AdoptValidation::PureInserts(Box::new(proven))),
+        }));
     }
 
     let candidate = classify_general_adopt(
@@ -3926,10 +4003,8 @@ async fn classify_adopt(
     ))
 }
 
-/// Classify the general adopt route after the pure-insert proof was either
-/// unavailable or exceeded its recovery-plan ceiling. The caller has already
-/// established table identity and whether publication advances the target
-/// data HEAD.
+/// Build an adoption candidate for a target that still matches the merge base.
+/// The caller establishes table identity and whether publication advances HEAD.
 async fn classify_general_adopt(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -3939,14 +4014,6 @@ async fn classify_general_adopt(
     advances_head: bool,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
 ) -> Result<CandidateTableState> {
-    // Compute the source-vs-target delta for the general route — it is the validation
-    // input the evaluator needs, independent of how the table is published.
-    // (`classify_adopt` is only reached when base == target, so the
-    // base-vs-source delta equals the target-vs-source delta.) A HEAD-advancing
-    // publish consumes it as the write payload (`AdoptWithDelta`); a pointer/fork
-    // publish ignores it and only validates it (`AdoptSourceState`), so a
-    // pointer-adopt whose source diverged is still checked for
-    // RI/uniqueness/cardinality against the merged state.
     let validation_delta = compute_adopt_delta(
         target_db,
         table_key,
@@ -3959,7 +4026,10 @@ async fn classify_general_adopt(
     .await?;
     match (advances_head, validation_delta) {
         (true, Some(delta)) => Ok(CandidateTableState::AdoptWithDelta(delta)),
-        (_, validation_delta) => Ok(CandidateTableState::AdoptSourceState { validation_delta }),
+        (_, validation_delta) => Ok(CandidateTableState::AdoptSourceState {
+            validation_delta: validation_delta
+                .map(|delta| AdoptValidation::RowDelta(Box::new(delta))),
+        }),
     }
 }
 
@@ -3973,16 +4043,10 @@ enum AdoptPublish {
     Nothing,
     /// A pointer switch onto a lineage the target can already read.
     Pointer(crate::db::DatasetUpdate),
-    /// The target holds no ref for this table yet; publication forks one. The
-    /// only arm that touches storage.
-    Fork {
-        source_branch: String,
-        target_branch: String,
-    },
 }
 
-/// Plan what adopting the source's table state publishes, without an effect;
-/// reaching a branch-bearing arm means the delta was empty.
+/// Plan the exact source endpoint for a named target. Main retains its lineage
+/// after an empty source delta.
 fn plan_adopted_source_state(
     target_active: Option<&str>,
     source_entry: &crate::db::DatasetEntry,
@@ -3991,13 +4055,11 @@ fn plan_adopted_source_state(
 ) -> AdoptPublish {
     let identity = source_entry.identity;
     let planned = match (target_active, source_entry.native_dataset_branch.as_deref()) {
-        // Source on main — pointer switch to its version. The target reads the
-        // same lineage whether it sits on main or on a branch.
-        (None, None) | (Some(_), None) => crate::db::DatasetUpdate {
+        (None, None) | (Some(_), _) => crate::db::DatasetUpdate {
             identity,
             type_key: table_key.to_string(),
             published_dataset_version: source_entry.published_dataset_version,
-            native_dataset_branch: None,
+            native_dataset_branch: source_entry.native_dataset_branch.clone(),
             entity_count: source_entry.entity_count,
             version_metadata: source_entry.version_metadata.clone(),
         },
@@ -4015,26 +4077,6 @@ fn plan_adopted_source_state(
                 .map(|entry| entry.version_metadata.clone())
                 .unwrap_or_else(|| source_entry.version_metadata.clone()),
         },
-        (Some(target_branch), Some(source_branch)) => {
-            let Some(owned) = target_entry
-                .filter(|entry| entry.native_dataset_branch.as_deref() == Some(target_branch))
-            else {
-                // A fork registers a ref the target lacks, so it is never a
-                // no-op.
-                return AdoptPublish::Fork {
-                    source_branch: source_branch.to_string(),
-                    target_branch: target_branch.to_string(),
-                };
-            };
-            crate::db::DatasetUpdate {
-                identity,
-                type_key: table_key.to_string(),
-                published_dataset_version: owned.published_dataset_version,
-                native_dataset_branch: Some(target_branch.to_string()),
-                entity_count: source_entry.entity_count,
-                version_metadata: owned.version_metadata.clone(),
-            }
-        }
     };
 
     if target_entry.is_some_and(|current| reregisters_current_entry(&planned, current)) {
@@ -4144,14 +4186,18 @@ mod adopt_plan_tests {
     }
 
     #[test]
-    fn target_owned_branch_table_with_equal_rows_plans_nothing() {
+    fn target_owned_branch_table_adopts_the_exact_source_endpoint() {
         let target = entry(5, Some("target"), 3, "manifest-v5");
-        let source = entry(7, Some("source"), 3, "manifest-v7");
-        assert!(adopt_advances_head(Some("target"), &source, Some(&target)));
-        assert!(matches!(
-            plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
-            AdoptPublish::Nothing
-        ));
+        for source_version in [3, 5, 7] {
+            let source = entry(source_version, Some("source"), 3, "manifest-source");
+            assert!(!adopt_advances_head(Some("target"), &source));
+            assert!(matches!(
+                plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
+                AdoptPublish::Pointer(update) if update.native_dataset_branch.as_deref() == Some("source")
+                    && update.published_dataset_version == source_version
+                    && update.version_metadata == source.version_metadata
+            ));
+        }
     }
 
     /// Source on main into a branch that owns the table: a pointer switch onto
@@ -4161,7 +4207,7 @@ mod adopt_plan_tests {
         let target = entry(5, Some("target"), 3, "manifest-v5");
         for source_version in [3, 5, 7] {
             let source = entry(source_version, None, 3, "manifest-main");
-            assert!(!adopt_advances_head(Some("target"), &source, Some(&target)));
+            assert!(!adopt_advances_head(Some("target"), &source));
             assert!(matches!(
                 plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
                 AdoptPublish::Pointer(update) if update.native_dataset_branch.is_none()
@@ -4224,29 +4270,24 @@ mod adopt_plan_tests {
         ));
     }
 
-    /// A target branch that does not own the table has no ref to compare, so
-    /// the publish forks one. This arm can never be a no-op.
     #[test]
-    fn unowned_target_branch_plans_a_fork() {
+    fn unowned_target_branch_plans_a_source_pointer() {
         let target = entry(2, None, 3, "manifest-v2");
         let source = entry(4, Some("source"), 3, "manifest-v4");
         assert!(matches!(
             plan_adopted_source_state(Some("target"), &source, Some(&target), "edge:Knows"),
-            AdoptPublish::Fork { .. }
+            AdoptPublish::Pointer(update) if update.native_dataset_branch.as_deref() == Some("source")
+                && update.published_dataset_version == 4
         ));
     }
 }
 
-/// Adopt the source's table state without a row delta, as planned by
-/// [`plan_adopted_source_state`]: a pointer switch, or a fork under
-/// `recovery_operation_id` so its reclaim never mistakes the merge's own pin.
-async fn publish_adopted_source_state(
-    target_db: &Omnigraph,
+/// Publish the source's pinned endpoint after validating its candidate delta.
+fn publish_adopted_source_state(
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     table_key: &str,
     target_active: Option<&str>,
-    recovery_operation_id: Option<&str>,
 ) -> Result<crate::db::DatasetUpdate> {
     let source_entry = source_snapshot
         .dataset(table_key)
@@ -4261,38 +4302,6 @@ async fn publish_adopted_source_state(
 
     match plan_adopted_source_state(target_active, source_entry, target_entry, table_key) {
         AdoptPublish::Pointer(update) => Ok(update),
-        AdoptPublish::Fork {
-            source_branch,
-            target_branch,
-        } => {
-            let operation_id = recovery_operation_id.ok_or_else(|| {
-                OmniError::manifest_internal("first-touch adopt fork has no armed recovery intent")
-            })?;
-            let full_path = format!("{}/{}", target_db.uri(), source_entry.dataset_path);
-            let ds = target_db
-                .fork_dataset_from_entry_state_under_intent(
-                    table_key,
-                    source_entry.identity,
-                    &full_path,
-                    Some(&source_branch),
-                    source_entry.published_dataset_version,
-                    &target_branch,
-                    Some(operation_id),
-                )
-                .await?;
-            let state = target_db.storage().table_state(&full_path, &ds).await?;
-            Ok(crate::db::DatasetUpdate {
-                identity: source_entry.identity,
-                type_key: table_key.to_string(),
-                published_dataset_version: state.version,
-                native_dataset_branch: Some(target_branch),
-                entity_count: state.row_count,
-                version_metadata: state.version_metadata,
-            })
-        }
-        // Classification drops a table whose adopt publishes nothing, so this
-        // arm means the candidate set and the plan disagree — an engine bug,
-        // not a caller error.
         AdoptPublish::Nothing => Err(OmniError::manifest_internal(format!(
             "branch merge table '{table_key}' publishes nothing and must not be a merge candidate"
         ))),
@@ -4629,6 +4638,7 @@ async fn publish_rewritten_merge_table(
     target_db: &Omnigraph,
     target_txn: &WriteTxn,
     recovery_operation_id: Option<&str>,
+    first_touch_branch: Option<&str>,
     table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     staged: &StagedMergeResult,
@@ -4645,8 +4655,14 @@ async fn publish_rewritten_merge_table(
     let (mut current_ds, full_path, table_branch) = match prepared_target {
         Some(prepared) => prepared.into_parts(),
         None => {
-            open_first_touch_merge_target(target_db, target_txn, table_key, recovery_operation_id)
-                .await?
+            open_first_touch_merge_target(
+                target_db,
+                target_txn,
+                table_key,
+                recovery_operation_id,
+                first_touch_branch,
+            )
+            .await?
         }
     };
 
@@ -4736,7 +4752,9 @@ async fn publish_rewritten_merge_table(
         published_dataset_version: final_state.version,
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
-        version_metadata: final_state.version_metadata,
+        version_metadata: final_state
+            .version_metadata
+            .with_table_fork_owner(captured_merge_target_ref(target_txn)?),
     })
 }
 
@@ -5002,6 +5020,7 @@ async fn publish_adopted_delta(
     target_db: &Omnigraph,
     target_txn: &WriteTxn,
     recovery_operation_id: Option<&str>,
+    first_touch_branch: Option<&str>,
     table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     delta: &AdoptDelta,
@@ -5013,8 +5032,14 @@ async fn publish_adopted_delta(
     let (mut current_ds, full_path, table_branch) = match prepared_target {
         Some(prepared) => prepared.into_parts(),
         None => {
-            open_first_touch_merge_target(target_db, target_txn, table_key, recovery_operation_id)
-                .await?
+            open_first_touch_merge_target(
+                target_db,
+                target_txn,
+                table_key,
+                recovery_operation_id,
+                first_touch_branch,
+            )
+            .await?
         }
     };
 
@@ -5115,7 +5140,9 @@ async fn publish_adopted_delta(
         published_dataset_version: final_state.version,
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
-        version_metadata: final_state.version_metadata,
+        version_metadata: final_state
+            .version_metadata
+            .with_table_fork_owner(captured_merge_target_ref(target_txn)?),
     })
 }
 
@@ -5485,11 +5512,6 @@ impl Omnigraph {
         let mut blob_pure_insert_histories: HashMap<String, ProvenPureInsertAdopt> = HashMap::new();
         let materializer = self.blob_materializer();
 
-        // Classify scalar tables once before any external source I/O. Blob
-        // tables get a descriptor-only first pass so every row-writing managed
-        // value and exact external range shares one operation budget. Pointer
-        // and fork adoption write no row, so their descriptors require neither
-        // policy approval nor source I/O.
         for table_key in &ordered_table_keys {
             let base_entry = base_snapshot.dataset(table_key);
             let source_entry = source_snapshot.dataset(table_key);
@@ -5555,7 +5577,7 @@ impl Omnigraph {
                 let Some(source_entry) = source_entry else {
                     continue;
                 };
-                if !adopt_advances_head(target_active.as_deref(), source_entry, target_entry) {
+                if !adopt_advances_head(target_active.as_deref(), source_entry) {
                     continue;
                 }
                 blob_adopt_proof_attempted.insert(table_key.clone());
@@ -5653,7 +5675,7 @@ impl Omnigraph {
             if same_manifest_state(base_entry, target_entry) {
                 let candidate = if blob_adopt_proof_attempted.contains(table_key) {
                     let advances_head = source_entry.is_some_and(|source_entry| {
-                        adopt_advances_head(target_active.as_deref(), source_entry, target_entry)
+                        adopt_advances_head(target_active.as_deref(), source_entry)
                     });
                     if !advances_head {
                         return Err(OmniError::manifest_internal(format!(
@@ -5888,7 +5910,14 @@ impl Omnigraph {
         let mut __dst_cand: Vec<_> = candidates.iter().collect();
         __dst_cand.sort_by(|a, b| a.0.cmp(b.0));
         for (table_key, candidate) in __dst_cand {
-            if let CandidateTableState::AdoptPureInserts(proven) = candidate {
+            let proven = match candidate {
+                CandidateTableState::AdoptPureInserts(proven) => Some(proven),
+                CandidateTableState::AdoptSourceState {
+                    validation_delta: Some(AdoptValidation::PureInserts(proven)),
+                } => Some(proven.as_ref()),
+                _ => None,
+            };
+            if let Some(proven) = proven {
                 revalidate_proven_pure_insert_source(
                     self,
                     table_key,
@@ -5938,7 +5967,7 @@ impl Omnigraph {
         let mut recovery_pins = Vec::new();
         let mut recovery_effects = Vec::new();
         let mut delta_slots = Vec::new();
-        let mut first_touch_effects = HashSet::new();
+        let mut first_touch_effects = HashMap::new();
         let mut planned_transactions_by_table = HashMap::new();
         let mut prepared_existing_targets = HashMap::new();
         for table_key in &ordered_table_keys {
@@ -5965,14 +5994,33 @@ impl Omnigraph {
             let planned_output_branch = match candidate {
                 CandidateTableState::RewriteMerged(_)
                 | CandidateTableState::AdoptWithDelta(_)
-                | CandidateTableState::AdoptPureInserts(_) => target_active.clone(),
+                | CandidateTableState::AdoptPureInserts(_) => {
+                    target_active.as_deref().map(|owner| {
+                        match target_entry.filter(|entry| {
+                            entry
+                                .native_dataset_branch
+                                .as_deref()
+                                .is_some_and(|native| {
+                                    entry.version_metadata.is_table_fork_of(native, owner)
+                                })
+                        }) {
+                            Some(entry) => entry
+                                .native_dataset_branch
+                                .clone()
+                                .expect("owned named ref"),
+                            _ => crate::branch_names::table_fork_name(
+                                owner,
+                                target_snapshot.graph_manifest_version(),
+                                &merge_lineage.graph_commit_id,
+                            ),
+                        }
+                    })
+                }
                 CandidateTableState::AdoptSourceState { .. } => {
-                    match (
-                        target_active.as_deref(),
-                        source_entry.native_dataset_branch.as_deref(),
-                    ) {
-                        (Some(target), Some(_)) => Some(target.to_string()),
-                        _ => None,
+                    if target_active.is_some() {
+                        source_entry.native_dataset_branch.clone()
+                    } else {
+                        None
                     }
                 }
             };
@@ -5980,7 +6028,7 @@ impl Omnigraph {
                 identity,
                 table_key: table_key.clone(),
                 expected_version,
-                table_branch: planned_output_branch,
+                table_branch: planned_output_branch.clone(),
                 confirmed: None,
             });
 
@@ -5996,7 +6044,14 @@ impl Omnigraph {
                     })?;
                     let source_fork_version = target_active
                         .as_deref()
-                        .filter(|target| entry.native_dataset_branch.as_deref() != Some(*target))
+                        .filter(|owner| {
+                            !entry
+                                .native_dataset_branch
+                                .as_deref()
+                                .is_some_and(|native| {
+                                    entry.version_metadata.is_table_fork_of(native, owner)
+                                })
+                        })
                         .map(|_| entry.published_dataset_version);
                     if source_fork_version.is_some()
                         && matches!(candidate, CandidateTableState::AdoptPureInserts(_))
@@ -6006,7 +6061,14 @@ impl Omnigraph {
                         )));
                     }
                     if source_fork_version.is_some() {
-                        first_touch_effects.insert(table_key.clone());
+                        first_touch_effects.insert(
+                            table_key.clone(),
+                            planned_output_branch.clone().ok_or_else(|| {
+                                OmniError::manifest_internal(
+                                    "first-touch merge has no planned native ref",
+                                )
+                            })?,
+                        );
                     } else {
                         // Existing-ref effects must prove that the physical
                         // baseline still equals the captured manifest pin
@@ -6029,7 +6091,8 @@ impl Omnigraph {
                         expected_version,
                         post_commit_pin: expected_version + 1,
                         confirmed_version: None,
-                        table_branch: target_active.clone(),
+                        table_branch: planned_output_branch,
+                        table_fork_owner: target_active.clone(),
                     });
                     recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
                         identity,
@@ -6042,35 +6105,7 @@ impl Omnigraph {
                         },
                     });
                 }
-                CandidateTableState::AdoptSourceState { .. } => {
-                    let Some(target) = target_active.as_deref() else {
-                        continue;
-                    };
-                    let creates_target_ref = source_entry.native_dataset_branch.is_some()
-                        && target_entry.and_then(|entry| entry.native_dataset_branch.as_deref())
-                            != Some(target);
-                    if !creates_target_ref {
-                        continue;
-                    }
-                    first_touch_effects.insert(table_key.clone());
-                    recovery_pins.push(crate::db::manifest::SidecarTablePin {
-                        identity,
-                        table_key: table_key.clone(),
-                        table_path: self.storage().dataset_uri(&source_entry.dataset_path),
-                        expected_version,
-                        post_commit_pin: source_entry.published_dataset_version,
-                        confirmed_version: None,
-                        table_branch: Some(target.to_string()),
-                    });
-                    recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
-                        identity,
-                        table_key: table_key.clone(),
-                        kind: crate::db::manifest::RecoveryBranchMergeEffectKind::RefOnlyFork {
-                            source_version: source_entry.published_dataset_version,
-                            confirmed_branch_identifier: None,
-                        },
-                    });
-                }
+                CandidateTableState::AdoptSourceState { .. } => {}
             }
         }
 
@@ -6106,62 +6141,6 @@ impl Omnigraph {
                 )
                 .await?;
                 continue;
-            }
-        }
-        if !first_touch_effects.is_empty() {
-            let references = Box::pin(
-                ManifestCoordinator::native_fork_references_under_control_gates(
-                    self.root_uri(),
-                    &self.control_session(),
-                ),
-            )
-            .await?;
-            let native = target_active.as_deref().ok_or_else(|| {
-                OmniError::manifest_internal("first-touch merge requires a named target")
-            })?;
-            for table_key in &first_touch_effects {
-                let entry = target_snapshot
-                    .dataset(table_key)
-                    .or_else(|| source_snapshot.dataset(table_key))
-                    .ok_or_else(|| {
-                        OmniError::manifest_internal("first-touch merge table is missing")
-                    })?;
-                if references.contains(entry.identity, native) {
-                    return Err(crate::db::manifest::detached_native_lineage_error(
-                        table_key, native,
-                    ));
-                }
-                let inherited = self.storage().open_snapshot_at_entry(entry).await?;
-                let branches =
-                    crate::branch_control::list_branch_contents(inherited.dataset()).await?;
-                if !branches.contains_key(native) {
-                    continue;
-                }
-                match crate::db::classify_fork_ref_with_references(
-                    self,
-                    entry.identity,
-                    native,
-                    None,
-                    &references,
-                )
-                .await
-                {
-                    crate::db::ForkRefStatus::Orphan => {
-                        let full_path = self.storage().dataset_uri(&entry.dataset_path);
-                        crate::db::force_delete_orphan_ref(self, table_key, &full_path, native)
-                            .await?;
-                    }
-                    crate::db::ForkRefStatus::Borrowed
-                    | crate::db::ForkRefStatus::Legitimate
-                    | crate::db::ForkRefStatus::Indeterminate => {
-                        return Err(OmniError::manifest_conflict(format!(
-                            "merge target ref '{table_key}:{native}' already exists while the \
-                             graph manifest inherits the table from another branch, and a \
-                             pending operation still claims it or its liveness could not be \
-                             verified; refusing to claim unowned physical state; retry"
-                        )));
-                    }
-                }
             }
         }
         final_revalidation_timing.finish();
@@ -6253,7 +6232,7 @@ impl Omnigraph {
                     CandidateTableState::RewriteMerged(_)
                     | CandidateTableState::AdoptWithDelta(_)
                     | CandidateTableState::AdoptPureInserts(_) => {
-                        if first_touch_effects.contains(table_key) {
+                        if first_touch_effects.contains_key(table_key) {
                             None
                         } else {
                             Some(prepared_existing_targets.remove(table_key).ok_or_else(|| {
@@ -6268,14 +6247,11 @@ impl Omnigraph {
                 let update = match candidate_state {
                     CandidateTableState::AdoptSourceState { .. } => {
                         publish_adopted_source_state(
-                            self,
                             source_snapshot,
                             target_snapshot,
                             table_key,
                             target_active.as_deref(),
-                            recovery_operation_id.as_deref(),
-                        )
-                        .await?
+                        )?
                     }
                     CandidateTableState::AdoptWithDelta(delta) => {
                         let planned = planned_transactions_by_table.get(table_key).ok_or_else(|| {
@@ -6287,6 +6263,7 @@ impl Omnigraph {
                             self,
                             target_txn,
                             recovery_operation_id.as_deref(),
+                            first_touch_effects.get(table_key).map(String::as_str),
                             table_key,
                             identity,
                             delta,
@@ -6327,6 +6304,7 @@ impl Omnigraph {
                             self,
                             target_txn,
                             recovery_operation_id.as_deref(),
+                            first_touch_effects.get(table_key).map(String::as_str),
                             table_key,
                             identity,
                             staged,
@@ -6336,13 +6314,7 @@ impl Omnigraph {
                         .await?
                     }
                 };
-                if first_touch_effects.contains(table_key) {
-                    let target = target_active.as_deref().ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "first-touch merge effect '{}' has no named target branch",
-                            table_key
-                        ))
-                    })?;
+                if let Some(target) = first_touch_effects.get(table_key) {
                     let entry = target_snapshot
                         .dataset(table_key)
                         .or_else(|| source_snapshot.dataset(table_key))

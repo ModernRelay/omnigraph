@@ -1,0 +1,86 @@
+# issue: none
+# notes: First-touch table refs stay bounded when logical names are long or encoded.
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+--- mutate
+branch create "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+--- expect ok
+--- mutate branch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+query write() {
+    update Person set { age: 31 } where name = "alice"
+}
+--- expect affected: nodes=1 edges=0
+--- query branch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+query read() {
+    match { $p: Person }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":31}
+--- expect shape
+p.age: I32
+--- mutate
+branch create "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+--- expect ok
+--- mutate branch: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+query write() {
+    update Person set { age: 31 } where name = "alice"
+}
+--- expect affected: nodes=1 edges=0
+--- query branch: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+query read() {
+    match { $p: Person }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":31}
+--- expect shape
+p.age: I32
+--- mutate
+branch create "team/data/ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+--- expect ok
+--- mutate branch: team/data/ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+query write() {
+    update Person set { age: 31 } where name = "alice"
+}
+--- expect affected: nodes=1 edges=0
+--- query branch: team/data/ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+query read() {
+    match { $p: Person }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":31}
+--- expect shape
+p.age: I32
+--- mutate
+branch create "équipe/échanges"
+--- expect ok
+--- mutate branch: équipe/échanges
+query write() {
+    update Person set { age: 31 } where name = "alice"
+}
+--- expect affected: nodes=1 edges=0
+--- query branch: équipe/échanges
+query read() {
+    match { $p: Person }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":31}
+--- expect shape
+p.age: I32
+--- query
+query main_is_unchanged() {
+    match { $p: Person }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":30}
+--- expect shape
+p.age: I32

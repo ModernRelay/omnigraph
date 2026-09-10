@@ -505,6 +505,8 @@ pub(crate) struct SidecarTablePin {
     /// compatibility with older sidecars; `None` means main / default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_fork_owner: Option<String>,
 }
 
 /// New-table registration captured by SchemaApply sidecars so recovery
@@ -1371,7 +1373,91 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
     Ok(sidecar)
 }
 
+fn validate_table_fork_owners(sidecar: &RecoverySidecar) -> Result<()> {
+    for pin in &sidecar.tables {
+        if let Some(owner) = pin.table_fork_owner.as_deref() {
+            if owner == "main"
+                || lance::dataset::refs::check_valid_branch(owner).is_err()
+                || sidecar.branch.as_deref()
+                    != Some(crate::branch_names::logical_branch_name(owner))
+                || pin
+                    .table_branch
+                    .as_deref()
+                    .is_none_or(|branch| branch == "main")
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "sidecar '{}' table '{}' has invalid table-fork owner '{}' for target {:?}",
+                    sidecar.operation_id, pin.table_key, owner, sidecar.branch
+                )));
+            }
+        }
+    }
+    let deltas = [
+        sidecar
+            .protocol_v3
+            .as_ref()
+            .map(|protocol| &protocol.intended_delta),
+        sidecar
+            .protocol_v4
+            .as_ref()
+            .map(|protocol| &protocol.intended_delta),
+        sidecar
+            .protocol_v7
+            .as_ref()
+            .map(|protocol| &protocol.intended_delta),
+        sidecar
+            .protocol_v8
+            .as_ref()
+            .map(|protocol| &protocol.intended_delta),
+    ];
+    for delta in deltas.into_iter().flatten() {
+        for slot in &delta.table_updates {
+            let Some(confirmed) = slot.confirmed.as_ref() else {
+                continue;
+            };
+            let Some(pin) = sidecar
+                .tables
+                .iter()
+                .find(|pin| pin.identity == slot.identity)
+            else {
+                continue;
+            };
+            if confirmed.version_metadata.table_fork_owner() != pin.table_fork_owner.as_deref() {
+                return Err(OmniError::manifest_internal(format!(
+                    "sidecar '{}' table '{}' confirmed owner {:?} differs from physical pin owner {:?}",
+                    sidecar.operation_id,
+                    pin.table_key,
+                    confirmed.version_metadata.table_fork_owner(),
+                    pin.table_fork_owner
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_table_fork_owner_snapshot(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    for pin in &sidecar.tables {
+        if let Some(owner) = pin.table_fork_owner.as_deref() {
+            if snapshot.native_branch() != Some(owner) {
+                return Err(OmniError::manifest_internal(format!(
+                    "sidecar '{}' table '{}' owner '{}' differs from captured target incarnation {:?}; leaving sidecar pending",
+                    sidecar.operation_id,
+                    pin.table_key,
+                    owner,
+                    snapshot.native_branch()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    validate_table_fork_owners(sidecar)?;
     let malformed = |reason: String| {
         OmniError::manifest_internal(format!(
             "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
@@ -2006,7 +2092,9 @@ fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar
                 // Pins name the native fork ref; the sidecar names the
                 // logical branch it belongs to.
                 branch != "main"
-                    && Some(crate::branch_names::logical_branch_name(branch)) == sidecar_branch
+                    && Some(crate::branch_names::logical_branch_name(
+                        pin.table_fork_owner.as_deref().unwrap_or(branch),
+                    )) == sidecar_branch
             }))
             || effect
                 .source_fork_version
@@ -3182,16 +3270,9 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
     })
 }
 
-/// Discard a sidecar whose branch no longer exists in the manifest (the
-/// authority — callers must key the orphan classification off the branch
-/// LIST, never off a `Not found` from an open, which could be a transient
-/// storage error masking real recovery intent). The branch's tree and
-/// per-table forks are already reclaimed, so the drift the sidecar pins is
-/// unreachable and the sidecar is provably moot; leaving it would wedge
-/// every heal (write entry) and every ReadWrite open on a dead-branch
-/// open, with `repair` refusing while it pends. Records an
-/// `OrphanedBranchDiscarded` audit row (lineage published on main — the
-/// sidecar's own branch no longer has a live graph head).
+/// Retire intent only after the authoritative branch list proves its graph branch absent.
+/// Record `OrphanedBranchDiscarded` on main; a failed table open is not absence proof.
+/// Abandoned table forks remain for explicit cleanup.
 async fn discard_orphaned_branch_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -3467,6 +3548,7 @@ async fn classify_sidecar_tables(
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
 ) -> Result<Vec<ClassifiedTable>> {
+    validate_table_fork_owner_snapshot(snapshot, sidecar)?;
     let mut states = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
         let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
@@ -3488,8 +3570,9 @@ async fn classify_sidecar_tables(
                 .is_some_and(|branch| branch != "main")
             && sidecar.branch.as_deref()
                 == pin
-                    .table_branch
+                    .table_fork_owner
                     .as_deref()
+                    .or(pin.table_branch.as_deref())
                     .map(crate::branch_names::logical_branch_name)
             && manifest_entry
                 .map(|entry| entry.native_dataset_branch != pin.table_branch)
@@ -3588,10 +3671,6 @@ pub(crate) async fn finalize_effect_free_occ_sidecar(
         return Ok(false);
     }
 
-    match cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, &states).await? {
-        NoEffectForkCleanup::Complete => {}
-        NoEffectForkCleanup::DeferredPathChild { .. } => return Ok(false),
-    }
     delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
     Ok(true)
 }
@@ -3739,39 +3818,10 @@ async fn process_sidecar(
         }
 
         if !any_own_effect {
-            // The sidecar was armed but this writer never landed a physical
-            // effect. RollForwardOnly recovery may be looking at a LIVE writer,
-            // so an Armed sidecar is presumed ownership; the one exception is
-            // the identity-aware retirement below, which proves the intent
-            // effect-free before touching it. A quiesced Full sweep may
-            // abandon it; first remove only exact, unpublished first-touch
-            // forks that this intent owns. Do not manufacture lineage for an
-            // empty intent and never restore a foreign advance.
             if matches!(mode, RecoveryMode::RollForwardOnly)
                 && (protocol.effect_phase == RecoveryEffectPhase::Armed
                     || states.iter().any(|state| state.unpublished_fork))
             {
-                // A dead writer's Armed mutation/load intent would otherwise
-                // pend until the next ReadWrite open, which a long-lived
-                // server never performs (issue #554). The caller holds this
-                // sidecar's full schema -> branch -> table gate envelope, so
-                // no in-process writer can own it; exact transaction-identity
-                // finalization retires it only when provably effect-free, the
-                // same one-mutation-process boundary destructive Full
-                // recovery already assumes (docs/dev/invariants.md, current
-                // support boundaries). Exclusions that keep deferring to the
-                // next ReadWrite open: pre-v9 sidecars and non-mutation/load
-                // kinds (no exact identity to prove effect-freedom with —
-                // finalization ERRORS on both rather than declining, so those
-                // gates must run here) and first-touch forks (reclaiming an
-                // unpublished target ref requires the quiescence
-                // `cleanup_unpublished_no_effect_forks` documents). The Armed
-                // conjunct is defense in depth: the enclosing branch plus the
-                // fork exclusion already force Armed, and finalization
-                // re-checks it. An Armed EnsureIndices intent wedges the same
-                // way but carries no exact-effect identity; its live
-                // retirement needs its own safety argument and is
-                // deliberately not folded in here.
                 if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
                     && matches!(
                         sidecar.writer_kind,
@@ -3814,30 +3864,6 @@ async fn process_sidecar(
                     "recovery: deferring sidecar with no physical effects to the next read-write open"
                 );
                 return Ok(false);
-            }
-            if matches!(mode, RecoveryMode::Full) {
-                if let NoEffectForkCleanup::DeferredPathChild {
-                    table_path,
-                    target_branch,
-                    path_child,
-                } = cleanup_unpublished_no_effect_forks(
-                    root_uri,
-                    storage.as_ref(),
-                    sidecar,
-                    &states,
-                )
-                .await?
-                {
-                    warn!(
-                        operation_id = sidecar.operation_id.as_str(),
-                        table_path,
-                        branch = target_branch,
-                        path_child,
-                        "recovery: deferring no-effect fork cleanup until legacy path-child \
-                         branches are deleted leaf-first"
-                    );
-                    return Ok(false);
-                }
             }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
@@ -3961,18 +3987,6 @@ async fn process_sidecar(
                 && !any_pin_advanced
             {
                 if matches!(mode, RecoveryMode::RollForwardOnly) {
-                    return Ok(false);
-                }
-                if matches!(
-                    cleanup_unpublished_no_effect_forks(
-                        root_uri,
-                        storage.as_ref(),
-                        sidecar,
-                        &states,
-                    )
-                    .await?,
-                    NoEffectForkCleanup::DeferredPathChild { .. }
-                ) {
                     return Ok(false);
                 }
                 delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
@@ -4516,6 +4530,7 @@ async fn process_ensure_indices_sidecar_v8(
     if let Some(outcome) = detect_visible_v8_outcome(root_uri, sidecar).await? {
         return finalize_visible_v8_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
     }
+    validate_table_fork_owner_snapshot(snapshot, sidecar)?;
     let protocol = sidecar
         .protocol_v8
         .as_ref()
@@ -4775,181 +4790,13 @@ async fn roll_back_ensure_indices_v8(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
-    snapshot: &Snapshot,
+    _snapshot: &Snapshot,
 ) -> Result<()> {
-    // Remove untouched first-touch refs before freezing the audit plan. A
-    // path-child overlap cannot be left behind once this rollback also owns a
-    // table effect, because a successful open would expose unresolved state.
-    if let NoEffectForkCleanup::DeferredPathChild {
-        table_path,
-        target_branch,
-        path_child,
-    } = cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await?
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "EnsureIndices sidecar '{}' cannot clean first-touch '{}:{}' while path-child '{}' is live",
-            sidecar.operation_id, table_path, target_branch, path_child
-        )));
-    }
-
-    // Persist the original observations before deleting a first-touch ref or
-    // restoring an existing one. Re-entry after either physical action reuses
-    // this exact operator-facing outcome set.
     let prepared = prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?;
     let protocol = prepared
         .protocol_v8
         .as_ref()
         .expect("prepared schema-v8 protocol");
-    let all_sidecars = list_sidecars(root_uri, storage).await?;
-    let fork_references = if protocol
-        .effects
-        .iter()
-        .any(|effect| effect.source_fork_version.is_some())
-    {
-        Some(
-            Box::pin(
-                super::ManifestCoordinator::native_fork_references_under_control_gates(
-                    root_uri,
-                    &crate::lance_access::control_session(),
-                ),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-
-    for ((pin, state), effect) in prepared.tables.iter().zip(states.iter()).map(|pair| {
-        let effect = protocol
-            .effects
-            .iter()
-            .find(|effect| effect.identity == pair.0.identity)
-            .expect("validated schema-v8 key sets");
-        (pair, effect)
-    }) {
-        let Some(source_fork_version) = effect.source_fork_version else {
-            continue;
-        };
-        if snapshot_entry_by_identity(snapshot, pin.identity)
-            .is_some_and(|entry| entry.native_dataset_branch == pin.table_branch)
-        {
-            return Err(OmniError::manifest_internal(format!(
-                "EnsureIndices sidecar '{}' cannot reclaim first-touch ref for '{}' because the manifest now owns it without the fixed original lineage",
-                prepared.operation_id, pin.table_key
-            )));
-        }
-        let Some(target_branch) = pin
-            .table_branch
-            .as_deref()
-            .filter(|branch| *branch != "main")
-        else {
-            return Err(OmniError::manifest_internal(format!(
-                "EnsureIndices first-touch table '{}' has no named target ref",
-                pin.table_key
-            )));
-        };
-        if fork_references
-            .as_ref()
-            .is_some_and(|references| references.contains(pin.identity, target_branch))
-        {
-            return Err(OmniError::manifest_internal(format!(
-                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while a live graph snapshot pins it",
-                prepared.operation_id, pin.table_path, target_branch
-            )));
-        }
-        if all_sidecars.iter().any(|candidate| {
-            candidate.operation_id != prepared.operation_id
-                && candidate.tables.iter().any(|candidate_pin| {
-                    candidate_pin.table_path == pin.table_path
-                        && candidate_pin.table_branch.as_deref() == Some(target_branch)
-                })
-        }) {
-            return Err(OmniError::manifest_internal(format!(
-                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while another recovery intent claims it",
-                prepared.operation_id, pin.table_path, target_branch
-            )));
-        }
-
-        let mut dataset = crate::instrumentation::open_dataset(
-            &pin.table_path,
-            crate::instrumentation::VersionResolution::Latest,
-            None,
-            crate::instrumentation::table_wrapper(),
-        )
-        .await?;
-        let branches = list_branch_contents(&dataset).await?;
-        if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
-            return Err(OmniError::manifest_internal(format!(
-                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while path-child '{}' is live",
-                prepared.operation_id, pin.table_path, target_branch, child
-            )));
-        }
-        let Some(contents) = branches.get(target_branch) else {
-            // Either the writer crashed before ref creation or a prior recovery
-            // deleted the exact owned ref and crashed before manifest publish.
-            if !crate::branch_control::reclaim_ref_absent_tree(&mut dataset, target_branch).await? {
-                return Err(OmniError::manifest_conflict(format!(
-                    "target ref '{target_branch}' appeared during EnsureIndices rollback"
-                )));
-            }
-            continue;
-        };
-        if contents.parent_version != source_fork_version {
-            return Err(OmniError::manifest_internal(format!(
-                "EnsureIndices sidecar '{}' first-touch '{}:{}' has parent {}, expected {}",
-                prepared.operation_id,
-                pin.table_path,
-                target_branch,
-                contents.parent_version,
-                source_fork_version
-            )));
-        }
-        if let Some(expected_identifier) = effect.confirmed_branch_identifier.as_ref()
-            && &contents.identifier != expected_identifier
-        {
-            return Err(OmniError::manifest_internal(format!(
-                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' because its ref identity changed",
-                prepared.operation_id, pin.table_path, target_branch
-            )));
-        }
-
-        match state.effect_ownership {
-            EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead => {
-                let target = dataset
-                    .checkout_branch(target_branch)
-                    .await
-                    .map_err(OmniError::storage)?;
-                if target.version().version != state.lance_head
-                    || !prove_ensure_indices_create_index_operation(
-                        &target,
-                        &effect.planned_transaction,
-                    )
-                    .await?
-                {
-                    return Err(OmniError::manifest_internal(format!(
-                        "EnsureIndices sidecar '{}' cannot prove its exact first-touch CreateIndex effect for '{}' before deletion",
-                        prepared.operation_id, pin.table_key
-                    )));
-                }
-                dataset
-                    .force_delete_branch(target_branch)
-                    .await
-                    .map_err(OmniError::storage)?;
-            }
-            EffectOwnership::None => {
-                // An untouched owned fork was removed by the helper above. A
-                // remaining moved ref has no exact owned UUID and is therefore
-                // a foreign first-touch winner: preserve it, never adopt it.
-            }
-            EffectOwnership::OwnBeforeHead | EffectOwnership::Unverifiable => {
-                return Err(OmniError::manifest_internal(format!(
-                    "EnsureIndices sidecar '{}' cannot safely reclaim first-touch '{}': its exact effect is buried or unverifiable",
-                    prepared.operation_id, pin.table_key
-                )));
-            }
-        }
-    }
-
     let mut changes = Vec::new();
     let mut expected = HashMap::new();
     for ((pin, state), effect) in prepared.tables.iter().zip(states.iter()).map(|pair| {
@@ -4985,6 +4832,7 @@ async fn roll_back_ensure_indices_v8(
             &pin.table_key,
             &pin.table_path,
             pin.table_branch.as_deref(),
+            pin.table_fork_owner.as_deref(),
             state.manifest_pinned,
             None,
             &mut changes,
@@ -5537,6 +5385,7 @@ async fn roll_back_schema_apply_v7(
             restored_table_key,
             &pin.table_path,
             None,
+            None,
             state.manifest_pinned,
             None,
             &mut changes,
@@ -5585,6 +5434,7 @@ async fn process_branch_merge_sidecar_v4(
     if let Some(outcome) = detect_visible_v4_outcome(root_uri, sidecar).await? {
         return finalize_visible_v4_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
     }
+    validate_table_fork_owner_snapshot(snapshot, sidecar)?;
     let protocol = sidecar
         .protocol_v4
         .as_ref()
@@ -5810,22 +5660,12 @@ async fn process_branch_merge_sidecar_v4(
         return roll_forward_branch_merge_v4(root_uri, storage, sidecar, mode).await;
     }
 
-    // A first-touch ref with no data commit is a recoverable physical artifact,
-    // but cleaning it restores the exact pre-attempt graph state. Do not
-    // manufacture a rollback graph commit: doing so would advance the target
-    // lineage and turn a later logical fast-forward into a three-way merge.
     if !any_head_movement {
         if matches!(mode, RecoveryMode::RollForwardOnly) {
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
                 "recovery: deferring armed BranchMerge intent with no proven physical effects"
             );
-            return Ok(false);
-        }
-        if let NoEffectForkCleanup::DeferredPathChild { .. } =
-            cleanup_unpublished_no_effect_forks(root_uri, storage.as_ref(), sidecar, &states)
-                .await?
-        {
             return Ok(false);
         }
         delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
@@ -6173,16 +6013,6 @@ enum EffectOwnership {
     Unverifiable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NoEffectForkCleanup {
-    Complete,
-    DeferredPathChild {
-        table_path: String,
-        target_branch: String,
-        path_child: String,
-    },
-}
-
 fn has_exact_protocol(sidecar: &RecoverySidecar) -> bool {
     sidecar.protocol_v3.is_some()
         || sidecar.protocol_v4.is_some()
@@ -6192,224 +6022,6 @@ fn has_exact_protocol(sidecar: &RecoverySidecar) -> bool {
 
 fn has_fixed_rollback_identity(sidecar: &RecoverySidecar) -> bool {
     has_exact_protocol(sidecar) || sidecar.ensure_indices_rollback_v6.is_some()
-}
-
-fn v4_effect_for(
-    sidecar: &RecoverySidecar,
-    identity: TableIdentity,
-) -> Option<&RecoveryBranchMergeEffect> {
-    sidecar
-        .protocol_v4
-        .as_ref()?
-        .effects
-        .iter()
-        .find(|effect| effect.identity == identity)
-}
-
-fn first_touch_fork_version(sidecar: &RecoverySidecar, pin: &SidecarTablePin) -> u64 {
-    v4_effect_for(sidecar, pin.identity)
-        .and_then(|effect| effect.kind.source_fork_version())
-        .or_else(|| {
-            sidecar.protocol_v8.as_ref().and_then(|protocol| {
-                protocol
-                    .effects
-                    .iter()
-                    .find(|effect| effect.identity == pin.identity)
-                    .and_then(|effect| effect.source_fork_version)
-            })
-        })
-        .unwrap_or(pin.expected_version)
-}
-
-/// Remove first-touch named-branch refs created by an Armed exact-protocol
-/// attempt, or by the legacy EnsureIndices adapter, that never completed this
-/// table's planned effect.
-///
-/// The sidecar is durable before the ref is created, so it is the ownership
-/// record while the manifest still inherits the table from another branch.
-/// Destruction is deliberately narrow: the manifest must not select the ref,
-/// no other pending sidecar may claim the same `(table_path, branch)`, and the
-/// live ref must still be exactly the fork point. Full recovery is quiesced, so
-/// this fresh re-check closes ordinary crash/retry races. Lance does not expose
-/// a compare-and-delete-by-branch-identifier primitive; a caller that can
-/// reach ref destruction here must either hold the Full-sweep quiescence
-/// guarantee or own the intent it destroys — the RFC-022 writer's own
-/// conflict-path finalization (`StagedMutation::commit_all`) reclaims the fork
-/// it just created under its still-held gate envelope. The live heal
-/// (`heal_pending_sidecars_roll_forward`) calls this only through
-/// `finalize_effect_free_occ_sidecar` with a fork-free pin set, where no ref
-/// surgery is reachable.
-async fn cleanup_unpublished_no_effect_forks(
-    root_uri: &str,
-    storage: &dyn StorageAdapter,
-    sidecar: &RecoverySidecar,
-    states: &[ClassifiedTable],
-) -> Result<NoEffectForkCleanup> {
-    if !has_exact_protocol(sidecar) && !matches!(sidecar.writer_kind, SidecarKind::EnsureIndices) {
-        return Ok(NoEffectForkCleanup::Complete);
-    }
-
-    // The sidecar's own branch is insufficient authority: another branch may
-    // lazily borrow this exact table ref. Full recovery is quiesced; an owned
-    // writer's conflict cleanup holds the schema/branch/table gate envelope.
-    let fork_references = if states
-        .iter()
-        .any(|state| state.unpublished_fork && state.effect_ownership == EffectOwnership::None)
-    {
-        Some(
-            super::ManifestCoordinator::native_fork_references_under_control_gates(
-                root_uri,
-                &crate::lance_access::control_session(),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let all_sidecars = list_sidecars(root_uri, storage).await?;
-    for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
-        if !state.unpublished_fork || state.effect_ownership != EffectOwnership::None {
-            continue;
-        }
-        // Legacy EnsureIndices has no transaction-identity ownership signal.
-        // Its loose classifier can still prove the no-effect case exactly:
-        // only `NoMovement` is an untouched fork. A moved HEAD must flow into
-        // the normal derived-state rollback path; treating it as a no-effect
-        // ref would try to delete a ref past its fork point and wedge recovery.
-        if matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
-            && !matches!(state.classification, TableClassification::NoMovement)
-        {
-            continue;
-        }
-        let Some(target_branch) = pin
-            .table_branch
-            .as_deref()
-            .filter(|branch| *branch != "main")
-        else {
-            continue;
-        };
-
-        if fork_references
-            .as_ref()
-            .is_some_and(|references| references.contains(pin.identity, target_branch))
-        {
-            // No effect belongs to this sidecar, so it may retire without
-            // reclaiming a ref whose history a published snapshot still owns.
-            continue;
-        }
-
-        let has_competing_claim = all_sidecars.iter().any(|candidate| {
-            candidate.operation_id != sidecar.operation_id
-                && candidate.tables.iter().any(|candidate_pin| {
-                    candidate_pin.table_path == pin.table_path
-                        && candidate_pin.table_branch.as_deref() == Some(target_branch)
-                })
-        });
-        if has_competing_claim {
-            // Never delete a ref while another pending intent claims it. Full
-            // recovery is quiesced by the shared gates, so this no-effect
-            // sidecar can safely discard itself without touching the ref. A
-            // later/last claimant either cleans the still-untouched fork or
-            // recovers its owned effect. The RollForwardOnly live heal never
-            // reaches this arm (its fork-free pin set skips the whole loop)
-            // and continues to defer unresolved fork ownership.
-            continue;
-        }
-
-        let mut dataset = crate::instrumentation::open_dataset(
-            &pin.table_path,
-            crate::instrumentation::VersionResolution::Latest,
-            None,
-            crate::instrumentation::table_wrapper(),
-        )
-        .await?;
-        let branches = list_branch_contents(&dataset).await?;
-        if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
-            // Lance cannot reclaim an ancestor tree while a slash-separated
-            // path-child remains. Old stores could admit that namespace shape.
-            // Keep the ownership sidecar and let open complete so the operator
-            // can delete the child branch first; the next Full sweep then
-            // rechecks authority and reclaims the ancestor fork.
-            warn!(
-                operation_id = sidecar.operation_id.as_str(),
-                table_path = pin.table_path.as_str(),
-                branch = target_branch,
-                path_child = child,
-                "recovery: deferring unpublished fork cleanup for legacy path overlap"
-            );
-            return Ok(NoEffectForkCleanup::DeferredPathChild {
-                table_path: pin.table_path.clone(),
-                target_branch: target_branch.to_string(),
-                path_child: child.to_string(),
-            });
-        }
-        let Some(contents) = branches.get(target_branch) else {
-            // BranchContents is authoritative, but Lance create writes the
-            // shallow-cloned target dataset first. The absent-ref state is
-            // therefore either crash-before-fork (idempotent no-op) or an
-            // exact clone-only zombie owned by this already-armed sidecar.
-            // Reclaim both through Lance's force API before retiring intent;
-            // merely skipping here leaves the zombie blocking every retry.
-            if !crate::branch_control::reclaim_ref_absent_tree(&mut dataset, target_branch).await? {
-                return Err(OmniError::manifest_conflict(format!(
-                    "target ref '{target_branch}' appeared during no-effect recovery; refusing \
-                     to retire its ownership intent"
-                )));
-            }
-            continue;
-        };
-        let exact_fork_version = first_touch_fork_version(sidecar, pin);
-        if contents.parent_version != exact_fork_version {
-            return Err(OmniError::manifest_internal(format!(
-                "OCC recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
-                 parent version is {}, expected exact fork point {}",
-                sidecar.operation_id,
-                pin.table_path,
-                target_branch,
-                contents.parent_version,
-                exact_fork_version
-            )));
-        }
-        if let Some(expected_identifier) = v4_effect_for(sidecar, pin.identity)
-            .and_then(|effect| effect.kind.confirmed_branch_identifier())
-            .or_else(|| {
-                sidecar.protocol_v8.as_ref().and_then(|protocol| {
-                    protocol
-                        .effects
-                        .iter()
-                        .find(|effect| effect.identity == pin.identity)
-                        .and_then(|effect| effect.confirmed_branch_identifier.as_ref())
-                })
-            })
-            && &contents.identifier != expected_identifier
-        {
-            return Err(OmniError::manifest_internal(format!(
-                "BranchMerge recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
-                 live target ref identity differs from the confirmed effect",
-                sidecar.operation_id, pin.table_path, target_branch
-            )));
-        }
-        let target = dataset
-            .checkout_branch(target_branch)
-            .await
-            .map_err(OmniError::storage)?;
-        if target.version().version != exact_fork_version {
-            return Err(OmniError::manifest_internal(format!(
-                "OCC recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
-                 live HEAD is {}, expected untouched version {}",
-                sidecar.operation_id,
-                pin.table_path,
-                target_branch,
-                target.version().version,
-                exact_fork_version
-            )));
-        }
-        dataset
-            .force_delete_branch(target_branch)
-            .await
-            .map_err(OmniError::storage)?;
-    }
-    Ok(NoEffectForkCleanup::Complete)
 }
 
 fn table_requires_rollback_effect(state: &ClassifiedTable) -> bool {
@@ -6571,33 +6183,6 @@ async fn roll_back_sidecar(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
-    // An Armed multi-table attempt can create every first-touch ref and then
-    // land effects on only a subset. No-effect refs are not selected by the
-    // rollback manifest publish, so they must be removed BEFORE that publish.
-    // If recovery crashed after publishing first, the fixed rollback outcome
-    // would make the next pass finalize/delete the sidecar without ever seeing
-    // the still-orphaned refs. A rollback that owns any physical effect may not
-    // defer and let read-write open succeed: legacy writers are not all enrolled
-    // in the v3 preparation barrier. Fail closed until the path child is removed.
-    if let NoEffectForkCleanup::DeferredPathChild {
-        table_path,
-        target_branch,
-        path_child,
-    } = cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await?
-    {
-        return Err(OmniError::manifest_internal(format!(
-            "OCC recovery sidecar '{}' owns physical effects but cannot clean unpublished fork \
-             '{}:{}' while legacy path-child '{}' is live; refusing read-write open; delete the \
-             child branch leaf-first using an existing handle or an offline Lance-level branch \
-             tool, then reopen",
-            sidecar.operation_id, table_path, target_branch, path_child
-        )));
-    }
-
-    // Once the fixed rollback commit is visible, early recovery finalization no
-    // longer has pre-restore table observations. Persist the exact audit plan
-    // after fork cleanup and before the first restore so that path can replay it
-    // without fabricating outcomes from pins.
     let prepared_fixed = if has_fixed_rollback_identity(sidecar) {
         Some(prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?)
     } else {
@@ -6657,6 +6242,7 @@ async fn roll_back_sidecar(
                 &pin.table_key,
                 &pin.table_path,
                 pin.table_branch.as_deref(),
+                pin.table_fork_owner.as_deref(),
                 state.manifest_pinned,
                 None,
                 &mut updates,
@@ -7703,6 +7289,7 @@ async fn roll_forward_all(
             &pin.table_key,
             &pin.table_path,
             pin.table_branch.as_deref(),
+            pin.table_fork_owner.as_deref(),
             pin.expected_version,
             Some(state.lance_head),
             &mut updates,
@@ -7860,6 +7447,7 @@ async fn push_table_update(
     table_key: &str,
     table_path: &str,
     branch: Option<&str>,
+    table_fork_owner: Option<&str>,
     expected_version: u64,
     target_version: Option<u64>,
     updates: &mut Vec<ManifestChange>,
@@ -7884,7 +7472,8 @@ async fn push_table_update(
     let row_count = ds.count_rows(None).await.map_err(OmniError::storage)? as u64;
     let table_relative_path = super::table_path_for_identity(table_key, identity)?;
     let version_metadata =
-        super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
+        super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?
+            .with_table_fork_owner(table_fork_owner);
     updates.push(ManifestChange::Update(DatasetUpdate {
         identity,
         type_key: table_key.to_string(),
@@ -9158,6 +8747,7 @@ mod tests {
     fn make_pin(table_key: &str, _table_path: &str, expected: u64, post: u64) -> SidecarTablePin {
         let identity = test_identity(table_key);
         SidecarTablePin {
+            table_fork_owner: None,
             identity,
             table_key: table_key.to_string(),
             table_path: format!(
@@ -10182,6 +9772,7 @@ mod tests {
         );
         // Confirmed to the observed HEAD → complete Phase B → roll forward.
         let confirmed = SidecarTablePin {
+            table_fork_owner: None,
             confirmed_version: Some(8),
             ..make_pin("node:Person", "irrelevant", 5, 6)
         };
@@ -10661,6 +10252,7 @@ node Person {
             None,
             None,
             vec![SidecarTablePin {
+                table_fork_owner: None,
                 identity: entry.identity,
                 table_key: "node:Person".to_string(),
                 table_path: table_uri.clone(),
@@ -10818,6 +10410,7 @@ node Company { age: I32? }
             None,
             vec![
                 SidecarTablePin {
+                    table_fork_owner: None,
                     identity: person_entry.identity,
                     table_key: "node:Person".to_string(),
                     table_path: person_uri,
@@ -10827,6 +10420,7 @@ node Company { age: I32? }
                     table_branch: person_entry.native_dataset_branch,
                 },
                 SidecarTablePin {
+                    table_fork_owner: None,
                     identity: company_entry.identity,
                     table_key: "node:Company".to_string(),
                     table_path: company_uri,
@@ -10979,6 +10573,7 @@ node Person { age: I32? }
             None,
             None,
             vec![SidecarTablePin {
+                table_fork_owner: None,
                 identity: entry.identity,
                 table_key: "node:Person".to_string(),
                 table_path: table_uri.clone(),

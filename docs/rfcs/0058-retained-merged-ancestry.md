@@ -13,7 +13,6 @@ supersedes: []
 superseded_by: []
 blocked_on:
   - Exact retention-policy treatment of retired native lifetimes
-  - Bounded live-branch lookup with accumulated retired native refs
   - Lance lifecycle-metadata, tag, cleanup, and recovery substrate evidence
   - Strict-format activation and compatibility evidence
 ---
@@ -37,10 +36,12 @@ if that exact base was reclaimed, it returns a typed history gap. It never
 selects an older readable base to conceal the gap. The proposal does not disable
 `cleanup --keep` or age limits on live histories.
 
-No production format, branch protocol, or retention behavior is activated by
-this draft. In particular, the pinned Lance API currently lists retired and
-live refs together. The physical-access gate below must be solved before
-activation; filtering that history-sized list in Rust is not a solution.
+Complete merged ancestry and descriptor-based snapshot continuity remain
+unactivated. Native logical retirement is implemented separately by RFC 0042
+in internal schema v8: identity-bound metadata marks stock native refs retired
+while preserving their physical ancestry. Cold logical branch enumeration
+filters the retained ref list; cached named-write admission uses its existing
+exact ref lookup. The broader cost gate below remains a draft requirement.
 
 ## Motivation
 
@@ -72,11 +73,10 @@ table-head lookup, not ancestry or physical pins. Neither its draft status
 nor the no-go result of [RFC 0025](0025-checkpoint-retention.md) authorizes a
 new retention format here.
 
-[RFC 0042](0042-incarnation-suffixed-branch-refs.md) currently makes live native
-manifest refs the branch registry and treats a removed incarnation's trees as
-garbage. This proposal would amend that lifecycle rule: a ref can be retired
-and remain physical retention state. It keeps one branch authority rather
-than adding a competing registry in the main manifest.
+[RFC 0042](0042-incarnation-suffixed-branch-refs.md) makes live native manifest
+refs the branch registry and now marks retired lifetimes in native metadata
+while preserving them for descendants. This proposal extends historical endpoint availability and
+ancestry metadata; it does not add a competing registry in main's manifest.
 
 ## User and operational behavior
 
@@ -89,7 +89,7 @@ than adding a competing registry in the main manifest.
   cleanup has reclaimed a required endpoint. A new `feature` has a different
   incarnation.
 - A branch-name read or write against the deleted branch fails. Retirement
-  does not expose an archived branch as a writable branch, and does not add an
+  does not expose a retired branch as a writable branch, and does not add an
   internal-ref addressing API.
 - Snapshot and diff authorization continues to use the commit's authored
   logical branch and existing policy actions. Retention does not grant access
@@ -179,43 +179,36 @@ gap. Defining recursive virtual merge bases is outside this proposal.
 
 ### Native lifecycle authority
 
-The `__manifest` Lance branch ref remains the only authority for a logical
-branch incarnation. Its metadata gains a versioned lifecycle payload with
-the logical name, immutable fork head, and `live` or `retired` state. The
-native `BranchIdentifier` remains the substrate lifetime witness. Native
-names retain RFC 0042's incarnation suffix. Unrecognized lifecycle versions
-fail closed; readers do not interpret a retired incarnation as a legacy live
-branch.
+Native logical retirement is implemented independently by
+[RFC 0042](0042-incarnation-suffixed-branch-refs.md), with strict internal
+schema v8. This does not activate the complete ancestry or immutable snapshot
+descriptor promises of this RFC.
 
-Creation has a recoverable preparation phase: persist a fixed control intent,
-create the uniquely named native clone through Lance, capture and persist its
-exact identifier, then publish complete `live` metadata through the public
-native API. An incomplete ref is not publicly visible. Recovery classifies it
-against the exact intent and existing native create-completion proofs. A ref
-without valid lifecycle metadata and without provable preparation ownership
-is an error, not permission to erase a possibly live tree.
+The `__manifest` ref in `_refs/branches/` remains the sole physical authority
+for a logical incarnation. Stock Lance's public `Branches::replace_metadata`
+sets `omnigraph.retired_manifest_branch`, a version-1 JSON value containing the
+exact native name and identifier. That single update publishes logical deletion
+while preserving physical history and unrelated metadata. Unsupported versions,
+unknown fields and conflicting identities fail closed.
 
-Deletion validates and settles relevant recovery while holding the supported
-schema, branch, and table control envelope. It persists an intent containing
-the expected identifier and exact before/after metadata, then changes `live`
-to `retired`. That native metadata change is the logical publication. The
-operation does not call Lance branch deletion or force-delete merely because
-the logical name has disappeared. Lost acknowledgements are classified by
-fresh metadata and identity; ambiguous or foreign changes fail closed.
+Stock `get` and `list` include retained physical refs. Engine logical helpers
+validate the marker and select only unretired refs. A named writer checks
+retirement through its existing identifier lookup; no additional normal-write
+request is introduced. Cold logical enumeration reads retained retired refs
+as well. A recreated logical name resolves to a fresh native ref, while the
+old captured handle cannot write through its retired authority.
 
-Retirement invalidates mutable branch handles. Every branch-bound reopen and
-write authority check must distinguish a retired incarnation from a live
-one even when its table versions did not change. Immutable descriptor-based
-reads may still open the retired native ref directly. Recreated names resolve
-only their new `live` incarnation; duplicate live incarnations remain an
-error. Native metadata replacement preserves unrelated metadata keys.
+The existing schema, branch and table control envelope settles recovery before
+retirement. The update checks the captured identifier and preserves unrelated
+metadata; a lost acknowledgement is classified by reading the exact marker
+back from the same physical ref. These controls retain the documented single
+mutation-process boundary; read/replace is not distributed fencing.
 
-Lance 11 exposes `Branches::replace_metadata`, but it performs an unconditional
-put. This proposal therefore retains the documented single-writer-process
-branch-control boundary and must prove its recovery envelope. It does not
-advertise a distributed CAS or fencing guarantee. Stronger multi-writer
-lifecycle semantics require separate substrate evidence and a reviewed
-protocol.
+Physical deletion remains Lance-owned. Retired refs still participate in stock
+descendant, tag and path checks. Cleanup closes the live root set over native
+dependencies, then reclaims unreferenced retired leaves.
+The descriptor, explicit-fork-head and ancestry-closure additions above still
+need their own acceptance and recovery evidence before activation.
 
 ### Reachability and physical retention
 
@@ -305,10 +298,10 @@ reclamation; it is not evidence that old damage has been repaired.
 
 ## Compatibility and reversibility
 
-This is a new durable capability even though Lance can store the metadata
-fields. Activation requires a strict internal format and recovery-version
-boundary, with the concrete numbers allocated only when acceptance and release
-scope are known. An old binary must refuse before branch control or cleanup
+Complete ancestry is a further durable capability beyond v8 native retirement.
+Its activation requires another reviewed internal-format and recovery-version
+boundary, with concrete numbers allocated when acceptance and release scope
+are known. An old binary must refuse before branch control or cleanup
 can erase retired history. No mixed-format fallback treats missing descriptors
 or lifecycle metadata as valid retained history.
 
@@ -385,8 +378,11 @@ result cardinality or a wall-clock mean alone is insufficient: count native
 list/GET/scan work, bytes, decoded rows, and high-water memory separately from
 setup and verification. With fixed live working set, growing retired history
 must not introduce a positive lookup-I/O slope. A failed required cell blocks
-activation, as in RFCs 0024 and 0025. The pinned `list_branches` API currently
-enumerates every ref and reads its contents, so this gate is presently open.
+activation, as in RFCs 0024 and 0025. The separately implemented native
+retirement uses stock Lance refs, so cold logical enumeration currently grows
+with retained retired refs. It does not satisfy this draft's stronger lookup
+cost goal. Complete ancestry still needs the cost and acceptance cells in
+this matrix.
 
 Upstream surfaces surveyed for this draft: complete Lance branch/tag format,
 tags-and-branches guide, quickstart versioning, and table versioning pages;
@@ -415,8 +411,6 @@ on older RFC substrate claims.
 - How does existing count retention apply to a retired native lifetime, and
   when can its final physical tree be reclaimed without silently weakening
   that policy? Indefinite all-ancestor retention is not the default.
-- What public Lance access shape will keep live branch lookup bounded as
-  retired refs accumulate? The current API has not met this requirement.
 - What explicit work and storage budgets should bound closure import and
   retirement metadata enumeration at the supported deployment scale? Values
   must come from the decision instruments before acceptance.

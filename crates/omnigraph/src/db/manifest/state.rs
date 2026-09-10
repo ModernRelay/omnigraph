@@ -584,6 +584,16 @@ pub(super) struct PublishScan {
     pub(super) graph_heads: HashMap<String, String>,
 }
 
+pub(super) async fn read_manifest_table_registrations(
+    dataset: &Dataset,
+) -> Result<Vec<TableRegistration>> {
+    Ok(read_manifest_scan(dataset, false)
+        .await?
+        .table_registrations
+        .into_values()
+        .collect())
+}
+
 /// One-scan read of everything the publish path needs. `collect_lineage` is
 /// always on here (the publisher resolves a parent), so the lineage JSON decode
 /// rides the same pass as the table-state assembly instead of a second scan.
@@ -731,6 +741,18 @@ async fn read_manifest_scan_with_clocks(
     fragments: Option<Vec<lance_table::format::Fragment>>,
     use_row_update_versions: bool,
 ) -> Result<ManifestScan> {
+    let historical;
+    let dataset = if super::migrations::read_stamp(dataset) == Some(7)
+        && dataset
+            .schema()
+            .metadata
+            .contains_key(super::upgrade::UPGRADE_PENDING_KEY)
+    {
+        historical = Box::pin(super::upgrade::historical_source(dataset.clone(), 7)).await?;
+        &historical
+    } else {
+        dataset
+    };
     let legacy = super::migrations::read_stamp(dataset) == Some(6);
     crate::instrumentation::record_manifest_scan();
     // Project only the columns the assembly below reads (RFC-013 PR2 #1c). The

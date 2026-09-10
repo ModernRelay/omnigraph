@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-07
-updated: 2026-09-08
+updated: 2026-09-09
 discussion: null
 supersedes: []
 superseded_by: []
@@ -105,21 +105,22 @@ publish on a branch is written on the row.
   publishes nothing (`AdoptPublish::Nothing`). A write whose pinned registration
   now wins on another native ref is refused as `ReadSetChanged`
   (`native_ref:<table>`).
-- The graph storage stamp moves from v6 to v7. Per the storage policy
-  (`docs/dev/versioning.md`: strict single version, rebuild across an
-  incompatible change) a v6 graph is refused on open with the export and rebuild
-  guidance, and this binary is refused by a newer stamp. A binary at the new
-  stamp refuses a v6 graph before reading or writing any table and names the
-  export binary; a v6 binary refuses a new-stamp graph with `upgrade omnigraph`.
-  Neither refusal changes the graph.
-- The rebuild is per branch: `omnigraph export --branch <b>` once per live
-  branch, each stream loaded into its own graph with `init` and `load`. Branch
+- The registration-clock design introduced graph storage schema v7 after v6.
+  The combined implementation uses v8 for RFC 0042's retirement metadata while
+  retaining v7's row-key meaning. The storage policy requires strict v8 normal
+  open, with explicit registered conversion or export/rebuild for older inputs.
+  [RFC 0064](0064-explicit-storage-upgrades.md) composes qualified standalone
+  v6-to-v7 registration conversion with metadata-only v7-to-v8 conversion.
+  Normal open refuses v6/v7 before table decoding; older binaries refuse the
+  new stamp. Neither refusal changes the graph.
+- The export/rebuild fallback is per branch: `omnigraph export --branch <b>`
+  once per live branch, each stream loaded into its own graph with `init` and `load`. Branch
   topology, shared ancestry, commit history and historical snapshots are not
   carried over (`docs/user/operations/upgrade.md`). The cutover quiesces
   writers, finishes recovery on the old binary before the export, builds the new
   graph at a parallel root, and never runs a mixed fleet against either root. A
-  deployment that needs its branches waits for the converter (unresolved
-  question 1).
+  qualified deployment can instead use RFC 0064's offline converter to preserve
+  branch topology and retained history.
 
 ## Design
 
@@ -280,28 +281,26 @@ rows are not written by a publish and carry `GENESIS_MANIFEST_VERSION`.
 `manifest_rows_batch` verifies every key with `manifest_version_from_object_id`;
 the scan projection list is unchanged.
 
-### Merge keeps its arms; the fold now honours them
+### Merge publishes exact source endpoints
 
-`plan_adopted_source_state` (`exec/merge.rs:3650`) keeps its arms. When the
-target does not own the registration it reads, the adopt forks and registers the
-fork ref, as today. When the source registration is on the root lineage
-(`native_dataset_branch: None`), an adopt at a lower or equal `table_version`
-registers the pointer
-`(source.published_dataset_version, None)`, and the projection now selects it
-whatever the target's previous number was.
-[PR #630](https://github.com/ModernRelay/omnigraph/pull/630)'s
-`adopt_requires_target_lineage` and the routing it selects are removed once this
-RFC lands (Rollout). `reregisters_current_entry` (`merge.rs:3714`) compares the
-physical fields as today, `native_dataset_branch` among them, so equal rows on a
-different native ref are not a re-registration and the pointer switch is
-published.
+When a table's target equals the merge base, a named target adopts the source's
+exact `native_dataset_branch`, published table version, and version metadata.
+This includes a target that currently owns a different fork. The source table
+version may be below, equal to, or above the previous target table version;
+the new registration's manifest version makes it authoritative.
 
-A pointer switch off a branch's own fork ref orphans that ref, and the branch's
-next first-touch write pays `reclaim_orphaned_fork_and_refork`
-(`table_store.rs:1296`, `table_ops.rs:1481`). The delta route of
-[PR #630](https://github.com/ModernRelay/omnigraph/pull/630) never orphans a
-ref, so this is the one job that route did which the clock does not do. This RFC
-accepts the cost.
+Main retains its target-lineage delta route for a source on a named ref.
+`reregisters_current_entry` still compares the complete physical registration,
+so an unchanged exact endpoint can be omitted. Pointer candidates still carry
+their validation delta through the shared constraint evaluator; avoiding table
+writes does not imply avoiding scans or validation.
+
+A replaced target fork can remain needed by another graph branch or by Lance
+ancestry. RFC 0042's unique table-fork names let a later first-touch write create
+a fresh ref from the adopted exact version without inspecting or reclaiming
+the old ref. Explicit cleanup reclaims unused forks after its full protection
+proof. The base manifest version in a fork name describes preparation and does
+not replace this RFC's publication order.
 
 ### Worked example (the lower-number case, table `Knows`)
 
@@ -359,23 +358,19 @@ Deny-list: none touched. Support boundary: unchanged.
   Lance data version to the manifest version: an incompatible manifest shape,
   since a v6 row key decoded by v7 would read a data version as a clock.
   `INTERNAL_MANIFEST_SCHEMA_VERSION` and `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`
-  move together (`migrations.rs:70`, `:80`); v6 graphs are refused with the
-  export and rebuild message. The stamp moves to v7: the abandoned v7 to v19
-  stamps of the MemWAL experiment never shipped
-  (`docs/dev/versioning.md:29`), `release_for_internal_schema_version` already
-  maps v6, and only the ceiling message and the docs rows
-  (`docs/dev/versioning.md`, `docs/user/operations/upgrade.md`,
-  `docs/dev/recovery.md`, `docs/dev/writes.md`, `docs/dev/testing.md`) change.
-  v6 is a released format, the
-  0.9.x and 0.10.x line, so every existing deployment pays the rebuild described
-  under user behavior.
+  move together; v6/v7 graphs are refused by normal open. This clock was
+  introduced at v7; the current combined implementation uses v8 because RFC
+  0042's native-ref retirement also changes storage interpretation. RFC 0064
+  qualifies explicit offline v6 → v7 → v8 and v7 → v8 routes without widening
+  serving admission. The rejected MemWAL experiment's v7 to v19 stamps never
+  shipped and remain unsupported inputs (`docs/dev/versioning.md`).
 - **Converter.** `__manifest` is created with `enable_stable_row_ids: true`
   (`db/manifest/graph.rs:138`), so Lance's `_row_last_updated_at_version`
   system column holds, for every existing row, the manifest version that last
-  wrote it. A standalone one-shot converter could derive `manifest_version`
-  and re-key `object_id` from it without an in-place migration dispatcher
-  (the shape `migrations.rs` reserves for such a tool). Not required by this
-  RFC.
+  wrote it. RFC 0064's v6-to-v7 handler derives registration clocks from pinned
+  source provenance, retaining old snapshots with explicit v6 decoding. Its
+  owned pending intent, receipts and main-last activation preserve retry
+  ownership across the composed v8 route.
 - **Wire.** Unchanged: no response field is added or re-typed, and the 409
   payload's `expected_published_dataset_version` and
   `actual_published_dataset_version` keep their meaning.
@@ -396,7 +391,7 @@ Deny-list: none touched. Support boundary: unchanged.
 | Alternative | What it is | Why not |
 |---|---|---|
 | Do nothing | keep number ordering | the three defects in Motivation, one of them silent row loss |
-| [PR #630](https://github.com/ModernRelay/omnigraph/pull/630)'s routing predicate | `adopt_requires_target_lineage` sends any adopt with `source ≤ target` number through the target-lineage delta writer, so the registered number always grows on the target | correct today, but the order is a rule every registering path must keep, not a property of the row; the equal-number case pays a data write for a pointer move; the equal-number pin gap in the precondition stays. Its one advantage over this RFC: the delta route never orphans the target's own fork ref, where the pointer switch does and charges the next first-touch write a `reclaim_orphaned_fork_and_refork`, a cost this RFC accepts |
+| [PR #630](https://github.com/ModernRelay/omnigraph/pull/630)'s routing predicate | `adopt_requires_target_lineage` sends any adopt with `source ≤ target` number through the target-lineage delta writer, so the registered number always grows on the target | correct today, but the order is a rule every registering path must keep, not a property of the row; the equal-number case pays a data write for a pointer move; the equal-number pin gap in the precondition stays. the pointer route can leave an old fork for explicit cleanup, while RFC 0042's unique names keep reclamation off the next write |
 | Order by Lance's `_row_last_updated_at_version` on `__manifest`, keep the current key | stable row ids are on, so the value exists for every row | the row key still collides on equal numbers, so the handoff replacement stays. That replacement does order correctly: with the guard removed, `when_matched(UpdateAll)` stamps the replaced row with the publishing version and this order wins both merge cases (`lance_version_columns.rs:212`). It is rejected for its consequences instead: a replaced row disappears from the delta fold and from the row-immutability argument of Invariant 8, and every fold must project a Lance system column |
 | Re-key only: `object_id` on `(identity, table_version, table_branch)`, keep number ordering | removes the collision and the handoff arm | the lower case still loses: `(4, None)` at a lower number than `(5, f)` stays invisible; and the equal-number tie stays, since the fold's `>=` keeps whichever row the scan yields first |
 | Re-key on `(identity, table_version, table_branch)` and order the fold by `_row_last_updated_at_version` | the two rows above combined, each dismissed by the defect the other fixes | it fixes all three defects with no new column and no stamp, so it wins on compatibility and loses on authority: the logical fold would take its order from a Lance physical system column (the invariants' governing principle, nearest deny-list item "a logical precondition based on ... staged layout"), the column's value under `__manifest` in-place rewrite (`manifest.rs:1316`) is unverified, and inherited fragments carry Lance-owned stamps |
@@ -432,11 +427,11 @@ side record".
   the HEAD assertion holds (a pointer switch writes no data).
 - Cross-version, the storage axis this stamp bump owes:
   `crates/omnigraph-cli/tests/crossversion_upgrade.rs`
-  `current_v7_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v7` (skips unless
+  `current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8` (skips unless
   `OMNIGRAPH_V6_BIN` names a released 0.10.x binary): the new binary refuses a
   v6 graph naming the export binary, the old binary refuses the new stamp, and
   an export rebuilds with row, vector and blob fidelity;
-  `migrations.rs` keeps its stamp tests at v7.
+  `migrations.rs` checks the current v8 stamp, including refusal of v7.
 - GQ logic tests (`.gqt`, `crates/omnigraph-gqt/cases/`), all carried by this
   PR: `merge_adopt_lower_source_version_keeps_edges.gqt` and
   `merge_adopt_equal_source_version_collides.gqt` (red on `main` before this
@@ -479,25 +474,27 @@ side record".
 
 1. This RFC and its implementation ship in one PR, based on `main` with
    [PR #630](https://github.com/ModernRelay/omnigraph/pull/630) merged: the row key,
-   the `DatasetEntry` field, projection, stamp bump to v7, the
+   the `DatasetEntry` field, projection, v7 row-key semantics under the current
+   v8 stamp required by RFC 0042's native retirement, the
    batch-duplicate refusal, the collision guard and handoff arm removed, the
    pin's native ref, the read-side `manifest_internal` refusals, the RFC 0028
    amendment, the `docs/dev/versioning.md` and
    `docs/user/operations/upgrade.md` rows, the release note, and the tests
    above. It also renames the local `manifest_version` in `repair.rs:198`,
    which holds a Lance data version and collides with the clock's name. A stamp
-   bump is a cutover, so the pieces cannot ship separately. The release that
-   carries it names this RFC as the sole reason for the rebuild unless another
-   stamp bump is planned for it.
+   bump is a cutover, so the pieces cannot ship separately. The release names
+   both this registration-clock change and RFC 0042's retirement metadata as
+   storage changes requiring explicit conversion or the export/rebuild fallback.
 2. Ordering against [PR #630](https://github.com/ModernRelay/omnigraph/pull/630):
    that PR landed first (2026-09-08), so this PR removes
    `adopt_requires_target_lineage`, the routing it selects, its
    `docs/dev/merge.md` paragraphs and release-note entry, and re-asserts its
    `branching.rs`, `merge_fast_forward.rs` and `failpoints.rs` tests under the
    clock: an adopt at or below the target's number registers the source's
-   version as a pointer switch, or as a fork onto the target's ref when the
-   target does not own one, and stages no rows. The fork arm's next write is
-   a known gap (Decision log, 2026-09-08).
+   exact endpoint as a pointer switch on named targets and stages no rows.
+   A later first-touch write creates a unique fork under RFC 0042; the
+   historical fork/index gap remains recorded below and requires regression
+   evidence for the new route.
 3. Optional: the one-shot converter, if a graph that cannot be rebuilt by
    export and load appears.
 
@@ -506,9 +503,9 @@ On maintainer approval `status` moves to `accepted` in this PR;
 
 ## Unresolved questions
 
-1. Converter in scope, or rebuild-only per the pre-release contract. Decider:
-   the release owners; forced by the first deployment that cannot rebuild by
-   export. Until then rebuild-only.
+1. The original rebuild-only scope is amended by RFC 0064's qualified explicit
+   routes. Its remaining backend, cluster and acceptance gates govern further
+   expansion; export/rebuild remains the fallback for unsupported inputs.
 
 ## Decision log
 
@@ -527,3 +524,8 @@ On maintainer approval `status` moves to `accepted` in this PR;
   is itself on a branch ref, so the arm stays and the lazy-target test stops
   after its reads. Follow-up: the merge's index handling after a fork from a
   branch ref.
+- 2026-09-09: RFC 0042 now separates table-fork names from graph-branch native
+  refs and records ownership in `TableVersionMetadata.table_fork_owner`.
+  Named targets adopt source pointers even when they own a fork, and later
+  writes allocate fresh names. Cleanup handles unused forks. Publication order
+  remains the graph branch's manifest version.

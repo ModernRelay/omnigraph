@@ -518,6 +518,7 @@ where
         let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
         let planned = pre_minted_schema_transaction(0);
         recovery_pins.push(crate::db::manifest::SidecarTablePin {
+            table_fork_owner: None,
             identity,
             table_key: table_key.clone(),
             table_path: db.storage().dataset_uri(&table_path),
@@ -570,6 +571,7 @@ where
         }
         let planned = pre_minted_schema_transaction(entry.published_dataset_version);
         recovery_pins.push(crate::db::manifest::SidecarTablePin {
+            table_fork_owner: None,
             identity,
             table_key: table_key.clone(),
             table_path: db.storage().dataset_uri(&entry.dataset_path),

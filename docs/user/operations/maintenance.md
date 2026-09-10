@@ -5,7 +5,7 @@ OmniGraph provides four direct-storage maintenance commands:
 - `optimize` compacts data and reconciles declared indexes.
 - `rebuild-full-text-indexes` replaces full-text indexes on one branch.
 - `repair` classifies storage drift and can publish an approved repair.
-- `cleanup` permanently removes old versions.
+- `cleanup` permanently removes eligible old versions and unused table forks.
 
 They do not run through the HTTP server. Address a standalone graph directly,
 or select a graph from a cluster root:
@@ -28,7 +28,8 @@ omnigraph optimize ./graph.omni --json
 
 Optimize rewrites small fragments into fewer larger fragments, refreshes scalar
 and vector coverage, and builds missing declared indexes that are ready to build. It does not
-delete old versions, so snapshots and retained history remain available.
+delete old versions or collect unused table forks. Use `cleanup` for storage
+reclamation.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -113,8 +114,11 @@ or backup.
 
 ## Cleanup
 
-Cleanup permanently removes old versions from the backing datasets for node and
-edge types, plus data reachable only through those versions. Without
+Cleanup collects unused table forks and permanently removes eligible old
+versions from node and edge datasets, plus data reachable only through those
+versions. Branch deletion and later writes leave reclamation to this command.
+Forks still needed by a live branch or its underlying history remain protected,
+even if their original branch no longer uses them. Without
 `--confirm`, the CLI only echoes the requested retention policy and exits before
 opening the graph; it does not enumerate candidate versions:
 
@@ -132,13 +136,17 @@ At least one retention option is required:
 
 | Option | Meaning |
 |---|---|
-| `--keep N` | Request retention of the newest `N` versions per node or edge type |
-| `--older-than DURATION` | Remove only versions older than the duration |
+| `--keep N` | Request retention of the newest `N` versions per retained node or edge dataset |
+| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff |
 
 When both are present, a version must be outside both retention windows before
 it can be removed. Live branches and other storage references may keep
-additional versions. `--keep 10` is a conservative starting point; choose a
-policy that matches your rollback and audit needs.
+additional versions. The count applies to dataset versions, not graph commits,
+and does not retain unused forks indefinitely. With `--keep` alone, an unused
+fork can be collected immediately. An explicit `--older-than` also protects the
+entire fork until every data and branch-reference object is older than the
+cutoff. Deleting a branch starts a fresh grace period for its retained history,
+even when that history is old. Choose a policy that matches your rollback and audit needs.
 
 For `s3://` and `az://` targets, destructive execution also requires an
 interactive confirmation or `--yes`. Non-interactive and JSON runs refuse

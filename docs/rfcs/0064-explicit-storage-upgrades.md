@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Azim Afroozeh
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-10
 discussion: null
 supersedes: []
 superseded_by: []
@@ -26,18 +26,19 @@ blocked_on:
 Extend `omnigraph upgrade` to select developer-written
 ***migration handlers***, code for named conversions with declared inputs,
 outputs, prerequisites, checks, effects, validation, and recovery.
-Start with internal v6 to v7 registration metadata ([RFC 0062](0062-manifest-version-clock.md));
+Compose internal v6 to v7 registration metadata ([RFC 0062](0062-manifest-version-clock.md))
+with metadata-only v7 to v8 retirement admission ([RFC 0042](0042-incarnation-suffixed-branch-refs.md));
 reuse table data only where its meaning and references remain valid.
 Later handlers can cover [RFC 0040](0040-system-column-namespace.md)'s system
-columns and settled fork ownership. Arbitrary conversions are unsupported;
-the default is fast, in-place migration that appends metadata and reuses table
+columns and separately qualified historical fork-ownership conversion. Arbitrary
+conversions are unsupported; the default is fast, in-place migration that appends metadata and reuses table
 data. Publication and recovery still require proof; reclamation runs later.
 
 ## Motivation
 
-Today's [versioning policy](../dev/versioning.md) refuses incompatible graphs
-and requires export/import, preserving exported entities but restarting commit
-history, snapshots, and shared branch ancestry. RFC 0062 identifies a metadata
+Normal open under the [versioning policy](../dev/versioning.md) refuses
+incompatible graphs. Export/import preserves exported entities but restarts
+commit history, snapshots, and shared branch ancestry. RFC 0062 identifies a metadata
 converter using `_row_last_updated_at_version`; RFC 0040 specifies a recoverable
 explicit upgrade. Extend that entry point to cover both without conflating their protocols.
 
@@ -52,14 +53,16 @@ Proposed migration behavior and options for `omnigraph upgrade`:
 
 ```text
 omnigraph upgrade <graph>
-omnigraph upgrade <graph> --check --to-format 7 --json
-omnigraph upgrade <graph> --to-format 7 --json
+omnigraph upgrade <graph> --check --to-format 8 --json
+omnigraph upgrade <graph> --to-format 8 --json
 ```
 
 The binary selects registered handlers from the stored format/capabilities to
 one declared default target, independent of its serving range and release
-number. `--to-format` overrides the target, never names a handler; v7 can stop
-before system-column conversion. The default does not adapt to the graph.
+number. The current default is v8. `--to-format` overrides the target, never
+names a handler: explicit v7 stops after registration conversion for a
+v7-compatible executable, while normal open in the current binary still requires
+v8. The default does not adapt to the graph.
 Missing steps, cycles, ambiguous routes, and unimplemented handlers block
 execution before effects. Numeric adjacency proves no route: graph format,
 schema IR, and recovery format are separate compatibility axes.
@@ -73,7 +76,10 @@ schema IR, and recovery format are separate compatibility axes.
 
 An online check is advisory: it proves neither converted-output correctness
 nor future availability and never authorizes serving with the target binary.
-`--check` may report recovery actions but cannot perform them.
+`--check` may report recovery actions but cannot perform them. A v6 → v8 check
+cannot inspect the future converted v7 output: `work.deferred_checks` names those
+output-dependent checks, which execution must run before the v7 → v8 handler's
+effects. A passing check does not imply those deferred checks have passed.
 
 | Outcome | Meaning | Exit |
 |---|---|---|
@@ -107,9 +113,10 @@ policy, or runtime ownership. Refuse that route until implemented and tested.
 
 Use compiled concrete handler functions, sharing admission, planning, reporting,
 and results. Developers supply rules and tests; the binary selects rather than
-invents conversions. A v6 graph targeting v7 selects its registered v6 to v7
-handler; longer routes require every declared prerequisite. Compatible releases
-need no new handler. No plugins, third-party scripts, schema-diff language, or
+invents conversions. A v6 graph targeting v8 selects protocol 1 (v6 to v7),
+then protocol 2 (v7 to v8). A v7 graph selects only protocol 2. Explicit target
+v7 selects only the first handler when required; longer routes require every
+declared prerequisite. Compatible releases need no new handler. No plugins, third-party scripts, schema-diff language, or
 generic migration ledger/scheduler. Share recovery only when effect identities
 and publication rules match. Durable graph state and owned recovery establish
 completion; progress reports and early-fence target stamps cannot establish it alone.
@@ -247,6 +254,30 @@ backup is established; preflight and results enumerate exclusions. Identical
 descriptors do not prove byte preservation. Required shared Lance files cannot
 use this exclusion.
 
+### v7 to v8 and route composition
+
+The v7-to-v8 handler preserves registration rows, table pointers, commit IDs and
+historical locators. It changes only manifest configuration through the sealed
+publication gateway; no table data or registration keys are rewritten. Retained
+v7 snapshots keep their original interpretation. This handler enables the v8
+retirement contract without retiring a branch or inferring legacy fork ownership.
+
+Protocol 2 retains all-branch admission, an owned pending intent on main,
+per-branch publication receipts and main-last activation. Every branch must
+validate before main clears the pending intent. The current binary refuses v7
+before conversion and any pending state during conversion. Current v8 no-op
+admission validates retirement markers and excludes valid retired refs from
+logical branch enumeration while preserving their physical ancestry. Source
+v6/v7 admission refuses any reserved retirement metadata, including a marker
+that would be valid under v8; conversion cannot legitimize ambiguous source state.
+
+Protocol 1 remains exactly the v6-to-v7 protocol above. Existing pending attempts
+retain their source, target, attempt identity and receipts. A request for v8
+finishes that owned v7 target before starting protocol 2; it never reinterprets
+the earlier pending intent as a v8 attempt. A later-step failure does not undo
+v7 activation. Explicit target v7 stops there, and cannot downgrade a pending
+v7-to-v8 attempt. Normal serving still requires v8 after the complete route.
+
 ### Later handlers
 
 RFC 0040 owns main-only admission, preflight, `SchemaApply` recovery, and ordered
@@ -257,7 +288,8 @@ stamp fence precludes a universal stamp-last rule.
 Fork conversion requires an accepted ownership representation and durable proof
 of existing ownership. Never infer it from plausible names, recreate missing
 incarnations, or assign current ownership to historical borrowers. Ambiguity
-refuses. Format number and ordering remain unassigned, not automatically v7 to v8.
+refuses. Rewriting historical fork ownership remains a separate conversion;
+the registered v7-to-v8 handler introduces retirement interpretation only.
 
 ## Invariants
 
@@ -283,9 +315,10 @@ required dependencies and declared external-byte exclusions. Retained old object
 in the same root do not by themselves provide rollback after activation or fencing. Plan explicitly for post-cutover writes absent from that backup.
 Later-handler failure never automatically undoes completed handlers.
 
-Acceptance amends rebuild-only policy for qualified routes while retaining the
-fallback. Coordinate policy/RFC 0062 and RFC 0040 command wording when implemented;
-current user docs must not advertise this unimplemented draft.
+Qualified registered routes amend rebuild-only policy while retaining the
+fallback. User guidance and the support matrix name only implemented, qualified
+routes; unqualified backends, cluster entry points and later handlers remain
+excluded while this RFC's acceptance gates are open.
 
 ## Alternatives
 
@@ -390,8 +423,8 @@ enforcement itself.
    recovery, safe deferred cleanup, and genuine v6-binary compatibility.
 2. Qualify the production handler against the full matrix on every advertised
    backend; prototype acceptance does not replace shipping evidence.
-3. Ship check and qualified v6 to v7 execution with upgrade/versioning guidance,
-   required compatibility CI, and genuine-binary evidence. Check may ship earlier
+3. Ship check and qualified v6 → v7 → v8 and v7 → v8 execution with
+   upgrade/versioning guidance, required compatibility CI, and genuine-binary evidence. Check may ship earlier
    only if execution unavailability is explicit.
 4. Integrate RFC 0040 and settled fork handlers under their own gates; refuse unsupported
    chains before effects.

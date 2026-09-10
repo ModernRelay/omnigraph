@@ -16,9 +16,9 @@ version axes. Never derive one axis from another.
 
 ## Current storage contract
 
-Normal graph open and new writes require **internal manifest schema v7**.
+Normal graph open and new writes require **internal manifest schema v8**.
 `INTERNAL_MANIFEST_SCHEMA_VERSION` and `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`
-are both 7.
+are both 8.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -32,17 +32,26 @@ are both 7.
   the `__manifest` version that wrote the row, and a table's current
   registration is the one with the greatest manifest version, not the greatest
   per-native-ref Lance version.
+- v8 preserves v7's registration clock and adds logical retirement metadata
+  on native graph refs ([RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md)).
+  Branch deletion retains exact native parent history while removing logical
+  branch authority. Older binaries do not interpret this metadata and could
+  expose retired branches; they must refuse v8 graphs before reading or
+  reclaiming their storage. Qualified v7 graphs have an explicit metadata-only
+  upgrade to v8.
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
-  and were never migration inputs; v7 is reused by RFC 0062. A graph stamped
-  v8–v19 by that experiment is refused as a future stamp; the refusal's
-  "upgrade omnigraph" advice cannot be satisfied for it, and such a graph is
-  rebuilt from an export taken with the build that wrote it.
+  and are not supported migration inputs. Reuse of a numeric stamp by another
+  design does not make an experimental graph compatible. Such graphs require
+  export with the build that wrote them and rebuild at a fresh root.
 
 Normal open refuses lower and higher stamps before recovery or table decoding.
-`omnigraph upgrade` explicitly converts supported standalone v6 graphs to v7.
-It preserves original retained snapshots and decodes their v6 registrations
-explicitly after main-root admission. A pending upgrade marker refuses normal
-opens until every branch validates and main activation completes.
+`omnigraph upgrade` defaults to v8: qualified standalone v6 graphs run the
+registered v6 → v7 → v8 route, and qualified v7 graphs run v7 → v8.
+Original retained snapshots remain unchanged; historical v6 registrations use
+an explicit legacy decoder after main-root admission. A pending upgrade marker
+refuses normal opens until every branch validates and main activation completes.
+Explicit `--to-format 7` retains the intermediate target for a v7-compatible
+executable; the current binary still refuses normal open of that result.
 See [RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) for the offline protocol.
 
 ## Recovery version
@@ -56,8 +65,10 @@ or lower it to match v6. See [recovery.md](recovery.md).
 
 ## Lance contract
 
-The workspace resolves the complete Lance package family to **11.0.0** and
-explicitly writes stable data storage version **V2_2**. A dependency bump alone
+The workspace resolves the unmodified crates.io Lance package family to
+**11.0.0** and explicitly writes stable data storage version **V2_2**.
+Engine adapters and compatibility boundaries are documented in
+[lance.md](lance.md). A dependency bump alone
 does not change the OmniGraph manifest format. Adopting a new Lance file format
 or a behavior that changes persisted graph meaning does.
 
@@ -66,9 +77,14 @@ Current compatibility fences and the required upstream reading set are in
 
 ## Registered conversion and rebuild fallback
 
-The registered v6-to-v7 handler appends manifest metadata and retains table
-files, branch ancestry, commit IDs and historical locators. Operators must stop
-all writers and maintenance and preserve a restorable backup before execution.
+The registered v6-to-v7 handler converts registration metadata; v7-to-v8 only
+changes manifest configuration metadata. Both retain table files, branch
+ancestry, commit IDs and historical locators. A pending v6-to-v7 attempt keeps
+its original protocol, target and ownership until it completes; a request for
+v8 then runs the next handler. Read-only checks of v6-to-v8 report output-dependent
+checks for the second handler as deferred, and execution runs them before its
+effects. Operators must stop all writers and maintenance and preserve a
+restorable backup before execution.
 Cluster-managed conversion is refused until its admission protocol is qualified.
 
 Other source formats still require export with the source executable, fresh
@@ -86,12 +102,18 @@ required cases fail the job. The binaries are version-checked before fixture
 creation. Branch naming without a post-fork logical-name witness is refused;
 see the [admission limits](../user/operations/upgrade.md).
 
-| Source executable / format | Normal open | Explicit route | Required case in `crossversion_upgrade.rs` |
+| Source executable / format | Normal open | Default explicit route | Required coverage owner |
 |---|---|---|---|
-| 0.9.0 / v6 | Refused | v6 → v7 | `genuine_v09_explicit_storage_upgrade_preserves_history` |
-| 0.10.0 / v6 | Refused | v6 → v7 | `genuine_v010_explicit_storage_upgrade_preserves_history` |
-| Current / v7 | Accepted | Already-current no-op | Both migration journeys, after conversion |
-| Older or unknown / not v6 or v7 | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
+| 0.9.0 / v6 | Refused | v6 → v7 → v8 | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history` |
+| 0.10.0 / v6 | Refused | v6 → v7 → v8 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
+| Qualified development / v7 | Refused | v7 → v8 | Engine storage-upgrade tests: metadata-only conversion, history and retry |
+| Current / v8 | Accepted | Already-current no-op | Both predecessor journeys after conversion; engine retired-ref admission tests |
+| Older, future or unqualified experimental format | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
+
+Source v6/v7 admission rejects any reserved native-ref retirement metadata.
+Current v8 no-op admission validates retirement markers and excludes valid
+retired refs from the logical branch census while preserving physical ancestry.
+An active v7-to-v8 attempt cannot be resumed as target v7.
 
 These journeys cover local standalone roots. Object-store backend qualification
 and deployment branch-protection configuration require their own environment

@@ -28,6 +28,14 @@ pub(crate) fn native_branch_name(logical: &str, incarnation: &str) -> String {
     format!("{logical}.{incarnation}")
 }
 
+/// Name one table fork using the accepted base and the existing commit identity.
+/// The name describes an attempt; publication order comes from the manifest.
+/// Ownership is recorded in table-version metadata, never inferred from this text.
+pub(crate) fn table_fork_name(owner: &str, base_manifest_version: u64, commit_id: &str) -> String {
+    let incarnation = split_native_branch_name(owner).1.unwrap_or("legacy");
+    format!("fork.{incarnation}.m{base_manifest_version}.{commit_id}")
+}
+
 fn is_incarnation(candidate: &str) -> bool {
     candidate.len() == INCARNATION_LEN
         && candidate.bytes().all(|byte| {
@@ -115,6 +123,28 @@ mod tests {
             ("feature/x", Some(incarnation.as_str()))
         );
         assert_eq!(logical_branch_name(&native), "feature/x");
+    }
+
+    /// GQT cannot supply u64::MAX manifest versions or legacy native-owner strings.
+    #[test]
+    fn table_fork_names_bound_encoded_paths_for_native_and_legacy_owners() {
+        let incarnation = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let commit = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let next_commit = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        for logical in ["a".repeat(175), "équipe/data/topic".to_string()] {
+            for owner in [logical.clone(), native_branch_name(&logical, incarnation)] {
+                let name = table_fork_name(&owner, u64::MAX, commit);
+                assert!(name.is_ascii());
+                assert!(!name.contains('/'));
+                assert!(
+                    name.len() <= 80,
+                    "bounded ref leaves room for local temporary suffixes"
+                );
+                lance::dataset::refs::check_valid_branch(&name).unwrap();
+                assert_eq!(name, table_fork_name(&owner, u64::MAX, commit));
+                assert_ne!(name, table_fork_name(&owner, u64::MAX, next_commit));
+            }
+        }
     }
 
     #[test]

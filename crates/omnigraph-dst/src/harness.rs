@@ -673,8 +673,8 @@ pub struct Scenario {
     /// for the hunt's per-op attribution), this answers the census question
     /// "did ANY execution in this universe walk the line" — and it composes
     /// with a REAL `crash_on_match` setup crash, which is how the
-    /// orphan-reclaim windows (classify.fresh_read, fork.before_reclaim)
-    /// and the recovery.* internals get their preconditions built.
+    /// recovery.* internals get their preconditions built. Cleanup workloads
+    /// obtain unused forks through ordinary branch deletion.
     pub probe_window: Option<&'static str>,
     /// SENSITIVITY KNOB (test-only red proof): force
     /// the maintenance-obligation RERUN to fail through a real engine
@@ -779,13 +779,7 @@ enum Milestone {
 
 const MILESTONE_BRANCH: &str = "mstone";
 
-/// The milestone sequence for a target window: window-specific recipes first
-/// (preconditions named from the engine sites), then the family
-/// default. Empty = not milestone territory (schema is quarantined; init/open
-/// are owned by birth universes). The recovery.* internals and the
-/// orphan-reclaim windows (classify.fresh_read, fork.before_reclaim) DO get
-/// steps here — theirs build the PRIMARY crash's precondition; the census
-/// pairs them with a real setup crash (`census_setup` in the instrument).
+/// Return the setup milestones that reach a target failpoint window.
 fn milestone_steps(window: &str) -> Vec<Milestone> {
     use Milestone::*;
     // Window-specific recipes (2026-08-12).
@@ -800,25 +794,8 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         | "fork.post_create_pre_open" => {
             return vec![EnsureBranch, DataOnBranch];
         }
-        // Orphan-ref territory: the census crashes the branch delete at
-        // `before_table_cleanup`, whose injected failure the engine SWALLOWS
-        // (branch gone, per-table fork refs leak — omnigraph.rs's own doc
-        // names the cleanup reconciler as the backstop). Then:
-        // - a cleanup walks the leaked refs (reconcile_fork + the
-        //   classify fresh-authority read);
-        // - re-creating the branch and writing to it collides with the
-        //   leaked ref on the write path (reclaim_orphaned_fork_and_refork).
         "classify.fresh_read" | "cleanup.reconcile_fork" => {
             return vec![EnsureBranch, DataOnBranch, DeleteBranch, CleanupMain];
-        }
-        "fork.before_reclaim" => {
-            return vec![
-                EnsureBranch,
-                DataOnBranch,
-                DeleteBranch,
-                EnsureBranch,
-                DataOnBranch,
-            ];
         }
         // Merge whose delta carries a DELETE — the rewrite-with-deletes
         // route. The MutateMain runs BEFORE the branch is cut so the branch
