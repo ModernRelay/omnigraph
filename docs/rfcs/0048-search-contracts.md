@@ -56,6 +56,9 @@ keeps this a single typed graph language. It specifies extension boundaries
 without requiring every future operator now. The current sketches' implicit
 last-source output remains provisional; explicit block output and a shared
 expression grammar must be resolved before the public syntax is frozen.
+The [query capability matrix](#query-capability-matrix) separates existing
+support, this RFC's release requirements, deferred extensions and the remaining
+scope decisions. Use it to review language coverage before committing to syntax.
 
 The immediate problem is correctness. Today, the same text can match before an
 index is built and stop matching afterward; fuzzy indexed and uncovered rows
@@ -670,17 +673,9 @@ budgets. A new optimization or projection cannot reinterpret one count as
 another. Extending final-limit parameters is additive to existing literal
 queries; it does not make limits row-dependent.
 
-These future capabilities fit the same core and may be deferred independently:
-
-| Future capability | Consistent extension point | Semantics that must remain explicit |
-|---|---|---|
-| Optional graph enrichment | Graph-pattern/stage operator | Preserve unmatched incoming bindings; export nullable new bindings; distinguish predicates inside the optional scope from later filters. |
-| Existence without fan-out | Correlated pattern predicate | Test whether a match exists without multiplying outer rows; keep ordinary traversal multiplicity unchanged. |
-| Reusable parent-level features and bounded evidence lists | Intermediate grouping/reduction over graph bindings | Name the new target/group identity, reduce child features explicitly, bound retained evidence, and establish fresh ranks before fusion. |
-| Global all-node discovery | Typed binding union, snapshot-resolved type scope and type narrowing | Preserve original type/entity identity and define legal common/type-specific projections; searchable representations remain separate from node-type scope. |
-| Top-N inside each group or row-dependent retrieval | Explicit partitioned/correlated source operator | Define each source population and query input, empty-group behavior and a shared total budget. This is not global top-K followed by `take`. |
-| Reranking or richer lexical queries | Typed scoring stage and typed lexical-query variants | Declare input population, output domain, missing-value behavior and semantic version; retain the same terms consumer distinction. |
-| Branch reuse and bounded subqueries | Lexically scoped stage inputs/outputs | Name the reused population and snapshot; no implicit reuse of stale candidate arms or re-execution with fresh defaults. |
+The [query capability matrix](#query-capability-matrix) records the future
+operators and their extension boundaries. They can be added independently
+without redefining graph identity, source membership or ordinary projection.
 
 Some narrower workflows already compose: `take` can select parent bindings
 using an explicit reduction of child metrics within each target/group pair.
@@ -720,6 +715,210 @@ transitions that reject discarded metrics. Record each deferred workflow as
 either expressible through existing operators or requiring a named extension
 with the contract above. These are design/compatibility gates, not a requirement
 to implement every future operator in the initial release.
+
+### Query capability matrix
+
+This inventory covers the current public `.gq` surface, the initial release
+described by this RFC, and the general graph/query/retrieval extensions the
+grammar must leave room for. It separates language support from implementation
+evidence; parser acceptance and native substrate support alone are insufficient.
+It is a review checklist, not a promise to implement every conceivable query
+operator or every future row in the initial release.
+
+**Current** describes the production path in this PR's source baseline, not
+the test-only staged parser or the archived integration prototype. `Limited`
+means a narrower capability or a known correctness gap, described in the cell.
+The four [GQT search regressions](#ci-checkpoint-and-regression-disposition)
+remain open. **RFC release** uses these dispositions:
+
+- `Keep`: preserve the existing operation and its meaning.
+- `Deliver`: required for the coordinated release, subject to its stated gates.
+- `Replace`: an existing surface migrates to the new contract at the cutover.
+- `Foundation`: fix the shared grammar/type/scope rules now; the broader
+  user-facing operator remains deferred.
+- `Defer`: outside the initial implementation; preserve the stated extension.
+- `Decision`: Phase 0 must explicitly include or defer it before release scope
+  is frozen. It is not currently a delivered capability.
+- `Separate`: an adjacent capability governed by its own contract, not a new
+  search feature.
+
+The last column states what can be added later and what the syntax must
+preserve. Examples such as `yield`, `group`, `collect` and nested object
+construction discussed during design are illustrative; this matrix does not
+accept their spelling, introduce a general scalar-variable declaration, or
+change the three tested RFC query sketches.
+
+#### Declarations, expressions and scope
+
+| Capability | Current | RFC release | Future extension / syntax constraint |
+|---|---|---|---|
+| Named queries; multiple query declarations per file | Yes | Keep | Query-body extensions retain the declaration and invocation model. |
+| Typed required and nullable parameters | Yes; scalar, list and vector forms; nullable omission accepted | Keep | Relation/object parameters would need separate type and transport contracts; a list is not implicit query batching. |
+| Stored-query tool metadata | Yes; `@description` and `@instruction` | Keep | Metadata describes the same query; it does not carry hidden execution semantics. |
+| Literals, parameters, property values, `date`, `datetime`, `now` | Yes, with current context restrictions | Keep | New expression variants preserve existing types, time semantics and literal parsing. |
+| One shared expression model across stages | Limited; fixed expression variants and context-specific handling | Foundation | Deliver shared parsing/typing for admitted expressions, including metrics; this does not deliver every scalar function below. |
+| Scalar comparison, exact String prefix/substring and list membership | Yes | Keep | Exact String behavior remains case-sensitive; `contains` on a list remains membership. |
+| General scalar Boolean composition and negation | Limited; match conditions conjoin and graph `not` tests pattern absence | Foundation | Add typed Boolean expressions with fixed precedence and null rules; graph absence keeps its correlation semantics. |
+| Explicit null tests/replacement, conditionals, arithmetic, casts and general scalar functions | No general surface | Foundation | Extend shared expressions through typed signatures; preserve overflow, null and score-domain rules. |
+| Intermediate named computations/projection | No | Defer | Add a stage with explicit value bindings and exports; specify whether it retains or drops incoming bindings. |
+| Result aliases used in final ordering | Yes | Keep | Result aliases remain distinct from graph parameters/bindings and source aliases. |
+| Reusing an earlier result alias in another projection | No; production rejects `T36` | Foundation | Decide alias scope explicitly before relaxing this rule; shared expression parsing alone is not alias reuse. |
+| Nested scopes, reusable query branches and bounded subqueries | Limited; correlated graph negation only | Defer | Declare imports, exports, shadowing, snapshot and shared budgets; distinguish reuse from re-execution. |
+| User-defined functions or query-valued parameters | No | Separate | If justified later, define typed namespaces, versioning and execution limits; arbitrary evaluation is not an initial requirement. |
+
+#### Graph matching and identity
+
+| Capability | Current | RFC release | Future extension / syntax constraint |
+|---|---|---|---|
+| Concrete typed node scans and inline property constraints | Yes | Keep | New type selectors must not reinterpret an existing concrete type. |
+| Directed traversal and binding joins within `match` | Yes | Keep | Preserve endpoint-pair versus edge-instance multiplicity and graph eligibility. |
+| Undirected traversal | Yes, between the same endpoint type | Keep | Preserve orientation and duplicate rules when extending edge-pattern syntax. |
+| Single-hop edge bindings and edge-property access | Yes | Keep | Node and edge kinds remain distinct even when names or ids coincide. |
+| Bounded multi-hop reachability | Yes; shortest-distance semantics, no bound path/edge sequence | Keep | A future path value or path enumeration needs an explicit operator and bounds; it cannot redefine existing hop syntax. |
+| Anonymous bindings and repeated-binding constraints | Yes | Keep | Anonymous bindings cannot name reusable rank/take targets; existing bindings cannot change type through rebinding. |
+| Correlated pattern absence | Yes; `not { ... }` | Keep | Inner bindings do not escape; future scalar negation does not acquire this scope behavior. |
+| Positive existence without outer-row fan-out | No dedicated positive-existence construct | Defer | Add a correlated pattern predicate; ordinary traversal continues to expose its matches. |
+| Optional graph enrichment | No | Defer | Preserve unmatched inputs and nullable exports; distinguish inner predicates from later filters. Multiple matches may still fan out. |
+| Graph matching before, between and after retrieval cuts | Limited; one `match` and terminal search ordering | Deliver | Repeated stages retain their input population; later filters cannot move before an earlier selection cut. |
+| Logical system identity projection and filtering | Limited; whole-node objects expose `id`, but `.id` is an ordinary declared property lookup | Deliver with RFC 0040 | Qualify `$binding.@id` and type/incarnation-aware follow-up; never expose native row IDs as graph identity. |
+| Explicit unions of typed graph bindings | No; interfaces do not provide polymorphic query scans | Decision | Add typed branches with explicit exports, bag/set semantics and original entity identity. |
+| All-node discovery, representation expansion and type narrowing | No | Decision | Resolve type scope separately from searchable representations at one snapshot; common fields and type-specific projections must typecheck. |
+| Global all-edge or mixed node/edge discovery | No; a concrete edge can be reached through traversal | Decision alongside global scope | Make entity kind and selected scope explicit; an all-node selector must not silently start including edges. |
+| Cross-graph federation | No combined `.gq` population; graph selection is external | Separate | Requires explicit authority, identity, snapshot and budget rules; global search in this RFC means one graph. |
+
+#### Projection and result shape
+
+| Capability | Current | RFC release | Future extension / syntax constraint |
+|---|---|---|---|
+| Flat projection of properties, parameters and literals | Yes | Keep | Ordinary projection preserves binding rows, duplicates and candidate windows. |
+| Explicit column aliases and unique output names | Yes; duplicate names rejected; some unaliased inferred/executed names still differ | Keep; qualify schema agreement | Freeze naming and result-schema agreement; extra syntax must not capture existing aliases. |
+| Whole-node object projection | Yes; id and properties except Blob/Vector | Keep | This remains schema-shaped shorthand; explicit fields provide stable compact results across schema additions. |
+| Bare edge object projection | No; project edge properties explicitly | Defer | Define an edge object/reference type and endpoints deliberately; do not assume node-object behavior. |
+| Existing list and vector property projection | Yes; each remains one column value | Keep | Projection does not unnest a list or execute vector retrieval. |
+| Blob values in ordinary read projection | No; dedicated Blob API | Separate | Preserve the Blob access/resource contract; object shorthand must not fetch Blob contents. |
+| Source score, distance, rank and fused-score projection | Limited; only a repeated leading `nearest`/`bm25` expression can expose its metric | Replace | Named `metric(source, field)` preserves domain, origin and missing membership through aliases and later stages. |
+| Selected nested object construction | No; whole-node objects are the only node-object shorthand | Defer | Add a typed expression that reshapes one row; it must not traverse, group or fetch related entities implicitly. |
+| New list/object construction from expressions | Limited; list literals and existing list values | Defer | Define element/field types and nullability; constructing a value is separate from collecting rows. |
+| List unnesting, mapping or comprehensions | No general surface | Defer | Unnest is an explicit population-changing operation; local value mapping needs its own typed scope and bounds. |
+| Nested related-entity/evidence collections | No | Defer | Use an explicitly correlated/grouped input, duplicate rule, local order, item limit and total byte budget. |
+| Snippets, highlights and source ranges | No dedicated query construct | Defer | Preserve source property/version, offset unit and bounds; generated text must remain distinguishable from stored source. |
+| Token-budget result packing | No | Defer | Declare tokenizer, selection policy, attribution and completeness; row limits must not become token limits. |
+
+#### Aggregation, selection and ordering
+
+| Capability | Current | RFC release | Future extension / syntax constraint |
+|---|---|---|---|
+| Terminal `count`, `sum`, `avg`, `min`, `max` | Yes | Keep | Preserve admitted input types, null behavior and duplicates; `count($node)` counts binding rows. |
+| Implicit grouping by non-aggregate return values | Yes, with current type restrictions | Keep | Adding a group projection can change row count; do not give ordinary intermediate projection this implicit effect. |
+| Grouped metric projection and explicit metric reductions | No staged metrics; legacy search/aggregate combinations restricted | Deliver | Projected metrics can be group keys or explicit reductions; discarded source metrics cannot order a new group. |
+| Reusable intermediate grouping/reduction | No | Defer | Export group keys/entities and reduced values explicitly; drop unreduced member bindings and active ranks. |
+| General distinct rows/entities and distinct aggregates | No dedicated syntax | Defer | Specify the identity/value tuple and duplicate equivalence; retrieval deduplication is not general `DISTINCT`. |
+| Distinct-target ranking with retained binding rows | Limited; legacy search exists without the new stage contract | Deliver | Each target gets one source rank; selecting it retains its associated binding rows. |
+| Quotas per explicit group, including ordinary non-search selection | No | Deliver through `take` | Select target/group pairs; use explicit reductions when order varies per pair; require local order without an active rank. |
+| Parent selection using reduced child metrics | Limited; terminal aggregates cannot feed a quota | Deliver through `take` reductions | Selection does not create reusable group features or implicit parent-source ranks. |
+| Top-N retrieval within every full group; row-dependent query inputs | No | Defer | Add a partitioned/correlated source with empty-group behavior and one total budget; global top-K plus `take` is different. |
+| Final ordering by properties/aliases and identity tie-breaks | Yes, with documented legacy search boundary-tie gaps | Keep; repair retrieval ties | Final ordering cannot change a previous source cutoff; each selection owns its complete comparator. |
+| Explicit `nulls first` / `nulls last` | No syntax; fixed ascending/descending defaults | Deliver | Apply consistently in local and final ordering; omission preserves existing defaults. |
+| Final row limit, including zero | Yes; integer literal | Keep | Counts output rows; it does not resize retrieval or bound all intermediate work. |
+| Parameterized final row limit | No | Foundation | An additive count-parameter extension remains possible; this matrix does not add it to the initial release. |
+| Parameterized source windows and group quotas | No corresponding stage syntax | Deliver | Admit integers before execution; positive source windows and nonnegative quotas have different units. |
+| General analytic windows, running aggregates and partition ranks | No public surface | Defer | Typed stage/expression rules must define partitions, frames and order; internal window use does not expose a language feature. |
+| Stable ranked cursors/pagination | No replayable ranked-execution contract | Defer | Preserve actual candidate order or qualify reproducibility, retention and policy; snapshot identity alone is insufficient. |
+
+#### Retrieval and ranking
+
+| Capability | Current | RFC release | Future extension / syntax constraint |
+|---|---|---|---|
+| Analyzed lexical membership | Limited; `search`/`match_text` have known execution-path inconsistencies | Replace | One typed `terms` description consumed by `match_terms`; filtering introduces no rank/window. |
+| Edit-tolerant lexical membership | Limited; `fuzzy` exists with analyzer/coverage defects | Replace | Shared analyzed edit semantics, explicit `mode` and `max_edits`, complete membership across index states. |
+| Exact-term lexical ranking | Limited; legacy `bm25` exists | Replace | Explicit bounded `lexical` source with qualified `bm25_v1` statistics, numeric rules and ties. |
+| Fuzzy lexical ranking | No unified ranked tolerant-query contract | Deliver | `lexical` consumes tolerant `terms`; no separate fuzzy scorer or inherited edit budget. |
+| Exact vector top-K as an explicit user choice | No exactness selector; some physical paths scan exactly | Deliver through `knn` | Exact top-K over eligible valid vectors; an index is an acceleration choice. |
+| Approximate vector top-K | Yes through legacy `nearest`, with implicit effort/window behavior | Replace with `ann` | Explicit approximation and bounded effort contract; exact rescoring does not imply complete recall. |
+| String or raw-vector retrieval inputs | Yes | Keep with resolved encoding | Validate dimensions and compatible encoders; inputs are constant per execution, not implicit per-row batches. |
+| Named sources, explicit candidate windows and explicit block output | No | Deliver | Sources share the incoming target population; select output independently of declaration order before freezing syntax. |
+| Weighted multi-source rank fusion | Limited; legacy RRF has two inline arms and asymmetric windows | Replace | Named 2–16-arm RRF, explicit weights/windows, checked arithmetic and one vote per target per arm. |
+| Search a traversal-introduced node or a bound edge | Limited; node search shapes have gaps and edge search is rejected | Deliver | Every source targets a property of the declared eligible binding; do not require a textual scan root. |
+| Search, traverse and search again | No explicit staged surface | Deliver | Each stage retains population and metric origin; earlier candidates cannot be reopened implicitly. |
+| Multiple fields on the same target as separate sources | Limited by legacy inline source forms | Deliver | Named sources may select different compatible field capabilities; fusion remains explicit. |
+| One logical multi-field/cross-type lexical corpus | No unified contract | Decision for global-search scope | Specify field reduction and shared live statistics before candidate cuts; per-table BM25 values are not globally comparable by default. |
+| Phrase, token-prefix, proximity and Boolean lexical queries | No portable typed contract | Defer | Add `LexicalQuery` variants shared by matching/ranking consumers; avoid a vendor query-string sublanguage. |
+| Geometric range retrieval and exact distance predicates | No dedicated public contract | Defer | Distinguish a complete eligible-population range query from a filter on ANN candidates. |
+| Candidate rescoring, learned reranking and general feature combination | No general stage | Defer | Declare input, model/formula, normalization population, output domain, missing values and resource behavior. |
+| General cross-identity fusion, such as passages with parent sources | No | Defer | Require graph mapping, reduction and fresh target ranks; matching id strings do not establish compatibility. |
+| Semantic diversification / complementary evidence selection | No | Defer | Add a set-selection objective and qualification; per-group quotas alone do not supply it. |
+
+#### Representation and execution contracts
+
+These rows are part of a query's meaning or execution interface, even when
+their authored syntax belongs to `.pg` or request options rather than `.gq`.
+
+| Capability | Current | RFC release | Future extension / syntax constraint |
+|---|---|---|---|
+| Analyzed String capability with immutable analyzer/scorer defaults | Limited; legacy FTS/index configuration and compatibility proofs | Deliver | Resolve `@analyzed` independently of `@index`; accepted semantics cannot follow mutable runtime defaults. |
+| Dense vector fields and embedding-source declarations | Yes; existing `Vector`/`@embed` | Replace unresolved semantics | Resolve dimension, geometry, source mapping and compatible immutable encoding recipes; qualify providers. |
+| Schema-owned default embedding recipe and reproducible exports | No complete resolved-default contract | Deliver | Final declaration spelling remains open; omission, explicit override and migration preserve accepted field bindings. |
+| Sparse vectors, multivectors/late interaction and named analyzed views | No retrieval surface | Defer | Extend typed representation/capability variants; do not define every retriever input permanently as one dense vector. |
+| Additional modalities or external retrieval sources | No general query source | Separate | Any later source needs explicit typing, authority, coherence and budget guarantees; no universal content object is introduced. |
+| Coherent branch/snapshot reads | Yes through existing execution interfaces | Keep | Use the graph's accepted snapshot and existing authority; stage syntax must not reopen a fresh view. |
+| Snapshot-coherent identity follow-up through all read transports | Limited; snapshot fields exist, system-id lookup and output paths have gaps | Deliver | Complete RFC 0040 lookup and JSON/JSONL continuation; unavailable/expired identity is explicit. |
+| Inline/stored query invocation and typed result descriptors | Yes; result-schema agreement has known gaps | Keep and qualify staged reads | Derive reads, result shape and fingerprints from every stage; aliases and hidden demand must agree with execution. |
+| Inspectable staged plans, metric origins and selection descriptors | No complete staged contract | Deliver | Expose resolved sources, inputs and semantics through the existing query interface; keep transport naming separate from graph properties. |
+| Representation coverage, including explicitly requested exact counts | No complete source-level contract | Deliver | Known/unknown readiness differs from completion and index coverage; exact counts share the query budget. |
+| Whole-query resource admission, cancellation and output accounting | Limited; existing local bounds do not establish the RFC guarantee | Deliver | All stages, encoders, fallbacks, nested work and projection share one execution context; no silent truncation. |
+| Graph/branch and stored-query authorization | Yes | Keep | All source reads and graph expansions obey existing gates; a snapshot is not a retained-access capability. |
+| Row/field-level security predicates | No policy engine for this scope | Separate | If added, constrain eligibility, statistics and metadata before selection; post-top-K filtering is insufficient. |
+
+#### Adjacent `.gq` operations
+
+| Capability | Current | RFC release | Future extension / syntax constraint |
+|---|---|---|---|
+| Named insert/update/delete query bodies | Yes, with current target and constructive/destructive restrictions | Keep | Read stages remain separate from mutation bodies; no implicit search-to-write pipeline. |
+| Several mutation statements in one graph publication | Yes within admitted mutation forms | Keep | A future write extension must preserve the single publication and recovery contracts. |
+| Standalone branch create/delete/merge/list statements | Yes; one per file, not beside query declarations | Keep | These control operations do not become data-query stages or typed unions. |
+| Conditional writes after a coherent read | Yes through the execution interface | Keep | Preserve the returned graph commit precondition; do not infer a new transaction from projection syntax. |
+
+#### Syntax decisions needed now
+
+Before stabilization, every `Deliver`/`Replace` row must have an accepted
+spelling and typing/lowering contract, every `Decision` row must have a recorded
+release disposition, and every deferred row must fit a named extension point:
+
+1. **Stage sequence:** graph matching, retrieval, selection and future
+   population-changing operators share one query-body model. The current IR
+   already has a pipeline; the AST's fixed single-match shape must evolve.
+2. **Shared expressions:** scalar computation, metrics and future structured
+   values use one typed expression model. Fix precedence, argument rules,
+   contextual keywords and namespaces before accepting its public syntax.
+3. **Scope transitions:** every operator declares retained, introduced and
+   discarded bindings, cardinality and nullability. Grouped entities need
+   explicit identity; reduced values do not inherit member source ranks.
+4. **Projection versus reduction:** an object constructor reshapes one row;
+   grouping reduces a population; a collection consumes an explicit local
+   population with its own order and bounds. Keep these meanings distinct.
+5. **Typed sources and representations:** extend source/query variants without
+   changing existing matching or encoding identities. A common call spelling
+   does not erase scalar, retriever, aggregate and collection distinctions.
+6. **Compatibility evidence:** retain ordinary-query and pre/post-cut fixtures,
+   identifier/alias cases, output schemas and negative scope cases. Old
+   accepted semantics remain fixed; future operators must not capture names,
+   resize windows or change output merely by being added to the grammar.
+
+The matrix's current-state evidence comes from the production
+[grammar](../../crates/omnigraph-compiler/src/query/query.pest),
+[typechecker](../../crates/omnigraph-compiler/src/query/typecheck.rs),
+[projection executor](../../crates/omnigraph/src/exec/projection.rs),
+[query guide](../user/queries/index.md), and
+[mutation guide](../user/mutations/index.md). Where prose disagrees, use code
+and owned tests: the guide's claim that earlier projection aliases can be
+projected again is stale; `T36` and the
+[score-projection GQT](../../crates/omnigraph-gqt/cases/issue_640_search_score_projection.gqt)
+refuse that shape. The typechecker's `executed_column_name` also records
+unaliased inferred/executed naming drift; a descriptor's existence does not
+qualify every projected shape. The
+[staged parser](../../crates/omnigraph-compiler/src/query/staged_probe.pest)
+qualifies only its documented prototype subset. This matrix is the scope
+index; detailed semantics and qualification remain in their sections below.
 
 ### Vector behavior and agent recipes
 
@@ -2623,6 +2822,11 @@ Apply the [language evolution contract](#language-evolution-and-compatibility):
 replace the prototype's implicit last-source output before stabilization,
 unify expression contexts, and fix scope/keyword/argument rules. A deferred
 operator needs a coherent extension point, not an implementation in Phase 0.
+Use the [query capability matrix](#query-capability-matrix) to classify every
+initial-release and future surface, especially cross-type scope, projection,
+grouping and nested collection. Record the global-search inclusion/defer
+decision explicitly; a table entry or illustrative spelling cannot make it
+implemented or silently defer a release requirement.
 Resolve encoding/provider identity and the shared schema-version decisions
 with RFCs 0040/0043/0044.
 Prototype the schema-wide default-recipe declaration and its omission/override
@@ -2785,18 +2989,12 @@ tests do not count as completion of a new phase.
 
 ### Extensions after the initial release
 
-| Capability | Disposition |
-|---|---|
-| Learned reranking / general feature combination | Retain typed input, normalization, model/domain, budget and failure contracts; implementation follows measured need |
-| Sparse, multivector and named analyzed views | Retain representation/capability extension points; new formats and algorithms require their own qualification |
-| Semantic diversification | Retain set-utility evaluation and extension point; initial per-group quotas do not claim this capability |
-| Distance range retrieval | Preserve explicit distance-predicate semantics; dedicated syntax/operator is outside the initial path |
-| Ranked pagination | Deferred until bounded execution preservation, policy and retention are qualified |
-| Snippets / token-budget packing | Deferred; initial compact projection and selective reads retain source/version attribution |
-| General cross-identity fusion | Deferred; initial arms share a declared target, and graph mappings never happen implicitly |
-
-Listing an extension does not claim support or require it for the initial
-release. Each extension retains its stated semantic and qualification boundary.
+The [query capability matrix](#query-capability-matrix) owns the extension
+inventory, including projection, grouping, optional matching, typed unions,
+advanced retrieval and representation forms. Its deferred rows do not claim
+support or require implementation for the initial release. A `Decision` row
+requires an explicit Phase 0 disposition; it is not automatically deferred.
+Every later extension retains the stated semantic and qualification boundary.
 
 ## Unresolved questions
 
@@ -2830,6 +3028,12 @@ release. Each extension retains its stated semantic and qualification boundary.
    cannot satisfy cross-type global discovery.
 
 ## Decision log
+
+- 2026-09-10 — added the query capability matrix, covering production support,
+  required RFC delivery, future extension boundaries and unresolved global
+  search scope. Consolidated the extension inventories and made projection,
+  reduction, collections and alias limitations explicit without accepting
+  illustrative syntax or expanding the initial implementation by implication.
 
 - 2026-09-10 — added the language evolution contract: one stage sequence and
   expression model, explicit scope/identity changes, contextual keywords and
