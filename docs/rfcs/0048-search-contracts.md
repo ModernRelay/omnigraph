@@ -15,6 +15,7 @@ blocked_on:
   - "RFC 0047 plan-truth guarantees reconciled with named stages; its interim Option<RetrievalIR> shape and scan-root restriction are not permanent dependencies"
   - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
   - "Language evolution contract: shared expressions, contextual keywords, explicit rank-block output, scope transitions, and compatibility fixtures before syntax stabilization"
+  - "Mixed analytical/graph/retrieval composition examples: proposed syntax, scope and result types, population counterexamples, and physical plans for deferred extensions before syntax stabilization"
   - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
   - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
   - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
@@ -25,7 +26,7 @@ blocked_on:
   - "Whole-query admission and accounting for token construction, graph fan-out, coverage, sorting, scoring, fallback, and output bytes"
   - "Snapshot-coherent follow-up read and stored-query fingerprint contracts through the existing read surface"
   - "All-node scope, representation selection, typed union/narrowing grammar, and an explicit disposition for cross-type search in the initial release"
-  - "Maintained retrieval judgments and a broader agent-task corpus beyond the diagnostic pilot; bounded ann_default_v1 recall/latency qualification per index family"
+  - "Maintained retrieval judgments and mixed analytical/graph/retrieval agent tasks beyond the document pilot; bounded ann_default_v1 recall/latency qualification per index family"
 ---
 
 # RFC 0048: Search contracts and retrieval algebra
@@ -34,10 +35,11 @@ blocked_on:
 
 This RFC proposes the search contract OmniGraph should carry into its stable
 API. It is under review in PR #606 alongside
-[RFC 0047](0047-search-plan-truth.md). The decision is whether bounded search
-should become an explicit operation in the graph language, with its own
-inputs, selection limits and result identity. The draft includes executable
-qualification evidence, but the complete production feature is not implemented.
+[RFC 0047](0047-search-plan-truth.md). The decision is how bounded search
+composes with exact lookup, graph traversal, analytical aggregation and
+projection in one typed language, with explicit inputs, selection limits and
+result identity. The draft includes executable qualification evidence, but the
+complete production feature is not implemented.
 The frontmatter status refers to that production feature.
 
 The [CI checkpoint](#ci-checkpoint-and-regression-disposition) has four failing
@@ -59,6 +61,10 @@ expression grammar must be resolved before the public syntax is frozen.
 The [query capability matrix](#query-capability-matrix) separates existing
 support, this RFC's release requirements, deferred extensions and the remaining
 scope decisions. Use it to review language coverage before committing to syntax.
+The [agent workload](#agent-workload-and-design-objective) includes analytical
+answers and comparisons with supporting evidence. The
+[composition examples](#required-composition-examples) make that workload a
+grammar acceptance gate even where an operator's implementation is deferred.
 
 The immediate problem is correctness. Today, the same text can match before an
 index is built and stop matching afterward; fuzzy indexed and uncovered rows
@@ -66,8 +72,9 @@ can disagree. Retrieval hidden inside `order` also makes a final output limit
 double as a vector candidate limit, while lexical fusion inputs are uncapped.
 These are observable differences in which facts a query returns.
 
-The proposed model follows one distinction: a predicate decides eligibility;
-a retriever selects and ranks eligible targets. For example, searching for the
+The proposed model separates three operations: a predicate decides eligibility;
+a retriever selects and ranks eligible targets; a scorer adds a feature to
+existing candidates without changing membership. For example, searching for the
 best incidents within one organization differs from searching globally and
 then discarding other organizations' incidents. Once an earlier stage drops
 a candidate, a later filter, grouping operation or reranker cannot recover it.
@@ -77,10 +84,16 @@ The language therefore needs explicit stages:
 ```text
 graph scope → lexical/vector candidates → fusion → graph expansion
             → selection per group → selective source reads
+
+graph population → aggregate → select groups → retrieve evidence → project
+
+retrieval candidates → graph expansion → aggregate selected population → project
 ```
 
-Their placement is semantic. Candidate windows, physical search effort and
-final output size are separate controls. Named metrics retain the target and
+These are composition shapes, not a claim that every intermediate aggregate or
+correlated evidence operator ships initially. Their placement is semantic.
+Candidate windows, physical search effort and final output size are separate
+controls. Named metrics retain the target and
 source that produced them; traversal duplicates cannot create extra fusion
 votes. One typed `terms` query supplies both Boolean matching and lexical
 retrieval, including fuzzy ranking. Exact vector `knn` and approximate `ann`
@@ -130,18 +143,25 @@ initial complete lexical/vector/graph path.
 
 ## Summary
 
-Make bounded retrieval compose with ordinary graph queries. Predicates
-establish eligibility; retrieval stages select and rank eligible targets;
-subsequent graph operations work on the selected results. The engine carries
-named stage metrics, result identity, and execution guarantees through the
-plan. Ordinary projection observes those results without changing selection.
+Support agent-driven investigation and computation over a typed graph.
+Queries combine exact lookup, graph traversal, analytical aggregation, lexical
+and semantic retrieval, scoring, and structured projection. These operations
+share one type system, explicit population and scope rules, one accepted
+snapshot, and one execution budget. The initial implementation and deferred
+composition operators are distinguished in the capability matrix.
 
-The intended agent workflow is compact discovery, selective source reads,
-graph expansion, and exact verification when needed. The objective is useful,
-attributable information within latency, compute, and context budgets. A
-relevance score is neither answer confidence nor proof that no other facts
-exist. Exhaustive graph queries and aggregates remain available independently
-of ranked retrieval.
+Results may contain computed facts, comparisons, entities and supporting
+evidence. Predicates establish eligibility; retrieval selects targets; scoring
+adds features; aggregation establishes a new group scope. Ordinary projection
+observes those results without changing selection. Named metrics keep their
+origin through the plan; ordinary graph and analytical rows require no score.
+
+The objective is reliable task completion within latency, execution-cost and
+working-context budgets. Agents can combine exhaustive computation and ranked
+discovery in the same investigation and, where supported, the same query.
+A relevance score is neither answer confidence nor proof that no other facts
+exist. An aggregate over retrieved candidates describes that selected
+population, not all potentially relevant facts in the graph.
 
 The proposal has three layers:
 
@@ -178,6 +198,39 @@ legacy lexical spellings, implicit retrieval inside `order`, `nearest`, and
 positional RRF. No compatibility execution path or deprecation release is
 required. Examples below are proposed grammar, not supported current syntax;
 parser/typechecker qualification remains an acceptance gate.
+
+### Agent workload and design objective
+
+The agent authors queries and consumes their results while deciding what to
+investigate next. A useful working context can be an analytical answer, a
+comparison, a graph neighborhood, source evidence, or a combination of these.
+Discovery, computation and follow-up must compose without requiring the agent
+to reproduce the engine's grouping, identity or snapshot rules in client code.
+
+| Workload | Required composition |
+|---|---|
+| Precise lookup and verification | Keys or logical identities, typed predicates, selected properties and coherent follow-up |
+| Discovery under uncertainty | Lexical, fuzzy and semantic retrieval with explicit eligible populations and candidate limits |
+| Analytical investigation | Exact counts/reductions, computed values, graph relationships and subsequent selection or retrieval |
+| Evidence assembly | Relate findings to sources, preserve optional facts and collect locally ordered, bounded evidence |
+| Coverage and comparison | State the population being counted or compared; distinguish absence from candidate omission or unavailable representations |
+| Adaptive investigation | Narrow or broaden a query, inspect relationships, read sources and revisit identities at the declared snapshot |
+
+These workload requirements guide grammar evolution; they do not change a
+deferred capability into an initial-release feature. The matrix owns that
+disposition. Stored queries offer concise interfaces to supported combinations
+and expose their chosen semantics through existing descriptions/instructions.
+
+Optimize supported task correctness together with query-generation success,
+round trips, latency, context bytes and execution work. Fewer calls can help
+when one query returns computed facts and bounded evidence, but cannot justify
+an unbounded fan-out or prevent adaptive decisions between calls. Freeze tasks,
+recipes and budgets before comparing designs or defaults.
+
+Output size, candidate limits and execution budgets have different purposes.
+An exact five-row summary may examine millions of records. Large aggregates
+may stream or spill through qualified paths, or fail within the shared budget;
+they must not silently become aggregates over a small retrieved sample.
 
 ## Motivation
 
@@ -590,10 +643,10 @@ an explicitly tolerant query. Both resolve the same default scoring policy.
 ### Language evolution and compatibility
 
 The goal is a small, composable typed property-graph language. A query declares
-bindings, constrains them, deliberately selects candidates, follows graph
-relationships and returns values. Search adds explicit selection boundaries
-to that language. It does not create a second query system with different
-variables, grouping rules or entity identities.
+bindings, constrains them, computes and aggregates values, deliberately selects
+candidates, follows graph relationships and returns values. Search adds
+explicit selection boundaries to that language. It does not create a second
+query system with different variables, grouping rules or entity identities.
 
 The current production grammar has one `match` block, fixed expression
 variants and terminal aggregate projection. The staged prototype adds repeated
@@ -676,6 +729,13 @@ queries; it does not make limits row-dependent.
 The [query capability matrix](#query-capability-matrix) records the future
 operators and their extension boundaries. They can be added independently
 without redefining graph identity, source membership or ordinary projection.
+
+The [required composition examples](#required-composition-examples) must fit
+these rules before syntax stabilization. Phase 0 must supply proposed syntax,
+type/scope derivations and golden logical plans for them, including deferred
+operators. A named future stage or a capability row alone is insufficient.
+Executable production tests follow the implementation of each operator;
+illustrative plans do not establish runtime support.
 
 Some narrower workflows already compose: `take` can select parent bindings
 using an explicit reduction of child metrics within each target/group pair.
@@ -760,7 +820,7 @@ change the three tested RFC query sketches.
 | Scalar comparison, exact String prefix/substring and list membership | Yes | Keep | Exact String behavior remains case-sensitive; `contains` on a list remains membership. |
 | General scalar Boolean composition and negation | Limited; match conditions conjoin and graph `not` tests pattern absence | Foundation | Add typed Boolean expressions with fixed precedence and null rules; graph absence keeps its correlation semantics. |
 | Explicit null tests/replacement, conditionals, arithmetic, casts and general scalar functions | No general surface | Foundation | Extend shared expressions through typed signatures; preserve overflow, null and score-domain rules. |
-| Intermediate named computations/projection | No | Defer | Add a stage with explicit value bindings and exports; specify whether it retains or drops incoming bindings. |
+| Intermediate named computations/projection | No | Foundation | Fix explicit value bindings and retained/exported scope through composition example C1; operator implementation remains deferred. |
 | Result aliases used in final ordering | Yes | Keep | Result aliases remain distinct from graph parameters/bindings and source aliases. |
 | Reusing an earlier result alias in another projection | No; production rejects `T36` | Foundation | Decide alias scope explicitly before relaxing this rule; shared expression parsing alone is not alias reuse. |
 | Nested scopes, reusable query branches and bounded subqueries | Limited; correlated graph negation only | Defer | Declare imports, exports, shadowing, snapshot and shared budgets; distinguish reuse from re-execution. |
@@ -778,7 +838,7 @@ change the three tested RFC query sketches.
 | Anonymous bindings and repeated-binding constraints | Yes | Keep | Anonymous bindings cannot name reusable rank/take targets; existing bindings cannot change type through rebinding. |
 | Correlated pattern absence | Yes; `not { ... }` | Keep | Inner bindings do not escape; future scalar negation does not acquire this scope behavior. |
 | Positive existence without outer-row fan-out | No dedicated positive-existence construct | Defer | Add a correlated pattern predicate; ordinary traversal continues to expose its matches. |
-| Optional graph enrichment | No | Defer | Preserve unmatched inputs and nullable exports; distinguish inner predicates from later filters. Multiple matches may still fan out. |
+| Optional graph enrichment | No | Foundation | Example C4 must preserve unmatched inputs and nullable exports; distinguish inner predicates from later filters. Multiple matches may still fan out; implementation remains deferred. |
 | Graph matching before, between and after retrieval cuts | Limited; one `match` and terminal search ordering | Deliver | Repeated stages retain their input population; later filters cannot move before an earlier selection cut. |
 | Logical system identity projection and filtering | Limited; whole-node objects expose `id`, but `.id` is an ordinary declared property lookup | Deliver with RFC 0040 | Qualify `$binding.@id` and type/incarnation-aware follow-up; never expose native row IDs as graph identity. |
 | Explicit unions of typed graph bindings | No; interfaces do not provide polymorphic query scans | Decision | Add typed branches with explicit exports, bag/set semantics and original entity identity. |
@@ -797,10 +857,10 @@ change the three tested RFC query sketches.
 | Existing list and vector property projection | Yes; each remains one column value | Keep | Projection does not unnest a list or execute vector retrieval. |
 | Blob values in ordinary read projection | No; dedicated Blob API | Separate | Preserve the Blob access/resource contract; object shorthand must not fetch Blob contents. |
 | Source score, distance, rank and fused-score projection | Limited; only a repeated leading `nearest`/`bm25` expression can expose its metric | Replace | Named `metric(source, field)` preserves domain, origin and missing membership through aliases and later stages. |
-| Selected nested object construction | No; whole-node objects are the only node-object shorthand | Defer | Add a typed expression that reshapes one row; it must not traverse, group or fetch related entities implicitly. |
+| Selected nested object construction | No; whole-node objects are the only node-object shorthand | Foundation | Example C4 fixes typed row reshaping separately from traversal/grouping/collection; constructor implementation remains deferred. |
 | New list/object construction from expressions | Limited; list literals and existing list values | Defer | Define element/field types and nullability; constructing a value is separate from collecting rows. |
 | List unnesting, mapping or comprehensions | No general surface | Defer | Unnest is an explicit population-changing operation; local value mapping needs its own typed scope and bounds. |
-| Nested related-entity/evidence collections | No | Defer | Use an explicitly correlated/grouped input, duplicate rule, local order, item limit and total byte budget. |
+| Nested related-entity/evidence collections | No | Foundation | Example C4 fixes correlation, exports, duplicate and empty-result rules, local order, item limit and shared byte/work budgets; implementation remains deferred. |
 | Snippets, highlights and source ranges | No dedicated query construct | Defer | Preserve source property/version, offset unit and bounds; generated text must remain distinguishable from stored source. |
 | Token-budget result packing | No | Defer | Declare tokenizer, selection policy, attribution and completeness; row limits must not become token limits. |
 
@@ -811,12 +871,12 @@ change the three tested RFC query sketches.
 | Terminal `count`, `sum`, `avg`, `min`, `max` | Yes | Keep | Preserve admitted input types, null behavior and duplicates; `count($node)` counts binding rows. |
 | Implicit grouping by non-aggregate return values | Yes, with current type restrictions | Keep | Adding a group projection can change row count; do not give ordinary intermediate projection this implicit effect. |
 | Grouped metric projection and explicit metric reductions | No staged metrics; legacy search/aggregate combinations restricted | Deliver | Projected metrics can be group keys or explicit reductions; discarded source metrics cannot order a new group. |
-| Reusable intermediate grouping/reduction | No | Defer | Export group keys/entities and reduced values explicitly; drop unreduced member bindings and active ranks. |
+| Reusable intermediate grouping/reduction | No | Foundation | Examples C1–C2 export group keys/entities and reduced values; drop unreduced member bindings and active ranks. Group-stage implementation remains deferred. |
 | General distinct rows/entities and distinct aggregates | No dedicated syntax | Defer | Specify the identity/value tuple and duplicate equivalence; retrieval deduplication is not general `DISTINCT`. |
 | Distinct-target ranking with retained binding rows | Limited; legacy search exists without the new stage contract | Deliver | Each target gets one source rank; selecting it retains its associated binding rows. |
 | Quotas per explicit group, including ordinary non-search selection | No | Deliver through `take` | Select target/group pairs; use explicit reductions when order varies per pair; require local order without an active rank. |
 | Parent selection using reduced child metrics | Limited; terminal aggregates cannot feed a quota | Deliver through `take` reductions | Selection does not create reusable group features or implicit parent-source ranks. |
-| Top-N retrieval within every full group; row-dependent query inputs | No | Defer | Add a partitioned/correlated source with empty-group behavior and one total budget; global top-K plus `take` is different. |
+| Top-N retrieval within every full group; row-dependent query inputs | No | Foundation | Examples C1/C4 require explicit correlation/partition scope, empty-group behavior and one total budget; implementation remains deferred. Global top-K plus `take` is different. |
 | Final ordering by properties/aliases and identity tie-breaks | Yes, with documented legacy search boundary-tie gaps | Keep; repair retrieval ties | Final ordering cannot change a previous source cutoff; each selection owns its complete comparator. |
 | Explicit `nulls first` / `nulls last` | No syntax; fixed ascending/descending defaults | Deliver | Apply consistently in local and final ordering; omission preserves existing defaults. |
 | Final row limit, including zero | Yes; integer literal | Keep | Counts output rows; it does not resize retrieval or bound all intermediate work. |
@@ -844,7 +904,7 @@ change the three tested RFC query sketches.
 | One logical multi-field/cross-type lexical corpus | No unified contract | Decision for global-search scope | Specify field reduction and shared live statistics before candidate cuts; per-table BM25 values are not globally comparable by default. |
 | Phrase, token-prefix, proximity and Boolean lexical queries | No portable typed contract | Defer | Add `LexicalQuery` variants shared by matching/ranking consumers; avoid a vendor query-string sublanguage. |
 | Geometric range retrieval and exact distance predicates | No dedicated public contract | Defer | Distinguish a complete eligible-population range query from a filter on ANN candidates. |
-| Candidate rescoring, learned reranking and general feature combination | No general stage | Defer | Declare input, model/formula, normalization population, output domain, missing values and resource behavior. |
+| Candidate rescoring, learned reranking and general feature combination | No general stage | Foundation | Example C3 fixes membership-preserving scoring, domains, statistics/normalization populations and resource behavior. Scoring/model/formula operators remain deferred. |
 | General cross-identity fusion, such as passages with parent sources | No | Defer | Require graph mapping, reduction and fresh target ranks; matching id strings do not establish compatibility. |
 | Semantic diversification / complementary evidence selection | No | Defer | Add a set-selection objective and qualification; per-group quotas alone do not supply it. |
 
@@ -903,6 +963,11 @@ release disposition, and every deferred row must fit a named extension point:
    identifier/alias cases, output schemas and negative scope cases. Old
    accepted semantics remain fixed; future operators must not capture names,
    resize windows or change output merely by being added to the grammar.
+
+The composition examples link the critical `Foundation` rows to concrete
+analytical/graph/retrieval questions. Their operator implementations remain
+deferred; the initial release must not advertise those complete workflows.
+Global-search rows retain their separate `Decision` disposition.
 
 The matrix's current-state evidence comes from the production
 [grammar](../../crates/omnigraph-compiler/src/query/query.pest),
@@ -1026,23 +1091,34 @@ ordinary content writes never build indexes inline.
 
 ### Logical operators and composition laws
 
-A ranked relation carries binding schema, declared target identity, total
-order, named metrics with origin, source membership, and snapshot/guarantee
-context. It is an internal plan value, not a new stored object or public graph
-entity. The logical plan needs multiple stages rather than one global
+Every stage consumes and produces a typed relation. Its schema identifies
+available graph bindings and computed values, with explicit multiplicity,
+scope and snapshot context. Ordinary graph and analytical relations need no
+relevance score or retrieval target. A ranked relation additionally carries
+declared target identity, order, named metrics with origin and source
+membership under its selection contract. Relations are internal plan values,
+not new stored objects or public graph entities.
+The logical plan needs multiple stages rather than one global
 `Option<RetrievalIR>`; concrete Rust shapes remain an implementation decision.
 
-| Operator | Effect |
-|---|---|
-| Graph match / predicate | Establish or restrict bindings eligible at this point |
-| Retriever | Select and order a bounded set of eligible target identities |
-| Scorer | Compute a named feature for existing candidates without implying source membership |
-| Fusion | Combine named ranked inputs on a declared common identity |
-| Reranker | Reorder its declared input set; any cutoff is explicit |
-| Graph expansion | Produce related bindings, preserving the origin of inherited metrics |
-| Select per group | Apply a declared quota and comparator to existing candidates |
-| Aggregate | Change row/group identity using existing aggregate semantics |
-| Projection / property read | Materialize requested values of selected bindings |
+| Operator | Population, scope and multiplicity | Order and metric contract |
+|---|---|---|
+| Graph match / predicate | Establish or extend bindings; predicates retain only eligible rows | Preserve inherited metric origins; a filter cannot create source membership |
+| Retriever | Select distinct eligible target identities and retain their associated incoming bindings | Establish source ranks/comparator; do not score duplicate paths as separate targets |
+| Scorer | Add a named feature to existing candidates while preserving membership and binding rows | Keep active order and original source membership; output has its own typed domain and origin |
+| Fusion | Combine named ranked inputs on a declared common identity | Compute new score/rank; retain original arm ranks and absence |
+| Reranker | Reorder its declared input; any membership cutoff is explicit | Establish a new comparator; preserve earlier metric origins |
+| Graph expansion | Extend bindings under graph traversal semantics; may produce several rows per input | Carry metrics on their original binding; never create additional arm votes |
+| Select per group | Select target/group pairs and retain their associated bindings | Use the declared local comparator; preserve source ranks and incoming active order |
+| Aggregate | Produce group keys/entities and explicit reductions; discard unreduced member bindings | Establish new group scope; no inherited member rank or implicit representative score |
+| Intermediate computation / projection | Add or export explicitly named values; declare retained/dropped bindings | Preserve row multiplicity and demanded metric origin; no implicit grouping |
+| Optional expansion / correlated collection | Declare imports/exports, nullable bindings or typed lists, duplicates and empty-result behavior | Local selection/order belongs to the declared input; nested work shares the query budget |
+| Final projection / property read | Materialize requested values from surviving rows | Preserve selection; aggregate-return shorthand follows the Aggregate contract |
+
+All operators use the same accepted snapshot and cumulative resource context.
+Each lowering must declare input column demand, read descriptors, output
+types/nullability, identity, ordering guarantees and failure behavior. This
+table includes extension contracts; release availability remains in the matrix.
 
 The normative laws are:
 
@@ -1076,6 +1152,165 @@ The normative laws are:
     are different facts. None is an implicit probability of answer correctness.
 11. Admission, execution, fallback, and output use one bounded resource
     protocol. Silent partial results and uncharged fallback work are forbidden.
+
+### Analytical populations and selection boundaries
+
+Four populations have separate identities in a composed query:
+
+| Population | Meaning |
+|---|---|
+| Eligible population | Distinct targets admitted by the graph/property constraints at a source, with their incoming binding rows |
+| Scoring corpus | The data used to establish declared statistics, such as the snapshot-visible field corpus for `bm25_v1` |
+| Retrieved candidates | Targets surviving a particular source/fusion/selection boundary |
+| Aggregate input | The binding rows or explicitly deduplicated entities consumed by that reduction |
+
+Existing aggregates consume their complete declared input under their numeric
+and null rules; a future approximate aggregate needs its own explicit contract.
+Counting an ANN-selected set does not establish a complete count of relevant entities in the eligible
+graph. Candidate selection is not statistical sampling, and the engine must
+not infer an extrapolated total or error bar from it. A complete semantic
+range/count would first need a defined predicate and complete evaluation over
+the stated population; a relevance label alone supplies neither.
+
+The plan must retain the aggregate's input stage and duplicate semantics,
+including any upstream approximate selection. A typed descriptor can expose
+that lineage without adding a score to ordinary analytical rows or inventing
+a graph-wide completeness flag. Exact result computation, retrieval recall,
+representation coverage and answer correctness remain separate properties.
+For BM25, ordinary eligibility and aggregate grouping do not redefine the
+accepted scoring corpus; the lexical section owns that statistics contract.
+
+Qualification must include these counterexamples:
+
+- With three eligible incidents, one binding per incident, and a cut selecting
+  two incidents, a count before selection is three and a count afterward is two.
+- After graph fan-out, three binding rows can represent two distinct incidents;
+  `count($incident)` still counts rows. Distinct counting needs explicit syntax
+  or a declared deduplication stage, not retrieval's implicit target identity.
+- A global candidate set can omit an entire group; a later per-group quota
+  cannot refill that group from the full population.
+- An exact aggregate over a large input may return one row. Final row or byte
+  limits cannot authorize an earlier truncation of the aggregate input.
+- Changing eligibility or grouping leaves the accepted BM25 corpus unchanged;
+  the existing statistics oracle must continue to distinguish these scopes.
+
+Selection, grouping, projection and graph expansion may be reordered only
+with an equivalence proof that preserves these populations, duplicate/null
+semantics and metric origins. Cost optimization cannot change which question
+the aggregate answers.
+
+### Required composition examples
+
+These four examples are acceptance requirements for grammar evolution. Their
+notation below describes logical stages, not accepted `.gq` spelling or
+implemented features. Phase 0 must supply proposed syntax, type/scope
+derivations and golden plans, plus counterexamples for invalid rewrites.
+Deferred operators need those design proofs before syntax stabilization;
+their executable GQT and resource proofs land with their implementation.
+The examples use ordinary application types such as `Service` and `Passage`.
+
+**C1 — Aggregate, select entities, then retrieve evidence.** Count incidents
+in two fixed periods by service, compute the increase, select the largest
+increase, and retrieve two relevant reports for that service:
+
+```text
+match incidents/services in the two periods
+→ group by service identity; export prior_count and current_count
+→ compute increase = current_count - prior_count
+→ select one service by increase descending, service identity ascending
+→ retrieve reports within that selected service's graph population
+→ project service identity, counts, increase and report evidence
+```
+
+With one service per incident, A has prior/current counts 2/8 and B has 6/7.
+The selected service must be A with increase 6 regardless of report relevance
+in B. The group exports `Service` identity and integer reductions; member
+incident bindings disappear. Selecting A must retain its computed values for
+later traversal/projection. A numeric group value never becomes an entity ID.
+The period reductions must define zero counts when one period has no incidents.
+An incident-rooted input does not create services with no incidents in either
+period; including those requires an explicit service population and enrichment.
+For multiple selected services, per-service retrieval requires an explicit
+partition/correlation contract, not repeated global top-K plus `take`.
+
+The physical plan may use qualified aggregation and expressions, a service
+selection boundary, then graph joins/masks and report retrieval. It must retain
+accepted service identity through reduction, declare new report reads, and
+share snapshot and budget. Executing nested sources once per parent without
+accounting for cumulative work is not an acceptable lowering.
+
+**C2 — Retrieve, traverse, then aggregate the selected population.** Select
+passages, follow their project relationships, and return per-project counts.
+For selected passages p1/p2, two retained graph bindings connect p1 to project P
+and one connects p2. Another eligible passage p3 is outside the candidate cut.
+P's binding-row count is three; its explicitly distinct selected-passage count
+is two. Neither count may include p3.
+
+```text
+retrieve passage candidates → traverse to projects
+→ group by project identity; reduce rows or explicit distinct passage identity
+→ project project identity and named counts
+```
+
+The group exports `Project` identity and counts, dropping passage bindings and
+active ranks. An explicitly reduced passage metric may survive under its own
+name; after this explicit grouping, an unreduced member metric is out of scope.
+In terminal aggregate-return shorthand, projecting that metric instead adds
+a grouping key and therefore asks a different question, as specified below.
+The physical plan retains the candidate barrier before expansion/aggregation.
+Distinct aggregates remain a deferred extension; the initial path must already
+qualify terminal binding-row counts and explicit metric reductions.
+
+**C3 — Score existing candidates without changing membership.** Dense retrieval
+selects d1/d2; both match the lexical query, but a lexical arm's window contains
+only d1. Compute a fresh BM25 feature for both dense candidates:
+
+```text
+select the named dense candidate output
+→ compute a named lexical feature over that existing target set
+→ optionally reorder by an explicit scoring policy
+→ project original arm metrics and the new feature separately
+```
+
+d2 keeps an absent lexical-arm rank/score and receives a separately named
+`Score<bm25_v1>` feature. Scoring preserves both targets, their binding rows
+and active order. Reordering or cutting them requires an explicit operation.
+The scorer declares query/representation identity, statistics or normalization
+population, absent-value behavior and resource limits. Aliases cannot erase
+those domains or retroactively change RRF membership.
+
+The physical plan scores the fixed target set using the accepted corpus
+statistics, then reattaches features by target identity. A hidden lexical top-K
+followed by a join is not equivalent: it can omit d2. A narrow target set can
+still require broad statistics work, charged to the same execution. Native
+scorer availability does not establish parity with the accepted formula.
+
+**C4 — Combine computed facts, optional graph facts and bounded evidence.**
+Return selected services and their computed counts, an owner if known, and up
+to two related reports per service in a declared local order:
+
+```text
+selected services with computed counts
+→ optional owner match
+→ correlated report input; select two per service under a local comparator
+→ construct one result per service with counts, nullable owner and report list
+```
+
+In a fixture with at most one owner per service, A has an owner and three
+reports; B has no owner or reports. Both services survive. A receives the first
+two reports under the complete local comparator; B receives a null owner and
+an empty typed report list. The count fields still describe their original
+aggregate input, not the length of the evidence list. Report duplicates need
+an explicit row/entity rule. With multiple owners, the query must declare
+collection or selection semantics instead of choosing an arbitrary owner.
+
+The output type contains accepted service identity, integer counts, nullable
+owner and a typed list of selected report fields. Nested bindings do not leak.
+Object construction reshapes values; collection consumes an explicitly scoped
+relation. Qualified outer joins, grouped local selection and collection are
+possible physical building blocks, but ordering, empty lists, nulls, shared
+buffers and total item/byte/work limits require end-to-end qualification.
+Local item limits alone do not bound all parent groups or upstream traversal.
 
 ### Target identity, fan-out, grouping, and metrics
 
@@ -1791,6 +2026,8 @@ plan. The design reuses the right owner for each operation:
 | Target selection and binding preservation | Distinct target stream for ranking; semi-join selected identities back to the incoming bindings | Deduplicate before candidate cuts; preserve every surviving graph binding and its metric origin |
 | Selection per group | DataFusion `dense_rank` over bindings, or distinct pairs plus `row_number` and a null-safe semi-join | Pair-constant comparator, explicit target tie key, pair quotas, binding multiplicity, key equality, metric and incoming-order preservation |
 | Graph expansion | Existing CSR/CSC and indexed edge paths | Retain traversal/path semantics, bound fan-out, carry metric origin |
+| Intermediate analytical results (future stage) | Qualified aggregation, expressions and entity-key joins | Export typed group values and accepted entity identities; preserve aggregate input lineage and selection barriers |
+| Correlated evidence and optional facts (future operators) | Qualified outer joins, grouped selection and typed collection | Define local populations, empty/null behavior, order, duplicate semantics and cumulative nested work |
 | Learned reranking | Future bounded scoring/model operator | Model identity, batched input, cancellation, resource and failure contracts |
 
 Lance's public scanner plan can return a DataFusion `ExecutionPlan`. Its
@@ -2676,6 +2913,22 @@ prove a specific algorithm or default is optimal for OmniGraph. The stage and
 identity laws also follow directly from the noncommuting operations in
 Motivation; they do not depend on benchmark leadership claims.
 
+The [Vespa `rank` operator](https://docs.vespa.ai/en/reference/querying/yql.html#rank)
+uses its first argument for matching while other arguments supply ranking
+features. It is a concrete precedent for C3's separation of candidate
+membership from scoring. [Cypher collection subqueries](https://neo4j.com/docs/cypher-manual/current/subqueries/collect/)
+construct lists from correlated query results with defined variable scope;
+they motivate C4's explicit correlation and typed result construction.
+OmniGraph retains its own scope, null, duplicate and budget rules. These
+references support specific design choices, not a claim of equivalent
+capability, performance or agent utility.
+
+The [agent workload](#agent-workload-and-design-objective) also requires
+analytical composition in both directions. C1–C4 are the required design
+examples, while the matrix states which operators can be executed in the
+initial release. The completed document-search pilot cannot establish those
+broader capabilities or select universal workload defaults.
+
 Extend existing test owners rather than creating a parallel search harness:
 
 | Boundary | Required evidence and owner |
@@ -2687,6 +2940,40 @@ Extend existing test owners rather than creating a parallel search harness:
 | Snapshot / policy / transport | `point_in_time.rs`, policy owners, server `data_routes`/`stored_queries`/`openapi`, and CLI parity for coherent follow-up, expiry/refusal, metadata, policy-safe counts and resolved query identity |
 | Format | Existing schema/rebuild and cross-version owners for resolved-default persistence/export/reapplication, stamp refusal, rewrite idempotence, unresolved encoding refusal, and representation compatibility |
 | Resource bounds | Checked-in cost instruments for NFC normalization, token construction, matching/scoring, coverage/statistics scans, graph fan-out, sort/spill, output bytes, cancellation, and shared fallback accounting |
+
+#### Mixed workload qualification
+
+Freeze tasks with exact graph facts and expected aggregate populations as
+well as relevance judgments. Use the existing GQT, mechanism and benchmark
+owners and extend their independent oracles at the boundary being tested.
+
+| Workload family | Qualification target |
+|---|---|
+| Exact graph analytics | Counts/reductions over the eligible graph, explicit binding multiplicity, selected properties and coherent follow-up |
+| Graph-scoped lexical/semantic retrieval | Correct target population, exact/approximate distinction, representation coverage and source windows |
+| Retrieval followed by graph aggregation | C2's initial terminal-aggregate subset; candidates and full-population totals stay distinguishable |
+| Analytics followed by retrieval | C1's type/plan proof now; executable task qualification when intermediate operators land |
+| Independent scoring | C3's type/plan proof now; feature/membership and cost qualification with the scorer implementation |
+| Structured evidence with optional facts | C4's type/plan proof now; complete results, empty groups and cumulative resource qualification when implemented |
+
+For runnable families, record supported task correctness, query parse/type
+failures and repair attempts, wrong-population answers, tool round trips,
+latency, returned/context bytes and measured execution work. Preserve refusals,
+timeouts, provider failures and unsupported requests in the report with
+distinct dispositions; successful completed queries alone are not the task
+denominator. Separate deterministic result oracles from judged relevance and
+answer support, and record who supplied those judgments.
+
+Vary eligibility selectivity, graph fan-out, duplicate paths, number/skew of
+groups, candidate windows, missing representations and payload width. Keep
+agent/model/recipe, schema, snapshot and budgets fixed within a comparison.
+Grammar evolution should reduce avoidable orchestration without forcing all
+investigation into one query. A cheap small result and an expensive exact
+summary are both legitimate workloads; measure their costs separately.
+Deferred families stay visibly unimplemented until their operators land, and
+must not count as proof of initial-release task coverage.
+
+#### Test harness integration
 
 Each `.gqt` case already exercises a real temporary graph through the compiler
 and public engine API, with result-shape checks and ordered or unordered row
@@ -2773,8 +3060,10 @@ The exact lexical qualification matrix retains all preceding requirements:
 Correctness and usefulness are separate evaluations. A fixed, checked-in
 corpus should include names with typos, rare identifiers, semantic questions,
 multi-hop investigation, duplicate-heavy candidates, missing representations,
-and exhaustive verification tasks. Report NDCG@10, MRR@10 and Recall@100 per
-modality, then task answer/source-attribution correctness, complementary
+and exhaustive verification tasks, alongside the analytical families in
+[mixed workload qualification](#mixed-workload-qualification). Report
+NDCG@10, MRR@10 and Recall@100 per modality, then task
+answer/source-attribution correctness, complementary
 coverage, tool calls, latency, and context consumption. Compare lexical,
 dense and fused pipelines; add reranked variants when implemented. Hold corpus,
 agent/model configuration and task budget fixed when attributing improvements.
@@ -2802,12 +3091,12 @@ and records its implementation PRs and evidence in this RFC.
 
 | Phase | Depends on | Outcome |
 |---|---|---|
-| 0. Resolve contracts | Current-code audit and design review | Accepted semantics, executable oracles, and owned qualification criteria |
+| 0. Resolve contracts | Current-code audit and design review | Accepted semantics, C1–C4 grammar/type/plan proofs, executable oracles, and owned qualification criteria |
 | 1. Build shared foundations | 0 | Resolved representations, typed stages, and one execution/resource context |
 | 2. Implement exact retrieval | 1 | Complete lexical matching, exact/fuzzy scoring, and exact vector selection |
-| 3. Compose graph and ranking stages | 2 | Named fusion, graph-defined populations, metric origin, and per-group selection |
+| 3. Compose graph and ranking stages | 2 | Named fusion, graph-defined populations, metric origin, terminal analytical composition and per-group selection |
 | 4. Complete agent-facing reads | 3 for end-to-end qualification | Stored-query recipes, truthful metadata, and coherent source reads |
-| 5. Qualify execution and defaults | 2 for native comparisons; 3–4 for full-pipeline evaluation | Qualified physical paths, resource evidence, and measured retrieval defaults |
+| 5. Qualify execution and defaults | 2 for native comparisons; 3–4 for full-pipeline evaluation | Qualified physical paths, resource evidence, mixed supported agent tasks and measured retrieval defaults |
 | 6. Ship the coordinated migration | 1–5 | One supported query/schema cutover with verified upgrade and client behavior |
 
 #### Phase 0: resolve contracts and build the oracles
@@ -2822,6 +3111,13 @@ Apply the [language evolution contract](#language-evolution-and-compatibility):
 replace the prototype's implicit last-source output before stabilization,
 unify expression contexts, and fix scope/keyword/argument rules. A deferred
 operator needs a coherent extension point, not an implementation in Phase 0.
+Complete the [composition examples](#required-composition-examples) C1–C4:
+proposed syntax, type/scope derivations, golden logical plans and a plausible
+Lance/DataFusion/graph lowering with explicit qualification limits. Include
+negative cases for discarded group bindings, fabricated source membership,
+incorrect aggregate populations and unbounded nested work. These are design
+proofs for deferred operators, not a requirement to ship those operators now;
+their production syntax and execution remain unavailable until implemented.
 Use the [query capability matrix](#query-capability-matrix) to classify every
 initial-release and future surface, especially cross-type scope, projection,
 grouping and nested collection. Record the global-search inclusion/defer
@@ -2850,17 +3146,21 @@ all later reads. Admit parameter bounds before the first data scan.
 
 Completion requires parser/typechecker prototypes and golden plans for both
 graph-scope-first and retrieval-first queries, independent numerical score
-fixtures, and concrete dispositions for the acceptance blockers. Define the
-fixed retrieval/agent-task corpus and evaluation criteria here, before tuning
-defaults. A capability listing or the existing compiler baseline is not that
+fixtures, the C1–C4 design proofs, and concrete dispositions for the acceptance
+blockers. Define the fixed retrieval and mixed analytical/graph/agent-task
+corpus and evaluation criteria here, before tuning defaults. A capability
+listing or the existing compiler baseline is not that
 evidence. Compiler, search, schema, and read-contract owners supply these proofs.
 
 #### Phase 1: build representation, plan, and resource foundations
 
 Implement accepted representation identities and validation, typed lexical
-queries, named stage IR, target/metric binding, and plan fingerprints. Resolve
-schema defaults into persisted per-field bindings and expose them through
-schema plans and exports; resolve query inputs and encoders once per execution.
+queries, shared expressions for admitted operators, named stage IR,
+target/metric binding, and plan fingerprints. Represent ordinary analytical
+rows without a relevance score, preserve group scope and aggregate input
+lineage, and leave typed extension points for the deferred C1–C4 operators.
+Resolve schema defaults into persisted per-field bindings and expose them
+through schema plans and exports; resolve query inputs and encoders once per execution.
 Introduce the shared snapshot, admission, cancellation, and resource-accounting
 context that every later
 operator must use. Extend the sealed storage interfaces and existing
@@ -2908,6 +3208,10 @@ Connect the retrievers to graph-defined eligible targets and implement named
 weighted RRF, graph expansion between rank blocks, per-group selection, and
 final ordering/projection. Preserve associated binding rows, distinct target
 identity, arm membership, and metric origin through fan-out and aggregation.
+Qualify existing terminal aggregates after graph/retrieval stages, including
+the runnable binding-row-count and metric-reduction subset of C2. Do not
+interpret `take` reductions as reusable intermediate group output; C1's
+intermediate operators and general distinct aggregates remain deferred.
 Reuse existing traversal and qualified DataFusion operators, wiring them into
 the Phase 1 memory/scratch accounting; introduce no eager graph cross product.
 
@@ -2916,6 +3220,8 @@ and after a cut, rank traversal-introduced targets, preserve one arm vote per
 target through repeated paths, and keep source windows independent of final
 limits. Search/traversal/ordering/aggregation owners verify missing-arm metrics,
 RRF arithmetic, per-group boundaries, and inherited metric reductions. Include
+the [analytical population counterexamples](#analytical-populations-and-selection-boundaries)
+for delivered operators, alongside ordinary exact graph aggregates. Include
 fan-out and sort/spill failures that cannot return successful partial results.
 
 #### Phase 4: complete the agent-facing read path
@@ -2930,7 +3236,10 @@ a declared application key; a journey using only keyed entities is insufficient.
 Resolve the combined HTTP/CLI compatibility questions and regenerate OpenAPI.
 
 Completion requires an end-to-end discovery → source read → graph expansion →
-exact verification journey through embedded, HTTP, stored-query, and CLI paths.
+exact verification journey and a graph-scoped retrieval → terminal aggregate
+journey through embedded, HTTP, stored-query, and CLI paths. The latter must
+preserve output types, population lineage and projected group identities for
+follow-up; it must not imply that deferred nested/group-stage workflows work.
 The snapshot, policy, and transport owners verify concurrent graph changes,
 unavailable/expired snapshots, revoked access, missing representations, and
 client serialization/error behavior. Large projections and fallback work
@@ -2949,10 +3258,14 @@ to discover the exact candidate set. Preserve rebuild/recovery ownership.
 Completion requires correctness and resource evidence for every enabled path,
 including cancellation, model calls, coverage scans, graph fan-out,
 sorting/spill, output, and fallback within the remaining budget. Run the
-fixed-corpus lexical, dense, and fused retrieval comparison and the agent-task
-evaluation; record
-quality, latency, and context use with the configuration. Freeze source/window
-defaults and each enabled index family's `ann_default_v1` mapping only after
+fixed-corpus lexical, dense, and fused retrieval comparison and the
+[mixed workload evaluation](#mixed-workload-qualification) for supported
+operators; retain explicit future qualification for deferred families. Record
+task correctness, query-generation failures/repairs, aggregate-population
+errors, round trips, quality, latency, context use and measured execution work
+with the configuration. The document pilot cannot substitute for analytical
+task coverage. Freeze source/window defaults and each enabled index family's
+`ann_default_v1` mapping only after
 that evaluation. An unqualified native path stays disabled while a qualified
 exact fallback serves its contract; measured limits must remain explicit.
 
@@ -2995,6 +3308,9 @@ advanced retrieval and representation forms. Its deferred rows do not claim
 support or require implementation for the initial release. A `Decision` row
 requires an explicit Phase 0 disposition; it is not automatically deferred.
 Every later extension retains the stated semantic and qualification boundary.
+`Foundation` rows require their grammar/type/composition proofs before syntax
+stabilization while their broader operators remain deferred. These design
+proofs do not enlarge the advertised initial-release feature set.
 
 ## Unresolved questions
 
@@ -3003,7 +3319,9 @@ Every later extension retains the stated semantic and qualification boundary.
    user-defined selection tie keys. The partial compiler
    prototype does not close the full result-schema and aggregation contract.
    Null-bucket and multiple-membership semantics are specified above; prove
-   their lowering and retain RFC 0040 namespace coordination.
+   their lowering and retain RFC 0040 namespace coordination. Complete the
+   C1–C4 syntax/type/plan proofs, including the analytical population and
+   deferred correlation/scoring boundaries, before syntax stabilization.
 2. Qualification of the specified BM25 policy: the pinned numeric kernel across
    supported targets, exact live-row statistics, polymorphic field-corpus
    resolution, and native/fallback score and winner parity. Validate its edit
@@ -3020,8 +3338,9 @@ Every later extension retains the stated semantic and qualification boundary.
 5. Read-envelope and stored-query definition fingerprints, snapshot-bound
    follow-up transport and retention. Stable ranked cursors remain deferred.
 6. Initial ANN effort mappings and agent recipe defaults, chosen by the owned
-   fixed-corpus evaluation. Further multilingual profiles require matched-set
-   evidence and new versioned identities.
+   fixed-corpus evaluation across the supported mixed workloads. The document
+   pilot alone cannot close this gate. Further multilingual profiles require
+   matched-set evidence and new versioned identities.
 7. General all-node/type-union selection, compatible representation expansion,
    type narrowing and heterogeneous projection. Explicitly decide its initial
    release scope in Phase 0; the same-binding fusion implementation alone
@@ -3029,6 +3348,13 @@ Every later extension retains the stated semantic and qualification boundary.
 
 ## Decision log
 
+- 2026-09-10 — made mixed analytical, graph and semantic investigation the
+  agent-workload objective. Consolidated typed relation/operator contracts,
+  separated aggregate input from eligibility, candidates and scoring corpus,
+  and required C1–C4 composition proofs before syntax stabilization. Marked
+  critical composition rows as foundations with deferred implementations;
+  expanded phase gates and evaluation families without claiming new runtime
+  support or changing the frozen document pilot's interpretation.
 - 2026-09-10 — added the query capability matrix, covering production support,
   required RFC delivery, future extension boundaries and unresolved global
   search scope. Consolidated the extension inventories and made projection,
