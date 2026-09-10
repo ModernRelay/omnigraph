@@ -17,7 +17,7 @@ graphs:
     queries: queries/            # discover every `query <name>` in queries/*.gq
 ```
 
-`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed (per-query `mcp:`/expose flags are a planned phase).
+`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed.
 
 ## CLI
 
@@ -57,8 +57,11 @@ omnigraph queries list --cluster . --graph dev     # names and typed params
 
 ## MCP exposure
 
-Every applied query is listed in `GET /graphs/{id}/queries` as a typed MCP tool. Per-query exposure controls (`mcp.expose`, `tool_name`) are a planned phase — there is no per-query `mcp:` flag in cluster mode today.
+Every applied query is listed in `GET /graphs/{id}/queries` as a typed MCP tool.
+There is no per-query `mcp:` flag in cluster mode.
 
 ## Note on per-query authorization
 
-The catalog is **not** Cedar-filtered per query yet: a caller with `read` but not `invoke_query` can *list* a query it cannot *invoke* (invocation would 404). Per-query authorization is future work; for now the catalog is a discovery surface and `invoke_query` is the invocation gate.
+The catalog is not Cedar-filtered per query: a caller with `read` but not
+`invoke_query` can list a query it cannot invoke (invocation would 404).
+The catalog is a discovery surface and `invoke_query` is the invocation gate.
