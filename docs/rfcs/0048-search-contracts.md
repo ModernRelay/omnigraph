@@ -15,7 +15,7 @@ blocked_on:
   - "RFC 0047 plan-truth guarantees reconciled with named stages; its interim Option<RetrievalIR> shape and scan-root restriction are not permanent dependencies"
   - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
   - "Language evolution contract: shared expressions, contextual keywords, scope transitions, and compatibility fixtures before syntax stabilization; explicit yield output is compiler-prototyped"
-  - "Mixed analytical/graph/retrieval composition examples: proposed syntax, scope and result types, population counterexamples, and physical plans for deferred extensions before syntax stabilization"
+  - "Mixed analytical/graph/retrieval composition: C1–C4 syntax/scope are compiler-prototyped; complete golden plans, population counterexamples and physical qualification remain required before stabilization"
   - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
   - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
   - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
@@ -1210,9 +1210,12 @@ the aggregate answers.
 ### Required composition examples
 
 These four examples are acceptance requirements for grammar evolution. Their
-notation below describes logical stages, not accepted `.gq` spelling or
-implemented features. Phase 0 must supply proposed syntax, type/scope
-derivations and golden plans, plus counterexamples for invalid rewrites.
+`.gq` spellings below are parsed and type/scope-checked by the test-only
+compiler owner; the production parser rejects them. The adjacent stage
+sketches describe their intended meaning. This supplies a syntax experiment,
+not accepted public syntax or executable analytical/nested operators. Phase 0
+must complete the golden plans and physical qualification arguments, plus
+counterexamples for invalid rewrites.
 Deferred operators need those design proofs before syntax stabilization;
 their executable GQT and resource proofs land with their implementation.
 The examples use ordinary application types such as `Service` and `Passage`.
@@ -1247,6 +1250,43 @@ accepted service identity through reduction, declare new report reads, and
 share snapshot and budget. Executing nested sources once per parent without
 accounting for cumulative work is not an acceptable lowering.
 
+Proposed spelling for the single-selected-service case:
+
+```gq
+query composition_c1($q: String) {
+  match {
+    $i: Incident
+    $s hasIncident $i
+    $i.period = "prior" or $i.period = "current"
+  }
+  group {
+    per { $s }
+    reduce {
+      count_if($i.period = "prior") as prior_count,
+      count_if($i.period = "current") as current_count
+    }
+  }
+  let { current_count - prior_count as increase }
+  select { order { increase desc, $s.@id asc } limit 1 }
+  match { $s hasReport $p }
+  rank $p {
+    lexical($p.text, terms($q), candidates: 2) as reports
+    yield reports
+  }
+  return {
+    $s as service, prior_count as prior_count, current_count as current_count,
+    increase as increase, $p.@id as report_id, $p.text as report_text
+  }
+}
+```
+
+`group` exports its entity keys under their existing binding names and its
+explicitly named reductions as values. `let` adds values to each row; its
+sibling expressions read the incoming scope. `select` orders and cuts the
+current rows, while `take` continues to select target/group pairs. This query
+has one selected service, so its final source has that service's population.
+Several selected services require the explicit correlation shown in C4.
+
 **C2 — Retrieve, traverse, then aggregate the selected population.** Select
 passages, follow their project relationships, and return per-project counts.
 For selected passages p1/p2, two retained graph bindings connect p1 to project P
@@ -1268,6 +1308,30 @@ a grouping key and therefore asks a different question, as specified below.
 The physical plan retains the candidate barrier before expansion/aggregation.
 Distinct aggregates remain a deferred extension; the initial path must already
 qualify terminal binding-row counts and explicit metric reductions.
+
+```gq
+query composition_c2($q: String) {
+  match { $p: Passage }
+  rank $p {
+    lexical($p.text, terms($q), candidates: 2) as candidates
+    yield candidates
+  }
+  match { $p $membership:inProject $project }
+  group {
+    per { $project }
+    reduce {
+      count($p) as binding_rows,
+      count_distinct($p.@id) as passages,
+      min(metric(candidates, rank)) as best_rank
+    }
+  }
+  return {
+    $project as project, binding_rows as binding_rows,
+    passages as passages, best_rank as best_rank
+  }
+  order { $project.@id asc }
+}
+```
 
 **C3 — Score existing candidates without changing membership.** Dense retrieval
 selects d1/d2; both match the lexical query, but a lexical arm's window contains
@@ -1292,6 +1356,31 @@ statistics, then reattaches features by target identity. A hidden lexical top-K
 followed by a join is not equivalent: it can omit d2. A narrow target set can
 still require broad statistics work, charged to the same execution. Native
 scorer availability does not establish parity with the accepted formula.
+
+```gq
+query composition_c3($q: String, $vector: Vector(3)) {
+  match { $p: Passage }
+  rank $p {
+    lexical($p.text, terms($q), candidates: 1) as words
+    knn($p.embedding, $vector, candidates: 2) as dense
+    yield dense
+  }
+  score $p {
+    lexical($p.text, terms($q), scoring: bm25_v1) as words_feature
+  }
+  return {
+    $p.@id as passage_id, metric(words, rank) as lexical_rank,
+    metric(words, score) as lexical_score, feature(words_feature) as lexical_feature
+  }
+}
+```
+
+`score` has no candidate window or output selector: it evaluates the incoming
+targets and preserves their comparator. `feature` resolves only a scorer;
+`metric` resolves retrieval membership and metrics. A scorer cannot acquire a
+rank or an RRF vote merely by sharing a constructor spelling with a retriever.
+The typed lexical constructor has different admitted arguments in those two
+operator roles; a hidden `candidates` option is refused in `score`.
 
 **C4 — Combine computed facts, optional graph facts and bounded evidence.**
 Return selected services and their computed counts, an owner if known, and up
@@ -1319,6 +1408,104 @@ relation. Qualified outer joins, grouped local selection and collection are
 possible physical building blocks, but ordering, empty lists, nulls, shared
 buffers and total item/byte/work limits require end-to-end qualification.
 Local item limits alone do not bound all parent groups or upstream traversal.
+
+Proposed spelling reuses the same staged body and result tail in each child:
+
+```gq
+query composition_c4($q: String) {
+  match {
+    $i: Incident
+    $s hasIncident $i
+    $i.period = "prior" or $i.period = "current"
+  }
+  group {
+    per { $s }
+    reduce {
+      count_if($i.period = "prior") as prior_count,
+      count_if($i.period = "current") as current_count
+    }
+  }
+  let { current_count - prior_count as increase }
+  select { order { increase desc, $s.@id asc } limit 2 }
+  optional ($s) as owner {
+    match { $s ownedBy $person }
+    return { $person as person }
+  }
+  collect ($s) as reports {
+    match { $s hasReport $p }
+    rank $p {
+      lexical($p.text, terms($q), candidates: 2) as relevant
+      yield relevant
+    }
+    return { $p.@id as id, $p.text as text }
+    order { metric(relevant, rank) asc, $p.@id asc }
+    limit 2
+  }
+  return {
+    $s as service, prior_count as prior_count, current_count as current_count,
+    increase as increase, owner as owner, reports as reports
+  }
+}
+```
+
+Imports are explicit: `$s` imports an entity binding; a bare name imports a
+computed row value. Query parameters remain available inside child scopes.
+Source aliases and child graph bindings do not leak across scope boundaries.
+`optional` produces a nullable object with the child's named fields; zero rows
+produce null and more than one row must raise a cardinality error unless the
+child explicitly selects one. The example's `OwnedBy` cardinality is zero or
+one. `collect` produces a non-null typed list of those objects, including an
+empty list for zero rows. It requires a local comparator and explicit output
+limit; the source window alone does not bound later graph fan-out. These are
+proposed result semantics, not runtime guarantees established by parsing.
+
+The proposed collection consumes binding rows; the prototype records that
+role without executing it. Multiple paths to the same report therefore need
+an explicit identity reduction before collection
+when the caller wants unique reports. Edge imports/group exports, total row
+ties, general nested-field access and runtime cardinality/resource enforcement
+remain unqualified. Both child operations must preserve their parent row and
+share its accepted snapshot and whole-query budget; no per-parent reset is
+allowed. Optional enrichment and collection spelling remain revisable until
+the full C4 plan and runtime boundaries have been qualified.
+
+**What is established, and what agents must investigate.** The
+[compiler experiment](../../crates/omnigraph-compiler/src/query/staged_probe.rs)
+reads these four examples directly from this RFC. Its assertions establish
+the following scope transitions; no result rows are executed by this owner:
+
+| Example | Checked type/scope boundary | Still unproved / required falsifier |
+|---|---|---|
+| C1 | Group retains `$s: Service`, exports non-null `I64` counts, drops `$i`, then retains those counts and `increase` through row selection and report retrieval. | Execute the 2/8 versus 6/7 fixture, a missing-period group and duplicate graph paths. Moving report retrieval before aggregation must change the adversarial answer and remain an illegal optimization. Node identity rehydration and overflow handling need engine proof. |
+| C2 | Candidate source precedes traversal/grouping; group retains `$project`, row/distinct counts and the reduced rank's source identity, while dropping `$p`, the membership edge and the active comparator. | Prove three binding rows versus two distinct selected passages, excluding p3. Aggregate null/equality semantics, distinct-state memory and optimizer preservation need execution tests. |
+| C3 | The scorer has no candidate window, rank or fusion vote; its feature has a distinct source identity. Dense output remains the active comparator. | Execute d2 with absent lexical-arm metrics and a present independent lexical feature. Define/test the score for a nonmatching retained target and the fixed statistics population. A top-K-and-join implementation must fail the control. |
+| C4 | Child scopes import named entities/values, retain query parameters, export only named result fields and have distinct source IDs. Parent facts survive; output types distinguish a nullable owner object from a non-null report list. | Execute B with no owner/reports, multiple-owner refusal, duplicate paths, a child with fan-out after its candidate cut and multiple parents sharing one small budget. The parser's local limit check proves none of these runtime properties. |
+
+The physical argument currently reaches API/source feasibility only. The
+pinned DataFusion 54
+[aggregate builder](https://docs.rs/crate/datafusion-expr/54.0.0/source/src/logical_plan/builder.rs),
+[filtered aggregate expressions](https://docs.rs/crate/datafusion-expr/54.0.0/source/src/expr_fn.rs)
+and [distinct count](https://docs.rs/crate/datafusion-functions-aggregate/54.0.0/source/src/count.rs)
+provide typed building blocks for C1/C2. Filtered counts need to count matching
+rows, not non-null Boolean values: `count(predicate)` would also count false.
+Grouping by accepted entity identity, preserving the candidate barrier and
+reattaching entity access remain OmniGraph lowering responsibilities. C3 needs
+the accepted lexical evaluator over a fixed target set, not a native lexical
+retriever used as a substitute for a scorer.
+
+C4 has a concrete substrate mismatch to retain as a qualification case:
+DataFusion's pinned
+[`ArrayAggAccumulator::evaluate`](https://docs.rs/crate/datafusion-functions-aggregate/54.0.0/source/src/array_agg.rs)
+returns a null list when it has no values. C4 promises an empty typed list.
+A left join before aggregation can instead manufacture a null placeholder
+row, so blindly coalescing a result is insufficient. One proposed lowering
+aggregates actual child rows by parent identity with explicit aggregate order,
+left-joins those groups to the retained parent population, and constructs the
+typed empty list only for absent groups. Optional objects also require a
+presence marker; an object whose properties happen to be null is not an absent
+row. Qualify these choices against empty groups, shuffled partitions and
+duplicate parents before adopting them. These source observations do not
+establish bounded collection, safe decorrelation or end-to-end execution.
 
 ### Target identity, fan-out, grouping, and metrics
 
@@ -2573,7 +2760,7 @@ does not make the proposed operators implemented behavior.
 
 | Surface | Validation result |
 |---|---|
-| Grammar and IR | Current `.gq` has one match block and fixed expression variants. The proposed rank/lexical/metric syntax still requires parser/typechecker and lowered-plan fixtures. |
+| Grammar and IR | Production `.gq` has one match block and fixed expression variants. The test-only compiler now checks staged syntax and C1–C4 scope transitions; complete lowered-plan/execution qualification remains open. See the implementation checkpoint for its exact boundary. |
 | Current fusion windows | Corrected: vector arms inherit the final limit; BM25 arms scan uncapped. Named windows are a new semantic contract. |
 | BM25 statistics | Native covered-index prefiltering retains corpus scores. A real Lance fixture reverses the winner when only the statistics corpus changes. The initial contract now fixes the snapshot-visible field corpus independently of ordinary eligibility; live-row statistics and score parity still need qualification. |
 | Fuzzy matching | The pin still has the nonzero-edit analyzer bypass, per-segment query-wide expansion cap and incomplete flat behavior. The tokenizer/edit-distance probe passed 73,008 comparisons again; it does not qualify the revised NFC pipeline, scanner parity, or query budgets. |
@@ -2708,11 +2895,21 @@ passes 361 tests. The extended test-only staged owner selects rank-block
 outputs with `yield <source>` and preserves a typed output reference per
 block. Its new fixture first failed because the old grammar rejected `yield`;
 it now covers unused sources, declaration reorder, contextual names and
-missing/duplicate/unknown/cross-block output refusal. The three RFC `.gq`
-examples are parsed and checked by that same owner; production syntax remains
-unchanged. `cargo test --locked -p omnigraph-compiler` passes 363 tests,
+missing/duplicate/unknown/cross-block output refusal. The three then-present
+RFC `.gq` examples were parsed and checked by that same owner; production
+syntax remained unchanged. `cargo test --locked -p omnigraph-compiler` passed 363 tests,
 including 13 staged-prototype tests; compiler Clippy, formatting and
-documentation checks pass. These counts apply only to this compiler checkpoint.
+documentation checks passed. These counts apply only to that compiler
+checkpoint. Its environment selected Rust 1.98.0 despite the repository's
+1.97.1 pin; do not cite it as pinned-toolchain evidence.
+
+The follow-on checkpoint starts from `58039351` and explicitly uses
+`cargo +1.97.1`. Its clean compiler baseline passes 363 tests; the production
+engine baseline passes 43 `lance_surface_guards` and 56 `search` tests. The
+extended compiler passes 367 tests, including all seven RFC examples and four
+new C1–C4 owners. Compiler Clippy passes on the same pinned toolchain. These
+composition additions remain test-only; the native baseline does not execute
+them. An unconfigured S3 guard remains excluded from remote-storage evidence.
 
 The same owner now parses expression operands through one `probe_value` root
 in match predicates, source arguments/options, group keys, local/final order,
@@ -2727,11 +2924,16 @@ parser. Its checked decisions and remaining limits are:
 | Scalar and metric types | Ordinary comparison/containment delegates to production type rules. Computed values retain input metric origins; arithmetic cannot erase metric domains. Compatible metric thresholds produce nullable Bool; `is_null` produces non-null Bool. Cross-source/domain comparisons need an explicit policy. |
 | Reduction scope | Aggregates are refused in row predicates and group keys, including when nested in another expression. A computed aggregate result remains a reduction, not an implicit grouping key. After reduction, final order uses projected output values. |
 | Counts and argument roles | Final limits now admit non-null integer parameters through the same bound checker as windows/quotas, retaining distinct units and zero rules. Row-dependent limits, duplicate/unknown named options and positional arguments after options are refused. Source operands still require their declared constant/property roles. |
+| Intermediate composition | `group`, `let` and row `select` preserve exported node identities and computed counts while dropping member scope. `count_if` and `count_distinct` have typed roles. Edge group export/import, computed values in `take`, complete duplicate-row comparators and the full aggregate/null type algebra still need qualification. |
+| Candidate scoring | `score` and `feature` distinguish feature computation from retrieval membership. No score values are evaluated; nonmatch/null behavior, representation/statistics identity, resource charging and physical lowering remain open. |
+| Nested results | `optional` and `collect` recurse into the same staged grammar with explicit imports, named fields and independent source scopes. Parent order survives. Nullable-object/list types are checked, but runtime cardinality, empty results, object-field access, decorrelation and cumulative work are not implemented. |
 | Numeric/null execution | Same-type scalar arithmetic is type-prototyped. Implicit casts, integer division, unary numeric syntax and overflow/non-finite behavior need further decisions/proofs; this experiment refuses unqualified arithmetic. Nullable typing alone does not prove runtime three-valued logic, short-circuit behavior or error handling. |
 
 These are parser/type/scope proofs, not an executable expression evaluator.
-The C1–C4 derivations, complete numeric/null rules, semantic fingerprints,
-physical plans and the remaining Phase 0 decision packages are still open.
+The C1–C4 examples now have parser/type/scope assertions and explicit
+falsifiers. Complete golden/optimized plans, numeric/null rules, semantic
+fingerprints, physical execution and the other Phase 0 decision packages
+remain open.
 The source/selection/descriptor integration and resource-refusal gate must
 still run through the actual engine and GQT. This checkpoint does not certify
 runtime selection or complete Phase 0.
@@ -3140,7 +3342,7 @@ the evidence boundaries below.
 
 | Evidence level | What it establishes | What implementers must still check |
 |---|---|---|
-| Design proved | Coherent proposed syntax, types, scope, population and logical/physical plan arguments | Actual compiler/execution behavior, resource bounds and supported integration paths |
+| Design argued | Proposed syntax, types, scope, population and a reasoned logical/physical plan | Counterexamples, actual compiler/execution behavior, resource bounds and supported integration paths; an argument is not executable proof |
 | Prototype executed | A recorded executable produced expected results on specified fixtures | Whether the fixture covers the claim and production lowering, optimization, transports and dependencies preserve it |
 | Production qualified | An integrated implementation passes its owned result, mechanism, resource and transport gates | The qualified revision, dependency/configuration envelope and excluded routes; this is not a universal guarantee |
 | Open / unproved | A design decision or implementation assumption lacks sufficient evidence | Resolve it through source inspection and a discriminating test, or record an explicit dependency/defer decision |
@@ -3156,7 +3358,8 @@ read the complete relevant upstream pages from [the Lance map](../dev/lance.md),
 and inspect matching pinned source. Extend the existing owner with the smallest
 test that would fail if the claim were false; verify its selected test count,
 physical setup and negative control. Record source revision, dependency and
-configuration identity, command, result and remaining limitation in the owning
+configuration identity, effective compiler/toolchain, command, result and
+remaining limitation in the owning
 evidence entry. Revalidate when the relied-on path or dependency changes;
 do not rerun unrelated experiments merely to accumulate green tests.
 If evidence contradicts a proposed mechanism, revise it and its recorded
@@ -3251,10 +3454,12 @@ corpus and evaluation criteria here, before tuning defaults. A capability
 listing or the existing compiler baseline is not that
 evidence. Compiler, search, schema, and read-contract owners supply these proofs.
 
-**Uncertainty and required investigation.** The sketches do not settle the
-complete expression grammar, explicit output spelling, C1–C4 scopes or
-cross-type result types. Check actual parser/name-resolution behavior and
-negative cases; illustrative notation is not accepted syntax. Resource and
+**Uncertainty and required investigation.** `yield` and the C1–C4 spellings
+now have parser/type/scope fixtures, as recorded in the
+[checkpoint](#implementation-handoff-and-validation-checkpoint). That does not
+settle the complete expression grammar, physical plans, numeric/null runtime
+rules or cross-type result types. Extend the existing negative cases and
+inspect actual lowering; proposed syntax is not accepted syntax. Resource and
 wire choices remain open too. Start a dependent work package only after its
 required decisions/interfaces are fixed; an unresolved native route needs an
 explicit upstream dependency or fallback disposition, not assumed feasibility.
@@ -3727,6 +3932,13 @@ this milestone does not imply support for all future operators.
 
 ## Decision log
 
+- 2026-09-11 — added test-only C1–C4 syntax and scope qualification for
+  intermediate groups/values, row selection, independent scoring and explicit
+  nested imports/results. Recorded each example's remaining falsifiers,
+  DataFusion's null-list mismatch and the pinned Rust baseline. Replaced
+  "Design proved" with "Design argued" so physical proposals are not mistaken
+  for execution evidence. Production implementation and remaining Phase 0
+  acceptance gates stay open.
 - 2026-09-11 — began Phase 0 with explicit `yield <source>` rank-block output
   and a shared expression root in the existing test-only compiler. Added
   precedence, contextual-name, scope, metric-domain and parameter-limit

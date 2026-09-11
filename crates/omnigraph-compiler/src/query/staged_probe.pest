@@ -2,7 +2,17 @@
 // Reuse current tokens, graph patterns and scalar expressions; query_file
 // remains the production root and cannot reach any of these rules.
 probe_file = { SOI ~ probe_decl ~ EOI }
-probe_decl = { "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{" ~ probe_match ~ (probe_rank | probe_match | probe_take)* ~ probe_return ~ probe_order? ~ probe_limit? ~ "}" }
+probe_decl = { "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{" ~ probe_body ~ "}" }
+probe_body = { probe_match ~ (probe_rank | probe_match | probe_take | probe_group | probe_let | probe_select | probe_score | probe_nested)* ~ probe_return ~ probe_order? ~ probe_limit? }
+probe_nested = { probe_nested_kind ~ "(" ~ probe_imports ~ ")" ~ "as" ~ ident ~ "{" ~ probe_body ~ "}" }
+probe_nested_kind = { "collect" | "optional" }
+probe_imports = { ((variable | ident) ~ ("," ~ (variable | ident))*)? }
+probe_score = { "score" ~ variable ~ "{" ~ probe_source+ ~ "}" }
+probe_group = { "group" ~ "{" ~ probe_group_keys ~ probe_group_reductions ~ "}" }
+probe_group_keys = { "per" ~ "{" ~ probe_projection+ ~ "}" }
+probe_group_reductions = { "reduce" ~ "{" ~ probe_projection+ ~ "}" }
+probe_let = { "let" ~ "{" ~ probe_projection+ ~ "}" }
+probe_select = { "select" ~ "{" ~ probe_order ~ probe_limit ~ "}" }
 probe_limit = { "limit" ~ probe_value }
 probe_match = { "match" ~ "{" ~ probe_match_item+ ~ "}" }
 probe_match_item = { probe_negation | binding | traversal | probe_match_terms | probe_filter }
@@ -36,7 +46,8 @@ probe_not = { (probe_kw_not ~ &"(")* ~ probe_comparison }
 probe_comparison = { probe_sum ~ (probe_comparison_op ~ probe_sum)? }
 probe_sum = { probe_product ~ (probe_add_op ~ probe_product)* }
 probe_product = { probe_primary ~ (probe_mul_op ~ probe_primary)* }
-probe_primary = { probe_metric | probe_identity | probe_aggregate | probe_is_null | "(" ~ probe_value ~ ")" | probe_alias | expr }
+probe_primary = { probe_metric | probe_feature | probe_identity | probe_aggregate | probe_is_null | "(" ~ probe_value ~ ")" | probe_alias | expr }
+probe_feature = { "feature" ~ "(" ~ ident ~ ")" }
 probe_alias = @{ !(("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_")) ~ ident_chars ~ !((WHITESPACE | COMMENT)* ~ "(") }
 probe_is_null = { "is_null" ~ "(" ~ probe_value ~ ")" }
 probe_comparison_op = @{ "starts_with" ~ !(ASCII_ALPHANUMERIC | "_") | "contains" ~ !(ASCII_ALPHANUMERIC | "_") | ">=" | "<=" | "!=" | ">" | "<" | "=" }
@@ -47,4 +58,5 @@ probe_kw_and = @{ "and" ~ !(ASCII_ALPHANUMERIC | "_") }
 probe_kw_or = @{ "or" ~ !(ASCII_ALPHANUMERIC | "_") }
 probe_metric = { "metric" ~ "(" ~ ident ~ "," ~ ident ~ ")" }
 probe_identity = { variable ~ ".@id" }
-probe_aggregate = { agg_func ~ "(" ~ probe_value ~ ")" }
+probe_aggregate = { probe_agg_func ~ "(" ~ probe_value ~ ")" }
+probe_agg_func = { "count_distinct" | "count_if" | agg_func }
