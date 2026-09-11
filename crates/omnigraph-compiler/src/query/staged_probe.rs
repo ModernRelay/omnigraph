@@ -27,6 +27,8 @@ struct Terms {
 enum MatchItem {
     Graph(Clause),
     Terms { field: Expr, query: Terms },
+    Filter(Value),
+    Negation(Vec<MatchItem>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ enum Stage {
     Rank {
         target: String,
         declarations: Vec<Declaration>,
+        output: String,
     },
     Take(Take),
 }
@@ -80,8 +83,56 @@ struct Take {
 enum Value {
     Core(Expr),
     Identity(String),
-    Metric { source: String, field: String },
-    Aggregate { function: String, value: Box<Value> },
+    Metric {
+        source: String,
+        field: String,
+    },
+    Aggregate {
+        function: String,
+        value: Box<Value>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Value>,
+        right: Box<Value>,
+    },
+    Not(Box<Value>),
+    IsNull(Box<Value>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    And,
+    Or,
+    Compare(CompOp),
+}
+
+impl Value {
+    fn contains_aggregate(&self) -> bool {
+        match self {
+            Self::Aggregate { .. } => true,
+            Self::Binary { left, right, .. } => {
+                left.contains_aggregate() || right.contains_aggregate()
+            }
+            Self::Not(value) | Self::IsNull(value) => value.contains_aggregate(),
+            _ => false,
+        }
+    }
+
+    fn uses_only_output_values(&self) -> bool {
+        match self {
+            Self::Core(Expr::AliasRef(_) | Expr::Literal(_)) => true,
+            Self::Binary { left, right, .. } => {
+                left.uses_only_output_values() && right.uses_only_output_values()
+            }
+            Self::Not(value) | Self::IsNull(value) => value.uses_only_output_values(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,9 +148,16 @@ struct Query {
     stages: Vec<Stage>,
     projections: Vec<(Value, Option<String>)>,
     order: Vec<OrderingSpec<Value>>,
+    limit: Option<Expr>,
 }
 
 fn core(pair: Pair<Rule>) -> ProbeResult<Expr> {
+    if pair.as_rule() == Rule::probe_value {
+        return match value(pair)? {
+            Value::Core(expr) => Ok(expr),
+            _ => Err("this operand requires a literal, parameter or property".into()),
+        };
+    }
     parse_expr(pair).map_err(|e| e.to_string())
 }
 
@@ -161,8 +219,53 @@ fn declaration(pair: Pair<Rule>) -> ProbeResult<Declaration> {
 }
 
 fn value(pair: Pair<Rule>) -> ProbeResult<Value> {
-    let item = pair.into_inner().next().unwrap();
+    let item = match pair.as_rule() {
+        Rule::probe_value | Rule::probe_primary => return value(pair.into_inner().next().unwrap()),
+        Rule::probe_or
+        | Rule::probe_and
+        | Rule::probe_comparison
+        | Rule::probe_sum
+        | Rule::probe_product => {
+            let mut parts = pair.into_inner();
+            let mut left = value(parts.next().unwrap())?;
+            while let Some(op) = parts.next() {
+                let op = match op.as_str() {
+                    "+" => BinaryOp::Add,
+                    "-" => BinaryOp::Subtract,
+                    "*" => BinaryOp::Multiply,
+                    "/" => BinaryOp::Divide,
+                    "and" => BinaryOp::And,
+                    "or" => BinaryOp::Or,
+                    "=" => BinaryOp::Compare(CompOp::Eq),
+                    "!=" => BinaryOp::Compare(CompOp::Ne),
+                    ">" => BinaryOp::Compare(CompOp::Gt),
+                    "<" => BinaryOp::Compare(CompOp::Lt),
+                    ">=" => BinaryOp::Compare(CompOp::Ge),
+                    "<=" => BinaryOp::Compare(CompOp::Le),
+                    "contains" => BinaryOp::Compare(CompOp::Contains),
+                    "starts_with" => BinaryOp::Compare(CompOp::StartsWith),
+                    _ => unreachable!(),
+                };
+                left = Value::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(value(parts.next().unwrap())?),
+                };
+            }
+            return Ok(left);
+        }
+        Rule::probe_not => {
+            let mut parts = pair.into_inner();
+            let mut result = value(parts.next_back().unwrap())?;
+            for _ in parts {
+                result = Value::Not(Box::new(result));
+            }
+            return Ok(result);
+        }
+        _ => pair,
+    };
     match item.as_rule() {
+        Rule::probe_alias => Ok(Value::Core(Expr::AliasRef(item.as_str().into()))),
         Rule::expr => Ok(Value::Core(core(item)?)),
         Rule::probe_identity => Ok(Value::Identity(
             item.into_inner().next().unwrap().as_str()[1..].into(),
@@ -179,6 +282,36 @@ fn value(pair: Pair<Rule>) -> ProbeResult<Value> {
             Ok(Value::Aggregate {
                 function: parts.next().unwrap().as_str().into(),
                 value: Box::new(value(parts.next().unwrap())?),
+            })
+        }
+        Rule::probe_is_null => Ok(Value::IsNull(Box::new(value(
+            item.into_inner().next().unwrap(),
+        )?))),
+        _ => unreachable!(),
+    }
+}
+
+fn match_item(pair: Pair<Rule>) -> ProbeResult<MatchItem> {
+    let item = pair.into_inner().next().unwrap();
+    match item.as_rule() {
+        Rule::binding => Ok(MatchItem::Graph(Clause::Binding(
+            parse_binding(item).map_err(|e| e.to_string())?,
+        ))),
+        Rule::traversal => Ok(MatchItem::Graph(Clause::Traversal(
+            parse_traversal(item).map_err(|e| e.to_string())?,
+        ))),
+        Rule::probe_negation => Ok(MatchItem::Negation(
+            item.into_inner()
+                .skip(1)
+                .map(match_item)
+                .collect::<ProbeResult<_>>()?,
+        )),
+        Rule::probe_filter => Ok(MatchItem::Filter(value(item.into_inner().next().unwrap())?)),
+        Rule::probe_match_terms => {
+            let mut parts = item.into_inner();
+            Ok(MatchItem::Terms {
+                field: core(parts.next().unwrap())?,
+                query: terms(parts.next().unwrap())?,
             })
         }
         _ => unreachable!(),
@@ -232,6 +365,7 @@ fn parse(input: &str) -> ProbeResult<Query> {
         stages: Vec::new(),
         projections: Vec::new(),
         order: Vec::new(),
+        limit: None,
     };
     for item in items {
         match item.as_rule() {
@@ -253,26 +387,27 @@ fn parse(input: &str) -> ProbeResult<Query> {
                 }
             }
             Rule::probe_match => {
-                let mut clauses = Vec::new();
-                for c in item.into_inner() {
-                    clauses.push(if c.as_rule() == Rule::clause {
-                        MatchItem::Graph(parse_clause(c).map_err(|e| e.to_string())?)
-                    } else {
-                        let mut parts = c.into_inner();
-                        MatchItem::Terms {
-                            field: core(parts.next().unwrap())?,
-                            query: terms(parts.next().unwrap())?,
-                        }
-                    });
-                }
+                let clauses = item
+                    .into_inner()
+                    .map(match_item)
+                    .collect::<ProbeResult<_>>()?;
                 query.stages.push(Stage::Match(clauses));
             }
             Rule::probe_rank => {
                 let mut parts = item.into_inner();
                 let target = parts.next().unwrap().as_str()[1..].to_string();
+                let output = parts
+                    .next_back()
+                    .unwrap()
+                    .into_inner()
+                    .nth(1)
+                    .unwrap()
+                    .as_str()
+                    .into();
                 query.stages.push(Stage::Rank {
                     target,
                     declarations: parts.map(declaration).collect::<ProbeResult<_>>()?,
+                    output,
                 });
             }
             Rule::probe_take => {
@@ -309,16 +444,7 @@ fn parse(input: &str) -> ProbeResult<Query> {
             Rule::probe_order => {
                 query.order = order(item)?;
             }
-            Rule::limit_clause => {
-                query.header.limit = Some(
-                    item.into_inner()
-                        .next()
-                        .unwrap()
-                        .as_str()
-                        .parse()
-                        .map_err(|e| format!("limit: {e}"))?,
-                )
-            }
+            Rule::probe_limit => query.limit = Some(core(item.into_inner().next().unwrap())?),
             _ => unreachable!(),
         }
     }
@@ -375,13 +501,39 @@ enum ValueType {
         function: AggFunc,
         input: Box<ValueType>,
     },
+    Computed {
+        scalar: PropType,
+        inputs: Vec<ValueType>,
+    },
 }
 
 impl ValueType {
+    fn scalar(&self) -> Option<PropType> {
+        match self {
+            Self::Core(ResolvedType::Scalar(ty)) | Self::Computed { scalar: ty, .. } => {
+                Some(ty.clone())
+            }
+            Self::Reduced {
+                function: AggFunc::Count,
+                ..
+            } => Some(PropType::scalar(ScalarType::I64, false)),
+            _ => None,
+        }
+    }
+
+    fn contains_reduction(&self) -> bool {
+        match self {
+            Self::Reduced { .. } => true,
+            Self::Computed { inputs, .. } => inputs.iter().any(Self::contains_reduction),
+            _ => false,
+        }
+    }
+
     fn metric_origins(&self) -> Vec<SourceId> {
         match self {
             Self::Metric { source, .. } => vec![*source],
             Self::Reduced { input, .. } => input.metric_origins(),
+            Self::Computed { inputs, .. } => inputs.iter().flat_map(Self::metric_origins).collect(),
             _ => Vec::new(),
         }
     }
@@ -415,11 +567,13 @@ struct CheckedTake {
 struct Plan {
     query: Query,
     sources: BTreeMap<String, CheckedSource>,
+    rank_outputs: BTreeMap<usize, SourceId>,
     selections: BTreeMap<usize, CheckedTake>,
     scopes: Vec<BTreeMap<String, String>>,
     projection_types: Vec<ValueType>,
     output_order: OutputOrder,
     output_scope: OutputScope,
+    final_limit: Option<Bound>,
 }
 
 fn context(catalog: &Catalog, prefix: &QueryDecl) -> ProbeResult<TypeContext> {
@@ -727,11 +881,11 @@ fn value_type(
             })
         }
         Value::Aggregate { function, value } => {
-            if matches!(value.as_ref(), Value::Aggregate { .. }) {
+            if value.contains_aggregate() {
                 return Err("nested aggregates are not supported".into());
             }
             let input = value_type(catalog, prefix, value, sources, aliases)?;
-            if matches!(input, ValueType::Reduced { .. }) {
+            if input.contains_reduction() {
                 return Err("nested aggregates through aliases are not supported".into());
             }
             let function = match function.as_str() {
@@ -740,7 +894,11 @@ fn value_type(
                 "max" => AggFunc::Max,
                 // Adding or averaging ranks or uncalibrated scores needs an
                 // explicit domain contract, not the underlying float type.
-                "sum" | "avg" if matches!(&input, ValueType::Core(ResolvedType::Scalar(ty)) if !ty.list && ty.scalar.is_numeric()) => {
+                "sum" | "avg"
+                    if input
+                        .scalar()
+                        .is_some_and(|ty| !ty.list && ty.scalar.is_numeric()) =>
+                {
                     if function == "sum" {
                         AggFunc::Sum
                     } else {
@@ -751,7 +909,12 @@ fn value_type(
             };
             let orderable = match &input {
                 ValueType::Metric { .. } => true,
-                ValueType::Core(ResolvedType::Scalar(ty)) => !ty.list && ty.scalar.is_orderable(),
+                _ if input
+                    .scalar()
+                    .is_some_and(|ty| !ty.list && ty.scalar.is_orderable()) =>
+                {
+                    true
+                }
                 _ => false,
             };
             if function != AggFunc::Count && !orderable {
@@ -762,13 +925,128 @@ fn value_type(
                 input: Box::new(input),
             })
         }
+        Value::IsNull(value) => Ok(ValueType::Computed {
+            scalar: PropType::scalar(ScalarType::Bool, false),
+            inputs: vec![value_type(catalog, prefix, value, sources, aliases)?],
+        }),
+        Value::Not(value) => {
+            let input = value_type(catalog, prefix, value, sources, aliases)?;
+            let ty = input
+                .scalar()
+                .filter(|t| !t.list && t.scalar == ScalarType::Bool)
+                .ok_or("not requires Bool")?;
+            Ok(ValueType::Computed {
+                scalar: ty,
+                inputs: vec![input],
+            })
+        }
+        Value::Binary { op, left, right } => {
+            let l = value_type(catalog, prefix, left, sources, aliases)?;
+            let r = value_type(catalog, prefix, right, sources, aliases)?;
+            let scalar = binary_type(catalog, *op, &l, &r)?;
+            Ok(ValueType::Computed {
+                scalar,
+                inputs: vec![l, r],
+            })
+        }
     }
+}
+
+fn binary_type(
+    catalog: &Catalog,
+    op: BinaryOp,
+    left: &ValueType,
+    right: &ValueType,
+) -> ProbeResult<PropType> {
+    let scalar_pair = left.scalar().zip(right.scalar());
+    if let BinaryOp::Compare(comparison) = op {
+        if let Some((l, r)) = scalar_pair {
+            // Reuse production comparison/containment type rules with typed
+            // parameters; these synthetic bindings never enter a query plan.
+            let query = QueryDecl {
+                name: "comparison_type_probe".into(),
+                description: None,
+                instruction: None,
+                params: [("left", l.clone()), ("right", r.clone())]
+                    .into_iter()
+                    .map(|(name, ty)| Param {
+                        name: name.into(),
+                        type_name: ty.display_name().trim_end_matches('?').into(),
+                        nullable: ty.nullable,
+                    })
+                    .collect(),
+                match_clause: vec![Clause::Filter(Filter {
+                    left: Expr::Variable("left".into()),
+                    op: comparison,
+                    right: Expr::Variable("right".into()),
+                })],
+                return_clause: Vec::new(),
+                order_clause: Vec::new(),
+                limit: None,
+                mutations: Vec::new(),
+            };
+            context(catalog, &query)?;
+            return Ok(PropType::scalar(ScalarType::Bool, l.nullable || r.nullable));
+        }
+        if matches!(
+            comparison,
+            CompOp::Contains | CompOp::StartsWith | CompOp::StringContains
+        ) {
+            return Err("text/list predicate requires ordinary scalar operands".into());
+        }
+        let threshold = |metric: &ValueType, scalar: &ValueType| {
+            let ValueType::Metric { domain, .. } = metric else {
+                return false;
+            };
+            scalar.scalar().is_some_and(|ty| {
+                !ty.list
+                    && match domain {
+                        MetricDomain::Rank => matches!(
+                            ty.scalar,
+                            ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64
+                        ),
+                        _ => ty.scalar.is_numeric(),
+                    }
+            })
+        };
+        if (matches!(left, ValueType::Metric { .. }) && left == right)
+            || threshold(left, right)
+            || threshold(right, left)
+        {
+            return Ok(PropType::scalar(ScalarType::Bool, true));
+        }
+        if matches!(comparison, CompOp::Eq | CompOp::Ne)
+            && matches!((left, right), (ValueType::Identity(l), ValueType::Identity(r)) if l == r)
+        {
+            return Ok(PropType::scalar(ScalarType::Bool, false));
+        }
+        return Err(
+            "comparison requires compatible metric domains/origins or scalar operands".into(),
+        );
+    }
+    let (l, r) = scalar_pair.ok_or("arithmetic/Boolean operators cannot erase a metric domain")?;
+    if l.list || r.list {
+        return Err("operator requires scalar operands".into());
+    }
+    let scalar = match op {
+        BinaryOp::And | BinaryOp::Or if l.scalar == ScalarType::Bool && r.scalar == ScalarType::Bool => ScalarType::Bool,
+        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+            if l.scalar.is_numeric() && l.scalar == r.scalar => {
+                if op == BinaryOp::Divide && !matches!(l.scalar, ScalarType::F32 | ScalarType::F64) {
+                    return Err("integer division requires an explicit future numeric policy".into());
+                }
+                l.scalar
+            }
+        _ => return Err("operator requires compatible numeric or Bool operands; implicit numeric casts are not qualified".into()),
+    };
+    Ok(PropType::scalar(scalar, l.nullable || r.nullable))
 }
 
 fn orderable(ty: &ValueType) -> bool {
     match ty {
         ValueType::Identity(_) | ValueType::Metric { .. } => true,
         ValueType::Core(ResolvedType::Scalar(ty)) => !ty.list && ty.scalar.is_orderable(),
+        ValueType::Computed { scalar, .. } => !scalar.list && scalar.scalar.is_orderable(),
         ValueType::Reduced {
             function: AggFunc::Count,
             ..
@@ -873,6 +1151,13 @@ fn pair_constant(
         }
         Value::Metric { source, .. } => determined.contains(&sources[source].target),
         Value::Aggregate { .. } => true, // value_type already validates the explicit per-pair reduction.
+        Value::Binary { left, right, .. } => {
+            pair_constant(left, prefix, take, determined, sources)
+                && pair_constant(right, prefix, take, determined, sources)
+        }
+        Value::Not(value) | Value::IsNull(value) => {
+            pair_constant(value, prefix, take, determined, sources)
+        }
         _ => false,
     }
 }
@@ -893,7 +1178,7 @@ fn check_take(
     let mut key_types = Vec::new();
     for key in &take.keys {
         let ty = value_type(catalog, prefix, key, sources, &aliases)?;
-        if !orderable(&ty) || matches!(ty, ValueType::Reduced { .. }) {
+        if !orderable(&ty) || ty.contains_reduction() {
             return Err(
                 "group key requires an identity or orderable scalar, without aggregation".into(),
             );
@@ -951,31 +1236,61 @@ fn check_take(
     })
 }
 
+fn check_match(
+    catalog: &Catalog,
+    prefix: &mut QueryDecl,
+    clauses: &[MatchItem],
+    sources: &BTreeMap<String, CheckedSource>,
+) -> ProbeResult<()> {
+    // Graph patterns are declarative inside a block. Resolve all graph
+    // bindings before typing predicates, without moving them across stages.
+    for clause in clauses {
+        if let MatchItem::Graph(c) = clause {
+            reject_legacy_clause(c)?;
+            prefix.match_clause.push(c.clone());
+        }
+    }
+    context(catalog, prefix)?;
+    for clause in clauses {
+        match clause {
+            MatchItem::Graph(_) => {}
+            MatchItem::Terms { field, query } => check_terms(catalog, prefix, field, query, None)?,
+            MatchItem::Filter(value) => {
+                if value.contains_aggregate() {
+                    return Err("aggregate is not a row predicate".into());
+                }
+                let ty = value_type(catalog, prefix, value, sources, &BTreeMap::new())?;
+                if !ty
+                    .scalar()
+                    .is_some_and(|t| !t.list && t.scalar == ScalarType::Bool)
+                {
+                    return Err("match predicate requires Bool".into());
+                }
+            }
+            MatchItem::Negation(inner) => {
+                check_match(catalog, &mut prefix.clone(), inner, sources)?
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
     let mut prefix = query.header.clone();
     let mut sources = BTreeMap::new();
+    let mut rank_outputs = BTreeMap::new();
     let mut selections = BTreeMap::new();
     let mut scopes = Vec::new();
     let mut active_order = None;
     for (index, stage) in query.stages.iter().enumerate() {
         match stage {
             Stage::Match(clauses) => {
-                for clause in clauses {
-                    match clause {
-                        MatchItem::Graph(c) => {
-                            reject_legacy_clause(c)?;
-                            prefix.match_clause.push(c.clone());
-                            context(catalog, &prefix)?;
-                        }
-                        MatchItem::Terms { field, query } => {
-                            check_terms(catalog, &prefix, field, query, None)?
-                        }
-                    }
-                }
+                check_match(catalog, &mut prefix, clauses, &sources)?;
             }
             Stage::Rank {
                 target,
                 declarations,
+                output,
             } => {
                 if target == "_" {
                     return Err("rank target must be named; anonymous `$_` has no reusable binding identity".into());
@@ -995,8 +1310,13 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
                     };
                     let source = check_source(catalog, &prefix, declaration, id, target, &sources)?;
                     sources.insert(declaration.alias.clone(), source);
-                    active_order = Some(id);
                 }
+                let selected = sources.get(output).ok_or("unknown rank output")?;
+                if selected.id.block != index {
+                    return Err("output must belong to the current rank block".into());
+                }
+                rank_outputs.insert(index, selected.id);
+                active_order = Some(selected.id);
             }
             Stage::Take(take) => {
                 selections.insert(
@@ -1022,11 +1342,11 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
     let aggregate = query
         .projections
         .iter()
-        .any(|(value, _)| matches!(value, Value::Aggregate { .. }));
+        .any(|(value, _)| value.contains_aggregate());
     let mut aliases = BTreeMap::new();
     let mut projection_types = Vec::new();
     for (value, alias) in &query.projections {
-        let ty = value_type(catalog, &prefix, value, &sources, &aliases)?;
+        let ty = value_type(catalog, &prefix, value, &sources, &BTreeMap::new())?;
         if let Some(alias) = alias {
             if aliases.insert(alias.clone(), ty.clone()).is_some() {
                 return Err("duplicate result alias".into());
@@ -1036,7 +1356,7 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
     }
     let mut explicit_order = Vec::new();
     for ordering in &query.order {
-        if aggregate && !matches!(ordering.value, Value::Core(Expr::AliasRef(_))) {
+        if aggregate && !ordering.value.uses_only_output_values() {
             return Err(
                 "aggregate ordering must reference a projected result alias in this prototype"
                     .into(),
@@ -1063,22 +1383,27 @@ fn check(catalog: &Catalog, query: Query) -> ProbeResult<Plan> {
             key_projections: projection_types
                 .iter()
                 .enumerate()
-                .filter_map(|(index, ty)| {
-                    (!matches!(ty, ValueType::Reduced { .. })).then_some(index)
-                })
+                .filter_map(|(index, ty)| (!ty.contains_reduction()).then_some(index))
                 .collect(),
         }
     } else {
         OutputScope::Bindings
     };
+    let final_limit = query
+        .limit
+        .as_ref()
+        .map(|expr| bound(&query.header, expr, 0, None))
+        .transpose()?;
     Ok(Plan {
         query,
         sources,
+        rank_outputs,
         selections,
         scopes,
         projection_types,
         output_order,
         output_scope,
+        final_limit,
     })
 }
 
@@ -1099,9 +1424,12 @@ query staged($q: String, $vector: Vector(3), $window: I64) {
     lexical($o.name, terms($q, max_edits: 1), candidates: $window) as words
     knn($o.embedding, $vector, candidates: 100) as meaning
     rrf(arm(words), arm(meaning, weight: 1.5), candidates: 20) as combined
+    yield combined
   }
   match { $o hasIncident $i $i.title contains "outage" }
-  rank $i { lexical($i.title, terms($q), candidates: 5) as incidents }
+  rank $i { lexical($i.title, terms($q), candidates: 5) as incidents
+    yield incidents
+  }
   return { $o.@id, $i.slug, metric(words, rank) as words, metric(incidents, score) as score }
   order { words asc, score desc, $i.@id }
   limit 3
@@ -1134,6 +1462,13 @@ fn staged_probe_preserves_scopes_populations_and_metric_origins() {
         [words.id, plan.sources["meaning"].id]
     );
     assert_eq!(plan.sources["incidents"].input_stage, 2);
+    assert_eq!(
+        plan.rank_outputs,
+        BTreeMap::from([
+            (1, plan.sources["combined"].id),
+            (3, plan.sources["incidents"].id)
+        ])
+    );
     assert_eq!(
         plan.projection_types,
         [
@@ -1176,7 +1511,7 @@ fn staged_probe_preserves_scopes_populations_and_metric_origins() {
         order[1].value.metric_origins(),
         [plan.sources["incidents"].id]
     );
-    assert_eq!(plan.query.header.limit, Some(3));
+    assert_eq!(plan.final_limit, Some(Bound::Literal(3)));
     assert_eq!(plan.output_scope, OutputScope::Bindings);
     assert_eq!(plan.sources["incidents"].declaration.alias, "incidents");
     assert!(
@@ -1302,7 +1637,9 @@ fn staged_probe_does_not_leak_negation_bindings_and_can_rank_edges() {
     let edge = r#"
 query edge_search($q: String) {
   match { $o: Organization $o $link:hasIncident $i }
-  rank $link { lexical($link.note, terms($q), candidates: 5) as edges }
+  rank $link { lexical($link.note, terms($q), candidates: 5) as edges
+    yield edges
+  }
   return { $link.@id, $i.slug, metric(edges, rank) as rank }
 }
 "#;
@@ -1320,9 +1657,13 @@ fn staged_probe_cross_block_metrics_do_not_reopen_previous_populations() {
     let input = r#"
 query repeated($q: String) {
   match { $o: Organization }
-  rank $o { lexical($o.name, terms($q), candidates: 10) as original }
+  rank $o { lexical($o.name, terms($q), candidates: 10) as original
+    yield original
+  }
   match { $o.name contains "selected" }
-  rank $o { lexical($o.name, terms($q), candidates: 5) as later }
+  rank $o { lexical($o.name, terms($q), candidates: 5) as later
+    yield later
+  }
   return { $o.slug, metric(original, rank) as original_rank, metric(later, rank) as later_rank }
 }
 "#;
@@ -1332,8 +1673,8 @@ query repeated($q: String) {
     assert_eq!(plan.sources["later"].input_stage, 2);
     assert_ne!(plan.projection_types[1], plan.projection_types[2]);
     let invalid = input.replace(
-        "as later }",
-        "as later rrf(arm(original), arm(later), candidates: 5) as reopened }",
+        "as later\n    yield later\n  }",
+        "as later rrf(arm(original), arm(later), candidates: 5) as reopened yield reopened }",
     );
     assert!(
         check(&catalog, parse(&invalid).unwrap())
@@ -1347,7 +1688,9 @@ fn staged_probe_aggregation_establishes_a_new_output_scope() {
     let input = r#"
 query grouped($q: String) {
   match { $o: Organization $o hasIncident $i }
-  rank $i { lexical($i.title, terms($q), candidates: 10) as hits }
+  rank $i { lexical($i.title, terms($q), candidates: 10) as hits
+    yield hits
+  }
   return { $o.slug as organization, min(metric(hits, rank)) as best, count($i) as n }
   order { best asc, organization asc }
 }
@@ -1493,7 +1836,7 @@ fn staged_probe_take_preserves_population_metrics_and_global_order() {
     );
     assert_eq!(plan.scopes[4], plan.scopes[3]);
     assert_eq!(plan.sources["incidents"].candidates, Bound::Literal(5));
-    assert_eq!(plan.query.header.limit, Some(3));
+    assert_eq!(plan.final_limit, Some(Bound::Literal(3)));
     assert_eq!(plan.output_scope, OutputScope::Bindings);
 
     // A local comparator chooses winners, without becoming a global order.
@@ -1517,7 +1860,7 @@ fn staged_probe_take_preserves_population_metrics_and_global_order() {
 
     let after = input.replace(
         "  return {",
-        "  rank $i { lexical($i.title, terms($q), candidates: 2) as after_take }\n  return {",
+        "  rank $i { lexical($i.title, terms($q), candidates: 2) as after_take yield after_take }\n  return {",
     );
     let after_plan = check(&catalog(), parse(&after).unwrap()).unwrap();
     assert_eq!(after_plan.sources["after_take"].input_stage, 4);
@@ -1570,7 +1913,7 @@ fn staged_probe_take_validates_pairs_and_explicit_reductions() {
             "per { count($i) }",
             "group key requires",
         ),
-        ("limit 2 }", "limit -1 }", "expected expr"),
+        ("limit 2 }", "limit -1 }", "expected probe_not"),
         (
             "limit 2 }",
             "limit 1.5 }",
@@ -1716,6 +2059,217 @@ query graph_only() {
     assert!(!order[0].nulls_first);
     assert!(!order[0].descending);
     assert!(parse_query(input).is_err());
+}
+
+#[test]
+fn staged_probe_rank_output_is_explicit_and_independent_of_unused_sources() {
+    let input = r#"
+query chosen($q: String, $v: Vector(3)) {
+  match { $o: Organization }
+  rank $o {
+    lexical($o.name, terms($q), candidates: 7) as words
+    knn($o.embedding, $v, candidates: 11) as meaning
+    yield words
+  }
+  return { $o.slug, metric(words, rank) as rank }
+}
+"#;
+    let catalog = catalog();
+    let before = check(&catalog, parse(input).unwrap()).unwrap();
+    let changed = input.replace(
+        "yield words",
+        "lexical($o.name, terms($q, max_edits: 1), candidates: 2) as extra yield words",
+    );
+    let after = check(&catalog, parse(&changed).unwrap()).unwrap();
+    for plan in [&before, &after] {
+        assert_eq!(
+            plan.rank_outputs,
+            BTreeMap::from([(1, plan.sources["words"].id)])
+        );
+        assert_eq!(
+            plan.output_order,
+            OutputOrder::Ranked(plan.sources["words"].id)
+        );
+        assert_eq!(plan.sources["words"].candidates, Bound::Literal(7));
+        assert!(plan.sources.values().all(|source| source.input_stage == 0));
+    }
+    assert_eq!(before.projection_types, after.projection_types);
+    assert_eq!(before.scopes, after.scopes);
+    assert_eq!(before.output_scope, after.output_scope);
+    assert!(parse_query(input).is_err());
+
+    let reordered = input.replace(
+        "lexical($o.name, terms($q), candidates: 7) as words\n    knn($o.embedding, $v, candidates: 11) as meaning",
+        "knn($o.embedding, $v, candidates: 11) as meaning\n    lexical($o.name, terms($q), candidates: 7) as words",
+    );
+    assert_ne!(input, reordered);
+    let plan = check(&catalog, parse(&reordered).unwrap()).unwrap();
+    assert_eq!(plan.rank_outputs[&1], plan.sources["words"].id);
+    assert_eq!(plan.sources["words"].candidates, Bound::Literal(7));
+
+    // The source alias may itself be a contextual keyword.
+    let keyword = input.replace("words", "yield");
+    let plan = check(&catalog, parse(&keyword).unwrap()).unwrap();
+    assert_eq!(
+        plan.output_order,
+        OutputOrder::Ranked(plan.sources["yield"].id)
+    );
+
+    for replacement in [
+        "",
+        "yield missing",
+        "yield words yield meaning",
+        "yieldwords",
+    ] {
+        let invalid = input.replace("yield words", replacement);
+        assert!(
+            parse(&invalid).and_then(|q| check(&catalog, q)).is_err(),
+            "{invalid}"
+        );
+    }
+    // Appending an unused source still validates its operands and bounds.
+    let invalid = changed.replace("candidates: 2) as extra", "candidates: 0) as extra");
+    assert!(
+        check(&catalog, parse(&invalid).unwrap())
+            .unwrap_err()
+            .contains("bound out of range")
+    );
+    let prior_block = input.replace(
+        "return {",
+        "rank $o { lexical($o.name, terms($q), candidates: 3) as later yield words } return {",
+    );
+    assert!(
+        check(&catalog, parse(&prior_block).unwrap())
+            .unwrap_err()
+            .contains("output must belong to the current rank block")
+    );
+}
+
+#[test]
+fn staged_probe_shared_expressions_preserve_types_origins_and_precedence() {
+    let input = r#"
+query expressions($q: String, $threshold: I64, $missing: Bool?) {
+  match { $o: Organization }
+  rank $o {
+    lexical($o.name, terms($q), candidates: 10) as words
+    yield words
+  }
+  match { metric(words, rank) <= $threshold and not($missing) }
+  return {
+    1 + 2 * 3 as amount,
+    is_null(metric(words, rank)) as absent,
+    metric(words, rank) as rank
+  }
+  order { amount + 1 desc, rank }
+}
+"#;
+    let plan = check(&catalog(), parse(input).unwrap()).unwrap();
+    assert_eq!(
+        plan.projection_types[0].scalar(),
+        Some(PropType::scalar(ScalarType::I64, false))
+    );
+    assert_eq!(
+        plan.projection_types[1].scalar(),
+        Some(PropType::scalar(ScalarType::Bool, false))
+    );
+    assert_eq!(
+        plan.projection_types[1].metric_origins(),
+        [plan.sources["words"].id]
+    );
+    let Value::Binary { op, right, .. } = &plan.query.projections[0].0 else {
+        panic!("expected additive expression");
+    };
+    assert_eq!(*op, BinaryOp::Add);
+    assert!(matches!(right.as_ref(), Value::Binary { op, .. } if *op == BinaryOp::Multiply));
+    let grouped = input.replace("1 + 2 * 3", "(1 + 2) * 3");
+    let grouped = check(&catalog(), parse(&grouped).unwrap()).unwrap();
+    assert!(
+        matches!(&grouped.query.projections[0].0, Value::Binary { op, .. } if *op == BinaryOp::Multiply)
+    );
+    let chain = input.replace("1 + 2 * 3", "9 - 3 - 1");
+    let chain = check(&catalog(), parse(&chain).unwrap()).unwrap();
+    assert!(
+        matches!(&chain.query.projections[0].0, Value::Binary { op, left, .. }
+        if *op == BinaryOp::Subtract && matches!(left.as_ref(), Value::Binary { op, .. } if *op == BinaryOp::Subtract))
+    );
+    for (from, to) in [
+        ("1 + 2 * 3", "metric(words, rank) + 1"),
+        ("<= $threshold", "<= metric(words, score)"),
+        ("and not($missing)", "and $q"),
+        ("<= $threshold", "<= $threshold <= 3"),
+        (
+            "metric(words, rank) <= $threshold",
+            "min(metric(words, rank)) <= $threshold",
+        ),
+        ("is_null(metric(words, rank))", "is_null($unknown.name)"),
+        ("1 + 2 * 3", "unknown(1)"),
+        ("is_null(metric(words, rank))", "amount"),
+    ] {
+        let invalid = input.replace(from, to);
+        assert_ne!(input, invalid);
+        assert!(
+            parse(&invalid).and_then(|q| check(&catalog(), q)).is_err(),
+            "{invalid}"
+        );
+    }
+    assert!(parse_query(input).is_err());
+
+    let parameter_limit = input.replace(
+        "order { amount + 1 desc, rank }",
+        "order { amount + 1 desc, rank } limit $threshold",
+    );
+    let bounded = check(&catalog(), parse(&parameter_limit).unwrap()).unwrap();
+    assert_eq!(
+        bounded.final_limit,
+        Some(Bound::Parameter {
+            name: "threshold".into(),
+            min: 0,
+            max: None
+        })
+    );
+    for invalid in [
+        parameter_limit.replace("$threshold: I64", "$threshold: I64?"),
+        parameter_limit.replace("limit $threshold", "limit $q"),
+        parameter_limit.replace("limit $threshold", "limit $o.name"),
+    ] {
+        assert!(parse(&invalid).and_then(|q| check(&catalog(), q)).is_err());
+    }
+    // A filter's textual position within a graph block does not change scope.
+    let before_binding = input.replace(
+        "match { $o: Organization }",
+        "match { $o.name contains $q $o: Organization }",
+    );
+    assert!(check(&catalog(), parse(&before_binding).unwrap()).is_ok());
+    // Graph absence has its own local bindings; scalar negation only takes a value.
+    let negation = input.replace("match { metric(words, rank) <= $threshold and not($missing) }", "match { not { $o hasIncident $hidden metric(words, rank) <= $threshold and $hidden.severity > 2 } }");
+    let absent = check(&catalog(), parse(&negation).unwrap()).unwrap();
+    assert!(!absent.scopes.last().unwrap().contains_key("hidden"));
+    let leaking = negation.replace("1 + 2 * 3", "$hidden.severity");
+    assert!(check(&catalog(), parse(&leaking).unwrap()).is_err());
+    // Contextual operators/constructors remain usable as result aliases.
+    for alias in [
+        "yield",
+        "not",
+        "and",
+        "or",
+        "rank",
+        "take",
+        "is_null",
+        "true_value",
+    ] {
+        let keyword = format!(
+            "query aliases() {{ match {{ $o: Organization }} return {{ $o.name as {alias} }} order {{ {alias} asc }} }}"
+        );
+        check(&catalog(), parse(&keyword).unwrap()).unwrap();
+    }
+    let grouped = input.replace("1 + 2 * 3 as amount", "count($o) + 1 as amount");
+    let grouped = check(&catalog(), parse(&grouped).unwrap()).unwrap();
+    assert_eq!(
+        grouped.output_scope,
+        OutputScope::Groups {
+            key_projections: vec![1, 2]
+        }
+    );
 }
 
 #[test]

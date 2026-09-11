@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on:
   - "RFC 0047 plan-truth guarantees reconciled with named stages; its interim Option<RetrievalIR> shape and scan-root restriction are not permanent dependencies"
   - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
-  - "Language evolution contract: shared expressions, contextual keywords, explicit rank-block output, scope transitions, and compatibility fixtures before syntax stabilization"
+  - "Language evolution contract: shared expressions, contextual keywords, scope transitions, and compatibility fixtures before syntax stabilization; explicit yield output is compiler-prototyped"
   - "Mixed analytical/graph/retrieval composition examples: proposed syntax, scope and result types, population counterexamples, and physical plans for deferred extensions before syntax stabilization"
   - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
   - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
@@ -55,9 +55,10 @@ table-provider registration alone cannot close them.
 
 The [language evolution contract](#language-evolution-and-compatibility)
 keeps this a single typed graph language. It specifies extension boundaries
-without requiring every future operator now. The current sketches' implicit
-last-source output remains provisional; explicit block output and a shared
-expression grammar must be resolved before the public syntax is frozen.
+without requiring every future operator now. Rank blocks explicitly select
+their output with `yield <source>`; the test-only compiler validates that
+contract. A shared expression grammar and broader scope proofs still need
+qualification before the public syntax is frozen.
 The [query capability matrix](#query-capability-matrix) separates existing
 support, this RFC's release requirements, deferred extensions and the remaining
 scope decisions. Use it to review language coverage before committing to syntax.
@@ -549,6 +550,7 @@ query find_organizations($q: String)
     ann($o.embedding, $q, oversample: 4, candidates: 100) as meaning
     rrf(arm(words), arm(meaning, weight: 1.5),
         k: 60, candidates: 20) as combined
+    yield combined
   }
   return {
     $o.slug,
@@ -564,9 +566,10 @@ query find_organizations($q: String)
 This sketch selects distinct `$o` identities. The source declarations read
 the rank block's incoming eligible population; a fusion declaration reads its
 named preceding inputs **within the same rank block**. The final declaration
-is the prototype's block output. That shorthand is provisional: the stable
-form must explicitly identify the output, as required by the
-[language evolution contract](#language-evolution-and-compatibility).
+does not implicitly become the block output. Exactly one terminal
+`yield <source>` selects a source declared in this block, even for a one-source
+block. Adding or reordering independent declarations does not change that
+selection. Missing, repeated, unknown and earlier-block outputs are errors.
 Source aliases are unique across the query; duplicate
 aliases, duplicate arm references, and forward references are errors.
 Referencing an earlier block's arm in a new fusion is rejected: that arm's
@@ -653,7 +656,7 @@ query system with different variables, grouping rules or entity identities.
 
 The current production grammar has one `match` block, fixed expression
 variants and terminal aggregate projection. The staged prototype adds repeated
-`match`, `rank` and `take`; its separate `probe_value` grammar is experimental.
+`match`, `rank` and `take`; its shared test-only expression grammar is experimental.
 Neither is a complete stable grammar for the logical algebra above. The rules
 below are acceptance requirements for the coordinated pre-stable cutover;
 they do not claim that the deferred operators are implemented.
@@ -701,15 +704,17 @@ Adding a projected non-aggregate value to today's aggregate return can change
 its grouping; ordinary projection's row-preservation law does not apply there.
 Do not extend that implicit grouping to every intermediate projection.
 
-**Name a rank block's output explicitly before freezing it.** In the current
-sketch, appending another source changes the output because the last
-declaration wins. The stable form must select a named output independently of
-declaration position; choose and qualify its spelling in Phase 0. Source
-declarations retain the common incoming population and explicit named fusion
-dependencies. Adding an unconsumed source must not select a different output
-population or comparator. Validation and the cost of requested additional
-metrics still apply. Earlier-block metrics remain readable with their original
-scope; reusing earlier candidates requires explicit remapping/intersection.
+**Name a rank block's output explicitly.** `yield <source>` terminates each
+block and resolves only a source declared in that block. It is a contextual
+keyword with a token boundary; `yield yield` can select a source named `yield`.
+Source declarations retain the common incoming population and explicit named
+fusion dependencies. Adding an unconsumed source must not select a different
+output population or comparator. Every declaration is still validated, and
+the cost of requested additional metrics still applies. Earlier-block metrics
+remain readable with their original scope; reusing earlier candidates requires
+explicit remapping/intersection. The compiler prototype preserves an explicit
+output reference for every block. This proves syntax and binding selection,
+not physical execution, whole-query budgets or semantic fingerprint stability.
 
 **Keep identifiers usable as the language grows.** Keywords are contextual
 and have token boundaries. Adding a clause or constructor must not reserve
@@ -1387,6 +1392,7 @@ query incidents_per_organization($q: String) {
   match { $o: Organization $o hasIncident $i }
   rank $i {
     lexical($i.title, terms($q), candidates: 100) as incidents
+    yield incidents
   }
   take $i { per { $o.slug } limit 2 }
   return { $o.slug, $i.slug, metric(incidents, rank) as rank }
@@ -2697,6 +2703,39 @@ the implementation above before its executable regression suite is green.
 
 ### Implementation handoff and validation checkpoint
 
+Phase 0 work on 2026-09-11 starts from `9891d421`. The clean compiler baseline
+passes 361 tests. The extended test-only staged owner selects rank-block
+outputs with `yield <source>` and preserves a typed output reference per
+block. Its new fixture first failed because the old grammar rejected `yield`;
+it now covers unused sources, declaration reorder, contextual names and
+missing/duplicate/unknown/cross-block output refusal. The three RFC `.gq`
+examples are parsed and checked by that same owner; production syntax remains
+unchanged. `cargo test --locked -p omnigraph-compiler` passes 363 tests,
+including 13 staged-prototype tests; compiler Clippy, formatting and
+documentation checks pass. These counts apply only to this compiler checkpoint.
+
+The same owner now parses expression operands through one `probe_value` root
+in match predicates, source arguments/options, group keys, local/final order,
+projection and limits. Graph-pattern parsing remains delegated to the real
+parser. Its checked decisions and remaining limits are:
+
+| Surface | Prototype evidence / remaining boundary |
+|---|---|
+| Precedence | Parentheses; multiplication/division; addition/subtraction; one non-chainable comparison; parenthesized scalar `not(...)`; `and`; `or`. Binary arithmetic is left-associative; AST assertions distinguish `1 + 2 * 3`, `(1 + 2) * 3` and `9 - 3 - 1`. |
+| Names and graph scope | Source, binding/parameter and result-alias namespaces remain distinct. Result aliases are readable in final order, including computed order, but not in sibling return expressions. Filters can precede their binding declaration within one match block. Graph `not { ... }` has local bindings; scalar `not(...)` introduces none. |
+| Contextual tokens | `not`, `and`, `or`, `rank`, `take`, `is_null` and `yield` remain usable result aliases. A failing `true_value` fixture exposed a Boolean-prefix lexer ambiguity; the shared root now preserves the complete identifier. Scalar negation requires parentheses to avoid capturing `order { not asc }`. |
+| Scalar and metric types | Ordinary comparison/containment delegates to production type rules. Computed values retain input metric origins; arithmetic cannot erase metric domains. Compatible metric thresholds produce nullable Bool; `is_null` produces non-null Bool. Cross-source/domain comparisons need an explicit policy. |
+| Reduction scope | Aggregates are refused in row predicates and group keys, including when nested in another expression. A computed aggregate result remains a reduction, not an implicit grouping key. After reduction, final order uses projected output values. |
+| Counts and argument roles | Final limits now admit non-null integer parameters through the same bound checker as windows/quotas, retaining distinct units and zero rules. Row-dependent limits, duplicate/unknown named options and positional arguments after options are refused. Source operands still require their declared constant/property roles. |
+| Numeric/null execution | Same-type scalar arithmetic is type-prototyped. Implicit casts, integer division, unary numeric syntax and overflow/non-finite behavior need further decisions/proofs; this experiment refuses unqualified arithmetic. Nullable typing alone does not prove runtime three-valued logic, short-circuit behavior or error handling. |
+
+These are parser/type/scope proofs, not an executable expression evaluator.
+The C1–C4 derivations, complete numeric/null rules, semantic fingerprints,
+physical plans and the remaining Phase 0 decision packages are still open.
+The source/selection/descriptor integration and resource-refusal gate must
+still run through the actual engine and GQT. This checkpoint does not certify
+runtime selection or complete Phase 0.
+
 This checkpoint records the 2026-09-09 investigation for implementers who did
 not participate in the review. Read the normative Design and Rollout sections
 before porting experimental code. The
@@ -3162,7 +3201,7 @@ semantics, complete tie comparators, and the relationship to RFC 0047. Qualify
 the unified BM25 reference, its pinned numeric kernel, and snapshot-visible
 live-row statistics; freeze vector numeric rules and checked fusion arithmetic.
 Apply the [language evolution contract](#language-evolution-and-compatibility):
-replace the prototype's implicit last-source output before stabilization,
+retain the prototype's explicit `yield` output through production lowering,
 unify expression contexts, and fix scope/keyword/argument rules. A deferred
 operator needs a coherent extension point, not an implementation in Phase 0.
 Complete the [composition examples](#required-composition-examples) C1–C4:
@@ -3688,6 +3727,11 @@ this milestone does not imply support for all future operators.
 
 ## Decision log
 
+- 2026-09-11 — began Phase 0 with explicit `yield <source>` rank-block output
+  and a shared expression root in the existing test-only compiler. Added
+  precedence, contextual-name, scope, metric-domain and parameter-limit
+  fixtures. Production execution, full numeric/null rules, C1–C4 and the
+  remaining acceptance packages are still unqualified.
 - 2026-09-11 — expanded every phase into an implementation handoff with
   inputs, deliverables, existing owners, exit criteria, deferred scope and
   concrete uncertainties to investigate. Distinguished design arguments,
