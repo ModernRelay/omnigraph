@@ -3,6 +3,12 @@
 # notes: A Date string with a time of day is refused on every user-facing entry;
 # notes: loader entry: loader/mod.rs load_refuses_date_string_with_a_time_of_day.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Event {
     name: String @key

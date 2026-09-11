@@ -4,6 +4,12 @@
 # notes: supported spelling. The refusal message carries no error-code prefix, so
 # notes: the raw fragment is the pin.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

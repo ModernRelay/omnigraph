@@ -2,6 +2,12 @@
 # notes: pins that committed mutations survive a store reopen; exercises
 # notes: mutate, loop, restart, and read steps in one case.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

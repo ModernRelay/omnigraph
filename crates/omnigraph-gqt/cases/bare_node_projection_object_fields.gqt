@@ -1,6 +1,12 @@
 # issue: none
 # notes: the node object keeps `id` and the declared non-Blob, non-Vector properties (the engine rewrites Blob columns before executing, so the exclusion only runs here).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

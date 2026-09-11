@@ -1,0 +1,19 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [42]
+
+--- schema
+node Person { name: String @key }
+--- seed
+--- fault
+at: branch_merge.post_sidecar_pre_fork
+occurrence: 1
+action: return_error
+scope: next_step
+--- mutate
+branch merge "injected failpoint triggered: branch_merge.post_sidecar_pre_fork" into main
+--- expect error: injected failpoint triggered: branch_merge.post_sidecar_pre_fork

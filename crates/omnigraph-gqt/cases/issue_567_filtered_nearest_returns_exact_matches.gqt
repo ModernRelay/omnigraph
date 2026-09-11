@@ -6,6 +6,12 @@
 # notes: issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k
 # notes: (tests/search.rs).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

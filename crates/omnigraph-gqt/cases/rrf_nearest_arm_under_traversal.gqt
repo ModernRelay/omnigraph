@@ -4,6 +4,12 @@
 # notes: eligible rows in row order and the unfiltered top-2 (0, 1) has no edge,
 # notes: so the fused set is the two nearest docs with an edge (3 > 2): d003, d006.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

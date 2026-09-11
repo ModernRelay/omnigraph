@@ -1,6 +1,12 @@
 # issue: 613
 # red_on: 2026-09-03, pre-fix build: knows{2,2} from alice returned bob, one hop away, instead of no rows.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

@@ -5,6 +5,12 @@
 # notes: answer is empty. Rust twin (probes: no scan runs):
 # notes: issue_567_proven_empty_eligible_set_runs_no_scan_and_no_overfetch.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

@@ -4,6 +4,12 @@
 # notes: sets b's age. The base of the t-into-main merge must be x's commit; the
 # notes: fork point (a=0) makes x's write look like an edit on both sides.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

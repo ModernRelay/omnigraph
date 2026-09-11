@@ -13,6 +13,12 @@
 # notes: k 2 (16, 17) and 8 (16..23: one source, 20) are short, k 32 fills:
 # notes: d020, d025. Three different answers, one per path.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

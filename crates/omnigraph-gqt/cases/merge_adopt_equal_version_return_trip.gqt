@@ -6,6 +6,12 @@
 # notes: `feature` and the branch merges back; `main` must keep all four edges
 # notes: across a restart.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

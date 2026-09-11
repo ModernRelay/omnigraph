@@ -5,6 +5,12 @@
 # notes: version number on different native branches. Adopting `main` into
 # notes: `feature` must fast-forward and show all four edges.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

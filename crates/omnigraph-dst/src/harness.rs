@@ -18,12 +18,14 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
 use crate::detectors::{self, Channel, Detector, ObservationSource, Oracle};
+use crate::environment::{UniverseEnvironment, UniverseProcess, UniverseScenario};
 use crate::fixtures::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, fixture_knows, knows_pairs, knows_pairs_bound_target,
     knows_pairs_on, knows_pairs_target, knows_pairs_target_mode, knows_rows_bound_target,
     mixed_params, mutate_on, person_jsonl, person_rows, person_rows_on, person_rows_target,
     physical_view_on, query_main, schema_with_extras,
 };
+use crate::memory::{MemoryEnvironment, MemoryStorage};
 use crate::rand::SplitMix64;
 
 /// Process-static debug toggles; the DST_PREDICT_LOG / DST_OP_LOG env
@@ -4953,13 +4955,6 @@ async fn resolve_keep_serving_watch(
     (db, ruling.e_outcome.map(|o| (o, channel)))
 }
 
-pub fn run_universe(root: &str, sc: &Scenario) -> UniverseReport {
-    match run_universe_caught(root, sc) {
-        Ok(report) => report,
-        Err(panic) => std::panic::resume_unwind(panic),
-    }
-}
-
 /// META ORACLE — strict replay, detector-tagged: two same-seed
 /// reports must be equal, row order included. The pins' comparison funnel;
 /// a red names (HarnessOutput, StrictReplay) in its recorded row.
@@ -4991,18 +4986,97 @@ pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// the fleet's universe entry: a VIOLATION becomes a recorded
-/// row instead of killing the whole pass. Identical execution to
-/// `run_universe` (same dedicated 16 MiB thread — its join already carries
-/// the panic; the pinned-suite path rethrows, this path returns it). The
-/// caller records (scenario, message) — a complete repro — and continues.
-pub fn run_universe_caught(
-    root: &str,
-    sc: &Scenario,
-) -> Result<UniverseReport, Box<dyn std::any::Any + Send>> {
-    // Seed logging: the knobs the pinned scenarios vary, so a failed run's
-    // line names its universe (remaining Scenario knobs come from the
-    // test's own source).
+#[derive(Debug)]
+struct RustEnvironment {
+    memory: MemoryEnvironment,
+    faults: Option<FaultPlan>,
+    die_at_write: Option<usize>,
+}
+
+#[derive(Debug)]
+struct RustResources {
+    memory: MemoryStorage,
+    storage: Arc<dyn StorageAdapter>,
+    failing: Option<Arc<FailingStorage>>,
+    lance_faults_state: Option<Arc<crate::lance_faults::LanceFaultState>>,
+    kill_state: Option<Arc<KillState>>,
+}
+
+impl UniverseEnvironment for RustEnvironment {
+    type Resources = RustResources;
+
+    fn seed(&self) -> u64 {
+        self.memory.seed()
+    }
+
+    fn process(&self) -> UniverseProcess {
+        self.memory.process()
+    }
+
+    async fn setup(&self) -> Result<RustResources, String> {
+        let memory = self.memory.setup().await?;
+        let concrete_adapter = memory.adapter.clone();
+        let base: Arc<dyn StorageAdapter> = concrete_adapter.clone();
+        let base: Arc<dyn StorageAdapter> = if crate::cost::armed() {
+            crate::lance_faults::install();
+            Arc::new(crate::cost::CostStorage::new(base))
+        } else {
+            base
+        };
+        let lance_faults_state = self
+            .faults
+            .as_ref()
+            .filter(|plan| plan.lance_realm)
+            .map(crate::lance_faults::LanceFaultState::from_plan);
+        let kill_state = self.die_at_write.map(KillState::new);
+        if lance_faults_state.is_some() || kill_state.is_some() {
+            crate::lance_faults::install();
+        }
+        crate::lance_faults::set_active(lance_faults_state.clone());
+        crate::lance_faults::set_kill(kill_state.clone());
+        FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
+        let failing: Option<Arc<FailingStorage>> = if self.faults.is_some() || kill_state.is_some()
+        {
+            Some(Arc::new(FailingStorage::new(
+                base.clone(),
+                self.faults.clone().unwrap_or_else(FaultPlan::none),
+                lance_faults_state.clone(),
+                kill_state.clone(),
+            )))
+        } else {
+            None
+        };
+        let storage: Arc<dyn StorageAdapter> = match &failing {
+            Some(f) => f.clone(),
+            None => base,
+        };
+
+        Ok(RustResources {
+            memory,
+            storage,
+            failing,
+            lance_faults_state,
+            kill_state,
+        })
+    }
+
+    async fn teardown(&self, resources: &mut RustResources) -> Result<(), String> {
+        crate::lance_faults::set_active(None);
+        crate::lance_faults::set_kill(None);
+        self.memory.teardown(&mut resources.memory).await
+    }
+}
+
+/// Run the Rust recipe using its existing root seed and fault-plan seeds.
+pub fn run_universe(root: &str, scenario: &Scenario) -> UniverseReport {
+    match run_universe_caught(root, scenario) {
+        Ok(report) => report,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Retain detector panic payloads while the shared executor finalizes resources.
+pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<UniverseReport> {
     println!(
         "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?} keep_serving={}]",
         sc.seed,
@@ -5019,111 +5093,57 @@ pub fn run_universe_caught(
         sc.die_at_write,
         sc.keep_serving_ops
     );
-    // Structural scope-out: the ack-loss client-retry re-executes an op the
-    // keep-serving machinery may have already judged at a watch resolution —
-    // the combination is undesigned. Enforced here, not by comment alone.
     assert!(
         sc.keep_serving_ops == 0 || !sc.faults.as_ref().map(|p| p.client_retry).unwrap_or(false),
         "keep_serving_ops and FaultPlan::client_retry are mutually scoped out"
     );
 
-    let mut seeds = SplitMix64(sc.seed);
-    let runtime_seed = seeds.next_u64();
-    let ulid_seed = seeds.next_u64();
-    let workload_seed = seeds.next_u64();
-    let entropy_seed = seeds.next_u64();
-
     detectors::install_violation_panic_hook();
-    clear_process_slots();
     crate::env_knobs::require_pool_env();
-
-    // Lance's retry backoff draws REAL entropy (the REPLAY-ENVELOPE NOTE on
-    // `UniverseReport`). Close what is closable in-process: (re)arm the
-    // entropy shim with a per-universe stream and force this thread's
-    // ThreadRng to re-pull from it — every jitter draw becomes a
-    // deterministic function of the universe seed, no matter what earlier
-    // universes consumed.
-    crate::entropy::arm(entropy_seed);
-
-    // THE UNIVERSE THREAD: every universe runs on a dedicated 16 MiB thread
-    // — the systemic fix for the 2 MiB test stack (supersedes per-frame
-    // Box::pin whack-a-mole). ThreadRng is THREAD-LOCAL, so the
-    // per-universe entropy reseed must happen INSIDE this thread; panics
-    // (oracle verdicts) propagate via resume_unwind so test messages
-    // survive. One fresh thread per universe keeps replay exact.
-    let result = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("dst-universe".into())
-            .stack_size(UNIVERSE_STACK_BYTES)
-            .spawn_scoped(scope, || {
-                let _ = rand::rng().reseed();
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .start_paused(true)
-                    .rng_seed(tokio::runtime::RngSeed::from_bytes(
-                        &runtime_seed.to_le_bytes(),
-                    ))
-                    .build_local(Default::default())
-                    .expect("seeded current-thread runtime");
-
-    // The WHOLE universe future is heap-allocated: the
-    // accumulated session/oracle state pushed the inline state machine past
-    // the 2 MiB test stack — boxing at the outermost boundary composes with
-    // the 16 MiB universe thread above.
-    runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
-
-        // The concrete handle survives beside the dyn one so the write
-        // census can bottom-list the store itself at universe end
-        // (`dst_list_all_keys` is inherent, not on the trait).
-        let concrete_adapter = Arc::new(ObjectStorageAdapter::in_memory());
-        let base: Arc<dyn StorageAdapter> = concrete_adapter.clone();
-        // Bench counting pass: when a cost ledger is armed, count at the
-        // innermost adapter layer (exactly the calls that reach the store)
-        // and make sure the Lance-realm decorator is interposed so its
-        // tallies fire too. Disarmed: zero change.
-        let base: Arc<dyn StorageAdapter> = if crate::cost::armed() {
-            crate::lance_faults::install();
-            Arc::new(crate::cost::CostStorage::new(base))
-        } else {
-            base
-        };
-        // the same plan storms BOTH realms — the adapter realm via
-        // FailingStorage, the Lance realm via the interposed provider. The
-        // slot is set unconditionally so a panicked faulty universe cannot
-        // leak weather into the next universe in this process.
-        let lance_faults_state = sc
-            .faults
-            .as_ref()
-            .filter(|plan| plan.lance_realm)
-            .map(crate::lance_faults::LanceFaultState::from_plan);
-        // the crash-state enumeration needs the same wrapped storage (its
-        // write counter lives in the wrappers of both realms).
-        let kill_state = sc.die_at_write.map(KillState::new);
-        if lance_faults_state.is_some() || kill_state.is_some() {
-            crate::lance_faults::install();
+    let environment = RustEnvironment {
+        memory: MemoryEnvironment::new(root, sc.seed, UniverseProcess::Shared),
+        faults: sc.faults.clone(),
+        die_at_write: sc.die_at_write,
+    };
+    let run = crate::environment::run_universe(&environment, sc);
+    let cleanup = run
+        .cleanup
+        .map_err(|panic| panic_message(panic.as_ref()))
+        .and_then(|result| result);
+    match run.result {
+        Err(panic) => {
+            if let Err(error) = cleanup {
+                eprintln!(
+                    "universe cleanup failed: {error}; original panic: {}",
+                    panic_message(panic.as_ref())
+                );
+            }
+            Err(panic)
         }
-        crate::lance_faults::set_active(lance_faults_state.clone());
-        crate::lance_faults::set_kill(kill_state.clone());
-        // Persisted tier: per-universe sink for the foreign-sidecar carve-out
-        // rows — cleared unconditionally (same leak-safety rule as the
-        // lance slots: a panicked predecessor must not bleed rows in).
-        FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
-        let failing: Option<Arc<FailingStorage>> = if sc.faults.is_some() || kill_state.is_some() {
-            Some(Arc::new(FailingStorage::new(
-                base.clone(),
-                sc.faults.clone().unwrap_or_else(FaultPlan::none),
-                lance_faults_state.clone(),
-                kill_state.clone(),
-            )))
-        } else {
-            None
-        };
-        let storage: Arc<dyn StorageAdapter> = match &failing {
-            Some(f) => f.clone(),
-            None => base,
-        };
+        Ok(result) => match cleanup {
+            Ok(()) => result.map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>),
+            Err(error) => Err(Box::new(format!(
+                "universe cleanup failed: {error}; original={result:?}"
+            ))),
+        },
+    }
+}
+
+impl UniverseScenario<RustResources> for Scenario {
+    type Output = UniverseReport;
+
+    async fn run<'a>(
+        &'a self,
+        resources: &'a mut RustResources,
+        workload_seed: u64,
+    ) -> UniverseReport {
+        let sc = self;
+        let root = resources.memory.root.as_str();
+        let concrete_adapter = &resources.memory.adapter;
+        let storage = resources.storage.clone();
+        let failing = resources.failing.clone();
+        let lance_faults_state = resources.lance_faults_state.clone();
+        let kill_state = resources.kill_state.clone();
 
         let mut db = Omnigraph::init_with_storage(
             root,
@@ -5657,8 +5677,8 @@ pub fn run_universe_caught(
                                     i,
                                     format!(
                                         "writes wedged on pending recovery operation {}: \
-                                         {} consecutive RecoveryRequired refusals on the \
-                                         live handle (first at op{}), reopen deferred",
+                                             {} consecutive RecoveryRequired refusals on the \
+                                             live handle (first at op{}), reopen deferred",
                                         watch.operation_id, watch.streak, watch.first_op
                                     ),
                                     Oracle::LiveWriteAvailability.doc(),
@@ -5714,10 +5734,7 @@ pub fn run_universe_caught(
                         // own reads. Captured once, pre-resolution, shared by
                         // the uncertainty classifier and the attribution
                         // below.
-                        let damaged_now = failing
-                            .as_ref()
-                            .map(|f| f.damage_events())
-                            .unwrap_or(0)
+                        let damaged_now = failing.as_ref().map(|f| f.damage_events()).unwrap_or(0)
                             > damage_before;
                         if let Some(watch) = keep_serving_watch.take() {
                             let err_text = format!("{err:?}");
@@ -5793,8 +5810,8 @@ pub fn run_universe_caught(
                                     i,
                                     format!(
                                         "writes wedged on pending recovery operation {}: \
-                                         refused on first contact with a keep-serving budget \
-                                         of {}, reopen deferred",
+                                             refused on first contact with a keep-serving budget \
+                                             of {}, reopen deferred",
                                         watch.operation_id, sc.keep_serving_ops
                                     ),
                                     Oracle::LiveWriteAvailability.doc(),
@@ -5856,12 +5873,19 @@ pub fn run_universe_caught(
                             let retry = Box::pin(exec_world_op(&mut db, &wop)).await;
                             if let Err(retry_err) = &retry
                                 && !(matches!(retry_err, OmniError::RecoveryRequired { .. })
-                                    || is_legal_rejection(retry_err, &world, &wop, expected_conflict))
+                                    || is_legal_rejection(
+                                        retry_err,
+                                        &world,
+                                        &wop,
+                                        expected_conflict,
+                                    ))
                             {
                                 detectors::violation(
                                     DET_ACK_LOSS,
                                     i,
-                                    format!("illegal RETRY failure after ack-loss (op={wop:?}): {retry_err:?}"),
+                                    format!(
+                                        "illegal RETRY failure after ack-loss (op={wop:?}): {retry_err:?}"
+                                    ),
                                     "a retry against the client's own durable success fails only in cataloged shapes",
                                 );
                             }
@@ -5883,12 +5907,6 @@ pub fn run_universe_caught(
                                 Some((outcome, channel, "watch-interrupt"))
                             } else if format!("{err:?}").contains(FAULT_MARKER)
                                 || format!("{err:?}").contains(ACK_LOSS_MARKER)
-                                // corruption-attributed failures (and
-                                // marked latent sector errors, which advance the
-                                // same ledger) MUST reconcile — the op may have
-                                // durably written before its poisoned read, and
-                                // only the two-picture arbitration can rule
-                                // Applied vs NotApplied on a garbage-fed op.
                                 || damaged_now
                                 || is_recovery_barrier_rejection(&wop, &err)
                             {
@@ -6119,7 +6137,10 @@ pub fn run_universe_caught(
             );
             FOREIGN_SIDECAR_ROWS.lock().unwrap().push(format!(
                 "s11b-foreign-sidecar-blocks-maintenance@final-audit: {}",
-                text.replace(root, "<root>").chars().take(160).collect::<String>()
+                text.replace(root, "<root>")
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
             ));
         }
         // closing capture — the loop's final op plus the closing
@@ -6278,7 +6299,7 @@ pub fn run_universe_caught(
                     sc.ops,
                     format!(
                         "OCC invariant: duplicate graph_commit_id on '{name}' \
-                         ({} ids, {} unique)",
+                             ({} ids, {} unique)",
                         branch_ids.len(),
                         unique.len()
                     ),
@@ -6321,8 +6342,14 @@ pub fn run_universe_caught(
         let latent_errors = failing.as_ref().map(|f| f.latent_errors()).unwrap_or(0);
         let writes_corrupted = failing.as_ref().map(|f| f.writes_corrupted()).unwrap_or(0);
         let writes_lost = failing.as_ref().map(|f| f.writes_lost()).unwrap_or(0);
-        let writes_misdirected = failing.as_ref().map(|f| f.writes_misdirected()).unwrap_or(0);
-        let persisted_consumed = failing.as_ref().map(|f| f.persisted_consumed()).unwrap_or(0);
+        let writes_misdirected = failing
+            .as_ref()
+            .map(|f| f.writes_misdirected())
+            .unwrap_or(0);
+        let persisted_consumed = failing
+            .as_ref()
+            .map(|f| f.persisted_consumed())
+            .unwrap_or(0);
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
         // Persisted tier: drain the foreign-sidecar carve-out rows into the
@@ -6364,15 +6391,7 @@ pub fn run_universe_caught(
             stale_reads_served,
             stale_lists_served,
         }
-    }))
-            })
-            .expect("spawn universe thread")
-            .join()
-    });
-    // Exit-side leak clear, BOTH outcomes — rationale on
-    // [`clear_process_slots`].
-    clear_process_slots();
-    result
+    }
 }
 
 // Pure-classifier honesty (unit level): the mutation

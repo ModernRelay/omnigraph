@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-06
+updated: 2026-09-10
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -50,6 +50,18 @@ assertions, scale symptoms, and cases needing process environment
 (examples in the AGENTS.md sentences below). No second toolchain enters
 the repo, and the harness calls only public engine surfaces.
 
+This amendment makes ***agent experience (AX)***, an agent's ability to
+construct, execute, diagnose, and reproduce a case without guessing,
+the format's design priority. Cases state the execution target, storage,
+and fault conditions that matter to a failure. Concision removes repetition, not
+required evidence. Convenience for a human author does not justify hidden
+configuration, automatic repair, or a weaker assertion.
+
+The proposed environment and fault contract is specified in Design.
+It extends the existing format; its target combinations are not a claim
+of implemented support. GQ declarations, schemas, and result comparison
+retain their existing owners.
+
 ## Motivation
 
 Query-behavior tests today are hand-written Rust (the `_issue_NNN`
@@ -77,7 +89,36 @@ omitted; its run-both-plans verification is deferred (Compatibility below).
 (small schemas, seeds, queries with known-correct answers) doubles as
 seed material for the DST generators.
 
+A fault reached during setup instead of the intended merge tests a different
+failure. A case rerun on local files instead of the original object store
+tests different storage behavior. A seed without the case and execution
+configuration cannot identify the original experiment. File-owned controls
+and explicit execution evidence address these ambiguities.
+
 ## User and operational behavior
+
+For the proposed environment extension, author one set of steps and
+expectations, list exact target/storage combinations before the schema,
+and place a fault immediately before its target operation. The harness
+validates all selected combinations first. An unsupported combination is
+a named failure, never a skipped assertion or a fallback environment.
+
+| Attempt to bypass the contract | Required refusal or evidence |
+|---|---|
+| Request DST from a build without it | Refuse before case setup. |
+| Omit runner configuration to inherit a backend | Refuse before case setup; every case declares its execution. |
+| Point an S3 case at another backend | Verify actual backend against the file. |
+| Match injected text without firing the hook | Require correlated typed delivery evidence. |
+| Run one environment and claim full coverage | Report the exact selection and omitted executions. |
+| Hide a failed write with retry or reopen | Execute only authored operations; no harness recovery. |
+
+| Supported author route | Accepted behavior |
+|---|---|
+| Existing engine/filesystem case | Add its explicit engine/filesystem environment before execution. |
+| Explicit environment list | Fresh graph and shared assertions for each supported entry. |
+| Fault before one operation | Injection, delivery verification, and cleanup at that operation. |
+| Exact environment/seed rerun | Declared subset only, with complete reproduction context. |
+
 
 Authoring a regression for a fixed issue:
 
@@ -92,7 +133,7 @@ behavior with no failure to witness): write
 `<short_name>.gqt` with `# issue: none`; `red_on:` is omitted, or kept when
 the case did witness a red state during development.
 
-Running:
+Running from `crates/omnigraph-gqt`, whose Cargo configuration enables DST:
 
 ```bash
 cargo test -p omnigraph-gqt
@@ -106,8 +147,9 @@ target prints one line per case with its elapsed time
 failing cases and, per failure, the failing step named by ordinal and kind
 (`step 3 (mutate)`), the iteration binding when the step sits in a loop
 (`$who=carol`), and the expected-versus-actual row diff, count mismatch,
-or error mismatch. A case stops at its first failing step (later steps
-would run against a store state the failed step no longer vouches for);
+or error mismatch. Each execution stops at its first failing step (later
+steps would use state the failed step no longer vouches for); explicit
+environments follow the replay and continuation rules in Design;
 across cases the target runs every case before failing, so one broken
 case never hides another. A file the harness refuses (any fail-closed
 check in the Design section) reports as a failing case carrying the
@@ -152,18 +194,18 @@ counts, or the reverse, it reports the mismatch instead of rewriting.
 Bless refuses cases containing loops (one expect body serves every
 iteration).
 
-CI: the workspace `Test Workspace` job picks the target up automatically
-and, since the pull-request tier landed, runs it on pull requests as a
-reporting context (`ci.yml`); regressions must block a merge, and only a
-required context can, so a per-change job (`GQ Logic Tests`) in a new
-workflow file, `.github/workflows/gq-logic-tests.yml`, runs
+CI: the required per-change job `GQ Logic Tests` in
+`.github/workflows/gq-logic-tests.yml` owns the complete corpus and runs
 `cargo test -p omnigraph-gqt --locked -- --nocapture`
-on every PR. The workflow triggers on push to `main`, `workflow_dispatch`,
+on every code-bearing PR, from `crates/omnigraph-gqt`,
+where its `.cargo/config.toml` enables seeded Tokio. The job must build
+the `omnigraph-gqt` worker binary and dispatch that executable from the same
+build. The workflow triggers on push to `main`, `workflow_dispatch`,
 and `pull_request` with only its code-bearing types declared (`opened`,
 `synchronize`, `reopened`); the gate below lives in its own workflow and
 declares the body-edit and label types itself, so a body edit or a label
 change never re-runs the Rust build. The test job compiles the engine
-crate, the `omnigraph-gqt` library, and its two test binaries: minutes
+crate, the `omnigraph-gqt` library, and its test binaries: minutes
 with a warm cache, tens of minutes cold. The test job honors the
 docs-only classification of `ci.yml`'s `Classify Changes` job, the way
 the other required Rust jobs do, through a verbatim copy of that job
@@ -174,9 +216,25 @@ docs-only PR it skips its build and reports success (the
 `Test omnigraph-server --features aws` job's pattern), so the required
 context never stays pending. The gate job always runs, at seconds-scale.
 Action references are pinned, per the
-repo's workflow-pin check; no failpoints features are needed. What a
-green `GQ Logic Tests` job promises, quotable: every `.gqt` case parsed,
-ran, and matched its expects, none refused.
+repo's workflow-pin check. Explicit fault/DST enrollment requires the
+test-only failpoint and seeded-runtime build owned by the environment
+extension; fault-free engine execution alone needs neither. On a code-bearing
+run,
+a green `GQ Logic Tests` job guarantees that every corpus case passed
+admission, every declared environment and mandatory seed/replay executed,
+and each execution either matched all expectations or satisfied the explicit
+Known recovery failures contract. Known failures remain separately reported;
+they do not establish that the graph defect is fixed. The docs-only success above
+reports classification, not corpus execution. A separate DST package job
+or an environment-filtered GQT invocation cannot discharge this guarantee.
+`Test Workspace` excludes GQT from both its compile and test commands with
+`--exclude omnigraph-gqt`; the separate required context owns that package.
+The GQT job also runs unit and dispatch tests from the workspace root to
+prove that an unconfigured build refuses requested DST execution, and runs
+Clippy in the configured build. Both dispatcher and worker in the complete
+corpus run must use the seeded build configuration. This changes build
+ownership, not coverage: every corpus case remains enrolled in the required
+GQT job. The unavailable-runtime refusal check cannot substitute for that run.
 
 Fix-PR gate: a required CI check (`Fix Regression Gate`, a job in its
 own workflow, `.github/workflows/fix-regression-gate.yml`, on
@@ -235,8 +293,8 @@ definition, not a run: the gate consults only the required contexts, and
 among Rust test targets only `omnigraph-gqt`'s (the corpus target and its
 unit tests), `Test omnigraph-server --features aws`, and `DST pinned suite`
 (`cargo test -p omnigraph-dst`, `dst.yml`) run on a pull request as
-required contexts (`Test Workspace` runs every workspace target on the
-pull request too, but as a reporting context, CI above); a test-attributed
+required contexts (`Test Workspace` runs the remaining workspace targets on
+the pull request as a reporting context, CI above); a test-attributed
 `issue_N` function inside `crates/omnigraph-gqt/`, `crates/omnigraph-server/`,
 or `crates/omnigraph-dst/` therefore runs in a required context, and the
 Rust shape stays a naming check everywhere else, where a defined
@@ -290,6 +348,12 @@ issue. The regression shape, one read step:
 # red_on: 2026-08-29, pre-fix build: total was 8, not 20.
 # notes: free text.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Chunk {
     slug: String @key
@@ -324,6 +388,12 @@ A multi-step feature case, showing mutation steps, a restart, and a loop:
 ```
 # issue: none
 # notes: pins that committed writes survive a store reopen.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
 
 --- schema
 node Person {
@@ -390,11 +460,14 @@ declaration step to that mode, for cases whose subject is one traversal
 path (Execution semantics owns the default); a statement step traverses
 nothing and runs outside the pin.
 
-A file is: `--- schema`, then `--- seed`, then one or more steps, of
-which at least one is a query or mutate step; a file missing either
-leading section, ordering them the other way, or carrying no query or
+A file is: required `--- runner` (Explicit execution environments),
+optional `--- known_failure` (Known recovery failures), then `--- schema`, then
+`--- seed`, then one or more steps, of
+which at least one is a query or mutate step; a file missing any of these
+three leading sections, ordering them differently, or carrying no query or
 mutate step (nothing would be asserted, a restart-only step list
-included) is refused. A step is one of:
+included) is refused. A `--- fault` may precede an operation as specified
+in Faults at an explicit step. A step is one of:
 
 - `--- query` holding exactly one GQ declaration with a read body, followed
   by an optional `--- params` section (JSON object) and a mandatory
@@ -536,9 +609,440 @@ seed too large to sit inline belongs to the heavy-repro tier below, not
 this format; there are deliberately no external-file references, or single
 files decay back into directories.
 
+### Explicit execution environments
+
+A ***test environment*** is one execution target, storage backend, and
+configuration for a complete case. Exactly one required `--- runner` YAML
+section before `--- schema` declares the environments. Every case, including
+an existing fault-free engine case, carries it. The following syntax specifies
+the amendment contract; the examples do not establish implementation
+qualification.
+
+```yaml
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+```
+
+`timeout_ms` and `environments` are required in every case.
+An environment requires `target` and `storage`, plus the parameters required
+by that target. Its full parameter set defines the environment; there is no
+separate environment ID. Exact duplicate entries are refused. There is no
+runner format version: the parser and corpus migrate together, and replay
+requires the recorded source and executable identities. Omitted configuration
+has no default execution route. There are 1 to 16 environments, executed in
+listed order. The file budget is 1 to 600000 milliseconds of wall time,
+starting before case reading and preflight. It measures profile resolution,
+setup, every environment, both executions of every DST seed, and ordinary
+teardown through the supervisor's final execution check. The supervisor checks
+the remaining budget before each worker dispatch and after execution. Expiry
+fails the case; unstarted executions are reported as not run. Worker execution
+is interruptible through process containment, which has a separate bounded
+allowance and cannot extend the case into success. Synchronous host-file reads,
+executable hashing, and file cleanup are not interruptible; their elapsed time
+counts when the supervisor next checks the budget. Terminal summary encoding
+and publication happen outside this execution budget. This is not a hard bound
+on total command wall time. Fast-tier admission independently
+limits which budgets may enter the per-PR corpus, as defined in Runner
+mechanics; selection cannot bypass that check.
+
+Each environment starts from a fresh isolated graph, applies the schema
+and seed, performs the existing index setup, then executes the complete
+step list. Branch targets, parameters, rows, result shapes, affected
+counts, and expected errors have one definition shared by all environments.
+Each environment is checked against the file's expectations. Cross-target
+identity of generated IDs, timestamps, or internal operation order is not
+asserted. A target-specific expected result belongs in a separate case.
+Target and storage selection cannot change inside a case execution.
+
+| Target | Execution |
+|---|---|
+| `omnigraph-engine` | Direct calls to `Omnigraph`. |
+| `omnigraph-engine-dst` | Direct engine execution under the seeded DST environment. |
+| `omnigraph-server` | Requests through the server's HTTP API. |
+| `omnigraph-server-dst` | Requests through the server's HTTP API with server tasks and its embedded engine under a qualified seeded DST environment. |
+
+`target` is the only execution selector. There is no separate `runtime` or
+DST-mode field. The server embeds `Omnigraph`; these names do not assert an
+independent server-to-engine network connection. Server-DST requires its own
+execution qualification; engine-DST qualification alone cannot establish it.
+
+| Storage | Meaning |
+|---|---|
+| `local-filesystem` | A fresh temporary directory on the local filesystem. |
+| `in-memory-object-store` | An injected object store whose contents live in process memory. |
+| `s3-compatible` | An explicitly configured S3-compatible service. |
+| `azure-blob-storage` | An explicitly configured Azure Blob service or emulator. |
+
+These names are GQT configuration values. `StorageAdapter` is the existing
+Rust interface, and `ObjectStorageAdapter` provides these storage
+implementations. Selecting a control-object adapter alone is insufficient:
+the environment must connect Lance dataset I/O to the corresponding
+isolated storage too. The storage name does not certify a provider's
+compatibility or change its existing qualification status.
+
+| Target roadmap | Local filesystem | In-memory object store | S3-compatible | Azure Blob |
+|---|---|---|---|---|
+| `omnigraph-engine` | Intended | Intended | Intended | Intended |
+| `omnigraph-engine-dst` | Refused | Intended | Refused | Refused |
+| `omnigraph-server` | Intended | Refused | Intended | Intended |
+| `omnigraph-server-dst` | Refused | Intended | Refused | Refused |
+
+`Intended` means potential support gated by Rollout; it does not mean
+implemented or qualified. Initial implementation admission is limited to
+`omnigraph-engine` with `local-filesystem` and no fault directives, and
+`omnigraph-engine-dst` with `in-memory-object-store`. Every other combination
+must report `unsupported_environment` before case setup. Further targets,
+storage combinations and controls require their own acceptance evidence.
+A requested combination unavailable in the running build
+fails before case setup. There is no automatic substitution or skip.
+
+S3, Azure, and every server environment additionally require `profile`.
+A ***connection profile*** supplies connection details and test lifecycle
+control outside the case. It cannot override target, storage, seeds,
+faults, assertions, or the file budget. The file carries the profile name;
+the report carries its resolved non-secret configuration and digest.
+Credentials stay outside the case and report. Profiles distinguish actual
+services, including different S3-compatible providers and Azure emulators.
+They record effective storage options, including request retry settings.
+Changing a provider or these options changes the recorded environment.
+
+For example, a future HTTP environment can declare:
+
+```yaml
+  - target: omnigraph-server
+    storage: s3-compatible
+    profile: gqt-server-s3
+```
+
+The profile must verify the server's actual backend and provide an
+exclusively owned graph with fresh schema and seed state. The server is
+cluster-only; graph provisioning follows cluster configuration and
+lifecycle controls, not an invented graph-creation HTTP endpoint. Reuse
+the server test support's lifecycle owner. A URL and credentials alone
+cannot satisfy this contract. A profile that cannot prove isolation,
+required result types, or a requested test control is refused.
+
+#### Seeds and reproducibility
+
+`seeds` is required for `omnigraph-engine-dst` and `omnigraph-server-dst`:
+1 to 64 distinct unsigned 64-bit integers. Other targets reject it.
+Declaring seeds does not make an unsupported target admissible. Each seed
+executes twice in
+fresh child processes, with seeded scheduling, engine IDs, engine time,
+and in-memory storage setup. Process-global initialization happens after
+the child receives its resolved configuration. Known ambient overrides
+of test semantics, including inherited `FAILPOINTS` and traversal pins,
+are refused rather than silently combined with the file.
+
+DST replay first requires equal validated input and build identities,
+as defined in Validation and agent diagnostics. It then compares all
+assertion-relevant actual observations: rows, executed result types,
+affected node/edge counts, and error codes with their compared payloads.
+It also compares main snapshot IDs, the reached operation sequence, and
+the final verdict. Each observation identifies its step ordinal and loop
+iteration, when present. Verdict includes the failure classification and
+structured assertion failure values; equality cannot rely on readable
+error text alone. A mismatch fails even when both executions fail the
+same assertion. Missing required observation evidence fails explicitly.
+This observation comparison does not prove equality of every storage call,
+unqueried branch state, or Lance thread schedule. `omnigraph-engine` and
+`omnigraph-server` runs have no deterministic replay guarantee. Their value is repeatable
+inputs and recorded conditions with the same explicit assertions.
+
+The harness issues each authored operation once. It never adds a mutation
+retry or reopens `Omnigraph` after an error. Engine and storage-client
+retries remain their production behavior, with effective configuration
+recorded. An authored retry is another explicit operation step.
+
+### Shared seeded execution
+
+`omnigraph-dst::run_universe(&environment, &scenario)` executes one selected
+seed. The environment supplies configuration and resource setup through
+`UniverseEnvironment`; the scenario supplies operations and checks through
+`UniverseScenario`. This entry point is for seeded execution. The ordinary
+engine target retains its ordinary runtime and the same GQT step comparisons.
+
+The caller must establish process isolation, process-start pool and entropy
+settings, failpoint registration, and the invocation wall deadline before
+entering the universe. Environment setup must not attempt to repair already
+initialized process settings. GQT's supervisor continues to own immutable input
+validation, seed/replay expansion, containment, terminal reporting, and the
+continuation rules in Validation and agent diagnostics.
+
+The executor installs seeded scheduling, clock, IDs, and entropy before
+constructing per-execution storage and controls. Configuration is not a live
+store. `MemoryEnvironment` creates a fresh control-object adapter and requires
+an empty, exclusively owned Lance graph namespace. It refuses existing graph
+contents rather than deleting them during setup. Both storage paths remain
+alive across a scenario's handle reopen. Teardown removes only that owned
+Lance namespace after observations are collected; it does not reset shared
+backend ETag counters or incomplete multipart state. GQT's fresh worker process
+per attempt remains required for its replay contract.
+
+Setup must guard partial acquisitions. `UniverseRun` retains the execution
+phase, scenario/setup outcome, and cleanup outcome separately, including
+original panic payloads. Teardown runs after a completed scenario returns or
+unwinds; a cleanup failure must not replace its original failure evidence.
+Required Rust census and fault-counter handles remain alive until their final
+checks finish. A hung or killed process cannot establish cleanup through Rust
+guards; the supervisor must apply the bounded containment rules above.
+
+The environment's selected root seed is authoritative. The existing Rust
+`harness::run_universe(root, scenario)` boundary translates `Scenario.seed`
+once into the environment, preserving the runtime, ULID, workload, and entropy
+child-seed draw order. Explicit `FaultPlan.seed` values keep their independent
+meaning. Rust generated scenarios and GQT scenarios retain their own loops,
+fixture setup, checks, and outputs; neither language is interpreted by the
+shared executor.
+
+### Faults at an explicit step
+
+A ***fault directive*** is a `--- fault` YAML section immediately before
+one query or mutate step. It arms a named engine hook only during that
+operation; schema creation, seed loading, and earlier steps cannot consume
+it. The following example begins after branch setup:
+
+```text
+--- fault
+at: branch_merge.post_sidecar_pre_fork
+occurrence: 1
+action: return_error
+scope: next_step
+
+--- mutate
+branch merge source into target
+
+--- expect error: injected failpoint triggered: branch_merge.post_sidecar_pre_fork
+
+--- mutate branch: target
+query unrelated_write() {
+    insert Marker { name: "after_failure" }
+}
+
+--- expect affected: nodes=1 edges=0
+```
+
+All four fault fields are required. `scope` accepts only `next_step`;
+`action` accepts only `return_error`. `occurrence` is 1 to 1000000 and
+counts crossings of that hook attributable to the selected operation,
+including its production retries. It starts at zero when the operation
+is armed. The selected crossing injects once; subsequent crossings do
+not inject. Target and storage do not change this meaning.
+
+The hook must be supported for the operation and selected environment.
+No caller-supplied code or arbitrary failpoint action string is accepted.
+Initial hook ownership is the prototype's merge hooks
+(`branch_merge.post_authority_capture`,
+`branch_merge.post_sidecar_pre_fork`,
+`branch_merge.post_effects_pre_confirm`,
+`branch_merge.post_phase_b_pre_manifest_commit`) and mutation hook
+`mutation.post_sidecar_pre_fork`. New hooks require an implementation,
+scope proof, and negative tests before the parser accepts them.
+
+The selected operation must finish before fault cleanup can be considered
+complete. On cancellation or timeout, stop the isolated worker or quarantine
+the dedicated server graph until outstanding work has stopped and hooks are
+disarmed. Use a bounded supervisor cleanup deadline; failure to establish
+cleanup prevents reuse and is reported, never an unbounded wait. A killed
+worker or quarantined graph does not count as a successful replay.
+
+The operation must observe the exact injected error through a typed error
+or an equivalent correlated server result. Matching text in query rows or
+an unrelated error is insufficient. The runner verifies delivery and
+disarms the hook before the following operation, including after an
+assertion failure. An unreached hook, failed cleanup, timeout, or lost
+delivery evidence fails the execution. A fault that leaked into another
+operation or graph fails isolation even if the expected rows match.
+
+One fault directive attaches to one operation; adjacent directives,
+directives before restart/setup, orphan directives, and directives inside
+loops are refused in this phase. Multiple faults in one operation and
+faults during setup remain out of scope. A case may contain up to 16
+fault directives at separate operations. No fault state survives a
+restart, environment change, seed, or replay.
+
+Initial `omnigraph-engine` admission rejects faults. A future fault-capable
+direct-engine implementation can use process isolation where failpoints are
+global. A server implementation needs equivalent isolation and explicit
+operation attribution; a shared server-wide toggle does not satisfy it.
+This amendment defines no production fault-control endpoint. HTTP fault
+execution stays unavailable until the test-only lifecycle/control owner
+proves this contract.
+
+`--- restart` continues to mean closing the graph handle and reopening
+the same stored graph. It does not mean process crash or HTTP reconnect.
+In-memory contents must survive that handle reopen. A server environment
+must perform the equivalent graph reopen or refuse the case. Process
+crashes, multi-connection interleavings, and randomized fault discovery
+remain outside this format extension.
+
+### Known recovery failures
+
+An optional `--- known_failure` section immediately after `--- runner` records one
+known recovery failure while keeping the healthy operation expectations.
+It is a narrow corpus admission rule, not an expected-error assertion:
+
+```yaml
+--- known_failure
+step: 4
+match:
+  error: RecoveryRequired
+  reason: "the exact OmniError::RecoveryRequired reason"
+```
+
+`step` and `match` are required, and other fields are refused. `step` is a
+positive operation ordinal. `match` is a typed error matcher: the only supported
+variant is `error: RecoveryRequired`, with a nonempty exact `reason` of at most
+2048 bytes. It names `OmniError::RecoveryRequired` directly; there is no wildcard
+or fallback variant. Unknown error names, including `Unknown`, are refused,
+as is the old `--- fixme` syntax. The existing `# issue` and `# notes` headers
+provide issue identity and context; `none` remains valid for an unassigned
+issue. The marker does not repeat notes or contain the generated operation ID.
+
+Admission requires only `omnigraph-engine-dst` with
+`in-memory-object-store`, no loops, and an ordinary mutate at the declared
+step with its healthy `ok` or `affected` expectation. At least one supported
+fault must precede that step. Faults at or after the marked step are refused.
+
+An execution qualifies only when every preceding assertion passes, every
+declared fault has exact typed delivery evidence at its own operation, and
+the marked assertion fails because that mutate returned the typed
+`OmniError::RecoveryRequired` variant with exactly the declared reason.
+The operation's typed error and the failed assertion must identify the same
+step and actual error. Matching text in data, a different error variant,
+another reason or step, and missing fault evidence never qualify.
+
+The step loop still stops at its first failure; later healthy assertions
+remain unchanged and unexecuted. Every selected seed and mandatory fresh
+replay must qualify. The full raw worker reports, including their assertion
+failures, operation IDs and other actual evidence, must still match. An
+accepted attempt carries `known_failure: true`, the invocation code is
+`known_failure`, and the runner prints `KNOWN_FAILURE`. This status permits a
+successful CI exit while explicitly retaining the graph defect. It does
+not mean that the scenario passed. Partial selection stays partial.
+
+If the scenario passes, the marker is stale and the invocation fails with
+`unexpected_pass`. Setup, worker panic, timeout, cleanup, observation and
+report failures are never waived. Replay derives acceptance again from the
+frozen marker and raw evidence and refuses inconsistent stored status.
+Blessing a marked case is refused. Removing the marker after a fix restores
+the ordinary requirement that every healthy assertion pass.
+
+### Validation and agent diagnostics
+
+Parse the complete file, resolve profiles, and check every selected
+environment's capabilities before creating case state. Reject unknown or
+duplicate YAML keys, YAML aliases/merge keys/tags, misplaced sections,
+unknown enum values, empty selections, duplicate environment parameters or seeds, and fields
+that do not apply to the chosen target. Do not infer a target from a
+storage URI or repair a misspelled field during execution.
+
+Preflight must produce one immutable input for the invocation: the exact
+validated case bytes, declared and selected executions, resolved non-secret
+profile settings, and expected engine/runner build identities. Every
+execution consumes that input; workers cannot reopen the original case or
+resolve a profile name again as configuration authority. The runner records
+the input digest. Before setup, each worker verifies that digest and its
+actual executable identity against the input. Known identity differences
+fail with `environment_changed`; unknown identities remain explicitly
+unverified and cannot support a verified reproduction or DST replay.
+Server execution additionally revalidates its effective configuration and
+build identity at readiness, before creating case state. Credentials remain
+external and excluded from the recorded input. This binds tested inputs;
+it does not freeze the external service's internal execution schedule.
+
+Capability requirements are derived from actual steps and configuration.
+For example, `--- fault` requires its exact hook, and `--- expect shape`
+requires result type evidence. There is no second hand-maintained
+`requires` list that can disagree with the case. A server cannot substitute
+inferred types for missing executed types or omit an existing comparison.
+
+Every result identifies its scope using the following applicability rules.
+The result carries the invocation's case path and content hash when the
+bytes were read, input digest when resolved, and known engine/runner build
+identities. A required but unavailable value carries an explicit reason;
+an inapplicable value is marked separately. No synthetic environment,
+profile, step, or seed may stand in for missing evidence.
+
+| Result scope | Applicable context |
+|---|---|
+| Case/preflight | Source span when locatable; environment parameters only when parsed unambiguously; profile digest only after resolution. No operation ordinal is required for malformed YAML. |
+| Execution/step | Target, storage, full declared parameters, effective settings, profile digest when required, and seed/replay index for DST. Step ordinal, loop iteration, source span, and expected/actual values apply to operation assertions; setup/teardown failures identify their phase instead. |
+| Replay comparison | Environment parameters, seed, both attempt identities, their verdicts, and differing observations when available. A comparison does not invent a single failing step when attempts reached different steps. |
+| Supervisor | The affected execution or invocation, containment outcome, and original failure reference. Operation context is included only when known. |
+| Invocation summary | Final outcome and coverage of every declared execution: selected or unselected, then passed, accepted known failure, failed, or not run with a reason. If parsing cannot establish that inventory, coverage is explicitly unavailable and the invocation fails. |
+
+Within one invocation, full environment parameters and seed/replay index identify an
+execution. Step ordinal and loop iteration identify an observation inside
+it. Reports from different invocations must retain their invocation boundary;
+case path or digest alone cannot identify a run. A replay compares operation
+identities and values, not run-specific report references.
+
+Build identity includes executable digests and source revision plus
+dirty-source identity when available. Unknown identity is reported explicitly
+and cannot claim a verified reproduction. Secret values are excluded.
+Observation and diagnostic collection must be bounded; exceeding the bound
+fails explicitly and cannot truncate compared evidence into success.
+Structured failures retain applicable expected/actual values and a stable
+error code alongside the readable explanation. Contract codes include
+`invalid_case`, `unsupported_environment`, `environment_changed`,
+`fault_unobserved`, `fault_cleanup_failed`, `assertion_failed`,
+`replay_mismatch`, `worker_failed`, `report_failed`, `timeout`, and
+`unexpected_pass`. `known_failure` is a separate accepted status defined
+in Known recovery failures; its raw worker result remains an assertion failure.
+Every invocation must emit a terminal summary. A missing, malformed,
+incomplete, or unwritable report fails the invocation and cannot yield
+a successful exit. If the structured output cannot be written, the runner
+also reports `report_failed` through stderr and exits unsuccessfully.
+Cleanup failure preserves the original operation failure as well as its
+own outcome; it never replaces the evidence that triggered cleanup.
+
+The runner supplies an exact rerun command plus the required build and
+profile references. The `--target`, `--storage` and `--seed` filters select all
+matching declared executions. Supplied filters combine with AND and only
+narrow the file's declared executions; they cannot change them. A seed filter
+requires a target or storage filter. The report lists
+selected and unselected executions, and a partial run never claims the
+whole case passed. Zero matching environments or seeds is a refusal.
+Each individual execution stops its step loop at the first failed step.
+A completed failing DST execution still gets its fresh replay, and later
+selected seeds continue while the deadline and isolation permit. A replay
+mismatch fails the case but does not suppress later seeds. A worker failure
+without a complete report stops that environment's remaining executions;
+other selected environments continue only after containment is confirmed.
+Deadline exhaustion or uncontained cleanup stops all further dispatch.
+Every suppressed execution, including a mandatory replay, is reported as
+not run with its terminal cause. Overall success requires every selected
+execution and mandatory replay to pass or satisfy Known recovery failures,
+and a complete terminal report. Accepted known failures remain distinct from
+genuine passes.
+
+The report is derived execution evidence, never configuration authority.
+A reproduction compares case, build, effective settings, and non-secret
+profile identities before running; missing or changed evidence is reported
+as a changed environment. Repeating a command against an altered server
+must not be described as replaying the original conditions.
+
+The precise command-line flags and structured-result wire schema are
+implementation deliverables in Rollout. Their acceptance tests must prove
+exact selection, stable refusal codes, and complete failure context.
+Bless remains available for an explicit single-engine, fault-free route;
+it is refused for fault, DST, known-failure, and multi-environment executions. A runner must never
+resolve disagreeing environments by rewriting the shared expectation.
+
+
 ### Execution semantics
 
-Per case, in order: create a `tempfile::tempdir()`, then
+The following setup and direct calls describe an explicitly declared
+`omnigraph-engine` / `local-filesystem` environment. Every environment uses
+the lifecycle and operation contract above.
+Per execution, in order: create a `tempfile::tempdir()`, then
 `Omnigraph::init(uri, schema_source)`, then
 `loader::load_jsonl(&db, seed, LoadMode::Overwrite)`, then
 `db.ensure_indices()` (its `Vec<PendingIndex>` return lists deferred
@@ -621,10 +1125,11 @@ process-global state stay Rust tests: the harness refuses a schema using
 `@embed` and a `nearest` over a string argument, both of which resolve an
 embedding provider from process environment variables
 (`EmbeddingClient::from_env`); a `nearest` over an explicit vector
-parameter stays in scope. Failpoint cases stay Rust tests likewise.
-Concurrency between connections (interleaved writers, transaction races)
-stays out: that is DST's domain. This keeps the logic test binary out of
-the serial group entirely.
+parameter stays in scope. Fault cases expressible by Faults at an explicit
+step may use GQT; other failpoint cases stay Rust tests. Interleaved writers
+and transaction races stay in the existing DST suites. Fault-enabled GQT
+executions require the isolation described above; they cannot share a
+process-global hook with unrelated cases.
 
 ### Comparison semantics
 
@@ -743,7 +1248,7 @@ trial under `datatest-stable`) named `case::<file>.gqt`. The runner it
 calls (parser, execution, comparison, bless) is the crate's library,
 `crates/omnigraph-gqt/src/lib.rs`, and the format self-tests are unit
 tests beside it in `crates/omnigraph-gqt/src/tests.rs`; the crate is
-`publish = false` and never built for release. Cases run on one shared
+`publish = false` and never built for release. Direct-engine cases run on one shared
 multi-thread tokio runtime whose worker stacks are 16 MiB (the engine's
 query futures overflow the 2 MiB default; the value equals the CI jobs'
 `RUST_MIN_STACK`, so the harness target does not depend on that
@@ -754,14 +1259,24 @@ once is set by libtest's `--test-threads=<n>` flag, which
 `datatest-stable` honors, independently of corpus size; that flag is a
 runner knob, not format contract.
 The per-PR corpus is the ***fast tier***: a case is expected to finish
-in well under a second. The runner's per-case budget defaults to 10
-seconds, generous against that expectation so a slow CI runner never
-trips it; `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` overrides the default, and the
-timeout failure message prints the budget in force. The elapsed time on each
-ok/FAIL line, not the timeout, is the drift signal a reviewer reads. A
-case that trips the budget belongs to the heavy-repro tier, defined below
-in the Enforcement ladder, so slowness fails the PR introducing it
-instead of accumulating in the required job. Each case's
+in well under a second. Every file owns its explicit `timeout_ms` budget;
+there is no default and `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` is refused as an
+ambient override. The timeout failure message prints the budget in force. The
+elapsed time on each ok/FAIL line is the drift signal a reviewer reads.
+
+The GQT corpus admission check must reject a declared file budget above
+10000 milliseconds before case setup, independent of selected environments
+or seeds. The required job must run this check over every corpus file
+before execution. It must not clamp an explicit budget to make a case
+admissible. A case that exceeds
+its admitted budget fails the required job. Larger budgets remain valid
+only for explicit file execution outside the per-PR corpus; the GQT
+command-line runner owns that local reproduction route. It is not
+automatically enrolled in CI. The existing heavy-repro tier, defined below
+in the Enforcement ladder, continues
+to discover Rust repro targets; it does not discover these external GQT
+files. A slow GQT reproduction must be reduced for corpus enrollment or
+converted to that tier's Rust route. Each case's
 outcome, a panic included, is caught and reported as that case's own
 failure, which lets the target run every case before
 failing. A corpus directory holding no case file makes the target panic
@@ -853,8 +1368,8 @@ Rust-test status quo already carries.
 
 ## Invariants
 
-No architectural invariant is touched; the change is test-and-CI only. Every
-engine surface the harness calls is public and chokepoint-registered in the
+No architectural invariant is weakened; the change is test-and-CI only. The
+existing engine surfaces are public and chokepoint-registered in the
 `forbidden_apis.rs` const registries: `query`, `query_with_head`, and
 `run_query_at` read-only, `load_jsonl` / `load_jsonl_file` under `LOAD_V9`,
 the `mutate` family under `MUTATION_V9`, and `open` / `open_with_storage`
@@ -862,11 +1377,14 @@ under the `RecoveryExecutor` write protocol. That `forbidden_apis.rs`
 walk covers `crates/omnigraph/src/**` only, so the `omnigraph-gqt` crate
 adds no registry entries; no deny-list item is affected, and no new
 public API is added.
-The target adds no shared state to the test suite (Execution semantics).
+The proposed fault extension must preserve per-case isolation. It cannot
+weaken graph publication, recovery, policy, or storage admission rules.
+Future HTTP execution needs a separately qualified test-control boundary;
+this amendment does not authorize production fault-control APIs.
 
 ## Compatibility and reversibility
 
-No storage or wire surface changes; the RFC is purely additive to tests,
+No production storage format or wire surface changes; the RFC extends tests,
 CI, and contributor docs. Reverting means deleting the `omnigraph-gqt`
 crate and its `members` entry in the workspace `Cargo.toml` (which drops
 `datatest-stable` and its lockfile closure), the two workflow files with
@@ -877,11 +1395,30 @@ header keys, and missing required headers are refusals, never silent
 skips, so an older harness refuses a newer logic test rather than
 mis-running it.
 
+The explicit runner section is mandatory for all cases. It has no version
+field; parser and corpus changes land together.
+Omitting the section or any required field is `invalid_case`, including for
+previously accepted engine/local-filesystem cases. Migration adds that
+environment explicitly to every existing case; no provider, execution target,
+seed or timeout is discovered from the host or supplied as a format default.
+
+The prototype's `mode: normal` / `mode: dst` runner shape is not an alias
+for this contract. The earlier draft's `runtime` field and `omnigraph-dst`
+value are not aliases either; use `target: omnigraph-engine-dst` for direct
+engine simulation. Migration rewrites every configuration explicitly. In
+particular, the prototype's
+fault occurrence count starts during initialization; the proposed count
+starts at the selected operation. Migration must identify that operation
+and re-establish the failure, never copy occurrence numbers mechanically.
+Old parsers reject the new sections. Rollback requires retaining the newer
+harness or migrating those files back, not silently dropping directives.
+
 Named compatible extensions, deferred until a real case demands each,
 with maintainers deciding each one when the first case that needs it
 forces the question:
 
-- `require <capability>` guards for optional engine features.
+- Additional feature requirements not already derivable from the
+  environment and step contract.
 - Loop nesting.
 - A per-case float-precision override; scale 12 for every number is the
   contract until a case a fixed scale cannot express appears.
@@ -901,10 +1438,29 @@ forces the question:
   execution model; until then the modes-are-equivalent contract keeps its
   existing owner, `tests/proptest_equivalence.rs`.
 
-Multi-connection interleaving stays out
-permanently rather than deferred (DST's domain, per Execution semantics).
+Whole-case execution across declared environments is distinct from the
+per-query second-plan verification deferred above. Multi-connection
+interleaving remains outside GQT and retains its existing DST owner.
 
 ## Alternatives
+
+| Environment/fault alternative | Decision and concrete cost |
+|---|---|
+| Keep only the current local runner and Rust fault tests | Smallest change, but each merge-failure case duplicates setup and assertions in Rust. |
+| Select environments entirely through CLI or CI | Short files, but copying a regression loses its required storage and fault conditions. Exact selection may narrow a file, not redefine it. |
+| Inline every endpoint and credential | Self-contained connection data, but secrets and machine-specific addresses prevent portable cases. Profiles own connection data; resolved evidence exposes drift. |
+| Reopen case/profile paths in every worker | Avoids handing workers resolved input, but an edit after preflight can make two workers agree on a different experiment. Preserve validated input and check worker identities. |
+| Arm faults once at file startup | Simpler lifecycle, but setup can consume the occurrence intended for a later merge. Step scope gives the occurrence an explicit owner. |
+| Add a separate capability list or expected file per target | Duplicates facts already present in operations and assertions, creating disagreement paths. Derive requirements and share expectations. |
+
+The nearest in-repo owners are the GQT parser/comparator, DST environment,
+`StorageAdapter`, and server test support. Extend those boundaries rather
+than add a second assertion engine or cluster lifecycle implementation.
+The [sqllogictest Runner](https://docs.rs/sqllogictest/latest/i686-pc-windows-msvc/sqllogictest/runner/struct.Runner.html)
+separates database execution from validation. [RisingWave's 2023 account](https://risingwave.com/blog/applying-deterministic-simulation-the-risingwave-story-part-2-of-2/)
+describes reusing scripts between real and simulated clusters. These
+support the separation; neither establishes this proposed GQT syntax.
+
 
 - **Regression-only scope first, wider role later** (this RFC's own prior
   draft): rejected because every deferred feature is already proven
@@ -955,6 +1511,44 @@ permanently rather than deferred (DST's domain, per Execution semantics).
   `-- --nocapture` is accepted as before (inert for this target).
 
 ## Evidence and tests
+
+The amendment requires the following evidence before a target/storage
+combination is advertised as supported:
+
+| Owner | Required evidence |
+|---|---|
+| GQT parser self-tests | Missing runner sections on existing and new cases, required fields, distinct environment parameters, all field bounds, invalid positions, unsupported combinations, old `runtime`/`mode` spellings, and migration refusals. |
+| GQT execution/dispatch tests | Every declared environment runs fresh; exact subset selection is visible; deadlines include preflight/setup/replays/cleanup; no-match selections fail. |
+| GQT input identity tests | Editing the original case/profile after preflight cannot change worker input; replacing a worker build is refused before setup; unequal identities cannot count as replay. |
+| GQT scheduling tests | A completed assertion-failing first seed still replays and later seeds run; mismatch, worker failure, deadline, and uncontained cleanup follow the specified continuation rules and account for every not-run attempt. |
+| GQT diagnostic tests | Malformed YAML, unresolved profiles, setup failures, replay mismatch, and cleanup failure have applicable context; missing/incomplete/unwritable reports fail, preserving the original failure. |
+| GQT CI/admission tests | A workflow-equivalent mixed engine/engine-DST corpus with explicit configuration executes every declared attempt; an over-10000-ms corpus file fails admission even under subset selection; explicit out-of-corpus execution preserves its declared budget. |
+| GQT comparison tests | Rows, executed types, counts, and error checks remain active through each executor; transport conversion preserves the existing contract. |
+| Fault isolation tests | Setup cannot consume a fault; another case cannot trigger it; occurrence counting includes production retries; spoofed or missing delivery fails. |
+| Fault cleanup tests | Expected errors, unexpected success, panic, cancellation, and timeout cannot leave a hook armed for another operation. |
+| DST replay tests | Successful and completed failing seeds repeat in fresh processes; changed actual counts, executed types, error payloads, rows, operation sequence, or main snapshot IDs fail comparison even with the same failure classification. |
+| Known recovery failure tests | Exact typed recovery reason and step qualify only with all earlier assertions and fault deliveries; changed reasons, other failures, missing faults, stale markers, and forged replay status fail. Raw reports still compare in full. |
+| Server test support | Backend verification, exclusive fresh graphs, authentication, actual graph reopen, and typed fault correlation before advertising each capability. |
+
+The existing merge-refusal cases retain successful-write expectations
+after the injected failure. An explicitly marked exact recovery defect can
+qualify only under Known recovery failures; its accepted status remains
+distinct from a genuine pass. Unmarked or mismatching failures remain
+regression failures. Neither blessing nor target selection can hide them.
+
+Lance's [object-store configuration](https://lance.org/guide/object_store/)
+documents backend options outside the query text. GQT must record the
+effective settings used by the tested build; current upstream defaults
+are not evidence of the pinned dependency's defaults. The initial engine/DST
+runner records its Rayon and Lance thread counts, deterministic-backoff setting,
+entropy seed when applicable, and Tokio runtime kind with explicit direct-engine
+worker count and stack size. These recorded values configure the worker and are
+verified against both this build's settings and the process environment before
+setup. Replay validates every recorded settings object before dispatching any
+worker. Lance's memory pool is recorded as `dependency_default`, with
+`LANCE_MEM_POOL_SIZE` absent; this identifies the pinned dependency's default
+selection, not a measured or independently verified pool capacity.
+
 
 The harness proves itself on two fronts: the logic-test-expressible #563
 regressions as the first corpus entries, each with a red state recorded
@@ -1030,12 +1624,63 @@ the docs indexes honest, so no new orphan doc file).
    tier member on `main`) is met. `implementation` advances to
    `complete`.
 
+### Environment extension rollout
+
+1. Deliver the first complete engine/DST integration: mandatory configuration
+   and corpus migration, immutable invocation inputs, exact selection, corpus
+   admission, structured diagnostics, preserved lifetime, scoped faults with
+   delivery evidence, shared assertions, and observation replay. Admit only
+   fault-free `omnigraph-engine` / `local-filesystem` and
+   `omnigraph-engine-dst` / `in-memory-object-store`. The GQT maintainer
+   decides the CLI/result schema before enabling this phase, including
+   explicit file execution outside the corpus and acceptance tests for
+   result applicability and failed report publication. The maintainer owns
+   the required workflow's seeded build, its `omnigraph-gqt` worker binary,
+   and the workspace test
+   invocation described in User and operational behavior. Before enrolling
+   DST cases, a workflow-equivalent mixed corpus must prove full declared
+   execution and admission enforcement. The DST package workflow alone is
+   insufficient. Migrate prototype faults by their intended operation.
+   Keep parser capability refusals for every unqualified combination. An
+   explicitly marked recovery defect must meet Known recovery failures,
+   with its raw failure evidence retained; other known-red cases fail.
+2. Qualify direct-engine in-memory storage and, independently, fault controls
+   for ordinary engine execution. These extend the first integration rather
+   than delay its engine-DST path. Preserve the same isolation, attribution,
+   result and reproduction evidence requirements.
+3. Qualify configured S3 and Azure engine execution with provider-specific
+   evidence and existing admission rules. CI must supply declared profiles;
+   missing configured services fail their selected cases.
+4. Add HTTP execution through the existing server lifecycle owner. Enable
+   `omnigraph-server` cases first; enable reopen and faults only when their
+   separate capability tests pass. Qualify `omnigraph-server-dst` independently,
+   including controlled server tasks and the embedded engine. Neither server
+   target is a prerequisite for the first engine/DST integration.
+
+The RFC's `implementation` remains `partial` while this extension has
+unqualified targets. No stage changes engine recovery behavior or claims
+determinism for real external services.
+
 ## Unresolved questions
 
-None before acceptance. The deferred extensions and their decider are
-listed in Compatibility and reversibility.
+The proposed format and failure semantics above are the acceptance
+decisions. Two implementation proposals remain, with explicit owners:
+
+| Proposal | Decision owner | Required event |
+|---|---|---|
+| CLI and diagnostic wire schema | GQT maintainer | Accept the proposal and pass phase 1's selection, applicability, coverage, and report-failure tests before enabling the interface. |
+| HTTP profile and test-control protocol | Server lifecycle maintainer, with GQT maintainer acceptance of the execution contract | Accept the proposal and qualify backend identity, exclusive graphs, result typing, and each requested control before enabling phase 4 capabilities. |
+
+These roles own the decisions, not an assertion that a particular maintainer
+has already approved them. Neither proposal may weaken the specified
+isolation, selection, typing, or evidence requirements.
 
 ## Decision log
+
+The entries below record earlier decisions. The current environment amendment
+supersedes their implicit execution and ambient-budget rules and assigns the
+complete corpus to the separate configured `GQ Logic Tests` context. Their
+historical command and configuration descriptions are not migration aliases.
 
 - 2026-09-02, from review of the RFC PR: the fix-PR gate is a diff check
   whose execution guarantee differs by shape (a corpus match ran green in

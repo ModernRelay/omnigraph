@@ -4,6 +4,12 @@
 # notes: The lazy child b1 keeps its former b0 rows across a restart;
 # notes: the new b0 write remains isolated from both b1 and main.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

@@ -43,6 +43,34 @@ cargo is invoked from the crate directory; from anywhere else, set
 `RUSTFLAGS="--cfg tokio_unstable"` yourself. The `failpoints` feature is a
 default of this crate.
 
+## Shared execution and storage lifetime
+
+`environment::run_universe(&environment, &scenario)` runs one complete scenario
+under one selected root seed. `UniverseEnvironment` creates resources inside
+the seeded runtime; `UniverseScenario` owns the operation loop and checks.
+Rust recipes and GQT use this executor with their respective scenario types.
+The ordinary GQT engine target retains its ordinary runtime.
+
+`MemoryEnvironment` supplies a fresh control-object adapter and an empty owned
+Lance graph namespace. It refuses nonempty or actively owned namespaces.
+The same resources survive an `Omnigraph` reopen within a scenario. Teardown
+clears only the owned Lance prefix, through the raw provider after scenario
+observations, and releases the adapter. This preserves a fresh graph, not a
+reset of shared-backend ETag counters or incomplete multipart state.
+
+`UniverseRun` records the execution phase, primary outcome, and cleanup outcome
+separately. Setup guards partial acquisitions; scenario errors and panics still
+run teardown. Panic payloads remain available to the Rust caller. The caller
+owns process-start settings, failpoint registration, isolation, wall deadlines,
+and containment of hung or killed workers. GQT still executes each replay in a
+fresh child process and verifies the frozen inputs and observations.
+
+The existing `harness::run_universe(root, &Scenario)` and
+`harness::run_universe_caught` calls translate `Scenario.seed` into the explicit
+environment. The four child streams retain their draw order; `FaultPlan.seed`
+continues to select the independent storage-fault stream. Rust fault wrappers,
+counters, and final census remain available through prepared resources.
+
 ## What a universe checks (the oracles)
 
 The five GROUPS below are the reader's map; the enforced census counts

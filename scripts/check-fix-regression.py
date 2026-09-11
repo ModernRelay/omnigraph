@@ -411,6 +411,12 @@ def failure_message(n: str, code_paths: list[str], hints: list[str]) -> str:
         "    # red_on: <date>, pre-fix build: <what the old build returned>",
         "    # notes: <one line on what the case pins>",
         "",
+        "    --- runner",
+        "    timeout_ms: 10000",
+        "    environments:",
+        "      - target: omnigraph-engine",
+        "        storage: local-filesystem",
+        "",
         "    --- schema",
         "    node Person {",
         "        name: String @key",
@@ -1072,6 +1078,8 @@ def self_test() -> int:
     message = failure_message("563", ["crates/omnigraph/src/lib.rs"], ["hint one"])
     assert message.startswith("FAIL: the body closes #563") and "near miss: hint one" in message
     assert "issue_563_<short_name>.gqt" in message and "# issue: 563" in message
+    assert "    --- runner\n    timeout_ms: 10000\n    environments:" in message
+    assert "      - target: omnigraph-engine\n        storage: local-filesystem" in message
 
     print("self-test ok")
     return 0

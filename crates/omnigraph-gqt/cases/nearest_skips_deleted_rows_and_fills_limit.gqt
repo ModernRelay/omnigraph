@@ -4,6 +4,12 @@
 # notes: masking deletions after the top-k answers nothing. Deleted rows never
 # notes: return and the limit fills from the 5 survivors (5 > 3): d003, d004, d005.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

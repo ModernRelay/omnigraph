@@ -3,6 +3,12 @@
 # notes: Feature writes successfully while that ancestor is still required by child.
 # notes: Both branches retain independent rows after restart and further writes.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

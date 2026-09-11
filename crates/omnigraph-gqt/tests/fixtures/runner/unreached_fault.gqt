@@ -1,0 +1,29 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [42]
+
+--- schema
+node Person { name: String @key }
+--- seed
+{"type": "Person", "data": {"name": "alice"}}
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name": "alice"}
+--- expect shape
+p.name: String
+--- mutate
+branch create source
+--- expect ok
+--- fault
+at: branch_merge.post_sidecar_pre_fork
+occurrence: 1
+action: return_error
+scope: next_step
+--- mutate
+branch merge source into main
+--- expect ok

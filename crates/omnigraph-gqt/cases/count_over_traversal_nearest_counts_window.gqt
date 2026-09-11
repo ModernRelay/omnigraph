@@ -7,6 +7,12 @@
 # notes: (0, 1) has no edge. Rust twin (probes: no overfetch on an aggregate):
 # notes: issue_567_aggregate_over_a_nearest_traversal_counts_the_window.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

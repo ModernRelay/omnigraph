@@ -1,6 +1,12 @@
 # issue: 620
 # red_on: 2026-09-03, main @ 0ff0ae3b: the query succeeded, one column `value` holding 7, the name silently dropped (step 1); steps 2-9 succeed the same way on 44211fce, which has no refusal to name.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Pair {
     name: String @key

@@ -6,6 +6,12 @@
 # notes: Seed geometry: 20 chunks all matching "needle", strict tf gradient
 # notes: (tf = 20 - c) so BM25 has a real order with no ties.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Chunk {
     slug: String @key

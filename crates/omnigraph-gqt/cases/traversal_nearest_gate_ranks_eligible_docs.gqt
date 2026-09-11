@@ -6,6 +6,12 @@
 # notes: (5.3), d040 (14.7), so the answer is the exact order among the eligible
 # notes: ids, not row order. The unfiltered top-3 (25, 26, 24) has no edge.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

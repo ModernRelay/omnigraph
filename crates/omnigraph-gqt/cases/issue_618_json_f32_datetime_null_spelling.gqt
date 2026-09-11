@@ -5,6 +5,12 @@
 # notes: and without milliseconds (no `Z`, no `.000`), and a null cell's key
 # notes: omitted from its row (the expected row carries no `p.note`).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Point {
     name: String @key

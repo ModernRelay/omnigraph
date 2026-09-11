@@ -1,7 +1,7 @@
 use super::*;
 
 const HDR: &str = "# issue: none\n";
-const SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n}\n";
+const SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
 const SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n";
 const QUERY: &str =
     "--- query\nquery all() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
@@ -391,7 +391,7 @@ fn refuses_substitution_marker_in_a_statement_body() {
     );
     assert_eq!(
         refusal("x", &text),
-        "line 10: `${` may appear only inside a params or expect body"
+        "line 16: `${` may appear only inside a params or expect body"
     );
 }
 
@@ -669,7 +669,7 @@ fn refuses_ordered_expect_without_an_order_clause() {
 
 #[test]
 fn refuses_embed_schema() {
-    let schema = "--- schema\nnode Doc {\n    slug: String @key\n    text: String\n    vec: Vector(4) @embed(\"text\")\n}\n";
+    let schema = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Doc {\n    slug: String @key\n    text: String\n    vec: Vector(4) @embed(\"text\")\n}\n";
     let seed = "--- seed\n";
     let text = format!("{HDR}{schema}{seed}{QUERY}{EXPECT}")
         .replace("$p: Person", "$p: Doc")
@@ -701,7 +701,7 @@ fn accepts_empty_expect_body_as_empty_result_assertion() {
 
 #[test]
 fn search_construct_sets_the_index_decision() {
-    let schema = "--- schema\nnode Doc {\n    slug: String @key\n    text: String @index\n}\n";
+    let schema = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Doc {\n    slug: String @key\n    text: String @index\n}\n";
     let query = "--- query\nquery q($q: String) {\n    match {\n        $d: Doc\n        search($d.text, $q)\n    }\n    return { $d.slug }\n}\n";
     let text = format!(
         "{HDR}{schema}--- seed\n{query}--- params\n{{\"q\": \"needle\"}}\n--- expect unordered\n--- expect shape\nd.slug: String\n"
@@ -925,7 +925,7 @@ mod shape_section {
         );
     }
 
-    const AGE_SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
+    const AGE_SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
     const AGE_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n{\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n";
     const AGE_QUERY: &str =
         "--- query\nquery all() {\n    match { $p: Person }\n    return { $p.name, $p.age }\n}\n";
@@ -954,7 +954,7 @@ mod shape_section {
             format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"alice\"}}\n");
         let reason = refusal("x", &text);
         assert!(
-            reason.contains("line 13: the rows expect needs an `--- expect shape` section"),
+            reason.contains("line 19: the rows expect needs an `--- expect shape` section"),
             "{reason}"
         );
         assert!(reason.contains("OMNIGRAPH_GQ_BLESS=1"), "{reason}");
@@ -1441,7 +1441,7 @@ fn expects_expand_ignores_bound_edges_and_plain_bindings() {
 }
 
 /// A two-node, one-edge graph with a one-hop traversal, for the pin tests.
-const TRAVERSAL_SCHEMA: &str = "--- schema\nnode Person {\n    name: String @key\n}\n\n\
+const TRAVERSAL_SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n\n\
                                 edge Knows: Person -> Person {\n    since: I64\n}\n";
 const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
                               {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
@@ -1701,4 +1701,50 @@ fn bless_splice_inserts_into_an_empty_expect_body() {
     let rows = vec!["{\"n\":1}".to_string()];
     let out = splice_lines(original, span, &rows);
     assert_eq!(out, "--- expect unordered\n{\"n\":1}\n--- restart\n");
+}
+
+#[test]
+fn runner_is_required_and_cannot_be_repeated() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let case = parse_case("normal", &text).unwrap();
+    assert!(
+        case.runner.environments[0].matches(Some("omnigraph-engine"), Some("local-filesystem"))
+    );
+    let runner_end = text.find("--- schema").unwrap();
+    let missing = format!("{HDR}{}", &text[runner_end..]);
+    assert!(refusal("normal", &missing).contains("--- runner"));
+    let duplicate = text.replacen(
+        "--- schema",
+        &format!("{}--- schema", &text[HDR.len()..runner_end]),
+        1,
+    );
+    assert!(parse_case("normal", &duplicate).is_err());
+}
+
+#[test]
+fn fault_limits_and_loop_scope_are_enforced() {
+    let fault = "--- fault\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: return_error\nscope: next_step\n";
+    let operation = "--- mutate\nquery add() { insert Person { name: \"bob\" } }\n--- expect error: injected failpoint\n";
+    let prefix = format!("{HDR}{SCHEMA}{SEED}");
+    assert!(
+        parse_case(
+            "fault_limit",
+            &format!("{prefix}{}", format!("{fault}{operation}").repeat(16))
+        )
+        .is_ok()
+    );
+    assert!(
+        refusal(
+            "fault_limit",
+            &format!("{prefix}{}", format!("{fault}{operation}").repeat(17))
+        )
+        .contains("at most 16")
+    );
+    assert!(
+        refusal(
+            "fault_loop",
+            &format!("{prefix}--- loop $i 0 1\n{fault}{operation}--- endloop\n")
+        )
+        .contains("inside loops")
+    );
 }

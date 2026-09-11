@@ -114,3 +114,10 @@ unsafe extern "C" fn CCRandomGenerateBytes(buf: *mut u8, buflen: usize) -> i32 {
         -1
     }
 }
+
+/// Return process-wide entropy requests to the operating system.
+pub(crate) fn disarm() {
+    *STREAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}

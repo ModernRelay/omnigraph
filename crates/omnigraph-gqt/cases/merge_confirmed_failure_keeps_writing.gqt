@@ -1,0 +1,113 @@
+# issue: none
+# notes: The runner section injects one merge failure under DST.
+# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+node Marker {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Marker","data":{"name":"initial"}}
+
+--- mutate
+branch create source
+
+--- expect ok
+
+--- mutate branch: source
+query add_source_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query advance_target() {
+    insert Person { name: "carol" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- fault
+at: branch_merge.post_phase_b_pre_manifest_commit
+occurrence: 1
+action: return_error
+scope: next_step
+
+--- mutate
+branch merge source into main
+
+--- expect error: injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit
+
+--- query branch: main
+query read_after_failure() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate branch: main
+query unrelated_write() {
+    insert Marker { name: "after_failure" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: main
+query markers_after_write() {
+    match { $m: Marker }
+    return { $m.name }
+}
+
+--- expect unordered
+{"m.name":"initial"}
+{"m.name":"after_failure"}
+
+--- expect shape
+m.name: String
+
+--- query branch: main
+query target_after_write() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- query branch: source
+query source_unchanged() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String

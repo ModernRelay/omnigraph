@@ -114,13 +114,19 @@ Focused iteration:
 ```bash
 cargo test -p omnigraph-engine --test traversal
 cargo test -p omnigraph-engine --test writes concurrent
-cargo test -p omnigraph-gqt                                      # every .gqt case + the format self-tests
-cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # the cases whose file name contains issue_563
-cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
 cargo test -p omnigraph-cluster --test failpoints --features failpoints
 cargo test -p omnigraph-bench --locked
+```
+
+Run GQT commands from `crates/omnigraph-gqt` so its Cargo configuration enables
+the DST runtime requested by corpus files:
+
+```bash
+cargo test -p omnigraph-gqt --locked                            # complete corpus and harness tests
+cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # matching case names
+cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 ```
 
 Every `.gqt` case is its own libtest test named `case::<file>.gqt`, registered
@@ -146,11 +152,12 @@ that matches no case is libtest's ordinary green zero-test run; read the
 Canonical workspace graph:
 
 ```bash
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```
 
-The feature-superset command is the canonical graph because it compiles the current tree once with failpoint hooks present but inert unless a test enables one. Also run formatting and both Clippy graphs before pushing; [ci.md](ci.md) lists the exact gates.
+The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one. The separate `GQ Logic Tests` context owns GQT: the root command above tests unavailable-DST refusal, and the complete corpus command from the GQT crate runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
 
 AWS server support has a separate feature owner:
 
@@ -159,6 +166,20 @@ cargo test -p omnigraph-server --features aws
 ```
 
 S3-backed tests skip unless `OMNIGRAPH_S3_TEST_BUCKET` and the corresponding AWS endpoint/credential variables are set. Azure-backed tests skip unless `OMNIGRAPH_AZURE_TEST_CONTAINER` and the documented Azure/Azurite variables are set. A configured CI backend treats a skip as failure.
+
+### GQT execution through DST
+
+GQT files select their execution target in a `--- runner` YAML section before
+the schema. The file owns its storage, seeds and explicit faults;
+the runner preserves GQT assertions and uses isolated seeded processes.
+Build from `crates/omnigraph-gqt` to enable its Tokio configuration.
+Workspace-root builds without that configuration explicitly refuse DST
+cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
+defines supported targets, hooks, replay observations, and limits. The configured
+CI owner enrolls the complete corpus. A strict `--- known_failure` marker admits only
+the recorded typed recovery failure at its declared step, with verified fault
+delivery and matching replay. Reports label it `known_failure`; changed failures
+and unexpected passes fail CI. The healthy assertion stays in the case.
 
 ### OpenAPI
 

@@ -4,6 +4,12 @@
 # notes: walk reaches x's commit before shared history, so it is not a base
 # notes: candidate and the merge proceeds on the fork point (RFC 0063 step 1).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key
