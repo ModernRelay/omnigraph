@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-11
+updated: 2026-09-12
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
@@ -15,7 +15,7 @@ blocked_on:
   - "RFC 0047 plan-truth guarantees reconciled with named stages; its interim Option<RetrievalIR> shape and scan-root restriction are not permanent dependencies"
   - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
   - "Language evolution contract: shared expressions, contextual keywords, scope transitions, and compatibility fixtures before syntax stabilization; explicit yield output is compiler-prototyped"
-  - "Mixed analytical/graph/retrieval composition: C1–C4 syntax/scope are compiler-prototyped; complete golden plans, population counterexamples and physical qualification remain required before stabilization"
+  - "Mixed analytical/graph/retrieval composition: C1–C4 have checked logical goldens and scoped DataFusion building-block probes; scorer semantics, integrated lowering and resource qualification remain open"
   - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
   - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
   - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
@@ -67,6 +67,10 @@ The [agent workload](#agent-workload-and-design-objective) includes analytical
 answers and comparisons with supporting evidence. The
 [composition examples](#required-composition-examples) make that workload a
 grammar acceptance gate even where an operator's implementation is deferred.
+Their checked logical plans now have golden fixtures, and native DataFusion
+probes exercise population and nested-result counterexamples. Those probes
+use materialized inputs: they do not execute the complete C1–C4 queries or
+establish native retrieval, correlated execution or whole-query limits.
 
 The immediate problem is correctness. Today, the same text can match before an
 index is built and stop matching afterward; fuzzy indexed and uncovered rows
@@ -1383,6 +1387,17 @@ rank or an RRF vote merely by sharing a constructor spelling with a retriever.
 The typed lexical constructor has different admitted arguments in those two
 operator roles; a hidden `candidates` option is refused in `score`.
 
+**Open scorer decision.** The reference BM25 definition alone does not settle
+how this extension represents a retained target that does not satisfy `terms`,
+has no analyzed tokens, or has a nullable missing field. In particular,
+`mode: all` can fail membership while some query terms have positive BM25
+contributions. Decide whether the feature is zero or the partial score, and
+whether missing field values produce null, before implementing this operator.
+The native composition fixture supplies positive, zero and null features as
+inputs; it tests their preservation, not how a scorer produces them. Invalid
+queries, incompatible representations and resource failures must remain
+explicit failures rather than being encoded as a feature value.
+
 **C4 — Combine computed facts, optional graph facts and bounded evidence.**
 Return selected services and their computed counts, an owner if known, and up
 to two related reports per service in a declared local order:
@@ -1470,20 +1485,51 @@ share its accepted snapshot and whole-query budget; no per-parent reset is
 allowed. Optional enrichment and collection spelling remain revisable until
 the full C4 plan and runtime boundaries have been qualified.
 
+Correlation is per incoming **parent row**, not just the imported entity ID.
+Two rows can bind the same service while carrying different computed facts;
+both must survive. The child execution's metric population is also specific
+to that correlation context. A lexical source ID in the compiled plan does
+not, by itself, identify every runtime per-parent ranking. Reusing a child
+calculation requires equivalent imported values, parameters, representation
+and snapshot context, while retaining all parent rows and accounting for
+actual shared work. This is an optimization proof obligation, not permission
+to merge rows that happen to bind the same entity.
+
 **What is established, and what agents must investigate.** The
 [compiler experiment](../../crates/omnigraph-compiler/src/query/staged_probe.rs)
-reads these four examples directly from this RFC. Its assertions establish
-the following scope transitions; no result rows are executed by this owner:
+reads these four examples directly from this RFC. Its
+[logical explanation](../../crates/omnigraph-compiler/src/query/staged_probe/plan.rs)
+derives golden plans from the checked stages, retaining input relations,
+selection barriers, source identities, group populations, projection types
+and nested imports. These are diagnostic views, not executable IR or a public
+plan serialization. Statements about shared budgets, snapshot inheritance
+and scoring statistics in a golden express required semantics; they do not
+prove their implementation. Omitted options and symbolic schema bindings
+also do not freeze resolved defaults or semantic fingerprints.
 
-| Example | Checked type/scope boundary | Still unproved / required falsifier |
+The existing native selection owner now includes a
+[composition probe](../../crates/omnigraph/tests/rrf_prefilter_gate/composition.rs).
+It executes typed DataFusion building blocks separately from the compiler:
+
+| Example / checked logical plan | Prototype evidence | Still unproved / required falsifier |
 |---|---|---|
-| C1 | Group retains `$s: Service`, exports non-null `I64` counts, drops `$i`, then retains those counts and `increase` through row selection and report retrieval. | Execute the 2/8 versus 6/7 fixture, a missing-period group and duplicate graph paths. Moving report retrieval before aggregation must change the adversarial answer and remain an illegal optimization. Node identity rehydration and overflow handling need engine proof. |
-| C2 | Candidate source precedes traversal/grouping; group retains `$project`, row/distinct counts and the reduced rank's source identity, while dropping `$p`, the membership edge and the active comparator. | Prove three binding rows versus two distinct selected passages, excluding p3. Aggregate null/equality semantics, distinct-state memory and optimizer preservation need execution tests. |
-| C3 | The scorer has no candidate window, rank or fusion vote; its feature has a distinct source identity. Dense output remains the active comparator. | Execute d2 with absent lexical-arm metrics and a present independent lexical feature. Define/test the score for a nonmatching retained target and the fixed statistics population. A top-K-and-join implementation must fail the control. |
-| C4 | Child scopes import named entities/values, retain query parameters, export only named result fields and have distinct source IDs. Parent facts survive; output types distinguish a nullable owner object from a non-null report list. | Execute B with no owner/reports, multiple-owner refusal, duplicate paths, a child with fan-out after its candidate cut and multiple parents sharing one small budget. The parser's local limit check proves none of these runtime properties. |
+| [C1](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c1.json) | Group retains `$s`, exports counts and drops `$i`; selection precedes report retrieval. Native filtered counts produce A=2/8, B=6/7, C=1/0, selecting A. A report-driven prefilter selects B instead; `count(Boolean)` counts false; a duplicate path changes A's count. | Actual GQ lowering and optimized population barriers, entity rehydration, arithmetic/null/overflow rules and resource ownership. The native probe models the report filter; it does not retrieve reports. |
+| [C2](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c2.json) | Group retains project identity and reduced metric origin while dropping member bindings/order. Native selection of p1/p2 yields three binding rows and two distinct passages; removing the cut admits p3 and changes both counts. | Graph target-ID mapping, GQ aggregate lowering, general equality/null semantics, distinct-state memory and the complete optimized graph/retrieval plan. |
+| [C3](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c3.json) | The scorer creates a separate feature with no candidate window or rank; dense output remains the comparator. A native fixture preserves p2 with absent lexical-arm rank and a positive feature; filtering on lexical membership incorrectly drops it. Zero/null feature inputs also survive. | The scorer itself, nonmatch/empty/missing-field policy, fixed live statistics and numeric parity. Precomputed fixture features prove neither BM25 values nor scorer cost. |
+| [C4](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c4.json) | Checked imports/exports and separate child source IDs. Native ordered object lists preserve two rows for A and an empty B; presence markers distinguish absent objects from present null payloads. Duplicate paths consume collection rows, and fan-out exceeds the source window. An aggregate detects multiple owners. | Correlated GQ lowering, generation/preservation of parent-row identity, actual typed cardinality refusal, full entity-object projection, total row ties and shared budget/cancellation under many parents. Detection of ambiguous owners is not the query refusal path. |
 
-The physical argument currently reaches API/source feasibility only. The
-pinned DataFusion 54
+The native probe uses DataFusion 54.0.0 and Arrow 58.3.0, in-memory inputs,
+one or four partitions and forward/reversed one-row batches. It forces
+partitioned hash joins using the existing owner's two zero thresholds; the
+separately recorded memory/`CollectLeft` counterexample still applies.
+It does not qualify Lance providers, native search, arbitrary optimizer
+configurations, snapshot pinning, cancellation or allocation bounds. These
+fixtures are Rust probes because the deferred operators cannot yet run in
+GQT; production behavior must move through the existing GQT owners when
+implemented. See the [checkpoint](#composition-plan-and-primitive-checkpoint)
+for the commands and tested source base.
+
+The pinned DataFusion 54
 [aggregate builder](https://docs.rs/crate/datafusion-expr/54.0.0/source/src/logical_plan/builder.rs),
 [filtered aggregate expressions](https://docs.rs/crate/datafusion-expr/54.0.0/source/src/expr_fn.rs)
 and [distinct count](https://docs.rs/crate/datafusion-functions-aggregate/54.0.0/source/src/count.rs)
@@ -1502,10 +1548,15 @@ A left join before aggregation can instead manufacture a null placeholder
 row, so blindly coalescing a result is insufficient. One proposed lowering
 aggregates actual child rows by parent identity with explicit aggregate order,
 left-joins those groups to the retained parent population, and constructs the
-typed empty list only for absent groups. Optional objects also require a
+typed empty list only for absent groups. Use parent-row correlation identity
+as the grouping/join key. Optional objects also require a
 presence marker; an object whose properties happen to be null is not an absent
-row. Qualify these choices against empty groups, shuffled partitions and
-duplicate parents before adopting them. These source observations do not
+row. The native probe executes this construction for lists of `{id, text}`
+objects, including empty groups, partition changes and repeated parent
+entities. Its wrong-plan controls produce `[null]` for scalar collection or a
+phantom `[{}]` for object collection after the outer join. The current JSON
+writer omits null object fields, which explains `{}` and absent keys in these
+assertions; this does not decide a new wire contract. The probe does not
 establish bounded collection, safe decorrelation or end-to-end execution.
 
 ### Target identity, fan-out, grouping, and metrics
@@ -2771,7 +2822,7 @@ does not make the proposed operators implemented behavior.
 | Vector arithmetic and encoding | Verified squared L2, cosine and shifted-dot kernels, current generated-vector normalization, and Gemini query/document roles. Added explicit formulas and requirements for invalid values, numeric parity and revision identity. |
 | Fusion arithmetic | Reproduced overflow with 16 finite maximum weights and `k=1`. Added checked arithmetic and explicit failure requirements. |
 | Graph scope through native masks | The public mask uses the same dataset's `_rowid` space. A graph-ID mapping and adapter qualification are still required. |
-| DataFusion composition | Typed DataFrame plans preserve target deduplication, cutoff/filter order, quotas after a cutoff, and binding multiplicity across shuffled input and multiple partitions. GQ lowering, graph/search operators, general group semantics, metric carriage and shared resource integration remain OmniGraph work. |
+| DataFusion composition | Typed DataFrame plans preserve target deduplication, cutoff/filter order, quotas after a cutoff, and binding multiplicity across shuffled input and multiple partitions. The C1–C4 primitive probe adds filtered/distinct counts and ordered object-list assembly with empty/duplicate-parent controls. Its feature values are supplied inputs. GQ lowering, graph/search operators, general group semantics and shared resource integration remain OmniGraph work; see the [composition checkpoint](#composition-plan-and-primitive-checkpoint). |
 | Snapshot follow-up | Existing requests accept `snapshot`; reads return `graph_commit_id` when available. Reuse those carriers and complete replay-identity, retention and failure guarantees. A snapshot does not freeze ANN candidates. |
 | Representation counts | The pin distinguishes metadata-based unfiltered counts from scanner-based filtered counts. Exact graph-scoped ready/pending/missing counts need separate work or qualified metadata. Default reporting now permits explicit unknown; exact requested counts must complete within the shared budget or fail. This is a source-level cost distinction, not a benchmark. |
 | Authorization | Current read/invoke gates are graph/branch-level. The staged design must preserve them; this RFC adds no row-level security engine. |
@@ -2931,10 +2982,12 @@ parser. Its checked decisions and remaining limits are:
 | Numeric/null execution | Same-type scalar arithmetic is type-prototyped. Implicit casts, integer division, unary numeric syntax and overflow/non-finite behavior need further decisions/proofs; this experiment refuses unqualified arithmetic. Nullable typing alone does not prove runtime three-valued logic, short-circuit behavior or error handling. |
 
 These are parser/type/scope proofs, not an executable expression evaluator.
-The C1–C4 examples now have parser/type/scope assertions and explicit
-falsifiers. Complete golden/optimized plans, numeric/null rules, semantic
-fingerprints, physical execution and the other Phase 0 decision packages
-remain open.
+At this compiler checkpoint the C1–C4 examples had parser/type/scope
+assertions and explicit falsifiers. The
+[later composition checkpoint](#composition-plan-and-primitive-checkpoint)
+adds checked logical goldens and native building-block results. Integrated
+optimized plans, numeric/null rules, semantic fingerprints and the other
+Phase 0 decision packages remain open.
 This compiler checkpoint does not certify runtime selection or complete
 Phase 0. The later integrated checkpoint below exercises a narrower lexical
 slice; it does not execute C1–C4 or establish the full expression contract.
@@ -2999,13 +3052,56 @@ resolved representation identity, nested scopes and semantic fingerprints
 still need Phase 0/1 decisions and implementation. The cap of 16 sources per block and
 the experiment's fixed field, window and resource limits are experimental
 admission choices, not newly accepted public defaults. Full shared expressions,
-Boolean matching, vector/fusion execution, C1–C4 plans, global search,
+Boolean matching, vector/fusion execution, integrated C1–C4 plans, global search,
 schema/default serialization and read/error envelopes remain open. Its
 post-decode accounting does not bound native allocation peaks, token maps,
 queued I/O, serialization or cancellation. Stored-query and CLI changes are
 carried forward as experiment code; historical transport pass counts do not
 qualify this revision. Implementers must investigate these boundaries through
 their existing owners before promoting the code into production.
+
+#### Composition plan and primitive checkpoint
+
+The checked-in composition extension starts from `1fb0423d`, using Rust
+1.97.1 and the locked DataFusion 54.0.0 / Arrow 58.3.0 dependencies. The clean
+compiler baseline passes 367 tests; the existing target-selection owner
+passes its one test across its twelve configurations before modification.
+The compiler extension keeps the same test count and adds four canonical
+logical-plan assertions to the existing C1–C4 tests. All 367 pass. This is a
+derived diagnostic over the test-only checked plan; the production compiler
+does not gain the deferred operators.
+
+The new `composition::staged_composition_population_and_collection_contracts`
+test passes across its four in-memory configurations. It runs typed
+DataFusion plans and the current `QueryResult` JSON writer, with the results
+and limitations recorded beside [C1–C4](#required-composition-examples).
+It does not apply or extend the archived compiler/engine integration patch.
+Reproduce the focused checks from the RFC branch with:
+
+```bash
+cargo +1.97.1 test --locked -p omnigraph-compiler
+cargo +1.97.1 test --locked -p omnigraph-engine --test rrf_prefilter_gate staged_composition
+```
+
+Formatting, documentation links and the AGENTS index checks pass. The scoped
+Clippy invocation also passes with warnings denied:
+
+```bash
+cargo +1.97.1 clippy --locked -p omnigraph-compiler --all-targets -p omnigraph-engine --test rrf_prefilter_gate -- -D warnings -W clippy::dbg_macro
+```
+
+**Remaining uncertainty.** The logical goldens and hand-built native plans
+are separate evidence. There is no compiler-to-DataFusion C1–C4 lowering in
+this checkpoint. The latter use materialized graph bindings, source ranks
+and features; they do not implement retrieval or prove scoring values.
+Parent-row IDs are fixture inputs, and detecting multiple owners is not an
+engine cardinality error. Safe correlation/decorrelation, complete entity
+projection, aggregate arithmetic/null policies, optimizer configurations,
+Lance integration and cumulative resource/cancellation behavior still need
+their own tests. The open C3 scorer policy must be decided rather than
+inferred from fixture values. These additions advance the composition design
+proofs; they neither complete Phase 0 nor repair the four production GQT
+regressions.
 
 #### Historical integration and diagnostic pilot
 
@@ -3526,10 +3622,12 @@ listing or the existing compiler baseline is not that
 evidence. Compiler, search, schema, and read-contract owners supply these proofs.
 
 **Uncertainty and required investigation.** `yield` and the C1–C4 spellings
-now have parser/type/scope fixtures, as recorded in the
-[checkpoint](#implementation-handoff-and-validation-checkpoint). That does not
-settle the complete expression grammar, physical plans, numeric/null runtime
-rules or cross-type result types. The explicit-output engine/GQT experiment
+have parser/type/scope fixtures; C1–C4 also have checked logical goldens and
+native primitive counterexamples, as recorded in the
+[checkpoint](#composition-plan-and-primitive-checkpoint). That does not
+settle the complete expression grammar, integrated physical plans, numeric/null
+runtime rules or cross-type result types. The explicit-output engine/GQT
+experiment
 qualifies only the recorded lexical slice; it does not close those broader
 gates. Extend the existing negative cases and inspect actual lowering;
 proposed syntax is not accepted syntax. Resource and
@@ -4005,6 +4103,14 @@ this milestone does not imply support for all future operators.
 
 ## Decision log
 
+- 2026-09-11 — added canonical C1–C4 logical-plan fixtures and typed
+  DataFusion population/collection counterexamples. Qualified filtered and
+  distinct counts, feature preservation, ordered object lists, empty results
+  and duplicate parent/path behavior within the recorded fixture envelope.
+  Made parent-row correlation explicit and retained the unresolved scorer
+  policy. Native feature inputs and ambiguity detection are not scoring or
+  cardinality-refusal implementations; integrated lowering and resource
+  qualification remain open.
 - 2026-09-11 — audited the historical integration archive at its exact base
   and ported explicit multi-source lexical output into an isolated actual
   compiler/engine/GQT experiment. Qualified independent windows, inherited

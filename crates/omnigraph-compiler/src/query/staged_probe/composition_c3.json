@@ -1,0 +1,123 @@
+{
+  "budget": "shared whole-query context; never reset per stage or parent",
+  "correlated_input": null,
+  "operators": [
+    {
+      "clauses": [
+        "Graph(Binding(Binding { variable: \"p\", type_name: \"Passage\", prop_matches: [] }))"
+      ],
+      "entity_scope": {
+        "p": "Node<Passage>"
+      },
+      "input": "r0.input",
+      "multiplicity": "binding rows; preserve graph paths",
+      "operator": "GraphMatch",
+      "output": "r0.0",
+      "value_scope": {}
+    },
+    {
+      "entity_scope": {
+        "p": "Node<Passage>"
+      },
+      "input": "r0.0",
+      "operator": "Rank",
+      "output": "r0.1",
+      "selection": "distinct target identities; reattach all incoming bindings of winners",
+      "sources": [
+        {
+          "alias": "words",
+          "candidates": 1,
+          "eligible_input_stage": 0,
+          "field": "$p.text",
+          "id": "s0.1.0",
+          "kind": "Lexical",
+          "options": {
+            "candidates": "1"
+          },
+          "query": "$q",
+          "statistics": "snapshot-visible field corpus, independent of eligible input",
+          "target": "p",
+          "terms_options": {}
+        },
+        {
+          "alias": "dense",
+          "candidates": 2,
+          "eligible_input_stage": 0,
+          "field": "$p.embedding",
+          "id": "s0.1.1",
+          "kind": "Knn",
+          "options": {
+            "candidates": "2"
+          },
+          "query": "$vector",
+          "target": "p"
+        }
+      ],
+      "target": "p",
+      "value_scope": {},
+      "yield": "s0.1.1"
+    },
+    {
+      "entity_scope": {
+        "p": "Node<Passage>"
+      },
+      "input": "r0.1",
+      "operator": "ScoreExistingTargets",
+      "output": "r0.2",
+      "semantics": "preserve target membership, binding rows and input order; create no retrieval rank",
+      "sources": [
+        {
+          "alias": "words_feature",
+          "candidates": null,
+          "eligible_input_stage": 1,
+          "field": "$p.text",
+          "id": "s0.2.0",
+          "kind": "LexicalFeature",
+          "options": {
+            "scoring": "bm25_v1"
+          },
+          "query": "$q",
+          "statistics": "snapshot-visible field corpus, independent of eligible input",
+          "target": "p",
+          "terms_options": {}
+        }
+      ],
+      "target": "p",
+      "value_scope": {}
+    }
+  ],
+  "qualification": "checked logical stages; physical execution and resource ownership are not proved by this diagnostic",
+  "result": {
+    "active_order": "Ranked(SourceId { scope: 0, block: 1, ordinal: 1 })",
+    "explicit_order": [],
+    "input": "r0.2",
+    "limit": null,
+    "projection": [
+      {
+        "alias": "passage_id",
+        "value": "$p.@id"
+      },
+      {
+        "alias": "lexical_rank",
+        "value": "metric(s0.1.0, rank)"
+      },
+      {
+        "alias": "lexical_score",
+        "value": "metric(s0.1.0, score)"
+      },
+      {
+        "alias": "lexical_feature",
+        "value": "feature(s0.2.0)"
+      }
+    ],
+    "scope": "Bindings",
+    "types": [
+      "Identity<$p>",
+      "Rank<s0.1.0>?",
+      "Bm25Score<s0.1.0>?",
+      "Bm25Score<s0.2.0>?"
+    ]
+  },
+  "scope": 0,
+  "snapshot": "inherited accepted snapshot"
+}

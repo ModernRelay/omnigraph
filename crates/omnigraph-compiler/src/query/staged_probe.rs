@@ -14,6 +14,9 @@ use crate::query::typecheck::{BoundVariable, ResolvedType, TypeContext, typechec
 use crate::schema::parser::parse_schema;
 use crate::types::{Direction, PropType, ScalarType};
 
+#[path = "staged_probe/plan.rs"]
+mod plan;
+
 type Options = BTreeMap<String, Expr>;
 type ProbeResult<T> = std::result::Result<T, String>;
 
@@ -720,6 +723,7 @@ struct CheckedNested {
 
 #[derive(Debug)]
 struct Plan {
+    scope: usize,
     query: Query,
     sources: BTreeMap<String, CheckedSource>,
     rank_outputs: BTreeMap<usize, SourceId>,
@@ -1926,6 +1930,7 @@ fn check_scope(
         .map(|expr| bound(&query.header, expr, 0, None))
         .transpose()?;
     Ok(Plan {
+        scope,
         query,
         sources: all_sources,
         rank_outputs,
@@ -2874,6 +2879,7 @@ fn composition_grouping_exports_entities_and_values_without_member_scope() {
     let catalog = composition_catalog();
     let input = composition_example("composition_c1");
     let plan = check(&catalog, parse(input).unwrap()).unwrap();
+    plan::assert_golden(&plan, include_str!("staged_probe/composition_c1.json"));
     assert_eq!(plan.groups[&1].input_stage, 0);
     assert_eq!(
         plan.groups[&1].key_types,
@@ -2932,6 +2938,7 @@ fn composition_retrieval_then_group_preserves_population_and_reduction_origin() 
     let catalog = composition_catalog();
     let input = composition_example("composition_c2");
     let plan = check(&catalog, parse(input).unwrap()).unwrap();
+    plan::assert_golden(&plan, include_str!("staged_probe/composition_c2.json"));
     assert_eq!(plan.sources["candidates"].input_stage, 0);
     assert_eq!(plan.groups[&3].input_stage, 2);
     assert_eq!(
@@ -2980,6 +2987,7 @@ fn composition_scoring_adds_a_feature_without_source_membership_or_selection() {
     let catalog = composition_catalog();
     let input = composition_example("composition_c3");
     let plan = check(&catalog, parse(input).unwrap()).unwrap();
+    plan::assert_golden(&plan, include_str!("staged_probe/composition_c3.json"));
     assert_eq!(
         plan.output_order,
         OutputOrder::Ranked(plan.sources["dense"].id)
@@ -3023,6 +3031,7 @@ fn composition_nested_results_have_explicit_imports_and_independent_source_scope
     let catalog = composition_catalog();
     let input = composition_example("composition_c4");
     let plan = check(&catalog, parse(input).unwrap()).unwrap();
+    plan::assert_golden(&plan, include_str!("staged_probe/composition_c4.json"));
     assert_eq!(plan.nested.len(), 2);
     let owner = &plan.nested[&4];
     let reports = &plan.nested[&5];

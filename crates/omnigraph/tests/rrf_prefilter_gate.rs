@@ -29,6 +29,8 @@
 //! or a fault-injection case would close the gap; until one exists, that
 //! leg is untested, not claimed covered.
 
+#[path = "rrf_prefilter_gate/composition.rs"]
+mod composition;
 mod helpers;
 
 use arrow_array::{Array, StringArray};

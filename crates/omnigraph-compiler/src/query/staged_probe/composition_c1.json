@@ -1,0 +1,196 @@
+{
+  "budget": "shared whole-query context; never reset per stage or parent",
+  "correlated_input": null,
+  "operators": [
+    {
+      "clauses": [
+        "Graph(Binding(Binding { variable: \"i\", type_name: \"Incident\", prop_matches: [] }))",
+        "Graph(Traversal(Traversal { src: \"s\", edge_name: \"hasIncident\", dst: \"i\", min_hops: 1, max_hops: Some(1), undirected: false, edge_binding: None }))",
+        "(($i.period = \"prior\") or ($i.period = \"current\"))"
+      ],
+      "entity_scope": {
+        "i": "Node<Incident>",
+        "s": "Node<Service>"
+      },
+      "input": "r0.input",
+      "multiplicity": "binding rows; preserve graph paths",
+      "operator": "GraphMatch",
+      "output": "r0.0",
+      "value_scope": {}
+    },
+    {
+      "active_order": "discarded",
+      "entity_scope": {
+        "s": "Node<Service>"
+      },
+      "identity": "group-key tuple; retained entity keys keep entity identity",
+      "input": "r0.0",
+      "keys": [
+        {
+          "alias": null,
+          "value": "$s"
+        }
+      ],
+      "operator": "Group",
+      "output": "r0.1",
+      "population": "r0.0",
+      "reductions": [
+        {
+          "alias": "prior_count",
+          "value": "count_if(($i.period = \"prior\"))"
+        },
+        {
+          "alias": "current_count",
+          "value": "count_if(($i.period = \"current\"))"
+        }
+      ],
+      "value_scope": {
+        "current_count": "I64 <- CountIf<Bool from [String, String]>",
+        "prior_count": "I64 <- CountIf<Bool from [String, String]>"
+      }
+    },
+    {
+      "entity_scope": {
+        "s": "Node<Service>"
+      },
+      "input": "r0.1",
+      "operator": "Compute",
+      "output": "r0.2",
+      "semantics": "all expressions read incoming scope; preserve rows and order",
+      "value_scope": {
+        "current_count": "I64 <- CountIf<Bool from [String, String]>",
+        "increase": "I64 from [I64 <- CountIf<Bool from [String, String]>, I64 <- CountIf<Bool from [String, String]>]",
+        "prior_count": "I64 <- CountIf<Bool from [String, String]>"
+      },
+      "values": [
+        {
+          "alias": "increase",
+          "value": "(current_count - prior_count)"
+        }
+      ]
+    },
+    {
+      "entity_scope": {
+        "s": "Node<Service>"
+      },
+      "input": "r0.2",
+      "limit": 1,
+      "operator": "SelectRows",
+      "order": [
+        {
+          "direction": "desc",
+          "nulls": "last",
+          "value": "increase"
+        },
+        {
+          "direction": "asc",
+          "nulls": "first",
+          "value": "$s.@id"
+        }
+      ],
+      "output": "r0.3",
+      "units": "input rows",
+      "value_scope": {
+        "current_count": "I64 <- CountIf<Bool from [String, String]>",
+        "increase": "I64 from [I64 <- CountIf<Bool from [String, String]>, I64 <- CountIf<Bool from [String, String]>]",
+        "prior_count": "I64 <- CountIf<Bool from [String, String]>"
+      }
+    },
+    {
+      "clauses": [
+        "Graph(Traversal(Traversal { src: \"s\", edge_name: \"hasReport\", dst: \"p\", min_hops: 1, max_hops: Some(1), undirected: false, edge_binding: None }))"
+      ],
+      "entity_scope": {
+        "p": "Node<Passage>",
+        "s": "Node<Service>"
+      },
+      "input": "r0.3",
+      "multiplicity": "binding rows; preserve graph paths",
+      "operator": "GraphMatch",
+      "output": "r0.4",
+      "value_scope": {
+        "current_count": "I64 <- CountIf<Bool from [String, String]>",
+        "increase": "I64 from [I64 <- CountIf<Bool from [String, String]>, I64 <- CountIf<Bool from [String, String]>]",
+        "prior_count": "I64 <- CountIf<Bool from [String, String]>"
+      }
+    },
+    {
+      "entity_scope": {
+        "p": "Node<Passage>",
+        "s": "Node<Service>"
+      },
+      "input": "r0.4",
+      "operator": "Rank",
+      "output": "r0.5",
+      "selection": "distinct target identities; reattach all incoming bindings of winners",
+      "sources": [
+        {
+          "alias": "reports",
+          "candidates": 2,
+          "eligible_input_stage": 4,
+          "field": "$p.text",
+          "id": "s0.5.0",
+          "kind": "Lexical",
+          "options": {
+            "candidates": "2"
+          },
+          "query": "$q",
+          "statistics": "snapshot-visible field corpus, independent of eligible input",
+          "target": "p",
+          "terms_options": {}
+        }
+      ],
+      "target": "p",
+      "value_scope": {
+        "current_count": "I64 <- CountIf<Bool from [String, String]>",
+        "increase": "I64 from [I64 <- CountIf<Bool from [String, String]>, I64 <- CountIf<Bool from [String, String]>]",
+        "prior_count": "I64 <- CountIf<Bool from [String, String]>"
+      },
+      "yield": "s0.5.0"
+    }
+  ],
+  "qualification": "checked logical stages; physical execution and resource ownership are not proved by this diagnostic",
+  "result": {
+    "active_order": "Ranked(SourceId { scope: 0, block: 5, ordinal: 0 })",
+    "explicit_order": [],
+    "input": "r0.5",
+    "limit": null,
+    "projection": [
+      {
+        "alias": "service",
+        "value": "$s"
+      },
+      {
+        "alias": "prior_count",
+        "value": "prior_count"
+      },
+      {
+        "alias": "current_count",
+        "value": "current_count"
+      },
+      {
+        "alias": "increase",
+        "value": "increase"
+      },
+      {
+        "alias": "report_id",
+        "value": "$p.@id"
+      },
+      {
+        "alias": "report_text",
+        "value": "$p.text"
+      }
+    ],
+    "scope": "Bindings",
+    "types": [
+      "Node(\"Service\")",
+      "I64 <- CountIf<Bool from [String, String]>",
+      "I64 <- CountIf<Bool from [String, String]>",
+      "I64 from [I64 <- CountIf<Bool from [String, String]>, I64 <- CountIf<Bool from [String, String]>]",
+      "Identity<$p>",
+      "String"
+    ]
+  },
+  "scope": 0,
+  "snapshot": "inherited accepted snapshot"
+}

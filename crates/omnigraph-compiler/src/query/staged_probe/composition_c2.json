@@ -1,0 +1,139 @@
+{
+  "budget": "shared whole-query context; never reset per stage or parent",
+  "correlated_input": null,
+  "operators": [
+    {
+      "clauses": [
+        "Graph(Binding(Binding { variable: \"p\", type_name: \"Passage\", prop_matches: [] }))"
+      ],
+      "entity_scope": {
+        "p": "Node<Passage>"
+      },
+      "input": "r0.input",
+      "multiplicity": "binding rows; preserve graph paths",
+      "operator": "GraphMatch",
+      "output": "r0.0",
+      "value_scope": {}
+    },
+    {
+      "entity_scope": {
+        "p": "Node<Passage>"
+      },
+      "input": "r0.0",
+      "operator": "Rank",
+      "output": "r0.1",
+      "selection": "distinct target identities; reattach all incoming bindings of winners",
+      "sources": [
+        {
+          "alias": "candidates",
+          "candidates": 2,
+          "eligible_input_stage": 0,
+          "field": "$p.text",
+          "id": "s0.1.0",
+          "kind": "Lexical",
+          "options": {
+            "candidates": "2"
+          },
+          "query": "$q",
+          "statistics": "snapshot-visible field corpus, independent of eligible input",
+          "target": "p",
+          "terms_options": {}
+        }
+      ],
+      "target": "p",
+      "value_scope": {},
+      "yield": "s0.1.0"
+    },
+    {
+      "clauses": [
+        "Graph(Traversal(Traversal { src: \"p\", edge_name: \"inProject\", dst: \"project\", min_hops: 1, max_hops: Some(1), undirected: false, edge_binding: Some(\"membership\") }))"
+      ],
+      "entity_scope": {
+        "membership": "Edge<InProject>",
+        "p": "Node<Passage>",
+        "project": "Node<Project>"
+      },
+      "input": "r0.1",
+      "multiplicity": "binding rows; preserve graph paths",
+      "operator": "GraphMatch",
+      "output": "r0.2",
+      "value_scope": {}
+    },
+    {
+      "active_order": "discarded",
+      "entity_scope": {
+        "project": "Node<Project>"
+      },
+      "identity": "group-key tuple; retained entity keys keep entity identity",
+      "input": "r0.2",
+      "keys": [
+        {
+          "alias": null,
+          "value": "$project"
+        }
+      ],
+      "operator": "Group",
+      "output": "r0.3",
+      "population": "r0.2",
+      "reductions": [
+        {
+          "alias": "binding_rows",
+          "value": "count($p)"
+        },
+        {
+          "alias": "passages",
+          "value": "count_distinct($p.@id)"
+        },
+        {
+          "alias": "best_rank",
+          "value": "min(metric(s0.1.0, rank))"
+        }
+      ],
+      "value_scope": {
+        "best_rank": "Rank<s0.1.0>? <- Min<Rank<s0.1.0>?>",
+        "binding_rows": "I64 <- Count<Node(\"Passage\")>",
+        "passages": "I64 <- CountDistinct<Identity<$p>>"
+      }
+    }
+  ],
+  "qualification": "checked logical stages; physical execution and resource ownership are not proved by this diagnostic",
+  "result": {
+    "active_order": "Explicit([OrderingSpec { value: Identity(\"project\"), descending: false, nulls_first: true }])",
+    "explicit_order": [
+      {
+        "direction": "asc",
+        "nulls": "first",
+        "value": "$project.@id"
+      }
+    ],
+    "input": "r0.3",
+    "limit": null,
+    "projection": [
+      {
+        "alias": "project",
+        "value": "$project"
+      },
+      {
+        "alias": "binding_rows",
+        "value": "binding_rows"
+      },
+      {
+        "alias": "passages",
+        "value": "passages"
+      },
+      {
+        "alias": "best_rank",
+        "value": "best_rank"
+      }
+    ],
+    "scope": "Bindings",
+    "types": [
+      "Node(\"Project\")",
+      "I64 <- Count<Node(\"Passage\")>",
+      "I64 <- CountDistinct<Identity<$p>>",
+      "Rank<s0.1.0>? <- Min<Rank<s0.1.0>?>"
+    ]
+  },
+  "scope": 0,
+  "snapshot": "inherited accepted snapshot"
+}
