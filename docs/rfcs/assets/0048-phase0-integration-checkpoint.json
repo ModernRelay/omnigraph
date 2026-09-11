@@ -1,0 +1,194 @@
+{
+  "recorded_at_utc": "2026-09-11T14:09:56.991555+00:00",
+  "kind": "RFC0048 Phase 0 explicit-output integration experiment",
+  "evidence_level": "Prototype executed",
+  "production_qualified": false,
+  "phase_0_complete": false,
+  "source": {
+    "base_commit": "b87068cb452ac4c2af0c4056ed3a5cde0b678604",
+    "result_tree": "c03f922fa32bf6f12f1eb5ae3f022377d734fdc1",
+    "patch": "0048-phase0-integration.patch",
+    "patch_sha256": "5bf6e0a670de5f8927f651d7325c76b31e252bb69f7e777e35d7e4cb21c0f18b",
+    "source_sha256": {
+      "crates/omnigraph-cli/src/read_format.rs": "5d95392c8d8f8f0703e83ba79bff85d5f78f131cbe04c98b318fd7858ac5d6fc",
+      "crates/omnigraph-cli/tests/parity_matrix.rs": "4138eacd49ae003fc633df7ea84127f2e00234746e8fdec9d7fa803e6d390558",
+      "crates/omnigraph-cli/tests/support/mod.rs": "0b995996153affefc2692ba3d7bc282ad1e04d77c5d9dc891816f963c7fb6942",
+      "crates/omnigraph-compiler/src/catalog/mod.rs": "d4d67b483342498cfad3972ca8663a8839a982057c4d76e3a55f9946d19d098a",
+      "crates/omnigraph-compiler/src/ir/lower.rs": "9813920a80c8dbbe92dd8607b48c49544ab14d33a5f94af91331ca6a18eecec3",
+      "crates/omnigraph-compiler/src/ir/lower_tests.rs": "b4e17db63e806e98757a2d248e213b592faea109755c4e9682c4a60cf9789de3",
+      "crates/omnigraph-compiler/src/ir/mod.rs": "4767f4675141218e34018bb9e4e0a371233f7d5bd48eab6dcdd325531647bad6",
+      "crates/omnigraph-compiler/src/ir/validate.rs": "ca9b61e42d479cb6ae319d4aaed1ce670bdd62f3346814c6d3a339f82047074e",
+      "crates/omnigraph-compiler/src/query/ast.rs": "dcb890640ed5c056388e713379de15e866d302708b4eb399598f6c8a8a26e2ce",
+      "crates/omnigraph-compiler/src/query/descriptor.rs": "f91cbad03644786bb161a4adb3424dbf4fb43a48f3fb54f2548a57f26efbc798",
+      "crates/omnigraph-compiler/src/query/parser.rs": "faa16317593387394d7415051497dd9f7d27a6f05cda6d4f89fd32effbc92f9d",
+      "crates/omnigraph-compiler/src/query/parser/staged.rs": "cb241f3b56cdce516677f0fa0c1a1cdbcaa7669320e8d98a3b5f716d2574186d",
+      "crates/omnigraph-compiler/src/query/query.pest": "a08dd86a26d383a59279fcb85090bf31286ebbc2e60b3ca5f8a58fac15c5d742",
+      "crates/omnigraph-compiler/src/query/staged_probe.rs": "d62d51ab0d54da42c07104f38fb92f54be520701c73733562e937c8fc5017ec0",
+      "crates/omnigraph-compiler/src/query/typecheck.rs": "0654f251ce9a5c35b854e2ba8cd367cb21c3897cd92a80452d780a3fbe5c20ac",
+      "crates/omnigraph-compiler/src/query/typecheck/staged.rs": "bc0658ef4172cce401df009cc3b4e78f658fa39166e94c2d3055770d3adc4e04",
+      "crates/omnigraph-compiler/src/query/typecheck_tests.rs": "3d10496e702ab6c842cf2bfb76c81d2aba55214e4a9ff57458b66d992e762e05",
+      "crates/omnigraph-gqt/cases/staged_lexical_traversal_take.gqt": "662a5c255dcb8d6f16633c6fc6405d5070f329d9c21f9da2641f3de53271da2b",
+      "crates/omnigraph-gqt/src/lib.rs": "c9baffb5e2aa950e11d0eed1a75be02c4d4491cfafdcfcd6480351f6cde32552",
+      "crates/omnigraph-gqt/src/tests.rs": "823e0d617e06607cac789e2a454099475918e00efd9df6e6557df7c2857d7ec9",
+      "crates/omnigraph-server/tests/stored_queries.rs": "aa50669cbb2a83fafd2e6b29107c436dabcec925d171932f7633ab94c28fed4e",
+      "crates/omnigraph/Cargo.toml": "f1cf61a7d4cd6c81bd0b30bf58d713f449e55b87a1c926611eb9bd9ef8ce27e0",
+      "crates/omnigraph/src/exec/projection.rs": "23f7bfb159c282b0d05b353e159acc007feffb203bcd68f4ea73ee44d1c3c504",
+      "crates/omnigraph/src/exec/query.rs": "3d4480748f3bb1579dbc60e3961f8d26a8303318cba8c8a48e7c6cc9a7555188",
+      "crates/omnigraph/src/exec/query/staged.rs": "9f988bb9c16075d98e17dfc36a5f3b8011c45fff665ee6a9163f99d0b3147c60",
+      "crates/omnigraph/src/loader/mod.rs": "77f6c6db1bf5a05d1aab6c05bc70530c30db3d8ee03c2a931772db25e1ab0b9c",
+      "crates/omnigraph/tests/search.rs": "a0c8193c0cd22731cb5bcf2b07b4038873fdcd13ff0989240e92edba80a9865e",
+      "docs/releases/v0.11.0.md": "5b9427ac7e6c5c09cffc2c0f45265fae6593925e5769f18e182fcb477ce7fe78",
+      "docs/user/cli/reference.md": "5118eceb87aeb02d1866c1603765ff3e2e71811d761e291705fbc49dd58ba0b6"
+    }
+  },
+  "reconstruction": "Create an isolated checkout at source.base_commit and git apply source.patch. Do not apply the historical patch first. The resulting temporary-index tree and all 29 file hashes were verified against this source inventory.",
+  "pins": {
+    "arrow-array": "58.3.0",
+    "datafusion": "54.0.0",
+    "lance": "11.0.0",
+    "libm": "0.2.16",
+    "tokio": "1.52.3",
+    "unicode-normalization": "0.1.25",
+    "rust": "1.97.1",
+    "rust_commit": "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+    "host": "aarch64-apple-darwin",
+    "profile": "unoptimized test",
+    "cargo_lock_sha256": "993d736f15af06b87c8ca1d6914db4283138ce30f8607e1a2632ee7dbc8d75f9"
+  },
+  "historical_archive_audit": {
+    "base_commit": "b1df2041c93e03aa13cee8308a0a574689baf210",
+    "patch": "0048-staged-integration.patch",
+    "patch_sha256": "658b03d60a234b5a95367bdbf41a9218cbc762b76c9ba9aec1d29196b82fbbff",
+    "matched_postimages": 28,
+    "compiler_command": "cargo +1.97.1 test --locked -p omnigraph-compiler",
+    "compiler_passed": 362,
+    "compiler_log_sha256": "889d8ca06cf80e7c7a6027243d49cd835482103953ca83043840fcec42d2ff91",
+    "boundary": "This refreshes patch reconstruction and compiler execution only. Original runtime and transport receipts retain their historical revision/toolchain scope."
+  },
+  "checks": [
+    {
+      "command": "cargo +1.97.1 test --locked -p omnigraph-compiler",
+      "status": "pass",
+      "passed": 368,
+      "ignored": 0,
+      "filtered_out": 0,
+      "log_sha256": "360814d54f51f0071cde5be585b75f21e32e90b09fa7b7408ff3be8ec7a764a5"
+    },
+    {
+      "command": "cargo +1.97.1 test --locked -p omnigraph-gqt --lib",
+      "status": "pass",
+      "passed": 127,
+      "ignored": 0,
+      "filtered_out": 0,
+      "log_sha256": "773026673e36fffcd38d7aacf9f4c732c371e577ef6df54b7514a9de80a5aa9c"
+    },
+    {
+      "command": "cargo +1.97.1 test --locked -p omnigraph-gqt --test gq_logic_tests staged_lexical",
+      "status": "pass",
+      "passed": 1,
+      "ignored": 0,
+      "filtered_out": 71,
+      "log_sha256": "b1179fe8e74eb216e91f46c32357460a7464c0c610410c25fdb8606db56bcdf6"
+    },
+    {
+      "command": "cargo +1.97.1 test --locked -p omnigraph-engine --lib needed_columns_tests",
+      "status": "pass",
+      "passed": 10,
+      "ignored": 0,
+      "filtered_out": 429,
+      "log_sha256": "18bd51e29108cca9f304657b379d497fa8acd430b6fe1e16ef099df1b5a711ea"
+    },
+    {
+      "command": "cargo +1.97.1 test --locked -p omnigraph-engine --lib exec::query::staged::",
+      "status": "pass",
+      "passed": 4,
+      "ignored": 1,
+      "filtered_out": 434,
+      "log_sha256": "e99c4ad77a737663f42ae626d7d9ccb1429e7bdcdca2edb49982faec131fcb5b"
+    },
+    {
+      "command": "cargo +1.97.1 test --locked -p omnigraph-engine --test search staged_budget_includes",
+      "status": "pass",
+      "passed": 1,
+      "ignored": 0,
+      "filtered_out": 56,
+      "log_sha256": "24d425f34af01061f0ca10589817d1ca124099d067ce4d7ad9abdf5a26a531a8"
+    },
+    {
+      "command": "cargo +1.97.1 clippy --locked -p omnigraph-compiler -p omnigraph-engine -p omnigraph-gqt --all-targets -- -D warnings -W clippy::dbg_macro",
+      "status": "pass",
+      "log_sha256": "0de3cc3404daba3ef6d055aa499d148e3c40a001efbab2797b98af468c08a929"
+    }
+  ],
+  "earlier_port_search_check": {
+    "command": "cargo +1.97.1 test --locked -p omnigraph-engine --test search",
+    "status": "pass",
+    "passed": 57,
+    "ignored": 0,
+    "filtered_out": 0,
+    "log_sha256": "75c693a51fe40ec51492f55fe6c8d9694b4de20a75111ebd40d6ec08b43939d9",
+    "scope": "Earlier in this port, before the final admission and column-demand assertions; the changed owners were rerun above. Not a fresh full-owner result for the frozen patch."
+  },
+  "discriminating_checks": [
+    "The actual rank IR preserves the explicit output and a later Filter barrier. Missing, duplicate, unknown, cross-block and unseparated yield are refused.",
+    "GQT executes three lexical sources over one incoming population. Reordering declarations or adding a nonmatching unused source preserves output. Choosing another output changes membership according to its independent window.",
+    "Missing source membership produces null rank/score values. JSON omits null-valued keys under the existing writer; GQT shape checks require every projected column and its Arrow type, including an all-null F64 column.",
+    "The inherited-order GQT owner first failed because it required a final order clause. Rank now supplies an admitted total ordering path; a take-only control remains refused.",
+    "Column demand, graph-read descriptors, GQT construct detection and GQT traversal detection walk later stages.",
+    "The graph-tail owner refuses 100200 bindings despite final limit 1, preserves the accepted graph version, and proves a later plain query still works.",
+    "Invalid later query text, candidate windows, edit budgets and group quotas fail before an oversized corpus field is scanned. This includes unused sources. Valid-input controls reach that field refusal."
+  ],
+  "negative_control": {
+    "command": "cargo +1.97.1 test --locked -p omnigraph-gqt --lib",
+    "owner": "refuses_ordered_expect_without_an_order_clause",
+    "observed": "126 passed, 1 failed: inherited rank order was refused without an order clause",
+    "log_sha256": "240393848753d8f1fad0cff14c4fda7b01c5413d4e6ed1f6849ea84d962fdd20"
+  },
+  "experimental_bounds_not_public_defaults": {
+    "sources_per_rank_block": 16,
+    "candidates_per_lexical_source": 10000,
+    "utf8_bytes_per_query_or_field": 4096,
+    "cumulative_lexical_input_bytes": 16777216,
+    "lexical_work_units": 50000000,
+    "materialized_binding_rows": 100000,
+    "participating_memory_pool_bytes": 134217728,
+    "spill": "disabled"
+  },
+  "remaining_investigation": [
+    "The integration retains the old production expression grammar plus the narrow stages; the separate test-only shared expression and C1-C4 prototype is not fully integrated.",
+    "SourceId is an alias-backed query-local wrapper, not the accepted nested scope/representation/execution fingerprint design.",
+    "Boolean matching, vector/fusion sources, C1-C4 golden and optimized plans, edge targets and cross-type global search remain unqualified.",
+    "Schema-owned defaults, resolved encoders, Unicode fingerprinting, format assignment and export/reapplication remain open.",
+    "Post-decode relation and consumed-batch reservations are not a preallocation/RSS bound. Token maps, queued/native work, output serialization, retries and cancellation need complete ownership.",
+    "A shared Budget object and these refusal tests do not qualify every cumulative multi-source resource path or an optimized native scorer.",
+    "The retained frozen-corpus diagnostic is ignored; there is no new claim for its instrument, S3, Azure, release performance or relevance.",
+    "CLI and stored-query code is carried in the patch but its tests were not rerun for this revision. Earlier transport pass counts remain historical.",
+    "No full-workspace qualification was run here. The RFC records four current-code GQT regressions separately; this experiment does not close them."
+  ],
+  "build_note": "The macOS linker warned that __eh_frame exceeds compact-unwind encoding size. Tests completed successfully; no release performance or exception-handling cost claim follows.",
+  "additional_checks": [
+    {
+      "command": "cargo +1.97.1 fmt --all --check",
+      "checkout": "isolated integration",
+      "status": "pass"
+    },
+    {
+      "command": "git diff --check",
+      "checkout": "isolated integration and RFC",
+      "status": "pass"
+    },
+    {
+      "command": "python3 scripts/check-docs.py",
+      "checkout": "RFC",
+      "status": "pass",
+      "markdown_files": 138
+    },
+    {
+      "command": "bash scripts/check-agents-md.sh",
+      "checkout": "RFC",
+      "status": "pass",
+      "links": 47,
+      "docs": 45
+    }
+  ]
+}

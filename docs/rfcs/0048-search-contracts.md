@@ -57,8 +57,9 @@ The [language evolution contract](#language-evolution-and-compatibility)
 keeps this a single typed graph language. It specifies extension boundaries
 without requiring every future operator now. Rank blocks explicitly select
 their output with `yield <source>`; the test-only compiler validates that
-contract. A shared expression grammar and broader scope proofs still need
-qualification before the public syntax is frozen.
+contract, and the [isolated integration](#explicit-output-integration-checkpoint)
+executes it for multiple lexical sources. A shared expression grammar and
+broader scope proofs still need qualification before the public syntax is frozen.
 The [query capability matrix](#query-capability-matrix) separates existing
 support, this RFC's release requirements, deferred extensions and the remaining
 scope decisions. Use it to review language coverage before committing to syntax.
@@ -2934,9 +2935,79 @@ The C1–C4 examples now have parser/type/scope assertions and explicit
 falsifiers. Complete golden/optimized plans, numeric/null rules, semantic
 fingerprints, physical execution and the other Phase 0 decision packages
 remain open.
-The source/selection/descriptor integration and resource-refusal gate must
-still run through the actual engine and GQT. This checkpoint does not certify
-runtime selection or complete Phase 0.
+This compiler checkpoint does not certify runtime selection or complete
+Phase 0. The later integrated checkpoint below exercises a narrower lexical
+slice; it does not execute C1–C4 or establish the full expression contract.
+
+#### Explicit-output integration checkpoint
+
+The follow-on experiment uses `b87068cb` as its base and Rust 1.97.1, with
+the same locked Lance 11.0.0, DataFusion 54.0.0 and Arrow 58.3.0 dependencies.
+Before porting, the historical integration patch was applied at its recorded
+`b1df2041` base: all 28 postimage hashes matched its receipt, and its compiler
+passed 362 tests on the pinned toolchain. That audit does not refresh the
+historical runtime or transport results.
+
+The [updated experimental patch](assets/0048-phase0-integration.patch) carries
+an explicit rank-block output through the real parser, typechecker, IR,
+engine and GQT. Its [receipt](assets/0048-phase0-integration-checkpoint.json)
+records exact source identities, commands, outcomes and limits. Apply this
+patch directly at its recorded base in an isolated checkout; it already
+contains the older experiment's code. Neither patch is part of this PR's
+production build.
+
+Each lexical source receives the same incoming bindings and has its own
+candidate window. Adding metric columns does not filter those bindings;
+`yield` selects the output population after the sources are evaluated. The
+owned GQT case checks source declaration reorder, an unused nonmatching
+source, different output choices, inherited output order and missing-source
+metrics. The existing JSON writer omits null cells; the expected rows use
+that encoding while shape checks still require the nullable rank and score
+columns, including an all-null `F64` score. Do not infer a wire-format change
+from nullable metric semantics.
+
+The integration exposed a harness assumption: GQT previously refused every
+ordered expectation without a final `order` clause. Its existing refusal
+owner first failed for inherited rank order. The experiment now recognizes
+the rank output's engine-applied comparator; a `take` stage alone still does
+not establish output order. The compiler retains a rank barrier ahead of a
+later filter and rejects missing, duplicate, unknown or cross-block outputs,
+the unseparated token `yieldhits`, and unsupported cross-source/domain metric
+comparisons.
+
+The compiler's read descriptor and GQT's construct/traversal detection include
+later graph stages. The engine's column-demand owner checks a second ranked
+target and a group-selection key after traversal. Admission checks reject
+invalid candidate windows, edit budgets and group quotas before the first
+corpus scan, including parameters of an unused source. A valid-input control
+reaches an oversized stored field and fails there instead. The graph-tail
+owner still refuses 100,200 intermediate bindings despite final `limit 1`,
+checks that the graph head did not move, and verifies a subsequent read.
+
+Fresh focused checks pass 368 compiler tests, 127 GQT unit tests, the one
+selected staged GQT case, ten column-demand tests, four staged unit tests for
+resources and scoring, and the extended graph-tail/admission test. One
+diagnostic instrument that uses the frozen corpus remains ignored. The full
+57-test search owner
+passed before the last admission assertions were added; the changed owner
+was rerun afterward. These are scoped prototype results, not a fresh
+workspace or transport qualification.
+
+**Remaining uncertainty.** This is an exact scalar-String lexical experiment,
+not the complete source algebra. Source IDs remain query-local alias wrappers;
+resolved representation identity, nested scopes and semantic fingerprints
+still need Phase 0/1 decisions and implementation. The cap of 16 sources per block and
+the experiment's fixed field, window and resource limits are experimental
+admission choices, not newly accepted public defaults. Full shared expressions,
+Boolean matching, vector/fusion execution, C1–C4 plans, global search,
+schema/default serialization and read/error envelopes remain open. Its
+post-decode accounting does not bound native allocation peaks, token maps,
+queued I/O, serialization or cancellation. Stored-query and CLI changes are
+carried forward as experiment code; historical transport pass counts do not
+qualify this revision. Implementers must investigate these boundaries through
+their existing owners before promoting the code into production.
+
+#### Historical integration and diagnostic pilot
 
 This checkpoint records the 2026-09-09 investigation for implementers who did
 not participate in the review. Read the normative Design and Rollout sections
@@ -3458,8 +3529,10 @@ evidence. Compiler, search, schema, and read-contract owners supply these proofs
 now have parser/type/scope fixtures, as recorded in the
 [checkpoint](#implementation-handoff-and-validation-checkpoint). That does not
 settle the complete expression grammar, physical plans, numeric/null runtime
-rules or cross-type result types. Extend the existing negative cases and
-inspect actual lowering; proposed syntax is not accepted syntax. Resource and
+rules or cross-type result types. The explicit-output engine/GQT experiment
+qualifies only the recorded lexical slice; it does not close those broader
+gates. Extend the existing negative cases and inspect actual lowering;
+proposed syntax is not accepted syntax. Resource and
 wire choices remain open too. Start a dependent work package only after its
 required decisions/interfaces are fixed; an unresolved native route needs an
 explicit upstream dependency or fallback disposition, not assumed feasibility.
@@ -3932,6 +4005,13 @@ this milestone does not imply support for all future operators.
 
 ## Decision log
 
+- 2026-09-11 — audited the historical integration archive at its exact base
+  and ported explicit multi-source lexical output into an isolated actual
+  compiler/engine/GQT experiment. Qualified independent windows, inherited
+  order, typed missing metrics, later-stage inspection and pre-scan parameter
+  refusal. Recorded the patch and fresh evidence separately from historical
+  transport results; representation, complete resource ownership and the
+  other Phase 0 decision packages remain open.
 - 2026-09-11 — added test-only C1–C4 syntax and scope qualification for
   intermediate groups/values, row selection, independent scoring and explicit
   nested imports/results. Recorded each example's remaining falsifiers,

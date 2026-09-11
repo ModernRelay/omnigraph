@@ -1,0 +1,3647 @@
+diff --git a/crates/omnigraph-cli/src/read_format.rs b/crates/omnigraph-cli/src/read_format.rs
+index ae57fc7658f19e2b718d4851bc367fcd8f4d0942..0bbe8233fc42903cc15efbdbd25f9928e9591f7c 100644
+--- a/crates/omnigraph-cli/src/read_format.rs
++++ b/crates/omnigraph-cli/src/read_format.rs
+@@ -57,6 +57,7 @@ fn render_jsonl(output: &ReadOutput) -> Result<String> {
+         "query_name": output.query_name,
+         "target": output.target,
+         "row_count": output.row_count,
++        "graph_commit_id": output.graph_commit_id,
+     }))?);
+     for row in rows(output)? {
+         lines.push(serde_json::to_string(&row)?);
+diff --git a/crates/omnigraph-cli/tests/parity_matrix.rs b/crates/omnigraph-cli/tests/parity_matrix.rs
+index 088b776fdae4c5602cb970a13948b143b7327cf0..4876fde051f9cd3581a96f2ec3ffcbc2b14b6b15 100644
+--- a/crates/omnigraph-cli/tests/parity_matrix.rs
++++ b/crates/omnigraph-cli/tests/parity_matrix.rs
+@@ -229,6 +229,62 @@ fn parity_query() {
+         "--json",
+     ]);
+     assert_parity("query", &l, &r);
++
++    // Continuation metadata must survive the actual CLI renderer on both
++    // transports. Comparing only JSON envelopes misses JSONL field loss.
++    let local_read = parse_stdout_json(&l);
++    let remote_read = parse_stdout_json(&r);
++    let head = local_read["graph_commit_id"].as_str().unwrap();
++    assert!(!head.is_empty());
++    assert_eq!(remote_read["graph_commit_id"], head);
++    for pinned in [false, true] {
++        let mut args = vec![
++            "query",
++            "--query",
++            query.to_str().unwrap(),
++            "get_person",
++            "--params",
++            r#"{"name":"Alice"}"#,
++            "--format",
++            "jsonl",
++        ];
++        if pinned {
++            args.extend(["--snapshot", head]);
++        }
++        let (local, remote) = p.run(&args);
++        for (arm, output) in [("local", local), ("remote", remote)] {
++            assert!(output.status.success(), "{arm}: {output:?}");
++            let text = std::str::from_utf8(&output.stdout).unwrap();
++            let mut lines = text.lines();
++            let metadata: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
++            assert_eq!(metadata["kind"], "metadata");
++            assert_eq!(
++                metadata["graph_commit_id"], head,
++                "{arm}, pinned={pinned}: {metadata}"
++            );
++            assert_eq!(
++                metadata["target"]["snapshot"],
++                serde_json::json!(pinned.then_some(head))
++            );
++            let rows: Vec<serde_json::Value> = lines
++                .map(|line| serde_json::from_str(line).unwrap())
++                .collect();
++            assert_eq!(serde_json::json!(rows), local_read["rows"]);
++        }
++    }
++    // A branch-list statement has no single content snapshot. Preserve that
++    // unavailable state explicitly instead of inventing a replay identity.
++    let (local, remote) = p.run(&["query", "-e", "branch list", "--format", "jsonl"]);
++    for output in [local, remote] {
++        assert!(output.status.success(), "{output:?}");
++        let text = std::str::from_utf8(&output.stdout).unwrap();
++        let metadata: serde_json::Value =
++            serde_json::from_str(text.lines().next().unwrap()).unwrap();
++        assert_eq!(
++            metadata.get("graph_commit_id"),
++            Some(&serde_json::Value::Null)
++        );
++    }
+ }
+
+ #[test]
+@@ -832,3 +888,106 @@ fn parity_changes_baseline() {
+         "the terminal handshake is not written into the snapshot file"
+     );
+ }
++
++/// The staged grammar and metrics must reach the actual CLI and TCP server;
++/// GQT and router tests do not exercise these carriers or their rendering.
++#[test]
++fn parity_staged_search() {
++    let temp = tempfile::tempdir().unwrap();
++    let schema = temp.path().join("search.pg");
++    let original = std::fs::read_to_string(fixture("test.pg")).unwrap();
++    assert!(original.contains("name: String @key"));
++    std::fs::write(
++        &schema,
++        original.replacen("name: String @key", "name: String @key @analyzed", 1),
++    )
++    .unwrap();
++    let local = temp.path().join("local.omni");
++    let cluster = parity_configs_with_fixture(temp.path(), &local, &schema, &fixture("test.jsonl"));
++    let server = spawn_server_with_cluster_env(
++        &cluster,
++        &[(
++            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
++            r#"{"act-parity":"parity-tok"}"#,
++        )],
++    );
++    let query = r#"
++query staged($q: String, $window: I64) {
++    match { $p: Person $p.age > 29 }
++    rank $p { lexical($p.name, terms($q, max_edits: 1), candidates: $window) as names yield names }
++    match { $p worksAt $c }
++    take $c { per { $p.name } order { $c.name } limit 1 }
++    return { $p.name as person, $c.name as company, metric(names, rank) as source_rank,
++             metric(names, score) as source_score }
++    order { metric(names, rank), $c.name }
++    limit 1
++}
++"#;
++    let params = r#"{"q":"ALIC","window":1}"#;
++    let (l, r) = run_both(
++        &local,
++        &server.base_url,
++        &["query", "-e", query, "--params", params, "--json"],
++    );
++    assert!(
++        l.status.success() && r.status.success(),
++        "local={l:?}, remote={r:?}"
++    );
++    let found = parse_stdout_json(&l);
++    assert_eq!(
++        found,
++        parse_stdout_json(&r),
++        "same snapshot, scores, schema and rows"
++    );
++    assert_eq!(found["row_count"], 1);
++    assert_eq!(found["rows"][0]["person"], "Alice");
++    assert_eq!(found["rows"][0]["company"], "Acme");
++    assert_eq!(found["rows"][0]["source_rank"], 1);
++    assert!(found["rows"][0]["source_score"].as_f64().unwrap() > 0.0);
++    let head = found["graph_commit_id"].as_str().unwrap();
++    assert!(!head.is_empty());
++    let (l, r) = run_both(
++        &local,
++        &server.base_url,
++        &[
++            "query",
++            "-e",
++            query,
++            "--params",
++            params,
++            "--snapshot",
++            head,
++            "--format",
++            "jsonl",
++        ],
++    );
++    for output in [l, r] {
++        assert!(output.status.success(), "{output:?}");
++        let text = std::str::from_utf8(&output.stdout).unwrap();
++        let mut lines = text.lines();
++        let metadata: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
++        assert_eq!(metadata["graph_commit_id"], head);
++        assert_eq!(metadata["target"]["snapshot"], head);
++        let rows: Vec<serde_json::Value> = lines
++            .map(|line| serde_json::from_str(line).unwrap())
++            .collect();
++        assert_eq!(serde_json::json!(rows), found["rows"]);
++    }
++    let (l, r) = run_both(
++        &local,
++        &server.base_url,
++        &[
++            "query",
++            "-e",
++            query,
++            "--params",
++            r#"{"q":"ALIC","window":0}"#,
++            "--json",
++        ],
++    );
++    assert!(
++        !l.status.success() && !r.status.success(),
++        "invalid semantic window must fail on both transports"
++    );
++    assert_eq!(l.status.code(), r.status.code());
++}
+diff --git a/crates/omnigraph-cli/tests/support/mod.rs b/crates/omnigraph-cli/tests/support/mod.rs
+index f7487b59dcb841f87a505a556ce4e55814b8afa2..8f4703eac9cfcc5688ca4a2e51ecc40b4ce88e15 100644
+--- a/crates/omnigraph-cli/tests/support/mod.rs
++++ b/crates/omnigraph-cli/tests/support/mod.rs
+@@ -1209,6 +1209,21 @@ pub const PARITY_GRAPH_ID: &str = "parity";
+ ///
+ /// Returns the `cluster_dir`. The caller spawns the server with `--cluster`.
+ pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> PathBuf {
++    parity_configs_with_fixture(
++        root,
++        local_graph,
++        &fixture("test.pg"),
++        &fixture("test.jsonl"),
++    )
++}
++
++/// Reuse the parity cluster, policy and twin-copy setup for a supplied fixture.
++pub fn parity_configs_with_fixture(
++    root: &Path,
++    local_graph: &Path,
++    schema_file: &Path,
++    data_file: &Path,
++) -> PathBuf {
+     let policy = root.join("parity.policy.yaml");
+     fs::write(&policy, parity_policy_yaml()).unwrap();
+
+@@ -1216,7 +1231,7 @@ pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) ->
+     // (`parity`), schema = the shared fixture, policy bound to the graph.
+     let cluster_dir = root.join("parity-cluster");
+     fs::create_dir_all(&cluster_dir).unwrap();
+-    fs::copy(fixture("test.pg"), cluster_dir.join("parity.pg")).unwrap();
++    fs::copy(schema_file, cluster_dir.join("parity.pg")).unwrap();
+     fs::copy(&policy, cluster_dir.join("parity.policy.yaml")).unwrap();
+     fs::write(
+         cluster_dir.join("cluster.yaml"),
+@@ -1262,7 +1277,7 @@ policies:
+         cli()
+             .arg("load")
+             .arg("--data")
+-            .arg(fixture("test.jsonl"))
++            .arg(data_file)
+             .arg("--mode")
+             .arg("overwrite")
+             .arg(&served_root),
+diff --git a/crates/omnigraph-compiler/src/catalog/mod.rs b/crates/omnigraph-compiler/src/catalog/mod.rs
+index 80da031d82672af74de4a0eed5f0b8d708964aa1..5c0c51465a094ba123d0ef96aa26beecb264d336 100644
+--- a/crates/omnigraph-compiler/src/catalog/mod.rs
++++ b/crates/omnigraph-compiler/src/catalog/mod.rs
+@@ -52,6 +52,9 @@ pub struct NodeType {
+     /// Interface names this type implements
+     pub implements: Vec<String>,
+     pub properties: HashMap<String, PropType>,
++    /// Experimental lexical declarations, derived from the accepted schema.
++    /// Default materialization and schema-format migration are separate gates.
++    pub analyzed_fields: HashSet<String>,
+     /// Key property names (from `@key` or `@key(name, ...)`). Runtime catalogs
+     /// project composite members in stable property-ID order so renames cannot
+     /// change physical tuple identity.
+@@ -416,6 +419,16 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
+                 node.name.clone(),
+                 NodeType {
+                     name: node.name.clone(),
++                    analyzed_fields: node
++                        .properties
++                        .iter()
++                        .filter(|p| {
++                            p.annotations.iter().any(|a| {
++                                a.name == "analyzed" && a.value.is_none() && a.kwargs.is_empty()
++                            })
++                        })
++                        .map(|p| p.name.clone())
++                        .collect(),
+                     implements: node.implements.clone(),
+                     properties,
+                     key,
+@@ -648,6 +661,16 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
+             node.name.clone(),
+             NodeType {
+                 name: node.name.clone(),
++                analyzed_fields: node
++                    .properties
++                    .iter()
++                    .filter(|p| {
++                        p.annotations.iter().any(|a| {
++                            a.name == "analyzed" && a.value.is_none() && a.kwargs.is_empty()
++                        })
++                    })
++                    .map(|p| p.name.clone())
++                    .collect(),
+                 implements: node
+                     .implements
+                     .iter()
+diff --git a/crates/omnigraph-compiler/src/ir/lower.rs b/crates/omnigraph-compiler/src/ir/lower.rs
+index dadff2608af925cd97d9a90157a6cf23ab388b78..96fb42662064a07ab80489876455818704fcef20 100644
+--- a/crates/omnigraph-compiler/src/ir/lower.rs
++++ b/crates/omnigraph-compiler/src/ir/lower.rs
+@@ -67,6 +67,65 @@ pub fn lower_query(
+         &mut fresh,
+     )?;
+
++    for stage in &query.stages {
++        match stage {
++            ReadStage::Match(clauses) => lower_clauses(
++                catalog,
++                clauses,
++                type_ctx,
++                &mut pipeline,
++                &mut bound_vars,
++                &param_names,
++                &param_types,
++                &mut fresh,
++            )?,
++            ReadStage::Rank(rank) => {
++                let mut sources = Vec::with_capacity(rank.sources.len());
++                for source in &rank.sources {
++                    let Expr::PropAccess { property, .. } = &source.field else {
++                        unreachable!("checked lexical field")
++                    };
++                    let BoundVariable::Node { type_name } = &type_ctx.bindings[&source.target]
++                    else {
++                        unreachable!("checked lexical target")
++                    };
++                    sources.push(LexicalIR {
++                        target: source.target.clone(),
++                        type_name: type_name.clone(),
++                        property: property.clone(),
++                        text: lower_expr(&source.terms.text, &param_names),
++                        max_edits: lower_expr(&source.terms.max_edits, &param_names),
++                        mode: source.terms.mode,
++                        candidates: lower_expr(&source.candidates, &param_names),
++                        source: SourceId(source.source.clone()),
++                    });
++                }
++                pipeline.push(IROp::Rank(Box::new(RankIR {
++                    target: rank.target.clone(),
++                    sources,
++                    output: SourceId(rank.output.clone()),
++                })));
++            }
++            ReadStage::Take(take) => pipeline.push(IROp::Take(Box::new(TakeIR {
++                target: take.target.clone(),
++                keys: take
++                    .keys
++                    .iter()
++                    .map(|e| lower_expr(e, &param_names))
++                    .collect(),
++                order: take
++                    .order
++                    .iter()
++                    .map(|o| IROrdering {
++                        expr: lower_expr(&o.expr, &param_names),
++                        descending: o.descending,
++                    })
++                    .collect(),
++                limit: lower_expr(&take.limit, &param_names),
++            }))),
++        }
++    }
++
+     let return_exprs: Vec<IRProjection> = query
+         .return_clause
+         .iter()
+@@ -703,6 +762,10 @@ fn lower_projection(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
+
+ fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
+     match expr {
++        Expr::Metric { source, kind } => IRExpr::Metric {
++            source: SourceId(source.clone()),
++            kind: *kind,
++        },
+         Expr::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
+         Expr::PropAccess { variable, property } => IRExpr::PropAccess {
+             variable: variable.clone(),
+diff --git a/crates/omnigraph-compiler/src/ir/lower_tests.rs b/crates/omnigraph-compiler/src/ir/lower_tests.rs
+index ed330652fa9ade06819f7aedea515c3fd1f3593e..8efcf871279c3e69de89651509a466266a7c9b20 100644
+--- a/crates/omnigraph-compiler/src/ir/lower_tests.rs
++++ b/crates/omnigraph-compiler/src/ir/lower_tests.rs
+@@ -975,3 +975,121 @@ return { $p.name }
+     assert!(matches!(&inner[1], IROp::Expand { .. }));
+     assert!(matches!(&inner[2], IROp::Filter(_)));
+ }
++#[test]
++fn staged_rank_retains_later_filters_and_metric_scope() {
++    let catalog = build_catalog(
++        &parse_schema(
++            r#"
++        node Doc { slug: String @key title: String @analyzed active: Bool }
++        node Tag { name: String @key }
++        edge Tagged: Doc -> Tag
++    "#,
++        )
++        .unwrap(),
++    )
++    .unwrap();
++    let source = r#"
++        query q($q: String) {
++            match { $d: Doc }
++            rank $d { lexical($d.title, terms($q), candidates: 2) as hits yield hits }
++            match { $d.active = true }
++            return { $d.slug, metric(hits, rank) as rank }
++            order { rank }
++        }
++    "#;
++    let query = parse_query(source).unwrap();
++    let ctx = typecheck_query(&catalog, query.single_decl()).unwrap();
++    let ir = lower_query(&catalog, query.single_decl(), &ctx).unwrap();
++    assert!(
++        matches!(&ir.pipeline[..], [IROp::NodeScan { filters, .. }, IROp::Rank(_), IROp::Filter(_)] if filters.is_empty())
++    );
++    let multi = source.replace(
++        "as hits yield hits",
++        "as hits lexical($d.title, terms(\"unused\"), candidates: 1) as unused yield hits",
++    );
++    let query = parse_query(&multi).unwrap();
++    let ctx = typecheck_query(&catalog, query.single_decl()).unwrap();
++    let ir = lower_query(&catalog, query.single_decl(), &ctx).unwrap();
++    let IROp::Rank(rank) = &ir.pipeline[1] else {
++        panic!("rank barrier was lost")
++    };
++    assert_eq!(rank.target, "d");
++    assert_eq!(rank.output, SourceId("hits".into()));
++    assert_eq!(
++        rank.sources
++            .iter()
++            .map(|source| source.source.0.as_str())
++            .collect::<Vec<_>>(),
++        ["hits", "unused"]
++    );
++    for predicate in [
++        "metric(hits, score) > metric(unused, score)",
++        "metric(hits, score) > metric(hits, rank)",
++    ] {
++        let invalid = multi.replace("$d.active = true", predicate);
++        let query = parse_query(&invalid).unwrap();
++        assert!(
++            typecheck_query(&catalog, query.single_decl())
++                .unwrap_err()
++                .to_string()
++                .contains("one source and metric domain")
++        );
++    }
++    let same_domain = multi.replace(
++        "$d.active = true",
++        "metric(hits, score) >= metric(hits, score)",
++    );
++    let query = parse_query(&same_domain).unwrap();
++    typecheck_query(&catalog, query.single_decl()).unwrap();
++    assert!(parse_query(&source.replace("yield hits", "")).is_err());
++    for replacement in ["yield missing", "yield hits yield hits", "yieldhits"] {
++        let invalid = source.replace("yield hits", replacement);
++        assert!(
++            parse_query(&invalid)
++                .and_then(|query| typecheck_query(&catalog, query.single_decl()))
++                .is_err()
++        );
++    }
++    let wrong_block = source.replace(
++        "match { $d.active = true }",
++        "rank $d { lexical($d.title, terms($q), candidates: 1) as later yield hits }",
++    );
++    let query = parse_query(&wrong_block).unwrap();
++    assert!(
++        typecheck_query(&catalog, query.single_decl())
++            .unwrap_err()
++            .to_string()
++            .contains("current block")
++    );
++    let expanded = parse_query(&source.replace(
++        "match { $d.active = true }",
++        "match { $d tagged $t $d.active = true }",
++    ))
++    .unwrap();
++    let descriptor =
++        crate::query::descriptor::describe_query_operation(&catalog, expanded.single_decl())
++            .unwrap();
++    assert_eq!(
++        descriptor
++            .reads
++            .iter()
++            .map(|r| r.type_name.as_str())
++            .collect::<Vec<_>>(),
++        ["Doc", "Tag", "Tagged"]
++    );
++    let unknown = source.replace("metric(hits, rank)", "metric(future, rank)");
++    let query = parse_query(&unknown).unwrap();
++    assert!(
++        typecheck_query(&catalog, query.single_decl())
++            .unwrap_err()
++            .to_string()
++            .contains("not in scope")
++    );
++    let query = parse_query(&source.replace("candidates: 2", "candidates: 0")).unwrap();
++    assert!(
++        typecheck_query(&catalog, query.single_decl())
++            .unwrap_err()
++            .to_string()
++            .contains("candidates")
++    );
++}
+diff --git a/crates/omnigraph-compiler/src/ir/mod.rs b/crates/omnigraph-compiler/src/ir/mod.rs
+index 3044ca01801bfbfb9a1f829c68b02091b0282a43..e339a01f2d6cb88cbeeeda3a24be8ee3b8c69f16 100644
+--- a/crates/omnigraph-compiler/src/ir/mod.rs
++++ b/crates/omnigraph-compiler/src/ir/mod.rs
+@@ -3,7 +3,7 @@ pub(crate) mod validate;
+
+ use std::collections::HashMap;
+
+-use crate::query::ast::{AggFunc, CompOp, Literal, Param};
++use crate::query::ast::{AggFunc, CompOp, Literal, MetricKind, Param, TermMode};
+ use crate::types::Direction;
+
+ #[derive(Debug, Clone)]
+@@ -58,6 +58,8 @@ pub type ParamMap = HashMap<String, Literal>;
+
+ #[derive(Debug, Clone)]
+ pub enum IROp {
++    Rank(Box<RankIR>),
++    Take(Box<TakeIR>),
+     NodeScan {
+         variable: String,
+         type_name: String,
+@@ -90,6 +92,44 @@ pub enum IROp {
+     },
+ }
+
++/// A query-local, scope-checked source identity. It never names a persisted
++/// graph object or survives into another query execution.
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++pub struct SourceId(pub String);
++
++impl SourceId {
++    pub fn column(&self, kind: MetricKind) -> String {
++        format!("__source.{}.{}", self.0, kind.name())
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct RankIR {
++    pub target: String,
++    pub sources: Vec<LexicalIR>,
++    pub output: SourceId,
++}
++
++#[derive(Debug, Clone)]
++pub struct LexicalIR {
++    pub target: String,
++    pub type_name: String,
++    pub property: String,
++    pub text: IRExpr,
++    pub max_edits: IRExpr,
++    pub mode: TermMode,
++    pub candidates: IRExpr,
++    pub source: SourceId,
++}
++
++#[derive(Debug, Clone)]
++pub struct TakeIR {
++    pub target: String,
++    pub keys: Vec<IRExpr>,
++    pub order: Vec<IROrdering>,
++    pub limit: IRExpr,
++}
++
+ #[derive(Debug, Clone)]
+ pub struct IRFilter {
+     pub left: IRExpr,
+@@ -99,6 +139,10 @@ pub struct IRFilter {
+
+ #[derive(Debug, Clone)]
+ pub enum IRExpr {
++    Metric {
++        source: SourceId,
++        kind: MetricKind,
++    },
+     PropAccess {
+         variable: String,
+         property: String,
+diff --git a/crates/omnigraph-compiler/src/ir/validate.rs b/crates/omnigraph-compiler/src/ir/validate.rs
+index fbe4918354f186cc05cb417a67665a009b629f31..edacbf2b03470fcac8a96414ea85b9b8afea4678 100644
+--- a/crates/omnigraph-compiler/src/ir/validate.rs
++++ b/crates/omnigraph-compiler/src/ir/validate.rs
+@@ -33,6 +33,40 @@ pub(crate) fn validate_query(ir: &QueryIR) -> Result<()> {
+ fn validate_pipeline(pipeline: &[IROp], introduced: &mut HashSet<String>) -> Result<()> {
+     for op in pipeline {
+         match op {
++            IROp::Rank(rank) => {
++                check_reference(&rank.target, introduced)?;
++                if !(1..=16).contains(&rank.sources.len())
++                    || !rank
++                        .sources
++                        .iter()
++                        .any(|source| source.source == rank.output)
++                    || rank
++                        .sources
++                        .iter()
++                        .any(|source| source.target != rank.target)
++                {
++                    return Err(CompilerError::Plan(
++                        "invalid rank target, source count or output reference".into(),
++                    ));
++                }
++                for source in &rank.sources {
++                    check_reference(&source.target, introduced)?;
++                    check_expr(&source.text, introduced)?;
++                    check_expr(&source.max_edits, introduced)?;
++                    check_expr(&source.candidates, introduced)?;
++                    introduce(&format!("__source.{}", source.source.0), introduced)?;
++                }
++            }
++            IROp::Take(take) => {
++                check_reference(&take.target, introduced)?;
++                for key in &take.keys {
++                    check_expr(key, introduced)?;
++                }
++                for order in &take.order {
++                    check_expr(&order.expr, introduced)?;
++                }
++                check_expr(&take.limit, introduced)?;
++            }
+             // Every field spelled, so a field added later that carries a
+             // variable is a compile error here, not an unchecked reference.
+             IROp::NodeScan {
+@@ -108,6 +142,9 @@ fn check_filter(filter: &IRFilter, introduced: &HashSet<String>) -> Result<()> {
+ /// compile error here rather than an unchecked reference.
+ fn check_expr(expr: &IRExpr, introduced: &HashSet<String>) -> Result<()> {
+     match expr {
++        IRExpr::Metric { source, .. } => {
++            check_reference(&format!("__source.{}", source.0), introduced)
++        }
+         IRExpr::PropAccess { variable, .. } | IRExpr::Nearest { variable, .. } => {
+             check_reference(variable, introduced)?;
+             if let IRExpr::Nearest { query, .. } = expr {
+diff --git a/crates/omnigraph-compiler/src/query/ast.rs b/crates/omnigraph-compiler/src/query/ast.rs
+index 2f9b14d9abf5ed0640952d5526c6bcea431d5ccf..e0f7f81d88fb66550b261fccb53b633c01cb4336 100644
+--- a/crates/omnigraph-compiler/src/query/ast.rs
++++ b/crates/omnigraph-compiler/src/query/ast.rs
+@@ -98,6 +98,9 @@ pub struct QueryDecl {
+     pub instruction: Option<String>,
+     pub params: Vec<Param>,
+     pub match_clause: Vec<Clause>,
++    /// Ordered stages after the initial graph match. Each selection is a
++    /// semantic barrier: subsequent graph predicates cannot move before it.
++    pub stages: Vec<ReadStage>,
+     pub return_clause: Vec<Projection>,
+     pub order_clause: Vec<Ordering>,
+     pub limit: Option<u64>,
+@@ -111,6 +114,65 @@ pub struct Param {
+     pub nullable: bool,
+ }
+
++#[derive(Debug, Clone)]
++pub enum ReadStage {
++    Match(Vec<Clause>),
++    Rank(RankStage),
++    Take(TakeStage),
++}
++
++#[derive(Debug, Clone)]
++pub struct RankStage {
++    pub target: String,
++    pub sources: Vec<LexicalStage>,
++    pub output: String,
++}
++
++#[derive(Debug, Clone)]
++pub struct LexicalStage {
++    pub target: String,
++    pub field: Expr,
++    pub terms: Terms,
++    pub candidates: Expr,
++    pub source: String,
++}
++
++#[derive(Debug, Clone)]
++pub struct Terms {
++    pub text: Expr,
++    pub max_edits: Expr,
++    pub mode: TermMode,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TermMode {
++    All,
++    Any,
++}
++
++#[derive(Debug, Clone)]
++pub struct TakeStage {
++    pub target: String,
++    pub keys: Vec<Expr>,
++    pub order: Vec<Ordering>,
++    pub limit: Expr,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum MetricKind {
++    Rank,
++    Score,
++}
++
++impl MetricKind {
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::Rank => "rank",
++            Self::Score => "score",
++        }
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub enum Clause {
+     Binding(Binding),
+@@ -198,6 +260,10 @@ impl std::fmt::Display for CompOp {
+
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Expr {
++    Metric {
++        source: String,
++        kind: MetricKind,
++    },
+     Now,
+     PropAccess {
+         variable: String,
+diff --git a/crates/omnigraph-compiler/src/query/descriptor.rs b/crates/omnigraph-compiler/src/query/descriptor.rs
+index cacd6e952fc34730bf26cd381988b901a7e050bc..e50e8ff8e40850e294a9a906bdeccd5ab764808b 100644
+--- a/crates/omnigraph-compiler/src/query/descriptor.rs
++++ b/crates/omnigraph-compiler/src/query/descriptor.rs
+@@ -93,6 +93,15 @@ fn describe_checked_query_operation(
+     let result = match checked {
+         CheckedQuery::Read(ctx) => {
+             collect_clause_reads(catalog, &query.match_clause, &mut reads)?;
++            for stage in &query.stages {
++                match stage {
++                    crate::query::ast::ReadStage::Match(clauses) => {
++                        collect_clause_reads(catalog, clauses, &mut reads)?
++                    }
++                    crate::query::ast::ReadStage::Rank(_)
++                    | crate::query::ast::ReadStage::Take(_) => {}
++                }
++            }
+             infer_query_result_schema(catalog, query, ctx)?
+                 .fields()
+                 .iter()
+diff --git a/crates/omnigraph-compiler/src/query/parser.rs b/crates/omnigraph-compiler/src/query/parser.rs
+index 037bff853081588ea206d211363d663e744c1ac0..8c7b09484d005ab688f3e1954dcdc565bf4f8c48 100644
+--- a/crates/omnigraph-compiler/src/query/parser.rs
++++ b/crates/omnigraph-compiler/src/query/parser.rs
+@@ -8,6 +8,8 @@ use crate::error::{
+
+ use super::ast::*;
+
++mod staged;
++
+ #[derive(Parser)]
+ #[grammar = "query/query.pest"]
+ #[cfg_attr(test, grammar = "query/staged_probe.pest")]
+@@ -142,6 +144,8 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
+     let mut instruction = None;
+     let mut params = Vec::new();
+     let mut match_clause = Vec::new();
++    let mut stages = Vec::new();
++    let mut initial_match_seen = false;
+     let mut return_clause = Vec::new();
+     let mut order_clause = Vec::new();
+     let mut limit = None;
+@@ -192,12 +196,21 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
+                         for section in body.into_inner() {
+                             match section.as_rule() {
+                                 Rule::match_clause => {
++                                    let mut clauses = Vec::new();
+                                     for c in section.into_inner() {
+                                         if let Rule::clause = c.as_rule() {
+-                                            match_clause.push(parse_clause(c)?);
++                                            clauses.push(parse_clause(c)?);
+                                         }
+                                     }
++                                    if initial_match_seen {
++                                        stages.push(ReadStage::Match(clauses));
++                                    } else {
++                                        match_clause = clauses;
++                                        initial_match_seen = true;
++                                    }
+                                 }
++                                Rule::rank_clause => stages.push(staged::rank(section)?),
++                                Rule::take_clause => stages.push(staged::take(section)?),
+                                 Rule::return_clause => {
+                                     for proj in section.into_inner() {
+                                         if let Rule::projection = proj.as_rule() {
+@@ -248,6 +261,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
+         instruction,
+         params,
+         match_clause,
++        stages,
+         return_clause,
+         order_clause,
+         limit,
+@@ -595,6 +609,20 @@ fn parse_filter(pair: pest::iterators::Pair<Rule>) -> Result<Filter> {
+ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+     let inner = pair.into_inner().next().unwrap();
+     match inner.as_rule() {
++        Rule::metric_call => {
++            let mut parts = inner.into_inner();
++            let source = parts.next().unwrap().as_str().to_string();
++            let kind = match parts.next().unwrap().as_str() {
++                "rank" => MetricKind::Rank,
++                "score" => MetricKind::Score,
++                other => {
++                    return Err(CompilerError::Parse(format!(
++                        "unsupported metric `{other}`"
++                    )));
++                }
++            };
++            Ok(Expr::Metric { source, kind })
++        }
+         Rule::now_call => Ok(Expr::Now),
+         Rule::prop_access => {
+             let mut parts = inner.into_inner();
+diff --git a/crates/omnigraph-compiler/src/query/parser/staged.rs b/crates/omnigraph-compiler/src/query/parser/staged.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..08d3500e511c6fc4b485087ffdeb32e5caed1956
+--- /dev/null
++++ b/crates/omnigraph-compiler/src/query/parser/staged.rs
+@@ -0,0 +1,118 @@
++//! Typed parsing for the executable RFC 0048 vertical slice.
++use super::*;
++use pest::iterators::Pair;
++use std::collections::BTreeMap;
++
++fn options<'a>(pairs: impl Iterator<Item = Pair<'a, Rule>>) -> Result<BTreeMap<String, Expr>> {
++    let mut result = BTreeMap::new();
++    for pair in pairs {
++        let mut parts = pair.into_inner();
++        let name = parts.next().unwrap().as_str().to_string();
++        if result
++            .insert(name.clone(), parse_expr(parts.next().unwrap())?)
++            .is_some()
++        {
++            return Err(CompilerError::Parse(format!("duplicate option `{name}`")));
++        }
++    }
++    Ok(result)
++}
++
++fn no_unknown(options: BTreeMap<String, Expr>) -> Result<()> {
++    if let Some(name) = options.keys().next() {
++        return Err(CompilerError::Parse(format!("unsupported option `{name}`")));
++    }
++    Ok(())
++}
++
++pub(super) fn rank(pair: Pair<Rule>) -> Result<ReadStage> {
++    let mut parts = pair.into_inner();
++    let target = parts.next().unwrap().as_str()[1..].to_string();
++    let output = parts
++        .next_back()
++        .unwrap()
++        .into_inner()
++        .nth(1)
++        .unwrap()
++        .as_str()
++        .to_string();
++    let sources = parts
++        .map(|part| lexical(target.clone(), part))
++        .collect::<Result<Vec<_>>>()?;
++    if sources.len() > 16 {
++        return Err(CompilerError::Plan(
++            "staged integration admits at most 16 lexical sources per block".into(),
++        ));
++    }
++    Ok(ReadStage::Rank(RankStage {
++        target,
++        sources,
++        output,
++    }))
++}
++
++fn lexical(target: String, pair: Pair<Rule>) -> Result<LexicalStage> {
++    let mut args: Vec<_> = pair.into_inner().collect();
++    let source = args.pop().unwrap().as_str().to_string();
++    let mut args = args.into_iter();
++    let field = parse_expr(args.next().unwrap())?;
++    let mut terms_args = args.next().unwrap().into_inner();
++    let text = parse_expr(terms_args.next().unwrap())?;
++    let mut terms_options = options(terms_args)?;
++    let max_edits = terms_options
++        .remove("max_edits")
++        .unwrap_or(Expr::Literal(Literal::Integer(0)));
++    let mode = match terms_options.remove("mode") {
++        None => TermMode::All,
++        Some(Expr::Literal(Literal::String(value))) if value == "all" => TermMode::All,
++        Some(Expr::Literal(Literal::String(value))) if value == "any" => TermMode::Any,
++        _ => {
++            return Err(CompilerError::Parse(
++                "terms mode must be \"all\" or \"any\"".into(),
++            ));
++        }
++    };
++    no_unknown(terms_options)?;
++    let mut source_options = options(args)?;
++    let candidates = source_options
++        .remove("candidates")
++        .ok_or_else(|| CompilerError::Parse("lexical requires explicit candidates".into()))?;
++    no_unknown(source_options)?;
++    Ok(LexicalStage {
++        target,
++        field,
++        terms: Terms {
++            text,
++            max_edits,
++            mode,
++        },
++        candidates,
++        source,
++    })
++}
++
++pub(super) fn take(pair: Pair<Rule>) -> Result<ReadStage> {
++    let mut parts = pair.into_inner();
++    let target = parts.next().unwrap().as_str()[1..].to_string();
++    let keys = parts
++        .next()
++        .unwrap()
++        .into_inner()
++        .map(parse_expr)
++        .collect::<Result<_>>()?;
++    let mut order = Vec::new();
++    let mut next = parts.next().unwrap();
++    if next.as_rule() == Rule::order_clause {
++        order = next
++            .into_inner()
++            .map(parse_ordering)
++            .collect::<Result<_>>()?;
++        next = parts.next().unwrap();
++    }
++    Ok(ReadStage::Take(TakeStage {
++        target,
++        keys,
++        order,
++        limit: parse_expr(next)?,
++    }))
++}
+diff --git a/crates/omnigraph-compiler/src/query/query.pest b/crates/omnigraph-compiler/src/query/query.pest
+index 7b092951b7268f2138f0fa0fafa47815d1a2f93f..990fe107f3343d2ba7b55f9371f1536b877eee48 100644
+--- a/crates/omnigraph-compiler/src/query/query.pest
++++ b/crates/omnigraph-compiler/src/query/query.pest
+@@ -41,6 +41,7 @@ query_body = { read_query_body | mutation_body }
+ mutation_body = { mutation_stmt+ }
+ read_query_body = {
+     match_clause
++    ~ (rank_clause | match_clause | take_clause)*
+     ~ return_clause
+     ~ order_clause?
+     ~ limit_clause?
+@@ -63,6 +64,16 @@ base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32"
+
+ match_clause = { "match" ~ "{" ~ clause+ ~ "}" }
+
++rank_clause = { "rank" ~ variable ~ "{" ~ lexical_source+ ~ rank_output ~ "}" }
++rank_output = { rank_yield ~ ident }
++rank_yield = @{ "yield" ~ !(ASCII_ALPHANUMERIC | "_") }
++lexical_source = { "lexical" ~ "(" ~ expr ~ "," ~ terms_call ~ ("," ~ named_option)* ~ ")" ~ "as" ~ ident }
++terms_call = { "terms" ~ "(" ~ expr ~ ("," ~ named_option)* ~ ")" }
++named_option = { ident ~ ":" ~ expr }
++take_clause = { "take" ~ variable ~ "{" ~ per_clause ~ order_clause? ~ "limit" ~ expr ~ "}" }
++per_clause = { "per" ~ "{" ~ expr ~ ("," ~ expr)* ~ "}" }
++metric_call = { "metric" ~ "(" ~ ident ~ "," ~ ident ~ ")" }
++
+ clause = { negation | binding | traversal | filter | text_search_clause }
+ text_search_clause = { search_call | fuzzy_call | match_text_call }
+
+@@ -103,7 +114,7 @@ order_dir = { "asc" | "desc" }
+ limit_clause = { "limit" ~ integer }
+
+ // Expressions
+-expr = { now_call | nearest_ordering | search_call | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call | prop_access | variable | literal | ident }
++expr = { metric_call | now_call | nearest_ordering | search_call | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call | prop_access | variable | literal | ident }
+ now_call = { "now" ~ "(" ~ ")" }
+ search_call = { "search" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
+ fuzzy_call = { "fuzzy" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
+diff --git a/crates/omnigraph-compiler/src/query/staged_probe.rs b/crates/omnigraph-compiler/src/query/staged_probe.rs
+index 9903374989a5187b624e9b7af2acc9567381f11f..ed966a6f36fdc59bb38a3bf94ae0b0c21a1a7f4a 100644
+--- a/crates/omnigraph-compiler/src/query/staged_probe.rs
++++ b/crates/omnigraph-compiler/src/query/staged_probe.rs
+@@ -406,6 +406,7 @@ fn parse(input: &str) -> ProbeResult<Query> {
+             instruction: None,
+             params: Vec::new(),
+             match_clause: Vec::new(),
++            stages: Vec::new(),
+             return_clause: Vec::new(),
+             order_clause: Vec::new(),
+             limit: None,
+@@ -1169,6 +1170,7 @@ fn binary_type(
+                     op: comparison,
+                     right: Expr::Variable("right".into()),
+                 })],
++                stages: Vec::new(),
+                 return_clause: Vec::new(),
+                 order_clause: Vec::new(),
+                 limit: None,
+@@ -2833,10 +2835,11 @@ fn staged_probe_checks_the_rfc_examples_directly() {
+         };
+         let plan = check(&selected_catalog, query).unwrap();
+         assert!(!plan.query.projections.is_empty());
+-        assert!(
+-            parse_query(example).is_err(),
+-            "RFC syntax is not shipped by this prototype"
+-        );
++        // This isolated integration checkout admits the lexical rank/take
++        // slice. Broader C1–C4 syntax remains test-only.
++        if example.starts_with("query composition_") {
++            assert!(parse_query(example).is_err());
++        }
+     }
+ }
+
+diff --git a/crates/omnigraph-compiler/src/query/typecheck.rs b/crates/omnigraph-compiler/src/query/typecheck.rs
+index 6bbb79647d49c8722b07b7e68084e95d735cb085..505b8c1b4dbb48abc36361f14f1ce0f0f44a3ef0 100644
+--- a/crates/omnigraph-compiler/src/query/typecheck.rs
++++ b/crates/omnigraph-compiler/src/query/typecheck.rs
+@@ -9,6 +9,8 @@ use crate::types::{Direction, PropType, ScalarType};
+
+ use super::ast::*;
+
++mod staged;
++
+ /// A variable in the query's single namespace, tagged by what it binds.
+ ///
+ /// Node and edge bindings share one symbol table (GQ has one variable
+@@ -42,6 +44,7 @@ pub struct TypeContext {
+     pub bindings: HashMap<String, BoundVariable>,
+     pub aliases: HashMap<String, ResolvedType>,
+     pub traversals: Vec<ResolvedTraversal>,
++    pub sources: HashMap<String, String>,
+ }
+
+ #[derive(Debug, Clone)]
+@@ -196,6 +199,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
+         bindings: HashMap::new(),
+         aliases: HashMap::new(),
+         traversals: Vec::new(),
++        sources: HashMap::new(),
+     };
+     let params = parse_declared_param_types(&query.params)?;
+
+@@ -203,6 +207,8 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
+
+     // Typecheck match clauses
+     typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;
++    staged::check(catalog, &query.stages, &mut ctx, &params)?;
++    staged::check_supported_query(query)?;
+
+     // Typecheck return projections
+     let mut result_columns: HashSet<String> = HashSet::new();
+@@ -1150,6 +1156,20 @@ fn resolve_expr_type(
+     params: &HashMap<String, PropType>,
+ ) -> Result<ResolvedType> {
+     match expr {
++        Expr::Metric { source, kind } => {
++            if !ctx.sources.contains_key(source) {
++                return Err(CompilerError::Type(format!(
++                    "metric source `{source}` is not in scope"
++                )));
++            }
++            Ok(ResolvedType::Scalar(PropType::scalar(
++                match kind {
++                    MetricKind::Rank => ScalarType::U64,
++                    MetricKind::Score => ScalarType::F64,
++                },
++                true,
++            )))
++        }
+         Expr::Now => Ok(ResolvedType::Scalar(PropType::scalar(
+             ScalarType::DateTime,
+             false,
+@@ -1625,6 +1645,7 @@ fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
+ /// it repeats the retrieval `order` executes (T33, `Expr::score_column`).
+ fn check_projection(expr: &Expr, order_clause: &[Ordering]) -> Result<()> {
+     match expr {
++        Expr::Metric { .. } => Ok(()),
+         Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::Literal(_) => Ok(()),
+         Expr::Aggregate { func, arg } => match arg.as_ref() {
+             Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => {
+@@ -1669,6 +1690,7 @@ fn check_projection(expr: &Expr, order_clause: &[Ordering]) -> Result<()> {
+
+ fn rank_keyword(expr: &Expr) -> &'static str {
+     match expr {
++        Expr::Metric { .. } => "metric",
+         Expr::Nearest { .. } => "nearest",
+         Expr::Bm25 { .. } => "bm25",
+         Expr::Rrf { .. } => "rrf",
+@@ -1758,6 +1780,7 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
+     }
+
+     match expr {
++        Expr::Metric { source, kind } => format!("metric({source},{})", kind.name()),
+         Expr::Now => "now".to_string(),
+         Expr::PropAccess { property, .. } => property.clone(),
+         Expr::Variable(variable) => variable.clone(),
+diff --git a/crates/omnigraph-compiler/src/query/typecheck/staged.rs b/crates/omnigraph-compiler/src/query/typecheck/staged.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..18c9a743a644215565ba56a9cacb3a970c0c53b4
+--- /dev/null
++++ b/crates/omnigraph-compiler/src/query/typecheck/staged.rs
+@@ -0,0 +1,219 @@
++//! Scope and admission checks for the executable lexical/selection slice.
++use super::*;
++
++pub(super) fn check_supported_query(query: &QueryDecl) -> Result<()> {
++    if query.stages.is_empty() {
++        return Ok(());
++    }
++    fn expr(value: &Expr) -> Result<()> {
++        match value {
++            Expr::Search { .. }
++            | Expr::Fuzzy { .. }
++            | Expr::MatchText { .. }
++            | Expr::Bm25 { .. }
++            | Expr::Nearest { .. }
++            | Expr::Rrf { .. } => Err(CompilerError::Type(
++                "staged retrieval cannot be mixed with legacy search expressions".into(),
++            )),
++            Expr::Aggregate { .. } => Err(CompilerError::Plan(
++                "integration aggregate metric scope is not yet executable".into(),
++            )),
++            _ => Ok(()),
++        }
++    }
++    fn clauses(items: &[Clause]) -> Result<()> {
++        for item in items {
++            match item {
++                Clause::Filter(f) => {
++                    expr(&f.left)?;
++                    expr(&f.right)?;
++                    if let (
++                        Expr::Metric {
++                            source: a,
++                            kind: ak,
++                        },
++                        Expr::Metric {
++                            source: b,
++                            kind: bk,
++                        },
++                    ) = (&f.left, &f.right)
++                        && (a != b || ak != bk)
++                    {
++                        return Err(CompilerError::Type("metric comparison requires one source and metric domain; cross-source policies are not implemented".into()));
++                    }
++                }
++                Clause::Negation(inner) => clauses(inner)?,
++                _ => {}
++            }
++        }
++        Ok(())
++    }
++    clauses(&query.match_clause)?;
++    for stage in &query.stages {
++        if let ReadStage::Match(items) = stage {
++            clauses(items)?;
++        }
++    }
++    for p in &query.return_clause {
++        expr(&p.expr)?;
++    }
++    for o in &query.order_clause {
++        expr(&o.expr)?;
++    }
++    Ok(())
++}
++
++fn integer(
++    expr: &Expr,
++    params: &HashMap<String, PropType>,
++    min: i64,
++    max: i64,
++    name: &str,
++) -> Result<()> {
++    match expr {
++        Expr::Literal(Literal::Integer(n)) if *n >= min && *n <= max => Ok(()),
++        Expr::Variable(p)
++            if params.get(p).is_some_and(|t| {
++                !t.nullable
++                    && !t.list
++                    && matches!(
++                        t.scalar,
++                        ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64
++                    )
++            }) =>
++        {
++            Ok(())
++        }
++        _ => Err(CompilerError::Type(format!(
++            "{name} requires a non-null integer in {min}..={max}"
++        ))),
++    }
++}
++
++pub(super) fn check(
++    catalog: &Catalog,
++    stages: &[ReadStage],
++    ctx: &mut TypeContext,
++    params: &HashMap<String, PropType>,
++) -> Result<()> {
++    for stage in stages {
++        match stage {
++            ReadStage::Match(clauses) => {
++                refuse_reserved_variable_names(clauses)?;
++                typecheck_clauses(catalog, clauses, ctx, params, false)?;
++            }
++            ReadStage::Rank(rank) => {
++                if !(1..=16).contains(&rank.sources.len()) {
++                    return Err(CompilerError::Plan(
++                        "rank requires 1..16 sources in this integration".into(),
++                    ));
++                }
++                for source in &rank.sources {
++                    if source.target != rank.target {
++                        return Err(CompilerError::Type(
++                            "rank sources must share the block target".into(),
++                        ));
++                    }
++                    let Some(BoundVariable::Node { type_name }) = ctx.bindings.get(&source.target)
++                    else {
++                        return Err(CompilerError::Type(
++                            "integration lexical target must be a bound node".into(),
++                        ));
++                    };
++                    let Expr::PropAccess { variable, property } = &source.field else {
++                        return Err(CompilerError::Type(
++                            "lexical field must be a property".into(),
++                        ));
++                    };
++                    if variable != &source.target {
++                        return Err(CompilerError::Type(
++                            "lexical field must belong to the rank target".into(),
++                        ));
++                    }
++                    let field = resolve_expr_type(catalog, &source.field, ctx, params)?;
++                    if !matches!(field, ResolvedType::Scalar(ref t) if t.scalar == ScalarType::String && !t.list)
++                        || !catalog.node_types[type_name]
++                            .analyzed_fields
++                            .contains(property)
++                    {
++                        return Err(CompilerError::Type("integration lexical field requires scalar String with bare @analyzed (standard_v1/bm25_v1)".into()));
++                    }
++                    let text = match &source.terms.text {
++                        Expr::Literal(Literal::String(_)) => true,
++                        Expr::Variable(p) => params.get(p).is_some_and(|t| {
++                            t.scalar == ScalarType::String && !t.list && !t.nullable
++                        }),
++                        _ => false,
++                    };
++                    if !text {
++                        return Err(CompilerError::Type(
++                            "terms text requires a non-null String literal or parameter".into(),
++                        ));
++                    }
++                    integer(&source.terms.max_edits, params, 0, 2, "max_edits")?;
++                    integer(&source.candidates, params, 1, 10_000, "candidates")?;
++                    if source.source.starts_with("__")
++                        || ctx
++                            .sources
++                            .insert(source.source.clone(), source.target.clone())
++                            .is_some()
++                    {
++                        return Err(CompilerError::Type(format!(
++                            "duplicate or reserved source `{}`",
++                            source.source
++                        )));
++                    }
++                }
++                if !rank
++                    .sources
++                    .iter()
++                    .any(|source| source.source == rank.output)
++                {
++                    return Err(CompilerError::Type(
++                        "rank output must name a source in the current block".into(),
++                    ));
++                }
++            }
++            ReadStage::Take(take) => {
++                if take.keys.is_empty() {
++                    return Err(CompilerError::Type(
++                        "take requires a nonempty group key".into(),
++                    ));
++                }
++                if !ctx.bindings.contains_key(&take.target) {
++                    return Err(CompilerError::Type("take target is not bound".into()));
++                }
++                integer(&take.limit, params, 0, i64::MAX, "take limit")?;
++                if take.order.is_empty() {
++                    return Err(CompilerError::Plan(
++                        "integration take requires explicit local order".into(),
++                    ));
++                }
++                for key in &take.keys {
++                    let t = resolve_expr_type(catalog, key, ctx, params)?;
++                    if !matches!(key, Expr::PropAccess { .. })
++                        || !matches!(t, ResolvedType::Scalar(ref p) if !p.list && matches!(p.scalar, ScalarType::String | ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64 | ScalarType::Bool))
++                    {
++                        return Err(CompilerError::Plan("integration take key must be a scalar String, Bool, or integer property".into()));
++                    }
++                }
++                for order in &take.order {
++                    let t = resolve_expr_type(catalog, &order.expr, ctx, params)?;
++                    let constant_on_pair = match &order.expr {
++                        Expr::PropAccess { variable, .. } => {
++                            variable == &take.target || take.keys.contains(&order.expr)
++                        }
++                        Expr::Metric { source, .. } => ctx.sources[source] == take.target,
++                        _ => false,
++                    };
++                    if !constant_on_pair
++                        || !matches!(t, ResolvedType::Scalar(ref p) if !p.list && matches!(p.scalar, ScalarType::String | ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64 | ScalarType::Bool | ScalarType::F64 | ScalarType::F32))
++                    {
++                        return Err(CompilerError::Plan("integration take order requires a scalar constant on each target/group pair".into()));
++                    }
++                }
++            }
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/omnigraph-compiler/src/query/typecheck_tests.rs b/crates/omnigraph-compiler/src/query/typecheck_tests.rs
+index eee3ee834f48e64be47e8b8047416bfe18c057ac..d3153afa4b7621d00c0031ba7f8dfcc08101a514 100644
+--- a/crates/omnigraph-compiler/src/query/typecheck_tests.rs
++++ b/crates/omnigraph-compiler/src/query/typecheck_tests.rs
+@@ -1643,6 +1643,7 @@ return { count($d.payload) }
+         )]),
+         aliases: HashMap::new(),
+         traversals: Vec::new(),
++        sources: HashMap::new(),
+     };
+     let error = infer_query_result_schema(&catalog, qf.single_decl(), &ctx).unwrap_err();
+     assert_eq!(
+@@ -1716,6 +1717,7 @@ return { $d.name }
+     // callers cannot route Blob membership around the ordinary comparison
+     // guard.
+     let direct_ast = QueryDecl {
++        stages: Vec::new(),
+         name: "blob_membership".to_string(),
+         description: None,
+         instruction: None,
+diff --git a/crates/omnigraph-gqt/cases/staged_lexical_traversal_take.gqt b/crates/omnigraph-gqt/cases/staged_lexical_traversal_take.gqt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca23297c053989dea27dafa33f0710782c98d2d9
+--- /dev/null
++++ b/crates/omnigraph-gqt/cases/staged_lexical_traversal_take.gqt
+@@ -0,0 +1,206 @@
++# issue: none
++# notes: RFC 0048 integration experiment. The excluded organization would outrank the
++# notes: eligible ones. Two edge rows reach the same incident; they consume one quota
++# notes: slot but both survive selection. A later output limit counts those rows.
++# notes: Empty analyzed queries are invalid even when no graph binding is eligible.
++# notes: Rank sources receive the same eligible binding relation with independent
++# notes: windows; only yield selects rows. Missing source metrics stay null, and
++# notes: adding or reordering unused sources cannot change the selected output.
++# notes: The existing JSON writer omits null cells. Shape checks still require
++# notes: every projected metric column, including the all-null F64 unused score.
++
++--- schema
++node Organization {
++    slug: String @key
++    eligible: Bool
++    name: String @analyzed
++}
++node Incident {
++    slug: String @key
++    severity: I64
++    title: String @analyzed
++}
++edge HasIncident: Organization -> Incident {
++    slug: String
++    @key(src, dst, slug)
++}
++
++--- seed
++{"type":"Organization","data":{"slug":"a","eligible":true,"name":"alpha alpha"}}
++{"type":"Organization","data":{"slug":"b","eligible":true,"name":"alpha beta"}}
++{"type":"Organization","data":{"slug":"c","eligible":true,"name":"alpha beta gamma delta"}}
++{"type":"Organization","data":{"slug":"excluded","eligible":false,"name":"alpha alpha alpha"}}
++{"type":"Incident","data":{"slug":"i1","severity":9,"title":"alpha alpha alpha"}}
++{"type":"Incident","data":{"slug":"i2","severity":8,"title":"alpha alpha"}}
++{"type":"Incident","data":{"slug":"i3","severity":7,"title":"alpha"}}
++{"type":"Incident","data":{"slug":"i4","severity":8,"title":"alpha beta"}}
++{"edge":"HasIncident","from":"a","to":"i1","data":{"slug":"a1"}}
++{"edge":"HasIncident","from":"a","to":"i1","data":{"slug":"a1again"}}
++{"edge":"HasIncident","from":"a","to":"i2","data":{"slug":"a2"}}
++{"edge":"HasIncident","from":"a","to":"i3","data":{"slug":"a3"}}
++{"edge":"HasIncident","from":"b","to":"i1","data":{"slug":"b1"}}
++{"edge":"HasIncident","from":"b","to":"i4","data":{"slug":"b4"}}
++{"edge":"HasIncident","from":"c","to":"i3","data":{"slug":"c3"}}
++{"edge":"HasIncident","from":"excluded","to":"i1","data":{"slug":"x1"}}
++
++--- query
++query staged($q: String) {
++    match { $o: Organization { eligible: true } }
++    rank $o {
++        lexical($o.name, terms($q), candidates: 2) as names
++        yield names
++    }
++    match { $o $e:hasIncident $i }
++    take $i {
++        per { $o.slug }
++        order { $i.severity desc, $i.slug }
++        limit 2
++    }
++    return { $o.slug as org, $i.slug as incident, $e.slug as path, metric(names, rank) as source_rank }
++    order { metric(names, rank), $i.severity desc, $i.slug, $e.slug }
++    limit 4
++}
++
++--- params
++{"q":"ALPHA"}
++
++--- expect ordered
++{"org":"a","incident":"i1","path":"a1","source_rank":1}
++{"org":"a","incident":"i1","path":"a1again","source_rank":1}
++{"org":"a","incident":"i2","path":"a2","source_rank":1}
++{"org":"b","incident":"i1","path":"b1","source_rank":2}
++
++--- expect shape
++org: String
++incident: String
++path: String
++source_rank: U64?
++
++--- query
++query empty_terms($q: String) {
++    match { $o: Organization }
++    rank $o { lexical($o.name, terms($q), candidates: 1) as names yield names }
++    return { $o.slug as org }
++}
++
++--- params
++{"q":"!!! ..."}
++
++--- expect error: terms query contains no searchable terms
++
++--- query
++query empty_terms_without_bindings($q: String) {
++    match { $o: Organization { slug: "missing" } }
++    rank $o { lexical($o.name, terms($q), candidates: 1) as names yield names }
++    return { $o.slug as org }
++}
++
++--- params
++{"q":""}
++
++--- expect error: terms query contains no searchable terms
++
++--- query
++query nonempty_terms_without_bindings($q: String) {
++    match { $o: Organization { slug: "missing" } }
++    rank $o { lexical($o.name, terms($q), candidates: 1) as names yield names }
++    return { $o.slug as org }
++    order { $o.slug }
++}
++
++--- params
++{"q":"zebra"}
++
++--- expect ordered
++
++--- expect shape
++org: String
++
++--- query
++query traversal_target($q: String) {
++    match { $o: Organization { eligible: true } $o $e:hasIncident $i }
++    rank $i { lexical($i.title, terms($q), candidates: 2) as incidents yield incidents }
++    take $i { per { $o.slug } order { $i.severity } limit 1 }
++    return { $o.slug as org, $i.slug as incident, $e.slug as path, metric(incidents, rank) as source_rank }
++    order { $o.slug, $e.slug }
++}
++
++--- params
++{"q":"alpha"}
++
++--- expect ordered
++{"org":"a","incident":"i2","path":"a2","source_rank":2}
++{"org":"b","incident":"i1","path":"b1","source_rank":1}
++
++--- expect shape
++org: String
++incident: String
++path: String
++source_rank: U64?
++
++--- query
++query explicit_output() {
++    match { $o: Organization { eligible: true } }
++    rank $o {
++        lexical($o.name, terms("alpha"), candidates: 2) as alpha
++        lexical($o.name, terms("beta"), candidates: 1) as beta
++        lexical($o.name, terms("nomatch"), candidates: 1) as unused
++        yield alpha
++    }
++    return { $o.slug as org, metric(alpha, rank) as alpha_rank,
++             metric(beta, rank) as beta_rank, metric(unused, score) as unused_score }
++}
++
++--- expect ordered
++{"org":"a","alpha_rank":1}
++{"org":"b","alpha_rank":2,"beta_rank":1}
++
++--- expect shape
++org: String
++alpha_rank: U64?
++beta_rank: U64?
++unused_score: F64?
++
++--- query
++query reordered_output() {
++    match { $o: Organization { eligible: true } }
++    rank $o {
++        lexical($o.name, terms("nomatch"), candidates: 1) as unused
++        lexical($o.name, terms("beta"), candidates: 1) as beta
++        lexical($o.name, terms("alpha"), candidates: 2) as alpha
++        yield alpha
++    }
++    return { $o.slug as org, metric(alpha, rank) as alpha_rank,
++             metric(beta, rank) as beta_rank, metric(unused, score) as unused_score }
++}
++
++--- expect ordered
++{"org":"a","alpha_rank":1}
++{"org":"b","alpha_rank":2,"beta_rank":1}
++
++--- expect shape
++org: String
++alpha_rank: U64?
++beta_rank: U64?
++unused_score: F64?
++
++--- query
++query different_output() {
++    match { $o: Organization { eligible: true } }
++    rank $o {
++        lexical($o.name, terms("alpha"), candidates: 1) as alpha
++        lexical($o.name, terms("beta"), candidates: 2) as beta
++        yield beta
++    }
++    return { $o.slug as org, metric(alpha, rank) as alpha_rank,
++             metric(beta, rank) as beta_rank }
++}
++
++--- expect ordered
++{"org":"b","beta_rank":1}
++{"org":"c","beta_rank":2}
++
++--- expect shape
++org: String
++alpha_rank: U64?
++beta_rank: U64?
+diff --git a/crates/omnigraph-gqt/src/lib.rs b/crates/omnigraph-gqt/src/lib.rs
+index 52e399ff4acb92bed53ef29aff05f1568472f93b..c816f6e6bc9fd75773cd4f741d68515a06e48a18 100644
+--- a/crates/omnigraph-gqt/src/lib.rs
++++ b/crates/omnigraph-gqt/src/lib.rs
+@@ -34,7 +34,7 @@ use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+ use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
+ use omnigraph::loader::{LoadMode, load_jsonl};
+ use omnigraph_compiler::query::ast::{
+-    BranchStmt, BranchWrite, Clause, Expr, Literal, Param, QueryDecl, QueryFile,
++    BranchStmt, BranchWrite, Clause, Expr, Literal, Param, QueryDecl, QueryFile, ReadStage,
+ };
+ use omnigraph_compiler::query::parser::parse_query;
+ use omnigraph_compiler::query::typecheck::{
+@@ -662,6 +662,7 @@ fn validate_subst_tokens(body: &str, loop_var: Option<&str>) -> Result<(), Strin
+ /// error, never a silent skip.
+ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
+     match expr {
++        Expr::Metric { .. } => {}
+         Expr::Now
+         | Expr::PropAccess {
+             variable: _,
+@@ -756,14 +757,18 @@ fn walk_clauses(
+
+ /// Why `expect ordered` is refused for this declaration, if it is. The
+ /// engine's order is total only where `apply_ordering` appends the `<var>.id`
+-/// tie-breaks (RFC 0045, Comparison semantics): no `order` clause, an
++/// tie-breaks (RFC 0045, Comparison semantics): no explicit or inherited order, an
+ /// `rrf()`-led one (fusion sorts by score alone), or an aggregate in the
+ /// `return` list (group rows carry no `<var>.id`) each fail that condition.
+ /// The tie-break is stable within a run only (ids are minted per load), so
+ /// a case's `order` keys must be total over its rows: an authoring rule the
+ /// parser cannot check.
+ fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
+-    if decl.order_clause.is_empty() {
++    // The staged engine applies the last rank block's explicit output rank
++    // through apply_ordering, including the ordinary binding-ID tie-breaks.
++    // A take stage preserves that order but cannot establish one by itself.
++    let inherited_rank = decl.stages.iter().any(|s| matches!(s, ReadStage::Rank(_)));
++    if decl.order_clause.is_empty() && !inherited_rank {
+         return Some("`expect ordered` is refused for a query without an `order` clause".into());
+     }
+     if matches!(
+@@ -793,6 +798,32 @@ fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
+
+ fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String> {
+     walk_clauses(&decl.match_clause, &decl.params, needs_indices)?;
++    for stage in &decl.stages {
++        match stage {
++            ReadStage::Match(clauses) => walk_clauses(clauses, &decl.params, needs_indices)?,
++            ReadStage::Rank(rank) => {
++                for source in &rank.sources {
++                    for expr in [
++                        &source.field,
++                        &source.terms.text,
++                        &source.terms.max_edits,
++                        &source.candidates,
++                    ] {
++                        walk_expr(expr, &decl.params, needs_indices)?;
++                    }
++                }
++            }
++            ReadStage::Take(take) => {
++                for expr in &take.keys {
++                    walk_expr(expr, &decl.params, needs_indices)?;
++                }
++                for order in &take.order {
++                    walk_expr(&order.expr, &decl.params, needs_indices)?;
++                }
++                walk_expr(&take.limit, &decl.params, needs_indices)?;
++            }
++        }
++    }
+     for projection in &decl.return_clause {
+         walk_expr(&projection.expr, &decl.params, needs_indices)?;
+     }
+@@ -1238,7 +1269,10 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
+                     branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
+                     decl: Box::new(decl.clone()),
+                     ordered_refusal: ordered_refusal(decl),
+-                    expects_expand: expects_expand(&decl.match_clause),
++                    expects_expand: expects_expand(&decl.match_clause)
++                        || decl.stages.iter().any(
++                            |s| matches!(s, ReadStage::Match(clauses) if expects_expand(clauses)),
++                        ),
+                     params_raw: None,
+                 }));
+             }
+diff --git a/crates/omnigraph-gqt/src/tests.rs b/crates/omnigraph-gqt/src/tests.rs
+index 4f7b29717fee07069345fa7584fac4c3665b5ef6..d054b44665d3248deeff4255e9e48b8450196066 100644
+--- a/crates/omnigraph-gqt/src/tests.rs
++++ b/crates/omnigraph-gqt/src/tests.rs
+@@ -665,6 +665,15 @@ fn refuses_file_name_outside_charset() {
+ fn refuses_ordered_expect_without_an_order_clause() {
+     let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect ordered\n{{\"p.name\": \"alice\"}}\n");
+     assert!(refusal("x", &text).contains("order` clause"));
++    let ranked = format!(
++        "{HDR}--- schema\nnode Doc {{ title: String @analyzed }}\n--- seed\n--- query\nquery q() {{ match {{ $d: Doc }} rank $d {{ lexical($d.title, terms(\"alpha\"), candidates: 2) as hits yield hits }} return {{ $d.title }} }}\n--- expect ordered\n--- expect shape\nd.title: String\n"
++    );
++    parse_case("inherited_rank_order", &ranked).unwrap();
++    let take_only = ranked.replace(
++        "rank $d { lexical($d.title, terms(\"alpha\"), candidates: 2) as hits yield hits }",
++        "take $d { per { $d.title } order { $d.title } limit 1 }",
++    );
++    assert!(refusal("take_without_active_order", &take_only).contains("order` clause"));
+ }
+
+ #[test]
+@@ -708,6 +717,15 @@ fn search_construct_sets_the_index_decision() {
+     );
+     let case = parse_case("x", &text).unwrap();
+     assert!(case.needs_indices);
++    // Inspection must reach later graph stages even when an earlier rank
++    // source itself uses the exact scan evaluator. This is a carrier test;
++    // the compiler separately refuses mixing legacy search with rank.
++    let staged = query.replace("        search($d.text, $q)",
++        "    }\n    rank $d { lexical($d.text, terms($q), candidates: 1) as hits yield hits }\n    match { search($d.text, $q)");
++    let text = format!(
++        "{HDR}{schema}--- seed\n{staged}--- params\n{{\"q\":\"needle\"}}\n--- expect error: legacy search\n"
++    );
++    assert!(parse_case("later_search", &text).unwrap().needs_indices);
+ }
+
+ #[test]
+@@ -1438,6 +1456,17 @@ fn expects_expand_ignores_bound_edges_and_plain_bindings() {
+                    return { $a.name }\n}\n";
+     let negated = parse_query(negated).unwrap();
+     assert!(!expects_expand(&negated.single_decl().match_clause));
++    let text = format!(
++        "{HDR}--- schema\nnode Doc {{ title: String @analyzed }}\nnode Tag {{ name: String }}\nedge Tagged: Doc -> Tag\n--- seed\n--- query\nquery staged() {{ match {{ $d: Doc }} rank $d {{ lexical($d.title, terms(\"alpha\"), candidates: 1) as hits yield hits }} match {{ $d tagged $t }} return {{ $t.name }} }}\n--- expect unordered\n--- expect shape\nt.name: String\n"
++    );
++    let case = parse_case("later_traversal", &text).unwrap();
++    let Some(Item::Step(Step::Query(query))) = case.items.first() else {
++        panic!("missing query step")
++    };
++    assert!(
++        query.expects_expand,
++        "traversal after rank must retain its route assertion"
++    );
+ }
+
+ /// A two-node, one-edge graph with a one-hop traversal, for the pin tests.
+diff --git a/crates/omnigraph-server/tests/stored_queries.rs b/crates/omnigraph-server/tests/stored_queries.rs
+index 457f24a58a546f011f886dd1d3b19ec385c51e99..4b07bf89a19227c9444967b3adcc29253c789968 100644
+--- a/crates/omnigraph-server/tests/stored_queries.rs
++++ b/crates/omnigraph-server/tests/stored_queries.rs
+@@ -719,3 +719,299 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
+     assert_eq!(body["affected_nodes"], 1, "body: {body}");
+     assert_receipt_commit_matches_get(&app, &body, "t-full").await;
+ }
++
++/// RFC 0048 transport qualification: GQT cannot exercise HTTP envelopes,
++/// stored invocation, or authorization after a server reopen.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn staged_search_replays_one_snapshot_across_inline_and_stored_reads() {
++    const DISCOVER: &str = r#"
++query discover($q: String, $window: I64) {
++    match { $p: Page }
++    rank $p { lexical($p.title, terms($q), candidates: $window) as pages yield pages }
++    match { $p $e:contains $s }
++    take $s { per { $p.slug } order { $s.slug } limit 1 }
++    return { $p as page, $s as section, $e.slot as path,
++             metric(pages, rank) as source_rank, metric(pages, score) as source_score }
++    order { metric(pages, rank), $p.slug, $s.slug, $e.slot }
++}
++"#;
++    const FOLLOW: &str = r#"
++query follow($page: String, $section: String) {
++    match { $p: Page { slug: $page } $p $e:contains $s $s.slug = $section }
++    return { $p as page, $s as section, $e.slot as path }
++    order { $e.slot }
++}
++"#;
++    const REVISE: &str = r#"
++query revise() {
++    update Page set { title: "beta" } where slug = "guide"
++    update Section set { text: "revised source" } where slug = "first"
++}
++"#;
++    const PRUNE: &str = r#"query prune() { delete Contains where slot = "duplicate" }"#;
++    fn read_request(
++        stored: bool,
++        name: &str,
++        source: &str,
++        mut body: Value,
++        token: &str,
++    ) -> axum::http::Request<Body> {
++        if stored {
++            invoke_request(name, token, body)
++        } else {
++            body["query"] = json!(source);
++            axum::http::Request::builder()
++                .uri(g("/query"))
++                .method(axum::http::Method::POST)
++                .header("content-type", "application/json")
++                .header("authorization", format!("Bearer {token}"))
++                .body(Body::from(serde_json::to_vec(&body).unwrap()))
++                .unwrap()
++        }
++    }
++
++    let temp = init_graph_with_schema_and_data(
++        r#"
++node Page { slug: String @key title: String @analyzed }
++node Section { slug: String @key text: String }
++edge Contains: Page -> Section { slot: String @key(src, dst, slot) }
++"#,
++        r#"
++{"type":"Page","data":{"slug":"guide","title":"alpha alpha"}}
++{"type":"Page","data":{"slug":"other","title":"beta"}}
++{"type":"Section","data":{"slug":"first","text":"original source"}}
++{"type":"Section","data":{"slug":"second","text":"second source"}}
++{"edge":"Contains","from":"guide","to":"first","data":{"slot":"direct"}}
++{"edge":"Contains","from":"guide","to":"first","data":{"slot":"duplicate"}}
++{"edge":"Contains","from":"guide","to":"second","data":{"slot":"second"}}
++{"edge":"Contains","from":"other","to":"second","data":{"slot":"other"}}
++"#,
++    )
++    .await;
++    let graph = graph_path(temp.path());
++    let policy_path = temp.path().join("policy.yaml");
++    std::fs::write(&policy_path, INVOKE_POLICY_YAML).unwrap();
++    let registry = || {
++        stored_query_registry(&[
++            ("discover", DISCOVER, true),
++            ("follow", FOLLOW, true),
++            ("revise", REVISE, false),
++            ("prune", PRUNE, false),
++        ])
++    };
++    let tokens = || {
++        vec![
++            ("act-invoke".into(), "t-invoke".into()),
++            ("act-full".into(), "t-full".into()),
++        ]
++    };
++    let state = AppState::open_single_with_queries(
++        graph.to_string_lossy().to_string(),
++        tokens(),
++        Some(&policy_path),
++        registry(),
++    )
++    .await
++    .unwrap();
++    let app = omnigraph_server::build_app(state);
++    let search_params = json!({"q":"ALPHA", "window":1});
++    let (status, discovered) = json_response(
++        &app,
++        invoke_request("discover", "t-invoke", json!({"params":search_params})),
++    )
++    .await;
++    assert_eq!(status, StatusCode::OK, "{discovered}");
++    assert_eq!(
++        discovered["row_count"], 2,
++        "one selected pair retains both paths"
++    );
++    assert_eq!(discovered["rows"][0]["path"], "direct");
++    assert_eq!(discovered["rows"][1]["path"], "duplicate");
++    for row in discovered["rows"].as_array().unwrap() {
++        assert_eq!(row["source_rank"], 1);
++        assert!(row["source_score"].as_f64().unwrap() > 0.0);
++    }
++    let old_head = discovered["graph_commit_id"]
++        .as_str()
++        .expect("replay identity from the same read")
++        .to_owned();
++    // RFC 0040's meta-field lookup is not in this integration prototype.
++    // Exercise the existing key lookup; retain returned node identities to
++    // prove the follow-up still identifies the same graph entities.
++    let page_id = discovered["rows"][0]["page"]["id"].as_str().unwrap();
++    let section_id = discovered["rows"][0]["section"]["id"].as_str().unwrap();
++    assert!(!page_id.is_empty() && !section_id.is_empty());
++    let follow_params = json!({"page":discovered["rows"][0]["page"]["slug"], "section":discovered["rows"][0]["section"]["slug"]});
++    for stored in [false, true] {
++        let (status, equivalent) = json_response(
++            &app,
++            read_request(
++                stored,
++                "discover",
++                DISCOVER,
++                json!({"params":search_params}),
++                "t-invoke",
++            ),
++        )
++        .await;
++        assert_eq!(status, StatusCode::OK, "{equivalent}");
++        assert_eq!(
++            equivalent, discovered,
++            "both carriers must expose the same result and head"
++        );
++    }
++
++    // Change both source tables, then separately delete a path: the language
++    // intentionally separates constructive and destructive mutations. The
++    // live answer must differ before an old-snapshot assertion proves replay.
++    let (status, revised) =
++        json_response(&app, invoke_request("revise", "t-full", json!({}))).await;
++    assert_eq!(status, StatusCode::OK, "{revised}");
++    let revised_head = revised["commit"]["graph_commit_id"].as_str().unwrap();
++    assert_ne!(revised_head, old_head);
++    let (status, pruned) = json_response(&app, invoke_request("prune", "t-full", json!({}))).await;
++    assert_eq!(status, StatusCode::OK, "{pruned}");
++    let new_head = pruned["commit"]["graph_commit_id"]
++        .as_str()
++        .unwrap()
++        .to_owned();
++    assert_ne!(new_head, old_head);
++    assert_ne!(new_head, revised_head);
++    drop(app);
++    let state = AppState::open_single_with_queries(
++        graph.to_string_lossy().to_string(),
++        tokens(),
++        Some(&policy_path),
++        registry(),
++    )
++    .await
++    .unwrap();
++    let app = omnigraph_server::build_app(state);
++    for stored in [false, true] {
++        for pinned in [false, true] {
++            let snapshot = pinned.then_some(old_head.as_str());
++            let expected_head = if pinned { &old_head } else { &new_head };
++            let (status, found) = json_response(
++                &app,
++                read_request(
++                    stored,
++                    "discover",
++                    DISCOVER,
++                    json!({"params":search_params,"snapshot":snapshot}),
++                    "t-invoke",
++                ),
++            )
++            .await;
++            assert_eq!(status, StatusCode::OK, "{found}");
++            assert_eq!(found["graph_commit_id"], expected_head.as_str());
++            assert_eq!(found["target"]["snapshot"], json!(snapshot));
++            assert_eq!(
++                found["rows"],
++                if pinned {
++                    discovered["rows"].clone()
++                } else {
++                    json!([])
++                }
++            );
++            let (status, source) = json_response(
++                &app,
++                read_request(
++                    stored,
++                    "follow",
++                    FOLLOW,
++                    json!({"params":follow_params,"snapshot":snapshot}),
++                    "t-invoke",
++                ),
++            )
++            .await;
++            assert_eq!(status, StatusCode::OK, "{source}");
++            assert_eq!(source["graph_commit_id"], expected_head.as_str());
++            let expected_rows = if pinned {
++                json!([
++                    {"page":{"id":page_id,"slug":"guide","title":"alpha alpha"},"section":{"id":section_id,"slug":"first","text":"original source"},"path":"direct"},
++                    {"page":{"id":page_id,"slug":"guide","title":"alpha alpha"},"section":{"id":section_id,"slug":"first","text":"original source"},"path":"duplicate"}
++                ])
++            } else {
++                json!([{"page":{"id":page_id,"slug":"guide","title":"beta"},"section":{"id":section_id,"slug":"first","text":"revised source"},"path":"direct"}])
++            };
++            assert_eq!(source["rows"], expected_rows);
++        }
++        for (extra, expected_status) in [
++            (
++                json!({"params":search_params,"snapshot":"missing-snapshot"}),
++                StatusCode::NOT_FOUND,
++            ),
++            (
++                json!({"params":search_params,"snapshot":old_head,"branch":"main"}),
++                StatusCode::BAD_REQUEST,
++            ),
++            (
++                json!({"params":{"q":"alpha","window":0}}),
++                StatusCode::BAD_REQUEST,
++            ),
++            (
++                json!({"params":{"q":"x".repeat(4097),"window":1}}),
++                StatusCode::PAYLOAD_TOO_LARGE,
++            ),
++        ] {
++            let (status, error) = json_response(
++                &app,
++                read_request(stored, "discover", DISCOVER, extra, "t-invoke"),
++            )
++            .await;
++            assert_eq!(status, expected_status, "{error}");
++            assert!(
++                error.get("rows").is_none(),
++                "a refusal cannot return successful partial rows: {error}"
++            );
++            if status == StatusCode::PAYLOAD_TOO_LARGE {
++                assert_eq!(error["resource_limit"]["limit"], 4096);
++                assert_eq!(error["resource_limit"]["actual"], 4097);
++            }
++        }
++    }
++
++    // Revoke the actor's read permission while retaining invoke_query. A
++    // previously issued snapshot identifies data; it does not grant access.
++    drop(app);
++    std::fs::write(
++        &policy_path,
++        r#"
++version: 1
++groups:
++  invokers: [act-invoke]
++protected_branches: [main]
++rules:
++  - id: invoke-only
++    allow:
++      actors: {group: invokers}
++      actions: [invoke_query]
++"#,
++    )
++    .unwrap();
++    let state = AppState::open_single_with_queries(
++        graph.to_string_lossy().to_string(),
++        tokens(),
++        Some(&policy_path),
++        registry(),
++    )
++    .await
++    .unwrap();
++    let app = omnigraph_server::build_app(state);
++    for stored in [false, true] {
++        let (status, error) = json_response(
++            &app,
++            read_request(
++                stored,
++                "follow",
++                FOLLOW,
++                json!({"params":follow_params,"snapshot":old_head}),
++                "t-invoke",
++            ),
++        )
++        .await;
++        assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
++        assert_eq!(error["code"], "forbidden");
++        assert!(error.get("rows").is_none());
++    }
++}
+diff --git a/crates/omnigraph/Cargo.toml b/crates/omnigraph/Cargo.toml
+index 3f9d5413dbb32e9f41e07f2aa13004967207c488..c1ca3abbdf6c798f4402863c01cc7ef1e43088f0 100644
+--- a/crates/omnigraph/Cargo.toml
++++ b/crates/omnigraph/Cargo.toml
+@@ -72,6 +72,7 @@ async-trait = { workspace = true }
+ url = { workspace = true }
+ chrono = { workspace = true }
+ arc-swap = { workspace = true }
++libm = "=0.2.16"
+
+ [dev-dependencies]
+ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.10.0" }
+diff --git a/crates/omnigraph/src/exec/projection.rs b/crates/omnigraph/src/exec/projection.rs
+index 3173b4ce8c1c846ba84566bc7782307c1cd5984d..0a073a42ef8cccccf6fa673cb3bc7848661386ac 100644
+--- a/crates/omnigraph/src/exec/projection.rs
++++ b/crates/omnigraph/src/exec/projection.rs
+@@ -49,7 +49,7 @@ fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
+             } => {
+                 out.insert(dst_var.clone(), dst_type.clone());
+             }
+-            IROp::Filter(_) => {}
++            IROp::Filter(_) | IROp::Rank(_) | IROp::Take(_) => {}
+             IROp::AntiJoin {
+                 outer_var: _,
+                 inner,
+@@ -114,6 +114,10 @@ fn evaluate_filter(
+ /// Evaluate an IR expression against a wide batch, producing an array.
+ fn evaluate_expr(batch: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> Result<ArrayRef> {
+     match expr {
++        IRExpr::Metric { source, kind } => batch
++            .column_by_name(&source.column(*kind))
++            .cloned()
++            .ok_or_else(|| OmniError::manifest_internal("metric column absent")),
+         IRExpr::PropAccess { variable, property } => {
+             let col_name = format!("{}.{}", variable, property);
+             batch.column_by_name(&col_name).cloned().ok_or_else(|| {
+@@ -435,7 +439,7 @@ pub(super) fn project_return(
+         fields.push(Field::new(
+             field_name,
+             col.data_type().clone(),
+-            col.null_count() > 0,
++            matches!(proj.expr, IRExpr::Metric { .. }) || col.null_count() > 0,
+         ));
+         columns.push(col);
+     }
+@@ -452,6 +456,12 @@ fn evaluate_projection(
+     ctx: &ProjectionContext<'_>,
+ ) -> Result<(String, ArrayRef)> {
+     match expr {
++        IRExpr::Metric { source, kind } => {
++            let col = wide_batch
++                .column_by_name(&source.column(*kind))
++                .ok_or_else(|| OmniError::manifest_internal("metric column absent"))?;
++            Ok((format!("metric({},{})", source.0, kind.name()), col.clone()))
++        }
+         IRExpr::PropAccess { variable, property } => {
+             let col_name = format!("{}.{}", variable, property);
+             let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
+@@ -523,6 +533,13 @@ pub(super) fn apply_ordering(
+
+     for ordering in orderings {
+         let col = match &ordering.expr {
++            IRExpr::Metric {
++                source: metric_source,
++                kind,
++            } => source
++                .column_by_name(&metric_source.column(*kind))
++                .cloned()
++                .ok_or_else(|| OmniError::manifest_internal("ordering metric column absent"))?,
+             IRExpr::PropAccess { variable, property } => {
+                 let col_name = format!("{}.{}", variable, property);
+                 source
+diff --git a/crates/omnigraph/src/exec/query.rs b/crates/omnigraph/src/exec/query.rs
+index a386e04f0dcc737dcb247d04066c2f76773b54d5..5cc9ef30dc91e82ada740e4fe53ec3c0a33d3d32 100644
+--- a/crates/omnigraph/src/exec/query.rs
++++ b/crates/omnigraph/src/exec/query.rs
+@@ -1,5 +1,7 @@
+ use super::*;
+
++mod staged;
++
+ use super::projection::{
+     apply_filter, apply_ordering, project_return, projections_have_aggregates,
+ };
+@@ -712,6 +714,8 @@ pub async fn execute_query(
+     }
+     let params = resolved_params.as_ref().unwrap_or(params);
+
++    let mut staged_budget = staged::admit(ir, params)?;
++
+     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
+
+     // Every large future awaited here is boxed: this function's state is
+@@ -764,6 +768,7 @@ pub async fn execute_query(
+         graph_index,
+         catalog,
+         &search_mode,
++        staged_budget.as_mut(),
+     ))
+     .await?;
+
+@@ -793,6 +798,7 @@ pub async fn execute_query(
+             graph_index,
+             catalog,
+             &uncapped,
++            staged_budget.as_mut(),
+         ))
+         .await?;
+         return Ok(QueryResult::new(retried.schema(), vec![retried]));
+@@ -854,6 +860,7 @@ pub async fn execute_query(
+                     graph_index,
+                     catalog,
+                     &wider,
++                    staged_budget.as_mut(),
+                 ))
+                 .await?;
+                 result_batch = retried;
+@@ -893,6 +900,7 @@ async fn execute_query_once(
+     graph_index: &GraphIndexHandle<'_>,
+     catalog: &Catalog,
+     search_mode: &SearchMode,
++    staged_budget: Option<&mut staged::Budget>,
+ ) -> Result<(RecordBatch, ScanReport)> {
+     let has_aggregates = projections_have_aggregates(&ir.return_exprs);
+
+@@ -924,9 +932,30 @@ async fn execute_query_once(
+         &mut scan_report,
+         final_expand_cap,
+         &needed_columns,
++        staged_budget,
+     )
+     .await?;
+-    let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
++    let mut wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
++    if ir.order_by.is_empty() && !has_aggregates {
++        if let Some(source) = ir.pipeline.iter().rev().find_map(|op| match op {
++            IROp::Rank(rank) => Some(&rank.output),
++            _ => None,
++        }) {
++            wide_batch = apply_ordering(
++                wide_batch.clone(),
++                &[IROrdering {
++                    expr: IRExpr::Metric {
++                        source: source.clone(),
++                        kind: omnigraph_compiler::query::ast::MetricKind::Rank,
++                    },
++                    descending: false,
++                }],
++                &wide_batch,
++                params,
++                None,
++            )?;
++        }
++    }
+     let mut result_batch = project_return(
+         &wide_batch,
+         &ir.return_exprs,
+@@ -1146,7 +1175,11 @@ fn rrf_gate_expand_sources<'a>(
+                     sources.push((edge_type.as_str(), *direction));
+                 }
+             }
+-            IROp::NodeScan { .. } | IROp::Filter(_) | IROp::AntiJoin { .. } => {}
++            IROp::NodeScan { .. }
++            | IROp::Filter(_)
++            | IROp::AntiJoin { .. }
++            | IROp::Rank(_)
++            | IROp::Take(_) => {}
+         }
+     }
+     if introduced_by_scan && !sources.is_empty() {
+@@ -1597,6 +1630,7 @@ async fn execute_rrf_fusion(
+         &mut ScanReport::default(),
+         None,
+         &needed_columns,
++        None,
+     )
+     .await?;
+
+@@ -1612,6 +1646,7 @@ async fn execute_rrf_fusion(
+         &mut ScanReport::default(),
+         None,
+         &needed_columns,
++        None,
+     )
+     .await?;
+
+@@ -1816,6 +1851,7 @@ fn search_filter_variable(filter: &IRFilter) -> Option<&str> {
+ /// Collect every binding variable referenced by an expression into `vars`.
+ fn collect_expr_variables(expr: &IRExpr, vars: &mut HashSet<String>) {
+     match expr {
++        IRExpr::Metric { .. } => {}
+         IRExpr::PropAccess { variable, .. } => {
+             vars.insert(variable.clone());
+         }
+@@ -1960,6 +1996,24 @@ fn collect_pipeline_columns(pipeline: &[IROp], needed: &mut HashMap<String, Need
+         // An unwalked reference prunes a column something still reads, which
+         // the `All` fail-open cannot catch.
+         match op {
++            IROp::Rank(rank) => {
++                record_prop(needed, &rank.target, "id");
++                for source in &rank.sources {
++                    collect_expr_columns(&source.text, needed);
++                    collect_expr_columns(&source.max_edits, needed);
++                    collect_expr_columns(&source.candidates, needed);
++                }
++            }
++            IROp::Take(take) => {
++                record_prop(needed, &take.target, "id");
++                for key in &take.keys {
++                    collect_expr_columns(key, needed);
++                }
++                for order in &take.order {
++                    collect_expr_columns(&order.expr, needed);
++                }
++                collect_expr_columns(&take.limit, needed);
++            }
+             IROp::NodeScan {
+                 variable: _,
+                 type_name: _,
+@@ -2013,6 +2067,7 @@ fn record_prop(needed: &mut HashMap<String, NeededColumns>, variable: &str, prop
+
+ fn collect_expr_columns(expr: &IRExpr, needed: &mut HashMap<String, NeededColumns>) {
+     match expr {
++        IRExpr::Metric { .. } => {}
+         IRExpr::PropAccess { variable, property } => record_prop(needed, variable, property),
+         // Fail open — see `NeededColumns::All`.
+         IRExpr::Variable(variable) => {
+@@ -2098,8 +2153,70 @@ fn execute_pipeline<'a>(
+     // always pass `None`.
+     final_expand_cap: Option<usize>,
+     needed_columns: &'a HashMap<String, NeededColumns>,
++    staged_budget: Option<&'a mut staged::Budget>,
+ ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+     Box::pin(async move {
++        if pipeline
++            .iter()
++            .any(|op| matches!(op, IROp::Rank(_) | IROp::Take(_)))
++        {
++            let mut start = 0;
++            let budget = staged_budget
++                .ok_or_else(|| OmniError::manifest_internal("staged pipeline was not admitted"))?;
++            for (i, op) in pipeline.iter().enumerate() {
++                if !matches!(op, IROp::Rank(_) | IROp::Take(_)) {
++                    continue;
++                }
++                execute_pipeline(
++                    &pipeline[start..i],
++                    params,
++                    snapshot,
++                    graph_index,
++                    catalog,
++                    wide,
++                    search_mode,
++                    scan_report,
++                    None,
++                    needed_columns,
++                    None,
++                )
++                .await?;
++                let batch = wide.as_mut().ok_or_else(|| {
++                    OmniError::manifest_internal("selection has no incoming relation")
++                })?;
++                budget.relation(batch)?;
++                match op {
++                    IROp::Rank(rank) => staged::rank(batch, rank, params, snapshot, budget).await?,
++                    IROp::Take(take) => staged::take(batch, take, params, budget).await?,
++                    _ => unreachable!(),
++                }
++                start = i + 1;
++            }
++            execute_pipeline(
++                &pipeline[start..],
++                params,
++                snapshot,
++                graph_index,
++                catalog,
++                wide,
++                search_mode,
++                scan_report,
++                None,
++                needed_columns,
++                None,
++            )
++            .await?;
++            if start < pipeline.len()
++                && let Some(batch) = wide.as_ref()
++            {
++                // The final graph segment has no following rank/take to
++                // account for it. Final projection/limit cannot erase its
++                // intermediate resource use. This remains post-decode
++                // admission; graph allocation peaks need earlier ownership.
++                budget.relation(batch)?;
++            }
++            return Ok(());
++        }
+         // Pre-pass: hoist filters onto the op that introduces their binding.
+         // Search filters always move to the binding's NodeScan (applied via
+         // `scanner.full_text_search`). Scalar filters referencing exactly one
+@@ -2123,7 +2240,7 @@ fn execute_pipeline<'a>(
+                 IROp::Expand { dst_var, .. } => {
+                     expand_dst_vars.insert(dst_var.as_str());
+                 }
+-                IROp::Filter(_) | IROp::AntiJoin { .. } => {}
++                IROp::Filter(_) | IROp::AntiJoin { .. } | IROp::Rank(_) | IROp::Take(_) => {}
+             }
+         }
+
+@@ -2180,6 +2297,9 @@ fn execute_pipeline<'a>(
+                 continue;
+             }
+             match op {
++                IROp::Rank(_) | IROp::Take(_) => {
++                    unreachable!("selection barriers were split before graph optimization")
++                }
+                 IROp::NodeScan {
+                     variable,
+                     type_name,
+@@ -2327,7 +2447,7 @@ fn collect_referenced_edge_names(pipeline: &[IROp], out: &mut std::collections::
+             // force a compile error here rather than silently under-scope the CSR
+             // build — an omitted edge would fail at runtime with "no adjacency
+             // index for edge". The non-traversal ops reference no edges.
+-            IROp::NodeScan { .. } | IROp::Filter(_) => {}
++            IROp::NodeScan { .. } | IROp::Filter(_) | IROp::Rank(_) | IROp::Take(_) => {}
+         }
+     }
+ }
+@@ -4175,6 +4295,7 @@ async fn execute_anti_join(
+         &mut ScanReport::default(),
+         None,
+         needed_columns,
++        None,
+     )
+     .await?;
+
+@@ -6091,6 +6212,34 @@ mod needed_columns_tests {
+         );
+         let needed = collect_needed_columns(&q);
+         assert_columns(&needed, "c", &["slug", "title", "probe", "edits", "k_ref"]);
++
++        let schema = omnigraph_compiler::schema::parser::parse_schema(
++            "node Parent { slug: String title: String @analyzed } node Child { slug: String title: String @analyzed severity: I64 } edge HasChild: Parent -> Child"
++        ).unwrap();
++        let catalog = omnigraph_compiler::catalog::build_catalog(&schema).unwrap();
++        let query = omnigraph_compiler::query::parser::parse_query(r#"
++            query later_reads() {
++                match { $p: Parent }
++                rank $p {
++                    lexical($p.title, terms("alpha"), candidates: 2) as parents
++                    lexical($p.title, terms("beta"), candidates: 1) as unused
++                    yield parents
++                }
++                match { $p hasChild $c }
++                rank $c { lexical($c.title, terms("alpha"), candidates: 2) as children yield children }
++                take $c { per { $p.slug } order { $c.severity } limit 1 }
++                return { $p.slug }
++            }
++        "#).unwrap();
++        let ctx =
++            omnigraph_compiler::query::typecheck::typecheck_query(&catalog, query.single_decl())
++                .unwrap();
++        let ir = omnigraph_compiler::lower_query(&catalog, query.single_decl(), &ctx).unwrap();
++        let needed = collect_needed_columns(&ir);
++        assert_columns(&needed, "p", &["id", "slug"]);
++        assert_columns(&needed, "c", &["id", "severity"]);
++        // The scorer reads title in its own pinned corpus scan. It must not
++        // force that payload into the incoming graph relation as well.
+     }
+
+     #[test]
+diff --git a/crates/omnigraph/src/exec/query/staged.rs b/crates/omnigraph/src/exec/query/staged.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..328d2587bf05a50137e6fa6a3498923c36cde445
+--- /dev/null
++++ b/crates/omnigraph/src/exec/query/staged.rs
+@@ -0,0 +1,790 @@
++//! Executable reference path for RFC 0048 integration. This bounded small-corpus
++//! experiment deliberately performs exact row scoring. It does not qualify an
++//! indexed scorer, global decode/RSS admission, or an optimized physical plan.
++use super::*;
++use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
++use datafusion::execution::memory_pool::{
++    FairSpillPool, MemoryConsumer, MemoryPool, MemoryReservation,
++};
++use datafusion::execution::runtime_env::RuntimeEnvBuilder;
++use datafusion::functions_window::rank::dense_rank;
++use datafusion::logical_expr::ExprFunctionExt;
++use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
++use lance_index::scalar::InvertedIndexParams;
++use omnigraph_compiler::ir::{LexicalIR, RankIR, SourceId, TakeIR};
++use omnigraph_compiler::query::ast::{MetricKind, TermMode};
++use std::collections::BTreeMap;
++use unicode_normalization::UnicodeNormalization;
++
++pub(super) struct Budget {
++    input_bytes: u64,
++    work: u64,
++    edit_cells_since_yield: usize,
++    query_terms: HashMap<SourceId, Arc<BTreeMap<String, u64>>>,
++    session: SessionContext,
++    resident: MemoryReservation,
++}
++
++pub(super) fn admit(ir: &QueryIR, params: &ParamMap) -> Result<Option<Budget>> {
++    if !ir
++        .pipeline
++        .iter()
++        .any(|op| matches!(op, IROp::Rank(_) | IROp::Take(_)))
++    {
++        return Ok(None);
++    }
++    let mut budget = Budget::new()?;
++    for op in &ir.pipeline {
++        match op {
++            IROp::Rank(rank) => {
++                for source in &rank.sources {
++                    integer(&source.candidates, params, 1, 10_000, "candidates")?;
++                    integer(&source.max_edits, params, 0, 2, "max_edits")?;
++                    let Literal::String(text) = literal(&source.text, params)? else {
++                        return Err(OmniError::manifest("terms text must be a String"));
++                    };
++                    let prepared = terms(text, &mut budget)?;
++                    if prepared.is_empty() {
++                        return Err(OmniError::manifest(
++                            "terms query contains no searchable terms",
++                        ));
++                    }
++                    budget
++                        .query_terms
++                        .insert(source.source.clone(), Arc::new(prepared));
++                }
++            }
++            IROp::Take(take) => {
++                integer(&take.limit, params, 0, i64::MAX as u64, "take limit")?;
++            }
++            _ => {}
++        }
++    }
++    Ok(Some(budget))
++}
++
++impl Budget {
++    pub(super) fn new() -> Result<Self> {
++        Self::with_memory(128 * 1024 * 1024, 4)
++    }
++
++    fn with_memory(memory_bytes: usize, partitions: usize) -> Result<Self> {
++        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(memory_bytes));
++        let resident = MemoryConsumer::new("staged binding relation").register(&pool);
++        let runtime = RuntimeEnvBuilder::new()
++            .with_memory_pool(pool)
++            // No-write means Disabled, not a zero after-write disk limit.
++            .with_disk_manager_builder(
++                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
++            )
++            .build_arc()
++            .map_err(OmniError::datafusion)?;
++        let config = SessionConfig::new()
++            .with_target_partitions(partitions)
++            .with_batch_size(256)
++            .with_sort_spill_reservation_bytes((memory_bytes / 8).min(1024 * 1024));
++        Ok(Self {
++            input_bytes: 0,
++            work: 0,
++            edit_cells_since_yield: 0,
++            query_terms: HashMap::new(),
++            session: SessionContext::new_with_config_rt(config, runtime),
++            resident,
++        })
++    }
++
++    pub(super) fn relation(&mut self, batch: &RecordBatch) -> Result<()> {
++        if batch.num_rows() > 100_000 {
++            return Err(OmniError::resource_limit(
++                "integration binding rows",
++                100_000,
++                batch.num_rows() as u64,
++            ));
++        }
++        // This accounts for the retained relation while DF operators use the
++        // same pool. Repeated views replace this live reservation rather than
++        // accumulating the backing allocation as processed input. It does not
++        // retroactively bound graph read/decode peaks.
++        self.resident
++            .try_resize(batch.get_array_memory_size())
++            .map_err(OmniError::datafusion)
++    }
++    fn charge(&mut self, input_bytes: u64, work: u64) -> Result<()> {
++        // Cumulative UTF-8 query/document/identity input, not Arrow capacity
++        // or a resident-memory estimate. Repeated source reads spend it again.
++        self.input_bytes = self.input_bytes.saturating_add(input_bytes);
++        self.work = self.work.saturating_add(work);
++        if self.input_bytes > 16 * 1024 * 1024 {
++            return Err(OmniError::resource_limit(
++                "integration cumulative lexical input bytes",
++                16 * 1024 * 1024,
++                self.input_bytes,
++            ));
++        }
++        if self.work > 50_000_000 {
++            return Err(OmniError::resource_limit(
++                "integration lexical work",
++                50_000_000,
++                self.work,
++            ));
++        }
++        Ok(())
++    }
++}
++
++fn literal<'a>(expr: &'a IRExpr, params: &'a ParamMap) -> Result<&'a Literal> {
++    match expr {
++        IRExpr::Literal(value) => Ok(value),
++        IRExpr::Param(name) => params
++            .get(name)
++            .ok_or_else(|| OmniError::manifest(format!("missing parameter {name}"))),
++        _ => Err(OmniError::manifest_internal(
++            "admitted bound is not a literal or parameter",
++        )),
++    }
++}
++
++fn integer(expr: &IRExpr, params: &ParamMap, min: u64, max: u64, name: &str) -> Result<usize> {
++    match literal(expr, params)? {
++        Literal::Integer(n) if *n >= 0 && (*n as u64) >= min && (*n as u64) <= max => {
++            usize::try_from(*n)
++                .map_err(|_| OmniError::manifest(format!("{name} exceeds machine capacity")))
++        }
++        _ => Err(OmniError::manifest(format!(
++            "{name} must be an integer in {min}..={max}"
++        ))),
++    }
++}
++
++fn terms(text: &str, budget: &mut Budget) -> Result<BTreeMap<String, u64>> {
++    // Bound the whole input before NFC: one normalizer.next() can consume an
++    // entire combining sequence. This small experiment rejects large fields.
++    if text.len() > 4096 {
++        return Err(OmniError::resource_limit(
++            "integration lexical input bytes",
++            4096,
++            text.len() as u64,
++        ));
++    }
++    budget.charge(text.len() as u64, text.len() as u64)?;
++    let normalized: String = text.nfc().collect();
++    let params = InvertedIndexParams::default()
++        .base_tokenizer("simple".into())
++        .language("English")
++        .map_err(OmniError::lance_internal)?
++        .lower_case(true)
++        .stem(false)
++        .remove_stop_words(false)
++        .ascii_folding(false)
++        .max_token_length(None);
++    let mut tokenizer = params.build().map_err(OmniError::lance_internal)?;
++    let mut stream = tokenizer.token_stream_for_doc(&normalized);
++    let mut result = BTreeMap::new();
++    while stream.advance() {
++        *result.entry(stream.token().text.clone()).or_default() += 1;
++    }
++    Ok(result)
++}
++
++async fn distance(a: &str, b: &str, budget: &mut Budget) -> Result<usize> {
++    let a: Vec<_> = a.chars().collect();
++    let b: Vec<_> = b.chars().collect();
++    budget.charge(0, (a.len() as u64 + 1) * (b.len() as u64 + 1))?;
++    let mut previous: Vec<_> = (0..=b.len()).collect();
++    let mut next = vec![0; b.len() + 1];
++    for (i, ac) in a.iter().enumerate() {
++        next[0] = i + 1;
++        let mut start = 0;
++        while start < b.len() {
++            // A fixed DP-cell quantum spans token pairs and source stages.
++            // This bounds work between Pending returns in this primitive;
++            // it does not promise scheduler fairness or request cancellation.
++            let end = (start + 4096 - budget.edit_cells_since_yield).min(b.len());
++            for j in start..end {
++                next[j + 1] = (previous[j + 1] + 1)
++                    .min(next[j] + 1)
++                    .min(previous[j] + usize::from(*ac != b[j]));
++            }
++            budget.edit_cells_since_yield += end - start;
++            start = end;
++            if budget.edit_cells_since_yield == 4096 {
++                budget.edit_cells_since_yield = 0;
++                tokio::task::yield_now().await;
++            }
++        }
++        std::mem::swap(&mut previous, &mut next);
++    }
++    Ok(previous[b.len()])
++}
++
++async fn term_alternatives(
++    query_term: &str,
++    documents: &[(String, BTreeMap<String, u64>)],
++    edits: usize,
++    budget: &mut Budget,
++) -> Result<Vec<Vec<(f64, usize)>>> {
++    let mut alternatives = Vec::with_capacity(documents.len());
++    // One source/query-term owns these comparisons. Repeated documents do not
++    // repeat DP matrices, and the cache cannot outlive this accepted corpus.
++    let mut distances: HashMap<&str, usize> = HashMap::new();
++    for (_, tokens) in documents {
++        let mut found = Vec::new();
++        if edits == 0 {
++            // Conservative lookup work: no more than one key comparison per
++            // entry, each bounded by query length. No edit matrix is needed.
++            budget.charge(0, ((query_term.len() + 1) * (tokens.len() + 1)) as u64)?;
++            if let Some(count) = tokens.get(query_term) {
++                found.push((*count as f64, 0));
++            }
++        } else {
++            for (term, count) in tokens {
++                budget.charge(0, term.len() as u64 + 1)?;
++                let edit = if let Some(edit) = distances.get(term.as_str()) {
++                    *edit
++                } else {
++                    let edit = distance(query_term, term, budget).await?;
++                    distances.insert(term.as_str(), edit);
++                    edit
++                };
++                if edit <= edits {
++                    found.push((*count as f64, edit));
++                }
++            }
++        }
++        alternatives.push(found);
++        // Cached/exact paths must cooperate too, even when no DP cell runs.
++        tokio::task::yield_now().await;
++    }
++    Ok(alternatives)
++}
++
++pub(super) async fn rank(
++    wide: &mut RecordBatch,
++    rank: &RankIR,
++    params: &ParamMap,
++    snapshot: &Snapshot,
++    budget: &mut Budget,
++) -> Result<()> {
++    // All sources see the same incoming binding rows. Adding metric columns
++    // does not select a population; only the explicit output does that.
++    for source in &rank.sources {
++        lexical(wide, source, params, snapshot, budget).await?;
++        budget.relation(wide)?;
++    }
++    let membership = wide
++        .column_by_name(&rank.output.column(MetricKind::Rank))
++        .ok_or_else(|| OmniError::manifest_internal("rank output metric absent"))?;
++    let kept = UInt32Array::from_iter_values(
++        (0..wide.num_rows())
++            .filter(|i| membership.is_valid(*i))
++            .map(|i| i as u32),
++    );
++    *wide = take_batch(wide, &kept)?;
++    budget.relation(wide)?;
++    Ok(())
++}
++
++async fn lexical(
++    wide: &mut RecordBatch,
++    source: &LexicalIR,
++    params: &ParamMap,
++    snapshot: &Snapshot,
++    budget: &mut Budget,
++) -> Result<()> {
++    let k = integer(&source.candidates, params, 1, 10_000, "candidates")?;
++    let edits = integer(&source.max_edits, params, 0, 2, "max_edits")?;
++    let query_terms = budget
++        .query_terms
++        .get(&source.source)
++        .cloned()
++        .ok_or_else(|| OmniError::manifest_internal("lexical source was not admitted"))?;
++    let ds = snapshot
++        .open_lance_dataset(&format!("node:{}", source.type_name))
++        .await?;
++    let mut documents = Vec::new();
++    let mut stream = crate::table_store::TableStore::scan_stream_bounded(
++        &ds,
++        Some(&["id", &source.property]),
++        None,
++        None,
++        false,
++        256,
++        65536,
++    )
++    .await?;
++    let scan_memory = MemoryConsumer::new("staged lexical scan buffers")
++        .register(&budget.session.runtime_env().memory_pool);
++    while let Some(batch) = stream.try_next().await.map_err(OmniError::lance_stream)? {
++        // Adjacent batches may share a much larger backing allocation. Charge
++        // the consumed batch as live memory, not cumulative processed bytes.
++        // Native prefetch/decode before this point is still outside admission.
++        scan_memory
++            .try_resize(batch.get_array_memory_size())
++            .map_err(OmniError::datafusion)?;
++        budget.charge(0, batch.num_rows() as u64)?;
++        let ids = batch
++            .column_by_name("id")
++            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
++            .ok_or_else(|| OmniError::manifest_internal("lexical identity column missing"))?;
++        let values = batch
++            .column_by_name(&source.property)
++            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
++            .ok_or_else(|| OmniError::manifest_internal("lexical String field missing"))?;
++        for row in 0..batch.num_rows() {
++            if values.is_null(row) {
++                continue;
++            }
++            let analyzed = terms(values.value(row), budget)?;
++            if !analyzed.is_empty() {
++                budget.charge(ids.value(row).len() as u64, 0)?;
++                documents.push((ids.value(row).to_string(), analyzed));
++            }
++        }
++        tokio::task::yield_now().await;
++    }
++    drop(stream);
++    scan_memory.free();
++    let n = documents.len() as f64;
++    let length: Vec<u64> = documents
++        .iter()
++        .map(|(_, terms)| terms.values().sum())
++        .collect();
++    let average = length.iter().sum::<u64>() as f64 / n.max(1.0);
++    let mut scores = vec![0.0_f64; documents.len()];
++    let mut matches = vec![0_usize; documents.len()];
++    for query_term in query_terms.keys() {
++        let alternatives = term_alternatives(query_term, &documents, edits, budget).await?;
++        let df = alternatives.iter().filter(|a| !a.is_empty()).count() as f64;
++        let idf = libm::log1p((n - df + 0.5) / (df + 0.5));
++        for (i, found) in alternatives.iter().enumerate() {
++            if found.is_empty() {
++                continue;
++            }
++            matches[i] += 1;
++            let norm = 1.2 * (0.25 + 0.75 * length[i] as f64 / average);
++            let best = found
++                .iter()
++                .map(|(tf, edit)| [1.0, 0.5, 0.25][*edit] * 2.2 * tf / (tf + norm))
++                .fold(0.0_f64, f64::max);
++            scores[i] += idf * best;
++        }
++        tokio::task::yield_now().await;
++    }
++    let id_name = format!("{}.id", source.target);
++    let ids = wide
++        .column_by_name(&id_name)
++        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
++        .ok_or_else(|| OmniError::manifest_internal("rank target identity absent"))?;
++    let eligible: HashSet<_> = ids.iter().flatten().collect();
++    let mut winners: Vec<_> = documents
++        .iter()
++        .enumerate()
++        .filter(|(i, (id, _))| {
++            eligible.contains(id.as_str())
++                && matches[*i] > 0
++                && (source.mode == TermMode::Any || matches[*i] == query_terms.len())
++        })
++        .map(|(i, (id, _))| (id, scores[i]))
++        .collect();
++    winners.sort_by(|(a, sa), (b, sb)| sb.total_cmp(sa).then_with(|| a.cmp(b)));
++    winners.truncate(k);
++    let ranks: HashMap<_, _> = winners
++        .iter()
++        .enumerate()
++        .map(|(i, (id, score))| (id.as_str(), (i as u64 + 1, *score)))
++        .collect();
++    let rank_array = UInt64Array::from(
++        (0..wide.num_rows())
++            .map(|i| ranks.get(ids.value(i)).map(|(rank, _)| *rank))
++            .collect::<Vec<_>>(),
++    );
++    let score_array = Float64Array::from(
++        (0..wide.num_rows())
++            .map(|i| ranks.get(ids.value(i)).map(|(_, score)| *score))
++            .collect::<Vec<_>>(),
++    );
++    let mut fields = wide.schema().fields().to_vec();
++    fields.push(Arc::new(Field::new(
++        source.source.column(MetricKind::Rank),
++        DataType::UInt64,
++        true,
++    )));
++    fields.push(Arc::new(Field::new(
++        source.source.column(MetricKind::Score),
++        DataType::Float64,
++        true,
++    )));
++    let mut columns = wide.columns().to_vec();
++    columns.extend([
++        Arc::new(rank_array) as ArrayRef,
++        Arc::new(score_array) as ArrayRef,
++    ]);
++    *wide = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
++        .map_err(OmniError::arrow_internal)?;
++    Ok(())
++}
++
++fn column(wide: &RecordBatch, expr: &IRExpr) -> Result<ArrayRef> {
++    let name = match expr {
++        IRExpr::PropAccess { variable, property } => format!("{variable}.{property}"),
++        IRExpr::Metric { source, kind } => source.column(*kind),
++        _ => {
++            return Err(OmniError::manifest_internal(
++                "unsupported selection expression",
++            ));
++        }
++    };
++    wide.column_by_name(&name)
++        .cloned()
++        .ok_or_else(|| OmniError::manifest_internal(format!("selection column {name} absent")))
++}
++
++pub(super) async fn take(
++    wide: &mut RecordBatch,
++    take: &TakeIR,
++    params: &ParamMap,
++    budget: &mut Budget,
++) -> Result<()> {
++    let quota = integer(&take.limit, params, 0, i64::MAX as u64, "take limit")?;
++    budget.relation(wide)?;
++    let ids = column(
++        wide,
++        &IRExpr::PropAccess {
++            variable: take.target.clone(),
++            property: "id".into(),
++        },
++    )?;
++    // Keep graph payloads out of the window pipeline. The row ordinal refers
++    // only to this incoming batch; it is never a graph/native row identity.
++    let mut columns: Vec<ArrayRef> = vec![
++        ids,
++        Arc::new(UInt32Array::from_iter_values(0..wide.num_rows() as u32)),
++    ];
++    let mut names = vec!["target".to_string(), "binding".to_string()];
++    let mut keys = Vec::new();
++    for (i, key) in take.keys.iter().enumerate() {
++        let name = format!("key_{i}");
++        columns.push(column(wide, key)?);
++        keys.push(col(&name));
++        names.push(name);
++    }
++    let mut order = Vec::new();
++    for (i, ordering) in take.order.iter().enumerate() {
++        let name = format!("order_{i}");
++        columns.push(column(wide, &ordering.expr)?);
++        order.push(col(&name).sort(!ordering.descending, !ordering.descending));
++        names.push(name);
++    }
++    order.push(col("target").sort(true, false));
++    let fields = names
++        .iter()
++        .zip(&columns)
++        .map(|(name, values)| Field::new(name, values.data_type().clone(), true))
++        .collect::<Vec<_>>();
++    let narrow = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
++        .map_err(OmniError::arrow_internal)?;
++    let frame = budget
++        .session
++        .read_batch(narrow)
++        .map_err(OmniError::datafusion)?
++        .window(vec![
++            dense_rank()
++                .partition_by(keys)
++                .order_by(order)
++                .build()
++                .map_err(OmniError::datafusion)?
++                .alias("pair_rank"),
++        ])
++        .map_err(OmniError::datafusion)?
++        .filter(col("pair_rank").lt_eq(lit(quota as u64)))
++        .map_err(OmniError::datafusion)?
++        .select(vec![col("binding")])
++        .map_err(OmniError::datafusion)?;
++    // Typechecking proves every comparator value is constant on a target/key
++    // pair. With target identity as final tie key, dense_rank counts distinct
++    // targets, while preserving every duplicate binding without a rejoin.
++    let mut stream = frame
++        .execute_stream()
++        .await
++        .map_err(OmniError::datafusion)?;
++    let mut kept = vec![false; wide.num_rows()];
++    while let Some(batch) = stream.try_next().await.map_err(OmniError::datafusion)? {
++        let rows = batch
++            .column(0)
++            .as_any()
++            .downcast_ref::<UInt32Array>()
++            .ok_or_else(|| {
++                OmniError::manifest_internal("take produced an invalid binding ordinal")
++            })?;
++        for row in rows.iter() {
++            let row = row.ok_or_else(|| {
++                OmniError::manifest_internal("take produced a null binding ordinal")
++            })? as usize;
++            let slot = kept.get_mut(row).ok_or_else(|| {
++                OmniError::manifest_internal("take produced an out-of-range binding ordinal")
++            })?;
++            if *slot {
++                return Err(OmniError::manifest_internal(
++                    "take repeated a binding ordinal",
++                ));
++            }
++            *slot = true;
++        }
++    }
++    drop(stream);
++    // Selection preserves incoming order. Do not let a window's physical
++    // partition/order replace the preceding ranking stage's active order.
++    let keep = UInt32Array::from(
++        kept.iter()
++            .enumerate()
++            .filter_map(|(i, keep)| keep.then_some(i as u32))
++            .collect::<Vec<_>>(),
++    );
++    *wide = take_batch(wide, &keep)?;
++    budget
++        .resident
++        .try_resize(wide.get_array_memory_size())
++        .map_err(OmniError::datafusion)?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use arrow_array::Int64Array;
++    use omnigraph_compiler::ir::IROrdering;
++
++    #[test]
++    fn repeated_views_do_not_accumulate_retained_buffer_bytes() {
++        let text = "x".repeat(4096);
++        let batch = RecordBatch::try_from_iter([(
++            "text",
++            Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
++                &text, 256,
++            ))) as ArrayRef,
++        )])
++        .unwrap();
++        let mut budget = Budget::with_memory(2 * 1024 * 1024, 1).unwrap();
++        let pool = Arc::clone(&budget.session.runtime_env().memory_pool);
++        let retained = batch.get_array_memory_size();
++        assert!(retained < 2 * 1024 * 1024);
++        for row in 0..batch.num_rows() {
++            let view = batch.slice(row, 1);
++            assert_eq!(view.get_array_memory_size(), retained);
++            budget
++                .relation(&view)
++                .expect("rechecking shared storage must not accumulate it");
++            assert_eq!(pool.reserved(), retained);
++        }
++        assert_eq!(
++            budget.input_bytes, 0,
++            "retained views are not new lexical input"
++        );
++        terms("abcd", &mut budget).unwrap();
++        assert_eq!(
++            budget.input_bytes, 4,
++            "input units are consumed UTF-8 bytes"
++        );
++        drop(budget);
++        assert_eq!(
++            pool.reserved(),
++            0,
++            "the query releases its relation reservation"
++        );
++    }
++
++    #[tokio::test]
++    #[ignore = "instrument: needs OMNIGRAPH_QUALIFICATION_GRAPH with the frozen Passage corpus"]
++    async fn corpus_scan_reports_shared_buffer_accounting() {
++        let root = std::env::var("OMNIGRAPH_QUALIFICATION_GRAPH").unwrap();
++        let db = Omnigraph::open(&root).await.unwrap();
++        let snapshot = db.snapshot_of("main").await.unwrap();
++        let ds = snapshot.open_lance_dataset("node:Passage").await.unwrap();
++        let mut stream = crate::table_store::TableStore::scan_stream_bounded(
++            &ds,
++            Some(&["id", "text"]),
++            None,
++            None,
++            false,
++            256,
++            65536,
++        )
++        .await
++        .unwrap();
++        let mut rows = 0;
++        let mut batches = 0;
++        let mut array_bytes = 0;
++        let mut text_bytes = 0;
++        let mut buffers = HashMap::new();
++        while let Some(batch) = stream.try_next().await.unwrap() {
++            rows += batch.num_rows();
++            batches += 1;
++            array_bytes += batch.get_array_memory_size();
++            let text = batch
++                .column_by_name("text")
++                .unwrap()
++                .as_any()
++                .downcast_ref::<StringArray>()
++                .unwrap();
++            text_bytes += text.iter().flatten().map(str::len).sum::<usize>();
++            // Retain clones so a freed allocation's address cannot be reused
++            // and mistaken for shared storage. These are diagnostic buffer
++            // identities, never graph/row identities or production accounting.
++            buffers.insert(text.values().as_ptr() as usize, text.values().clone());
++        }
++        assert!(
++            rows > 0 && batches > 1,
++            "instrument requires multiple real batches"
++        );
++        eprintln!(
++            "{}",
++            serde_json::json!({
++                "rows": rows, "batches": batches, "summed_array_bytes": array_bytes,
++                "logical_text_bytes": text_bytes, "unique_text_buffers": buffers.len(),
++            "unique_text_buffer_bytes": buffers.values().map(|buffer| buffer.len()).sum::<usize>(),
++            })
++        );
++    }
++
++    // CPU cooperation is a future-poll property, not an elapsed-time claim.
++    // Large comparisons must yield, and many tiny comparisons must share the
++    // same quantum so splitting work cannot monopolize a runtime worker.
++    #[tokio::test]
++    async fn edit_distance_yields_before_completion_and_across_comparisons() {
++        use std::task::Poll;
++
++        let mut budget = Budget::new().unwrap();
++        let a = "a".repeat(1024);
++        let b = format!("{}b", "a".repeat(1023));
++        let mut comparison = Box::pin(distance(&a, &b, &mut budget));
++        assert!(
++            futures::poll!(comparison.as_mut()).is_pending(),
++            "a large edit computation must return control before completion"
++        );
++        drop(comparison);
++        let admitted = budget.work;
++        assert_eq!(admitted, 1025 * 1025);
++
++        let mut yielded = false;
++        for _ in 0..4096 {
++            let mut comparison = Box::pin(distance("a", "b", &mut budget));
++            match futures::poll!(comparison.as_mut()) {
++                Poll::Ready(result) => assert_eq!(result.unwrap(), 1),
++                Poll::Pending => {
++                    yielded = true;
++                    assert_eq!(comparison.await.unwrap(), 1);
++                }
++            }
++        }
++        assert!(
++            yielded,
++            "the quantum must span successive small comparisons"
++        );
++        assert_eq!(budget.work, admitted + 4096 * 4);
++        assert_eq!(distance("café", "cafe", &mut budget).await.unwrap(), 1);
++        assert_eq!(distance("ab", "ba", &mut budget).await.unwrap(), 2);
++        assert_eq!(distance("😀", "é", &mut budget).await.unwrap(), 1);
++    }
++
++    // Physical-work contract: repeated vocabulary must not repeat the same
++    // DP matrix per document. The numerical lifecycle oracle owns scoring.
++    #[tokio::test]
++    async fn repeated_vocabulary_shares_comparison_work() {
++        let query = "ab".repeat(128);
++        let fuzzy = format!("ac{}", "ab".repeat(127));
++        let tokens = BTreeMap::from([(query.clone(), 2), (fuzzy, 3)]);
++        let documents: Vec<_> = (0..1024)
++            .map(|i| (format!("doc-{i}"), tokens.clone()))
++            .collect();
++        for edits in 0..=2 {
++            let mut budget = Budget::new().unwrap();
++            let result = term_alternatives(&query, &documents, edits, &mut budget)
++                .await
++                .expect("repeated vocabulary must fit the unchanged work budget");
++            assert_eq!(result.len(), documents.len());
++            let expected = if edits == 0 {
++                vec![(2.0, 0)]
++            } else {
++                vec![(2.0, 0), (3.0, 1)]
++            };
++            assert!(result.iter().all(|found| found == &expected));
++            assert!(budget.work < 2_000_000);
++        }
++    }
++
++    // Mechanism coverage: GQT cannot choose the operator pool or observe its
++    // reservations. The same retained input must compete with the window,
++    // and refusing that window must release resources without returning rows.
++    #[tokio::test]
++    async fn take_shares_retained_input_budget_and_cleans_up_on_refusal() {
++        let batch = RecordBatch::try_from_iter(vec![
++            (
++                "d.id",
++                Arc::new(StringArray::from_iter_values(
++                    (0..1000).map(|i| format!("d-{:04}", i / 2)),
++                )) as ArrayRef,
++            ),
++            (
++                "g.bucket",
++                Arc::new(Int64Array::from_iter_values((0..1000).map(|i| i / 100))) as ArrayRef,
++            ),
++            (
++                "d.score",
++                Arc::new(Int64Array::from_iter_values((0..1000).map(|i| i / 2))) as ArrayRef,
++            ),
++        ])
++        .unwrap();
++        let selection = TakeIR {
++            target: "d".into(),
++            keys: vec![IRExpr::PropAccess {
++                variable: "g".into(),
++                property: "bucket".into(),
++            }],
++            order: vec![IROrdering {
++                expr: IRExpr::PropAccess {
++                    variable: "d".into(),
++                    property: "score".into(),
++                },
++                descending: true,
++            }],
++            limit: IRExpr::Literal(Literal::Integer(2)),
++        };
++        for memory in [batch.get_array_memory_size() + 1, 128 * 1024 * 1024] {
++            let mut budget = Budget::with_memory(memory, 4).unwrap();
++            let runtime = budget.session.runtime_env();
++            budget.relation(&batch).unwrap();
++            assert_eq!(
++                runtime.memory_pool.reserved(),
++                batch.get_array_memory_size()
++            );
++            let mut result = batch.clone();
++            let outcome = take(&mut result, &selection, &ParamMap::default(), &mut budget).await;
++            if memory == batch.get_array_memory_size() + 1 {
++                let error = outcome.unwrap_err();
++                assert!(matches!(error, OmniError::DataFusion(_)), "{error}");
++                assert!(error.to_string().contains("Resources exhausted"), "{error}");
++                assert_eq!(
++                    result, batch,
++                    "a failed selection must not publish partial bindings"
++                );
++            } else {
++                outcome.unwrap();
++                assert_eq!(
++                    result.num_rows(),
++                    40,
++                    "two targets, each with two paths, in ten groups"
++                );
++            }
++            drop(budget);
++            tokio::time::timeout(std::time::Duration::from_secs(1), async {
++                while runtime.memory_pool.reserved() != 0 {
++                    tokio::task::yield_now().await;
++                }
++            })
++            .await
++            .expect("window reservations must be released");
++            assert_eq!(runtime.disk_manager.used_disk_space(), 0);
++            assert!(runtime.disk_manager.temp_dir_paths().is_empty());
++        }
++    }
++}
+diff --git a/crates/omnigraph/src/loader/mod.rs b/crates/omnigraph/src/loader/mod.rs
+index 7d0d991bfcfe58b060784f385956ff060e00daaf..f0bcbfcfd7c3897cb7981fe2e00a9c593e75b627 100644
+--- a/crates/omnigraph/src/loader/mod.rs
++++ b/crates/omnigraph/src/loader/mod.rs
+@@ -4247,6 +4247,7 @@ node Doc {
+         .unwrap();
+
+         let node_type = NodeType {
++            analyzed_fields: Default::default(),
+             name: "Test".to_string(),
+             implements: vec![],
+             properties: Default::default(),
+diff --git a/crates/omnigraph/tests/search.rs b/crates/omnigraph/tests/search.rs
+index 893bd7a84aa834c93ef42ccadc0faef105c9c051..5009503716ac08e349ef120d86bde5facaf3e686 100644
+--- a/crates/omnigraph/tests/search.rs
++++ b/crates/omnigraph/tests/search.rs
+@@ -3593,13 +3593,12 @@ query nearest_whole($q: Vector(4)) {
+     );
+ }
+
+-/// RFC 0048's numerical reference experiment, before the staged GQ evaluator
+-/// exists. Inputs are already-analyzed terms; whitespace only separates those
+-/// terms in the fixture. Expected scores were independently evaluated with
+-/// 80-digit Decimal arithmetic. This does not qualify tokenizer/index parity,
+-/// portable bit identity, resource bounds, or real-world relevance quality.
+-#[test]
+-fn lexical_scoring_v1_reference_oracle() {
++/// RFC 0048 numerical oracle, also exercised through the experimental staged
++/// compiler/engine path. Scores come from independent 80-digit Decimal values;
++/// a Rust owner is needed for explicit floating-point tolerance and physical
++/// lifecycle controls. Native indexed scoring itself remains unqualified.
++#[tokio::test]
++async fn lexical_scoring_v1_reference_oracle() {
+     use std::collections::{BTreeMap, BTreeSet};
+
+     #[derive(serde::Deserialize)]
+@@ -3613,6 +3612,111 @@ fn lexical_scoring_v1_reference_oracle() {
+         expected_order: Vec<usize>,
+     }
+
++    fn assert_executed(case: &Case, result: QueryResult, phase: &str) {
++        use arrow_array::{Float64Array, StructArray, UInt64Array};
++        let batch = result.concat_batches().unwrap();
++        let objects = batch
++            .column(0)
++            .as_any()
++            .downcast_ref::<StructArray>()
++            .unwrap();
++        let slugs = objects
++            .column_by_name("slug")
++            .unwrap()
++            .as_any()
++            .downcast_ref::<StringArray>()
++            .unwrap();
++        let ids = objects
++            .column_by_name("id")
++            .unwrap()
++            .as_any()
++            .downcast_ref::<StringArray>()
++            .unwrap();
++        let scores = batch
++            .column(1)
++            .as_any()
++            .downcast_ref::<Float64Array>()
++            .unwrap();
++        let ranks = batch
++            .column(2)
++            .as_any()
++            .downcast_ref::<UInt64Array>()
++            .unwrap();
++        let mut expected_order = Vec::new();
++        assert_eq!(
++            batch.num_rows(),
++            case.expected_scores.iter().flatten().count(),
++            "{} {phase}: membership count",
++            case.name
++        );
++        for row in 0..batch.num_rows() {
++            let index: usize = slugs.value(row).parse().unwrap();
++            let expected: f64 = case.expected_scores[index]
++                .as_ref()
++                .unwrap()
++                .parse()
++                .unwrap();
++            assert!(!scores.is_null(row) && !ranks.is_null(row));
++            assert!(
++                (scores.value(row) - expected).abs() <= 2e-14 * expected.abs().max(1.0),
++                "{} {phase} doc {index}: {} != {expected}",
++                case.name,
++                scores.value(row)
++            );
++            assert_eq!(
++                ranks.value(row),
++                row as u64 + 1,
++                "{} {phase}: ordinal",
++                case.name
++            );
++            expected_order.push((
++                expected,
++                ids.value(row).to_string(),
++                slugs.value(row).to_string(),
++            ));
++        }
++        expected_order.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
++        assert_eq!(
++            slugs.iter().flatten().collect::<Vec<_>>(),
++            expected_order
++                .iter()
++                .map(|v| v.2.as_str())
++                .collect::<Vec<_>>(),
++            "{} {phase}: score/identity order",
++            case.name
++        );
++    }
++
++    async fn assert_fts_state(db: &Omnigraph, expect_covered: bool) {
++        let snapshot = snapshot_main(db).await.unwrap();
++        let dataset = snapshot.open_dataset("node:Doc").await.unwrap();
++        let field = dataset.schema().field("text").unwrap().id;
++        let indices = dataset.load_indices().await.unwrap();
++        let fts = indices
++            .iter()
++            .find(|index| {
++                index.fields.contains(&field)
++                    && index.files.as_ref().is_some_and(|files| {
++                        files
++                            .iter()
++                            .any(|file| file.path == "omnigraph_fts_compat.json")
++                    })
++            })
++            .expect("fixture must have a physical certified FTS index");
++        assert!(
++            fts.fragment_bitmap.is_some(),
++            "pin exposes FTS fragment coverage"
++        );
++        // The sealed reader reports combined user-index coverage. Together
++        // with the FTS inventory above this proves indexed/mixed physical
++        // states; it does not expose per-FTS-segment current fragment IDs.
++        assert_eq!(
++            !dataset.has_unindexed_fragments().await.unwrap(),
++            expect_covered,
++            "fixture did not reach requested physical coverage state"
++        );
++    }
++
+     // A two-row scalar-value DP, independent of native vocabulary expansion.
+     fn distance(a: &str, b: &str) -> usize {
+         let b: Vec<_> = b.chars().collect();
+@@ -3787,5 +3891,317 @@ fn lexical_scoring_v1_reference_oracle() {
+             );
+         }
+         println!("{}: {:?}", case.name, case.expected_order);
++
++        // Keep this path independent of the scalar evaluator above: fixtures
++        // are real accepted graph rows and the query projects actual metrics.
++        let directory = tempfile::tempdir().unwrap();
++        let uri = directory.path().to_str().unwrap();
++        let db = Omnigraph::init(
++            uri,
++            "node Doc { slug: String @key text: String? @analyzed @index }",
++        )
++        .await
++        .unwrap();
++        let rows: Vec<_> = case
++            .docs
++            .iter()
++            .enumerate()
++            .map(|(i, text)| {
++                serde_json::json!({"type":"Doc","data":{"slug":i.to_string(),"text":text}})
++                    .to_string()
++            })
++            .collect();
++        if !rows.is_empty() {
++            load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
++                .await
++                .unwrap();
++        }
++        let query = format!(
++            r#"
++            query scored($q: String, $edits: I64) {{
++                match {{ $d: Doc }}
++                rank $d {{ lexical($d.text, terms($q, max_edits: $edits, mode: "{}"), candidates: 100) as hits yield hits }}
++                return {{ $d as doc, metric(hits, score) as score, metric(hits, rank) as rank }}
++                order {{ metric(hits, rank) }}
++            }}
++        "#,
++            if case.all_terms { "all" } else { "any" }
++        );
++        let parameters = std::collections::HashMap::from([
++            ("q".to_string(), Literal::String(case.query.join(" "))),
++            ("edits".to_string(), Literal::Integer(case.edits as i64)),
++        ]);
++        let (flat, head) = db
++            .query_with_head("main", &query, "scored", &parameters)
++            .await
++            .unwrap();
++        assert_executed(case, flat, "flat");
++        if !rows.is_empty() {
++            db.ensure_indices().await.unwrap();
++            assert_fts_state(&db, true).await;
++            assert_executed(
++                case,
++                db.query("main", &query, "scored", &parameters)
++                    .await
++                    .unwrap(),
++                "indexed",
++            );
++            // Change an indexed value, restore it through a tail write, and
++            // delete an added row. The logical corpus returns to the fixture.
++            let update = "query change($text: String?) { update Doc set { text: $text } where slug = \"0\" }";
++            db.mutate(
++                "main",
++                update,
++                "change",
++                &std::collections::HashMap::from([(
++                    "text".into(),
++                    Literal::String("temporary beta".into()),
++                )]),
++            )
++            .await
++            .unwrap();
++            db.mutate(
++                "main",
++                update,
++                "change",
++                &std::collections::HashMap::from([(
++                    "text".into(),
++                    case.docs[0]
++                        .clone()
++                        .map(Literal::String)
++                        .unwrap_or(Literal::Null),
++                )]),
++            )
++            .await
++            .unwrap();
++            load_jsonl(
++                &db,
++                r#"{"type":"Doc","data":{"slug":"discard","text":"beta alpha"}}"#,
++                LoadMode::Append,
++            )
++            .await
++            .unwrap();
++            db.mutate(
++                "main",
++                "query remove() { delete Doc where slug = \"discard\" }",
++                "remove",
++                &std::collections::HashMap::new(),
++            )
++            .await
++            .unwrap();
++            assert_fts_state(&db, false).await;
++            assert_executed(
++                case,
++                db.query("main", &query, "scored", &parameters)
++                    .await
++                    .unwrap(),
++                "tail-update-delete",
++            );
++            let optimized = db.optimize().await.unwrap();
++            assert!(
++                optimized
++                    .iter()
++                    .any(|s| s.type_key == "node:Doc" && s.fragments_removed > 0),
++                "{}: require actual compaction, not a nominal optimize call",
++                case.name
++            );
++            assert_executed(
++                case,
++                db.query("main", &query, "scored", &parameters)
++                    .await
++                    .unwrap(),
++                "compacted",
++            );
++        }
++        // The follow-up is pinned to the earlier accepted graph commit, after
++        // later writes and compaction. It must still read the original corpus.
++        if let Some(head) = head {
++            // Make the current answer observably different; checking a pin
++            // only after restoring identical data cannot detect reading HEAD.
++            let live_only = serde_json::json!({"type":"Doc","data":{"slug":"live-only","text":case.query.join(" ")}}).to_string();
++            load_jsonl(&db, &live_only, LoadMode::Append).await.unwrap();
++            assert_eq!(
++                db.query("main", &query, "scored", &parameters)
++                    .await
++                    .unwrap()
++                    .num_rows(),
++                case.expected_order.len() + 1
++            );
++            let reopened = Omnigraph::open(uri).await.unwrap();
++            assert_executed(
++                case,
++                reopened
++                    .query(
++                        omnigraph::db::ReadTarget::snapshot(omnigraph::db::SnapshotId::new(head)),
++                        &query,
++                        "scored",
++                        &parameters,
++                    )
++                    .await
++                    .unwrap(),
++                "pinned-original",
++            );
++        }
++    }
++}
++
++/// Mechanism/scale coverage: the prototype's 100,000-binding admission must
++/// cover graph work after its final rank, even when the response has one row.
++/// Rust keeps the generated fixture small and checks typed resource evidence
++/// and unchanged graph publication, which the GQT error carrier cannot expose.
++#[tokio::test]
++async fn staged_budget_includes_graph_tail_after_last_rank() {
++    let directory = tempfile::tempdir().unwrap();
++    let schema = r#"
++node Root { slug: String @key title: String @analyzed }
++node Left { slug: String @key ordinal: I64 }
++node Right { slug: String @key ordinal: I64 }
++edge HasLeft: Root -> Left {}
++edge HasRight: Root -> Right {}
++"#;
++    let query = r#"
++query tail($lefts: I64, $rights: I64) {
++    match { $root: Root }
++    rank $root { lexical($root.title, terms("alpha"), candidates: 1) as names yield names }
++    match {
++        $root hasLeft $left
++        $root hasRight $right
++        $left.ordinal < $lefts
++        $right.ordinal < $rights
++    }
++    return { $left.slug as left, $right.slug as right }
++    limit 1
++}
++"#;
++    let mut rows =
++        vec![serde_json::json!({"type":"Root","data":{"slug":"root","title":"alpha"}}).to_string()];
++    for (kind, edge, count) in [("Left", "HasLeft", 200), ("Right", "HasRight", 501)] {
++        for ordinal in 0..count {
++            let slug = format!("{kind}-{ordinal}");
++            rows.push(
++                serde_json::json!({"type":kind,"data":{"slug":slug,"ordinal":ordinal}}).to_string(),
++            );
++            rows.push(
++                serde_json::json!({"edge":edge,"from":"root","to":slug,"data":{}}).to_string(),
++            );
++        }
++    }
++    let mut db = Omnigraph::init(directory.path().to_str().unwrap(), schema)
++        .await
++        .unwrap();
++    load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
++        .await
++        .unwrap();
++    let manifest_version = version_main(&db).await.unwrap();
++    let parameters = |lefts, rights| {
++        std::collections::HashMap::from([
++            ("lefts".to_string(), Literal::Integer(lefts)),
++            ("rights".to_string(), Literal::Integer(rights)),
++        ])
++    };
++    let small = query_main(&mut db, query, "tail", &parameters(2, 3))
++        .await
++        .unwrap();
++    assert_eq!(small.num_rows(), 1);
++    let error = query_main(&mut db, query, "tail", &parameters(200, 501))
++        .await
++        .expect_err("a final one-row response must not bypass intermediate admission");
++    assert!(
++        matches!(
++            error,
++            omnigraph::error::OmniError::ResourceLimitExceeded { ref resource, limit: 100_000, actual: 100_200 }
++                if resource == "integration binding rows"
++        ),
++        "wrong refusal: {error}"
++    );
++    assert_eq!(version_main(&db).await.unwrap(), manifest_version);
++    assert_eq!(
++        query_main(&mut db, query, "tail", &parameters(2, 3))
++            .await
++            .unwrap()
++            .num_rows(),
++        1,
++        "refusal must not poison a subsequent query"
++    );
++
++    // All source inputs must be admitted before an earlier source scans its
++    // corpus. The oversized stored value makes that earlier scan observable:
++    // a valid second input reaches the field limit, an empty one must not.
++    let oversized = serde_json::json!({
++        "type": "Root", "data": {"slug": "oversized", "title": "a".repeat(4097)}
++    });
++    load_jsonl(&db, &oversized.to_string(), LoadMode::Append)
++        .await
++        .unwrap();
++    let admitted_version = version_main(&db).await.unwrap();
++    let two_sources = r#"
++query admit_sources($q: String) {
++    match { $root: Root }
++    rank $root { lexical($root.title, terms("alpha"), candidates: 1) as first yield first }
++    rank $root { lexical($root.title, terms($q), candidates: 1) as second yield second }
++    return { $root.slug }
++}
++"#;
++    let same_block = two_sources
++        .replace("yield first }\n    rank $root {", "")
++        .replace("yield second", "yield first");
++    for query in [two_sources, same_block.as_str()] {
++        for text in ["!!!", "alpha"] {
++            let params = std::collections::HashMap::from([(
++                "q".to_string(),
++                Literal::String(text.to_string()),
++            )]);
++            let error = query_main(&mut db, query, "admit_sources", &params)
++                .await
++                .expect_err("both failures must be explicit");
++            if text == "!!!" {
++                assert!(
++                    error
++                        .to_string()
++                        .contains("terms query contains no searchable terms"),
++                    "a later invalid source must fail before the earlier corpus scan: {error}"
++                );
++            } else {
++                assert!(
++                    matches!(
++                        error,
++                        omnigraph::error::OmniError::ResourceLimitExceeded { ref resource, limit: 4096, actual: 4097 }
++                            if resource == "integration lexical input bytes"
++                    ),
++                    "the valid-input control must reach the corpus field limit: {error}"
++                );
++            }
++            assert_eq!(version_main(&db).await.unwrap(), admitted_version);
++        }
++    }
++    let bounds = r#"
++query admit_bounds($window: I64, $edits: I64, $quota: I64) {
++    match { $root: Root }
++    rank $root {
++        lexical($root.title, terms("alpha"), candidates: 1) as first
++        lexical($root.title, terms("alpha", max_edits: $edits), candidates: $window) as unused
++        yield first
++    }
++    take $root { per { $root.slug } order { $root.slug } limit $quota }
++    return { $root.slug }
++}
++"#;
++    for (window, edits, quota, expected) in [
++        (0, 0, 1, "candidates must be an integer"),
++        (10_001, 0, 1, "candidates must be an integer"),
++        (1, 3, 1, "max_edits must be an integer"),
++        (1, 0, -1, "take limit must be an integer"),
++        (1, 0, 1, "integration lexical input bytes"),
++    ] {
++        let params = std::collections::HashMap::from([
++            ("window".to_string(), Literal::Integer(window)),
++            ("edits".to_string(), Literal::Integer(edits)),
++            ("quota".to_string(), Literal::Integer(quota)),
++        ]);
++        let error = query_main(&mut db, bounds, "admit_bounds", &params)
++            .await
++            .expect_err("invalid parameters precede the oversized corpus read");
++        assert!(error.to_string().contains(expected), "{error}");
++        assert_eq!(version_main(&db).await.unwrap(), admitted_version);
+     }
+ }
+diff --git a/docs/releases/v0.11.0.md b/docs/releases/v0.11.0.md
+index d9bfa65d2e437be6fcf1fb38fa5ff9c574cf8b82..e2b80192d5cff74a254fe9211531bface5cc24b8 100644
+--- a/docs/releases/v0.11.0.md
++++ b/docs/releases/v0.11.0.md
+@@ -4,6 +4,11 @@ Notes accumulate here until the release is cut.
+
+ ## Highlights
+
++- CLI `--format jsonl` now preserves `graph_commit_id` in the metadata line
++  for inline and stored reads. Agents can use that same-read id for snapshot
++  follow-up or conditional writes; operations without a content snapshot emit
++  `null`. Result rows are unchanged.
++
+ - **Graph storage moves to internal manifest schema v7; v6 graphs are rebuilt
+   by export and load.** Every `__manifest` registration row is now keyed by the
+   manifest version that wrote it, and a branch's view of a table is the
+diff --git a/docs/user/cli/reference.md b/docs/user/cli/reference.md
+index 557d6c8a08a45469a4524400eb369cd76a55fc7d..55bb01c2b4e37d6a20076191330dd5c8d6d2d18b 100644
+--- a/docs/user/cli/reference.md
++++ b/docs/user/cli/reference.md
+@@ -101,6 +101,9 @@ When the read snapshot has an effective graph head, `omnigraph query --json`
+ returns its `graph_commit_id` in the complete read envelope. The id and rows
+ come from the same pinned snapshot; use that id when a later mutation must be
+ conditional on the state that was read.
++`--format jsonl` carries the same id in its first metadata line. That field
++is `null` when the operation has no content snapshot, such as `branch list`.
++Use a returned id with `query --snapshot <id>` for a read against that state.
+
+ Successful `mutate --json`, `load --json`, and compatibility
+ `ingest --json` responses include `commit`, the exact commit published by
