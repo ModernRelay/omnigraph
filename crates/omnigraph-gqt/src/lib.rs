@@ -2460,15 +2460,20 @@ pub fn corpus_root() -> PathBuf {
 
 /// `OMNIGRAPH_GQ_BLESS=1` turns bless on; unset, empty, or `0` leaves it off.
 ///
-/// # Panics
+/// # Errors
 ///
-/// On any other value: the knob is refused, not ignored.
-pub fn bless_from_env() -> bool {
+/// Refuses any other value, including non-UTF-8 values.
+pub fn bless_from_env() -> Result<bool, String> {
     match std::env::var(BLESS_ENV) {
-        Err(_) => false,
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
-        Ok(v) => panic!("{BLESS_ENV} takes 1 (or 0/unset), got `{v}`"),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(v)) => Err(format!(
+            "invalid_case: {BLESS_ENV} requires UTF-8, got {v:?}"
+        )),
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" || v.is_empty() => Ok(false),
+        Ok(v) => Err(format!(
+            "invalid_case: {BLESS_ENV} takes 1 (or 0/empty/unset), got `{v}`"
+        )),
     }
 }
 

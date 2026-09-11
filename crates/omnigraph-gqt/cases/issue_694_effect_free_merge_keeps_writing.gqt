@@ -1,6 +1,7 @@
 # issue: 694
-# red_on: ed3ea500 (2026-09-09): step 6 rejects the unrelated write with pending BranchMerge
-# notes: The runner section injects one merge failure under DST.
+# red_on: d205f7f3 (2026-09-11): step 8 rejects the unrelated write with pending BranchMerge
+# notes: Source and donor diverge; target inherits donor without owning a table fork.
+# notes: The fault fires after merge recovery is armed and before target first-touch.
 # notes: Reads and the next unrelated write use the same Omnigraph without reopening.
 
 --- runner
@@ -11,7 +12,7 @@ environments:
     seeds: [0, 42]
 
 --- known_failure
-step: 6
+step: 8
 match:
   error: RecoveryRequired
   reason: "pending BranchMerge recovery operation on branch 'target' blocks the synchronous write/control recovery barrier (datasets dataset for node type 'Person'); reopen the graph read-write before retrying"
@@ -35,7 +36,19 @@ branch create source
 --- expect ok
 
 --- mutate
-branch create target
+branch create donor
+
+--- expect ok
+
+--- mutate branch: donor
+query add_inherited_target_row() {
+    insert Person { name: "carol" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create target from donor
 
 --- expect ok
 
@@ -65,6 +78,7 @@ query read_after_failure() {
 
 --- expect unordered
 {"p.name": "alice"}
+{"p.name": "carol"}
 
 --- expect shape
 p.name: String
@@ -97,6 +111,7 @@ query target_after_write() {
 
 --- expect unordered
 {"p.name": "alice"}
+{"p.name": "carol"}
 
 --- expect shape
 p.name: String

@@ -19,10 +19,19 @@ Branch protection currently requires these reporting contexts:
 - `Fix Regression Gate`
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
-required context. It first checks unit tests and unavailable-DST refusal from
-the workspace root, then runs the whole package and Clippy from
-`crates/omnigraph-gqt`, whose Cargo configuration enables the seeded Tokio
-runtime. Every corpus case is enrolled, including cases whose required graph
+required context aggregating three qualification jobs. `GQT (ordinary)` checks
+unit tests and unavailable-DST refusal from the workspace root. `GQT (dst)`
+runs the whole package, while `GQT (dst-clippy)` checks all package targets
+with Clippy. Both run from `crates/omnigraph-gqt`, whose Cargo configuration
+enables the seeded Tokio runtime. Each job has its own
+45-minute budget and cache key. Matrix fail-fast cancels the remaining jobs
+when one fails; Cargo retains its default fail-fast between test targets.
+The required context fails if classification or any qualification fails,
+is cancelled, or is skipped. A successful run still requires all three jobs
+to pass; fail-fast never turns incomplete qualification into success.
+Test jobs upload invocation reports, and all three jobs upload available
+Cargo build timings separately, including on failure.
+Every corpus case is enrolled, including cases whose required graph
 behavior currently fails. `Test Workspace` excludes this separately tested
 package; it does not silently skip DST cases. `GQ Logic Tests` takes the documentation-only skip the way
 the AWS job does and reports success without building; its workflow carries a

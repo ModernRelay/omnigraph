@@ -18,11 +18,11 @@ fn case(path: &Path) -> datatest_stable::Result<()> {
     ) {
         return Err(reason.into());
     }
-    let outcome = omnigraph_gqt::run_corpus_case(
-        path,
-        Path::new(env!("CARGO_BIN_EXE_omnigraph-gqt")),
-        omnigraph_gqt::bless_from_env(),
-    );
+    let bless = omnigraph_gqt::bless_from_env().map_err(|error| {
+        omnigraph_gqt::report_cli_refusal(Some(path.to_path_buf()), None, error)
+    })?;
+    let outcome =
+        omnigraph_gqt::run_corpus_case(path, Path::new(env!("CARGO_BIN_EXE_omnigraph-gqt")), bless);
     println!(
         "{} {} {:.2}s",
         if outcome.result.is_ok() { "ok" } else { "FAIL" },
