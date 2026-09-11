@@ -161,6 +161,11 @@ attempts are accounted for when execution cannot continue. The supervisor uses
 synchronous local-file reads and report writes; these host I/O operations are
 not interruptible by its worker deadline.
 
+For case invocations, `OMNIGRAPH_GQ_BLESS` accepts `1` to enable rewriting;
+unset, empty, or `0` leaves it disabled. Other values, including non-UTF-8
+values, produce an `invalid_case` report before execution or rewriting.
+Replay ignores this variable and refuses saved blessing invocations.
+
 `OMNIGRAPH_GQ_BLESS=1` is supported only for a case declaring one direct-engine
 environment. A subset selection cannot bless a multi-environment case. It rewrites a failing row or shape expectation and still returns
 failure until a subsequent run confirms it. DST cannot bless. The legacy

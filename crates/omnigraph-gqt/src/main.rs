@@ -103,10 +103,11 @@ fn run() -> Result<(), String> {
     match invocation {
         Invocation::Replay(path) => omnigraph_gqt::replay_report(&path, &executable),
         Invocation::Case(selection) => {
+            let bless = omnigraph_gqt::bless_from_env().map_err(refusal)?;
             let outcome = omnigraph_gqt::run_selected(
                 &selection.path,
                 &executable,
-                omnigraph_gqt::bless_from_env(),
+                bless,
                 selection.target.as_deref(),
                 selection.storage.as_deref(),
                 selection.seed,

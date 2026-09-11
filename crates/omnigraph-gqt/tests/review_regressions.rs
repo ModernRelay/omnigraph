@@ -53,6 +53,72 @@ fn cli_refusals_always_keep_one_terminal_report() {
     }
 }
 
+/// OS environment bytes and terminal reports require a subprocess boundary.
+#[test]
+fn invalid_bless_values_keep_one_terminal_report_without_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("case.gqt");
+    std::fs::write(&path, SIMPLE).unwrap();
+    let invalid_values: Vec<std::ffi::OsString> = vec!["true".into(), "2".into(), " ".into()];
+    #[cfg(unix)]
+    let invalid_values = {
+        use std::os::unix::ffi::OsStringExt;
+        let mut values = invalid_values;
+        values.push(std::ffi::OsString::from_vec(vec![0xff]));
+        values
+    };
+    for value in invalid_values {
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .env("OMNIGRAPH_GQ_BLESS", &value)
+            .output()
+            .unwrap();
+        let report = summary(&output);
+        assert_eq!(output.status.code(), Some(1), "{value:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+        assert_eq!(report["code"], "invalid_case");
+        assert!(report["attempts"].as_array().unwrap().is_empty());
+        assert!(
+            report["result"]["Err"]
+                .as_str()
+                .unwrap()
+                .contains("OMNIGRAPH_GQ_BLESS")
+        );
+        assert_eq!(
+            report["not_run"][0]["reason"]["error"],
+            report["result"]["Err"]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SIMPLE);
+    }
+}
+
+/// In-case assertions cannot inspect the case file that bless mode rewrites.
+#[test]
+fn only_bless_one_rewrites_expectations() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("case.gqt");
+    let incorrect = SIMPLE.replace("p.name\":\"alice", "p.name\":\"wrong");
+    assert_ne!(incorrect, SIMPLE);
+    for value in [None, Some(""), Some("0"), Some("1")] {
+        std::fs::write(&path, &incorrect).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command.arg(&path).env_remove("OMNIGRAPH_GQ_BLESS");
+        if let Some(value) = value {
+            command.env("OMNIGRAPH_GQ_BLESS", value);
+        }
+        let output = command.output().unwrap();
+        let report = summary(&output);
+        let bless = value == Some("1");
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {report}");
+        assert_eq!(report["code"], "assertion_failed");
+        assert_eq!(report["attempts"][0]["input"]["bless"], bless);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            if bless { SIMPLE } else { &incorrect }
+        );
+    }
+}
+
 #[test]
 fn ambient_refusal_and_parse_failure_preserve_their_causes() {
     let directory = tempfile::tempdir().unwrap();
