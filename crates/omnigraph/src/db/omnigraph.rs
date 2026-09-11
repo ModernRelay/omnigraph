@@ -2264,6 +2264,20 @@ impl Omnigraph {
         Ok(())
     }
 
+    pub(crate) async fn recover_failed_branch_merge_under_gates(
+        &self,
+        sidecar: &crate::db::manifest::RecoverySidecar,
+    ) -> Result<bool> {
+        let recovered = crate::db::manifest::recover_failed_branch_merge_under_gates(
+            self.uri(),
+            &self.storage,
+            sidecar,
+        )
+        .await;
+        self.refresh_coordinator_only().await?;
+        recovered
+    }
+
     /// Refresh coordinator state and invalidate the runtime cache WITHOUT
     /// running the recovery sweep. Engine-internal callers that hold an
     /// in-flight sidecar (e.g. `schema_apply::apply_schema_with_lock`'s

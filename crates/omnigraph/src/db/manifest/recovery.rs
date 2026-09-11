@@ -5424,6 +5424,41 @@ async fn roll_back_schema_apply_v7(
     Ok(())
 }
 
+/// Resolve only the failed merge whose schema, branch and table gates remain held.
+/// The caller must have awaited its effect phase to completion; cancelled writers
+/// are left to the ordinary recovery entry points.
+pub(crate) async fn recover_failed_branch_merge_under_gates(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    failed: &RecoverySidecar,
+) -> Result<bool> {
+    assert_eq!(failed.writer_kind, SidecarKind::BranchMerge);
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_PRE_ERROR_RECOVERY)?;
+    let Some(sidecar) = reread_sidecar_under_gates(root_uri, storage.as_ref(), failed).await?
+    else {
+        return Ok(true);
+    };
+    if !sidecar
+        .protocol_v4
+        .as_ref()
+        .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed)
+    {
+        return Ok(false);
+    }
+    let coordinator = match sidecar.branch.as_deref() {
+        Some(branch) => GraphCoordinator::open_branch(root_uri, branch, storage.clone()).await?,
+        None => GraphCoordinator::open(root_uri, storage.clone()).await?,
+    };
+    process_branch_merge_sidecar_v4(
+        root_uri,
+        storage,
+        &coordinator.snapshot(),
+        &sidecar,
+        RecoveryMode::Full,
+    )
+    .await
+}
+
 async fn process_branch_merge_sidecar_v4(
     root_uri: &str,
     storage: &std::sync::Arc<dyn StorageAdapter>,

@@ -181,6 +181,7 @@ pub mod names {
     /// Every merge table effect is complete, but the sidecar is still in its
     /// pre-confirmation shape.
     pub const BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM: &str = "branch_merge.post_effects_pre_confirm";
+    pub const BRANCH_MERGE_PRE_ERROR_RECOVERY: &str = "branch_merge.pre_error_recovery";
     pub const BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM: &str =
         "branch_merge.rewrite_after_delete_pre_confirm";
     pub const BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE: &str =

@@ -83,8 +83,19 @@ the graph quiescent, Full recovery may:
 - promote or discard owned schema staging;
 - refuse an invariant violation or ambiguous effect.
 
-Lance Restore can defeat a concurrent writer, so this destructive mode must not
-run as an in-process heal while writers may be active.
+Lance Restore can defeat a concurrent writer, so ordinary in-process healing
+must not run a destructive Full sweep.
+
+A merge that returns an error before durable effect confirmation resolves only
+its own BranchMerge sidecar while retaining its schema, branch and table gates.
+It re-reads the durable record and reuses the exact Full classifier to retire
+an effect-free attempt or compensate owned unconfirmed effects. The original
+merge error is returned after cleanup; failed or deferred cleanup retains
+`RecoveryRequired`. Confirmed effects remain on the ordinary roll-forward path.
+This scoped error cleanup does not handle a cancelled future and does not add
+cross-process fencing or prove the completion of an already-transmitted remote
+write after an ambiguous I/O failure; the existing recovery support boundary
+still applies.
 
 ### RollForwardOnly
 
