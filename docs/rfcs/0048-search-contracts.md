@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-10
+updated: 2026-09-11
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
@@ -137,9 +137,12 @@ and the read/error envelope before calling the design accepted. The
 separates checked-in tests, isolated experiments and the completed diagnostic
 pilot from the remaining production qualification.
 The [phases](#implementation-phases) specify what each implementation must
-prove. Sparse/multivector representations, learned reranking and stable ranked
-pagination retain extension contracts; they are not prerequisites for the
-initial complete lexical/vector/graph path.
+prove, including uncertainties implementers must investigate. The
+[next delivery milestone](#next-delivery-milestone-composed-analytical-answers)
+turns the deferred analytical and nested composition foundations into usable
+queries. Sparse/multivector representations, learned reranking and stable
+ranked pagination retain extension contracts; they are not prerequisites for
+the initial complete lexical/vector/graph path.
 
 ## Summary
 
@@ -3089,6 +3092,37 @@ exact evaluator exists; enabling a path requires its qualification gate.
 Every phase extends the [existing test owners](#research-context-and-required-qualification)
 and records its implementation PRs and evidence in this RFC.
 
+**How implementers should use this plan.** The phase handoffs describe required
+outcomes and integration order. They do not certify the proposed implementation.
+This RFC remains a draft; normative statements are proposed acceptance
+requirements, while the repository's standing invariants govern implementation.
+Treat API reuse, physical plans, defaults and prototype results as claims with
+the evidence boundaries below.
+
+| Evidence level | What it establishes | What implementers must still check |
+|---|---|---|
+| Design proved | Coherent proposed syntax, types, scope, population and logical/physical plan arguments | Actual compiler/execution behavior, resource bounds and supported integration paths |
+| Prototype executed | A recorded executable produced expected results on specified fixtures | Whether the fixture covers the claim and production lowering, optimization, transports and dependencies preserve it |
+| Production qualified | An integrated implementation passes its owned result, mechanism, resource and transport gates | The qualified revision, dependency/configuration envelope and excluded routes; this is not a universal guarantee |
+| Open / unproved | A design decision or implementation assumption lacks sufficient evidence | Resolve it through source inspection and a discriminating test, or record an explicit dependency/defer decision |
+
+These labels explain evidence, not a second phase-status system. Keep current
+findings in the [contract-to-code matrix](#contract-to-code-qualification) and
+[implementation checkpoint](#implementation-handoff-and-validation-checkpoint),
+and production status in frontmatter. Do not copy old pass counts into a new
+implementation PR as fresh evidence.
+
+Before adopting a claim, inspect the implementation checkout and its lockfile,
+read the complete relevant upstream pages from [the Lance map](../dev/lance.md),
+and inspect matching pinned source. Extend the existing owner with the smallest
+test that would fail if the claim were false; verify its selected test count,
+physical setup and negative control. Record source revision, dependency and
+configuration identity, command, result and remaining limitation in the owning
+evidence entry. Revalidate when the relied-on path or dependency changes;
+do not rerun unrelated experiments merely to accumulate green tests.
+If evidence contradicts a proposed mechanism, revise it and its recorded
+disposition. Do not weaken a promised result to make a probe pass.
+
 | Phase | Depends on | Outcome |
 |---|---|---|
 | 0. Resolve contracts | Current-code audit and design review | Accepted semantics, C1–C4 grammar/type/plan proofs, executable oracles, and owned qualification criteria |
@@ -3100,6 +3134,26 @@ and records its implementation PRs and evidence in this RFC.
 | 6. Ship the coordinated migration | 1–5 | One supported query/schema cutover with verified upgrade and client behavior |
 
 #### Phase 0: resolve contracts and build the oracles
+
+**Purpose.** Resolve choices that would otherwise force incompatible compiler,
+schema and execution implementations.
+
+**Required inputs.** A fresh production baseline, the capability matrix,
+open frontmatter gates and recorded prototype evidence. Inspect the archived
+integration patch at its recorded base before porting it.
+
+**Deliverables.** Each decision needs a concrete disposition in its owning
+section, with the proof or remaining dependency attached:
+
+| Decision package | Owning contract / required artifact |
+|---|---|
+| Stage/expression syntax and output | [Language evolution](#language-evolution-and-compatibility): explicit block output, namespaces, precedence, argument and scope rules |
+| Analytical and nested composition | [C1–C4](#required-composition-examples): proposed syntax, type/scope derivation, golden logical plan, physical feasibility and invalid-rewrite counterexample for each |
+| Selection and scoring identity | [Target/group rules](#target-identity-fan-out-grouping-and-metrics) and [lexical scoring](#lexical-scoring-and-shared-matching-semantics): multiplicity, statistics, numeric policy and complete ties |
+| Representation and schema identity | [Defaults](#directive-defaults-and-omission-rules) and [representation identity](#representation-identity-and-source-attribution): resolved encoders, Unicode/analyzer identity and format assignment |
+| Global search | [Cross-type discovery](#graph-wide-discovery-across-entity-types): include/defer disposition, type/representation scope and narrowing/projection |
+| Execution and read envelopes | [Budgets and continuation](#result-metadata-coherent-continuation-and-budgets): units, admission, response/error types, replay and retention |
+| Workload qualification | [Mixed workload protocol](#mixed-workload-qualification): fixed tasks, oracles/judgments, recipe inputs and acceptance criteria |
 
 Refresh the compiler/engine baseline and identify the remaining RFC 0047
 guarantees before porting any prototype code.
@@ -3144,7 +3198,13 @@ Keep filter movement within graph segments separated by selection barriers;
 an executable query alone does not prove its descriptor or test harness sees
 all later reads. Admit parameter bounds before the first data scan.
 
-Completion requires parser/typechecker prototypes and golden plans for both
+**Integration points.** Extend the compiler's
+[query grammar/typechecker](../../crates/omnigraph-compiler/src/query/),
+[IR lowering](../../crates/omnigraph-compiler/src/ir/lower.rs) and existing
+search/GQT owners. Coordinate schema identity with RFCs 0040/0043/0044 and
+read-envelope decisions with existing API/CLI owners.
+
+**Exit criteria.** Parser/typechecker prototypes and golden plans for both
 graph-scope-first and retrieval-first queries, independent numerical score
 fixtures, the C1–C4 design proofs, and concrete dispositions for the acceptance
 blockers. Define the fixed retrieval and mixed analytical/graph/agent-task
@@ -3152,7 +3212,29 @@ corpus and evaluation criteria here, before tuning defaults. A capability
 listing or the existing compiler baseline is not that
 evidence. Compiler, search, schema, and read-contract owners supply these proofs.
 
+**Uncertainty and required investigation.** The sketches do not settle the
+complete expression grammar, explicit output spelling, C1–C4 scopes or
+cross-type result types. Check actual parser/name-resolution behavior and
+negative cases; illustrative notation is not accepted syntax. Resource and
+wire choices remain open too. Start a dependent work package only after its
+required decisions/interfaces are fixed; an unresolved native route needs an
+explicit upstream dependency or fallback disposition, not assumed feasibility.
+
+**Deferred work.** Full production implementations of C1, C3 and C4 and C2's
+general distinct/intermediate-group extensions. Their design proofs are due
+here. The next milestone qualifies analytical/nested composition; independent
+candidate scoring (C3) remains a separate extension.
+
 #### Phase 1: build representation, plan, and resource foundations
+
+**Purpose.** Give admitted graph, analytical and retrieval stages one typed
+plan and execution context without introducing a parallel query engine.
+
+**Required inputs.** Phase 0's expression/stage interfaces, resolved schema
+identities, resource units and error contract. Ordinary-query compatibility
+fixtures must be available before changing the production AST/IR.
+
+**Deliverables.**
 
 Implement accepted representation identities and validation, typed lexical
 queries, shared expressions for admitted operators, named stage IR,
@@ -3166,7 +3248,17 @@ context that every later
 operator must use. Extend the sealed storage interfaces and existing
 schema/rebuild tooling; coordinate one format boundary for the final release.
 
-Completion requires compiler/schema fixtures for serialization, parameter
+**Integration points.** The compiler's
+[AST](../../crates/omnigraph-compiler/src/query/ast.rs),
+[IR](../../crates/omnigraph-compiler/src/ir/),
+[descriptor](../../crates/omnigraph-compiler/src/query/descriptor.rs) and
+[SchemaIR](../../crates/omnigraph-compiler/src/catalog/schema_ir.rs);
+the engine's [query execution](../../crates/omnigraph/src/exec/query.rs),
+[sealed TableStore](../../crates/omnigraph/src/table_store.rs) and schema/rebuild
+owners. Every stage walker, including GQT construct detection, must see later
+reads and retained hidden columns.
+
+**Exit criteria.** Compiler/schema fixtures for serialization, parameter
 bounds, invalid references, rename versus drop/re-add identity, incompatible
 encoding refusal, default/override resolution, export/reapplication stability,
 and migration rewrite idempotence. Tests must show that
@@ -3179,7 +3271,33 @@ calls are active, with retained plans and shared caches present. Keep the
 native scheduler counterexample as an upstream compatibility fence; a passing
 counterexample test documents the missing guarantee, not its repair.
 
+**Uncertainty and required investigation.** A shared DataFusion pool does not
+prove that Lance decode buffers, Arrow aliases, dispatched I/O and encoders
+obey one hard allowance. The matrix records counterexamples. Inspect actual
+allocation/task ownership and configured scanner planning; exercise
+preallocation refusal, cancellation and cleanup across sources and suffix
+stages. Any unresolved route blocks its claimed resource guarantee.
+
+**Deferred work.** Public syntax/execution for broader computed/grouped/nested
+operators. Internal extension interfaces do not make those operators available.
+
 #### Phase 2: implement complete lexical and vector retrieval
+
+**Purpose.** Establish correct membership and ranking baselines against which
+every physical acceleration can be compared.
+
+**Required inputs.** Phase 1's resolved representations and resource context;
+Phase 0's lexical/vector numeric rules and independent score fixtures.
+
+**Deliverables.** Review these packages independently while preserving the
+shared lexical query and execution context:
+
+| Work package | Required result / evidence |
+|---|---|
+| Lexical membership | Complete analyzed `Terms` evaluation across edits and index states; owned GQT regressions and analyzer/lifecycle controls |
+| Lexical scoring | Exact/fuzzy ranking with accepted live statistics and numeric rules; Decimal oracle and complete-boundary fixtures |
+| Exact vectors | `knn` over eligible valid vectors; geometry, arithmetic, invalid-value and tie fixtures |
+| Approximate vectors | Declared ANN effort/coverage behavior and qualified fallback; exact-reference recall comparison before enabling a native path |
 
 Build one bounded NFC/analyzer pipeline and the exact scan evaluator for the
 `Terms` relation, then exact and fuzzy lexical scoring against the Phase 0
@@ -3189,7 +3307,12 @@ total comparator. Establish the ANN source contract and its qualified exact
 fallback before enabling indexed approximation. Charge analysis, statistics,
 representation coverage, scoring, and selection to the Phase 1 context.
 
-Completion requires `.gqt` result/error cases plus search and substrate
+**Integration points.** Extend `search.rs`, `lance_surface_guards.rs`, existing
+score fixtures and [search GQT cases](#ci-checkpoint-and-regression-disposition),
+using TableStore for pinned reads. Native arithmetic/coverage assertions
+belong in Rust; observable rows/errors/shapes belong in GQT.
+
+**Exit criteria.** `.gqt` result/error cases plus search and substrate
 fixtures for the lexical qualification matrix, snapshot-correct statistics,
 vector numeric boundaries, complete ties, and explicit budget/cancellation
 failure. Exercise append/update/delete, compaction, and different index states
@@ -3202,7 +3325,26 @@ current answer differ from the pinned answer before reading the old snapshot;
 restoring identical data before that assertion cannot detect an accidental
 read of the current head. Reopening the handle should preserve the same result.
 
+**Uncertainty and required investigation.** Native fuzzy analysis, float32
+BM25, live-row statistics and native candidate cuts are not proven substitutes
+for this contract. Reproduce the matrix's analyzer, rare-expansion, deletion
+and tie counterexamples against the actual pin before reuse. Numerical
+agreement does not establish a useful relevance default; ANN recall and
+recipe quality still require Phase 5's workload qualification.
+
+**Deferred work.** General candidate-scoring/model operators, phrase/proximity
+queries and sparse/multivector representations. Workload-default selection
+awaits Phase 5's evidence.
+
 #### Phase 3: compose graph scope, fusion, and selection
+
+**Purpose.** Deliver the first useful mixed graph/retrieval/analytical path.
+
+**Required inputs.** Phase 2's reference retrievers and Phase 1's shared stage
+and resource interfaces. Use Phase 0's small integrated query to expose
+composition defects before every native optimization is complete.
+
+**Deliverables.**
 
 Connect the retrievers to graph-defined eligible targets and implement named
 weighted RRF, graph expansion between rank blocks, per-group selection, and
@@ -3215,7 +3357,12 @@ intermediate operators and general distinct aggregates remain deferred.
 Reuse existing traversal and qualified DataFusion operators, wiring them into
 the Phase 1 memory/scratch accounting; introduce no eager graph cross product.
 
-Completion requires plans and `.gqt` cases that distinguish filtering before
+**Integration points.** Existing query execution, traversal and
+[projection/aggregation](../../crates/omnigraph/src/exec/projection.rs), typed
+IR lowering, and qualified DataFusion operators. Extend GQT plus `search.rs`,
+`rrf_prefilter_gate.rs`, `ordering.rs`, `aggregation.rs` and traversal owners.
+
+**Exit criteria.** Plans and `.gqt` cases that distinguish filtering before
 and after a cut, rank traversal-introduced targets, preserve one arm vote per
 target through repeated paths, and keep source windows independent of final
 limits. Search/traversal/ordering/aggregation owners verify missing-arm metrics,
@@ -3224,7 +3371,39 @@ the [analytical population counterexamples](#analytical-populations-and-selectio
 for delivered operators, alongside ordinary exact graph aggregates. Include
 fan-out and sort/spill failures that cannot return successful partial results.
 
+Use these concrete result contracts for the mixed-query fixtures; the
+[composition laws](#logical-operators-and-composition-laws) remain their
+semantic authority:
+
+| Query journey | Required observation |
+|---|---|
+| Graph-constrained retrieval → traversal → terminal count | C2's selected p1/p2 produce three binding rows for P; excluded p3 does not enter the count |
+| Retrieval → metric reduction by project | The declared reduction survives as a typed result; adding a non-aggregate metric changes grouping, while ordering by a discarded metric is refused |
+| Graph filter before versus after retrieval | Different winners or counts in the two fixture queries; the optimizer preserves both placements |
+| Fusion → fan-out → group quota | One arm vote per target; missing arm metrics stay null; winning target/group pairs retain exactly their associated bindings |
+| Small result with a large graph suffix | Intermediate admission can refuse despite final `limit 1`; no successful truncated aggregate |
+
+**Uncertainty and required investigation.** Native relational probes do not
+qualify GQ lowering, target masks, ordering after payload reads or descriptor
+walkers. The nullable-join dynamic-filter counterexample is a known fence;
+inspect the pinned optimizer before removing it. Compare complete optimized
+plans with the scalar oracle over duplicate paths, null keys, partition
+changes and equal-score boundaries, and retain failure controls.
+
+**Deferred work.** Reusable intermediate groups, general distinct aggregates
+and full per-parent retrieval/collection. Initial C2 support is terminal
+binding-row aggregation and the declared metric reductions.
+
 #### Phase 4: complete the agent-facing read path
+
+**Purpose.** Make supported mixed queries inspectable, invocable and usable
+for coherent follow-up through existing agent-facing interfaces.
+
+**Required inputs.** Phase 0's read/error envelope and stored-query fingerprint
+decisions; Phase 3's qualified result/population semantics. Transport work can
+start earlier against the agreed interfaces.
+
+**Deliverables.**
 
 Expose the staged plan through existing inline and stored queries, with
 definition/execution fingerprints, inspectable plans, named metrics, and
@@ -3235,7 +3414,12 @@ Integrate RFC 0040's identity projection and lookup, including entities without
 a declared application key; a journey using only keyed entities is insufficient.
 Resolve the combined HTTP/CLI compatibility questions and regenerate OpenAPI.
 
-Completion requires an end-to-end discovery → source read → graph expansion →
+**Integration points.** Compiler descriptors,
+[API types](../../crates/omnigraph-api-types/src/lib.rs), server `data_routes`,
+`stored_queries`, `auth_policy` and `openapi` owners, and CLI `cli_data` and
+`parity_matrix`. Use existing snapshot request fields and query metadata.
+
+**Exit criteria.** An end-to-end discovery → source read → graph expansion →
 exact verification journey and a graph-scoped retrieval → terminal aggregate
 journey through embedded, HTTP, stored-query, and CLI paths. The latter must
 preserve output types, population lineage and projected group identities for
@@ -3246,7 +3430,35 @@ client serialization/error behavior. Large projections and fallback work
 must stay within the same resource contract. Stable ranked cursors and a
 durable search-result store are not part of this phase.
 
+| Request/result journey | Required observation |
+|---|---|
+| Inline/stored discovery, change head, follow a returned identity | Follow-up at the returned snapshot reads the earlier value; include an entity without an application key |
+| Retrieved population → aggregate | Executed and inferred types agree, and the result/plan identifies the aggregate's selected population |
+| Exact requested coverage exceeds budget | Typed failure, not empty success or silent downgrade to unknown coverage |
+| Snapshot unavailable/expired or access revoked | Explicit refusal through applicable transports; identity does not retain authorization |
+| JSON and JSONL continuation | Both preserve same-read snapshot identity or its explicit unavailability; test renderer parity |
+
+**Uncertainty and required investigation.** Existing snapshot fields do not
+prove complete identity lookup, retention, renderer or client compatibility.
+Inspect real serializers/parsers, and make current and pinned answers differ
+in fixtures. A graph snapshot does not freeze an external encoder; verify
+resolved representation/query identity instead of trusting a provider label.
+Concrete envelope and error spellings must follow Phase 0 decisions.
+
+**Deferred work.** Stable ranked cursors, durable result storage and the full
+nested analytical-answer surface. Preserve existing continuation semantics.
+
 #### Phase 5: qualify physical execution and measure retrieval
+
+**Purpose.** Decide which physical paths and defaults are justified by the
+supported workload, using correctness and cost evidence separately.
+
+**Required inputs.** Phase 2's exact references, Phase 3's composition oracles,
+Phase 4's agent-facing journeys and the frozen mixed-workload protocol.
+Native comparisons can begin after Phase 2; complete agent trials require
+the actual supported transport/query surface.
+
+**Deliverables.**
 
 Compare each proposed Lance/index path against the Phase 2 exact evaluator
 and the Phase 3 composition rules. Qualify graph-ID/native-row-mask mapping,
@@ -3255,7 +3467,12 @@ uncovered tails, raw-vector rescoring, and physical partition behavior. Native A
 evaluated against exact `knn` for recall and bounded effort; it is not required
 to discover the exact candidate set. Preserve rebuild/recovery ownership.
 
-Completion requires correctness and resource evidence for every enabled path,
+**Integration points.** Existing search/substrate owners,
+[search-selection instruments](../../crates/omnigraph/benches/scenarios/search_selection.rs),
+`benchmark_scenario_contract.rs` and the repository's benchmark harness.
+Record outcomes in the owning qualification entries and workload report.
+
+**Exit criteria.** Correctness and resource evidence for every enabled path,
 including cancellation, model calls, coverage scans, graph fan-out,
 sorting/spill, output, and fallback within the remaining budget. Run the
 fixed-corpus lexical, dense, and fused retrieval comparison and the
@@ -3269,7 +3486,34 @@ task coverage. Freeze source/window defaults and each enabled index family's
 that evaluation. An unqualified native path stays disabled while a qualified
 exact fallback serves its contract; measured limits must remain explicit.
 
+The experiment handoff must fix corpus/schema/snapshot, model and saved
+representation identity, queries/recipes, windows, budgets, expected exact
+facts, relevance judgments, tested configurations and pass/refusal criteria
+before tuning. Distinguish exact-result parity, ANN recall, judged task
+correctness and physical cost. Preserve failed/refused trials and provenance.
+Enable an optimization only after its semantic and resource gates pass;
+select a default only within the measured workload/configuration envelope.
+
+**Uncertainty and required investigation.** The document pilot has no
+independent human adjudication and does not establish analytical task quality,
+a modality winner or production latency. No universal join strategy, candidate
+window or ANN effort mapping is known. Test the dimensions in
+[mixed qualification](#mixed-workload-qualification), seek counterexamples to
+the proposed default, and report limits rather than extrapolating from one
+fixture or debug-host timing. The frozen pilot remains historical evidence.
+
+**Deferred work.** Qualification of unsupported operators and untested index
+families/environments. Future milestone tasks need fresh evidence once those
+operators exist; no general agent-superiority claim follows from this phase.
+
 #### Phase 6: ship the coordinated language and data migration
+
+**Purpose.** Deliver one supported cutover with reviewable migration behavior.
+
+**Required inputs.** Qualified release paths from Phases 1–5, the agreed
+schema/format boundary and concrete HTTP/CLI/client compatibility decisions.
+
+**Deliverables.**
 
 Remove the legacy search grammar, IR variants, and compatibility execution
 paths in the same public release that supplies the complete new path. Deliver
@@ -3278,13 +3522,46 @@ client changes, user/developer guides, and release notes. Exercise the
 [migration sequence](#migration-sequence) using the existing export/init/load
 and explicit index-reconciliation owners.
 
-Completion requires predecessor/current format refusal and rebuild tests,
+**Integration points.** Existing schema/export/init/load and reconciliation
+owners, CLI [cross-version tests](../../crates/omnigraph-cli/tests/crossversion_upgrade.rs),
+ordinary/search query journeys, API/OpenAPI and client checks, user/developer
+guides and release notes. The [testing guide](../dev/testing.md) owns actual
+predecessor binaries and required CI environments.
+
+**Exit criteria.** Predecessor/current format refusal and rebuild tests,
 compatible-value preservation, explicit unresolved-encoding refusal, and
 successful migrated queries and follow-up reads. Verify ordinary graph queries
 as well as fuzzy, lexical, vector, fused, and graph-scoped journeys. Run the
 required compiler/engine/transport suites, canonical workspace checks, and
 documentation/OpenAPI checks for the final implementation. Users encounter
 one supported cutover; temporary implementation scaffolding is removed.
+
+Execute release checks in this order, using the
+[migration sequence](#migration-sequence) as the user-visible contract:
+
+1. Resolve final schema/format identities and assemble the release's supported
+   syntax, semantic defaults and wire changes.
+2. Prepare schema/query diagnostics and rewritten application/stored-query
+   examples; refuse unresolved old encoding identities rather than guessing.
+3. Exercise predecessor export and new init/load on real fixtures, regenerate
+   incompatible representations and reconcile indexes explicitly. Preserve
+   access to the predecessor graph when old history is required.
+4. Verify ordinary and migrated search queries, aggregate result shapes,
+   follow-up identity, and client result/error handling on the rebuilt graph.
+5. Complete owned release checks and publish coordinated docs/migration
+   instructions. Remove temporary production scaffolding and obsolete syntax;
+   retain qualification evidence and compatibility guards that still apply.
+
+**Uncertainty and required investigation.** The final format assignment can
+change as related RFCs land, and keeping an endpoint does not prove client
+compatibility. Refresh accepted SchemaIR/version decisions and real client
+parsers at implementation time. A green predecessor test skipped because its
+binary was absent is not upgrade evidence. Recheck the documented loss of old
+histories/snapshot references across rebuild and actual refusal behavior.
+
+**Deferred work.** The later composition milestone and any global-search
+capability explicitly deferred in Phase 0. Release docs must state the
+implemented boundary rather than the full language roadmap.
 
 ### Release and completion criteria
 
@@ -3311,6 +3588,69 @@ Every later extension retains the stated semantic and qualification boundary.
 `Foundation` rows require their grammar/type/composition proofs before syntax
 stabilization while their broader operators remain deferred. These design
 proofs do not enlarge the advertised initial-release feature set.
+
+### Next delivery milestone: composed analytical answers
+
+This is the proposed next delivery priority after the initial release. It
+implements C1, C4 and C2's general distinct/intermediate-group extensions from
+the [required composition examples](#required-composition-examples). Their
+Phase 0 proofs remain acceptance gates now; their runtime delivery is a
+separate milestone. This ordering does not settle the global-search
+`Decision` rows or make a deferred operator available.
+
+**Purpose.** Let one query derive facts about a population, use those facts to
+select graph entities, retrieve relevant evidence, and return a structured
+answer that preserves entities with no optional evidence.
+
+**Required inputs.** Phase 0's accepted syntax/type/scope and plan arguments,
+Phase 1's typed relation and shared execution context, Phase 3's composition
+semantics, and Phase 4's descriptors and read contract. Extend the accepted
+grammar without changing existing query meanings. Revisit a design proof if
+implementation contradicts it before committing another public spelling.
+
+**Deliverables.** Implement in dependency order, extending the common stage
+and expression model:
+
+1. Reusable intermediate computation, projection and grouping, including
+   explicit distinct aggregation. Preserve projected group identities and
+   computed values; refuse references to discarded member bindings/metrics.
+2. Local ordering/selection and full correlated retrieval over each selected
+   group's eligible population. Define imported/exported bindings, empty
+   groups and metric scope, and charge repeated work to one query budget.
+3. Optional graph enrichment and bounded nested objects/evidence collections,
+   composed with analytical rows. Define null versus empty-list results and
+   require explicit handling of multiple owners or evidence rows.
+
+**Integration points.** Extend the existing compiler grammar/typechecker,
+typed IR, traversal/projection/aggregation and qualified DataFusion operators.
+Carry scopes, populations and output types through descriptors, stored-query
+plans and transports. Extend existing GQT and mixed-workload owners; do not
+introduce a second analytical query engine or a document-only result model.
+
+**Exit criteria.** Execute the full C1/C2/C4 fixtures through the common query
+path and public read interfaces. C1 computes increases of six and one, selects
+service A and retrieves only its eligible reports. C2 preserves three binding
+rows versus two distinct reports and excludes p3. C4 returns at most two
+reports for A while preserving B with a null owner and empty evidence list.
+Assert inferred/executed types, projected identity, deterministic local
+selection, snapshot-bound follow-up and explicit refusal under a small shared
+budget. Preserve the initial release's accepted queries and demonstrate the
+new mixed tasks under the frozen evaluation protocol.
+
+**Uncertainty and required investigation.** A generic join, aggregate or
+collection API does not prove correlated execution, correct empty-group
+behavior or bounded nested materialization. Inspect actual lowering and
+optimized plans, then compare against simple independent evaluators using
+empty groups, duplicate bindings, nulls, skewed fan-out and wrong-group
+counterexamples. Prove that retained outer bindings and shared budgets survive
+repeated retrieval before optimizing reuse or batching. Per-group rescan cost,
+safe reuse boundaries and the best structured-output implementation remain
+unproved; measure them instead of inferring them from Phase 0's plan argument.
+
+**Deferred work.** C3's independent candidate-scoring stage and broader
+ranking/model extensions retain their separate design and qualification
+contracts. The capability matrix continues to own other extension priorities;
+this milestone does not imply support for all future operators.
 
 ## Unresolved questions
 
@@ -3348,6 +3688,12 @@ proofs do not enlarge the advertised initial-release feature set.
 
 ## Decision log
 
+- 2026-09-11 — expanded every phase into an implementation handoff with
+  inputs, deliverables, existing owners, exit criteria, deferred scope and
+  concrete uncertainties to investigate. Distinguished design arguments,
+  prototype evidence and production qualification, and named the next
+  analytical/nested composition milestone. No new runtime qualification or
+  initial-release support is claimed by these planning changes.
 - 2026-09-10 — made mixed analytical, graph and semantic investigation the
   agent-workload objective. Consolidated typed relation/operator contracts,
   separated aggregate input from eligibility, candidates and scoring corpus,
