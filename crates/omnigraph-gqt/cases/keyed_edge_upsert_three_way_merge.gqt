@@ -1,15 +1,21 @@
 # issue: none
-# notes: keyed twin of unkeyed_edge_dup_three_way_merge.gqt: with @key(src, dst) (RFC 0044) the self-loop
+# notes: keyed twin of unkeyed_edge_dup_three_way_merge.gqt: with @key(@src, @dst) (RFC 0044) the self-loop
 # notes: born on both sides derives one id and merges to one row, the branch's re-insert of an inherited
 # notes: pair upserts, main's person write merges beside them, and source delete plus restart keep one
 # notes: row per pair.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
 
 --- schema
 node Person {
     name: String @key
 }
 edge Knows: Person -> Person {
-    @key(src, dst)
+    @key(@src, @dst)
 }
 
 --- seed

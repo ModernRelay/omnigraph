@@ -4,6 +4,12 @@
 # notes: inherited pair to two, main's person write merges beside them, and source delete plus restart
 # notes: keep every row.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

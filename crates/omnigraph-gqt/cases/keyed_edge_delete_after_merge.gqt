@@ -1,14 +1,20 @@
 # issue: none
-# notes: keyed twin of unkeyed_edge_dup_delete_after_merge.gqt: with @key(src, dst) (RFC 0044) the branch's
+# notes: keyed twin of unkeyed_edge_dup_delete_after_merge.gqt: with @key(@src, @dst) (RFC 0044) the branch's
 # notes: re-insert upserts, both the merged branch and main stay writable, and a delete by source removes
 # notes: the one row per pair; restart keeps the deletion.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
 
 --- schema
 node Person {
     name: String @key
 }
 edge Knows: Person -> Person {
-    @key(src, dst)
+    @key(@src, @dst)
 }
 
 --- seed

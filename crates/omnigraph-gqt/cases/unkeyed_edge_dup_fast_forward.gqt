@@ -2,6 +2,12 @@
 # notes: an unkeyed edge type is a multiset (RFC 0044): re-inserting a pair the branch inherited mints a
 # notes: second row, the fast-forward merge carries it to main, and a restart keeps both copies.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

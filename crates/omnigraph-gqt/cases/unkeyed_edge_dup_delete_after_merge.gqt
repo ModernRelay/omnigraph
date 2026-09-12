@@ -3,6 +3,12 @@
 # notes: writable, and a delete by source removes every copy of an unkeyed pair, not one; restart keeps
 # notes: the deletion.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

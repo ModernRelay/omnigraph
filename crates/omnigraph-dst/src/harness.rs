@@ -5455,9 +5455,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                 }
             }
-            let mut heads_before = if failing.is_some()
-                || (crash_now.is_some() && !sc.probe_only)
-            {
+            let mut heads_before = if failing.is_some() || (crash_now.is_some() && !sc.probe_only) {
                 branch_heads(&db, &world, i, &wop, failing.as_deref()).await
             } else {
                 Vec::new()
