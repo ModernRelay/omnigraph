@@ -480,7 +480,7 @@ version: 1
 id: worker-identity-test
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 3, seed: 0 }
   data: { provenance: synthetic, tables: 2, rows_per_table: 12, payload_bytes: 8, column_shape: scalars, topology_skew: uniform }
   state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 6 }
 workload: { delta_rows_per_side: 6, diverged_tables: 1, arrival: unscheduled-single-shot, clients: 1, read_write_mix: write-heavy, contention: distinct-key }

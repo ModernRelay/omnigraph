@@ -74,10 +74,10 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d047","n":47,"name":"doc-047","embedding":[47.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d048","n":48,"name":"doc-048","embedding":[48.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d049","n":49,"name":"doc-049","embedding":[49.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d010","to":"d011","data":{"id":"e010_0"}}
-{"edge":"Knows","from":"d020","to":"d021","data":{"id":"e020_0"}}
-{"edge":"Knows","from":"d030","to":"d031","data":{"id":"e030_0"}}
-{"edge":"Knows","from":"d040","to":"d041","data":{"id":"e040_0"}}
+{"edge":"Knows","id":"e010_0","from":"d010","to":"d011","data":{}}
+{"edge":"Knows","id":"e020_0","from":"d020","to":"d021","data":{}}
+{"edge":"Knows","id":"e030_0","from":"d030","to":"d031","data":{}}
+{"edge":"Knows","id":"e040_0","from":"d040","to":"d041","data":{}}
 
 --- query
 query scenario($q: Vector(4)) {

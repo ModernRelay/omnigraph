@@ -62,7 +62,8 @@ async fn init_creates_graph() {
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.path().join("__schema_state.json")).unwrap())
             .unwrap();
-    assert_eq!(ir.ir_version, 2);
+    assert_eq!(ir.ir_version, 5);
+    assert!(ir.features.contains("system-columns"));
     let persisted: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.path().join("_schema.ir.json")).unwrap()).unwrap();
     assert!(persisted.get("actor_provenance").is_none());
@@ -101,8 +102,8 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        8,
-        "fresh graphs must use v8 so old binaries refuse retired native refs"
+        9,
+        "fresh graphs are stamped at the current-vintage manifest format (v9, RFC 0040 system columns over the RFC 0042 retirement metadata)"
     );
     assert!(snap.dataset("node:Person").is_some());
     assert!(snap.dataset("node:Company").is_some());
@@ -119,8 +120,8 @@ async fn init_creates_graph() {
             .collect::<Vec<_>>();
         assert_eq!(
             primary_key,
-            ["id"],
-            "fresh graph table {table_key} must be created with exactly `id` as its Lance unenforced primary key"
+            ["__id"],
+            "fresh graph table {table_key} must be created with exactly `__id` as its Lance unenforced primary key"
         );
         assert!(
             dataset.schema().field("__omnigraph_stream_v1$").is_none(),
@@ -336,10 +337,12 @@ async fn open_refuses_v3_live_or_staged_schema_without_changing_files() {
 
     // The unsupported version is the boundary, including disabled bindings.
     // Do not require this binary to understand the removed binding shape.
-    for (filename, enabled) in [
-        ("_schema.ir.json", true),
-        ("_schema.ir.json", false),
-        ("_schema.ir.json.staging", true),
+    for (filename, enabled, duplicate_features) in [
+        ("_schema.ir.json", true, false),
+        ("_schema.ir.json", false, false),
+        ("_schema.ir.json.staging", true, false),
+        ("_schema.ir.json", true, true),
+        ("_schema.ir.json.staging", true, true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -356,11 +359,11 @@ async fn open_refuses_v3_live_or_staged_schema_without_changing_files() {
             dir.path().join("__schema_state.json.staging"),
         )
         .unwrap();
-        fs::write(
-            dir.path().join(filename),
-            serde_json::to_vec_pretty(&ir).unwrap(),
-        )
-        .unwrap();
+        let mut ir_text = serde_json::to_string_pretty(&ir).unwrap();
+        if duplicate_features {
+            ir_text.insert_str(1, "\"features\": [],");
+        }
+        fs::write(dir.path().join(filename), ir_text).unwrap();
         let before = files(dir.path());
 
         for read_only in [true, false] {

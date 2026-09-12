@@ -137,7 +137,13 @@ fn schema_show_preserves_plain_source_and_json_contract() {
     assert_eq!(stdout_string(&plain).trim_end(), source.trim_end());
     let json = output_success(cli().args(["schema", "show", "--json"]).arg(&graph));
     let payload: Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(payload, serde_json::json!({ "schema_source": source }));
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "schema_source": source,
+            "system_columns": { "id": "__id", "src": "__src", "dst": "__dst" }
+        })
+    );
 }
 
 #[test]

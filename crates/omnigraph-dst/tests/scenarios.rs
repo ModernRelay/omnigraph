@@ -3694,15 +3694,8 @@ fn dst_merge_version_collision_diverged_edge_table() {
     })
 }
 
-/// MULTISET-DEFAULT CONTRACT pin (localized 2026-08-12 from seed 10228's
-/// op transcript; reclassified from bug pin to contract pin by RFC 0044):
-/// the SAME logical unkeyed edge added independently on BOTH sides of a
-/// fork, then merged. The three-way merge keys rows on the generated `id`,
-/// so the rows never collide and the merge keeps both (bound raw = 2,
-/// gated traversal = 1 — the visited gate dedupes membership). This is the
-/// documented multiset default for edge types without `@key`; declaring
-/// `@key(src, dst)` opts into convergence instead, pinned by the keyed
-/// twin `dst_keyed_born_on_both_edge_converges` below.
+/// Unkeyed edges added on both branches remain distinct after merge.
+/// Traversal deduplicates membership; a bound edge query retains both rows.
 #[test]
 #[serial]
 fn dst_merge_duplicates_born_on_both_edge() {
@@ -3811,7 +3804,7 @@ fn dst_merge_duplicates_born_on_both_edge() {
                     "multiset default: an unkeyed born-on-both edge merges \
                      into two physical rows. If this is 1, unkeyed edges \
                      started converging — a contract change beyond RFC 0044 \
-                     (which scopes convergence to @key(src, dst) types)."
+                     (which scopes convergence to @key(@src, @dst) types)."
                 );
                 println!(
                     "BORN-ON-BOTH pinned: the edge merged into {bound_dup} \
@@ -3825,15 +3818,10 @@ fn dst_merge_duplicates_born_on_both_edge() {
     })
 }
 
-/// Keyed twin of the multiset-default pin: the same born-on-both shape with
-/// `@key(src, dst)` declared on `Knows`. Both sides derive the same id, so
-/// the merge converges the edge to ONE physical row with no conflict
-/// (RFC 0044 opt-in). Bound raw and gated traversal agree at 1.
+/// Keyed edges added on both branches converge to one row after merge.
 #[test]
 #[serial]
 fn dst_keyed_born_on_both_edge_converges() {
-    // Mirrors fixtures/test.pg plus the one `@key(src, dst)` line; a
-    // TEST_SCHEMA edit must be carried here by hand.
     const KEYED_TEST_SCHEMA: &str = r#"
 node Person {
     name: String @key
@@ -3847,7 +3835,7 @@ node Company {
 
 edge Knows: Person -> Person {
     since: Date?
-    @key(src, dst)
+    @key(@src, @dst)
 }
 
 edge WorksAt: Person -> Company

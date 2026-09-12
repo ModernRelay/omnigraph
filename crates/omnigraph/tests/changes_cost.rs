@@ -108,13 +108,13 @@ node Company {
                     .await
                     .unwrap();
                 assert_eq!(
-                    parent.has_btree_index("id").await.unwrap(),
+                    parent.has_btree_index("__id").await.unwrap(),
                     stale_index,
                     "the two cost cells must distinguish absent from physically present index"
                 );
                 assert!(
                     matches!(
-                        parent.index_coverage("id").await.unwrap(),
+                        parent.index_coverage("__id").await.unwrap(),
                         IndexCoverage::Degraded { .. }
                     ),
                     "both absent and stale/partial coverage must be normal degraded states"

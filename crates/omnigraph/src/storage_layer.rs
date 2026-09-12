@@ -54,6 +54,7 @@ use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 #[cfg(test)]
 use lance::dataset::{WhenMatched, WhenNotMatched};
+use omnigraph_compiler::SystemColumns;
 
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
@@ -531,6 +532,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         filter: &str,
+        system_columns: SystemColumns,
     ) -> Result<Option<u64>>;
 
     /// Return one exact source id already present in this manifest-pinned
@@ -540,6 +542,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         source_ids: &[String],
+        system_columns: SystemColumns,
     ) -> Result<Option<String>>;
 
     async fn table_state(&self, dataset_uri: &str, snapshot: &SnapshotHandle)
@@ -569,6 +572,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         table_key: &str,
         batch: RecordBatch,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch>;
 
     /// Authorize and probe the complete operation's distinct external Blob
@@ -582,6 +586,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         table_key: &str,
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch>;
 
     /// Rewrite retained Overwrite URI cells to the exact normalized targets
@@ -591,13 +596,19 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         table_key: &str,
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch>;
 
     /// Validate the physical key contract shared by every v6 graph-table
     /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
     /// batch. Callers preparing a deferred first-touch or Overwrite plan must
     /// invoke this before recovery is armed or a native branch ref is created.
-    fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()>;
+    fn validate_keyed_write_batch(
+        &self,
+        table_key: &str,
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+    ) -> Result<()>;
 
     #[cfg(test)]
     async fn stage_append(
@@ -630,6 +641,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         table_key: &str,
         batch: RecordBatch,
         semantics: KeyedWriteSemantics,
+        system_columns: SystemColumns,
     ) -> Result<StagedHandle>;
 
     /// Stage a provenance-proven strict insert without re-running Lance's
@@ -642,6 +654,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: SnapshotHandle,
         chunk: ProvenInsertChunk,
+        system_columns: SystemColumns,
     ) -> Result<StagedHandle>;
 
     /// Test-only streaming-source sibling of [`Self::stage_keyed_write`].
@@ -658,6 +671,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         table_key: &str,
         source: &SnapshotHandle,
         semantics: KeyedWriteSemantics,
+        system_columns: SystemColumns,
     ) -> Result<StagedHandle>;
 
     /// Blob-aware full-row stream with an explicit batch ceiling. Branch
@@ -684,6 +698,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         begin_version: u64,
         end_version: u64,
         external_preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream>;
 
     #[cfg(test)]
@@ -987,16 +1002,18 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         filter: &str,
+        system_columns: SystemColumns,
     ) -> Result<Option<u64>> {
-        TableStore::first_row_id_for_filter(self, snapshot.dataset(), filter).await
+        TableStore::first_row_id_for_filter(self, snapshot.dataset(), filter, system_columns).await
     }
 
     async fn first_existing_id(
         &self,
         snapshot: &SnapshotHandle,
         source_ids: &[String],
+        system_columns: SystemColumns,
     ) -> Result<Option<String>> {
-        TableStore::first_existing_id(snapshot.dataset(), source_ids).await
+        TableStore::first_existing_id(snapshot.dataset(), source_ids, system_columns).await
     }
 
     async fn table_state(
@@ -1032,8 +1049,9 @@ impl TableStorage for TableStore {
         &self,
         table_key: &str,
         batch: RecordBatch,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch> {
-        TableStore::prepare_keyed_write_batch(self, table_key, batch).await
+        TableStore::prepare_keyed_write_batch(self, table_key, batch, system_columns).await
     }
 
     async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight> {
@@ -1045,9 +1063,16 @@ impl TableStorage for TableStore {
         table_key: &str,
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch> {
-        TableStore::prepare_keyed_write_batch_with_preflight(self, table_key, batch, preflight)
-            .await
+        TableStore::prepare_keyed_write_batch_with_preflight(
+            self,
+            table_key,
+            batch,
+            preflight,
+            system_columns,
+        )
+        .await
     }
 
     fn prepare_overwrite_blob_references_with_preflight(
@@ -1055,14 +1080,24 @@ impl TableStorage for TableStore {
         table_key: &str,
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<RecordBatch> {
         TableStore::prepare_overwrite_blob_references_with_preflight(
-            self, table_key, batch, preflight,
+            self,
+            table_key,
+            batch,
+            preflight,
+            system_columns,
         )
     }
 
-    fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {
-        TableStore::validate_keyed_write_batch(self, table_key, batch)
+    fn validate_keyed_write_batch(
+        &self,
+        table_key: &str,
+        batch: &RecordBatch,
+        system_columns: SystemColumns,
+    ) -> Result<()> {
+        TableStore::validate_keyed_write_batch(self, table_key, batch, system_columns)
     }
 
     #[cfg(test)]
@@ -1097,9 +1132,10 @@ impl TableStorage for TableStore {
         table_key: &str,
         batch: RecordBatch,
         semantics: KeyedWriteSemantics,
+        system_columns: SystemColumns,
     ) -> Result<StagedHandle> {
         let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_keyed_write(self, ds, table_key, batch, semantics)
+        TableStore::stage_keyed_write(self, ds, table_key, batch, semantics, system_columns)
             .await
             .map(StagedHandle::new)
     }
@@ -1108,9 +1144,10 @@ impl TableStorage for TableStore {
         &self,
         snapshot: SnapshotHandle,
         chunk: ProvenInsertChunk,
+        system_columns: SystemColumns,
     ) -> Result<StagedHandle> {
         let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_proven_strict_insert(self, ds, chunk)
+        TableStore::stage_proven_strict_insert(self, ds, chunk, system_columns)
             .await
             .map(StagedHandle::new)
     }
@@ -1122,11 +1159,19 @@ impl TableStorage for TableStore {
         table_key: &str,
         source: &SnapshotHandle,
         semantics: KeyedWriteSemantics,
+        system_columns: SystemColumns,
     ) -> Result<StagedHandle> {
         let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_keyed_write_stream(self, ds, table_key, source.dataset(), semantics)
-            .await
-            .map(StagedHandle::new)
+        TableStore::stage_keyed_write_stream(
+            self,
+            ds,
+            table_key,
+            source.dataset(),
+            semantics,
+            system_columns,
+        )
+        .await
+        .map(StagedHandle::new)
     }
 
     async fn scan_stream_for_rewrite_bounded(
@@ -1146,6 +1191,7 @@ impl TableStorage for TableStore {
         begin_version: u64,
         end_version: u64,
         external_preflight: &ExternalBlobPreflight,
+        system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream> {
         TableStore::scan_proven_insert_delta_bounded(
             self,
@@ -1154,6 +1200,7 @@ impl TableStorage for TableStore {
             begin_version,
             end_version,
             external_preflight,
+            system_columns,
         )
         .await
     }

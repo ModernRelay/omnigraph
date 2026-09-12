@@ -506,7 +506,9 @@ async fn persist_graph_index_artifact(
         );
         return Ok(());
     }
-    let index = crate::graph_index::GraphIndex::build(&snapshot, &edge_types).await?;
+    let index =
+        crate::graph_index::GraphIndex::build(&snapshot, &edge_types, db.catalog().system_columns)
+            .await?;
     let written =
         crate::graph_index::persist::save(&snapshot, db.storage_adapter(), &edge_types, &index)
             .await?;

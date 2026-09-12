@@ -442,12 +442,12 @@ async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
     let seed = r#"{"type":"Person","data":{"name":"Alice"}}
 {"type":"Person","data":{"name":"Bob"}}
 {"type":"Company","data":{"name":"Acme"}}
-{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+{"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}"#;
     let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
     let err = load_jsonl(
         &db,
-        r#"{"edge":"WorksAt","from":"Bob","to":"Acme","data":{"id":"E1"}}"#,
+        r#"{"edge":"WorksAt","id":"E1","from":"Bob","to":"Acme","data":{}}"#,
         LoadMode::Merge,
     )
     .await
@@ -470,13 +470,13 @@ async fn merge_load_duplicate_edge_id_counts_once_per_card() {
 {"type":"Person","data":{"name":"Bob"}}
 {"type":"Company","data":{"name":"Acme"}}
 {"type":"Company","data":{"name":"Beta"}}
-{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E0"}}"#;
+{"edge":"WorksAt","id":"E0","from":"Alice","to":"Acme","data":{}}"#;
     let (_dir, db) = init_with(CARDINALITY_SCHEMA, seed).await;
 
     // Same edge id E1 under two srcs in one batch: commit keeps the last
     // (Bob->Beta). Alice stays at her one committed edge (E0).
-    let batch = r#"{"edge":"WorksAt","from":"Alice","to":"Beta","data":{"id":"E1"}}
-{"edge":"WorksAt","from":"Bob","to":"Beta","data":{"id":"E1"}}"#;
+    let batch = r#"{"edge":"WorksAt","id":"E1","from":"Alice","to":"Beta","data":{}}
+{"edge":"WorksAt","id":"E1","from":"Bob","to":"Beta","data":{}}"#;
     load_jsonl(&db, batch, LoadMode::Merge)
         .await
         .expect("a deduped edge id must not double-count Alice into a @card(0..1) violation");
@@ -492,7 +492,7 @@ async fn merge_load_duplicate_edge_id_counts_once_per_card() {
 async fn mutation_delete_edge_below_card_min_rejected() {
     let seed = r#"{"type":"Person","data":{"name":"Alice"}}
 {"type":"Company","data":{"name":"Acme"}}
-{"edge":"WorksAt","from":"Alice","to":"Acme","data":{"id":"E1"}}"#;
+{"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}"#;
     let (_dir, mut db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
     let err = mutate_main(
@@ -718,7 +718,7 @@ const EDGE_KEY_SCHEMA: &str = r#"
 node Person { name: String @key }
 edge Knows: Person -> Person {
     since: String?
-    @key(src, dst)
+    @key(@src, @dst)
 }
 "#;
 
@@ -791,8 +791,8 @@ async fn keyed_edge_reinsert_updates_non_key_properties() {
 const EDGE_KEY_UNIQUE_SCHEMA: &str = r#"
 node Person { name: String @key }
 edge Knows: Person -> Person {
-    @key(src, dst)
-    @unique(src, dst)
+    @key(@src, @dst)
+    @unique(@src, @dst)
 }
 "#;
 
@@ -823,7 +823,7 @@ async fn keyed_edge_load_refuses_mismatched_explicit_id() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     let err = load_jsonl(
         &db,
-        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"wrong"}}"#,
+        r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
         LoadMode::Merge,
     )
     .await
@@ -848,10 +848,8 @@ async fn keyed_edge_load_derives_and_converges_on_merge() {
         .expect("merge-load re-upserting an existing keyed edge converges");
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
 
-    // The derived id for @key(src, dst) is the composite JSON array; supplying
-    // it verbatim round-trips.
     let explicit =
-        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"[\"Alice\",\"Bob\"]"}}"#;
+        r#"{"edge":"Knows","id":"[\"Alice\",\"Bob\"]","from":"Alice","to":"Bob","data":{}}"#;
     load_jsonl(&db, explicit, LoadMode::Merge)
         .await
         .expect("an explicit id equal to the derivation is accepted");
@@ -864,7 +862,7 @@ async fn keyed_edge_append_load_refuses_mismatched_explicit_id() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     let err = load_jsonl(
         &db,
-        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"wrong"}}"#,
+        r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
         LoadMode::Append,
     )
     .await
@@ -897,7 +895,7 @@ const EDGE_COMPOSITE_KEY_SCHEMA: &str = r#"
 node Person { name: String @key }
 edge Knows: Person -> Person {
     since: String
-    @key(src, dst, since)
+    @key(@src, @dst, since)
 }
 "#;
 

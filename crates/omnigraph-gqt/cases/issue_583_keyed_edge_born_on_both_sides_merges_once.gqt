@@ -1,6 +1,6 @@
 # issue: 583
 # red_on: 2026-09-07, main @ ad425c68 (no edge keys yet): the schema is refused at parse, "@key constraint is not supported on edges (edge Knows)"; with that line removed the same fork returned the a->c edge TWICE from the bound traversal and count($w.since) was 2, one physical row per side of the fork (the #583 shape).
-# notes: a keyed edge (@key(src, dst)) inserted on both sides of a fork with the
+# notes: a keyed edge (@key(@src, @dst)) inserted on both sides of a fork with the
 # notes: same key derives the same id on both sides, so the three-way merge sees
 # notes: one logical edge changed identically and main holds it once: the bound
 # notes: traversal returns one row and counts 1. Unkeyed edge types keep both rows (multiset default, RFC 0044).
@@ -18,7 +18,7 @@ node Person {
 
 edge Knows: Person -> Person {
     since: I32
-    @key(src, dst)
+    @key(@src, @dst)
 }
 
 --- seed

@@ -5,9 +5,10 @@ use super::*;
 use crate::db::Omnigraph;
 
 async fn synthetic_v6_fixture(root: &str) {
-    let db = Omnigraph::init(root, "node Person { name: String }")
-        .await
-        .unwrap();
+    let db =
+        Omnigraph::init_with_legacy_system_columns_for_tests(root, "node Person { name: String }")
+            .await
+            .unwrap();
     db.mutate(
         "main",
         "query seed($name: String) { insert Person { name: $name } }",
@@ -372,7 +373,8 @@ async fn storage_upgrade_policy_denial_precedes_effects() {
 async fn storage_upgrade_refuses_unknown_ownership_and_source() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::failpoints::FailScenario::setup();
-    for source_format in ["5", "99"] {
+    for (source_format, expected_code) in [("5", "unsupported_source"), ("99", "newer_than_binary")]
+    {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         synthetic_v6_fixture(root).await;
@@ -390,7 +392,8 @@ async fn storage_upgrade_refuses_unknown_ownership_and_source() {
             report
                 .findings
                 .iter()
-                .any(|finding| finding.code == "unsupported_source")
+                .any(|finding| finding.code == expected_code),
+            "{report:?}"
         );
         assert_eq!(stored_files(dir.path()), before);
     }
@@ -775,9 +778,12 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         drop(
-            Omnigraph::init(root, "node Person { name: String }")
-                .await
-                .unwrap(),
+            Omnigraph::init_with_legacy_system_columns_for_tests(
+                root,
+                "node Person { name: String }",
+            )
+            .await
+            .unwrap(),
         );
         let mut dataset = open(root, None).await.unwrap();
         dataset
@@ -838,9 +844,10 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     let _scenario = crate::failpoints::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(root, "node Person { name: String }")
-        .await
-        .unwrap();
+    let db =
+        Omnigraph::init_with_legacy_system_columns_for_tests(root, "node Person { name: String }")
+            .await
+            .unwrap();
     db.branch_create("parent").await.unwrap();
     db.branch_create_from(crate::db::ReadTarget::branch("parent"), "child")
         .await
@@ -901,6 +908,99 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     .await
     .unwrap();
     assert_eq!(result.outcome, UpgradeOutcome::CheckFailed, "{result:?}");
+    assert_eq!(stored_files(dir.path()), before);
+}
+
+/// A graph born at the current vintage (v9) sits above the default route
+/// target: the default request is already current and effect-free, and an
+/// explicit lower or unreachable target is refused without effects.
+#[tokio::test]
+async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::failpoints::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    drop(
+        Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap(),
+    );
+    let before = stored_files(dir.path());
+    for check in [true, false] {
+        let result = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check,
+                to_format: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, UpgradeOutcome::AlreadyCurrent, "{result:?}");
+        assert_eq!(
+            result.observed_format,
+            Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
+        );
+        assert_eq!(stored_files(dir.path()), before);
+        let explicit_served = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check,
+                to_format: Some(8),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            explicit_served.outcome,
+            UpgradeOutcome::AlreadyCurrent,
+            "{explicit_served:?}"
+        );
+        assert_eq!(stored_files(dir.path()), before);
+        for (to_format, expected_code) in [(7, "target_below_stamp"), (9, "unsupported_target")] {
+            let refused = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check,
+                    to_format: Some(to_format),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused.outcome, UpgradeOutcome::CheckFailed, "{refused:?}");
+            assert!(
+                refused
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == expected_code),
+                "{refused:?}"
+            );
+            assert_eq!(
+                refused.observed_format,
+                Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION),
+                "a refused target still reports the stamp it read: {refused:?}"
+            );
+            assert_eq!(stored_files(dir.path()), before);
+        }
+    }
+    let mut dataset = open(root, None).await.unwrap();
+    dataset
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "10")])
+        .await
+        .unwrap();
+    drop(dataset);
+    let before = stored_files(dir.path());
+    let newer = upgrade_storage(root, UpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(newer.outcome, UpgradeOutcome::CheckFailed, "{newer:?}");
+    assert!(
+        newer
+            .findings
+            .iter()
+            .any(|finding| finding.code == "newer_than_binary"),
+        "{newer:?}"
+    );
     assert_eq!(stored_files(dir.path()), before);
 }
 

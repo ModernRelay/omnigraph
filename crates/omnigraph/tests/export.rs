@@ -33,9 +33,9 @@ edge References: Note -> Note
 "#;
 
 const NOTE_DATA: &str = r#"
-{"type":"Note","data":{"id":"note-1","text":"Alpha"}}
-{"type":"Note","data":{"id":"note-2","text":"Beta"}}
-{"edge":"References","from":"note-1","to":"note-2","data":{"id":"edge-1"}}
+{"type":"Note","id":"note-1","data":{"text":"Alpha"}}
+{"type":"Note","id":"note-2","data":{"text":"Beta"}}
+{"edge":"References","id":"edge-1","from":"note-1","to":"note-2","data":{}}
 "#;
 
 const U64_KEY_SCHEMA: &str = r#"
@@ -64,9 +64,9 @@ edge OccursOn: Instant -> CalendarDay
 "#;
 
 const LEGACY_TEMPORAL_KEY_DATA: &str = r#"
-{"edge":"OccursOn","from":"2024-01-01T00:00:00Z","to":"2024-01-01","data":{"id":"legacy-edge"}}
-{"type":"CalendarDay","data":{"id":"2024-01-01","day":19723}}
-{"type":"Instant","data":{"id":"2024-01-01T00:00:00Z","happened_at":"2024-01-01T00:00:00Z"}}
+{"edge":"OccursOn","id":"legacy-edge","from":"2024-01-01T00:00:00Z","to":"2024-01-01","data":{}}
+{"type":"CalendarDay","id":"2024-01-01","data":{"day":19723}}
+{"type":"Instant","id":"2024-01-01T00:00:00Z","data":{"happened_at":"2024-01-01T00:00:00Z"}}
 "#;
 
 const LEGACY_TYPED_REMAP_SCHEMA: &str = r#"
@@ -86,10 +86,10 @@ edge Converts: Exact -> Rounded
 "#;
 
 const LEGACY_TYPED_REMAP_DATA: &str = r#"
-{"edge":"Converts","from":"16777217","to":"16777217","data":{"id":"conversion"}}
-{"type":"Rounded","data":{"id":"16777217","value":16777217}}
-{"type":"Padded","data":{"id":"00042","value":42}}
-{"type":"Exact","data":{"id":"16777217","value":16777217}}
+{"edge":"Converts","id":"conversion","from":"16777217","to":"16777217","data":{}}
+{"type":"Rounded","id":"16777217","data":{"value":16777217}}
+{"type":"Padded","id":"00042","data":{"value":42}}
+{"type":"Exact","id":"16777217","data":{"value":16777217}}
 "#;
 
 const COMPOSITE_KEY_SCHEMA: &str = r#"
@@ -156,7 +156,7 @@ fn collect_u64_key_rows(batches: &[RecordBatch]) -> Vec<(u64, String)> {
     let mut rows = Vec::new();
     for batch in batches {
         let ids = batch
-            .column_by_name("id")
+            .column_by_name("__id")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -184,8 +184,8 @@ async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
         .collect::<Vec<_>>();
     assert_eq!(
         primary_key,
-        ["id"],
-        "later import must preserve exactly `id` as the Lance unenforced primary key for {table_key}"
+        ["__id"],
+        "later import must preserve exactly `__id` as the Lance unenforced primary key for {table_key}"
     );
 }
 
@@ -232,9 +232,9 @@ async fn export_jsonl_round_trips_branch_snapshot() {
     let main_jsonl = db.export_jsonl("main", &[]).await.unwrap();
     assert!(
         main_jsonl.lines().any(
-            |line| line == r#"{"type":"Person","data":{"id":"Alice","age":30,"name":"Alice"}}"#
+            |line| line == r#"{"type":"Person","id":"Alice","data":{"age":30,"name":"Alice"}}"#
         ),
-        "export line bytes: `id` first, then the catalog's column order, the writer's spelling: {main_jsonl}"
+        "export line bytes: type, identity, then data in catalog column order: {main_jsonl}"
     );
     let feature_jsonl = db.export_jsonl("feature", &[]).await.unwrap();
     let mut feature_unordered = Vec::new();
@@ -415,11 +415,11 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
     for line in exported.lines() {
         let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
         let key = row["data"]["sequence"].as_u64().unwrap();
-        let id = row["data"]["id"].as_str().unwrap();
+        let id = row["id"].as_str().unwrap();
         assert_eq!(id, key.to_string(), "exported id must match typed U64 key");
         exported_keys.push(key);
         if key == u64::MAX {
-            row["data"]["id"] = serde_json::Value::String("wrong-id".to_string());
+            row["id"] = serde_json::Value::String("wrong-id".to_string());
         }
         mismatched_rows.push(serde_json::to_string(&row).unwrap());
     }
@@ -467,20 +467,20 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
         .await
         .unwrap();
     assert_eq!(
-        collect_column_strings(&read_table(&source, "node:CalendarDay").await, "id"),
+        collect_column_strings(&read_table(&source, "node:CalendarDay").await, "__id"),
         ["19723"]
     );
     assert_eq!(
-        collect_column_strings(&read_table(&source, "node:Instant").await, "id"),
+        collect_column_strings(&read_table(&source, "node:Instant").await, "__id"),
         ["1704067200000"]
     );
 
     let source_edges = read_table(&source, "edge:OccursOn").await;
     assert_eq!(
-        collect_column_strings(&source_edges, "src"),
+        collect_column_strings(&source_edges, "__src"),
         ["1704067200000"]
     );
-    assert_eq!(collect_column_strings(&source_edges, "dst"), ["19723"]);
+    assert_eq!(collect_column_strings(&source_edges, "__dst"), ["19723"]);
 
     for (table_key, canonical_id, duplicate_row) in [
         (
@@ -519,10 +519,10 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
         .iter()
         .find(|row| row["type"] == "CalendarDay")
         .unwrap();
-    assert_eq!(day["data"]["id"], "19723");
+    assert_eq!(day["id"], "19723");
     assert_eq!(day["data"]["day"], "2024-01-01");
     let instant = rows.iter().find(|row| row["type"] == "Instant").unwrap();
-    assert_eq!(instant["data"]["id"], "1704067200000");
+    assert_eq!(instant["id"], "1704067200000");
     assert_eq!(
         instant["data"]["happened_at"], "2024-01-01T00:00:00",
         "Date64 exports as the DateTime string of RFC 0051"
@@ -537,7 +537,7 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
     .unwrap();
     let mismatch = load_jsonl(
         &rejected,
-        r#"{"type":"CalendarDay","data":{"id":"2024-01-02","day":19723}}"#,
+        r#"{"type":"CalendarDay","id":"2024-01-02","data":{"day":19723}}"#,
         LoadMode::Overwrite,
     )
     .await
@@ -559,19 +559,19 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
         .await
         .unwrap();
     assert_eq!(
-        collect_column_strings(&read_table(&rebuilt, "node:CalendarDay").await, "id"),
+        collect_column_strings(&read_table(&rebuilt, "node:CalendarDay").await, "__id"),
         ["19723"]
     );
     assert_eq!(
-        collect_column_strings(&read_table(&rebuilt, "node:Instant").await, "id"),
+        collect_column_strings(&read_table(&rebuilt, "node:Instant").await, "__id"),
         ["1704067200000"]
     );
     let rebuilt_edges = read_table(&rebuilt, "edge:OccursOn").await;
     assert_eq!(
-        collect_column_strings(&rebuilt_edges, "src"),
+        collect_column_strings(&rebuilt_edges, "__src"),
         ["1704067200000"]
     );
-    assert_eq!(collect_column_strings(&rebuilt_edges, "dst"), ["19723"]);
+    assert_eq!(collect_column_strings(&rebuilt_edges, "__dst"), ["19723"]);
     assert_exact_id_primary_key(&rebuilt, "node:CalendarDay").await;
     assert_exact_id_primary_key(&rebuilt, "node:Instant").await;
 }
@@ -588,23 +588,23 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
         .unwrap();
 
     assert_eq!(
-        collect_column_strings(&read_table(&db, "node:Exact").await, "id"),
+        collect_column_strings(&read_table(&db, "node:Exact").await, "__id"),
         ["16777217"]
     );
     assert_eq!(
-        collect_column_strings(&read_table(&db, "node:Rounded").await, "id"),
+        collect_column_strings(&read_table(&db, "node:Rounded").await, "__id"),
         ["16777216"],
         "the F32 key must use the value actually stored after width conversion"
     );
     assert_eq!(
-        collect_column_strings(&read_table(&db, "node:Padded").await, "id"),
+        collect_column_strings(&read_table(&db, "node:Padded").await, "__id"),
         ["42"],
         "a leading-zero legacy numeric id must rebuild to the typed canonical id"
     );
 
     let edges = read_table(&db, "edge:Converts").await;
-    assert_eq!(collect_column_strings(&edges, "src"), ["16777217"]);
-    assert_eq!(collect_column_strings(&edges, "dst"), ["16777216"]);
+    assert_eq!(collect_column_strings(&edges, "__src"), ["16777217"]);
+    assert_eq!(collect_column_strings(&edges, "__dst"), ["16777216"]);
 
     let duplicate = load_jsonl(
         &db,
@@ -635,8 +635,8 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
     let collision_error = load_jsonl(
         &collision,
         r#"
-{"type":"Padded","data":{"id":"00042","value":42}}
-{"type":"Padded","data":{"id":"42","value":42}}
+{"type":"Padded","id":"00042","data":{"value":42}}
+{"type":"Padded","id":"42","data":{"value":42}}
 "#,
         LoadMode::Append,
     )
@@ -661,18 +661,18 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     // owns tuple order (`slot`, then `tenant`) on every write surface.
     let canonical = r#"["7","acme"]"#;
     let legacy = r#"
-{"edge":"Related","from":"7","to":"7","data":{"id":"related"}}
-{"type":"Membership","data":{"id":"7","tenant":"acme","slot":7,"label":"legacy"}}
+{"edge":"Related","id":"related","from":"7","to":"7","data":{}}
+{"type":"Membership","id":"7","data":{"tenant":"acme","slot":7,"label":"legacy"}}
 "#;
     load_jsonl(&db, legacy, LoadMode::Overwrite).await.unwrap();
 
     assert_eq!(
-        collect_column_strings(&read_table(&db, "node:Membership").await, "id"),
+        collect_column_strings(&read_table(&db, "node:Membership").await, "__id"),
         [canonical]
     );
     let edges = read_table(&db, "edge:Related").await;
-    assert_eq!(collect_column_strings(&edges, "src"), [canonical]);
-    assert_eq!(collect_column_strings(&edges, "dst"), [canonical]);
+    assert_eq!(collect_column_strings(&edges, "__src"), [canonical]);
+    assert_eq!(collect_column_strings(&edges, "__dst"), [canonical]);
 
     let duplicate = load_jsonl(
         &db,
@@ -697,7 +697,7 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     .unwrap();
     assert_eq!(count_rows(&db, "node:Membership").await, 1);
     let membership = read_table(&db, "node:Membership").await;
-    assert_eq!(collect_column_strings(&membership, "id"), [canonical]);
+    assert_eq!(collect_column_strings(&membership, "__id"), [canonical]);
     assert_eq!(collect_column_strings(&membership, "label"), ["updated"]);
 
     let key_update = db
@@ -717,7 +717,7 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     );
     assert_eq!(count_rows(&db, "node:Membership").await, 1);
     assert_eq!(
-        collect_column_strings(&read_table(&db, "node:Membership").await, "id"),
+        collect_column_strings(&read_table(&db, "node:Membership").await, "__id"),
         [canonical]
     );
 
@@ -728,8 +728,8 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     let ambiguity = load_jsonl(
         &ambiguous,
         r#"
-{"type":"Membership","data":{"id":"7","tenant":"acme","slot":7,"label":"one"}}
-{"type":"Membership","data":{"id":"7","tenant":"globex","slot":7,"label":"two"}}
+{"type":"Membership","id":"7","data":{"tenant":"acme","slot":7,"label":"one"}}
+{"type":"Membership","id":"7","data":{"tenant":"globex","slot":7,"label":"two"}}
 "#,
         LoadMode::Overwrite,
     )
@@ -758,19 +758,25 @@ async fn composite_key_rebuild_accepts_mixed_pre_and_post_rename_scalar_ids() {
     // accept both by typed equality, persist full tuple ids, and rewrite edge
     // endpoints that still name those old physical ids.
     let legacy = r#"
-{"edge":"Connects","from":"7","to":"2024-01-02","data":{"id":"mixed-generation"}}
-{"type":"RenamedPair","data":{"id":"7","aaaa":19723,"zzzz":7,"label":"pre-rename"}}
-{"type":"RenamedPair","data":{"id":"2024-01-02","aaaa":"2024-01-02","zzzz":8,"label":"post-rename"}}
+{"edge":"Connects","id":"mixed-generation","from":"7","to":"2024-01-02","data":{}}
+{"type":"RenamedPair","id":"7","data":{"aaaa":19723,"zzzz":7,"label":"pre-rename"}}
+{"type":"RenamedPair","id":"2024-01-02","data":{"aaaa":"2024-01-02","zzzz":8,"label":"post-rename"}}
 "#;
     load_jsonl(&db, legacy, LoadMode::Overwrite).await.unwrap();
 
-    let mut ids = collect_column_strings(&read_table(&db, "node:RenamedPair").await, "id");
+    let mut ids = collect_column_strings(&read_table(&db, "node:RenamedPair").await, "__id");
     ids.sort();
     assert_eq!(ids, [r#"["19723","7"]"#, r#"["19724","8"]"#]);
 
     let edges = read_table(&db, "edge:Connects").await;
-    assert_eq!(collect_column_strings(&edges, "src"), [r#"["19723","7"]"#]);
-    assert_eq!(collect_column_strings(&edges, "dst"), [r#"["19724","8"]"#]);
+    assert_eq!(
+        collect_column_strings(&edges, "__src"),
+        [r#"["19723","7"]"#]
+    );
+    assert_eq!(
+        collect_column_strings(&edges, "__dst"),
+        [r#"["19724","8"]"#]
+    );
 }
 
 #[tokio::test]
@@ -896,21 +902,21 @@ async fn export_jsonl_preserves_explicit_ids_for_non_key_graphs() {
         .unwrap();
 
     let node_batches = read_table(&imported, "node:Note").await;
-    let node_ids = collect_column_strings(&node_batches, "id");
+    let node_ids = collect_column_strings(&node_batches, "__id");
     assert_eq!(node_ids, vec!["note-1".to_string(), "note-2".to_string()]);
 
     let edge_batches = read_table(&imported, "edge:References").await;
-    let edge_ids = collect_column_strings(&edge_batches, "id");
+    let edge_ids = collect_column_strings(&edge_batches, "__id");
     assert_eq!(edge_ids, vec!["edge-1".to_string()]);
 
     let srcs = edge_batches[0]
-        .column_by_name("src")
+        .column_by_name("__src")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     let dsts = edge_batches[0]
-        .column_by_name("dst")
+        .column_by_name("__dst")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -1001,24 +1007,22 @@ node Document {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
-    let document = |title: &str| {
-        &rows
-            .iter()
+    let row = |title: &str| {
+        rows.iter()
             .find(|row| row["data"]["title"] == title)
-            .unwrap()["data"]
+            .unwrap()
     };
-    assert_eq!(document("readme")["content"], "base64:SGVsbG8=");
-    assert_eq!(document("valid-empty")["content"], "base64:");
-    assert_eq!(document("neighbor")["content"], "base64:TmVpZ2hib3I=");
-    assert!(document("null")["content"].is_null());
-    assert_eq!(document("external")["content"], canonical_external_uri);
+    assert_eq!(row("readme")["data"]["content"], "base64:SGVsbG8=");
+    assert_eq!(row("valid-empty")["data"]["content"], "base64:");
+    assert_eq!(row("neighbor")["data"]["content"], "base64:TmVpZ2hib3I=");
+    assert!(row("null")["data"]["content"].is_null());
+    assert_eq!(row("external")["data"]["content"], canonical_external_uri);
 
-    let entity_id = |title: &str| document(title)["id"].as_str().unwrap().to_string();
     let readme = db
         .entity_at_target(
             ReadTarget::branch("main"),
             "node:Document",
-            &entity_id("readme"),
+            row("readme")["id"].as_str().unwrap(),
         )
         .await
         .unwrap()
@@ -1028,7 +1032,7 @@ node Document {
         .entity_at_target(
             ReadTarget::branch("main"),
             "node:Document",
-            &entity_id("external"),
+            row("external")["id"].as_str().unwrap(),
         )
         .await
         .unwrap()
@@ -1038,7 +1042,7 @@ node Document {
         .entity_at_target(
             ReadTarget::branch("main"),
             "node:Document",
-            &entity_id("null"),
+            row("null")["id"].as_str().unwrap(),
         )
         .await
         .unwrap()

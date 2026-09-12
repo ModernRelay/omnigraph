@@ -1170,7 +1170,7 @@ struct Model {
     /// name → (age, ver); ver = -1 for rows written without one.
     persons: BTreeMap<String, (i64, i64)>,
     /// Physical rows by id — the multiset default: re-inserting a pair is
-    /// a second row (`@key(src, dst)` opts a type out, RFC 0044).
+    /// a second row (`@key(@src, @dst)` opts a type out, RFC 0044).
     edges: BTreeMap<EdgeRowId, (String, String)>,
     /// The physical-vs-logical edge delta — EMPTY by construction since
     /// the #474 fix made self-loops ordinary visible edges. Kept (with its

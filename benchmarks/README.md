@@ -161,7 +161,7 @@ code contracts that interpret the remaining typed fields.
 
 Index state is an inventory rather than a global label. Use `indexes: []` for
 an unindexed fixture; each indexed entry names its `table`, `column`, `kind`,
-and `freshness`. Synthetic branch-merge builder v2 supports only
+and `freshness`. Synthetic branch-merge builder v3 supports only
 `compaction_recency: not-optimized`, because OmniGraph optimization
 materializes physical indexes outside this builder's exact inventory contract.
 
@@ -422,7 +422,7 @@ timed. The repetition's writes disappear when `active` is removed rather than
 aging the next sample, and the never-opened template is checked after every
 worker exits.
 
-Before it initializes a fixture, the runner derives the exact builder-v2
+Before it initializes a fixture, the runner derives the exact builder-v3
 publication count, rejects a mismatched history declaration, applies explicit
 local row/byte/entry/history limits, and proves that the scratch volume has its
 conservative frozen-copy capacity allowance plus space for the staged,

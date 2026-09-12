@@ -89,7 +89,7 @@ async fn node_ids_are_key_values() {
     let db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "node:Person").await;
-    let mut ids = collect_column_strings(&batches, "id");
+    let mut ids = collect_column_strings(&batches, "__id");
     ids.sort();
     assert_eq!(ids, vec!["Alice", "Bob", "Charlie", "Diana"]);
 }
@@ -102,7 +102,7 @@ async fn node_properties_are_correct() {
     let batches = read_table(&db, "node:Person").await;
     let batch = &batches[0];
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -128,9 +128,16 @@ node Flagged {
     slug: String @key
     active: Bool
     rating: I32?
+    id: String
+}
+edge Reflects: Flagged -> Flagged {
+    id: String
+    src: String
+    dst: String
 }
 "#;
-    let data = r#"{"type":"Flagged","data":{"slug":"alpha","active":true,"rating":42}}"#;
+    let data = r#"{"type":"Flagged","data":{"slug":"alpha","active":true,"rating":42,"id":"user-id"}}
+{"edge":"Reflects","id":"edge-id","from":"alpha","to":"alpha","data":{"id":"user-edge-id","src":"user-src","dst":"user-dst"}}"#;
 
     let db = Omnigraph::init(uri, schema).await.unwrap();
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
@@ -140,9 +147,27 @@ node Flagged {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(entity["id"], serde_json::json!("alpha"));
+    assert_eq!(entity["@id"], serde_json::json!("alpha"));
     assert_eq!(entity["active"], serde_json::json!(true));
     assert_eq!(entity["rating"], serde_json::json!(42));
+    assert_eq!(entity["id"], "user-id");
+    assert!(entity.get("__id").is_none());
+    let version = db
+        .graph_manifest_version_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let edge = db
+        .entity_at("edge:Reflects", "edge-id", version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edge,
+        serde_json::json!({
+            "@id": "edge-id", "@src": "alpha", "@dst": "alpha",
+            "id": "user-edge-id", "src": "user-src", "dst": "user-dst"
+        })
+    );
 }
 
 #[tokio::test]
@@ -187,13 +212,13 @@ async fn edge_src_dst_reference_node_ids() {
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
     let srcs = batch
-        .column_by_name("src")
+        .column_by_name("__src")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     let dsts = batch
-        .column_by_name("dst")
+        .column_by_name("__dst")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -219,7 +244,7 @@ async fn edge_ids_are_unique_strings() {
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -263,7 +288,7 @@ async fn overwrite_replaces_data() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 1);
     let ids = batch
-        .column_by_name("id")
+        .column_by_name("__id")
         .unwrap()
         .as_any()
         .downcast_ref::<StringArray>()
@@ -333,7 +358,7 @@ async fn signals_fixture_loads_correctly() {
         .try_collect()
         .await
         .unwrap();
-    let ids = collect_column_strings(&batches, "id");
+    let ids = collect_column_strings(&batches, "__id");
     // Should contain slug values like "aws", "openai", etc.
     assert!(ids.contains(&"aws".to_string()));
     assert!(ids.contains(&"openai".to_string()));
@@ -820,13 +845,13 @@ async fn mutation_delete_node_cascades_edges() {
             .unwrap();
         for batch in &batches {
             let srcs = batch
-                .column_by_name("src")
+                .column_by_name("__src")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
             let dsts = batch
-                .column_by_name("dst")
+                .column_by_name("__dst")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -1182,7 +1207,7 @@ async fn blob_read_returns_bytes() {
 {"type":"Document","data":{"title":"empty","content":"base64:"}}
 {"type":"Document","data":{"title":"null"}}
 {"type":"Document","data":{"title":"peer"}}
-{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
+{"edge":"Attachment","id":"attachment-1","from":"readme","to":"peer","data":{"payload":"base64:RWRnZQ=="}}"#;
     load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let metacharacter_id = r"quote'\slash";

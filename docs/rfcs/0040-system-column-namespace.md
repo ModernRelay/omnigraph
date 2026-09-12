@@ -50,11 +50,11 @@ after it (Design).
 ## Motivation
 
 A user property named `id` collides with the implicit physical id column.
-Issue #529 reports the visible half: `node Grp { id: String @key }` fails
+Issue [#529](https://github.com/ModernRelay/omnigraph/issues/529) reports the visible half: `node Grp { id: String @key }` fails
 with "@key must reference declared properties" although the property is
 declared. The silent half is worse: without `@key` the schema is accepted
 and the table carries two `id` columns. Edge properties named `src`/`dst`
-hit both failure modes. A companion patch (tracked on issue #529; Rollout
+hit both failure modes. A companion patch (tracked on issue [#529](https://github.com/ModernRelay/omnigraph/issues/529); Rollout
 step 1), to be submitted alongside this RFC, will reserve the three names
 with a clear error. Three liabilities remain:
 
@@ -127,7 +127,9 @@ no property `id` is
 declared, the compiler's error gains a hint at every unknown-property site
 (T2, T6, T11, T15) on both vintages: "type `Person` has no property `id`;
 the system identity is `$p.@id`" after a binding, and the same error naming
-`@id` in a mutation predicate or assignment. No query is ever silently
+`@id` in a mutation predicate. Assignment errors explain that the engine assigns identity, which cannot be
+set through a property assignment; inline-match errors show a meta-field
+filter in the match block. No query is ever silently
 reinterpreted, at the release boundary or at the upgrade (Design).
 
 ### What does not change: user properties
@@ -151,6 +153,7 @@ row per surface:
 | Query results | the projection's name: `return { $p }` yields the node object under `p` with its identity under the member `@id` (today `id`); `$p.@id` under `p.@id`, by the rule that puts `$p.name` under `p.name`, or its `as` alias | `$e.@src`/`$e.@dst`, likewise | under the property name | object key logical, identity member `id` |
 | Mutations | `where @id = …` | `from`/`to` | bare names | `from`/`to` already logical |
 | Load and export (JSONL: CLI `load`/`export`, `POST /load/ndjson`, `POST /export`) | `id` beside `type` or `edge`, outside `data` | `from`/`to` beside `edge`, as today | `data` holds user properties only | `data.id` was the identity slot |
+| Entity lookup (`entity_at`, `entity_at_target`) | `@id` in the flat image | `@src`/`@dst` for edges | user keys verbatim | physical field names |
 | Change feed (RFC 0030) | `id` on the change | `before`/`after` `.endpoints.from`/`.to` | `properties`, user keys verbatim | already logical |
 | Blob selectors (RFC 0033) | `id` in the selector | none | `property` | already logical |
 | Merge conflicts | `entity_id` on the conflict | none | none | already logical |
@@ -224,7 +227,7 @@ an IR carrying any name it does not know, the same fail-closed refusal
 `ir_version` gives today, per name instead of per number. `ir_version` 5
 marks an IR as carrying the set and is the scalar's last value: 2 and 4
 keep the meanings RFC 0044's merged text assigns them (2 the base, 4 the
-edge-key number, implemented in #593), 3 stays burned (RFC 0054's
+edge-key number, implemented in [#593](https://github.com/ModernRelay/omnigraph/pull/593)), 3 stays burned (RFC 0054's
 Compatibility boundary: refused before effects, never reinterpreted), and
 every schema feature after this RFC adds a name, never a version.
 
@@ -317,42 +320,33 @@ single underscore belongs to the substrate (`_rowid`), double to OmniGraph
 
 ### Historical reads resolve through the pinned dataset
 
-A read pinned to a manifest version (`snapshot_at`, and the change feed's
-commit-era images) binds the current accepted catalog to that version's
-dataset images by immutable table identity (`Snapshot::bind_catalog_aliases`
-in `crates/omnigraph/src/db/manifest.rs`), and RFC 0030 already requires an
-old entity image to be decoded with its commit-era physical schema. This
-RFC adds the rule for system columns: on a pinned dataset image, each
-system role's spelling is resolved from that image's Lance schema by
-***stable field ID***, the per-column identifier Lance assigns at column
-creation and preserves across a rename, never from the current catalog's
-spelling. Concretely, the resolution point reads the role's field ID from
-the Lance schema of the table's manifest-selected dataset version (the
-catalog's Arrow schema carries no field IDs) and looks that ID up in the
-pinned image's
-schema; the name found there is the spelling to scan. The lookup lives in
-the engine beside `bind_catalog_aliases`: the live table's Lance schema
-supplies the role's field ID, the pinned `SnapshotDataset::schema()` supplies
-the spelling, and the compiler's `Catalog` never sees a field ID. The change
-feed's image hoist (`emitted_image` in
-`crates/omnigraph/src/changes/enumerate.rs`) and the graph index's endpoint
-projection (`crates/omnigraph/src/graph_index/mod.rs`) are two such scans.
-Within one table incarnation the system roles' field IDs are invariant:
-`alter_columns` preserves them, and every `Overwrite` re-derives them from a
-schema that always places `id`, `src`, `dst` first. So pre-upgrade versions
-spell `id`, post-upgrade versions `__id`, and both decode correctly under one
-catalog. Across incarnations nothing changes: a pinned version whose table
-identity the current catalog no longer holds is unreadable under it, as today
-(`bind_catalog_aliases`).
-History written before the upgrade stays readable after it, and the change
-feed crosses the upgrade commit as a compatible pair, because the upgrade
-changes no logical schema, once the feed's boundary gate
-(`user_schema_fingerprint` in
-`crates/omnigraph/src/changes/row_compare.rs`, keyed on field names today)
-excludes the system roles or keys them by role. The field ID resolves a
-spelling within one table incarnation and never a type or a graph identity,
-which RFC 0030 §10.1 forbids inferring from field IDs. No new durable record
-is needed: the field ID is already in every Lance manifest.
+A historical image is selected by the graph's manifest lineage and immutable
+table identity. System spellings come from the selected image's Lance schema,
+through its ***unenforced primary-key marker***, the field metadata that marks
+the entity identity column. Exactly one non-null `Utf8` field must carry it,
+named `id` or `__id`. That name selects the system-column vintage. Edge images
+must also contain that vintage's endpoint fields; node properties named `src`
+or `dst` stay user properties. Malformed or mixed images fail closed.
+
+`system_columns_at_image` in `crates/omnigraph/src/db/manifest.rs` reads the
+schema of a handle already opened for the image. It does not consult a live
+table or open another dataset. The marker survives a rename, and table creation
+and overwrite retain the exact identity marker (RFC 0023). Field IDs do not
+identify graph entities, table incarnations, or system roles.
+
+Change-feed and net-diff schema fingerprints map system fields to roles and
+compare user fields by name. Their row comparator maps each side's system
+roles to that side's spelling. A rename alone is therefore a compatible pair.
+Entity images expose `@id`, `@src`, and `@dst`, with user properties unchanged.
+
+Rollout step 2 implements these per-image readers and verifies a raw Lance
+rename pair. Query planning retains the accepted catalog because no operation
+in that step changes a graph's vintage. Rollout step 3 owns binding queries to
+pre-upgrade schemas, including user properties introduced after the upgrade,
+and the end-to-end guarantee that old queries and feed cursors cross the upgrade.
+It must resolve only datasets the read needs; unrelated reclaimed history must
+not make a pinned query fail. A manifest stamp cannot select a historical
+vintage: step 3 advances the stamp before publishing the table renames.
 
 ### Pre-RFC graphs with colliding properties
 
@@ -443,7 +437,7 @@ effects run in this order.
 4. Today's staging-to-final promotion, unchanged in shape and position:
    `_schema.ir.json` re-stamped at `ir_version` 5 with `system-columns` added
    to the recomputed set, `_schema.pg` with constraint references respelled
-   to `@id`/`@src`/`@dst`, `__schema_state.json` promoted last. The graph is
+   to `@src`/`@dst`, `__schema_state.json` promoted last. The graph is
    new-vintage once `_schema.ir.json` is promoted, and the window between
    the publish and the promotion is the one
    `ensure_read_only_schema_coherent` already refuses to serve. The
@@ -513,11 +507,10 @@ The `.gq` grammar gains `binding.@ident` and bare `@ident` in mutation
 predicate position (`@` is free in both; today it appears only in top-level
 annotations). Lowering emits role-resolved column references instead of the
 literal `id`. The `.pg` grammar gains the meta-field spelling in constraint
-references: `@unique(@src, @dst)` names the endpoint roles, and `@id` the
-identity, on both vintages. The bare `id`/`src`/`dst` spelling in a
-constraint list, which today lowers to the system roles (`field_ref` in
-`crates/omnigraph-compiler/src/catalog/schema_ir.rs`), keeps that meaning on
-old-vintage graphs only, where no user property can carry those names. On
+references: `@unique(@src, @dst)` names the endpoint roles on both vintages.
+`@id` is refused in every constraint list: identity is already the row key,
+not a declared property to constrain. Bare `src`/`dst` in an edge constraint
+list keeps its endpoint meaning on old-vintage graphs only. On
 new-vintage graphs it resolves against declared properties like every bare
 name, so `@key(id)` names the user property `id` and is the unknown-property
 error without one. The upgrade respells the old meaning (The upgrade). The
@@ -529,7 +522,8 @@ instead of `Field::new("id", ...)`.
 Aligned with logical contract over physical state: the logical contract
 (every table has an identity column, edges have endpoints) is unchanged;
 the spelling becomes per-graph logical state resolved from the schema
-authority, never inspected from storage. RFC 0028's identity model is
+authority for live planning and the selected image for historical decoding.
+RFC 0028's identity model is
 preserved with one stated amendment: 0028 declares the `id`/`src`/`dst`
 fields cannot be renamed or supplied by a schema declaration; this RFC
 amends the rename half of that sentence, applying 0028's own
@@ -547,13 +541,11 @@ amendment above, and it is strengthened: system column identity becomes
 role-resolved exactly as user column identity already is. No other Hard
 Invariant is weakened.
 
-Historical reads (Design) use a Lance field ID only to locate, within one
-table incarnation, the spelling of a role whose identity the accepted IR has
-already fixed; no identity is inferred from it, which is the reading
-Invariant 6 forbids and the `omnigraph.stable_property_id` marker exists to
-prevent for user properties. Invariant 6's wording gains that clause when
-this RFC is accepted, and RFC 0030 §10.1's requirement not to infer graph
-identity from field IDs is answered the same way.
+Historical reads use the selected image's primary-key marker to locate the
+spelling of an already-defined system role. Graph and table identity remain
+manifest authority; no identity is inferred from a field ID or spelling.
+This preserves RFC 0030 §10.1 and the stable-property identity marker used for
+user fields.
 
 ## Compatibility and reversibility
 
@@ -563,7 +555,7 @@ next available stamp when this draft is activated.
 Two fences keep a new-vintage graph away from binaries that predate this
 RFC, and they act at different depths. The `__manifest` internal-schema
 stamp advances from 8 to 9 on every new-vintage graph, at creation or as
-the upgrade's first effect; `refuse_if_internal_schema_unsupported` reads
+the upgrade's first effect; `read_supported_internal_schema_version` reads
 it as the first object-store read of both open modes, before the recovery
 sweeps a read-write open runs, so every binary that predates this RFC,
 whether it reads v6 (0.9.x, 0.10.x), development v7, or v8
@@ -595,8 +587,8 @@ guard's range test) and in `docs/user/operations/upgrade.md` ("one storage
 format per binary", including its export-binary table), in
 `docs/dev/versioning.md` (the storage row of its policy table, §Current
 storage contract, and §Changing an axis), and in the doc comment on
-`refuse_if_internal_schema_unsupported` in
-`crates/omnigraph/src/db/manifest.rs` (every branch at CURRENT): 8 is the
+`read_supported_internal_schema_version` in
+`crates/omnigraph/src/db/manifest.rs` (main's stamp, read before recovery): 8 is the
 one stamp
 this binary can upgrade in place, through the explicit operation rather than
 an open-time dispatcher. Rollout step 2 owns those rewrites.
@@ -607,15 +599,15 @@ the existing hard "unsupported ir_version" error:
 | Binary generation | Accepts | Mechanism |
 |---|---|---|
 | predating RFC 0044's implementation (0.10.x and earlier) | 2 | exact-equality check on the scalar |
-| implementing RFC 0044 (today's main, #593) | {2, 4} | membership check on the scalar; 3 refused (RFC 0054) |
+| implementing RFC 0044 (today's main, [#593](https://github.com/ModernRelay/omnigraph/pull/593)) | {2, 4} | membership check on the scalar; 3 refused (RFC 0054) |
 | this RFC's | {2, 4, 5} | membership check, plus refusal within 5 of any feature name it does not know; 3 stays refused |
 
 No binary can half-read unknown
 spellings. Acceptance of 4 rides on the edge-key machinery being
-present: this RFC's implementation builds on RFC 0044's (#593, on main),
+present: this RFC's implementation builds on RFC 0044's ([#593](https://github.com/ModernRelay/omnigraph/pull/593), on main),
 and a binary that removed that machinery must refuse 4 explicitly (RFC
 0044, Reversibility), because accepting a keyed graph without it
-re-opens the duplicate-edge bug (#583) on exactly the tables
+re-opens the duplicate-edge bug ([#583](https://github.com/ModernRelay/omnigraph/pull/583)) on exactly the tables
 whose schema declares immunity. 3 is refused on every generation and
 never reinterpreted (RFC 0054). A 4-stamped graph stays 4 until its
 first accept under this RFC's release, which re-stamps it 5 (or 2 when
@@ -655,11 +647,10 @@ The change feed, Blob selectors, and merge conflicts already chose logical
 envelopes; load and export join them.
 
 **Rejected: refusing pre-upgrade history after the upgrade.** The design
-without field-ID resolution: versions below the upgrade commit refused. It
+without per-image role resolution: versions below the upgrade commit refused. It
 fails a change-feed consumer (RFC 0030) whose cursor is behind the upgrade
 commit and every time-travel query into the graph's past, for a rename
-that changed no logical schema, while the field ID it would save reading is
-already durable in every Lance manifest.
+that changed no logical schema, while the identity marker is already durable in the selected image.
 
 **Rejected: the `ir_version` envelope as the only old-binary fence.** On
 0.10.x it is read after a read-write open's recovery sweeps, so that binary
@@ -685,7 +676,7 @@ the bug but keeps `id` unavailable forever; it is the fence that makes this
 RFC's guarantees provable, not the destination.
 
 **Rejected: user-wins shadowing.** SQLite's documented `rowid` footgun;
-reopens #529's silent variant.
+reopens [#529](https://github.com/ModernRelay/omnigraph/issues/529)'s silent variant.
 
 **Rejected: binding-as-identity** (`$a = $b` as identity equality).
 Elegant but overloads bare bindings in projections; separable, composes
@@ -698,7 +689,7 @@ because old-spelling graphs are permanent and keep gaining capabilities.
 **Rejected: deferring the scheme to a dedicated versioning RFC.** Same
 scheme, one more document; the first capability it governs is this RFC's
 own, and RFC 0044 already carries its half (4, as merged and implemented
-in #593), so settling it
+in [#593](https://github.com/ModernRelay/omnigraph/pull/593)), so settling it
 here keeps one owner and lets acceptance close the question.
 
 **Rejected: a dedicated spelling flag beside the scalar.** Solves this
@@ -759,7 +750,7 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   gate's fingerprint no longer keys on the system roles' names (Historical
   reads).
 - Early fence: a binary of the 2-only and of the {2, 4} generation refuses
-  a new-vintage graph at `refuse_if_internal_schema_unsupported` with no
+  a new-vintage graph at `read_supported_internal_schema_version` with no
   object-store write, in both open modes, including a graph left
   half-upgraded (Compatibility and reversibility); on a graph carrying the
   intent but not yet the stamp, a read-write open on those
@@ -777,7 +768,7 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   graphs).
 - Upgrade effects: after the upgrade every table spells `__id`/`__src`/
   `__dst`, the IR carries `system-columns` at `ir_version` 5, `_schema.pg`
-  constraint references read `@id`/`@src`/`@dst`, the stamp reads 9, and a
+  constraint references read `@src`/`@dst`, the stamp reads 9, and a
   query valid before the upgrade returns the same rows after it (The
   upgrade).
 - Upgrade recovery: under the DST harness, a crash at every schema-apply
@@ -789,8 +780,7 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   `alter_columns` commits a `Project` transaction, preserves every field ID
   and fragment, keeps each index attached under its creation-time name, and
   keeps the `lance-schema:unenforced-primary-key` field metadata on the
-  renamed field; an `Overwrite` re-derives the system roles' field IDs from a
-  schema that places `id`, `src`, `dst` first
+  renamed field; an `Overwrite` preserves the exact non-null identity marker
   (`crates/omnigraph/tests/lance_surface_guards.rs`; The upgrade).
 - Constraint spelling: `@unique(@src, @dst)` admits on both vintages; bare
   `src`/`dst` in a constraint list lowers to the roles on an old-vintage
@@ -811,24 +801,25 @@ the recovery gates, `crates/omnigraph/tests/lance_surface_guards.rs` for
 the Lance gate, and `crates/omnigraph-cli/tests/crossversion_upgrade.rs`
 (cross-version refusal and continuity). Acceptance: every gate above lands as a test in
 one of these suites, or a new suite beside them, and passes in the same
-CI battery as today's. The draft implementation (#548) carries the
+CI battery as today's. The draft implementation ([#548](https://github.com/ModernRelay/omnigraph/pull/548)) carries the
 per-test enumeration.
 
 ## Rollout
 
 1. The companion reservation patch lands first and ships alone: `id`,
    `src`, `dst` are refused at admission with a clear error, closing
-   #529's misleading failure and fencing the coexistence guarantees this
+   [#529](https://github.com/ModernRelay/omnigraph/issues/529)'s misleading failure and fencing the coexistence guarantees this
    RFC depends on.
-2. Resolution and admission (the draft implementation, #548): system
-   columns resolve by role through the accepted vintage, live and
-   historical (Historical reads), new graphs admit under the prefix rule,
+2. Resolution and admission (the draft implementation, [#548](https://github.com/ModernRelay/omnigraph/pull/548)): system
+   columns resolve by role through the accepted vintage for query planning
+   and through selected images for change feeds, net diffs, and entity reads
+   (Historical reads). New graphs admit under the prefix rule,
    spell `__id`/`__src`/`__dst`, and stamp `__manifest` 9 (this binary
    serves {8, 9}), the meta-field namespace lands in `.gq` and in `.pg`
    constraint references, the wire envelope moves the identity beside
    `type`/`edge` on export and load, and the versioning machinery ships
    whole: the feature-set field, {2, 4, 5} acceptance (4 with the
-   edge-key machinery of #593 present, 3 refused, per Compatibility),
+   edge-key machinery of [#593](https://github.com/ModernRelay/omnigraph/pull/593) present, 3 refused, per Compatibility),
    unknown-name refusal, the
    derivation check at accept and load, and the total stamping rule (2 or
    5 with the set, never 4). Old graphs and queries see no behavior change
@@ -845,11 +836,12 @@ per-test enumeration.
    `release_for_internal_schema_version`, the guard's range test,
    `docs/user/operations/upgrade.md` with its export-binary table,
    `docs/dev/versioning.md`, and the doc comment on
-   `refuse_if_internal_schema_unsupported`.
+   `read_supported_internal_schema_version`.
    `implementation` stays `in-progress`.
 3. The upgrade: the engine operation with its preflight, ordered effects,
    roll-forward recovery, and `_schema.pg` respelling; its CLI and
-   cluster-config surfaces; the Lance surface guard. The operating
+   cluster-config surfaces; query planning across the upgrade; the end-to-end
+   historical-read and change-feed gates; the Lance surface guard. The operating
    procedure in cluster mode is one revision: back up the whole graph root
    and the deployment bundle, stop every server serving the graph first,
    apply the revision carrying the per-graph field, boot, and resume.
@@ -878,9 +870,9 @@ None.
 
 ## Decision log
 
-- 2026-08-23: Draft opened for review as PR #546; motivating discussion on
-  issue #529.
-- 2026-09-01: Review (ragnorc, #546): the design approach confirmed
+- 2026-08-23: Draft opened for review as PR [#546](https://github.com/ModernRelay/omnigraph/pull/546); motivating discussion on
+  issue [#529](https://github.com/ModernRelay/omnigraph/issues/529).
+- 2026-09-01: Review (ragnorc, [#546](https://github.com/ModernRelay/omnigraph/pull/546)): the design approach confirmed
   (vintage-keyed resolution, meta-fields, the no-migration posture, the
   reserved `__` namespace as the home for future engine-owned columns).
   Applied from the same review: conversion to the normalized template and
@@ -897,7 +889,7 @@ None.
   set-carrying graphs at RFC 0044's acceptance. A dedicated versioning
   RFC, a further counting version, and a dedicated spelling flag were
   considered and rejected (Alternatives).
-- 2026-09-05: Post-merge amendment after the second review of PR #546
+- 2026-09-05: Post-merge amendment after the second review of PR [#546](https://github.com/ModernRelay/omnigraph/pull/546)
   (2026-09-01, on the pre-rebase head `cf354b67`). The sentences it
   supersedes, by section.
   Summary: "`$p.id` keeps its exact current behavior on existing graphs
@@ -941,7 +933,7 @@ None.
   over refusing pre-upgrade versions; the meta-field spelling
   `@unique(@src, @dst)` for constraint references over the storage spelling
   `@unique(__src, __dst)` (former unresolved question 1, which the merged
-  text had left to the #548 reviewers), because the storage spelling would
+  text had left to the [#548](https://github.com/ModernRelay/omnigraph/pull/548) reviewers), because the storage spelling would
   put a bucket name into `.pg` source, which Wire surfaces forbids
   everywhere else; and the two-stamp scheme, this binary serving {6, 7},
   which retires the single-version contract in `migrations.rs` and
@@ -949,13 +941,13 @@ None.
   reversibility and in Rollout step 2) over a standalone one-shot
   converter.
 - 2026-09-08: Renumbered before the amendment PR opened, against three
-  merges since 2026-09-05. #593 implemented RFC 0044 and moved the
+  merges since 2026-09-05. [#593](https://github.com/ModernRelay/omnigraph/pull/593) implemented RFC 0044 and moved the
   edge-key number from 3 to 4, because the withdrawn actor-provenance
   build stamped 3 and RFC 0054 refuses every version-3 graph before
   effects; the set-carrying version is therefore 5, the Design section
   formerly titled "`ir_version` ends at 4" is "`ir_version` ends at 5",
   4 keeps its merged meaning, 3 stays burned, and the number 3 the
-  2026-09-01 entry keeps as the edge-key number is today's 4. #686 (RFC 0062)
+  2026-09-01 entry keeps as the edge-key number is today's 4. [#686](https://github.com/ModernRelay/omnigraph/pull/686) (RFC 0062)
   advanced the `__manifest` internal-schema stamp to 7; the two-stamp
   scheme is therefore {7, 8}, with 8 the new-vintage stamp, and the
   {6, 7} of the 2026-09-05 entry reads {7, 8}. RFC 0054's withdrawal
@@ -964,10 +956,15 @@ None.
   2026-09-05 ground "the `ir_version` fence alone let an old binary write
   before refusing" holds for 0.10.x only; the stamp's reasons are restated
   in Compatibility and reversibility and in Alternatives. Reusing 4 or 7 was
-  rejected on the grounds #593 gave for 3: a merged binary already stamps
-  each (main since #593 and #686), and a number once stamped is never
+  rejected on the grounds [#593](https://github.com/ModernRelay/omnigraph/pull/593) gave for 3: a merged binary already stamps
+  each (main since [#593](https://github.com/ModernRelay/omnigraph/pull/593) and [#686](https://github.com/ModernRelay/omnigraph/pull/686)), and a number once stamped is never
   reinterpreted.
 
 - 2026-09-09: RFC 0042 native retirement uses internal schema v8. This draft
   provisionally serves {8, 9}, with 9 reserved for its new-vintage storage
   meaning; historical stamp choices in earlier decision entries are unchanged.
+- 2026-09-09: From the implementation: historical image decoding uses the
+  existing primary-key marker instead of a live field-ID lookup. Step 2
+  tests per-image comparison; step 3 owns query planning across the upgrade.
+  Entity lookup uses logical meta-field names. Constraint lists refuse `@id`
+  because identity is already the row key; endpoint meta-fields remain valid.

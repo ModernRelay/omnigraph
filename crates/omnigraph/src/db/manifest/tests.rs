@@ -19,6 +19,8 @@ use super::publisher::{
 };
 use super::state::read_publish_scan;
 use super::*;
+#[cfg(feature = "failpoints")]
+use crate::db::Omnigraph;
 use crate::error::{ManifestConflictDetails, ManifestError, StorageFailureKind};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -103,7 +105,7 @@ fn entity_batch(
         .iter()
         .map(|field| -> Arc<dyn arrow_array::Array> {
             match field.name().as_str() {
-                "id" => Arc::new(StringArray::from(vec![id.clone()])),
+                "id" | "__id" => Arc::new(StringArray::from(vec![id.clone()])),
                 "name" => Arc::new(StringArray::from(vec![name.clone()])),
                 "age" => Arc::new(Int32Array::from(vec![age])),
                 _ => arrow_array::new_null_array(field.data_type(), 1),
@@ -213,36 +215,225 @@ async fn test_init_creates_manifest_and_sub_tables() {
 
 #[tokio::test]
 async fn exact_genesis_probe_rejects_another_initialization_attempt() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let catalog = build_test_catalog();
-    let control_session = crate::lance_access::control_session();
-    let committed_attempt = GenesisManifestAttempt::mint().unwrap();
+    for system_columns in [SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let current = build_test_catalog();
+        let mut schema_ir = current.bound_schema_ir().unwrap().clone();
+        if system_columns == SYSTEM_COLUMNS_LEGACY {
+            schema_ir = omnigraph_compiler::into_legacy_vintage(schema_ir);
+        }
+        let catalog = build_catalog_from_ir(&schema_ir).unwrap();
+        assert_eq!(catalog.system_columns, system_columns);
+        let control_session = crate::lance_access::control_session();
+        let committed_attempt = GenesisManifestAttempt::mint(catalog.system_columns).unwrap();
 
-    ManifestCoordinator::init_commit(uri, &catalog, &control_session, &committed_attempt)
-        .await
-        .unwrap();
-    ManifestCoordinator::open_exact_genesis_with_lineage(uri, &committed_attempt, &control_session)
+        ManifestCoordinator::init_commit(uri, &catalog, &control_session, &committed_attempt)
+            .await
+            .unwrap();
+        ManifestCoordinator::open_exact_genesis_with_lineage(
+            uri,
+            &committed_attempt,
+            &control_session,
+        )
         .await
         .expect("the creating attempt must authenticate its own immutable genesis");
 
-    let foreign_attempt = GenesisManifestAttempt::mint().unwrap();
-    let error = match ManifestCoordinator::open_exact_genesis_with_lineage(
-        uri,
-        &foreign_attempt,
-        &control_session,
-    )
-    .await
-    {
-        Ok(_) => panic!("a valid v1 manifest from another initializer must not authenticate"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("genesis lineage does not match this initialization attempt"),
-        "unexpected probe error: {error:?}"
-    );
+        let foreign_attempt = GenesisManifestAttempt::mint(catalog.system_columns).unwrap();
+        let error = match ManifestCoordinator::open_exact_genesis_with_lineage(
+            uri,
+            &foreign_attempt,
+            &control_session,
+        )
+        .await
+        {
+            Ok(_) => panic!("a valid v1 manifest from another initializer must not authenticate"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("genesis lineage does not match this initialization attempt"),
+            "unexpected probe error: {error:?}"
+        );
+
+        let other_vintage = if system_columns == SYSTEM_COLUMNS_LEGACY {
+            SYSTEM_COLUMNS_V3
+        } else {
+            SYSTEM_COLUMNS_LEGACY
+        };
+        let foreign_vintage_attempt = GenesisManifestAttempt::mint(other_vintage).unwrap();
+        let error = match ManifestCoordinator::open_exact_genesis_with_lineage(
+            uri,
+            &foreign_vintage_attempt,
+            &control_session,
+        )
+        .await
+        {
+            Ok(_) => panic!("a manifest stamped for another vintage must not authenticate"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("internal-schema stamp is v"),
+            "unexpected probe error: {error:?}"
+        );
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
+    let _scenario = crate::failpoints::FailScenario::setup();
+    for legacy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = "node Person { name: String }\n";
+        let db = if legacy {
+            Omnigraph::init_with_legacy_system_columns_for_tests(uri, schema)
+                .await
+                .unwrap()
+        } else {
+            Omnigraph::init(uri, schema).await.unwrap()
+        };
+        drop(db);
+        let mut manifest = open_manifest_dataset(uri, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut manifest, if legacy { 9 } else { 8 })
+            .await
+            .unwrap();
+        let before_version = manifest.version().version;
+        let reached_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let test_thread = std::thread::current().id();
+        let _probes = (!legacy).then(|| {
+            [
+                crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE,
+                crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+            ]
+            .map(|name| {
+                let reached_effects = Arc::clone(&reached_effects);
+                crate::failpoints::ScopedFailPoint::with_callback(name, move || {
+                    if std::thread::current().id() == test_thread {
+                        reached_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+        });
+        for mode in [
+            crate::db::OpenMode::ReadOnly,
+            crate::db::OpenMode::ReadWrite,
+        ] {
+            let result = match mode {
+                crate::db::OpenMode::ReadOnly => Omnigraph::open_read_only(uri).await,
+                crate::db::OpenMode::ReadWrite => Omnigraph::open(uri).await,
+            };
+            if legacy {
+                result.expect("stamp-first upgrade window must preserve legacy reads");
+            } else {
+                let error = result
+                    .err()
+                    .expect("current system columns require stamp 9");
+                assert!(
+                    error.to_string().contains("expected at least v9"),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                reached_effects.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unsupported system columns must refuse before the local write probe or recovery"
+            );
+            assert_eq!(
+                open_manifest_dataset(uri, None)
+                    .await
+                    .unwrap()
+                    .version()
+                    .version,
+                before_version
+            );
+        }
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn open_refuses_unknown_schema_features_before_recovery() {
+    let _scenario = crate::failpoints::FailScenario::setup();
+    for staged in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        drop(
+            Omnigraph::init(uri, "node Person { name: String }\n")
+                .await
+                .unwrap(),
+        );
+        let live_path = dir.path().join(crate::db::schema_state::SCHEMA_IR_FILENAME);
+        let mut ir: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&live_path).unwrap()).unwrap();
+        ir["features"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::String("time-travel".into()));
+        let target = if staged {
+            dir.path()
+                .join(crate::db::schema_state::SCHEMA_IR_STAGING_FILENAME)
+        } else {
+            live_path
+        };
+        let tampered = serde_json::to_string(&ir).unwrap();
+        std::fs::write(&target, &tampered).unwrap();
+        let before_version = open_manifest_dataset(uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version;
+        let reached_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let test_thread = std::thread::current().id();
+        let _probes = [
+            crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE,
+            crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+        ]
+        .map(|name| {
+            let reached_effects = Arc::clone(&reached_effects);
+            crate::failpoints::ScopedFailPoint::with_callback(name, move || {
+                if std::thread::current().id() == test_thread {
+                    reached_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        });
+        for mode in [
+            crate::db::OpenMode::ReadOnly,
+            crate::db::OpenMode::ReadWrite,
+        ] {
+            let result = match mode {
+                crate::db::OpenMode::ReadOnly => Omnigraph::open_read_only(uri).await,
+                crate::db::OpenMode::ReadWrite => Omnigraph::open(uri).await,
+            };
+            let error = result
+                .err()
+                .expect("an unknown feature name must refuse open");
+            assert!(
+                error.to_string().contains("unknown to this build"),
+                "staged {staged}: {error}"
+            );
+            assert_eq!(
+                reached_effects.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unknown feature names must refuse before the local write probe or recovery"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                tampered,
+                "staged {staged}: the refused artifact must be left in place"
+            );
+            assert_eq!(
+                open_manifest_dataset(uri, None)
+                    .await
+                    .unwrap()
+                    .version()
+                    .version,
+                before_version
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2685,13 +2876,6 @@ async fn future_stamp_is_refused_in_both_open_modes() {
     }
 }
 
-// A graph stamped below CURRENT (the strand floor: `MIN_SUPPORTED == CURRENT`,
-// so anything older than v5) is refused on open in BOTH modes, with the
-// rebuild-via-export/import hint — there is no in-place migration. This is the
-// floor twin of `future_stamp_is_refused_in_both_open_modes` (the ceiling). The
-// open path (`Omnigraph::open` read-write and `Omnigraph::open_read_only`) routes
-// the stamp through `refuse_if_stamp_unsupported`, whose sub-MIN branch points
-// the operator at `omnigraph export`.
 #[tokio::test]
 async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
     use crate::db::Omnigraph;
@@ -2704,8 +2888,6 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
         .await
         .unwrap();
 
-    // Rewind main's stamp to v4 — a graph this binary's single served version
-    // (v5) cannot open, since `MIN_SUPPORTED == CURRENT == 5`.
     {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
         super::migrations::set_stamp_for_test(&mut ds, 4)
@@ -3045,7 +3227,7 @@ async fn append_node_row_and_make_update(
         .fields()
         .iter()
         .map(|field| match field.name().as_str() {
-            "id" => {
+            "id" | "__id" => {
                 Arc::new(StringArray::from(vec![id.to_string()])) as Arc<dyn arrow_array::Array>
             }
             "name" => Arc::new(StringArray::from(vec![name.to_string()])),

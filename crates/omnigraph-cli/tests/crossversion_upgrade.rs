@@ -12,14 +12,15 @@
 //! The v3 case uses `OMNIGRAPH_OLD_BIN` (0.7.2), and the v4 case uses
 //! `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). The immediate-predecessor v5 case uses
 //! `OMNIGRAPH_V5_BIN` (built from the final internal-v5 commit) and proves both
-//! directions of the v5/v8 format fence. Each case skips only when its variable
+//! directions of the v5/v9 format fence. Each case skips only when its variable
 //! is unset; a set but invalid path fails loudly.
 //! `OMNIGRAPH_V09_BIN` selects the released v0.9 CLI for the end-to-end
 //! journey of a fully exercised v6 graph — branches, edges, vectors,
 //! full-text and blobs — which the current binary refuses and which is
 //! rebuilt from a 0.9 export.
 //! `OMNIGRAPH_V6_BIN` (the released 0.10.x CLI) proves both directions of the
-//! v6/v8 fence (RFC 0062 registration clock and RFC 0042 native-ref retirement metadata).
+//! v6/v9 fence (RFC 0062 registration clock, RFC 0042 native-ref retirement
+//! metadata and RFC 0040 system columns).
 
 mod support;
 
@@ -137,12 +138,77 @@ fn canonical_export_rows(bytes: &[u8]) -> Vec<String> {
         .map(|line| {
             let mut value =
                 serde_json::from_str::<serde_json::Value>(line).expect("valid export JSONL");
+            relocate_legacy_export_identity(&mut value);
             normalize_f32_and_nulls(&mut value);
+            value.sort_all_objects();
             value.to_string()
         })
         .collect::<Vec<_>>();
     rows.sort();
     rows
+}
+
+fn export_for_rebuild(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .expect("export JSONL must be UTF-8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut value = serde_json::from_str(line).expect("valid export JSONL");
+            relocate_legacy_export_identity(&mut value);
+            format!("{value}\n")
+        })
+        .collect()
+}
+
+/// RFC 0040 exports identity beside `type`/`edge`; predecessor exports put it in `data`.
+fn relocate_legacy_export_identity(value: &mut serde_json::Value) {
+    let envelope = value.as_object_mut().expect("export record object");
+    if !envelope.contains_key("id") {
+        let identity = envelope
+            .get_mut("data")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|data| data.remove("id"))
+            .expect("legacy export identity");
+        envelope.insert("id".to_string(), identity);
+    }
+}
+
+#[test]
+fn canonical_export_rows_preserves_identity_across_envelopes() {
+    let legacy = br#"{"type":"Doc","data":{"id":"doc-1","title":"hello"}}"#;
+    let current = br#"{"type":"Doc","id":"doc-1","data":{"title":"hello"}}"#;
+    assert_eq!(
+        canonical_export_rows(legacy),
+        canonical_export_rows(current)
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&export_for_rebuild(legacy)).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(current).unwrap()
+    );
+    let edge = br#"{"edge":"links","from":"doc-1","to":"doc-2","data":{"id":"edge-1","weight":1.234567890123,"optional":null}}"#;
+    let rebuilt_edge: serde_json::Value = serde_json::from_str(&export_for_rebuild(edge)).unwrap();
+    assert_eq!(rebuilt_edge["id"], "edge-1");
+    assert_eq!(rebuilt_edge["from"], "doc-1");
+    assert_eq!(rebuilt_edge["to"], "doc-2");
+    assert_eq!(
+        rebuilt_edge["data"],
+        serde_json::json!({"weight": 1.234567890123, "optional": null})
+    );
+    let changed = br#"{"type":"Doc","id":"doc-2","data":{"title":"hello"}}"#;
+    assert_ne!(
+        canonical_export_rows(legacy),
+        canonical_export_rows(changed)
+    );
+    let user_id = br#"{"type":"Doc","id":"doc-1","data":{"id":"user-1","title":"hello"}}"#;
+    assert_ne!(
+        canonical_export_rows(current),
+        canonical_export_rows(user_id)
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&export_for_rebuild(user_id)).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(user_id).unwrap()
+    );
 }
 
 /// Every predecessor binary exported an F32 cell as widened 64-bit digits and
@@ -188,18 +254,24 @@ fn assert_exported_blob_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {
     );
 }
 
-/// Format v6 activates RFC-023 by installing exactly `id` as the unenforced
-/// Lance primary key on every graph dataset. Assert the rebuilt image crossed
-/// that physical boundary, which the current storage format preserves.
-fn assert_rebuilt_graph_datasets_use_exact_id_pk(graph: &Path) {
+/// Rebuilt graphs are stamped 9 and use `__id` as the unenforced Lance primary
+/// key (RFC 0040), preserving the primary-key contract of format v6 (RFC 0023).
+fn assert_rebuilt_v9_graph(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
-            .expect("open rebuilt v8 graph");
+            .expect("open rebuilt v9 graph");
+        assert_eq!(
+            db.internal_schema_version_of(ReadTarget::branch("main"))
+                .await
+                .expect("read rebuilt graph storage version"),
+            9,
+            "rebuild must create main's __manifest at storage version 9",
+        );
         let snapshot = db
             .snapshot_of(ReadTarget::branch("main"))
             .await
-            .expect("open rebuilt v8 main snapshot");
+            .expect("open rebuilt v9 main snapshot");
         let type_keys = snapshot
             .datasets()
             .filter(|entry| {
@@ -207,12 +279,12 @@ fn assert_rebuilt_graph_datasets_use_exact_id_pk(graph: &Path) {
             })
             .map(|entry| entry.type_key.clone())
             .collect::<Vec<_>>();
-        assert!(!type_keys.is_empty(), "rebuilt v8 graph has no graph datasets");
+        assert!(!type_keys.is_empty(), "rebuilt v9 graph has no graph datasets");
         for type_key in type_keys {
             let dataset = snapshot
                 .open_dataset(&type_key)
                 .await
-                .unwrap_or_else(|error| panic!("open rebuilt v8 dataset {type_key}: {error}"));
+                .unwrap_or_else(|error| panic!("open rebuilt v9 dataset {type_key}: {error}"));
             let primary_key = dataset
                 .schema()
                 .unenforced_primary_key()
@@ -221,8 +293,8 @@ fn assert_rebuilt_graph_datasets_use_exact_id_pk(graph: &Path) {
                 .collect::<Vec<_>>();
             assert_eq!(
                 primary_key,
-                ["id"],
-                "rebuilt v8 dataset {type_key} must declare exactly `id` as its Lance unenforced primary key",
+                ["__id"],
+                "rebuilt v9 dataset {type_key} must declare exactly `__id` as its Lance unenforced primary key",
             );
         }
     });
@@ -232,11 +304,11 @@ fn assert_rebuilt_graph_datasets_empty(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
-            .expect("open rejected-import v8 graph");
+            .expect("open rejected-import v9 graph");
         let snapshot = db
             .snapshot_of(ReadTarget::branch("main"))
             .await
-            .expect("open rejected-import v8 main snapshot");
+            .expect("open rejected-import v9 main snapshot");
         for entry in snapshot.datasets().filter(|entry| {
             entry.type_key.starts_with("node:") || entry.type_key.starts_with("edge:")
         }) {
@@ -260,7 +332,7 @@ fn assert_rebuilt_blob_bytes(graph: &Path, expected: &[u8]) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
-            .expect("open rebuilt v8 graph for blob read");
+            .expect("open rebuilt v9 graph for blob read");
         let blob = db
             .read_blob_at(
                 ReadTarget::branch("main"),
@@ -274,7 +346,7 @@ fn assert_rebuilt_blob_bytes(graph: &Path, expected: &[u8]) {
             .await
             .expect("open rebuilt blob");
         let BlobContent::Managed { reader, .. } = blob.content else {
-            panic!("v5 → v8 rebuild must produce managed Blob content");
+            panic!("rebuild must produce managed Blob content");
         };
         let bytes = reader
             .read_range(0..reader.len())
@@ -283,7 +355,7 @@ fn assert_rebuilt_blob_bytes(graph: &Path, expected: &[u8]) {
         assert_eq!(
             &bytes[..],
             expected,
-            "v5 → v8 rebuild must preserve exact blob bytes",
+            "rebuild must preserve exact blob bytes",
         );
     });
 }
@@ -337,7 +409,7 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
     assert_ok("export", &export);
     assert!(!export.stdout.is_empty(), "old export produced no rows");
     let v3_jsonl = temp.path().join("v3.jsonl");
-    std::fs::write(&v3_jsonl, &export.stdout).unwrap();
+    std::fs::write(&v3_jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     // 3. The CURRENT binary refuses the genuine v3 graph, names the writing
     //    release, and nudges to export — on the real on-disk shape.
@@ -374,12 +446,12 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
 
     // 5. Round-trip fidelity: re-export with the current binary and compare.
     let reexport = output_success(cli().arg("export").arg(&new_graph));
-    assert_export_fidelity("v3 → v8", &export.stdout, &reexport.stdout);
-    assert_rebuilt_graph_datasets_use_exact_id_pk(&new_graph);
+    assert_export_fidelity("v3 → v9", &export.stdout, &reexport.stdout);
+    assert_rebuilt_v9_graph(&new_graph);
 }
 
 #[test]
-fn current_v8_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v8() {
+fn current_v9_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v9() {
     let Some(previous) = previous_bin() else {
         eprintln!(
             "skipping immediate-predecessor upgrade test: OMNIGRAPH_PREVIOUS_BIN is not set to a 0.8.1 binary"
@@ -422,14 +494,14 @@ fn current_v8_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v8() {
     let export = run_old(&previous, &["export", old_uri]);
     assert_ok("v4 export", &export);
     let jsonl = temp.path().join("v4.jsonl");
-    std::fs::write(&jsonl, &export.stdout).unwrap();
+    std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     let refusal = output_failure(cli().arg("snapshot").arg(&old_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
     assert!(stderr.contains("0.8.x"), "got: {stderr}");
     assert!(stderr.contains("export"), "got: {stderr}");
 
-    let new_graph = temp.path().join("new-v8-from-v4.omni");
+    let new_graph = temp.path().join("new-v9-from-v4.omni");
     output_success(
         cli()
             .arg("init")
@@ -447,13 +519,13 @@ fn current_v8_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v8() {
             .arg(&new_graph),
     );
     let reexport = output_success(cli().arg("export").arg(&new_graph));
-    assert_export_fidelity("v4 → v8", &export.stdout, &reexport.stdout);
-    assert_rebuilt_graph_datasets_use_exact_id_pk(&new_graph);
+    assert_export_fidelity("v4 → v9", &export.stdout, &reexport.stdout);
+    assert_rebuilt_v9_graph(&new_graph);
 
     let reverse = run_old(&previous, &["snapshot", new_graph.to_str().unwrap()]);
     assert!(
         !reverse.status.success(),
-        "a v4 binary must refuse a genuine v8 graph"
+        "a v4 binary must refuse a genuine v9 graph"
     );
     let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
     assert!(
@@ -465,7 +537,7 @@ fn current_v8_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v8() {
 }
 
 #[test]
-fn current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8() {
+fn current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9() {
     let Some(v5) = v5_bin() else {
         eprintln!(
             "skipping immediate-predecessor v5 upgrade test: OMNIGRAPH_V5_BIN is not set to a final internal-v5 binary"
@@ -526,7 +598,7 @@ fn current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8() {
     assert_ok("v5 export", &export);
     assert!(!export.stdout.is_empty(), "v5 export produced no rows");
     let jsonl = temp.path().join("v5.jsonl");
-    std::fs::write(&jsonl, &export.stdout).unwrap();
+    std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     let refusal = output_failure(cli().arg("snapshot").arg(&v5_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
@@ -557,9 +629,13 @@ fn current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8() {
     duplicate_export.push_str(duplicate_line);
     duplicate_export.push('\n');
     let duplicate_jsonl = temp.path().join("v5-duplicate-id.jsonl");
-    std::fs::write(&duplicate_jsonl, duplicate_export).unwrap();
+    std::fs::write(
+        &duplicate_jsonl,
+        export_for_rebuild(duplicate_export.as_bytes()),
+    )
+    .unwrap();
 
-    let rejected_graph = temp.path().join("rejected-v8-from-v5.omni");
+    let rejected_graph = temp.path().join("rejected-v9-from-v5.omni");
     output_success(
         cli()
             .arg("init")
@@ -593,13 +669,13 @@ fn current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8() {
         "a rejected target import must leave the old source root untouched",
     );
 
-    let v8_graph = temp.path().join("new-v8-from-v5.omni");
+    let v9_graph = temp.path().join("new-v9-from-v5.omni");
     output_success(
         cli()
             .arg("init")
             .arg("--schema")
             .arg(&schema)
-            .arg(&v8_graph),
+            .arg(&v9_graph),
     );
     output_success(
         cli()
@@ -608,32 +684,32 @@ fn current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8() {
             .arg("overwrite")
             .arg("--data")
             .arg(&jsonl)
-            .arg(&v8_graph),
+            .arg(&v9_graph),
     );
-    let reexport = output_success(cli().arg("export").arg(&v8_graph));
-    assert_export_fidelity("v5 → v8", &export.stdout, &reexport.stdout);
-    assert_exported_blob_fidelity("v5 → v8", &export.stdout, &reexport.stdout);
-    assert_rebuilt_graph_datasets_use_exact_id_pk(&v8_graph);
-    assert_rebuilt_blob_bytes(&v8_graph, &[0, 1, 2, 3, 255]);
+    let reexport = output_success(cli().arg("export").arg(&v9_graph));
+    assert_export_fidelity("v5 → v9", &export.stdout, &reexport.stdout);
+    assert_exported_blob_fidelity("v5 → v9", &export.stdout, &reexport.stdout);
+    assert_rebuilt_v9_graph(&v9_graph);
+    assert_rebuilt_blob_bytes(&v9_graph, &[0, 1, 2, 3, 255]);
 
     // The fence is bidirectional: a predecessor writer cannot accidentally
     // open and mutate the new PK-bearing format either.
-    let reverse = run_old(&v5, &["snapshot", v8_graph.to_str().unwrap()]);
+    let reverse = run_old(&v5, &["snapshot", v9_graph.to_str().unwrap()]);
     assert!(
         !reverse.status.success(),
-        "a v5 binary must refuse a genuine v8 graph",
+        "a v5 binary must refuse a genuine v9 graph",
     );
     let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
     assert!(
         reverse_stderr.contains("upgrade omnigraph")
             || reverse_stderr.contains("newer")
             || reverse_stderr.contains("expects v5"),
-        "unexpected v5→v8 reverse-refusal message: {reverse_stderr}",
+        "unexpected v5→v9 reverse-refusal message: {reverse_stderr}",
     );
 }
 
 #[test]
-fn current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8() {
+fn current_v9_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v9() {
     let Some(v6) = v6_bin() else {
         eprintln!(
             "skipping immediate-predecessor v6 upgrade test: OMNIGRAPH_V6_BIN is not set to a released 0.10.x binary"
@@ -691,7 +767,7 @@ fn current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8() {
     assert_ok("v6 export", &export);
     assert!(!export.stdout.is_empty(), "v6 export produced no rows");
     let jsonl = temp.path().join("v6.jsonl");
-    std::fs::write(&jsonl, &export.stdout).unwrap();
+    std::fs::write(&jsonl, export_for_rebuild(&export.stdout)).unwrap();
 
     let refusal = output_failure(cli().arg("snapshot").arg(&v6_graph));
     let stderr = String::from_utf8_lossy(&refusal.stderr);
@@ -704,13 +780,13 @@ fn current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8() {
         "v6 refusal must direct the operator to export/import rebuild, got: {stderr}",
     );
 
-    let v8_graph = temp.path().join("new-v8-from-v6.omni");
+    let v9_graph = temp.path().join("new-v9-from-v6.omni");
     output_success(
         cli()
             .arg("init")
             .arg("--schema")
             .arg(&schema)
-            .arg(&v8_graph),
+            .arg(&v9_graph),
     );
     output_success(
         cli()
@@ -719,30 +795,69 @@ fn current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8() {
             .arg("overwrite")
             .arg("--data")
             .arg(&jsonl)
-            .arg(&v8_graph),
+            .arg(&v9_graph),
     );
-    let reexport = output_success(cli().arg("export").arg(&v8_graph));
-    assert_export_fidelity("v6 → v8", &export.stdout, &reexport.stdout);
-    assert_exported_blob_fidelity("v6 → v8", &export.stdout, &reexport.stdout);
-    assert_rebuilt_graph_datasets_use_exact_id_pk(&v8_graph);
-    assert_rebuilt_blob_bytes(&v8_graph, &[0, 1, 2, 3, 255]);
+    let reexport = output_success(cli().arg("export").arg(&v9_graph));
+    assert_export_fidelity("v6 → v9", &export.stdout, &reexport.stdout);
+    assert_exported_blob_fidelity("v6 → v9", &export.stdout, &reexport.stdout);
+    assert_rebuilt_v9_graph(&v9_graph);
+    assert_rebuilt_blob_bytes(&v9_graph, &[0, 1, 2, 3, 255]);
 
-    let reverse = run_old(&v6, &["snapshot", v8_graph.to_str().unwrap()]);
+    let reverse = run_old(&v6, &["snapshot", v9_graph.to_str().unwrap()]);
     assert!(
         !reverse.status.success(),
-        "a v6 binary must refuse a genuine v8 graph",
+        "a v6 binary must refuse a genuine v9 graph",
     );
     let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
     assert!(
         reverse_stderr.contains("upgrade omnigraph")
             || reverse_stderr.contains("newer")
             || reverse_stderr.contains("expects v6"),
-        "unexpected v6→v8 reverse-refusal message: {reverse_stderr}",
+        "unexpected v6→v9 reverse-refusal message: {reverse_stderr}",
+    );
+}
+
+/// The guide's own preflight spelling and the default both report
+/// already_current on a graph this binary created.
+#[test]
+fn current_binary_reports_already_current_on_a_fresh_graph() {
+    let temp = tempdir().unwrap();
+    let graph = temp.path().join("fresh-current.omni");
+    let uri = graph.to_str().unwrap();
+    let schema = temp.path().join("fresh-current.pg");
+    std::fs::write(&schema, "node Person { name: String @key }\n").unwrap();
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+
+    for args in [
+        vec!["upgrade", uri, "--check", "--json"],
+        vec!["upgrade", uri, "--json"],
+        vec!["upgrade", uri, "--check", "--to-format", "8", "--json"],
+    ] {
+        let report = support::parse_stdout_json(&output_success(cli().args(&args)));
+        assert_eq!(report["outcome"], "already_current", "{args:?}");
+        assert_eq!(report["observed_format"], 9, "{args:?}");
+    }
+
+    let refused = support::parse_stdout_json(&output_failure(cli().args([
+        "upgrade",
+        uri,
+        "--check",
+        "--to-format",
+        "7",
+        "--json",
+    ])));
+    assert!(
+        refused["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "target_below_stamp"),
+        "unexpected downgrade refusal: {refused}"
     );
 }
 
 #[test]
-fn current_v8_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
+fn current_v9_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
     use serde_json::json;
     use std::fs;
     use support::{parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
@@ -979,7 +1094,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     let rebuilt_uri = rebuilt.to_str().unwrap();
     for (i, branch) in ["main", "review"].into_iter().enumerate() {
         let jsonl = temp.path().join(format!("v09-{branch}.jsonl"));
-        fs::write(&jsonl, &exports[i]).unwrap();
+        fs::write(&jsonl, export_for_rebuild(&exports[i])).unwrap();
         let mut load = cli();
         load.args(["load", "--mode", "overwrite", "--data"])
             .arg(&jsonl)
@@ -989,6 +1104,8 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         }
         output_success(load.arg(&rebuilt));
     }
+
+    assert_rebuilt_v9_graph(&rebuilt);
 
     let query_command = |target: &[&str], branch: &str, name: &str, params: &str| {
         let mut command = cli();
@@ -1163,7 +1280,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     let reverse = run_old(&old, &["snapshot", rebuilt_uri]);
     assert!(
         !reverse.status.success(),
-        "a 0.9 binary must refuse a genuine v8 graph",
+        "a 0.9 binary must refuse a genuine v9 graph",
     );
     let reverse_stderr = String::from_utf8_lossy(&reverse.stderr);
     assert!(

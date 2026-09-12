@@ -197,7 +197,7 @@ async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        vec!["id", "name"],
+        vec!["__id", "name"],
         "raw conflict injector is intentionally limited to the name-only fixture"
     );
     let batch = RecordBatch::try_new(
@@ -209,7 +209,7 @@ async fn commit_raw_fenced_name_row(table_uri: &str, id: &str) {
     )
     .unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    let mut builder = MergeInsertBuilder::try_new(base.clone(), vec!["id".to_string()]).unwrap();
+    let mut builder = MergeInsertBuilder::try_new(base.clone(), vec!["__id".to_string()]).unwrap();
     builder
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::InsertAll)
@@ -2582,7 +2582,7 @@ async fn rfc023_disjoint_retryable_strict_conflict_reprepares_without_key_confli
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>(),
-        ["id", "name", "score"],
+        ["__id", "name", "score"],
         "raw disjoint-conflict injector is schema-specific"
     );
     let foreign = RecordBatch::try_new(
@@ -4515,7 +4515,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
         .clone()
         .unwrap();
     let mut ds = helpers::open_dataset_head_exact(&person_uri, Some(&feature_fork)).await;
-    ds.drop_index("id_idx").await.unwrap();
+    ds.drop_index("__id_idx").await.unwrap();
     let dropped_index_head = ds.version().version;
     db.failpoint_publish_table_head_without_index_rebuild_for_test(
         "feature",
@@ -4603,7 +4603,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
     // handle alive. The entry barrier must finish the roll-forward-eligible v8
     // intent before the retry captures another base or plans another index.
     let mut ds = helpers::open_dataset_head_exact(&person_uri, Some(&feature_fork)).await;
-    ds.drop_index("id_idx").await.unwrap();
+    ds.drop_index("__id_idx").await.unwrap();
     db.failpoint_publish_table_head_without_index_rebuild_for_test(
         "feature",
         "node:Person",
@@ -8534,7 +8534,7 @@ node Embedding {
     let embedding = snapshot.open_dataset("node:Embedding").await.unwrap();
     assert!(embedding.has_unindexed_fragments().await.unwrap());
     assert_eq!(
-        embedding.index_coverage("id").await.unwrap(),
+        embedding.index_coverage("__id").await.unwrap(),
         omnigraph::IndexCoverage::Indexed,
         "only the excluded FTS tail and untrainable vector may remain"
     );

@@ -1,9 +1,11 @@
 # Upgrading OmniGraph
 
-Normal open accepts the current storage format. Use explicit storage migration
-for a registered route, or export/import with a source-compatible binary when
-no route exists. Storage formats, release versions and full-text index formats
-are separate; check the [release notes](../../releases/) before upgrading.
+Normal open accepts storage formats v8 and v9: v8 graphs spell their system
+columns `id`/`src`/`dst`, v9 graphs spell them `__id`/`__src`/`__dst`, and
+neither is migrated on open. Use explicit storage migration for a registered
+route, or export/import with a source-compatible binary when no route exists.
+Storage formats, release versions and full-text index formats are separate;
+check the [release notes](../../releases/) before upgrading.
 
 ## Explicit storage migration
 
@@ -53,8 +55,13 @@ their registration-clock interpretation.
    make downgrading safe. Post-upgrade writes are absent from that backup.
 
 `--to-format` defaults to 8. Explicit `--to-format 7` stops at v7 for a
-v7-compatible executable; the current binary accepts only v8 for normal open
-and will refuse that intermediate result. Unsupported sources and targets
+v7-compatible executable; the current binary accepts v8 and v9 for normal open
+and will refuse that intermediate result. Upgraded graphs keep the legacy
+system column spellings at v8; no route targets v9, and the in-place
+system-column conversion is not available. A graph already at v9 reports
+`already_current` for the default and for an explicit `--to-format 8` alike;
+`--to-format 7` on a v8 or v9 graph is refused as a downgrade below the served
+range. Unsupported sources and targets
 refuse; there is no automatic data-moving fallback. Both check and execution
 return zero only for success (`check_passed`, `completed` or `already_current`).
 Repeated successful execution is a no-write no-op after admission checks.
@@ -71,7 +78,7 @@ requires investigation; never delete the pending marker to force serving or
 point the source executable at it.
 
 Source v6/v7 graphs containing reserved native-ref retirement metadata refuse
-conversion. On a current v8 graph, admission validates that metadata and excludes
+conversion. On a v8 graph, admission validates that metadata and excludes
 valid retired refs from logical branch enumeration while retaining their physical
 ancestry. Upgrade neither retires branches nor reclaims their storage.
 
@@ -232,24 +239,33 @@ mapping is:
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
 | v7 | the exact unreleased development build that wrote it |
-| v8 | current 0.11.x line; entity export/import normally not required within this generation |
+| v8 | 0.11 development builds before the system-column namespace change, and every `omnigraph upgrade` output; still served by the current binary without export/import |
+| v9 | current 0.11.x line; entity export/import normally not required within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary rather
 than rebuilding with it.
+
+An in-place system-column upgrade is [planned](../../rfcs/0040-system-column-namespace.md#rollout). It is not available in this build; existing v8 graphs retain their spellings.
 
 ## Rebuild
 
 Keep the old and new executables separate. Use a different target URI so the
 source remains recoverable throughout verification.
 
+When an export already carries top-level `id`, the rewrite preserves it and any user property named `id`. For predecessor schemas, change endpoint constraint references from `src`/`dst` to `@src`/`@dst` before the new `init`. See [ingestion](../../dev/ingestion.md#strict-graph-batch) for the envelope contract.
+
 ```bash
 # Old binary
 old-omnigraph schema show s3://bucket/graph.omni > schema.pg
 old-omnigraph export s3://bucket/graph.omni > graph.jsonl
 
-# New binary
+# Relocate predecessor export identities
+jq -c 'if has("id") then . else .id = .data.id | del(.data.id) end' \
+  graph.jsonl > graph-current.jsonl
+
+# New binary (schema.pg endpoint constraints use @src and @dst)
 omnigraph init --schema schema.pg s3://bucket/graph-new.omni
-omnigraph load --mode overwrite --data graph.jsonl \
+omnigraph load --mode overwrite --data graph-current.jsonl \
   s3://bucket/graph-new.omni
 
 # Verify with the new binary
@@ -262,8 +278,10 @@ For another branch:
 ```bash
 old-omnigraph export --branch review s3://bucket/graph.omni \
   > review.jsonl
+jq -c 'if has("id") then . else .id = .data.id | del(.data.id) end' \
+  review.jsonl > review-current.jsonl
 omnigraph init --schema schema.pg s3://bucket/graph-review-new.omni
-omnigraph load --mode overwrite --data review.jsonl \
+omnigraph load --mode overwrite --data review-current.jsonl \
   s3://bucket/graph-review-new.omni
 ```
 

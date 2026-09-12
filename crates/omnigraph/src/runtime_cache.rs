@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 
 use lance::Dataset;
 use lance::session::Session;
+use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::QueryIR;
 use sha2::{Digest, Sha256};
@@ -119,6 +120,7 @@ impl RuntimeCache {
         resolved: &ResolvedTarget,
         edge_types: &HashMap<String, (String, String)>,
         adapter: &dyn crate::storage::StorageAdapter,
+        system_columns: SystemColumns,
     ) -> Result<Arc<GraphIndex>> {
         let key = graph_index_cache_key(resolved, edge_types);
         {
@@ -183,7 +185,8 @@ impl RuntimeCache {
         // build concurrently. The graph-build probe fires inside
         // `GraphIndex::build` itself, so a persisted-artifact load is never
         // counted as a build.
-        let index = Arc::new(GraphIndex::build(&resolved.snapshot, edge_types).await?);
+        let index =
+            Arc::new(GraphIndex::build(&resolved.snapshot, edge_types, system_columns).await?);
         let mut cache = self.graph_indices.lock().await;
         if let Some(existing) = cache.entries.get(&key).cloned() {
             return Ok(existing);
@@ -716,11 +719,11 @@ edge Likes: Person -> Person {}
             HashMap::from([(edge.to_string(), (et.from_type.clone(), et.to_type.clone()))])
         };
         let knows = db
-            .graph_index_for_resolved(&resolved, &scope("Knows"))
+            .graph_index_for_resolved(&resolved, &scope("Knows"), catalog.system_columns)
             .await
             .unwrap();
         let likes = db
-            .graph_index_for_resolved(&resolved, &scope("Likes"))
+            .graph_index_for_resolved(&resolved, &scope("Likes"), catalog.system_columns)
             .await
             .unwrap();
         assert!(

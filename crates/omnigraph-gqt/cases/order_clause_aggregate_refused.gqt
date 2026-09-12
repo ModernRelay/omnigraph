@@ -26,3 +26,12 @@ query count_ordered() {
 }
 
 --- expect error: unsupported ordering expression
+
+--- query
+query meta_aggregate_order_refused() {
+    match { $p: Person }
+    return { $p.name, count($p.@id) }
+    order { max($p.@id) }
+}
+
+--- expect error: unsupported ordering expression

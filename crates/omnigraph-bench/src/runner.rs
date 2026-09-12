@@ -3957,7 +3957,7 @@ version: 1
 id: tiny-runner
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 3, seed: 0 }
   data:
     provenance: synthetic
     tables: 2

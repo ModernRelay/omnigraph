@@ -291,7 +291,7 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
         // each declared node property (probing its actual physical kind), and
         // edge id/src/dst. Unknown raw Lance metadata remains explicitly
         // unverified below rather than being presented as a complete inventory.
-        let mut index_columns = BTreeSet::from(["id".to_string()]);
+        let mut index_columns = BTreeSet::from([catalog.system_columns.id.to_string()]);
         if let Some(declared_indexes) = node_declared_indexes {
             for fields in declared_indexes {
                 let [column] = fields.as_slice() else {
@@ -302,7 +302,10 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
                 index_columns.insert(column.clone());
             }
         } else {
-            index_columns.extend(["src".to_string(), "dst".to_string()]);
+            index_columns.extend([
+                catalog.system_columns.src.to_string(),
+                catalog.system_columns.dst.to_string(),
+            ]);
         }
         let table_has_stale_index = dataset.has_unindexed_fragments().await.map_err(|error| {
             RealGraphError::new(format!("inspect index freshness for {table_key}: {error}"))
@@ -569,11 +572,10 @@ impl LogicalGraphSink {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let (table_key, canonical_row, payload_bytes) = if let Some(node) = node_type {
-            let mut data = object
+            let data = object
                 .remove("data")
                 .and_then(|value| value.as_object().cloned())
                 .ok_or_else(|| RealGraphError::new("node export row has no data object"))?;
-            data.remove("id");
             let payload = canonical_json_bytes(&Value::Object(data.clone()))?;
             let mut canonical = Vec::new();
             frame(&mut canonical, b"node");
@@ -591,11 +593,10 @@ impl LogicalGraphSink {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| RealGraphError::new("edge export row has no string to"))?;
-            let mut data = object
+            let data = object
                 .remove("data")
                 .and_then(|value| value.as_object().cloned())
                 .ok_or_else(|| RealGraphError::new("edge export row has no data object"))?;
-            data.remove("id");
             let payload = canonical_json_bytes(&Value::Object(data.clone()))?;
             let mut canonical = Vec::new();
             frame(&mut canonical, b"edge");
@@ -832,11 +833,11 @@ mod tests {
     #[test]
     fn logical_multiset_omits_generated_ids_preserves_duplicates_and_ignores_order() {
         let edge_a =
-            r#"{"edge":"Transfer","from":"a","to":"b","data":{"id":"generated-a","amount":1}}"#;
+            r#"{"edge":"Transfer","id":"generated-a","from":"a","to":"b","data":{"amount":1}}"#;
         let edge_b =
-            r#"{"edge":"Transfer","from":"a","to":"b","data":{"id":"generated-b","amount":1}}"#;
+            r#"{"edge":"Transfer","id":"generated-b","from":"a","to":"b","data":{"amount":1}}"#;
         let edge_other =
-            r#"{"edge":"Transfer","from":"b","to":"a","data":{"id":"generated-c","amount":2}}"#;
+            r#"{"edge":"Transfer","id":"generated-c","from":"b","to":"a","data":{"amount":2}}"#;
         let left = export_rows(&[edge_a, edge_other]);
         let rebuilt = export_rows(&[edge_other, edge_b]);
         assert_eq!(left.logical_content_sha256, rebuilt.logical_content_sha256);
@@ -850,10 +851,10 @@ mod tests {
     #[test]
     fn canonical_property_order_and_redundant_node_id_do_not_change_content() {
         let first = export_rows(&[
-            r#"{"type":"Person","data":{"id":"physical-a","personId":"p1","active":true}}"#,
+            r#"{"type":"Person","id":"physical-a","data":{"personId":"p1","active":true}}"#,
         ]);
         let second = export_rows(&[
-            r#"{"type":"Person","data":{"active":true,"personId":"p1","id":"physical-b"}}"#,
+            r#"{"type":"Person","id":"physical-b","data":{"active":true,"personId":"p1"}}"#,
         ]);
         assert_eq!(first.logical_content_sha256, second.logical_content_sha256);
         assert_eq!(first.logical_payload_bytes, second.logical_payload_bytes);
@@ -871,7 +872,7 @@ mod tests {
     fn partial_export_cannot_mint_a_logical_digest() {
         let mut sink = LogicalGraphSink::default();
         sink.write_all(
-            br#"{"type":"Person","data":{"id":"p1","personId":"p1"}}
+            br#"{"type":"Person","id":"p1","data":{"personId":"p1"}}
 "#,
         )
         .unwrap();

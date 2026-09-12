@@ -1667,20 +1667,17 @@ edge WorksAt: Person -> Company @card(0..1)
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
-    // Seed: Alice + Acme + Bigco + WorksAt(id=w1, Alice→Acme). Note the
-    // loader reads edge ids from the `data.id` field (not top-level), so
-    // we place the id inside `data` for both the seed and the update.
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
-{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
+{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Acme", "data": {}}
 "#;
     load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Merge-update the same edge id w1 to point at Bigco. Counted naively
     // as union, Alice has 2 WorksAt (committed Acme + pending Bigco) which
     // would trip @card(0..1). With merge dedupe, Alice has 1 WorksAt.
-    let merge_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
+    let merge_data = r#"{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Bigco", "data": {}}
 "#;
     load_jsonl(&db, merge_data, LoadMode::Merge)
         .await
@@ -1727,8 +1724,8 @@ edge WorksAt: Person -> Company @card(0..1)
     // the first in the end-of-query dedupe. If pending-counting doesn't
     // dedupe, Alice has 2 pending edges → @card(0..1) trips → load
     // fails. With dedupe, Alice has 1 → load succeeds.
-    let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
-{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
+    let dup_data = r#"{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Acme", "data": {}}
+{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Bigco", "data": {}}
 "#;
     load_jsonl(&db, dup_data, LoadMode::Merge)
         .await
@@ -2729,13 +2726,13 @@ async fn multi_table_staging_matches_serial_staging() {
         let mut edges: Vec<(String, String)> = Vec::new();
         for batch in &read_table(&db, "edge:Knows").await {
             let from = batch
-                .column_by_name("src")
+                .column_by_name("__src")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .unwrap();
             let to = batch
-                .column_by_name("dst")
+                .column_by_name("__dst")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
@@ -2784,7 +2781,7 @@ const EDGE_KEY_WRITE_SCHEMA: &str = r#"
 node Person { name: String @key }
 edge Knows: Person -> Person {
     since: String?
-    @key(src, dst)
+    @key(@src, @dst)
 }
 "#;
 

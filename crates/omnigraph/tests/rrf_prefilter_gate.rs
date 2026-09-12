@@ -108,16 +108,16 @@ fn gate_seed_data() -> String {
     rows.extend(gate_chunk_rows());
     for chunk in 4..=6 {
         rows.push(format!(
-            r#"{{"edge":"ChunkOfArtifact","from":"chunk-{chunk:02}","to":"art-0","data":{{"id":"eoa-{chunk:02}","label":"of"}}}}"#
+            r#"{{"edge":"ChunkOfArtifact","id":"eoa-{chunk:02}","from":"chunk-{chunk:02}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
     rows.push(
-        r#"{"edge":"ChunkOfArtifact","from":"chunk-07","to":"art-1","data":{"id":"eoa-07","label":"of"}}"#
+        r#"{"edge":"ChunkOfArtifact","id":"eoa-07","from":"chunk-07","to":"art-1","data":{"label":"of"}}"#
             .to_string(),
     );
     for (from, to) in [(2, 10), (5, 12), (8, 3), (12, 15)] {
         rows.push(format!(
-            r#"{{"edge":"ChunkCites","from":"chunk-{from:02}","to":"chunk-{to:02}","data":{{"id":"ec-{from:02}-{to:02}","label":"cites"}}}}"#
+            r#"{{"edge":"ChunkCites","id":"ec-{from:02}-{to:02}","from":"chunk-{from:02}","to":"chunk-{to:02}","data":{{"label":"cites"}}}}"#
         ));
     }
     rows.join("\n")
@@ -437,7 +437,7 @@ fn stats_seed_data() -> String {
     }
     for chunk in 0..4 {
         rows.push(format!(
-            r#"{{"edge":"ChunkOfArtifact","from":"s-{chunk:02}","to":"art-0","data":{{"id":"soa-{chunk:02}","label":"of"}}}}"#
+            r#"{{"edge":"ChunkOfArtifact","id":"soa-{chunk:02}","from":"s-{chunk:02}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
     rows.join("\n")
@@ -604,7 +604,7 @@ async fn natural_gate_prefilters_at_ratio_boundary() {
     rows.extend(gate_chunk_rows());
     for chunk in 4..=5 {
         rows.push(format!(
-            r#"{{"edge":"ChunkOfArtifact","from":"chunk-{chunk:02}","to":"art-0","data":{{"id":"eoa-{chunk:02}","label":"of"}}}}"#
+            r#"{{"edge":"ChunkOfArtifact","id":"eoa-{chunk:02}","from":"chunk-{chunk:02}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
     load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
@@ -730,7 +730,7 @@ async fn partial_fts_coverage_falls_back() {
     // fragment is not in the FTS index's fragment bitmap.
     let appended = [
         r#"{"type":"Chunk","data":{"slug":"chunk-99","text":"needle sharp filler","embedding":[99.0,0.0,0.0,0.0]}}"#,
-        r#"{"edge":"ChunkOfArtifact","from":"chunk-99","to":"art-0","data":{"id":"eoa-99","label":"of"}}"#,
+        r#"{"edge":"ChunkOfArtifact","id":"eoa-99","from":"chunk-99","to":"art-0","data":{"label":"of"}}"#,
     ]
     .join("\n");
     load_jsonl(&db, &appended, LoadMode::Append).await.unwrap();
@@ -824,7 +824,7 @@ async fn natural_gate_prefilters_selective_fixture() {
     let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
     rows.extend(gate_chunk_rows());
     rows.push(
-        r#"{"edge":"ChunkOfArtifact","from":"chunk-04","to":"art-0","data":{"id":"eoa-04","label":"of"}}"#
+        r#"{"edge":"ChunkOfArtifact","id":"eoa-04","from":"chunk-04","to":"art-0","data":{"label":"of"}}"#
             .to_string(),
     );
     load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
@@ -897,7 +897,7 @@ async fn decoy_flood_winner_holds_under_both_plans() {
     }
     for slug in ["x", "y", "n"] {
         rows.push(format!(
-            r#"{{"edge":"ChunkOfArtifact","from":"{slug}","to":"art-0","data":{{"id":"e-{slug}","label":"of"}}}}"#
+            r#"{{"edge":"ChunkOfArtifact","id":"e-{slug}","from":"{slug}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
     load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
@@ -948,7 +948,7 @@ async fn natural_gate_falls_back_on_broad_fixture() {
     rows.extend(gate_chunk_rows());
     for chunk in 4..12 {
         rows.push(format!(
-            r#"{{"edge":"ChunkOfArtifact","from":"chunk-{chunk:02}","to":"art-0","data":{{"id":"eoa-{chunk:02}","label":"of"}}}}"#
+            r#"{{"edge":"ChunkOfArtifact","id":"eoa-{chunk:02}","from":"chunk-{chunk:02}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
     load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)

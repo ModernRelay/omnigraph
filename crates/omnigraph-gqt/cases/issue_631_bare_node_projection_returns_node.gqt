@@ -27,8 +27,8 @@ query bare_person() {
 }
 
 --- expect unordered
-{"p": {"id": "alice", "name": "alice", "age": 30}}
-{"p": {"id": "bob", "name": "bob"}}
+{"p": {"@id": "alice", "name": "alice", "age": 30}}
+{"p": {"@id": "bob", "name": "bob"}}
 
 --- expect shape
 p: Person
@@ -43,7 +43,7 @@ query friend_of_alice() {
 }
 
 --- expect unordered
-{"p.name": "alice", "f": {"id": "bob", "name": "bob"}}
+{"p.name": "alice", "f": {"@id": "bob", "name": "bob"}}
 
 --- expect shape
 p.name: String
@@ -59,7 +59,7 @@ query friends_per_person() {
 }
 
 --- expect unordered
-{"p": {"id": "alice", "name": "alice", "age": 30}, "friends": 1}
+{"p": {"@id": "alice", "name": "alice", "age": 30}, "friends": 1}
 
 --- expect shape
 p: Person

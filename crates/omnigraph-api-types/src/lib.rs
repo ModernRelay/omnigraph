@@ -1091,6 +1091,32 @@ pub struct SchemaApplyOutput {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchemaOutput {
     pub schema_source: String,
+    /// The graph's physical system column spellings: `__id`/`__src`/`__dst`
+    /// on current-vintage graphs, `id`/`src`/`dst` on legacy ones. This is
+    /// storage discovery for loaders, exports and raw readers of mixed
+    /// vintages; query results address identity and endpoints through the
+    /// meta-fields `@id`, `@src` and `@dst` on every vintage. Optional for
+    /// compatibility with servers predating the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_columns: Option<SystemColumnsOutput>,
+}
+
+/// A graph's system column spellings (see `SchemaOutput::system_columns`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SystemColumnsOutput {
+    pub id: String,
+    pub src: String,
+    pub dst: String,
+}
+
+impl From<omnigraph_compiler::SystemColumns> for SystemColumnsOutput {
+    fn from(columns: omnigraph_compiler::SystemColumns) -> Self {
+        Self {
+            id: columns.id.to_string(),
+            src: columns.src.to_string(),
+            dst: columns.dst.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1149,7 +1175,8 @@ pub struct CommitListQuery {
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
-    /// The internal-schema (storage-format) version this binary writes and reads.
+    /// The newest internal-schema (storage-format) version this binary serves;
+    /// it also reads and writes the preceding legacy-vintage version.
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,

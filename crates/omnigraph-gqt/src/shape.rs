@@ -56,7 +56,7 @@ pub(crate) fn parse_shape_body(body: &[(usize, &str)]) -> Result<Vec<ShapeLine>,
         let name = name.trim();
         if !is_column_name(name) {
             return Err(format!(
-                "line {line_no}: `{name}` is not a column name (`ident` or `ident.ident`)"
+                "line {line_no}: `{name}` is not a column name (`ident`, `ident.ident`, or `ident.@ident`)"
             ));
         }
         let type_text = type_text.trim();
@@ -109,8 +109,8 @@ fn node_object_names(catalog: &Catalog, type_name: &str) -> Result<Vec<String>, 
         .get(type_name)
         .ok_or_else(|| format!("`{type_name}` is not a node type of this schema"))?;
     Ok(node_type
-        .node_object_fields()
-        .map(|field| field.name().clone())
+        .node_object_members()
+        .map(|(member, _)| member.to_string())
         .collect())
 }
 
@@ -131,7 +131,9 @@ fn is_ident(s: &str) -> bool {
 
 fn is_column_name(name: &str) -> bool {
     match name.split_once('.') {
-        Some((var, prop)) => is_ident(var) && is_ident(prop),
+        Some((var, prop)) => {
+            is_ident(var) && (is_ident(prop) || prop.strip_prefix('@').is_some_and(is_ident))
+        }
         None => is_ident(name),
     }
 }
@@ -266,8 +268,8 @@ pub(crate) fn bless_shape_lines(
                 .iter()
                 .filter(|(_, node_type)| {
                     node_type
-                        .node_object_fields()
-                        .map(|f| f.name().clone())
+                        .node_object_members()
+                        .map(|(member, _)| member.to_string())
                         .collect::<Vec<_>>()
                         == names
                 })
