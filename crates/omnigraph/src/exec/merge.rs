@@ -6396,6 +6396,20 @@ impl Omnigraph {
         let (_updates, changed_edge_tables) = match post_arm_result {
             Ok(result) => result,
             Err(error) => {
+                if let Some((sidecar, _)) = &recovery {
+                    let recovered = self.recover_failed_branch_merge_under_gates(sidecar).await;
+                    match recovered {
+                        Ok(true) => return Err(error),
+                        Ok(false) => {}
+                        Err(recovery_error) => {
+                            tracing::warn!(
+                                operation_id = sidecar.operation_id.as_str(),
+                                error = %recovery_error,
+                                "failed merge recovery did not complete"
+                            );
+                        }
+                    }
+                }
                 return match recovery_operation_id {
                     Some(operation_id) => Err(OmniError::recovery_required(
                         operation_id,

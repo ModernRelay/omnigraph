@@ -22,7 +22,8 @@ use serial_test::serial;
 
 use helpers::recovery::{
     FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
-    branch_head_commit_id, recovery_audit_kinds, single_sidecar_operation_id,
+    branch_head_commit_id, recovery_audit_kinds, sidecar_operation_ids,
+    single_sidecar_operation_id,
 };
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, collect_column_strings, count_rows, mixed_params, mutate_main,
@@ -10551,6 +10552,8 @@ async fn branch_merge_multichunk_insert_armed_prefix_rolls_back() {
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let operation_id = {
+        let _error_recovery_failure =
+            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
         let _failpoint =
             ScopedFailPoint::new(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS, "return");
         match db.branch_merge("feature", "main").await.unwrap_err() {
@@ -10609,6 +10612,140 @@ async fn branch_merge_multichunk_insert_armed_prefix_rolls_back() {
     assert_eq!(count_rows(&recovered, "node:Person").await, 8194);
     let names = collect_column_strings(&read_table(&recovered, "node:Person").await, "name");
     assert!(names.iter().any(|name| name == "merge-row-8192"));
+}
+
+/// The same prefix failure with error cleanup enabled: the merge compensates
+/// its own durable first chunk before returning, and the same handle keeps
+/// writing and can retry without reopening (issue 694).
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn issue_694_multichunk_insert_prefix_cleans_up_live() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, person_uri, expected_version) = setup_branch_merge_multichunk_adopt(&dir).await;
+    let db = Omnigraph::open(&uri).await.unwrap();
+
+    {
+        let _failpoint =
+            ScopedFailPoint::new(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS, "return");
+        let error = db.branch_merge("feature", "main").await.unwrap_err();
+        assert!(
+            !matches!(error, OmniError::RecoveryRequired { .. })
+                && error
+                    .to_string()
+                    .contains(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+            "live cleanup must return the original merge error: {error}"
+        );
+    }
+    assert!(
+        sidecar_operation_ids(dir.path()).is_empty(),
+        "the armed partial-prefix sidecar must be retired before the merge returns"
+    );
+    assert!(
+        Dataset::open(&person_uri).await.unwrap().version().version > expected_version + 1,
+        "compensation must restore over the durable first chunk"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 1);
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledBack")
+            .count(),
+        1
+    );
+
+    db.load(
+        "main",
+        r#"{"type":"Person","data":{"name":"live-after-failure","score":2}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("the same handle must accept an unrelated write without reopening");
+    assert_eq!(count_rows(&db, "node:Person").await, 2);
+    db.branch_merge("feature", "main")
+        .await
+        .expect("the complete multi-chunk insert remains retryable after live cleanup");
+    assert_eq!(count_rows(&db, "node:Person").await, 8195);
+    let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    assert!(names.iter().any(|name| name == "merge-row-8192"));
+}
+
+/// Live cleanup interrupted after the table restore but before its publish
+/// keeps the sidecar and returns `RecoveryRequired`; the next open finishes the
+/// compensation from the owned restore (issue 694).
+#[tokio::test]
+#[serial]
+#[serial(branch_merge_phase_b)]
+async fn issue_694_live_cleanup_interrupted_after_restore_retains_recovery() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, person_uri, expected_version) = setup_branch_merge_multichunk_adopt(&dir).await;
+    let db = Omnigraph::open(&uri).await.unwrap();
+
+    let operation_id = {
+        let _restore_interrupt =
+            ScopedFailPoint::new(names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH, "return");
+        let _failpoint =
+            ScopedFailPoint::new(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS, "return");
+        match db.branch_merge("feature", "main").await.unwrap_err() {
+            OmniError::RecoveryRequired { operation_id, .. } => operation_id,
+            other => panic!("interrupted live cleanup must retain recovery ownership: {other}"),
+        }
+    };
+    let sidecar_path = dir
+        .path()
+        .join("__recovery")
+        .join(format!("{operation_id}.json"));
+    assert!(sidecar_path.exists());
+    assert!(
+        recovery_audit_kinds(dir.path()).await.is_empty(),
+        "an interrupted live rollback must not claim a completed audit outcome"
+    );
+    let person_after_interrupted_restore =
+        Dataset::open(&person_uri).await.unwrap().version().version;
+    assert!(
+        person_after_interrupted_restore > expected_version + 1,
+        "the restore must be durable before the interrupted publish"
+    );
+    assert!(
+        matches!(
+            db.load(
+                "main",
+                r#"{"type":"Person","data":{"name":"live-after-failure","score":2}}"#,
+                LoadMode::Append,
+            )
+            .await,
+            Err(OmniError::RecoveryRequired { .. })
+        ),
+        "a retained sidecar must keep protecting writes on the same handle"
+    );
+    drop(db);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("the next open must finish the interrupted compensation");
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        Dataset::open(&person_uri).await.unwrap().version().version,
+        person_after_interrupted_restore,
+        "restartable rollback must reuse the owned restore instead of restoring again"
+    );
+    assert_eq!(count_rows(&recovered, "node:Person").await, 1);
+    assert_eq!(
+        recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "RolledBack")
+            .count(),
+        1
+    );
+    recovered
+        .branch_merge("feature", "main")
+        .await
+        .expect("the complete multi-chunk insert remains retryable after recovery");
+    assert_eq!(count_rows(&recovered, "node:Person").await, 8194);
 }
 
 /// Once both exact pure-insert transactions are durably confirmed, a
@@ -10748,6 +10885,8 @@ async fn branch_merge_multichunk_delete_armed_prefix_rolls_back() {
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let operation_id = {
+        let _error_recovery_failure =
+            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
         let _failpoint = ScopedFailPoint::new(names::BRANCH_MERGE_BETWEEN_DELETE_CHUNKS, "return");
         match db.branch_merge("feature", "main").await.unwrap_err() {
             OmniError::RecoveryRequired { operation_id, .. } => operation_id,
@@ -10953,6 +11092,8 @@ async fn assert_partial_merge_rolls_back(
     // Crash mid-Phase-B at the injected window.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
+        let _error_recovery_failure =
+            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
         let _fp = ScopedFailPoint::new(failpoint, "return");
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
@@ -13746,6 +13887,8 @@ async fn assert_branch_merge_first_touch_ref_is_recovered(
     assert!(inherited_entry.native_dataset_branch.is_some());
 
     let error = {
+        let _error_recovery_failure =
+            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
         let _failpoint = ScopedFailPoint::new(failpoint, "return");
         db.branch_merge("source", "target").await.unwrap_err()
     };
@@ -14146,6 +14289,8 @@ async fn branch_merge_dropping_a_net_zero_table_confirms_and_recovers() {
     // Crash between the durable effects and the sidecar confirmation.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
+        let _error_recovery_failure =
+            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
         let _failpoint =
             ScopedFailPoint::new(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM, "return");
         let err = db.branch_merge("feature", "main").await.unwrap_err();
