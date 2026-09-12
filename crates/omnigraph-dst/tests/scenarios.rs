@@ -574,6 +574,63 @@ fn dst_sessions_agree_and_replay() {
     );
 }
 
+/// Faulted merges and separately confirmed retries need raw-row arbitration.
+#[test]
+#[serial]
+fn dst_failed_attempts_arbitrate_on_bound_rows() {
+    for (seed, op, expected) in [(228_316u64, 8, "NotApplied"), (228_319, 14, "AppliedTwice")] {
+        let sc = Scenario {
+            seed,
+            ops: 30,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed.wrapping_mul(103),
+                error_pct: 0,
+                read_error_pct: 0,
+                latency_pct: 0,
+                max_latency_ms: 1,
+                lance_realm: false,
+                ack_loss_pct: 15,
+                client_retry: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let report = run_universe(&format!("shared-memory://dst-pin-failed-bound-{seed}"), &sc);
+        assert!(
+            report
+                .reconcile_verdicts
+                .iter()
+                .any(|(tag, outcome, channel)| {
+                    tag == &format!("fault@op{op}")
+                        && outcome == expected
+                        && channel == "query+bound"
+                }),
+            "seed {seed} must be ruled on raw rows: {:?}",
+            report.reconcile_verdicts
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn dst_maintenance_commit_uses_execution_branch() {
+    for (seed, write, op) in [(228_301, 118, 13), (228_317, 133, 9)] {
+        let report = run_universe(
+            &format!("shared-memory://dst-maintenance-commit-{seed}"),
+            &Scenario {
+                seed,
+                ops: 30,
+                die_at_write: Some(write),
+                ..Default::default()
+            },
+        );
+        assert!(report.crash_state_hit);
+        assert!(report.reconcile_verdicts.iter().any(|(tag, outcome, _)| {
+            tag == &format!("crash-state:write#{write}@op{op}") && outcome == "Applied"
+        }));
+    }
+}
+
 /// PHYSICAL-CHANNEL ORACLE, honesty proof — FLIPPED on the #474 fix
 /// (self-loop edges are ordinary visible edges; issue #474, fixed in PR #476): seed 10's
 /// op stream opens with insert w2 → add_friend(w2, w2), the old ghost

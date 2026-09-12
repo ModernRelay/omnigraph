@@ -1135,8 +1135,9 @@ pub struct UniverseReport {
     /// deliberately unasserted (lance-realm compositions are
     /// process-context-sensitive) —
     /// and channel is the observation surface the ruling rested on
-    /// ("query", or "query+bound" when the tie-break consulted the
-    /// bound-edge rows). The per-death RESULT the ledger records for
+    /// ("query", or "query+bound" when the raw Knows rows of the branch
+    /// the op moved were consulted, which can overrule the query
+    /// picture). The per-death RESULT the ledger records for
     /// hits. Deterministic and replay-compared for adapter-realm one-op
     /// rows — an arbitration that flips between same-seed runs is itself
     /// a caught bug; the keep-serving rows carry the lance-realm envelope
@@ -3543,15 +3544,21 @@ impl RetryEffect {
         };
         let outcome = judge(after);
         if let Some(before) = before {
-            judge(before);
-            if after.len() < before.len() {
+            let seen = judge(before);
+            let rank = |o: &ReconcileOutcome| match o {
+                ReconcileOutcome::AppliedTwice => 2,
+                ReconcileOutcome::Applied => 1,
+                _ => 0,
+            };
+            let demoted = rank(&outcome) < rank(&seen);
+            if demoted {
                 detectors::violation(
                     DET_CRASH_CONTRACT,
                     at_op,
                     format!(
-                        "{label}: recovery demoted a visible edge insertion: before={before:?}, after={after:?}"
+                        "{label}: recovery changed a visible effect: before={before:?} judged {seen:?}, after={after:?} judged {outcome:?}"
                     ),
-                    "recovery must preserve every visible insertion, including the retry",
+                    "recovery preserves every visible effect, including a landed retry",
                 );
             }
         }
@@ -3781,20 +3788,76 @@ fn insertion_branch<'a>(wop: &'a WorldOp, world: &WorldModel) -> Option<&'a str>
     }
 }
 
+/// Actor the engine signs rollback and legacy-sidecar recovery commits with; an
+/// exact-protocol roll-forward (v3/v4/v7/v8, every sidecar the current writer
+/// emits) publishes the writer's actor, so a writer commit is one NOT signed so.
+const RECOVERY_ACTOR: &str = "omnigraph:recovery";
+
+/// Newest graph commit id on `branch`, `None` when the branch has no readable
+/// history (dead target, damaged store).
+async fn branch_head_commit(db: &Omnigraph, branch: &str) -> Option<String> {
+    db.list_commits(Some(branch))
+        .await
+        .ok()?
+        .first()
+        .map(|commit| commit.graph_commit_id.clone())
+}
+
+async fn branch_heads(
+    db: &Omnigraph,
+    world: &WorldModel,
+    at_op: usize,
+    wop: &WorldOp,
+    failing: Option<&FailingStorage>,
+) -> Vec<(String, String)> {
+    if let Some(f) = failing {
+        f.suspend();
+    }
+    crate::cost::set_label("_heads");
+    let mut heads = Vec::new();
+    for name in world.branch_names() {
+        match branch_head_commit(db, &name).await {
+            Some(head) => heads.push((name, head)),
+            None => detectors::violation(
+                DET_ARBITRATION_PHYSICAL,
+                at_op,
+                format!("live branch '{name}' has no readable commit history before the op"),
+                "every live branch lists at least its fork-point commit",
+            ),
+        }
+    }
+    crate::cost::set_label(&crate::cost::debug_head(wop));
+    if let Some(f) = failing {
+        f.resume();
+    }
+    heads
+}
+
+struct Arbitration<'a> {
+    label: &'a str,
+    at_op: usize,
+    retry: RetryEffect,
+    recovery_crash: Option<&'static str>,
+    heads_before: &'a [(String, String)],
+}
+
 /// Judge the failed op and its optional retry, then reopen and enforce
 /// recovery monotonicity. Unrelated unjudged ops require watch reconciliation.
-#[allow(clippy::too_many_arguments)]
 async fn reconcile_after_failure(
     db: Omnigraph,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
     world: &WorldModel,
-    label: &str,
-    at_op: usize,
-    recovery_crash: Option<&'static str>,
-    retry: RetryEffect,
+    arbitration: Arbitration<'_>,
 ) -> (Omnigraph, ReconcileOutcome, &'static str) {
+    let Arbitration {
+        label,
+        at_op,
+        retry,
+        recovery_crash,
+        heads_before,
+    } = arbitration;
     // Stale-capture rule on [`resolve_keep_serving_watch`]: a ruling can
     // remove the op's target between its sampling and this judgment. A
     // dead-target op has exactly one legal outcome — NotApplied — enforced
@@ -3833,7 +3896,21 @@ async fn reconcile_after_failure(
         );
     }
     let insertion_branch = insertion_branch(wop, world);
-    let visible_edge_rows = if let Some(branch) = insertion_branch {
+    let moved: Vec<String> = world
+        .branch_names()
+        .into_iter()
+        .filter(|name| {
+            with.state_of_opt(name).is_some_and(|with_state| {
+                world.state_of(name).physical_rows() != with_state.physical_rows()
+            })
+        })
+        .collect();
+    let moved = match moved.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => panic!("{label}: one op moves rows on one branch (op={wop:?}, moved={many:?})"),
+    };
+    let visible_edge_rows = if let Some(branch) = &moved {
         Some(Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await)
     } else {
         None
@@ -3885,31 +3962,102 @@ async fn reconcile_after_failure(
     // Which channel the ruling rests on — recorded so the run tables carry
     // observed provenance, never an assumption (canary lesson).
     let mut channel: &'static str = "query";
-    if target_live && (as_model == as_with || insertion_branch.is_some()) {
-        let touched = match wop {
-            WorldOp::Data { branch, .. } => Some(branch),
-            _ => None,
+    if target_live && let Some(branch) = &moved {
+        channel = "query+bound";
+        let expect_world = world.state_of(branch).physical_rows();
+        let expect_with = with.state_of(branch).physical_rows();
+        let knows = Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
+        let expect_twice = if insertion_branch.is_some() && retry != RetryEffect::None {
+            let mut twice = with.clone();
+            apply_world(&mut twice, wop);
+            twice.state_of(branch).physical_rows()
+        } else {
+            expect_with.clone()
         };
-        if let Some(branch) = touched {
-            let expect_world = world.state_of(branch).physical_rows();
-            let expect_with = with.state_of(branch).physical_rows();
-            if expect_world != expect_with {
-                channel = "query+bound";
-                let knows =
-                    Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
-                let expect_twice = if insertion_branch.is_some() && retry != RetryEffect::None {
-                    let mut twice = with.clone();
-                    apply_world(&mut twice, wop);
-                    twice.state_of(branch).physical_rows()
-                } else {
-                    expect_with.clone()
-                };
-                outcome = retry.reconcile_edges(
-                    visible_edge_rows.as_deref(),
-                    &knows,
-                    [&expect_world, &expect_with, &expect_twice],
-                    label,
+        outcome = retry.reconcile_edges(
+            visible_edge_rows.as_deref(),
+            &knows,
+            [&expect_world, &expect_with, &expect_twice],
+            label,
+            at_op,
+        );
+    }
+    if target_live {
+        for (branch, before) in heads_before {
+            let (Some(world_state), Some(with_state)) =
+                (world.state_of_opt(branch), with.state_of_opt(branch))
+            else {
+                continue;
+            };
+            let predicted = world_state.person_rows() != with_state.person_rows()
+                || world_state.physical_rows() != with_state.physical_rows();
+            let own_target = match wop {
+                WorldOp::Data {
+                    op:
+                        Op::Optimize | Op::Cleanup | Op::EnsureIndices | Op::SchemaAddProperty { .. },
+                    ..
+                } => branch == "main",
+                WorldOp::Data { branch: target, .. } => target == branch,
+                WorldOp::BranchMerge { .. } => branch == "main",
+                _ => false,
+            };
+            if !predicted && own_target {
+                continue;
+            }
+            let commits = match db.list_commits(Some(branch)).await {
+                Ok(commits) => commits,
+                Err(error) => detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
                     at_op,
+                    format!(
+                        "{label}: commit history of '{branch}' unreadable after recovery: {error}"
+                    ),
+                    "a recovered branch lists its commits",
+                ),
+            };
+            let Some(newer) = commits.iter().position(|c| c.graph_commit_id == *before) else {
+                detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
+                    at_op,
+                    format!(
+                        "{label}: recorded head {before} of '{branch}' vanished from its history"
+                    ),
+                    "recovery appends commits, never rewrites history",
+                )
+            };
+            let since: Vec<String> = commits[..newer]
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}@v{} parent={:?} actor={:?}",
+                        c.graph_commit_id, c.graph_manifest_version, c.parent_commit_id, c.actor_id
+                    )
+                })
+                .collect();
+            let writer_commits = commits[..newer]
+                .iter()
+                .filter(|c| c.actor_id.as_deref() != Some(RECOVERY_ACTOR))
+                .count();
+            let retried = retry != RetryEffect::None;
+            let legal = match (predicted, &outcome) {
+                (false, _) | (true, ReconcileOutcome::NotApplied | ReconcileOutcome::ForkOnly) => {
+                    writer_commits == 0
+                }
+                (true, ReconcileOutcome::Applied) => {
+                    writer_commits == 1 || (retried && writer_commits == 2)
+                }
+                (true, ReconcileOutcome::AppliedTwice) => writer_commits == 2,
+            };
+            if !legal {
+                detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
+                    at_op,
+                    format!(
+                        "{label}: {writer_commits} writer commit(s) on '{branch}' since {before} \
+                         ({since:?}) contradict the arbitration {outcome:?} \
+                         (predicted change={predicted}, retried={retried})"
+                    ),
+                    "an applied attempt lands one writer commit on the branch it changes (two when its retry re-committed idempotently) and none elsewhere",
                 );
             }
         }
@@ -4152,7 +4300,12 @@ async fn crash_op(
     recovery_crash: Option<&'static str>,
     expected_conflict: bool,
     failing: Option<&FailingStorage>,
+    heads_before: &[(String, String)],
 ) -> (Omnigraph, CrashOutcome) {
+    assert!(
+        !heads_before.is_empty(),
+        "a scheduled crash requires pre-op commit heads for arbitration"
+    );
     let mut db = db;
     let result = {
         let _fp = omnigraph::failpoints::ScopedFailPoint::new(failpoint, "return");
@@ -4188,10 +4341,13 @@ async fn crash_op(
         root,
         wop,
         world,
-        &format!("crash window '{failpoint}'"),
-        at_op,
-        recovery_crash,
-        RetryEffect::None,
+        Arbitration {
+            label: &format!("crash window '{failpoint}'"),
+            at_op,
+            retry: RetryEffect::None,
+            recovery_crash,
+            heads_before,
+        },
     ))
     .await;
     if let Some(f) = failing {
@@ -4213,6 +4369,7 @@ async fn crash_op(
     _recovery_crash: Option<&'static str>,
     _expected_conflict: bool,
     _failing: Option<&FailingStorage>,
+    _heads_before: &[(String, String)],
 ) -> (Omnigraph, CrashOutcome) {
     panic!("crash scenarios require --features failpoints");
 }
@@ -4737,32 +4894,10 @@ async fn reconcile_watch_resolution(
         );
     }
     assert_no_recovery_residue(&storage, root, label, at_op).await;
-    // Ambiguity: several compositions can render identically while their
-    // MODELS differ in ghost content or row count. Resolve through the bound-edge rows
-    // per touched branch; a raw read matching NO tied composition is its
-    // own violation. Runs BEFORE the monotonicity checks so they judge the
-    // narrowed set — quantifying over pre-narrowing ties could let the
-    // tie-break eliminate the only Applied match after a demotion check
-    // already passed, installing a demoted model with no red. Scope:
-    // `touched` covers the `Data` branches of A and E only — a ghost
-    // divergence born inside a `LoadFork`'s fork copy or a `BranchMerge`'s
-    // ghost import falls to preference order. Acceptable while ghosts are
-    // empty by construction (post-#474; the ghost set is a regression
-    // tripwire), and inherited from [`reconcile_after_failure`]'s identical
-    // Data-only tie-break scope. Ties whose models are ghost-identical fall
-    // to preference order — the models being equal, the pick is immaterial.
     let mut channel: &'static str = "query";
     if after_matches.len() > 1 {
-        let mut touched: Vec<&String> = Vec::new();
-        if let WorldOp::Data { branch, .. } = deferred {
-            touched.push(branch);
-        }
-        if let Some(i) = interrupt
-            && let WorldOp::Data { branch, .. } = i.wop
-        {
-            touched.push(branch);
-        }
-        for branch in touched {
+        let touched = hyps[after_matches[0]].world.branch_names();
+        for branch in &touched {
             // The raw expectation per tied composition: rows ∪ ghosts on
             // the touched branch (None = branch absent in that model —
             // uniform across ties, since the shared render lists branches).
@@ -4776,7 +4911,7 @@ async fn reconcile_watch_resolution(
                 })
                 .collect();
             let first = &expectations[0];
-            if first.is_none() || expectations.iter().all(|e| e == first) {
+            if expectations.iter().all(|e| e == first) {
                 continue;
             }
             channel = "query+bound";
@@ -5320,6 +5455,13 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                 }
             }
+            let mut heads_before = if failing.is_some()
+                || (crash_now.is_some() && !sc.probe_only)
+            {
+                branch_heads(&db, &world, i, &wop, failing.as_deref()).await
+            } else {
+                Vec::new()
+            };
             if let Some(failpoint) = crash_now.filter(|_| !sc.probe_only) {
                 // A scheduled crash ends any keep-serving experiment first —
                 // deferral contract on [`resolve_keep_serving_watch`]. No
@@ -5341,6 +5483,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     ))
                     .await;
                     db = new_db;
+                    heads_before = branch_heads(&db, &world, i, &wop, failing.as_deref()).await;
                     // Stale-capture rule on [`resolve_keep_serving_watch`]:
                     // re-derive the prediction from the world crash_op will
                     // actually judge against.
@@ -5357,6 +5500,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     sc.recovery_crash,
                     expected_conflict,
                     failing.as_deref(),
+                    &heads_before,
                 ))
                 .await;
                 db = new_db;
@@ -5515,10 +5659,13 @@ impl UniverseScenario<RustResources> for Scenario {
                         root,
                         &wop,
                         &world,
-                        "crash-state death",
-                        i,
-                        None,
-                        RetryEffect::None,
+                        Arbitration {
+                            label: "crash-state death",
+                            at_op: i,
+                            retry: RetryEffect::None,
+                            recovery_crash: None,
+                            heads_before: &heads_before,
+                        },
                     ))
                     .await;
                     db = new_db;
@@ -5762,6 +5909,7 @@ impl UniverseScenario<RustResources> for Scenario {
                             db = new_db;
                             interrupt_judged = ruling;
                             watch_resolved = true;
+                            heads_before.clear();
                         }
                         // Stale-capture rule on
                         // [`resolve_keep_serving_watch`]: re-derive the
@@ -5923,10 +6071,13 @@ impl UniverseScenario<RustResources> for Scenario {
                                     root,
                                     &wop,
                                     &world,
-                                    "injected-fault failure",
-                                    i,
-                                    None,
-                                    retry_effect,
+                                    Arbitration {
+                                        label: "injected-fault failure",
+                                        at_op: i,
+                                        retry: retry_effect,
+                                        recovery_crash: None,
+                                        heads_before: &heads_before,
+                                    },
                                 ))
                                 .await;
                                 db = new_db;

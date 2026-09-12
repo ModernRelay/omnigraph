@@ -1,0 +1,133 @@
+# issue: none
+# notes: keyed twin of unkeyed_edge_dup_three_way_merge.gqt: with @key(src, dst) (RFC 0044) the self-loop
+# notes: born on both sides derives one id and merges to one row, the branch's re-insert of an inherited
+# notes: pair upserts, main's person write merges beside them, and source delete plus restart keep one
+# notes: row per pair.
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    @key(src, dst)
+}
+
+--- seed
+{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"type": "Person", "data": {"name": "Charlie"}}
+{"type": "Person", "data": {"name": "Diana"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob"}
+{"edge": "Knows", "from": "Alice", "to": "Charlie"}
+{"edge": "Knows", "from": "Bob", "to": "Diana"}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: main
+query change() { insert Knows { from: "Diana", to: "Diana" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: b0
+query change() { insert Knows { from: "Diana", to: "Diana" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: b0
+query change() { insert Knows { from: "Diana", to: "Diana" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: b0
+query change() { insert Knows { from: "Alice", to: "Bob" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: main
+query change() { insert Person { name: "Eve" } }
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: b0
+query edges() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { $p.name, $q.name }
+}
+
+--- expect unordered
+{"p.name": "Alice", "q.name": "Bob"}
+{"p.name": "Alice", "q.name": "Charlie"}
+{"p.name": "Bob", "q.name": "Diana"}
+{"p.name": "Diana", "q.name": "Diana"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate
+branch merge b0
+
+--- expect ok
+
+--- query branch: main
+query edges() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { $p.name, $q.name }
+}
+
+--- expect unordered
+{"p.name": "Alice", "q.name": "Bob"}
+{"p.name": "Alice", "q.name": "Charlie"}
+{"p.name": "Bob", "q.name": "Diana"}
+{"p.name": "Diana", "q.name": "Diana"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- query branch: main
+query people() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Alice"}
+{"p.name": "Bob"}
+{"p.name": "Charlie"}
+{"p.name": "Diana"}
+{"p.name": "Eve"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+branch delete b0
+
+--- expect ok
+
+--- restart
+
+--- query branch: main
+query edge_count() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { count($q.name) as n }
+}
+
+--- expect unordered
+{"n": 4}
+
+--- expect shape
+n: I64
