@@ -46,11 +46,11 @@ omit `model=...` when the embedding provider supplies the model.
 
 ### Edge constraints go inside a body block
 
-`@unique(@src, @dst)` on an edge goes inside `{ }`, after `@card(...)`:
+`@unique(src, dst)` on an edge goes inside `{ }`, after `@card(...)`:
 
 ```pg
 edge PartOfArtifact: Chunk -> InformationArtifact @card(1..1) {
-    @unique(@src)
+    @unique(src)
 }
 ```
 
@@ -162,7 +162,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 
 **Group-level (inside body block):**
 - `@key(prop1, prop2)` — ordered node identity tuple
-- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
+- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(src, dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
 - `@range(prop, min..max)` — node-only numeric bounds; either bound may be omitted
 - `@check(prop, "regex")` — node-only String regular-expression constraint

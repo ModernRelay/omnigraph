@@ -372,11 +372,11 @@ async fn plan_intervals(
                 if user_schema_fingerprint(
                     &from_dataset,
                     from_columns,
-                    table_key.starts_with("edge:"),
+                    crate::db::manifest::is_edge_table_key(table_key),
                 ) != user_schema_fingerprint(
                     &to_dataset,
                     to_columns,
-                    table_key.starts_with("edge:"),
+                    crate::db::manifest::is_edge_table_key(table_key),
                 ) {
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }

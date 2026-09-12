@@ -57,9 +57,11 @@ their registration-clock interpretation.
 `--to-format` defaults to 8. Explicit `--to-format 7` stops at v7 for a
 v7-compatible executable; the current binary accepts v8 and v9 for normal open
 and will refuse that intermediate result. Upgraded graphs keep the legacy
-system column spellings at v8; no route targets v9, whose system-column
-conversion is defined by RFC 0040 Rollout step 3 and is not available.
-Unsupported sources and targets
+system column spellings at v8; no route targets v9, and the in-place
+system-column conversion is not available. A graph already at v9 reports
+`already_current` for the default and for an explicit `--to-format 8` alike;
+`--to-format 7` on a v8 or v9 graph is refused as a downgrade below the served
+range. Unsupported sources and targets
 refuse; there is no automatic data-moving fallback. Both check and execution
 return zero only for success (`check_passed`, `completed` or `already_current`).
 Repeated successful execution is a no-write no-op after admission checks.
@@ -76,7 +78,7 @@ requires investigation; never delete the pending marker to force serving or
 point the source executable at it.
 
 Source v6/v7 graphs containing reserved native-ref retirement metadata refuse
-conversion. On a current v8 graph, admission validates that metadata and excludes
+conversion. On a v8 graph, admission validates that metadata and excludes
 valid retired refs from logical branch enumeration while retaining their physical
 ancestry. Upgrade neither retires branches nor reclaims their storage.
 
@@ -243,7 +245,7 @@ mapping is:
 If the graph's generation is newer than the binary, upgrade the binary rather
 than rebuilding with it.
 
-An in-place system-column upgrade is [planned](../../rfcs/0040-system-column-namespace.md#rollout). It is not available in this build; existing v7 graphs retain their spellings.
+An in-place system-column upgrade is [planned](../../rfcs/0040-system-column-namespace.md#rollout). It is not available in this build; existing v8 graphs retain their spellings.
 
 ## Rebuild
 

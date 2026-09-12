@@ -55,7 +55,7 @@ impl GenesisManifestAttempt {
                 actor_id: None,
                 created_at: crate::db::now_micros()?,
             },
-            stamp: stamp_for_system_columns(system_columns),
+            stamp: stamp_for_system_columns(system_columns)?,
         })
     }
 

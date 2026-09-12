@@ -254,8 +254,8 @@ fn assert_exported_blob_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {
     );
 }
 
-/// Rebuilt graphs use `__id` as the unenforced Lance primary key (RFC 0040),
-/// preserving the primary-key contract introduced by format v6 (RFC 0023).
+/// Rebuilt graphs are stamped 9 and use `__id` as the unenforced Lance primary
+/// key (RFC 0040), preserving the primary-key contract of format v6 (RFC 0023).
 fn assert_rebuilt_v9_graph(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
@@ -814,6 +814,45 @@ fn current_v9_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v9() {
             || reverse_stderr.contains("newer")
             || reverse_stderr.contains("expects v6"),
         "unexpected v6→v9 reverse-refusal message: {reverse_stderr}",
+    );
+}
+
+/// The guide's own preflight spelling and the default both report
+/// already_current on a graph this binary created.
+#[test]
+fn current_binary_reports_already_current_on_a_fresh_graph() {
+    let temp = tempdir().unwrap();
+    let graph = temp.path().join("fresh-current.omni");
+    let uri = graph.to_str().unwrap();
+    let schema = temp.path().join("fresh-current.pg");
+    std::fs::write(&schema, "node Person { name: String @key }\n").unwrap();
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+
+    for args in [
+        vec!["upgrade", uri, "--check", "--json"],
+        vec!["upgrade", uri, "--json"],
+        vec!["upgrade", uri, "--check", "--to-format", "8", "--json"],
+    ] {
+        let report = support::parse_stdout_json(&output_success(cli().args(&args)));
+        assert_eq!(report["outcome"], "already_current", "{args:?}");
+        assert_eq!(report["observed_format"], 9, "{args:?}");
+    }
+
+    let refused = support::parse_stdout_json(&output_failure(cli().args([
+        "upgrade",
+        uri,
+        "--check",
+        "--to-format",
+        "7",
+        "--json",
+    ])));
+    assert!(
+        refused["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "target_below_stamp"),
+        "unexpected downgrade refusal: {refused}"
     );
 }
 

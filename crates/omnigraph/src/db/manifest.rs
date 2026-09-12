@@ -194,7 +194,7 @@ pub struct Snapshot {
     read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
 }
 
-fn is_edge_table_key(table_key: &str) -> bool {
+pub(crate) fn is_edge_table_key(table_key: &str) -> bool {
     table_key.starts_with("edge:")
 }
 

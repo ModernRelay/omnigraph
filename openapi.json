@@ -4738,7 +4738,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary writes and reads.",
+            "description": "The newest internal-schema (storage-format) version this binary serves;\nit also reads and writes the preceding legacy-vintage version.",
             "minimum": 0
           },
           "source_version": {
@@ -5474,7 +5474,7 @@
               },
               {
                 "$ref": "#/components/schemas/SystemColumnsOutput",
-                "description": "The graph's system column spellings. Query-result payloads carry\nthese exact field names; reading them here is the supported discovery\nmechanism for clients serving graphs of mixed vintages. Optional for\ncompatibility with servers predating the field."
+                "description": "The graph's physical system column spellings: `__id`/`__src`/`__dst`\non current-vintage graphs, `id`/`src`/`dst` on legacy ones. This is\nstorage discovery for loaders, exports and raw readers of mixed\nvintages; query results address identity and endpoints through the\nmeta-fields `@id`, `@src` and `@dst` on every vintage. Optional for\ncompatibility with servers predating the field."
               }
             ]
           }

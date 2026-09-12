@@ -43,6 +43,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `failpoint_names_guard.rs`, in-source manifest/recovery tests |
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
+| Legacy-vintage graphs (`id`/`src`/`dst` spellings, stamp 8) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
 | Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and `benchmark_scenario_contract.rs` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.
@@ -101,7 +102,7 @@ v0.10 local standalone journeys through the default v6 → v7 → v8 route. It f
 missing predecessor binaries, missing cases and skipped required cases. Engine
 storage-upgrade tests own direct v7 → v8 conversion, exact pending v6 → v7
 recovery before composition, explicit target 7, deferred check reporting, and
-current v8 no-op admission with retained retired refs. Keep the normal-open
+v8 no-op admission with retained retired refs. Keep the normal-open
 format fences: explicit conversion does not grant serving support for v6/v7.
 See the [support matrix](versioning.md#storage-upgrade-support-matrix).
 

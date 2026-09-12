@@ -555,7 +555,7 @@ next available stamp when this draft is activated.
 Two fences keep a new-vintage graph away from binaries that predate this
 RFC, and they act at different depths. The `__manifest` internal-schema
 stamp advances from 8 to 9 on every new-vintage graph, at creation or as
-the upgrade's first effect; `refuse_if_internal_schema_unsupported` reads
+the upgrade's first effect; `read_supported_internal_schema_version` reads
 it as the first object-store read of both open modes, before the recovery
 sweeps a read-write open runs, so every binary that predates this RFC,
 whether it reads v6 (0.9.x, 0.10.x), development v7, or v8
@@ -587,8 +587,8 @@ guard's range test) and in `docs/user/operations/upgrade.md` ("one storage
 format per binary", including its export-binary table), in
 `docs/dev/versioning.md` (the storage row of its policy table, §Current
 storage contract, and §Changing an axis), and in the doc comment on
-`refuse_if_internal_schema_unsupported` in
-`crates/omnigraph/src/db/manifest.rs` (every branch at CURRENT): 8 is the
+`read_supported_internal_schema_version` in
+`crates/omnigraph/src/db/manifest.rs` (main's stamp, read before recovery): 8 is the
 one stamp
 this binary can upgrade in place, through the explicit operation rather than
 an open-time dispatcher. Rollout step 2 owns those rewrites.
@@ -750,7 +750,7 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   gate's fingerprint no longer keys on the system roles' names (Historical
   reads).
 - Early fence: a binary of the 2-only and of the {2, 4} generation refuses
-  a new-vintage graph at `refuse_if_internal_schema_unsupported` with no
+  a new-vintage graph at `read_supported_internal_schema_version` with no
   object-store write, in both open modes, including a graph left
   half-upgraded (Compatibility and reversibility); on a graph carrying the
   intent but not yet the stamp, a read-write open on those
@@ -836,7 +836,7 @@ per-test enumeration.
    `release_for_internal_schema_version`, the guard's range test,
    `docs/user/operations/upgrade.md` with its export-binary table,
    `docs/dev/versioning.md`, and the doc comment on
-   `refuse_if_internal_schema_unsupported`.
+   `read_supported_internal_schema_version`.
    `implementation` stays `in-progress`.
 3. The upgrade: the engine operation with its preflight, ordered effects,
    roll-forward recovery, and `_schema.pg` respelling; its CLI and

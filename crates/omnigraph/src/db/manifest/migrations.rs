@@ -66,7 +66,7 @@ use crate::error::{OmniError, Result};
 /// - v9 — RFC-0040 spells the system columns `__id`/`__src`/`__dst`, freeing
 ///   `id`, `src`, `dst` for user properties. Stamped on every graph created
 ///   with the new spellings; a v8 graph keeps the legacy spellings and its
-///   stamp. The upgrade is defined by RFC 0040 Rollout step 3, not yet available.
+///   stamp. RFC 0040 Rollout step 3 defines the v8 → v9 upgrade.
 ///
 /// v1–v7 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
@@ -81,12 +81,16 @@ pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 8;
 /// v8 for the legacy spellings, v9 (CURRENT) for `__id`/`__src`/`__dst`. The
 /// vintage itself is read from the schema IR's feature set, never from the
 /// stamp; the stamp is the storage-format fence old binaries refuse on.
-pub(crate) fn stamp_for_system_columns(system_columns: SystemColumns) -> u32 {
+pub(crate) fn stamp_for_system_columns(system_columns: SystemColumns) -> Result<u32> {
     if system_columns == SYSTEM_COLUMNS_LEGACY {
-        MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+        Ok(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION)
+    } else if system_columns == SYSTEM_COLUMNS_V3 {
+        Ok(INTERNAL_MANIFEST_SCHEMA_VERSION)
     } else {
-        assert_eq!(system_columns, SYSTEM_COLUMNS_V3);
-        INTERNAL_MANIFEST_SCHEMA_VERSION
+        Err(OmniError::manifest_internal(format!(
+            "system column spellings '{}'/'{}'/'{}' belong to no known vintage",
+            system_columns.id, system_columns.src, system_columns.dst
+        )))
     }
 }
 
@@ -111,9 +115,6 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         }
         6 => "0.9.x or 0.10.x",
         7 => "an unreleased v7 development build",
-        // Unreachable today (1–7 are mapped; > CURRENT is caught by the ceiling
-        // guard before this is consulted). Worded to read naturally after
-        // "created by omnigraph " if a future bump ever leaves a gap.
         _ => "an unrecognized older release",
     }
 }
@@ -237,8 +238,8 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{stamp}, but this omnigraph reads only v{min} to v{current}. \
              This graph was created by omnigraph {release}. Rebuild it: with an omnigraph {release} binary run \
-             `omnigraph export <graph> > graph.jsonl`, relocate each record's `data.id` to the top-level `id` \
-             (see docs/dev/ingestion.md), then with this binary run \
+             `omnigraph export <graph> > graph.jsonl`, relocate each record's `data.id` to the top-level `id`, \
+             then with this binary run \
              `omnigraph init --schema <schema.pg> <new-graph>` and \
              `omnigraph load --mode overwrite --data graph.jsonl <new-graph>`. \
              (Data, vectors, and blobs are preserved; commit history and branches are not.) \
@@ -308,6 +309,9 @@ mod tests {
     /// ceiling.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 8);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 9);
+        assert!(stamp_for_system_columns(omnigraph_compiler::SYSTEM_COLUMNS_META).is_err());
         assert_eq!(
             (
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
@@ -337,13 +341,6 @@ mod tests {
         assert!(future.contains("internal schema v10"), "got: {future}");
         assert!(future.contains("reads only v8 to v9"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
-    }
-
-    /// A fresh graph is born with its vintage's stamp.
-    #[test]
-    fn stamp_follows_the_system_column_vintage() {
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY), 8);
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3), 9);
     }
 
     /// The refusal names the release line that wrote each stamp so an operator

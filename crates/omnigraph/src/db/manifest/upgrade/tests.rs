@@ -373,7 +373,8 @@ async fn storage_upgrade_policy_denial_precedes_effects() {
 async fn storage_upgrade_refuses_unknown_ownership_and_source() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::failpoints::FailScenario::setup();
-    for source_format in ["5", "99"] {
+    for (source_format, expected_code) in [("5", "unsupported_source"), ("99", "newer_than_binary")]
+    {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         synthetic_v6_fixture(root).await;
@@ -391,7 +392,8 @@ async fn storage_upgrade_refuses_unknown_ownership_and_source() {
             report
                 .findings
                 .iter()
-                .any(|finding| finding.code == "unsupported_source")
+                .any(|finding| finding.code == expected_code),
+            "{report:?}"
         );
         assert_eq!(stored_files(dir.path()), before);
     }
@@ -909,10 +911,9 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     assert_eq!(stored_files(dir.path()), before);
 }
 
-/// A graph born at the current vintage (v9, RFC 0040 spellings) sits above the
-/// default route target: the default request is already current and
-/// effect-free, while an explicit lower or unreachable target is refused
-/// without effects.
+/// A graph born at the current vintage (v9) sits above the default route
+/// target: the default request is already current and effect-free, and an
+/// explicit lower or unreachable target is refused without effects.
 #[tokio::test]
 async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
     #[cfg(feature = "failpoints")]
@@ -941,7 +942,22 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
             Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
         );
         assert_eq!(stored_files(dir.path()), before);
-        for to_format in [8, 9] {
+        let explicit_served = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check,
+                to_format: Some(8),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            explicit_served.outcome,
+            UpgradeOutcome::AlreadyCurrent,
+            "{explicit_served:?}"
+        );
+        assert_eq!(stored_files(dir.path()), before);
+        for (to_format, expected_code) in [(7, "target_below_stamp"), (9, "unsupported_target")] {
             let refused = upgrade_storage(
                 root,
                 UpgradeOptions {
@@ -952,9 +968,40 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
             .await
             .unwrap();
             assert_eq!(refused.outcome, UpgradeOutcome::CheckFailed, "{refused:?}");
+            assert!(
+                refused
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == expected_code),
+                "{refused:?}"
+            );
+            assert_eq!(
+                refused.observed_format,
+                Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION),
+                "a refused target still reports the stamp it read: {refused:?}"
+            );
             assert_eq!(stored_files(dir.path()), before);
         }
     }
+    let mut dataset = open(root, None).await.unwrap();
+    dataset
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "10")])
+        .await
+        .unwrap();
+    drop(dataset);
+    let before = stored_files(dir.path());
+    let newer = upgrade_storage(root, UpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(newer.outcome, UpgradeOutcome::CheckFailed, "{newer:?}");
+    assert!(
+        newer
+            .findings
+            .iter()
+            .any(|finding| finding.code == "newer_than_binary"),
+        "{newer:?}"
+    );
+    assert_eq!(stored_files(dir.path()), before);
 }
 
 #[tokio::test]

@@ -43,7 +43,8 @@ pub(crate) async fn refuse_unsupported_schema_versions(
 
     #[derive(Deserialize)]
     struct FeatureEnvelope {
-        features: std::collections::BTreeSet<String>,
+        #[serde(default)]
+        features: BTreeSet<String>,
     }
 
     for filename in [SCHEMA_IR_FILENAME, SCHEMA_IR_STAGING_FILENAME] {
@@ -68,16 +69,40 @@ pub(crate) async fn refuse_unsupported_schema_versions(
         let Ok(envelope) = serde_json::from_str::<FeatureEnvelope>(&text) else {
             continue;
         };
-        let required_stamp = crate::db::manifest::stamp_for_system_columns(
-            omnigraph_compiler::system_columns_for_features(&envelope.features),
-        );
-        if internal_schema_version < required_stamp {
+        if let Some(unknown) = envelope
+            .features
+            .iter()
+            .find(|name| !omnigraph_compiler::is_known_feature(name))
+        {
+            return Err(schema_lock_conflict(format!(
+                "schema feature '{unknown}' in {filename} is unknown to this build; upgrade omnigraph before opening this graph; open will not recover or migrate this schema"
+            )));
+        }
+        if let Some(required_stamp) =
+            stamp_covers_system_columns(internal_schema_version, &envelope.features)?
+        {
             return Err(schema_lock_conflict(format!(
                 "graph internal schema v{internal_schema_version} cannot serve the system columns in {filename}; expected at least v{required_stamp}; open will not recover or migrate this schema"
             )));
         }
     }
     Ok(())
+}
+
+/// The stamp floor a graph's system column vintage demands. `Ok(Some(stamp))`
+/// carries the stamp the vintage needs, so both the pre-open gate and the
+/// post-catalog check phrase one rule rather than recomputing it.
+pub(crate) fn stamp_covers_system_columns(
+    internal_schema_version: u32,
+    features: &BTreeSet<String>,
+) -> Result<Option<u32>> {
+    let required_stamp = crate::db::manifest::stamp_for_system_columns(
+        omnigraph_compiler::system_columns_for_features(features),
+    )?;
+    if internal_schema_version < required_stamp {
+        return Ok(Some(required_stamp));
+    }
+    Ok(None)
 }
 
 const MISSING_SCHEMA_CONTRACT_MESSAGE: &str = "graph is missing the mandatory identity-bearing schema contract (_schema.ir.json and __schema_state.json); automatic bootstrap is not supported";

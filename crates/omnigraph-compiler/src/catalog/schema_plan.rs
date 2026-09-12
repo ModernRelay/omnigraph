@@ -196,15 +196,16 @@ pub fn plan_schema_migration(
         .into());
     }
     validate_evolution_identity(accepted, desired)?;
-    if accepted.ir_version != desired.ir_version {
+    let system_columns = accepted.system_columns();
+    if desired.system_columns() != system_columns {
         return Err(crate::error::SchemaIdentityError::Resolution(format!(
-            "migration planning requires matching ir_version (accepted {}, desired {}); \
-             system column spellings never change under evolution",
-            accepted.ir_version, desired.ir_version
+            "migration planning requires matching system column spellings (accepted {}, desired {}); \
+             the vintage never changes under evolution",
+            system_columns.id,
+            desired.system_columns().id
         ))
         .into());
     }
-    let system_columns = accepted.system_columns();
     let mut steps = Vec::new();
     plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
     plan_nodes(&accepted.nodes, &desired.nodes, &mut steps, system_columns);
@@ -1196,6 +1197,93 @@ node Ticket {
             plan.steps.is_empty(),
             "reorder must be a no-op plan: {:?}",
             plan.steps
+        );
+    }
+
+    /// A legacy-vintage accepted IR, built the way `Omnigraph::init` builds
+    /// one: an empty accept stripped of `system-columns`, then resolved.
+    fn legacy_ir(source: &str) -> crate::catalog::schema_ir::SchemaIR {
+        let empty = compile_schema_shape(&parse_schema("").unwrap()).unwrap();
+        let accepted = crate::catalog::schema_ir::into_legacy_vintage(
+            initialize_schema_ir(
+                SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                &empty,
+            )
+            .unwrap()
+            .schema_ir,
+        );
+        evolve(&accepted, source)
+    }
+
+    const LEGACY_KEYED: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+"#;
+
+    /// Legacy graphs keyed on main carry ir_version 4 and no names; evolution
+    /// re-stamps them 5 + `edge-keys`, and gaining or losing edge keys moves
+    /// 2 ↔ 5 within one vintage.
+    #[test]
+    fn plan_evolves_legacy_graphs_across_the_feature_number() {
+        let mut accepted = legacy_ir(LEGACY_KEYED);
+        accepted.features.clear();
+        accepted.ir_version = crate::catalog::schema_ir::SCHEMA_IR_VERSION_EDGE_KEYS;
+        validate_schema_ir(&accepted).unwrap();
+        let desired = evolve(
+            &accepted,
+            r#"
+node Person { name: String @key extra: String? }
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+"#,
+        );
+        assert_eq!(
+            desired.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION_FEATURES
+        );
+        assert_eq!(desired.system_columns(), accepted.system_columns());
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            AddProperty { property_name, .. } if property_name == "extra"
+        )));
+
+        let unkeyed = legacy_ir("node Person { name: String @key }\n");
+        assert_eq!(
+            unkeyed.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION
+        );
+        let keyed = evolve(&unkeyed, LEGACY_KEYED);
+        assert_eq!(
+            keyed.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION_FEATURES
+        );
+        let gained = plan_schema_migration(&unkeyed, &keyed).unwrap();
+        assert!(gained.supported, "{gained:?}");
+        let unkeyed_again = evolve(&keyed, "node Person { name: String @key }\n");
+        assert_eq!(
+            unkeyed_again.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION
+        );
+        let lost = plan_schema_migration(&keyed, &unkeyed_again).unwrap();
+        assert!(lost.supported, "{lost:?}");
+    }
+
+    #[test]
+    fn plan_refuses_a_vintage_change() {
+        let accepted = legacy_ir("node Person { name: String @key }\n");
+        let desired = ir("node Person { name: String @key }\n");
+        assert_ne!(desired.system_columns(), accepted.system_columns());
+        let error = plan_schema_migration(&accepted, &desired)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("matching system column spellings"),
+            "{error}"
         );
     }
 

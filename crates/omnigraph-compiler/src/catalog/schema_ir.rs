@@ -134,6 +134,14 @@ pub fn required_ir_version(features: &BTreeSet<String>) -> u32 {
     }
 }
 
+/// The legacy-vintage twin of an accepted IR: drop `system-columns` and
+/// re-derive the version. The one place the vintage is ever stripped.
+pub fn into_legacy_vintage(mut ir: SchemaIR) -> SchemaIR {
+    ir.features.remove(FEATURE_SYSTEM_COLUMNS);
+    ir.ir_version = required_ir_version(&ir.features);
+    ir
+}
+
 /// Opaque namespace for every numeric identity in one graph root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -2112,14 +2120,6 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(@src, @dst) }
         assert!(validate_schema_ir(&v1).is_err());
     }
 
-    /// The IR a pre-RFC-0040 graph carries: `system-columns` absent, the
-    /// number re-derived under the total stamping rule.
-    fn legacy_vintage(mut ir: SchemaIR) -> SchemaIR {
-        ir.features.remove(FEATURE_SYSTEM_COLUMNS);
-        ir.ir_version = required_ir_version(&ir.features);
-        ir
-    }
-
     fn features(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| name.to_string()).collect()
     }
@@ -2149,7 +2149,7 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(@src, @dst) }
 
     #[test]
     fn legacy_graphs_stamp_the_base_number_and_return_to_it_when_the_last_key_drops() {
-        let keyed = legacy_vintage(initialize(
+        let keyed = into_legacy_vintage(initialize(
             "node P { n: String } edge E: P -> P { @key(@src, @dst) }",
         ));
         assert_eq!(keyed.ir_version, SCHEMA_IR_VERSION_FEATURES);
@@ -2182,7 +2182,7 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(@src, @dst) }
 
     #[test]
     fn merged_edge_key_number_is_accepted_on_load_and_never_emitted() {
-        let mut merged = legacy_vintage(initialize(
+        let mut merged = into_legacy_vintage(initialize(
             "node P { n: String } edge E: P -> P { @key(@src, @dst) }",
         ));
         merged.features.clear();
@@ -2225,7 +2225,7 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(@src, @dst) }
                 .contains("time-travel-v9")
         );
 
-        let mut legacy_unkeyed_at_edge_key_number = legacy_vintage(unkeyed);
+        let mut legacy_unkeyed_at_edge_key_number = into_legacy_vintage(unkeyed);
         legacy_unkeyed_at_edge_key_number.ir_version = SCHEMA_IR_VERSION_EDGE_KEYS;
         assert!(validate_schema_ir(&legacy_unkeyed_at_edge_key_number).is_err());
     }
@@ -2281,7 +2281,7 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(@src, @dst) }
             }
         }
 
-        let legacy = legacy_vintage(accepted.clone());
+        let legacy = into_legacy_vintage(accepted.clone());
         for name in RESERVED {
             let mut malformed = legacy.clone();
             malformed.nodes[0].properties[0].name = name.to_string();

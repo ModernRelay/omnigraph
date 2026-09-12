@@ -24,6 +24,8 @@ supported existing graph with legacy spellings `id`/`src`/`dst` retains stamp 8,
 and every registered upgrade route ends there. New graphs use
 `__id`/`__src`/`__dst` and stamp 9. The stamp is a storage-format fence for
 older binaries; the vintage itself is read from the schema IR's feature set.
+A stamp is the floor for the vintage it names: a legacy-vintage graph is served
+at stamp 8 or 9, a new-vintage graph only at 9.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -121,7 +123,7 @@ see the [admission limits](../user/operations/upgrade.md).
 | 0.10.0 / v6 | Refused | v6 → v7 → v8 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
 | Qualified development / v7 | Refused | v7 → v8 | Engine storage-upgrade tests: metadata-only conversion, history and retry |
 | Legacy vintage / v8 | Accepted | Already-current no-op | Both predecessor journeys after conversion; engine retired-ref admission tests |
-| Current / v9 | Accepted | No route; already the newest vintage | Engine legacy-column and stamp tests (`legacy_columns.rs`, `migrations.rs`) |
+| Current / v9 | Accepted | No route; already the newest vintage | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
 | Older, future or unqualified experimental format | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
 
 Source v6/v7 admission rejects any reserved native-ref retirement metadata.

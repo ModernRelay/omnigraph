@@ -422,13 +422,11 @@ impl Omnigraph {
         let domain = SchemaIdentityDomain::from_ulid(crate::dst_ids::new_ulid());
         let resolution = if legacy_system_columns {
             let empty_shape = read_schema_shape_from_source("")?;
-            let mut accepted = initialize_schema_ir(domain, &empty_shape)
-                .map_err(|error| OmniError::manifest(error.to_string()))?
-                .schema_ir;
-            accepted
-                .features
-                .remove(omnigraph_compiler::FEATURE_SYSTEM_COLUMNS);
-            accepted.ir_version = omnigraph_compiler::required_ir_version(&accepted.features);
+            let accepted = omnigraph_compiler::into_legacy_vintage(
+                initialize_schema_ir(domain, &empty_shape)
+                    .map_err(|error| OmniError::manifest(error.to_string()))?
+                    .schema_ir,
+            );
             omnigraph_compiler::resolve_schema_ir(&accepted, &schema_shape)
         } else {
             initialize_schema_ir(domain, &schema_shape)
@@ -792,8 +790,10 @@ impl Omnigraph {
         validate_schema_ir_against_snapshot(&accepted_ir, &coordinator.snapshot())?;
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
-        let required_stamp = crate::db::manifest::stamp_for_system_columns(catalog.system_columns);
-        if internal_schema_version < required_stamp {
+        if let Some(required_stamp) = crate::db::schema_state::stamp_covers_system_columns(
+            internal_schema_version,
+            &accepted_ir.features,
+        )? {
             return Err(OmniError::manifest(format!(
                 "graph internal schema v{internal_schema_version} cannot serve the accepted system columns; expected at least v{required_stamp}"
             )));

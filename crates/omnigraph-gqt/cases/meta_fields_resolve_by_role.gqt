@@ -1,6 +1,12 @@
 # issue: none
 # notes: RFC 0040 Query language: `$p.@id`, `$e.@src`, `$e.@dst` and a bare `@id` in a mutation predicate resolve to the system columns by role; a bare `id` is a user property (declared here on `Doc`) or the unknown-property error.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key
