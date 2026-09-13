@@ -709,33 +709,17 @@ async fn probe_dataset_latest_incarnation(
         })
     }
     .await;
-    let error = match held {
+    match held {
         Ok(incarnation) => return Ok(incarnation),
-        Err(error @ (OmniError::BranchNotFound { .. } | OmniError::Storage(_))) => error,
+        Err(OmniError::BranchNotFound { .. } | OmniError::Storage(_)) => {}
         Err(error) => return Err(error),
-    };
-    // The held native ref or its tree is gone. Under incarnation-suffixed refs
-    // a recreated branch lives at a new native ref, so re-resolve the logical
-    // name through the live registry: the replacement's identity is a
-    // guaranteed mismatch, and a deleted branch is a typed absence. Only a
-    // registry that still names the held ref makes the miss a real failure.
-    let live = crate::branch_control::list_live_manifest_branch_contents(dataset).await?;
-    let Some(native) =
-        crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), branch)?
-    else {
-        return Err(OmniError::BranchNotFound {
-            branch: branch.to_string(),
-        });
-    };
-    if dataset.manifest().branch.as_deref() == Some(native.as_str()) {
-        return Err(error);
     }
+    let native = resolve_native_manifest_branch(dataset, branch).await?;
     let replacement = dataset
         .checkout_branch(&native)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
-    let branch_identifier = replacement
-        .branch_identifier()
+    let branch_identifier = crate::branch_control::dataset_branch_identifier(&replacement)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     Ok(ManifestIncarnation {

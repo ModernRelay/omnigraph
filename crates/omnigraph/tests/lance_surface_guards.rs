@@ -4322,3 +4322,76 @@ async fn fts_prefilter_does_not_change_covered_fragment_scores() {
          the fixture cannot detect filter-dependent scoring and this guard is vacuous"
     );
 }
+
+/// A branch ref read racing `replace_metadata` on the same ref must succeed:
+/// the ref is never deleted, so any error is a torn read (Lance 11.0.0 read refs
+/// as `head` then `get_range`, and a rewrite between the two calls yields a prefix).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a Lance whose `from_path` reads a ref in one `get` (the 0179 Lance PR); red on \
+            11.0.0, which reads `head` then `get_range`. Un-ignore at that bump, where the \
+            `branch_control` stale-head tests go red and the retry arm leaves"]
+async fn branch_ref_read_survives_concurrent_metadata_rewrite() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let uri = format!("memory:///guard-ref-rewrite-{unique}.lance");
+    let mut ds = fresh_dataset(&uri).await;
+    let base = ds.version().version;
+    ds.create_branch("feature", base, None).await.unwrap();
+    let ds = Arc::new(ds);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let writer = {
+        let ds = ds.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            for round in 0..20_000usize {
+                let metadata: HashMap<String, String> = [(
+                    "omnigraph.retired_manifest_branch".to_string(),
+                    "x".repeat(round % 97),
+                )]
+                .into_iter()
+                .collect();
+                ds.branches()
+                    .replace_metadata("feature", metadata)
+                    .await
+                    .unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let ds = ds.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut reads = 0usize;
+                let mut failures = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    reads += 1;
+                    if let Err(error) = ds.branches().get("feature").await {
+                        failures.push(error.to_string());
+                    }
+                }
+                (reads, failures)
+            })
+        })
+        .collect();
+    writer.await.unwrap();
+    let mut total_reads = 0usize;
+    let mut failures = Vec::new();
+    for reader in readers {
+        let (reads, mut errors) = reader.await.unwrap();
+        total_reads += reads;
+        failures.append(&mut errors);
+    }
+    assert!(total_reads > 100, "readers barely ran: {total_reads} reads");
+    assert!(
+        failures.is_empty(),
+        "{} of {total_reads} branch ref reads failed under a concurrent metadata rewrite \
+         (the ref is never deleted, so every error is a failure); first: {}",
+        failures.len(),
+        failures[0]
+    );
+}

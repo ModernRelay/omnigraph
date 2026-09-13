@@ -1288,7 +1288,9 @@ async fn proven_insert_history_segments(
             return None;
         }
         let branch = dataset.manifest.branch.as_deref()?;
-        let contents = dataset.branches().get(branch).await.ok()?;
+        let contents = crate::branch_control::get_branch_contents(&dataset, branch)
+            .await
+            .ok()?;
         if contents.identifier != identifier || contents.parent_version != fork_version {
             return None;
         }
@@ -1299,7 +1301,9 @@ async fn proven_insert_history_segments(
             ))
             .await
             .ok()?;
-        let parent_identifier = parent.branch_identifier().await.ok()?;
+        let parent_identifier = crate::branch_control::dataset_branch_identifier(&parent)
+            .await
+            .ok()?;
         if parent.manifest.branch != contents.parent_branch
             || parent.version().version != fork_version
             || parent_identifier.version_mapping.as_slice()
@@ -1372,9 +1376,10 @@ async fn try_proven_pure_insert_history(
     {
         return Ok(None);
     }
-    let base_identifier = base.branch_identifier().await.map_err(OmniError::storage)?;
-    let source_identifier = source
-        .branch_identifier()
+    let base_identifier = crate::branch_control::dataset_branch_identifier(&base)
+        .await
+        .map_err(OmniError::storage)?;
+    let source_identifier = crate::branch_control::dataset_branch_identifier(&source)
         .await
         .map_err(OmniError::storage)?;
     if base_entry.native_dataset_branch == source_entry.native_dataset_branch
@@ -2937,16 +2942,14 @@ async fn plan_lineage_merge(
     }
 
     if let (Some(base_dataset), Some(base_entry)) = (&base, base_entry) {
-        let base_identifier = base_dataset
-            .branch_identifier()
+        let base_identifier = crate::branch_control::dataset_branch_identifier(base_dataset)
             .await
             .map_err(OmniError::storage)?;
         for (side_dataset, side_entry) in [(&source, source_entry), (&target, target_entry)] {
             let (Some(side_dataset), Some(side_entry)) = (side_dataset, side_entry) else {
                 continue;
             };
-            let side_identifier = side_dataset
-                .branch_identifier()
+            let side_identifier = crate::branch_control::dataset_branch_identifier(side_dataset)
                 .await
                 .map_err(OmniError::storage)?;
             if side_entry.native_dataset_branch == base_entry.native_dataset_branch {
