@@ -33,6 +33,11 @@ blocked_on:
 
 ## Maintainer briefing
 
+This is the concise decision document. The companion
+[agent context](assets/0048-agent-context.md) preserves the full long-form
+rationale, experiments and handoff detail. Use this RFC for current decisions
+and the context document for the evidence behind them.
+
 OmniGraph needs search that composes with exact lookup, graph traversal,
 aggregation and projection in one typed query language. The immediate defects
 are correctness failures: indexed and unindexed text can match differently,
@@ -1947,7 +1952,7 @@ checks payloads and final binding order, and retains both dense and distinct-pai
 routes because their costs differ with fan-out and payload width. Downstream
 reliance on Take's ordering metadata remains unqualified.
 
-The [historical physical experiments](https://github.com/ModernRelay/omnigraph/blob/499192a17f89cfcb7c1f656b096e514c6da485c2/docs/rfcs/0048-search-contracts.md#lance-datafusion-and-graph-execution)
+The [historical physical experiments](assets/0048-agent-context.md#lance-datafusion-and-graph-execution)
 record configurations, timing/I/O/spill tables and controls. They support these
 implementation candidates, not production latency or a universal winner.
 Reproduce through the existing instrument:
@@ -2068,7 +2073,7 @@ whole-query resource bounds.
 
 The [upstream receipt](assets/0048-upstream-contract-checkpoint.json) records
 checksum-matched crate sources and probe results. The
-[pre-condensation RFC](https://github.com/ModernRelay/omnigraph/blob/499192a17f89cfcb7c1f656b096e514c6da485c2/docs/rfcs/0048-search-contracts.md#evidence-and-tests)
+[agent context](assets/0048-agent-context.md#evidence-and-tests)
 retains the detailed validation history. The current obligations are summarized
 below; historical pass counts must not be reported as fresh evidence.
 
@@ -2295,7 +2300,7 @@ Its evidence includes forty generated graph comparisons against an independent
 evaluator, twelve Decimal/lifecycle fixtures, snapshot/current-read controls,
 authorization refusals and resource counterexamples. These are finite
 experimental proofs, not complete language, transport or resource qualification.
-The [original checkpoint](https://github.com/ModernRelay/omnigraph/blob/499192a17f89cfcb7c1f656b096e514c6da485c2/docs/rfcs/0048-search-contracts.md#historical-integration-and-diagnostic-pilot)
+The [original checkpoint](assets/0048-agent-context.md#historical-integration-and-diagnostic-pilot)
 retains exact commands and the distinction between fresh and earlier runs.
 
 #### Lessons the implementation must retain
@@ -2341,7 +2346,7 @@ The lexical recipes used `mode: all`, whose conjunction was not explained in
 the shared tool description. Hybrid used application RRF over two engine
 queries, not staged fusion or one shared native budget. Host/API variability
 and timeout/cleanup overhead preclude production latency or hard-deadline
-claims. The [full protocol and interpretation](https://github.com/ModernRelay/omnigraph/blob/499192a17f89cfcb7c1f656b096e514c6da485c2/docs/rfcs/0048-search-contracts.md#completed-agent-pilot-and-interpretation)
+claims. The [full protocol and interpretation](assets/0048-agent-context.md#completed-agent-pilot-and-interpretation)
 preserve these controls.
 
 The actionable lesson is to expose recipe semantics and source revision/status
@@ -2805,9 +2810,12 @@ before optimizing batching, and measure per-group rescan cost.
 
 ## Decision log
 
+- 2026-09-13 — retained the full long-form version as an
+  [agent context document](assets/0048-agent-context.md) alongside this concise
+  RFC. The context records its original revision; this RFC owns current decisions.
 - 2026-09-13 — condensed the RFC around contracts, scope, evidence limits and
   phase handoffs. Detailed experimental chronology remains in the linked
-  `499192a1` revision and checked-in receipts; no semantic or release-scope
+  agent context and checked-in receipts; no semantic or release-scope
   decision changes.
 - 2026-09-11/12 — added explicit `yield` integration, C1–C4 logical plans and
   native population/collection counterexamples. Phase 0 remains incomplete.
@@ -2824,7 +2832,7 @@ before optimizing batching, and measure per-group rescan cost.
 - 2026-09-03 — published this draft alongside RFC 0047 after separating
   plan-truth work from representation/search contracts.
 
-The [full prior decision log](https://github.com/ModernRelay/omnigraph/blob/499192a17f89cfcb7c1f656b096e514c6da485c2/docs/rfcs/0048-search-contracts.md#decision-log)
+The [full prior decision log](assets/0048-agent-context.md#decision-log)
 preserves the earlier revisions and their superseded proposals.
 
 ## Appendix: implementation evidence (non-normative)
@@ -2834,7 +2842,7 @@ The [upstream receipt](assets/0048-upstream-contract-checkpoint.json) and
 to Lance 11.0.0, DataFusion 54.0.0 and Arrow 58.3.0. The recorded Lance commit
 is `ab6b5bbe46009ed78746b444df8db59a8bc5d842`; later dependencies require
 renewed qualification. The
-[original source appendix](https://github.com/ModernRelay/omnigraph/blob/499192a17f89cfcb7c1f656b096e514c6da485c2/docs/rfcs/0048-search-contracts.md#appendix-implementation-evidence-non-normative)
+[original source appendix](assets/0048-agent-context.md#appendix-implementation-evidence-non-normative)
 retains exact implementation links for analyzer drift, fuzzy expansion,
 flat scans, vector rescoring, lexical ties and native BM25.
 
