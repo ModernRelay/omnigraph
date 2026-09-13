@@ -20,6 +20,7 @@ single-graph server mode.
 | Route family | Purpose |
 |---|---|
 | `GET /healthz`, `/openapi.json` | Process metadata |
+| `GET /readyz` | Replica readiness, applied revision and served/quarantined counts |
 | `GET /graphs` | List served graphs (`graph_list`) |
 | `/graphs/{id}/query`, `/mutate` | Inline GQ reads and writes |
 | `/graphs/{id}/mutate/if-graph-commit` | Conditional inline mutation |
@@ -29,7 +30,7 @@ single-graph server mode.
 | `/graphs/{id}/branches` | Branch operations and merge |
 | `/graphs/{id}/snapshot`, `/commits` | Snapshot and history |
 | `/graphs/{id}/commits/{commit}/changes` | One first-parent commit diff |
-| `/graphs/{id}/changes` | Poll a feed or capture a baseline |
+| `GET /graphs/{id}/changes`, `POST /graphs/{id}/changes/baseline` | Poll a feed or capture a baseline |
 | `/graphs/{id}/schema` | Read the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot |
 
@@ -43,6 +44,20 @@ write receipts and conditional semantics are summarized in
 [commit changes and feeds](changes.md). Blob delivery is in [Blob values](blobs.md).
 The deprecated `/read` response does not carry that commit position; consumers
 that need conditional writes must use `/query`.
+
+Canonical `/query` accepts `branch list`; `/mutate` accepts `branch create`,
+`branch delete` and `branch merge` with no request target, name or params. These
+return branch outcomes, not ordinary data-mutation receipts; see
+[branch statements](changes.md#branch-statements). `/schema` reports the graph's
+physical `system_columns`; GQ uses `@id`/`@src`/`@dst` on either storage vintage.
+
+`/readyz` is unauthenticated and contains no graph names. It identifies the
+applied revision this process booted from, reports `ready: false`/HTTP 503 while
+draining, and includes served/quarantined graph counts. Authorized `GET /graphs`
+identifies quarantined graphs. Healthy graphs keep serving unless startup uses
+`--require-all-graphs`; an applied empty cluster can be ready, while a nonempty
+cluster with every graph failed refuses startup. Applied revisions activate on
+restart, not through the readiness request.
 
 ## Authentication and actor identity
 
@@ -59,6 +74,12 @@ A server with neither tokens nor policy refuses to start unless explicitly
 given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only on a
 trusted development network. Tokens without a policy allow only `read`; other
 actions remain denied.
+
+Managed signed data credentials are a separate token source, enabled with
+`--data-token-trust <file>`. The trust file binds keys to the exact deployment;
+tokens select an immutable principal actor and only narrow current Cedar grants.
+Control-plane login does not grant data access. See
+[managed data credentials](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/cli/managed-data.md).
 
 ## Cedar actions
 
@@ -137,5 +158,5 @@ does not recreate server authorization. Protect raw graph storage with object
 store IAM/ACLs and restrict who can run direct maintenance. Served writes reject
 client-supplied actor identity because only the token may select it.
 
-Canonical contracts: [server operations](../../../docs/user/operations/server.md)
-and [authorization](../../../docs/user/operations/policy.md).
+Canonical contracts: [server operations](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/operations/server.md)
+and [authorization](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/operations/policy.md).

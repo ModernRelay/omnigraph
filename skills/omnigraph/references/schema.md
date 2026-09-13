@@ -44,15 +44,34 @@ embedding: Vector(1536) @embed("text", model="openai/text-embedding-3-large") @i
 The identifier form `@embed(text)` is also valid. The quoted form is canonical;
 omit `model=...` when the embedding provider supplies the model.
 
+The annotation does not generate vectors on mutation or load. Supply a required
+target explicitly; nullable targets may remain null. See [`search.md`](search.md).
+
+### System identity is separate from user properties
+
+Use `@id`, `@src`, and `@dst` for system fields in queries and constraints.
+New graphs store them as `__id`, `__src`, and `__dst`, and may declare ordinary
+properties named `id`, `src`, or `dst`. Property names beginning `_` are
+reserved; edge property names `from` and `to` are reserved for insert endpoints.
+Existing supported legacy graphs retain their physical spellings and reserve
+`id` on all types plus `src`/`dst` on edges. Inspect `system_columns` in
+`schema show --json` rather than inferring the graph vintage from the binary.
+
 ### Edge constraints go inside a body block
 
-`@unique(src, dst)` on an edge goes inside `{ }`, after `@card(...)`:
+`@unique(@src, @dst)` on an edge goes inside `{ }`, after `@card(...)`:
 
 ```pg
 edge PartOfArtifact: Chunk -> InformationArtifact @card(1..1) {
-    @unique(src)
+    @unique(@src)
 }
 ```
+
+An edge may declare `@key(@src, @dst)` (plus additional non-null scalar
+properties) to derive identity from that tuple. Both endpoints are required
+key members. Declare it when creating the type: adding a key to an existing
+edge type is unsupported. Repeated inserts of the same key upsert the edge;
+without a key, repeated endpoint pairs remain distinct edges.
 
 ### Lint after every edit
 
@@ -148,7 +167,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@key` — single-property node key
 - `@unique` — single-property uniqueness constraint
 - `@index` — single-property index intent (currently materialized automatically only for node properties)
-- `@embed("source_prop")` — on a node Vector property, embed from a String source
+- `@embed("source_prop")` — associates a node Vector property with a String source; does not populate it during writes
 - `@description("...")` — metadata (no migration impact)
 
 **Edge-level:**
@@ -162,7 +181,8 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 
 **Group-level (inside body block):**
 - `@key(prop1, prop2)` — ordered node identity tuple
-- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(src, dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
+- `@key(@src, @dst, prop)` — edge identity tuple including both endpoints and optional scalar members
+- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
 - `@range(prop, min..max)` — node-only numeric bounds; either bound may be omitted
 - `@check(prop, "regex")` — node-only String regular-expression constraint

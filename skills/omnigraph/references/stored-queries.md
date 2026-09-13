@@ -19,6 +19,11 @@ graphs:
 
 `queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed.
 
+A standalone `branch create`, `branch delete`, `branch merge`, or `branch list`
+statement cannot be registered as a stored query. Registry files must contain
+named `query` declarations; `lint`, `cluster validate`, and server registry
+loading reject branch-statement files.
+
 ## CLI
 
 ```bash
@@ -45,6 +50,11 @@ omnigraph queries list --cluster . --graph dev     # names and typed params
 | `POST /graphs/{id}/queries/{name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries params only — **never** `.gq` source. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
 
 `?branch=` / `?snapshot=` query params apply to `POST /graphs/{id}/queries/{name}` reads; branch/snapshot access stays enforced by the inner `read`/`change` gate (`invoke_query` itself is graph-scoped, not branch-scoped).
+
+Stored reads share the [query result contract](queries.md#system-fields-and-result-values):
+system identities use `@id`, bare node projections return objects, null fields
+are omitted from JSON rows, and DateTime strings are UTC without a trailing
+`Z`. Check consumer expectations when upgrading the stored-query surface.
 
 ## Policy gating (`invoke_query`)
 

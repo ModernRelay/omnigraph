@@ -85,4 +85,4 @@ Historical identity fails closed: if a rename, drop/re-add, or branch lifetime
 does not prove that a historical property is the same logical Blob property,
 OmniGraph returns an error rather than guessing.
 
-Canonical user contract: [Blob values](../../../docs/user/blobs.md).
+Canonical user contract: [Blob values](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/blobs.md).

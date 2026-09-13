@@ -92,6 +92,12 @@ Or per-alias (`format: jsonl`), or per-call (`--format jsonl`).
 - **`csv`** — for spreadsheets or line-count-heavy analysis
 - **`table`** — default human view; don't use in automation
 
+Query row spelling follows [`queries.md`](queries.md#system-fields-and-result-values):
+null fields are omitted, bare node projections are objects, and DateTime
+strings are UTC without a trailing `Z`. Use `json` when the consumer needs
+the complete column list or the snapshot's `graph_commit_id` for a later
+conditional mutation; the JSONL metadata line does not carry those fields.
+
 ## Alias Naming Convention
 
 Short, hyphenated, matches the conceptual operation:
