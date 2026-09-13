@@ -20,7 +20,7 @@ const MAX_LOGICAL_PAYLOAD_BYTES: u64 = 1 << 50;
 const MAX_HISTORY_DEPTH: u64 = 1_000_000;
 pub(crate) const MAX_WARMUP_ITERATIONS: u32 = 1_000;
 const MAX_DEADLINE_SECONDS: u64 = 3_600;
-pub(crate) const SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION: u32 = 2;
+pub(crate) const SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION: u32 = 3;
 
 /// A complete V1 branch-merge experiment. `id` is a human selector only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,7 +640,7 @@ fn validate_workload(case: &CaseV1, diagnostics: &mut Vec<Diagnostic>) {
             "invalid_diverged_tables",
             "workload.diverged_tables",
             format!(
-                "builder v2 diverges edge tables and requires diverged_tables between 1 and the fixture's {edge_tables} edge tables"
+                "builder v3 diverges edge tables and requires diverged_tables between 1 and the fixture's {edge_tables} edge tables"
             ),
         ));
     }
@@ -711,7 +711,7 @@ fn validate_fixture_scale(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) 
         diagnostics.push(Diagnostic::error(
             "invalid_graph_table_mix",
             "fixture.data.tables",
-            "synthetic-branch-merge builder v2 requires an even total table count >= 2, split equally between node and edge tables",
+            "synthetic-branch-merge builder v3 requires an even total table count >= 2, split equally between node and edge tables",
         ));
     }
     if !(1..=MAX_ROWS_PER_TABLE).contains(&data.rows_per_table) {
@@ -775,7 +775,7 @@ fn validate_fixture_state(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) 
         diagnostics.push(Diagnostic::error(
             "impossible_optimized_index_state",
             "fixture.state.compaction_recency",
-            "synthetic-branch-merge builder v2 cannot truthfully declare optimized state because OmniGraph optimization materializes indexes outside this builder's exact inventory contract; use not-optimized",
+            "synthetic-branch-merge builder v3 cannot truthfully declare optimized state because OmniGraph optimization materializes indexes outside this builder's exact inventory contract; use not-optimized",
         ));
     }
 }
@@ -1010,7 +1010,7 @@ scenario: branch-merge-v1
 fixture:
   builder:
     kind: synthetic-branch-merge
-    version: 2
+    version: 3
     seed: 0
   data:
     provenance: synthetic
@@ -1178,13 +1178,13 @@ protocol:
             "unsupported_case_version"
         );
         let old_builder =
-            VALID.replace("    version: 2\n    seed: 0", "    version: 1\n    seed: 0");
+            VALID.replace("    version: 3\n    seed: 0", "    version: 2\n    seed: 0");
         assert_eq!(
             parse_case(&old_builder).diagnostics[0].code,
             "unsupported_builder_version"
         );
         let future_builder =
-            VALID.replace("    version: 2\n    seed: 0", "    version: 3\n    seed: 0");
+            VALID.replace("    version: 3\n    seed: 0", "    version: 4\n    seed: 0");
         assert_eq!(
             parse_case(&future_builder).diagnostics[0].code,
             "unsupported_builder_version"
@@ -1259,7 +1259,7 @@ protocol:
     }
 
     #[test]
-    fn builder_v2_rejects_optimized_fixture_state_for_any_index_inventory() {
+    fn builder_v3_rejects_optimized_fixture_state_for_any_index_inventory() {
         let optimized = VALID.replace(
             "compaction_recency: not-optimized",
             "compaction_recency: optimized",
@@ -1298,7 +1298,7 @@ protocol:
     }
 
     #[test]
-    fn builder_v2_requires_balanced_node_edge_tables_and_edge_divergence() {
+    fn builder_v3_requires_balanced_node_edge_tables_and_edge_divergence() {
         for (yaml, code) in [
             (
                 VALID.replace("tables: 8", "tables: 1"),

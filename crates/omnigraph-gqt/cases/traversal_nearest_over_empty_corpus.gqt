@@ -1,6 +1,12 @@
 # issue: none
 # notes: an empty corpus with a traversal: nearest limit 10 returns no rows and no error.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

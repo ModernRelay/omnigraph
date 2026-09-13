@@ -4,6 +4,12 @@
 # notes: runs in the anti-join's inner pipeline, whose string column carries no
 # notes: null buffer; the in-memory arm folded nulls unconditionally.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

@@ -3,6 +3,12 @@
 # notes: A replacement branch then writes and fast-forwards into feature.
 # notes: Further writes on feature and replacement stay isolated; child retains its old rows.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

@@ -4,6 +4,12 @@
 # notes: prefilters from the incoming adjacency), limit 2 (3 > 2): d010, d020. An
 # notes: engine reading the outgoing side answers d009, d019.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -56,9 +62,9 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d037","n":37,"name":"doc-037","embedding":[37.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d038","n":38,"name":"doc-038","embedding":[38.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d039","n":39,"name":"doc-039","embedding":[39.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d009","to":"d010","data":{"id":"e009_0"}}
-{"edge":"Knows","from":"d019","to":"d020","data":{"id":"e019_0"}}
-{"edge":"Knows","from":"d029","to":"d030","data":{"id":"e029_0"}}
+{"edge":"Knows","id":"e009_0","from":"d009","to":"d010","data":{}}
+{"edge":"Knows","id":"e019_0","from":"d019","to":"d020","data":{}}
+{"edge":"Knows","id":"e029_0","from":"d029","to":"d030","data":{}}
 
 --- query
 query scenario($q: Vector(4)) {

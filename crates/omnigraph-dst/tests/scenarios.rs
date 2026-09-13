@@ -574,6 +574,63 @@ fn dst_sessions_agree_and_replay() {
     );
 }
 
+/// Faulted merges and separately confirmed retries need raw-row arbitration.
+#[test]
+#[serial]
+fn dst_failed_attempts_arbitrate_on_bound_rows() {
+    for (seed, op, expected) in [(228_316u64, 8, "NotApplied"), (228_319, 14, "AppliedTwice")] {
+        let sc = Scenario {
+            seed,
+            ops: 30,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed.wrapping_mul(103),
+                error_pct: 0,
+                read_error_pct: 0,
+                latency_pct: 0,
+                max_latency_ms: 1,
+                lance_realm: false,
+                ack_loss_pct: 15,
+                client_retry: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let report = run_universe(&format!("shared-memory://dst-pin-failed-bound-{seed}"), &sc);
+        assert!(
+            report
+                .reconcile_verdicts
+                .iter()
+                .any(|(tag, outcome, channel)| {
+                    tag == &format!("fault@op{op}")
+                        && outcome == expected
+                        && channel == "query+bound"
+                }),
+            "seed {seed} must be ruled on raw rows: {:?}",
+            report.reconcile_verdicts
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn dst_maintenance_commit_uses_execution_branch() {
+    for (seed, write, op) in [(228_301, 118, 13), (228_317, 133, 9)] {
+        let report = run_universe(
+            &format!("shared-memory://dst-maintenance-commit-{seed}"),
+            &Scenario {
+                seed,
+                ops: 30,
+                die_at_write: Some(write),
+                ..Default::default()
+            },
+        );
+        assert!(report.crash_state_hit);
+        assert!(report.reconcile_verdicts.iter().any(|(tag, outcome, _)| {
+            tag == &format!("crash-state:write#{write}@op{op}") && outcome == "Applied"
+        }));
+    }
+}
+
 /// PHYSICAL-CHANNEL ORACLE, honesty proof — FLIPPED on the #474 fix
 /// (self-loop edges are ordinary visible edges; issue #474, fixed in PR #476): seed 10's
 /// op stream opens with insert w2 → add_friend(w2, w2), the old ghost
@@ -3694,15 +3751,8 @@ fn dst_merge_version_collision_diverged_edge_table() {
     })
 }
 
-/// MULTISET-DEFAULT CONTRACT pin (localized 2026-08-12 from seed 10228's
-/// op transcript; reclassified from bug pin to contract pin by RFC 0044):
-/// the SAME logical unkeyed edge added independently on BOTH sides of a
-/// fork, then merged. The three-way merge keys rows on the generated `id`,
-/// so the rows never collide and the merge keeps both (bound raw = 2,
-/// gated traversal = 1 — the visited gate dedupes membership). This is the
-/// documented multiset default for edge types without `@key`; declaring
-/// `@key(src, dst)` opts into convergence instead, pinned by the keyed
-/// twin `dst_keyed_born_on_both_edge_converges` below.
+/// Unkeyed edges added on both branches remain distinct after merge.
+/// Traversal deduplicates membership; a bound edge query retains both rows.
 #[test]
 #[serial]
 fn dst_merge_duplicates_born_on_both_edge() {
@@ -3811,7 +3861,7 @@ fn dst_merge_duplicates_born_on_both_edge() {
                     "multiset default: an unkeyed born-on-both edge merges \
                      into two physical rows. If this is 1, unkeyed edges \
                      started converging — a contract change beyond RFC 0044 \
-                     (which scopes convergence to @key(src, dst) types)."
+                     (which scopes convergence to @key(@src, @dst) types)."
                 );
                 println!(
                     "BORN-ON-BOTH pinned: the edge merged into {bound_dup} \
@@ -3825,15 +3875,10 @@ fn dst_merge_duplicates_born_on_both_edge() {
     })
 }
 
-/// Keyed twin of the multiset-default pin: the same born-on-both shape with
-/// `@key(src, dst)` declared on `Knows`. Both sides derive the same id, so
-/// the merge converges the edge to ONE physical row with no conflict
-/// (RFC 0044 opt-in). Bound raw and gated traversal agree at 1.
+/// Keyed edges added on both branches converge to one row after merge.
 #[test]
 #[serial]
 fn dst_keyed_born_on_both_edge_converges() {
-    // Mirrors fixtures/test.pg plus the one `@key(src, dst)` line; a
-    // TEST_SCHEMA edit must be carried here by hand.
     const KEYED_TEST_SCHEMA: &str = r#"
 node Person {
     name: String @key
@@ -3847,7 +3892,7 @@ node Company {
 
 edge Knows: Person -> Person {
     since: Date?
-    @key(src, dst)
+    @key(@src, @dst)
 }
 
 edge WorksAt: Person -> Company

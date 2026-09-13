@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::catalog::Catalog;
+use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemFieldRole};
 use crate::error::{CompilerError, Result};
 use crate::types::{Direction, PropType, ScalarType};
 
@@ -313,8 +314,10 @@ fn typecheck_mutation(
                             .get(&assignment.property)
                             .ok_or_else(|| {
                                 CompilerError::Type(format!(
-                                    "T11: type `{}` has no property `{}`",
-                                    insert.type_name, assignment.property
+                                    "T11: type `{}` has no property `{}`{}",
+                                    insert.type_name,
+                                    assignment.property,
+                                    identity_assignment_hint(&assignment.property)
                                 ))
                             })?;
                     check_match_value_type(
@@ -369,7 +372,7 @@ fn typecheck_mutation(
                             check_match_value_type(
                                 &assignment.value,
                                 &param_types,
-                                &PropType::scalar(ScalarType::String, false),
+                                &meta_field_type(),
                                 "from",
                             )?;
                         }
@@ -378,7 +381,7 @@ fn typecheck_mutation(
                             check_match_value_type(
                                 &assignment.value,
                                 &param_types,
-                                &PropType::scalar(ScalarType::String, false),
+                                &meta_field_type(),
                                 "to",
                             )?;
                         }
@@ -388,8 +391,10 @@ fn typecheck_mutation(
                                 .get(&assignment.property)
                                 .ok_or_else(|| {
                                     CompilerError::Type(format!(
-                                        "T11: type `{}` has no property `{}`",
-                                        insert.type_name, assignment.property
+                                        "T11: type `{}` has no property `{}`{}",
+                                        insert.type_name,
+                                        assignment.property,
+                                        identity_assignment_hint(&assignment.property)
                                     ))
                                 })?;
                             check_match_value_type(
@@ -465,8 +470,10 @@ fn typecheck_mutation(
                         .get(&assignment.property)
                         .ok_or_else(|| {
                             CompilerError::Type(format!(
-                                "T11: type `{}` has no property `{}`",
-                                update.type_name, assignment.property
+                                "T11: type `{}` has no property `{}`{}",
+                                update.type_name,
+                                assignment.property,
+                                identity_assignment_hint(&assignment.property)
                             ))
                         })?;
                 check_match_value_type(
@@ -531,19 +538,99 @@ fn ensure_no_duplicate_assignment_names(assignments: &[MutationAssignment]) -> R
     Ok(())
 }
 
+/// The system role a meta-field spelling names (RFC 0040 Query language):
+/// `@id` on any binding, `@src`/`@dst` on an edge; `None` for a bare name.
+fn meta_field_role(property: &str) -> Option<Option<SystemFieldRole>> {
+    property.starts_with('@').then(|| match property {
+        name if name == SYSTEM_COLUMNS_META.id => Some(SystemFieldRole::Id),
+        name if name == SYSTEM_COLUMNS_META.src => Some(SystemFieldRole::Src),
+        name if name == SYSTEM_COLUMNS_META.dst => Some(SystemFieldRole::Dst),
+        _ => None,
+    })
+}
+
+/// The type of every meta-field: the system identity and endpoints are
+/// non-null strings on both vintages.
+fn meta_field_type() -> PropType {
+    PropType::scalar(ScalarType::String, false)
+}
+
+fn system_field_hint(property: &str, binding: Option<&str>, is_edge: bool) -> String {
+    let meta = match property {
+        "id" => SYSTEM_COLUMNS_META.id,
+        "src" if is_edge => SYSTEM_COLUMNS_META.src,
+        "dst" if is_edge => SYSTEM_COLUMNS_META.dst,
+        _ => return String::new(),
+    };
+    let role = if property == "id" {
+        "identity"
+    } else {
+        "endpoint"
+    };
+    match binding {
+        Some(variable) => format!("; the system {role} is `${variable}.{meta}`"),
+        None => format!("; the system {role} is `{meta}`"),
+    }
+}
+
+fn identity_assignment_hint(property: &str) -> &'static str {
+    if property == "id" {
+        "; the engine assigns system identity; it cannot be set through a property assignment"
+    } else {
+        ""
+    }
+}
+
+/// A meta-field in a mutation predicate: `@id` on a node, `@id`/`@src`/`@dst`
+/// on an edge, typed as the endpoint strings `from`/`to` already are.
+fn typecheck_meta_field_predicate(
+    type_name: &str,
+    predicate: &MutationPredicate,
+    is_edge: bool,
+    param_types: &HashMap<String, PropType>,
+) -> Result<()> {
+    let admitted = match meta_field_role(&predicate.property) {
+        Some(Some(SystemFieldRole::Id)) => true,
+        Some(Some(SystemFieldRole::Src | SystemFieldRole::Dst)) => is_edge,
+        _ => false,
+    };
+    if !admitted {
+        let known = if is_edge {
+            "`@id`, `@src`, `@dst`"
+        } else {
+            "`@id`"
+        };
+        return Err(CompilerError::Type(format!(
+            "T11: type `{}` has no meta-field `{}`; the meta-fields of this type are {known}",
+            type_name, predicate.property
+        )));
+    }
+    check_match_value_type(
+        &predicate.value,
+        param_types,
+        &meta_field_type(),
+        &predicate.property,
+    )
+}
+
 fn typecheck_mutation_predicate(
     type_name: &str,
     predicate: &MutationPredicate,
     node_type: &crate::catalog::NodeType,
     param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
+    if predicate.property.starts_with('@') {
+        return typecheck_meta_field_predicate(type_name, predicate, false, param_types);
+    }
     let prop_type = node_type
         .properties
         .get(&predicate.property)
         .ok_or_else(|| {
             CompilerError::Type(format!(
-                "T11: type `{}` has no property `{}`",
-                type_name, predicate.property
+                "T11: type `{}` has no property `{}`{}",
+                type_name,
+                predicate.property,
+                system_field_hint(&predicate.property, None, false)
             ))
         })?;
     if matches!(prop_type.scalar, ScalarType::Blob) {
@@ -571,9 +658,12 @@ fn typecheck_edge_mutation_predicate(
         return check_match_value_type(
             &predicate.value,
             param_types,
-            &PropType::scalar(ScalarType::String, false),
+            &meta_field_type(),
             &predicate.property,
         );
+    }
+    if predicate.property.starts_with('@') {
+        return typecheck_meta_field_predicate(type_name, predicate, true, param_types);
     }
 
     let prop_type = edge_type
@@ -581,8 +671,10 @@ fn typecheck_edge_mutation_predicate(
         .get(&predicate.property)
         .ok_or_else(|| {
             CompilerError::Type(format!(
-                "T11: type `{}` has no property `{}`",
-                type_name, predicate.property
+                "T11: type `{}` has no property `{}`{}",
+                type_name,
+                predicate.property,
+                system_field_hint(&predicate.property, None, true)
             ))
         })?;
     if matches!(prop_type.scalar, ScalarType::Blob) {
@@ -718,8 +810,17 @@ fn typecheck_binding(
     for pm in &binding.prop_matches {
         let prop = node_type.properties.get(&pm.prop_name).ok_or_else(|| {
             CompilerError::Type(format!(
-                "T2: type `{}` has no property `{}`",
-                binding.type_name, pm.prop_name
+                "T2: type `{}` has no property `{}`{}",
+                binding.type_name,
+                pm.prop_name,
+                if pm.prop_name == "id" {
+                    format!(
+                        "; filter the system identity with `${}.@id = ...` in the match block",
+                        binding.variable
+                    )
+                } else {
+                    String::new()
+                }
             ))
         })?;
 
@@ -1160,6 +1261,24 @@ fn resolve_expr_type(
                 CompilerError::Type(format!("T6: variable `${}` is not bound", variable))
             })?;
 
+            if let Some(role) = meta_field_role(property) {
+                let admitted = match (bv, role) {
+                    (_, Some(SystemFieldRole::Id)) => true,
+                    (BoundVariable::Edge { .. }, Some(_)) => true,
+                    (BoundVariable::Node { .. }, Some(_)) | (_, None) => false,
+                };
+                if !admitted {
+                    let known = match bv {
+                        BoundVariable::Node { .. } => "`@id`",
+                        BoundVariable::Edge { .. } => "`@id`, `@src`, `@dst`",
+                    };
+                    return Err(CompilerError::Type(format!(
+                        "T6: binding `${variable}` has no meta-field `{property}`; its meta-fields are {known}"
+                    )));
+                }
+                return Ok(ResolvedType::Scalar(meta_field_type()));
+            }
+
             let prop = match bv {
                 BoundVariable::Node { type_name } => {
                     let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
@@ -1170,8 +1289,10 @@ fn resolve_expr_type(
                     })?;
                     node_type.properties.get(property).ok_or_else(|| {
                         CompilerError::Type(format!(
-                            "T6: type `{}` has no property `{}`",
-                            type_name, property
+                            "T6: type `{}` has no property `{}`{}",
+                            type_name,
+                            property,
+                            system_field_hint(property, Some(variable), false)
                         ))
                     })?
                 }
@@ -1184,8 +1305,10 @@ fn resolve_expr_type(
                     })?;
                     edge_type.properties.get(property).ok_or_else(|| {
                         CompilerError::Type(format!(
-                            "T6: edge `{}` has no property `{}`",
-                            type_name, property
+                            "T6: edge `{}` has no property `{}`{}",
+                            type_name,
+                            property,
+                            system_field_hint(property, Some(variable), true)
                         ))
                     })?
                 }
@@ -1228,8 +1351,10 @@ fn resolve_expr_type(
             })?;
             let prop_type = node_type.properties.get(property).ok_or_else(|| {
                 CompilerError::Type(format!(
-                    "T15: type `{}` has no property `{}`",
-                    node_type_name, property
+                    "T15: type `{}` has no property `{}`{}",
+                    node_type_name,
+                    property,
+                    system_field_hint(property, Some(variable), false)
                 ))
             })?;
             let vector_dim = match prop_type.scalar {
@@ -1825,9 +1950,9 @@ fn resolved_type_to_field_shape(
                 CompilerError::Type(format!("type `{}` not found in catalog", type_name))
             })?;
             let fields: Vec<Field> = node_type
-                .node_object_fields()
-                .map(|field| {
-                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                .node_object_members()
+                .map(|(member, field)| {
+                    Field::new(member, field.data_type().clone(), field.is_nullable())
                 })
                 .collect();
             Ok((DataType::Struct(fields.into()), false))

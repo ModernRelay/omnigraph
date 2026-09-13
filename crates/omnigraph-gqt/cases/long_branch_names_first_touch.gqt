@@ -1,5 +1,11 @@
 # issue: none
 # notes: First-touch table refs stay bounded when logical names are long or encoded.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

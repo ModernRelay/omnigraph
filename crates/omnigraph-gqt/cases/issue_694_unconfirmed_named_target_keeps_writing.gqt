@@ -1,0 +1,144 @@
+# issue: 694
+# red_on: fb6ed452 (2026-09-12), cleanup disabled: step 8 rejects the unrelated write with pending BranchMerge on branch 'target'
+# notes: Source and donor diverge; target inherits donor without owning a table fork.
+# notes: The fault fires after every merge table effect, including the created first-touch fork, and before confirmation.
+# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
+# notes: The failed merge compensates its own unconfirmed effects on a named target before returning, so step 8 succeeds and the merge retry lands.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+node Marker {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Marker","data":{"name":"initial"}}
+
+--- mutate
+branch create source
+
+--- expect ok
+
+--- mutate
+branch create donor
+
+--- expect ok
+
+--- mutate branch: donor
+query add_inherited_target_row() {
+    insert Person { name: "carol" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create target from donor
+
+--- expect ok
+
+--- mutate branch: source
+query add_source_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- fault
+at: branch_merge.post_effects_pre_confirm
+occurrence: 1
+action: return_error
+scope: next_step
+
+--- mutate
+branch merge source into target
+
+--- expect error: injected failpoint triggered: branch_merge.post_effects_pre_confirm
+
+--- query branch: target
+query read_after_failure() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate branch: target
+query unrelated_write() {
+    insert Marker { name: "after_failure" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: target
+query markers_after_write() {
+    match { $m: Marker }
+    return { $m.name }
+}
+
+--- expect unordered
+{"m.name":"initial"}
+{"m.name":"after_failure"}
+
+--- expect shape
+m.name: String
+
+--- query branch: target
+query target_after_write() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- query branch: source
+query source_unchanged() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+branch merge source into target
+
+--- expect ok
+
+--- query branch: target
+query target_after_retry() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String

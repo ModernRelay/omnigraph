@@ -7,6 +7,12 @@
 # notes: (0, 1) has no edge. Rust twin (probes: no overfetch on an aggregate):
 # notes: issue_567_aggregate_over_a_nearest_traversal_counts_the_window.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -59,9 +65,9 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d037","n":37,"name":"doc-037","embedding":[37.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d038","n":38,"name":"doc-038","embedding":[38.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d039","n":39,"name":"doc-039","embedding":[39.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d010","to":"d011","data":{"id":"e010_0"}}
-{"edge":"Knows","from":"d020","to":"d021","data":{"id":"e020_0"}}
-{"edge":"Knows","from":"d030","to":"d031","data":{"id":"e030_0"}}
+{"edge":"Knows","id":"e010_0","from":"d010","to":"d011","data":{}}
+{"edge":"Knows","id":"e020_0","from":"d020","to":"d021","data":{}}
+{"edge":"Knows","id":"e030_0","from":"d030","to":"d031","data":{}}
 
 --- query
 query scenario($q: Vector(4)) {

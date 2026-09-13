@@ -1,6 +1,6 @@
 # Migration and Retired Vocabulary
 
-The rest of this skill describes OmniGraph 0.10.x. Use this page only to
+The rest of this skill describes released OmniGraph 0.10.0. Use this page only to
 recognize an older command, config, route, or upgrade boundary.
 
 ## Upgrade v0.9 to v0.10
@@ -40,7 +40,7 @@ boundary is required.
 v0.10 also removes ambiguous client vocabulary such as `table_key`, `row_id`,
 `manifest_version`, `rows_loaded`, and `export --table`. Use node/edge, type,
 entity, property, graph-manifest, and published-dataset terms plus
-`export --type`. See the canonical [upgrade procedure](../../../docs/user/operations/upgrade.md).
+`export --type`. See the [v0.10.0 upgrade procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md).
 
 ## Pre-0.7 configuration
 

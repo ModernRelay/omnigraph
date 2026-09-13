@@ -1894,7 +1894,7 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
                     let a = (c * FANOUT + f) % ARTIFACTS;
                     let _ = writeln!(
                         edges,
-                        r#"{{"edge":"ChunkOfArtifact","from":"chunk-{c:06}","to":"art-{a:04}","data":{{"id":"e-{c:06}-{f}","label":"of"}}}}"#
+                        r#"{{"edge":"ChunkOfArtifact","id":"e-{c:06}-{f}","from":"chunk-{c:06}","to":"art-{a:04}","data":{{"label":"of"}}}}"#
                     );
                     edge_rows += 1;
                     if edge_rows == EDGE_BATCH_ROWS {
@@ -1931,7 +1931,7 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
                 .iter()
                 .map(|slug| datafusion::prelude::lit(slug.clone()))
                 .collect();
-            let in_list_expr = datafusion::prelude::col("id").in_list(id_list, false);
+            let in_list_expr = datafusion::prelude::col(db.catalog().system_columns.id).in_list(id_list, false);
             let inlist_build_ms = inlist_build_start.elapsed().as_micros() as f64 / 1000.0;
             std::hint::black_box(&in_list_expr);
 

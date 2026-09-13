@@ -51,7 +51,7 @@ insert_stmt = { "insert" ~ type_name ~ "{" ~ mutation_assignment+ ~ "}" }
 update_stmt = { "update" ~ type_name ~ "set" ~ "{" ~ mutation_assignment+ ~ "}" ~ "where" ~ mutation_predicate }
 delete_stmt = { "delete" ~ type_name ~ "where" ~ mutation_predicate }
 mutation_assignment = { ident ~ ":" ~ match_value ~ ","? }
-mutation_predicate = { ident ~ comp_op ~ match_value }
+mutation_predicate = { (meta_field | ident) ~ comp_op ~ match_value }
 
 param_list = { param ~ ("," ~ param)* }
 param = { variable ~ ":" ~ type_ref }
@@ -112,7 +112,10 @@ bm25_call = { "bm25" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
 rank_expr = { nearest_ordering | bm25_call }
 rrf_call = { "rrf" ~ "(" ~ rank_expr ~ "," ~ rank_expr ~ ("," ~ expr)? ~ ")" }
 
-prop_access = { variable ~ "." ~ ident }
+prop_access = { variable ~ "." ~ (meta_field | ident) }
+// A system field named by role (RFC 0040): `$p.@id`, `$e.@src`, `$e.@dst`, and
+// bare `@id` in a mutation predicate. User properties never enter this namespace.
+meta_field = @{ "@" ~ ident }
 
 agg_call = { agg_func ~ "(" ~ expr ~ ")" }
 agg_func = { "count" | "sum" | "avg" | "min" | "max" }

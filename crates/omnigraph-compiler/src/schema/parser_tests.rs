@@ -278,7 +278,7 @@ payload: Blob
 node Document { name: String }
 edge Attaches: Document -> Document {
 payload: Blob?
-@unique(src, payload)
+@unique(@src, payload)
 }
 "#,
             "Attaches.payload",
@@ -601,10 +601,48 @@ edge Knows: Person -> Person
 
 #[test]
 fn test_parse_edge_unique_src_dst() {
+    for constraint in [
+        "@key(@id)",
+        "@unique(@id)",
+        "@index(@id)",
+        "@range(@id, 0..1)",
+        "@check(@id, \"x\")",
+    ] {
+        let error = parse_schema(&format!("node N {{ n: String {constraint} }}")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot reference '@id'; the identity is already the row key"),
+            "{error}"
+        );
+    }
+    for (constraint, expected) in [
+        (
+            "@unique(__src, @dst)",
+            "storage column '__src'; the system field is '@src'",
+        ),
+        (
+            "@key(__src, @dst)",
+            "storage column '__src'; the system field is '@src'",
+        ),
+        (
+            "@index(@src, __dst)",
+            "storage column '__dst'; the system field is '@dst'",
+        ),
+    ] {
+        let source = format!("node N {{ n: String }} edge E: N -> N {{ {constraint} }}");
+        let error = parse_schema(&source).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    parse_schema_for_vintage(
+        "node N { __src: String @unique(__src) }",
+        SYSTEM_COLUMNS_LEGACY,
+    )
+    .unwrap();
     let input = r#"
 node Person { name: String }
 edge Knows: Person -> Person {
-@unique(src, dst)
+@unique(@src, @dst)
 }
 "#;
     let schema = parse_schema(input).unwrap();
@@ -613,7 +651,7 @@ edge Knows: Person -> Person {
             assert!(
                 e.constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Unique(v) if v == &["src", "dst"]))
+                    .any(|c| matches!(c, Constraint::Unique(v) if v == &["@src", "@dst"]))
             );
         }
         _ => panic!("expected Edge"),
@@ -1197,16 +1235,8 @@ fn test_parse_error_diagnostic_has_span() {
 }
 
 #[test]
-fn test_reject_lance_virtual_system_column_property_names() {
-    const RESERVED: [&str; 5] = [
-        "_rowid",
-        "_rowaddr",
-        "_rowoffset",
-        "_row_created_at_version",
-        "_row_last_updated_at_version",
-    ];
-
-    for name in RESERVED {
+fn test_admission_reserves_leading_underscore_property_names() {
+    for name in ["_rowid", "_row_id", "_ROWID", "_foo", "__id", "__manifest"] {
         let declarations = [
             format!("interface I {{ {name}: String }}"),
             format!("node N {{ {name}: String }}"),
@@ -1214,14 +1244,74 @@ fn test_reject_lance_virtual_system_column_property_names() {
         ];
         for source in declarations {
             let error = parse_schema(&source).unwrap_err().to_string();
-            assert!(error.contains("reserved"), "unexpected error: {error}");
+            assert!(
+                error.contains("reserved for system columns"),
+                "unexpected error: {error}"
+            );
             assert!(error.contains(name), "unexpected error: {error}");
-            assert!(error.contains("exported"), "unexpected error: {error}");
         }
     }
 
-    parse_schema("node N { _row_id: String _rowid2: String _ROWID: String }")
-        .expect("only the five exact, case-sensitive Lance names are reserved");
+    parse_schema("node N { id: String @key src: String dst: String }")
+        .expect("'id'/'src'/'dst' are ordinary user property names on admission");
+}
+
+#[test]
+fn test_legacy_vintage_admission_keeps_historical_names_and_reserves_upgrade_targets() {
+    use crate::catalog::schema_ir::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
+
+    parse_schema_for_vintage("node N { _row_id: String }", SYSTEM_COLUMNS_LEGACY)
+        .expect("legacy evolution restates historically legal underscore names");
+
+    let error = parse_schema_for_vintage("node N { id: String }", SYSTEM_COLUMNS_LEGACY)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("collides with this graph's physical"),
+        "unexpected error: {error}"
+    );
+
+    for source in [
+        "node N { __id: String }",
+        "node N {} edge E: N -> N { __src: String }",
+        "node N {} edge E: N -> N { __dst: String }",
+    ] {
+        let error = parse_schema_for_vintage(source, SYSTEM_COLUMNS_LEGACY)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reserved for the system column upgrade"),
+            "unexpected error: {error}"
+        );
+    }
+
+    parse_schema_for_vintage("node N { __src: String }", SYSTEM_COLUMNS_LEGACY)
+        .expect("'__src' collides with nothing on legacy nodes");
+
+    parse_schema_for_vintage("node N { id: String @key }", SYSTEM_COLUMNS_V3)
+        .expect("current-vintage targets keep the freed names");
+}
+
+#[test]
+fn test_persisted_contract_keeps_historical_underscore_names() {
+    const LANCE_RESERVED: [&str; 5] = [
+        "_rowid",
+        "_rowaddr",
+        "_rowoffset",
+        "_row_created_at_version",
+        "_row_last_updated_at_version",
+    ];
+
+    for name in LANCE_RESERVED {
+        let source = format!("node N {{ {name}: String }}");
+        let error = parse_persisted_schema_contract(&source)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exported"), "unexpected error: {error}");
+    }
+
+    parse_persisted_schema_contract("node N { _row_id: String _rowid2: String _ROWID: String }")
+        .expect("persisted contracts predate the underscore reservation and stay readable");
 }
 
 // The split is load-bearing for upgrades: a stored catalog that legally
@@ -1262,7 +1352,7 @@ fn test_parse_edge_body_constraint_key() {
 node Person { name: String }
 edge Knows: Person -> Person {
 since: Date
-@key(src, dst, since)
+@key(@src, @dst, since)
 }
 "#;
     let schema = parse_schema(input).unwrap();
@@ -1271,7 +1361,7 @@ since: Date
             assert!(
                 e.constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Key(v) if v == &["src", "dst", "since"]))
+                    .any(|c| matches!(c, Constraint::Key(v) if v == &["@src", "@dst", "since"]))
             );
         }
         _ => panic!("expected Edge"),
@@ -1283,7 +1373,7 @@ fn test_parse_edge_key_endpoints_only() {
     let input = r#"
 node Person { name: String }
 edge Knows: Person -> Person {
-@key(src, dst)
+@key(@src, @dst)
 }
 "#;
     let schema = parse_schema(input).unwrap();
@@ -1292,7 +1382,7 @@ edge Knows: Person -> Person {
             assert!(
                 e.constraints
                     .iter()
-                    .any(|c| matches!(c, Constraint::Key(v) if v == &["src", "dst"]))
+                    .any(|c| matches!(c, Constraint::Key(v) if v == &["@src", "@dst"]))
             );
         }
         _ => panic!("expected Edge"),
@@ -1304,18 +1394,28 @@ fn test_reject_edge_key_missing_endpoint() {
     let cases = [
         (
             "missing dst",
-            "@key(src)",
-            "@key on edge Knows must include both endpoints (missing 'dst')",
+            "@key(@src)",
+            "@key on edge Knows must include both endpoints (missing '@dst')",
         ),
         (
             "missing src",
-            "@key(dst)",
-            "@key on edge Knows must include both endpoints (missing 'src')",
+            "@key(@dst)",
+            "@key on edge Knows must include both endpoints (missing '@src')",
         ),
         (
             "missing both",
             "@key(since)",
-            "@key on edge Knows must include both endpoints (missing 'src')",
+            "@key on edge Knows must include both endpoints (missing '@src')",
+        ),
+        (
+            "user src is not an endpoint",
+            "src: String\n@key(src, @dst)",
+            "@key on edge Knows must include both endpoints (missing '@src')",
+        ),
+        (
+            "user dst is not an endpoint",
+            "dst: String\n@key(@src, dst)",
+            "@key on edge Knows must include both endpoints (missing '@dst')",
         ),
     ];
     for (case, constraint, expected) in cases {
@@ -1337,8 +1437,8 @@ fn test_reject_multiple_edge_keys() {
 node Person { name: String }
 edge Knows: Person -> Person {
 since: Date
-@key(src, dst)
-@key(src, dst, since)
+@key(@src, @dst)
+@key(@src, @dst, since)
 }
 "#;
     let error = parse_schema_diagnostic(input).expect_err("two @key groups");
@@ -1393,7 +1493,7 @@ since: Date @key
 
 #[test]
 fn test_reject_reserved_logical_property_names() {
-    for name in ["id", "src", "dst", "from", "to"] {
+    for name in ["from", "to"] {
         let input = format!(
             "node Person {{ name: String }}\nedge Knows: Person -> Person {{\n{name}: String\n}}\n"
         );
@@ -1416,7 +1516,7 @@ fn test_reject_repeated_key_column() {
 node Person { name: String }
 edge Knows: Person -> Person {
 since: Date
-@key(src, dst, since, since)
+@key(@src, @dst, since, since)
 }
 "#;
     let error = parse_schema_diagnostic(edge).expect_err("repeated edge member");
@@ -1443,31 +1543,31 @@ fn test_reject_edge_key_column_rules() {
         (
             "nullable member",
             "since: Date?",
-            "@key(src, dst, since)",
+            "@key(@src, @dst, since)",
             "@key property Knows.since cannot be nullable",
         ),
         (
             "list member",
             "tags: [String]",
-            "@key(src, dst, tags)",
+            "@key(@src, @dst, tags)",
             "@key is not supported on list property Knows.tags",
         ),
         (
             "vector member",
             "embedding: Vector(3)",
-            "@key(src, dst, embedding)",
+            "@key(@src, @dst, embedding)",
             "@key is not supported on vector property Knows.embedding",
         ),
         (
             "blob member",
             "payload: Blob",
-            "@key(src, dst, payload)",
+            "@key(@src, @dst, payload)",
             "@key is not supported on blob property Knows.payload",
         ),
         (
             "unknown member",
             "since: Date",
-            "@key(src, dst, weight)",
+            "@key(@src, @dst, weight)",
             "@key on Knows references unknown property 'weight'",
         ),
     ];

@@ -341,11 +341,12 @@ fn build_insert_batch(
     id: &str,
     assignments: &HashMap<String, Literal>,
     blob_properties: &HashSet<String>,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
-        if field.name() == "id" {
+        if field.name() == system_columns.id {
             columns.push(Arc::new(StringArray::from(vec![id])));
         } else if blob_properties.contains(field.name()) {
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
@@ -358,12 +359,12 @@ fn build_insert_batch(
                     field.name()
                 )));
             }
-        } else if field.name() == "src" {
+        } else if field.name() == system_columns.src {
             let lit = assignments.get("from").ok_or_else(|| {
                 OmniError::manifest("missing required edge endpoint 'from'".to_string())
             })?;
             columns.push(literal_to_typed_array(lit, field.data_type(), 1)?);
-        } else if field.name() == "dst" {
+        } else if field.name() == system_columns.dst {
             let lit = assignments.get("to").ok_or_else(|| {
                 OmniError::manifest("missing required edge endpoint 'to'".to_string())
             })?;
@@ -388,13 +389,22 @@ fn predicate_to_sql(
     predicate: &IRMutationPredicate,
     params: &ParamMap,
     is_edge: bool,
+    system_columns: SystemColumns,
 ) -> Result<String> {
     let column = if is_edge {
         match predicate.property.as_str() {
-            "from" => "src".to_string(),
-            "to" => "dst".to_string(),
+            "from" | "@src" => system_columns.src.to_string(),
+            "to" | "@dst" => system_columns.dst.to_string(),
+            "@id" => system_columns.id.to_string(),
             other => other.to_string(),
         }
+    } else if predicate.property == "@id" {
+        system_columns.id.to_string()
+    } else if predicate.property.starts_with('@') {
+        return Err(OmniError::manifest(format!(
+            "unsupported node meta-field '{}' in mutation predicate",
+            predicate.property
+        )));
     } else {
         predicate.property.clone()
     };
@@ -1199,7 +1209,8 @@ impl Omnigraph {
                 crate::dst_ids::new_ulid().to_string()
             };
 
-            let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
+            let batch =
+                build_insert_batch(&schema, &id, &resolved, &blob_props, catalog.system_columns)?;
             // Validation (value/enum/unique) runs end-of-query via the evaluator.
             let has_key = node_type.key.is_some();
             let table_key = format!("node:{}", type_name);
@@ -1235,17 +1246,16 @@ impl Omnigraph {
             let schema = edge_type.arrow_schema.clone();
             let blob_props = edge_type.blob_properties.clone();
             let id = if let Some(key_columns) = edge_type.key.as_ref() {
+                let system_columns = catalog.system_columns;
                 let mut typed_keys = Vec::with_capacity(key_columns.len());
                 for key_col in key_columns {
-                    // Endpoint key columns arrive under the insert's from/to
-                    // parameters, aliased to src/dst by build_insert_batch.
-                    let assignment = match key_col.as_str() {
-                        "src" => "from",
-                        "dst" => "to",
-                        other => other,
+                    let (assignment, is_endpoint) = match key_col.as_str() {
+                        column if column == system_columns.src => ("from", true),
+                        column if column == system_columns.dst => ("to", true),
+                        other => (other, false),
                     };
                     let key_literal = resolved.get(assignment).ok_or_else(|| {
-                        if key_col == "src" || key_col == "dst" {
+                        if is_endpoint {
                             OmniError::manifest(format!(
                                 "missing required edge endpoint '{}'",
                                 assignment
@@ -1279,7 +1289,8 @@ impl Omnigraph {
                 crate::dst_ids::new_ulid().to_string()
             };
 
-            let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
+            let batch =
+                build_insert_batch(&schema, &id, &resolved, &blob_props, catalog.system_columns)?;
             // Validation (edge-RI, enum, unique, @card against the live
             // manifest-visible branch snapshot) runs
             // end-of-query via the evaluator.
@@ -1354,7 +1365,7 @@ impl Omnigraph {
             }
         }
 
-        let pred_sql = predicate_to_sql(predicate, params, false)?;
+        let pred_sql = predicate_to_sql(predicate, params, false, catalog.system_columns)?;
         let schema = catalog.node_types[type_name].arrow_schema.clone();
         let blob_props = catalog.node_types[type_name].blob_properties.clone();
 
@@ -1400,7 +1411,7 @@ impl Omnigraph {
                     pending_schema,
                     None,
                     Some(&pred_sql),
-                    Some("id"),
+                    Some(catalog.system_columns.id),
                     scan_budget,
                 )
                 .await?
@@ -1411,7 +1422,7 @@ impl Omnigraph {
                     pending_batches,
                     pending_schema,
                     Some(&pred_sql),
-                    Some("id"),
+                    Some(catalog.system_columns.id),
                     scan_budget,
                 )
                 .await?
@@ -1480,7 +1491,7 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_sql = predicate_to_sql(predicate, params, false)?;
+        let pred_sql = predicate_to_sql(predicate, params, false, txn.catalog.system_columns)?;
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1507,7 +1518,12 @@ impl Omnigraph {
             dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
         let batches = self
             .storage()
-            .scan(&ds, Some(&["id"]), Some(&scan_filter), None)
+            .scan(
+                &ds,
+                Some(&[txn.catalog.system_columns.id]),
+                Some(&scan_filter),
+                None,
+            )
             .await?;
 
         let deleted_ids: Vec<String> = ids_from_batches(&batches);
@@ -1551,10 +1567,16 @@ impl Omnigraph {
         for (edge_name, from_type, to_type) in &edge_info {
             let mut cascade_filters = Vec::new();
             if from_type == type_name {
-                cascade_filters.push(format!("src IN ({})", id_list));
+                cascade_filters.push(format!(
+                    "{} IN ({})",
+                    txn.catalog.system_columns.src, id_list
+                ));
             }
             if to_type == type_name {
-                cascade_filters.push(format!("dst IN ({})", id_list));
+                cascade_filters.push(format!(
+                    "{} IN ({})",
+                    txn.catalog.system_columns.dst, id_list
+                ));
             }
             if cascade_filters.is_empty() {
                 continue;
@@ -1594,7 +1616,12 @@ impl Omnigraph {
             let matched_ids = ids_from_batches(
                 &self
                     .storage()
-                    .scan(&edge_ds, Some(&["id"]), Some(&count_filter), None)
+                    .scan(
+                        &edge_ds,
+                        Some(&[txn.catalog.system_columns.id]),
+                        Some(&count_filter),
+                        None,
+                    )
                     .await?,
             );
             let matched = matched_ids.len();
@@ -1625,7 +1652,7 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_sql = predicate_to_sql(predicate, params, true)?;
+        let pred_sql = predicate_to_sql(predicate, params, true, txn.catalog.system_columns)?;
 
         let table_key = format!("edge:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1655,7 +1682,12 @@ impl Omnigraph {
         let deleted_ids = ids_from_batches(
             &self
                 .storage()
-                .scan(&ds, Some(&["id"]), Some(&count_filter), None)
+                .scan(
+                    &ds,
+                    Some(&[txn.catalog.system_columns.id]),
+                    Some(&count_filter),
+                    None,
+                )
                 .await?,
         );
         let affected = deleted_ids.len();
@@ -1744,7 +1776,13 @@ mod predicate_sql_tests {
             op: CompOp::Eq,
             value: IRExpr::Literal(Literal::String("acme".into())),
         };
-        let sql = predicate_to_sql(&predicate, &ParamMap::new(), false).unwrap();
+        let sql = predicate_to_sql(
+            &predicate,
+            &ParamMap::new(),
+            false,
+            omnigraph_compiler::SYSTEM_COLUMNS_V3,
+        )
+        .unwrap();
         assert_eq!(
             sql, "repoName = 'acme'",
             "column must be unquoted and case-preserved, got {sql}"

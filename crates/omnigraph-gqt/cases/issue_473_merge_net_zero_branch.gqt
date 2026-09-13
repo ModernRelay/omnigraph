@@ -7,6 +7,12 @@
 # notes: merge reports `fast_forward` and publishes no registration for the
 # notes: table, and `main` still reads its one edge.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

@@ -29,7 +29,10 @@ prop_decl = { ident ~ ":" ~ type_ref ~ annotation* }
 body_constraint = { "@" ~ constraint_name ~ "(" ~ constraint_args ~ ")" }
 constraint_name = { "key" | "unique" | "index" | "range" | "check" }
 constraint_args = { constraint_arg ~ ("," ~ constraint_arg)* }
-constraint_arg = { range_bound | literal | ident }
+constraint_arg = { range_bound | literal | meta_field | ident }
+// A system field named by role (RFC 0040): `@id`, `@src`, `@dst`. Never a user
+// property, so a constraint list can name an endpoint on every vintage.
+meta_field = @{ "@" ~ ident }
 range_bound = { (signed_float | signed_integer) ~ ".." ~ (signed_float | signed_integer)? | ".." ~ (signed_float | signed_integer) }
 
 type_ref = { core_type ~ "?"? }

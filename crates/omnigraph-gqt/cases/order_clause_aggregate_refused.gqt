@@ -4,6 +4,12 @@
 # notes: supported spelling. The refusal message carries no error-code prefix, so
 # notes: the raw fragment is the pin.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key
@@ -17,6 +23,15 @@ query count_ordered() {
     match { $p: Person }
     return { count($p) as total }
     order { count($p) }
+}
+
+--- expect error: unsupported ordering expression
+
+--- query
+query meta_aggregate_order_refused() {
+    match { $p: Person }
+    return { $p.name, count($p.@id) }
+    order { max($p.@id) }
 }
 
 --- expect error: unsupported ordering expression

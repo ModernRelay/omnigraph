@@ -5,6 +5,12 @@
 # notes: rerun asks for 16 of the 20 live rows (16 < 20, a wider rung) and holds
 # notes: survivors 10..15 (6 > 4): d010, d011, d012, d013.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

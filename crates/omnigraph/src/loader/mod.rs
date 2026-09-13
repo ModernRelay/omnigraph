@@ -17,6 +17,7 @@ use base64::Engine;
 use lance::blob::BlobArrayBuilder;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::types::PropType;
+use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SystemColumns};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -561,10 +562,21 @@ async fn load_jsonl_reader_once<R: BufRead>(
                         record_num, type_name
                     )));
                 }
-                let data = value
+                let identity = take_lenient_identity(&mut value, record_num)?;
+                let mut data = value
                     .get_mut("data")
                     .map(JsonValue::take)
                     .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+                let object = data.as_object_mut().ok_or_else(|| {
+                    OmniError::manifest(format!("record {record_num}: 'data' must be an object"))
+                })?;
+                place_identity(
+                    format_args!("record {record_num}"),
+                    object,
+                    identity,
+                    &catalog.node_types[&type_name].properties,
+                    catalog.system_columns,
+                )?;
                 if bounded_keyed_input {
                     account_keyed_json_row(
                         &format!("node:{type_name}"),
@@ -599,15 +611,23 @@ async fn load_jsonl_reader_once<R: BufRead>(
                         OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
                     })?
                     .to_string();
-                let data = value
+                let identity = take_lenient_identity(&mut value, record_num)?;
+                let mut data = value
                     .get_mut("data")
                     .map(JsonValue::take)
                     .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-                let canonical = catalog
-                    .lookup_edge_by_name(&edge_name)
-                    .unwrap()
-                    .name
-                    .clone();
+                let object = data.as_object_mut().ok_or_else(|| {
+                    OmniError::manifest(format!("record {record_num}: 'data' must be an object"))
+                })?;
+                let edge_type = catalog.lookup_edge_by_name(&edge_name).unwrap();
+                place_identity(
+                    format_args!("record {record_num}"),
+                    object,
+                    identity,
+                    &edge_type.properties,
+                    catalog.system_columns,
+                )?;
+                let canonical = edge_type.name.clone();
                 if bounded_keyed_input {
                     account_keyed_json_row(
                         &format!("edge:{canonical}"),
@@ -676,7 +696,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     __dst_nr.sort_by(|a, b| a.0.cmp(b.0));
     for (type_name, rows) in __dst_nr {
         let node_type = &catalog.node_types[type_name];
-        let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
+        let batch = build_node_batch(node_type, rows, &mut node_id_remap, catalog.system_columns)?;
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
@@ -732,7 +752,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     __dst_er.sort_by(|a, b| a.0.cmp(b.0));
     for (edge_name, rows) in __dst_er {
         let edge_type = &catalog.edge_types[edge_name];
-        let batch = build_edge_batch(edge_type, rows, &node_id_remap)?;
+        let batch = build_edge_batch(edge_type, rows, &node_id_remap, catalog.system_columns)?;
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
@@ -799,6 +819,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 &snapshot,
                 &table_key,
                 changeset.get(&table_key).expect("key from this changeset"),
+                catalog.system_columns,
             )
             .await?;
             if !removed.is_empty() {
@@ -1141,14 +1162,22 @@ fn parse_strict_graph_rows<R: BufRead>(
 
         match (envelope.contains_key("type"), envelope.contains_key("edge")) {
             (true, false) => {
-                validate_strict_envelope_fields(line_number, &envelope, &["type", "data"])?;
+                validate_strict_envelope_fields(line_number, &envelope, &["type", "id", "data"])?;
                 let type_name = take_required_string(&mut envelope, "type", line_number)?;
-                let data = take_object_or_empty(&mut envelope, "data", line_number)?;
+                let identity = take_optional_string(&mut envelope, "id", line_number)?;
+                let mut data = take_object_or_empty(&mut envelope, "data", line_number)?;
                 if !catalog.node_types.contains_key(&type_name) {
                     return Err(OmniError::manifest(format!(
                         "line {line_number}: unknown node type '{type_name}'"
                     )));
                 }
+                place_identity(
+                    format_args!("line {line_number}"),
+                    &mut data,
+                    identity,
+                    &catalog.node_types[&type_name].properties,
+                    catalog.system_columns,
+                )?;
                 let table_key = format!("node:{type_name}");
                 let row = JsonValue::Object(data);
                 if bounded_keyed_input {
@@ -1160,13 +1189,14 @@ fn parse_strict_graph_rows<R: BufRead>(
                 validate_strict_envelope_fields(
                     line_number,
                     &envelope,
-                    &["edge", "from", "to", "data"],
+                    &["edge", "id", "from", "to", "data"],
                 )?;
                 let edge_name = take_required_string(&mut envelope, "edge", line_number)?;
+                let identity = take_optional_string(&mut envelope, "id", line_number)?;
                 let from = take_required_string(&mut envelope, "from", line_number)?;
                 let to = take_required_string(&mut envelope, "to", line_number)?;
                 let mut data = take_object_or_empty(&mut envelope, "data", line_number)?;
-                for reserved in ["src", "dst"] {
+                for reserved in [catalog.system_columns.src, catalog.system_columns.dst] {
                     if data.contains_key(reserved) {
                         return Err(OmniError::manifest(format!(
                             "line {line_number}: edge data field '{reserved}' is reserved structural state"
@@ -1178,6 +1208,13 @@ fn parse_strict_graph_rows<R: BufRead>(
                         "line {line_number}: unknown edge type '{edge_name}'"
                     ))
                 })?;
+                place_identity(
+                    format_args!("line {line_number}"),
+                    &mut data,
+                    identity,
+                    &edge_type.properties,
+                    catalog.system_columns,
+                )?;
                 let canonical = edge_type.name.clone();
                 let table_key = format!("edge:{canonical}");
                 if bounded_keyed_input {
@@ -1188,8 +1225,14 @@ fn parse_strict_graph_rows<R: BufRead>(
                         keyed_input_budget,
                     )?;
                 }
-                data.insert("src".to_string(), JsonValue::String(from));
-                data.insert("dst".to_string(), JsonValue::String(to));
+                data.insert(
+                    catalog.system_columns.src.to_string(),
+                    JsonValue::String(from),
+                );
+                data.insert(
+                    catalog.system_columns.dst.to_string(),
+                    JsonValue::String(to),
+                );
                 rows.edges
                     .entry(canonical)
                     .or_default()
@@ -1204,6 +1247,70 @@ fn parse_strict_graph_rows<R: BufRead>(
     }
 
     Ok(rows)
+}
+
+/// Place the envelope identity under the graph's physical spelling. Legacy
+/// graphs also accept `data.id`; current graphs reserve it for declared properties.
+fn place_identity(
+    location: fmt::Arguments<'_>,
+    data: &mut serde_json::Map<String, JsonValue>,
+    identity: Option<String>,
+    properties: &HashMap<String, PropType>,
+    system_columns: SystemColumns,
+) -> Result<()> {
+    if system_columns != SYSTEM_COLUMNS_LEGACY
+        && data.contains_key("id")
+        && !properties.contains_key("id")
+    {
+        return Err(OmniError::manifest(format!(
+            "{location}: unknown input field 'id': move data.id to the top-level 'id' field; \
+             data.id is only valid when the schema declares an 'id' property"
+        )));
+    }
+    if system_columns != SYSTEM_COLUMNS_LEGACY && data.contains_key(system_columns.id) {
+        return Err(OmniError::manifest(format!(
+            "{location}: data field '{}' is reserved physical state; the entity id \
+             is the top-level 'id' field",
+            system_columns.id
+        )));
+    }
+    if let Some(identity) = identity {
+        if system_columns == SYSTEM_COLUMNS_LEGACY && data.contains_key(system_columns.id) {
+            return Err(OmniError::manifest(format!(
+                "{location}: the entity id is given both as the top-level 'id' and \
+                 as data.{}",
+                system_columns.id
+            )));
+        }
+        data.insert(system_columns.id.to_string(), JsonValue::String(identity));
+    }
+    Ok(())
+}
+
+/// The lenient loader's twin of [`take_optional_string`] for the top-level
+/// `id`: a record whose `id` is present but not a string is refused.
+fn take_lenient_identity(value: &mut JsonValue, record_num: usize) -> Result<Option<String>> {
+    match value.get_mut("id").map(JsonValue::take) {
+        None => Ok(None),
+        Some(JsonValue::String(identity)) => Ok(Some(identity)),
+        Some(other) => Err(OmniError::manifest(format!(
+            "record {record_num}: top-level field 'id' must be a string, got {other}"
+        ))),
+    }
+}
+
+fn take_optional_string(
+    envelope: &mut serde_json::Map<String, JsonValue>,
+    field: &str,
+    line_number: usize,
+) -> Result<Option<String>> {
+    match envelope.remove(field) {
+        None => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(value) => Err(OmniError::manifest(format!(
+            "line {line_number}: top-level field '{field}' must be a string, got {value}"
+        ))),
+    }
 }
 
 fn validate_strict_envelope_fields(
@@ -1383,6 +1490,7 @@ fn build_node_batch(
     node_type: &NodeType,
     rows: &[JsonValue],
     node_id_remap: &mut TypedNodeIdRemap,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     let schema = node_type.arrow_schema.clone();
     let row_refs = rows.iter().collect::<Vec<_>>();
@@ -1454,7 +1562,7 @@ fn build_node_batch(
         .iter()
         .enumerate()
         .map(|(row_index, row)| {
-            let explicit_id = match row.get("id") {
+            let explicit_id = match row.get(system_columns.id) {
                 None => None,
                 Some(JsonValue::String(id)) => Some(id.as_str()),
                 Some(value) => {
@@ -1511,6 +1619,7 @@ fn build_edge_batch(
     edge_type: &omnigraph_compiler::catalog::EdgeType,
     rows: &[(String, String, JsonValue)],
     node_id_remap: &TypedNodeIdRemap,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     let schema = edge_type.arrow_schema.clone();
     let row_refs = rows.iter().map(|(_, _, data)| data).collect::<Vec<_>>();
@@ -1570,6 +1679,7 @@ fn build_edge_batch(
         &src_column,
         &dst_column,
         &property_columns,
+        system_columns,
     )?;
     let ids = rows
         .iter()
@@ -1582,7 +1692,7 @@ fn build_edge_batch(
                         edge_type.name
                     ))
                 })?;
-                match data.get("id") {
+                match data.get(system_columns.id) {
                     None => {}
                     Some(JsonValue::String(explicit_id)) => {
                         if *explicit_id != canonical {
@@ -1602,7 +1712,7 @@ fn build_edge_batch(
                 Ok(canonical)
             } else {
                 Ok(data
-                    .get("id")
+                    .get(system_columns.id)
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .unwrap_or_else(generate_id))
@@ -1628,6 +1738,7 @@ fn edge_key_columns(
     src_column: &ArrayRef,
     dst_column: &ArrayRef,
     property_columns: &[ArrayRef],
+    system_columns: SystemColumns,
 ) -> Result<Option<Vec<ArrayRef>>> {
     edge_type
         .key
@@ -1636,8 +1747,8 @@ fn edge_key_columns(
             columns
                 .iter()
                 .map(|column| match column.as_str() {
-                    "src" => Ok(src_column.clone()),
-                    "dst" => Ok(dst_column.clone()),
+                    endpoint if endpoint == system_columns.src => Ok(src_column.clone()),
+                    endpoint if endpoint == system_columns.dst => Ok(dst_column.clone()),
                     property => {
                         let schema_index = schema.index_of(property).map_err(|_| {
                             OmniError::manifest_internal(format!(
@@ -1679,13 +1790,13 @@ pub(crate) fn normalize_strict_json_rows(
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?;
-        normalize_strict_node_rows(node_type, rows)
+        normalize_strict_node_rows(node_type, rows, catalog.system_columns)
     } else if let Some(type_name) = table_key.strip_prefix("edge:") {
         let edge_type = catalog
             .edge_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?;
-        normalize_strict_edge_rows(edge_type, rows)
+        normalize_strict_edge_rows(edge_type, rows, catalog.system_columns)
     } else {
         Err(OmniError::manifest(format!(
             "invalid table key '{table_key}'"
@@ -1693,12 +1804,22 @@ pub(crate) fn normalize_strict_json_rows(
     }
 }
 
-fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+fn normalize_strict_node_rows(
+    node_type: &NodeType,
+    rows: &[JsonValue],
+    system_columns: SystemColumns,
+) -> Result<RecordBatch> {
     let objects = strict_row_objects(rows)?;
     let table_key = format!("node:{}", node_type.name);
     for object in &objects {
-        validate_strict_input_fields(&table_key, object, &node_type.properties, &[])?;
-        validate_optional_row_id(&node_type.name, object)?;
+        validate_strict_input_fields(
+            &table_key,
+            object,
+            &node_type.properties,
+            &[],
+            system_columns,
+        )?;
+        validate_optional_row_id(&node_type.name, object, system_columns)?;
     }
 
     let schema = Arc::clone(&node_type.arrow_schema);
@@ -1760,7 +1881,7 @@ fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Resul
         .iter()
         .enumerate()
         .map(|(row_index, object)| {
-            let explicit_id = optional_row_id(&node_type.name, object)?;
+            let explicit_id = optional_row_id(&node_type.name, object, system_columns)?;
             if let Some(key_columns) = &key_columns {
                 let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
                     OmniError::manifest(format!(
@@ -1789,14 +1910,24 @@ fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Resul
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
-fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+fn normalize_strict_edge_rows(
+    edge_type: &EdgeType,
+    rows: &[JsonValue],
+    system_columns: SystemColumns,
+) -> Result<RecordBatch> {
     let objects = strict_row_objects(rows)?;
     let table_key = format!("edge:{}", edge_type.name);
     for object in &objects {
-        validate_strict_input_fields(&table_key, object, &edge_type.properties, &["src", "dst"])?;
-        validate_optional_row_id(&edge_type.name, object)?;
-        validate_required_row_string(&edge_type.name, "src", object)?;
-        validate_required_row_string(&edge_type.name, "dst", object)?;
+        validate_strict_input_fields(
+            &table_key,
+            object,
+            &edge_type.properties,
+            &[system_columns.src, system_columns.dst],
+            system_columns,
+        )?;
+        validate_optional_row_id(&edge_type.name, object, system_columns)?;
+        validate_required_row_string(&edge_type.name, system_columns.src, object)?;
+        validate_required_row_string(&edge_type.name, system_columns.dst, object)?;
     }
 
     let schema = Arc::clone(&edge_type.arrow_schema);
@@ -1814,11 +1945,11 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
 
     let srcs = objects
         .iter()
-        .map(|object| validate_required_row_string(&edge_type.name, "src", object))
+        .map(|object| validate_required_row_string(&edge_type.name, system_columns.src, object))
         .collect::<Result<Vec<_>>>()?;
     let dsts = objects
         .iter()
-        .map(|object| validate_required_row_string(&edge_type.name, "dst", object))
+        .map(|object| validate_required_row_string(&edge_type.name, system_columns.dst, object))
         .collect::<Result<Vec<_>>>()?;
     let src_column: ArrayRef = Arc::new(StringArray::from(srcs));
     let dst_column: ArrayRef = Arc::new(StringArray::from(dsts));
@@ -1848,12 +1979,13 @@ fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Resul
         &src_column,
         &dst_column,
         &property_columns,
+        system_columns,
     )?;
     let ids = objects
         .iter()
         .enumerate()
         .map(|(row_index, object)| {
-            let explicit_id = optional_row_id(&edge_type.name, object)?;
+            let explicit_id = optional_row_id(&edge_type.name, object, system_columns)?;
             if let Some(key_columns) = &key_columns {
                 let canonical = canonical_key_id(key_columns, row_index)?.ok_or_else(|| {
                     OmniError::manifest(format!(
@@ -1898,6 +2030,7 @@ fn validate_strict_input_fields(
     object: &serde_json::Map<String, JsonValue>,
     properties: &HashMap<String, PropType>,
     structural_fields: &[&str],
+    system_columns: SystemColumns,
 ) -> Result<()> {
     for field in object.keys() {
         if is_reserved_physical_input_field(field) {
@@ -1905,7 +2038,7 @@ fn validate_strict_input_fields(
                 "input field '{field}' is reserved physical state"
             )));
         }
-        if field == "id"
+        if field == system_columns.id
             || structural_fields.contains(&field.as_str())
             || properties.contains_key(field)
         {
@@ -1933,18 +2066,21 @@ fn is_reserved_physical_input_field(field: &str) -> bool {
 fn validate_optional_row_id(
     type_name: &str,
     object: &serde_json::Map<String, JsonValue>,
+    system_columns: SystemColumns,
 ) -> Result<()> {
-    optional_row_id(type_name, object).map(|_| ())
+    optional_row_id(type_name, object, system_columns).map(|_| ())
 }
 
 fn optional_row_id<'a>(
     type_name: &str,
     object: &'a serde_json::Map<String, JsonValue>,
+    system_columns: SystemColumns,
 ) -> Result<Option<&'a str>> {
-    match object.get("id") {
+    match object.get(system_columns.id) {
         Some(JsonValue::String(value)) => Ok(Some(value)),
         Some(value) => Err(OmniError::manifest(format!(
-            "input entity of type '{type_name}' field 'id' must be a string, got {value}"
+            "input entity of type '{type_name}' field '{}' must be a string, got {value}",
+            system_columns.id
         ))),
         None => Ok(None),
     }
@@ -3609,7 +3745,7 @@ edge WorksAt: Person -> Company
         );
 
         let list_schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", DataType::Utf8, false),
+            arrow_schema::Field::new("__id", DataType::Utf8, false),
             arrow_schema::Field::new(
                 "tags",
                 DataType::List(Arc::new(arrow_schema::Field::new(
@@ -3620,7 +3756,7 @@ edge WorksAt: Person -> Company
                 false,
             ),
         ]);
-        let list_row = serde_json::json!({"id": "row", "tags": ["one", "two"]});
+        let list_row = serde_json::json!({"__id": "row", "tags": ["one", "two"]});
         let error = preflight_strict_row_arrow_bytes_with_limit(
             &list_schema,
             list_row.as_object().unwrap(),
@@ -3759,58 +3895,68 @@ node Doc {
         let cases = [
             (
                 "recursive duplicate",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","extra":{"x":1,"x":2}}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","extra":{"x":1,"x":2}}}"#,
                 "duplicate JSON member 'x'",
             ),
             (
                 "two objects on one line",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"}} {"type":"Person","data":{"id":"Bob","name":"Bob"}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice"}} {"type":"Person","id":"Bob","data":{"name":"Bob"}}"#,
                 "invalid strict JSON",
             ),
             (
                 "node and edge",
-                r#"{"type":"Person","edge":"Knows","data":{"id":"Alice","name":"Alice"}}"#,
+                r#"{"type":"Person","edge":"Knows","id":"Alice","data":{"name":"Alice"}}"#,
                 "exactly one of 'type' or 'edge'",
             ),
             (
                 "unknown top-level field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"branch":"main"}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice"},"branch":"main"}"#,
                 "unknown top-level graph batch field 'branch'",
             ),
             (
                 "reserved top-level field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"_rowid":7}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice"},"_rowid":7}"#,
                 "reserved physical state",
             ),
             (
+                "legacy identity placement",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
                 "unknown data field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","nickname":"Al"}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","nickname":"Al"}}"#,
                 "unknown input field 'nickname'",
             ),
             (
                 "reserved data field",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","_rowid":7}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","_rowid":7}}"#,
                 "reserved physical state",
             ),
             (
                 "non-string supplied id",
-                r#"{"type":"Person","data":{"id":7,"name":"Alice"}}"#,
-                "field 'id' must be a string",
+                r#"{"type":"Person","id":7,"data":{"name":"Alice"}}"#,
+                "top-level field 'id' must be a string",
             ),
             (
                 "noncanonical id",
-                r#"{"type":"Person","data":{"id":"person-1","name":"Alice"}}"#,
+                r#"{"type":"Person","id":"person-1","data":{"name":"Alice"}}"#,
                 "does not match its canonical @key id 'Alice'",
             ),
             (
                 "nullable wrong type",
-                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","age":"old"}}"#,
+                r#"{"type":"Person","id":"Alice","data":{"name":"Alice","age":"old"}}"#,
                 "expects Int32",
             ),
             (
                 "edge structural field in data",
-                r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"knows-1","src":"Mallory"}}"#,
+                r#"{"edge":"Knows","id":"knows-1","from":"Alice","to":"Bob","data":{"__src":"Mallory"}}"#,
                 "reserved structural state",
+            ),
+            (
+                "storage identity spelling in data",
+                r#"{"type":"Person","data":{"__id":"Alice","name":"Alice"}}"#,
+                "reserved physical state",
             ),
         ];
 
@@ -3841,6 +3987,72 @@ node Doc {
                 0,
                 "{case} wrote node rows"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_refuses_invalid_identity_envelopes_before_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person { name: String? } edge Knows: Person -> Person",
+        )
+        .await
+        .unwrap();
+        let before = db.version().await;
+        let mut cases = [
+            (
+                r#"{"type":"Person","data":{"id":"alice"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
+                r#"{"edge":"Knows","from":"alice","to":"bob","data":{"id":"knows-1"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
+                r#"{"type":"Person","id":"alice","data":{"id":"other"}}"#,
+                "move data.id to the top-level 'id'",
+            ),
+            (
+                r#"{"type":"Person","id":null,"data":{}}"#,
+                "top-level field 'id' must be a string",
+            ),
+            (
+                r#"{"edge":"Knows","id":null,"from":"alice","to":"bob","data":{}}"#,
+                "top-level field 'id' must be a string",
+            ),
+            (
+                r#"{"type":"Person","id":"alice","data":{"__id":"alice"}}"#,
+                "record 1: data field '__id'",
+            ),
+        ]
+        .into_iter()
+        .map(|(input, expected)| (input.to_string(), expected))
+        .collect::<Vec<_>>();
+        for data in ["null", "[]", "7", "\"text\""] {
+            for envelope in [
+                r#""type":"Person""#,
+                r#""edge":"Knows","from":"alice","to":"bob""#,
+            ] {
+                let input = format!("{{{envelope},\"id\":\"entity-1\",\"data\":{data}}}");
+                cases.push((input, "record 1: 'data' must be an object"));
+            }
+        }
+        for (input, expected) in cases {
+            let error = load_jsonl(&db, &input, LoadMode::Overwrite)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(db.version().await, before);
+            let snapshot = db.snapshot().await;
+            for table in ["node:Person", "edge:Knows"] {
+                let dataset = snapshot.open_dataset(table).await.unwrap();
+                assert_eq!(
+                    dataset.count_rows(None).await.unwrap(),
+                    0,
+                    "{input}: {table}"
+                );
+            }
         }
     }
 
@@ -3887,7 +4099,7 @@ node Doc {
 
         let batch = &batches[0];
         let ids = batch
-            .column_by_name("id")
+            .column_by_name("__id")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -3921,13 +4133,13 @@ node Doc {
 
         let batch = &batches[0];
         let srcs = batch
-            .column_by_name("src")
+            .column_by_name("__src")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         let dsts = batch
-            .column_by_name("dst")
+            .column_by_name("__dst")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -4110,7 +4322,7 @@ node Doc {
         let mut ages_by_id = HashMap::new();
         for batch in &batches {
             let ids = batch
-                .column_by_name("id")
+                .column_by_name("__id")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()

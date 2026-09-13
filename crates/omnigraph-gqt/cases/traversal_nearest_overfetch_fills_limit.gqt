@@ -8,6 +8,12 @@
 # notes: Rust twin (probes: one overfetch, no exact pass):
 # notes: issue_567_nearest_gate_falls_back_above_the_ratio.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -40,10 +46,10 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d017","n":17,"name":"doc-017","embedding":[17.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d018","n":18,"name":"doc-018","embedding":[18.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d002","to":"d003","data":{"id":"e002_0"}}
-{"edge":"Knows","from":"d005","to":"d006","data":{"id":"e005_0"}}
-{"edge":"Knows","from":"d008","to":"d009","data":{"id":"e008_0"}}
-{"edge":"Knows","from":"d011","to":"d012","data":{"id":"e011_0"}}
+{"edge":"Knows","id":"e002_0","from":"d002","to":"d003","data":{}}
+{"edge":"Knows","id":"e005_0","from":"d005","to":"d006","data":{}}
+{"edge":"Knows","id":"e008_0","from":"d008","to":"d009","data":{}}
+{"edge":"Knows","id":"e011_0","from":"d011","to":"d012","data":{}}
 
 --- query
 query scenario($q: Vector(4)) {

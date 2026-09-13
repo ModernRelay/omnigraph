@@ -1,6 +1,12 @@
 # issue: none
 # notes: the node object from a search scan and from an rrf-fused batch carries no `_score`, `_distance` or vector column.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Chunk {
     slug: String @key
@@ -28,8 +34,8 @@ query top_chunks($q: String) {
 {"q": "needle"}
 
 --- expect ordered
-{"c": {"id": "chunk-00", "slug": "chunk-00", "text": "needle needle needle filler"}}
-{"c": {"id": "chunk-01", "slug": "chunk-01", "text": "needle needle filler"}}
+{"c": {"@id": "chunk-00", "slug": "chunk-00", "text": "needle needle needle filler"}}
+{"c": {"@id": "chunk-01", "slug": "chunk-01", "text": "needle needle filler"}}
 
 --- expect shape
 c: Chunk
@@ -46,9 +52,9 @@ query hybrid_chunks($q: String, $v: Vector(2)) {
 {"q": "needle", "v": [1.0, 0.0]}
 
 --- expect unordered
-{"c": {"id": "chunk-00", "slug": "chunk-00", "text": "needle needle needle filler"}}
-{"c": {"id": "chunk-01", "slug": "chunk-01", "text": "needle needle filler"}}
-{"c": {"id": "chunk-02", "slug": "chunk-02", "text": "needle filler"}}
+{"c": {"@id": "chunk-00", "slug": "chunk-00", "text": "needle needle needle filler"}}
+{"c": {"@id": "chunk-01", "slug": "chunk-01", "text": "needle needle filler"}}
+{"c": {"@id": "chunk-02", "slug": "chunk-02", "text": "needle filler"}}
 
 --- expect shape
 c: Chunk

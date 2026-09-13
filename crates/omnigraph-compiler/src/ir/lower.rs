@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
+use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemColumns};
 use crate::error::Result;
 use crate::query::ast::*;
 use crate::query::typecheck::{BoundVariable, TypeContext};
@@ -71,16 +72,31 @@ pub fn lower_query(
         .return_clause
         .iter()
         .map(|p| IRProjection {
-            expr: lower_projection(&p.expr, &param_names),
-            alias: p.alias.clone(),
+            expr: lower_projection(&p.expr, &param_names, catalog.system_columns),
+            alias: p.alias.clone().or_else(|| meta_field_result_key(&p.expr)),
         })
+        .collect();
+
+    let has_aggregates = query
+        .return_clause
+        .iter()
+        .any(|p| matches!(&p.expr, Expr::Aggregate { .. }));
+    let aggregate_meta_columns: HashSet<String> = query
+        .return_clause
+        .iter()
+        .filter(|p| has_aggregates && p.alias.is_none())
+        .filter_map(|p| meta_field_result_key(&p.expr))
         .collect();
 
     let order_by: Vec<IROrdering> = query
         .order_clause
         .iter()
         .map(|o| IROrdering {
-            expr: lower_expr(&o.expr, &param_names),
+            expr: meta_field_result_key(&o.expr)
+                .filter(|_| matches!(&o.expr, Expr::PropAccess { .. }))
+                .filter(|name| aggregate_meta_columns.contains(name))
+                .map(IRExpr::AliasRef)
+                .unwrap_or_else(|| lower_expr(&o.expr, &param_names, catalog.system_columns)),
             descending: o.descending,
         })
         .collect();
@@ -374,12 +390,12 @@ fn lower_clauses(
                 pipeline.push(IROp::Filter(IRFilter {
                     left: IRExpr::PropAccess {
                         variable: temp_var,
-                        property: "id".to_string(),
+                        property: catalog.system_columns.id.to_string(),
                     },
                     op: CompOp::Eq,
                     right: IRExpr::PropAccess {
                         variable: traversal.dst.clone(),
-                        property: "id".to_string(),
+                        property: catalog.system_columns.id.to_string(),
                     },
                 }));
             } else if !src_bound && dst_bound {
@@ -503,9 +519,9 @@ fn lower_clauses(
     // Lower explicit filters
     for filter in &filters {
         pipeline.push(IROp::Filter(IRFilter {
-            left: lower_expr(&filter.left, param_names),
+            left: lower_expr(&filter.left, param_names, catalog.system_columns),
             op: resolve_filter_op(catalog, type_ctx, param_types, &local_bindings, filter),
-            right: lower_expr(&filter.right, param_names),
+            right: lower_expr(&filter.right, param_names, catalog.system_columns),
         }));
     }
 
@@ -536,10 +552,13 @@ fn lower_clauses(
     Ok(())
 }
 
-/// Whether `binding.property` is a non-list scalar String. Node and edge type
-/// namespaces are independent, so the binding discriminant selects the one
-/// catalog namespace that may define the property.
+/// Whether `binding.property` is a non-list scalar String. Every meta-field is
+/// one (typecheck admitted it); otherwise the binding discriminant selects the
+/// one independent catalog namespace that may define the property.
 fn is_scalar_string_property(catalog: &Catalog, binding: &BoundVariable, property: &str) -> bool {
+    if property.starts_with('@') {
+        return true;
+    }
     match binding {
         BoundVariable::Node { type_name } => catalog
             .node_types
@@ -691,22 +710,51 @@ fn expr_var(expr: &Expr) -> Option<String> {
 /// A projected rank expression lowers to the score column the retrieval
 /// appends under its binding (`Expr::score_column`); typecheck's T33 has
 /// already required `order` to execute that retrieval.
-fn lower_projection(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
+fn lower_projection(
+    expr: &Expr,
+    param_names: &HashSet<String>,
+    system_columns: SystemColumns,
+) -> IRExpr {
     match expr.score_column() {
         Some((variable, property)) => IRExpr::PropAccess {
             variable: variable.to_string(),
             property: property.to_string(),
         },
-        None => lower_expr(expr, param_names),
+        None => lower_expr(expr, param_names, system_columns),
     }
 }
 
-fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
+/// Lower a query meta-field to the graph's physical spelling.
+/// Bare names remain user properties.
+fn physical_property(property: &str, system_columns: SystemColumns) -> String {
+    match property {
+        name if name == SYSTEM_COLUMNS_META.id => system_columns.id.to_string(),
+        name if name == SYSTEM_COLUMNS_META.src => system_columns.src.to_string(),
+        name if name == SYSTEM_COLUMNS_META.dst => system_columns.dst.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The alias an unaliased meta-field projection needs. The executor keys a
+/// projection by its physical column, which is vintage-specific, so the logical
+/// `var.@id` rides as the alias and result columns read as the query wrote them.
+fn meta_field_result_key(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::PropAccess { variable, property } if property.starts_with('@') => {
+            Some(format!("{variable}.{property}"))
+        }
+        Expr::Aggregate { arg, .. } => meta_field_result_key(arg),
+        _ => None,
+    }
+}
+
+fn lower_expr(expr: &Expr, param_names: &HashSet<String>, system_columns: SystemColumns) -> IRExpr {
+    let lower = |expr: &Expr| lower_expr(expr, param_names, system_columns);
     match expr {
         Expr::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
         Expr::PropAccess { variable, property } => IRExpr::PropAccess {
             variable: variable.clone(),
-            property: property.clone(),
+            property: physical_property(property, system_columns),
         },
         Expr::Nearest {
             variable,
@@ -715,40 +763,37 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
         } => IRExpr::Nearest {
             variable: variable.clone(),
             property: property.clone(),
-            query: Box::new(lower_expr(query, param_names)),
+            query: Box::new(lower(query)),
         },
         Expr::Search { field, query } => IRExpr::Search {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
+            field: Box::new(lower(field)),
+            query: Box::new(lower(query)),
         },
         Expr::Fuzzy {
             field,
             query,
             max_edits,
         } => IRExpr::Fuzzy {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
-            max_edits: max_edits
-                .as_ref()
-                .map(|expr| Box::new(lower_expr(expr, param_names))),
+            field: Box::new(lower(field)),
+            query: Box::new(lower(query)),
+            max_edits: max_edits.as_ref().map(|expr| Box::new(lower(expr))),
         },
         Expr::MatchText { field, query } => IRExpr::MatchText {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
+            field: Box::new(lower(field)),
+            query: Box::new(lower(query)),
         },
         Expr::Bm25 { field, query } => IRExpr::Bm25 {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
+            field: Box::new(lower(field)),
+            query: Box::new(lower(query)),
         },
         Expr::Rrf {
             primary,
             secondary,
             k,
         } => IRExpr::Rrf {
-            primary: Box::new(lower_expr(primary, param_names)),
-            secondary: Box::new(lower_expr(secondary, param_names)),
-            k: k.as_ref()
-                .map(|expr| Box::new(lower_expr(expr, param_names))),
+            primary: Box::new(lower(primary)),
+            secondary: Box::new(lower(secondary)),
+            k: k.as_ref().map(|expr| Box::new(lower(expr))),
         },
         Expr::Variable(v) => {
             if param_names.contains(v) {
@@ -760,7 +805,7 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
         Expr::Literal(l) => IRExpr::Literal(l.clone()),
         Expr::Aggregate { func, arg } => IRExpr::Aggregate {
             func: *func,
-            arg: Box::new(lower_expr(arg, param_names)),
+            arg: Box::new(lower(arg)),
         },
         Expr::AliasRef(name) => IRExpr::AliasRef(name.clone()),
     }

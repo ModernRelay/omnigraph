@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use arrow_array::StringArray;
 use futures::TryStreamExt;
+use omnigraph_compiler::SystemColumns;
 
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
@@ -180,6 +181,7 @@ impl GraphIndex {
     pub async fn build(
         snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>, // edge_name → (from_type, to_type)
+        system_columns: SystemColumns,
     ) -> Result<Self> {
         // Counted here — not at the cache-miss site — so the probe counts
         // actual edge-table scan builds, never persisted-artifact loads.
@@ -209,7 +211,7 @@ impl GraphIndex {
 
             let batches: Vec<arrow_array::RecordBatch> = ds
                 .scan()
-                .project(&["src", "dst"])
+                .project(&[system_columns.src, system_columns.dst])
                 .map_err(OmniError::storage)?
                 .try_into_stream()
                 .await
@@ -227,8 +229,8 @@ impl GraphIndex {
 
             let mut edges: Vec<(u32, u32)> = Vec::new();
             for batch in &batches {
-                let srcs = string_column(batch, "src")?;
-                let dsts = string_column(batch, "dst")?;
+                let srcs = string_column(batch, system_columns.src)?;
+                let dsts = string_column(batch, system_columns.dst)?;
 
                 for i in 0..batch.num_rows() {
                     let src_dense = type_indices
@@ -279,11 +281,12 @@ impl GraphIndex {
         snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>,
         adapter: Option<&dyn crate::storage::StorageAdapter>,
+        system_columns: SystemColumns,
     ) -> Result<Self> {
         if let Some((index, _)) = persist::load(snapshot, edge_types, adapter).await {
             return Ok(index);
         }
-        Self::build(snapshot, edge_types).await
+        Self::build(snapshot, edge_types, system_columns).await
     }
 
     /// Load the persisted artifact fresh for `edge_types`, returning the full
@@ -447,7 +450,7 @@ mod tests {
     fn string_column_returns_error_for_bad_schema() {
         let batch = arrow_array::RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
-                "src",
+                "__src",
                 DataType::UInt64,
                 false,
             )])),
@@ -455,7 +458,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = string_column(&batch, "src").unwrap_err();
-        assert!(err.to_string().contains("src"));
+        let err = string_column(&batch, "__src").unwrap_err();
+        assert!(err.to_string().contains("__src"));
     }
 }

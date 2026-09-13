@@ -35,11 +35,18 @@ pub mod cost;
 pub mod detectors;
 pub mod entropy;
 pub mod env_knobs;
+pub mod environment;
 pub mod fixtures;
 pub mod harness;
 pub mod lance_faults;
 pub mod lane_b;
+pub mod memory;
 pub mod oplog;
 pub mod rand;
 pub mod trace;
 pub mod write_census;
+
+pub use environment::{
+    UniverseEnvironment, UniversePhase, UniverseProcess, UniverseRun, UniverseScenario,
+    run_universe,
+};

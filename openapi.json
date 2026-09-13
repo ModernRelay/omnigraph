@@ -2295,7 +2295,7 @@
           }
         ],
         "requestBody": {
-          "description": "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {}; optional `data.id` follows ordinary ID semantics. Duplicate, unknown, reserved physical, and noncanonical supplied node-ID members are refused.",
+          "description": "Strict raw graph-level NDJSON. Each nonblank line is exactly one node envelope {\"type\":\"<Node>\",\"id\":\"<entity-id>\",\"data\":{...}} or edge envelope {\"edge\":\"<Edge>\",\"id\":\"<entity-id>\",\"from\":\"<src-id>\",\"to\":\"<dst-id>\",\"data\":{...}}. `data` defaults to {} and holds user properties; the optional top-level `id` follows ordinary ID semantics. Legacy-vintage graphs also accept `data.id` as identity when top-level `id` is absent and refuse both placements together. Duplicate, unknown, reserved physical, and noncanonical supplied entity-ID members are refused.",
           "content": {
             "application/x-ndjson": {
               "schema": {
@@ -4738,7 +4738,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary writes and reads.",
+            "description": "The newest internal-schema (storage-format) version this binary serves;\nit also reads and writes the preceding legacy-vintage version.",
             "minimum": 0
           },
           "source_version": {
@@ -5466,6 +5466,17 @@
         "properties": {
           "schema_source": {
             "type": "string"
+          },
+          "system_columns": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SystemColumnsOutput",
+                "description": "The graph's physical system column spellings: `__id`/`__src`/`__dst`\non current-vintage graphs, `id`/`src`/`dst` on legacy ones. This is\nstorage discovery for loaders, exports and raw readers of mixed\nvintages; query results address identity and endpoints through the\nmeta-fields `@id`, `@src` and `@dst` on every vintage. Optional for\ncompatibility with servers predating the field."
+              }
+            ]
           }
         }
       },
@@ -5534,6 +5545,26 @@
             "format": "int32",
             "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at.",
             "minimum": 0
+          }
+        }
+      },
+      "SystemColumnsOutput": {
+        "type": "object",
+        "description": "A graph's system column spellings (see `SchemaOutput::system_columns`).",
+        "required": [
+          "id",
+          "src",
+          "dst"
+        ],
+        "properties": {
+          "dst": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "src": {
+            "type": "string"
           }
         }
       }

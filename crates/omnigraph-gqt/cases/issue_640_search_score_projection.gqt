@@ -4,6 +4,12 @@
 # notes: `{var}._score`) and must repeat the leading `order` key (T33); `_distance` is the squared L2 distance.
 # notes: the bm25 values pin Lance 11's BM25 (k1 1.2, b 0.75, default tokenizer) on this corpus; a Lance bump that changes scoring reds that step by design.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

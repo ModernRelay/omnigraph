@@ -4,6 +4,12 @@
 # notes: Limit 3 with 1 eligible (1 < 3): the prefiltered scan admits fewer rows
 # notes: than k and the answer is that one row, no padding, no error.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -36,7 +42,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d017","n":17,"name":"doc-017","embedding":[17.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d018","n":18,"name":"doc-018","embedding":[18.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d015","to":"d016","data":{"id":"e015_0"}}
+{"edge":"Knows","id":"e015_0","from":"d015","to":"d016","data":{}}
 
 --- query
 query scenario($q: Vector(4)) {

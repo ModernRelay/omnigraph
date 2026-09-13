@@ -5,6 +5,12 @@
 # notes: ranking spans indexed and unindexed fragments. Then `--- restart` and
 # notes: the same query: the committed rows survive the reopen, same answer.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

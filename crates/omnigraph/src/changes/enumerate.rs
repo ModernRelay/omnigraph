@@ -14,18 +14,21 @@
 //! the continuation key inside a page token names a position in that order.
 
 use lance::Dataset;
+use omnigraph_compiler::SystemColumns;
 
 use super::candidate_scan::{CandidatePlan, EmitSource};
 use super::model::{
     COMMIT_CHANGES_MAX_BYTES, ChangeEntityKind, ChangeFeedScope, ChangeOpKind, EntityEndpoints,
     EntityImage, GraphEntityChange, GraphTypeRef,
 };
-use super::row_compare::{OrderedRows, RawRow, ScanTargets, rows_equal, user_schema_fingerprint};
+use super::row_compare::{
+    OrderedRows, RawRow, ScanTargets, rows_equal_across_vintages, user_schema_fingerprint,
+};
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
 use crate::db::DatasetEntry;
 use crate::db::logical_row_image;
-use crate::db::manifest::Snapshot;
+use crate::db::manifest::{Snapshot, system_columns_at_image};
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
 
@@ -125,17 +128,18 @@ async fn emitted_image(
     dataset: &Dataset,
     raw: &RawRow,
     kind: ChangeEntityKind,
+    system_columns: SystemColumns,
 ) -> Result<EntityImage> {
     crate::instrumentation::record_change_image_materialized();
-    let mut properties = logical_row_image(dataset, &raw.slice, 0).await?;
-    properties.remove("id");
+    let mut properties = logical_row_image(dataset, &raw.slice, 0, system_columns.id).await?;
+    properties.remove(system_columns.id);
     let endpoints = if kind == ChangeEntityKind::Edge {
         let from = properties
-            .remove("src")
+            .remove(system_columns.src)
             .and_then(|value| value.as_str().map(str::to_string))
             .ok_or_else(|| OmniError::manifest_internal("edge image is missing src"))?;
         let to = properties
-            .remove("dst")
+            .remove(system_columns.dst)
             .and_then(|value| value.as_str().map(str::to_string))
             .ok_or_else(|| OmniError::manifest_internal("edge image is missing dst"))?;
         Some(EntityEndpoints { from, to })
@@ -171,6 +175,9 @@ pub(crate) async fn next_emit(
     from: &mut OrderedRows,
     to: &mut OrderedRows,
     scope: &ChangeFeedScope,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
 ) -> Result<Option<Emit>> {
     loop {
         let left_id = from.peek().await?.map(|row| row.id.clone());
@@ -188,7 +195,17 @@ pub(crate) async fn next_emit(
             (Some(_), Some(_)) => {
                 let left = from.pop().await?.expect("peeked row present");
                 let right = to.pop().await?.expect("peeked row present");
-                if rows_equal(from.dataset(), &left, to.dataset(), &right).await? {
+                if rows_equal_across_vintages(
+                    from.dataset(),
+                    &left,
+                    to.dataset(),
+                    &right,
+                    from_columns,
+                    to_columns,
+                    is_edge,
+                )
+                .await?
+                {
                     continue;
                 }
                 Emit::Update {
@@ -218,6 +235,11 @@ pub(crate) struct IntervalPlan {
     pub(crate) to_entry: DatasetEntry,
     pub(crate) from_dataset: Dataset,
     pub(crate) to_dataset: Dataset,
+    /// The system column spellings each side's image carries, resolved from
+    /// the image (RFC 0040 Historical reads); the two differ only across the
+    /// upgrade commit.
+    pub(crate) from_columns: SystemColumns,
+    pub(crate) to_columns: SystemColumns,
     /// The candidate-pruning decision, computed by `plan_intervals` BEFORE the
     /// final post-open head witness. The adjacent transaction is referenced by
     /// the already-pinned child manifest, and `Some` stores the complete
@@ -240,12 +262,29 @@ async fn resolve_digest_position(
     key: &ContinuationKey,
 ) -> Result<String> {
     debug_assert!(key.position.is_digest());
-    let mut left =
-        OrderedRows::open(plan.from_dataset.clone(), Some(key.position.scan_after())).await?;
-    let mut right =
-        OrderedRows::open(plan.to_dataset.clone(), Some(key.position.scan_after())).await?;
+    let mut left = OrderedRows::open(
+        plan.from_dataset.clone(),
+        Some(key.position.scan_after()),
+        plan.from_columns.id,
+    )
+    .await?;
+    let mut right = OrderedRows::open(
+        plan.to_dataset.clone(),
+        Some(key.position.scan_after()),
+        plan.to_columns.id,
+    )
+    .await?;
     let mut resolved: Option<String> = None;
-    while let Some(emit) = next_emit(&mut left, &mut right, scope).await? {
+    while let Some(emit) = next_emit(
+        &mut left,
+        &mut right,
+        scope,
+        plan.from_columns,
+        plan.to_columns,
+        plan.kind == ChangeEntityKind::Edge,
+    )
+    .await?
+    {
         let (id, operation_rank) = match &emit {
             Emit::Insert(row) | Emit::Delete(row) => (row.id.as_str(), emit.op().rank()),
             Emit::Update { after, .. } => (after.id.as_str(), emit.op().rank()),
@@ -328,7 +367,17 @@ async fn plan_intervals(
             (Some(from), Some(to)) => {
                 let from_dataset = store.open_at_entry_verified(from).await?;
                 let to_dataset = store.open_at_entry_verified(to).await?;
-                if user_schema_fingerprint(&from_dataset) != user_schema_fingerprint(&to_dataset) {
+                let from_columns = system_columns_at_image(from_dataset.schema(), table_key)?;
+                let to_columns = system_columns_at_image(to_dataset.schema(), table_key)?;
+                if user_schema_fingerprint(
+                    &from_dataset,
+                    from_columns,
+                    crate::db::manifest::is_edge_table_key(table_key),
+                ) != user_schema_fingerprint(
+                    &to_dataset,
+                    to_columns,
+                    crate::db::manifest::is_edge_table_key(table_key),
+                ) {
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
                 let (kind, type_name) = parse_table_key(table_key);
@@ -358,6 +407,8 @@ async fn plan_intervals(
                     to_entry: to.clone(),
                     from_dataset,
                     to_dataset,
+                    from_columns,
+                    to_columns,
                     candidate_plan,
                 });
             }
@@ -487,6 +538,8 @@ pub(crate) async fn enumerate_commit_changes(
             after_id.as_deref(),
             scope,
             ScanTargets::for_page(budget.remaining_rows, budget.remaining_bytes),
+            plan.from_columns,
+            plan.to_columns,
         )
         .await?;
 
@@ -507,18 +560,28 @@ pub(crate) async fn enumerate_commit_changes(
             let op = emit.op();
             let (id, before, after) = match emit {
                 Emit::Insert(raw) => {
-                    let image = emitted_image(source.child_dataset(), &raw, plan.kind).await?;
+                    let image =
+                        emitted_image(source.child_dataset(), &raw, plan.kind, plan.to_columns)
+                            .await?;
                     (raw.id, None, Some(image))
                 }
                 Emit::Delete(raw) => {
-                    let image = emitted_image(source.parent_dataset(), &raw, plan.kind).await?;
+                    let image =
+                        emitted_image(source.parent_dataset(), &raw, plan.kind, plan.from_columns)
+                            .await?;
                     (raw.id, Some(image), None)
                 }
                 Emit::Update { before, after } => {
-                    let before_image =
-                        emitted_image(source.parent_dataset(), &before, plan.kind).await?;
+                    let before_image = emitted_image(
+                        source.parent_dataset(),
+                        &before,
+                        plan.kind,
+                        plan.from_columns,
+                    )
+                    .await?;
                     let after_image =
-                        emitted_image(source.child_dataset(), &after, plan.kind).await?;
+                        emitted_image(source.child_dataset(), &after, plan.kind, plan.to_columns)
+                            .await?;
                     (after.id, Some(before_image), Some(after_image))
                 }
             };

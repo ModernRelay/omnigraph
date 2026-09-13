@@ -38,7 +38,7 @@ to ask questions, share feedback, and follow development.
 | **Built for fleets of agents** | Hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph. |
 | **Multimodal retrieval** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
-| **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS). Native Azure Blob support is available as a qualification preview; code, Azurite validation, and a live managed-identity smoke proof are complete, while adversarial qualification remains pending. VPC, on-prem, hybrid; your data never leaves your store. |
+| **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
 | **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
 
 ## What you can build

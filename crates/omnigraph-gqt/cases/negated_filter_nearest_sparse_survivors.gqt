@@ -6,6 +6,12 @@
 # notes: d049, d050. Short here = the exact pass did not run; more rows = a
 # notes: `not` block was pushed or the anti-join leaked.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

@@ -18,10 +18,22 @@ Branch protection currently requires these reporting contexts:
 - `GQ Logic Tests`
 - `Fix Regression Gate`
 
-`GQ Logic Tests` (`gq-logic-tests.yml`) runs the `.gqt` logic-test corpus on
-every pull request as its own required context; `Test Workspace` runs the same
-target again inside the full workspace suite, also on every pull request but as
-a reporting context. `GQ Logic Tests` takes the documentation-only skip the way
+`GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
+required context aggregating three qualification jobs. `GQT (ordinary)` checks
+unit tests and unavailable-DST refusal from the workspace root. `GQT (dst)`
+runs the whole package, while `GQT (dst-clippy)` checks all package targets
+with Clippy. Both run from `crates/omnigraph-gqt`, whose Cargo configuration
+enables the seeded Tokio runtime. Each job has its own
+45-minute budget and cache key. Matrix fail-fast cancels the remaining jobs
+when one fails; Cargo retains its default fail-fast between test targets.
+The required context fails if classification or any qualification fails,
+is cancelled, or is skipped. A successful run still requires all three jobs
+to pass; fail-fast never turns incomplete qualification into success.
+Test jobs upload invocation reports, and all three jobs upload available
+Cargo build timings separately, including on failure.
+Every corpus case is enrolled, including cases whose required graph
+behavior currently fails. `Test Workspace` excludes this separately tested
+package; it does not silently skip DST cases. `GQ Logic Tests` takes the documentation-only skip the way
 the AWS job does and reports success without building; its workflow carries a
 verbatim copy of the `Classify Changes` job under the name
 `Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
@@ -115,10 +127,10 @@ Container entrypoint and Azure deployment-validation jobs test argument composit
 
 ## Full correctness graphs
 
-The full workspace suite (`Test Workspace`) runs on every non-documentation pull request, on every push to `main`, on release tags, and by manual dispatch. The `main`, tag, and dispatch form (a pull request drops `--no-fail-fast`):
+The workspace suite (`Test Workspace`) runs on every non-documentation pull request, on every push to `main`, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request drops `--no-fail-fast`):
 
 ```bash
-cargo test --workspace --locked --no-fail-fast \
+cargo test --workspace --exclude omnigraph-gqt --locked --no-fail-fast \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
@@ -150,7 +162,7 @@ The remaining jobs own contracts that need special infrastructure. They run afte
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
-- **V5 ↔ V6 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every non-documentation pull request, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it as for `Test Workspace`. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
+- **V5 ↔ V9 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every non-documentation pull request, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it as for `Test Workspace`. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every non-documentation pull request, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards as for `Test Workspace`. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
 - **Azurite Azure integration** runs only after merge, on tags, or by manual
   dispatch: its 90-minute ceiling would outrun `Test Workspace` on a pull
@@ -169,7 +181,7 @@ CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intenti
 
 ## DST tiers
 
-Two workflows own deterministic simulation testing; both set
+Two workflows own the simulator's pinned tests and generated fleets; both set
 `RUSTFLAGS: --cfg tokio_unstable` themselves (the `omnigraph-dst` crate
 compiles empty without it, so the default jobs are unaffected):
 
@@ -184,6 +196,10 @@ compiles empty without it, so the default jobs are unaffected):
   seed intervals. Failures are logs with seed rows, not required contexts;
   the concurrent fleet's `wild` mode makes no replay claim.
 
+`gq-logic-tests.yml` separately owns authored GQT execution through DST. Its
+configured step runs from `crates/omnigraph-gqt` to load `tokio_unstable`.
+An unavailable-runtime refusal test does not replace executing the DST cases.
+
 ## Local pre-push checks
 
 For Rust changes:
@@ -194,8 +210,16 @@ cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_ma
 cargo clippy --workspace --all-targets --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
   -- -D warnings -W clippy::dbg_macro
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
+```
+
+From `crates/omnigraph-gqt`, also run the complete configured package:
+
+```bash
+cargo test -p omnigraph-gqt --locked
+cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro
 ```
 
 For repository metadata and workflow changes:

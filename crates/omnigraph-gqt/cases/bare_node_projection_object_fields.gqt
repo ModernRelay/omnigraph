@@ -1,5 +1,11 @@
 # issue: none
-# notes: the node object keeps `id` and the declared non-Blob, non-Vector properties (the engine rewrites Blob columns before executing, so the exclusion only runs here).
+# notes: the node object keeps `@id` and the declared non-Blob, non-Vector properties (the engine rewrites Blob columns before executing, so the exclusion only runs here).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
 
 --- schema
 node Person {
@@ -26,9 +32,9 @@ query object_and_vector() {
 }
 
 --- expect unordered
-{"p": {"id": "alice", "name": "alice", "age": 30}, "p.embedding": [1.0, 2.0]}
-{"p": {"id": "bob", "name": "bob"}}
-{"p": {"id": "carol", "name": "carol", "age": 41}}
+{"p": {"@id": "alice", "name": "alice", "age": 30}, "p.embedding": [1.0, 2.0]}
+{"p": {"@id": "bob", "name": "bob"}}
+{"p": {"@id": "carol", "name": "carol", "age": 41}}
 
 --- expect shape
 p: Person
@@ -67,8 +73,8 @@ query friends_per_person() {
 }
 
 --- expect unordered
-{"p": {"id": "alice", "name": "alice", "age": 30}, "friends": 2}
-{"p": {"id": "bob", "name": "bob"}, "friends": 1}
+{"p": {"@id": "alice", "name": "alice", "age": 30}, "friends": 2}
+{"p": {"@id": "bob", "name": "bob"}, "friends": 1}
 
 --- expect shape
 p: Person
@@ -82,9 +88,9 @@ query alias_ordered() {
 }
 
 --- expect ordered
-{"person": {"id": "carol", "name": "carol", "age": 41}}
-{"person": {"id": "bob", "name": "bob"}}
-{"person": {"id": "alice", "name": "alice", "age": 30}}
+{"person": {"@id": "carol", "name": "carol", "age": 41}}
+{"person": {"@id": "bob", "name": "bob"}}
+{"person": {"@id": "alice", "name": "alice", "age": 30}}
 
 --- expect shape
 person: Person

@@ -427,7 +427,7 @@ side record".
   the HEAD assertion holds (a pointer switch writes no data).
 - Cross-version, the storage axis this stamp bump owes:
   `crates/omnigraph-cli/tests/crossversion_upgrade.rs`
-  `current_v8_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v8` (skips unless
+  `current_v9_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v9` (skips unless
   `OMNIGRAPH_V6_BIN` names a released 0.10.x binary): the new binary refuses a
   v6 graph naming the export binary, the old binary refuses the new stamp, and
   an export rebuilds with row, vector and blob fidelity;

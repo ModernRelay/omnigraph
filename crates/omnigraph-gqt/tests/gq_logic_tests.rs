@@ -11,66 +11,25 @@
 #![recursion_limit = "512"]
 
 use std::path::Path;
-use std::sync::OnceLock;
-
-use omnigraph_gqt::{
-    bless_from_env, case_budget_from_env, run_case_bounded, traversal_override_refusal,
-};
-use tokio::runtime::Runtime;
-
-/// Worker stack for the case runtime: the engine's query futures overflow
-/// the 2 MiB default (CI sets `RUST_MIN_STACK` to this same value for the
-/// engine test jobs; pinning it here keeps this target's cases independent
-/// of it; the crate's unit tests run on libtest's own threads).
-const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
-
-/// One multi-thread runtime shared by every case; libtest calls `case`
-/// from its own worker threads, each call spawns its case onto the runtime
-/// and blocks on the join handle.
-fn runtime() -> &'static Runtime {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(WORKER_STACK_BYTES)
-            .build()
-            .expect("tokio runtime")
-    })
-}
 
 fn case(path: &Path) -> datatest_stable::Result<()> {
-    if let Some(reason) =
-        traversal_override_refusal(std::env::var_os("OMNIGRAPH_TRAVERSAL_MODE").as_deref())
-    {
+    if let Some(reason) = omnigraph_gqt::traversal_override_refusal(
+        std::env::var_os("OMNIGRAPH_TRAVERSAL_MODE").as_deref(),
+    ) {
         return Err(reason.into());
     }
-    let rt = runtime();
-    let task = rt.spawn(run_case_bounded(
-        path.to_path_buf(),
-        case_budget_from_env(),
-        bless_from_env(),
-    ));
-    // `run_case_bounded` catches the case's own panics; the task around it
-    // holds nothing that can panic.
-    let outcome = rt.block_on(task).expect("a case task never panics");
-    let secs = outcome.elapsed.as_secs_f64();
-    match outcome.result {
-        Ok(()) => {
-            println!("ok {} {secs:.2}s", outcome.stem);
-            Ok(())
-        }
-        Err(detail) => {
-            // The detail (row diff, refusal, panic text, budget overrun) goes
-            // to stdout under the FAIL line: the harness renders a returned
-            // error Debug-escaped on one line, which hides a multi-line diff.
-            println!(
-                "FAIL {} {secs:.2}s\n  {}",
-                outcome.stem,
-                detail.replace('\n', "\n  ")
-            );
-            Err(format!("{}: see its FAIL block above", outcome.stem).into())
-        }
-    }
+    let bless = omnigraph_gqt::bless_from_env().map_err(|error| {
+        omnigraph_gqt::report_cli_refusal(Some(path.to_path_buf()), None, error)
+    })?;
+    let outcome =
+        omnigraph_gqt::run_corpus_case(path, Path::new(env!("CARGO_BIN_EXE_omnigraph-gqt")), bless);
+    println!(
+        "{} {} {:.2}s",
+        if outcome.result.is_ok() { "ok" } else { "FAIL" },
+        outcome.stem,
+        outcome.elapsed.as_secs_f64()
+    );
+    outcome.result.map_err(Into::into)
 }
 
 datatest_stable::harness! {

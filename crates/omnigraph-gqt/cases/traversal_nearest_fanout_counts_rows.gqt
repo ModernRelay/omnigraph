@@ -6,6 +6,12 @@
 # notes: 4: the two nearest docs' four (d, t) pairs (6 > 4); the order within one
 # notes: d is unspecified, so the expect is the unordered set.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -58,12 +64,12 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d037","n":37,"name":"doc-037","embedding":[37.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d038","n":38,"name":"doc-038","embedding":[38.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d039","n":39,"name":"doc-039","embedding":[39.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d010","to":"d011","data":{"id":"e010_0"}}
-{"edge":"Knows","from":"d010","to":"d012","data":{"id":"e010_1"}}
-{"edge":"Knows","from":"d020","to":"d021","data":{"id":"e020_0"}}
-{"edge":"Knows","from":"d020","to":"d022","data":{"id":"e020_1"}}
-{"edge":"Knows","from":"d030","to":"d031","data":{"id":"e030_0"}}
-{"edge":"Knows","from":"d030","to":"d032","data":{"id":"e030_1"}}
+{"edge":"Knows","id":"e010_0","from":"d010","to":"d011","data":{}}
+{"edge":"Knows","id":"e010_1","from":"d010","to":"d012","data":{}}
+{"edge":"Knows","id":"e020_0","from":"d020","to":"d021","data":{}}
+{"edge":"Knows","id":"e020_1","from":"d020","to":"d022","data":{}}
+{"edge":"Knows","id":"e030_0","from":"d030","to":"d031","data":{}}
+{"edge":"Knows","id":"e030_1","from":"d030","to":"d032","data":{}}
 
 --- query
 query scenario($q: Vector(4)) {

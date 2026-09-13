@@ -11,6 +11,7 @@ use lance::index::DatasetIndexExt;
 use lance_namespace::models::CreateTableVersionRequest;
 use lance_table::format::IndexMetadata;
 use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3, SystemColumns};
 
 #[path = "manifest/graph.rs"]
 mod graph;
@@ -57,6 +58,7 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{
     OMNIGRAPH_ROW_COUNT_KEY, object_store_path_from_uri, table_version_metadata_for_state,
 };
+pub(crate) use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
@@ -73,8 +75,8 @@ pub(crate) use recovery::{
     confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
     finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
     new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
-    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_manifest_drift,
-    schema_apply_serial_queue_key, write_sidecar,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_failed_branch_merge_under_gates,
+    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::DatasetEntry;
 #[cfg(test)]
@@ -85,10 +87,8 @@ use state::{
     read_manifest_state, read_object_identities_at_offsets,
 };
 
-/// The internal-schema (storage-format) version this binary writes and reads.
-/// A graph's on-disk per-branch stamp is read via [`internal_schema_stamp_at`];
-/// this const is the binary's CURRENT. Surfaced to operators via `omnigraph
-/// snapshot` and `omnigraph --version`.
+/// The maximum supported storage-format stamp; this binary reads and writes 8 or 9.
+/// Read a graph's per-branch stamp with [`internal_schema_stamp_at`].
 pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = migrations::INTERNAL_MANIFEST_SCHEMA_VERSION;
 
 const OBJECT_TYPE_TABLE: &str = "table";
@@ -141,25 +141,13 @@ pub(crate) async fn internal_schema_stamp_at(
     Ok(migrations::read_stamp(&dataset))
 }
 
-/// Refuse to open a graph whose `__manifest` (main) is stamped outside this
-/// binary's supported internal-schema range (newer than CURRENT, or older than
-/// MIN_SUPPORTED). Both open paths (read-write and read-only) call this before
-/// reading any data, so an old binary refuses a newer graph instead of silently
-/// misreading it, and this binary refuses a below-floor graph with a
-/// rebuild-via-export/import message instead of opening a format it can't read.
-///
-/// The stamp is gated at the GRAPH level (main only). It is a graph-wide
-/// storage-format property — the upgrade path is a whole-graph export/import, so
-/// with one binary version every branch is always CURRENT (init stamps main,
-/// `create_branch` forks the stamp, the publisher writes rows without
-/// re-stamping). A branch stamped out of range while main stays in range is only
-/// reachable with concurrent multi-version writers, an unsupported topology
-/// (writes are refused per-branch by the publisher; a newer binary advancing
-/// main is refused here). See the matching known gap in `docs/dev/invariants.md`.
-pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Result<()> {
+/// Read main's supported storage-format stamp before either graph-open path
+/// loads data. The publisher separately validates the selected branch before
+/// publication; supported bounds are owned by [`migrations::guard_stamp`].
+pub(crate) async fn read_supported_internal_schema_version(root_uri: &str) -> Result<u32> {
     let control_session = crate::lance_access::control_session();
     let dataset = open_manifest_dataset_with_session(root_uri, None, &control_session).await?;
-    migrations::guard_stamp(&dataset).map(|_| ())
+    migrations::guard_stamp(&dataset)
 }
 
 /// Whether the selected graph-manifest dataset depends on files outside its
@@ -204,6 +192,55 @@ pub struct Snapshot {
     /// snapshots, time-travel / Snapshot-id reads, and directly-built test
     /// snapshots, which fall back to a plain open.
     read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
+}
+
+pub(crate) fn is_edge_table_key(table_key: &str) -> bool {
+    table_key.starts_with("edge:")
+}
+
+/// The vintage a system identity column's spelling belongs to.
+fn vintage_of_identity_spelling(id: &str, table_key: &str) -> Result<SystemColumns> {
+    if id == SYSTEM_COLUMNS_LEGACY.id {
+        Ok(SYSTEM_COLUMNS_LEGACY)
+    } else if id == SYSTEM_COLUMNS_V3.id {
+        Ok(SYSTEM_COLUMNS_V3)
+    } else {
+        Err(OmniError::manifest_internal(format!(
+            "table '{table_key}': its system identity column is spelled '{id}', which is \
+             neither 'id' nor '__id'"
+        )))
+    }
+}
+
+/// Resolve system column spellings from a pinned image's exact non-null Utf8 primary key.
+pub(crate) fn system_columns_at_image(
+    image: &LanceSchema,
+    table_key: &str,
+) -> Result<SystemColumns> {
+    let primary_key = image.unenforced_primary_key();
+    let [id] = primary_key.as_slice() else {
+        return Err(OmniError::manifest_internal(format!(
+            "table '{table_key}': the pinned image has {} unenforced primary key fields, \
+             expected exactly the system identity column",
+            primary_key.len()
+        )));
+    };
+    if id.nullable || id.data_type() != arrow_schema::DataType::Utf8 {
+        return Err(OmniError::manifest_internal(format!(
+            "table '{table_key}': the system identity primary key must be non-null Utf8"
+        )));
+    }
+    let vintage = vintage_of_identity_spelling(&id.name, table_key)?;
+    if is_edge_table_key(table_key)
+        && (image.field(vintage.src).is_none() || image.field(vintage.dst).is_none())
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "table '{table_key}': the pinned image lacks the '{}'/'{}' endpoints of its \
+             identity column's vintage",
+            vintage.src, vintage.dst
+        )));
+    }
+    Ok(vintage)
 }
 
 /// Ephemeral native-table liveness proof derived from every live graph branch.
@@ -880,7 +917,7 @@ pub(crate) fn table_path_for_identity(table_key: &str, identity: TableIdentity) 
             identity.stable_table_id, identity.table_incarnation_id
         ));
     }
-    if table_key.strip_prefix("edge:").is_some() {
+    if is_edge_table_key(table_key) {
         return Ok(format!(
             "edges/{:016x}-{:016x}",
             identity.stable_table_id, identity.table_incarnation_id
@@ -1072,7 +1109,7 @@ impl ManifestCoordinator {
         catalog: &Catalog,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<(Self, Vec<GraphLineageRow>)> {
-        let attempt = GenesisManifestAttempt::mint()?;
+        let attempt = GenesisManifestAttempt::mint(catalog.system_columns)?;
         let dataset = Self::init_commit(root_uri, catalog, control_session, &attempt).await?;
         Self::finish_init(root_uri, dataset).await
     }
@@ -1894,6 +1931,9 @@ impl ManifestCoordinator {
     }
 }
 
+#[cfg(test)]
+#[path = "manifest/system_roles_tests.rs"]
+mod system_roles_tests;
 #[cfg(test)]
 #[path = "manifest/tests.rs"]
 mod tests;

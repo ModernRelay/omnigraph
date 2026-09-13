@@ -196,10 +196,20 @@ pub fn plan_schema_migration(
         .into());
     }
     validate_evolution_identity(accepted, desired)?;
+    let system_columns = accepted.system_columns();
+    if desired.system_columns() != system_columns {
+        return Err(crate::error::SchemaIdentityError::Resolution(format!(
+            "migration planning requires matching system column spellings (accepted {}, desired {}); \
+             the vintage never changes under evolution",
+            system_columns.id,
+            desired.system_columns().id
+        ))
+        .into());
+    }
     let mut steps = Vec::new();
     plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
-    plan_nodes(&accepted.nodes, &desired.nodes, &mut steps);
-    plan_edges(&accepted.edges, &desired.edges, &mut steps);
+    plan_nodes(&accepted.nodes, &desired.nodes, &mut steps, system_columns);
+    plan_edges(&accepted.edges, &desired.edges, &mut steps, system_columns);
 
     if steps.is_empty() && accepted != desired {
         steps.push(SchemaMigrationStep::UnsupportedChange {
@@ -409,7 +419,12 @@ fn plan_interfaces(
     }
 }
 
-fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMigrationStep>) {
+fn plan_nodes(
+    accepted: &[NodeIR],
+    desired: &[NodeIR],
+    steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
+) {
     let accepted_by_id = accepted
         .iter()
         .map(|node| (node.type_id, node))
@@ -475,6 +490,7 @@ fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMig
             &existing.constraints,
             &node.constraints,
             steps,
+            system_columns,
         );
     }
 
@@ -497,7 +513,12 @@ fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMig
     }
 }
 
-fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMigrationStep>) {
+fn plan_edges(
+    accepted: &[EdgeIR],
+    desired: &[EdgeIR],
+    steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
+) {
     let accepted_by_id = accepted
         .iter()
         .map(|edge| (edge.type_id, edge))
@@ -565,6 +586,7 @@ fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMig
             &existing.constraints,
             &edge.constraints,
             steps,
+            system_columns,
         );
     }
 
@@ -838,6 +860,7 @@ fn plan_constraints(
     accepted: &[ConstraintIR],
     desired: &[ConstraintIR],
     steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
 ) {
     let desired_map = desired
         .iter()
@@ -875,7 +898,7 @@ fn plan_constraints(
                 let step = SchemaMigrationStep::AddConstraint {
                     type_kind,
                     type_name: type_name.to_string(),
-                    constraint: constraint_from_ir(&constraint),
+                    constraint: constraint_from_ir(&constraint, system_columns),
                 };
                 if !steps.contains(&step) {
                     steps.push(step);
@@ -885,7 +908,8 @@ fn plan_constraints(
                 entity: format!("{}:{}", schema_type_kind_key(type_kind), type_name),
                 reason: format!(
                     "adding constraint '{}' to '{}' is not supported in schema migration v1",
-                    key, type_name
+                    constraint_from_ir(&constraint, system_columns),
+                    type_name
                 ),
                 code: None,
             }),
@@ -1176,6 +1200,93 @@ node Ticket {
         );
     }
 
+    /// A legacy-vintage accepted IR, built the way `Omnigraph::init` builds
+    /// one: an empty accept stripped of `system-columns`, then resolved.
+    fn legacy_ir(source: &str) -> crate::catalog::schema_ir::SchemaIR {
+        let empty = compile_schema_shape(&parse_schema("").unwrap()).unwrap();
+        let accepted = crate::catalog::schema_ir::into_legacy_vintage(
+            initialize_schema_ir(
+                SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                &empty,
+            )
+            .unwrap()
+            .schema_ir,
+        );
+        evolve(&accepted, source)
+    }
+
+    const LEGACY_KEYED: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+"#;
+
+    /// Legacy graphs keyed on main carry ir_version 4 and no names; evolution
+    /// re-stamps them 5 + `edge-keys`, and gaining or losing edge keys moves
+    /// 2 ↔ 5 within one vintage.
+    #[test]
+    fn plan_evolves_legacy_graphs_across_the_feature_number() {
+        let mut accepted = legacy_ir(LEGACY_KEYED);
+        accepted.features.clear();
+        accepted.ir_version = crate::catalog::schema_ir::SCHEMA_IR_VERSION_EDGE_KEYS;
+        validate_schema_ir(&accepted).unwrap();
+        let desired = evolve(
+            &accepted,
+            r#"
+node Person { name: String @key extra: String? }
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+"#,
+        );
+        assert_eq!(
+            desired.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION_FEATURES
+        );
+        assert_eq!(desired.system_columns(), accepted.system_columns());
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            AddProperty { property_name, .. } if property_name == "extra"
+        )));
+
+        let unkeyed = legacy_ir("node Person { name: String @key }\n");
+        assert_eq!(
+            unkeyed.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION
+        );
+        let keyed = evolve(&unkeyed, LEGACY_KEYED);
+        assert_eq!(
+            keyed.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION_FEATURES
+        );
+        let gained = plan_schema_migration(&unkeyed, &keyed).unwrap();
+        assert!(gained.supported, "{gained:?}");
+        let unkeyed_again = evolve(&keyed, "node Person { name: String @key }\n");
+        assert_eq!(
+            unkeyed_again.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION
+        );
+        let lost = plan_schema_migration(&keyed, &unkeyed_again).unwrap();
+        assert!(lost.supported, "{lost:?}");
+    }
+
+    #[test]
+    fn plan_refuses_a_vintage_change() {
+        let accepted = legacy_ir("node Person { name: String @key }\n");
+        let desired = ir("node Person { name: String @key }\n");
+        assert_ne!(desired.system_columns(), accepted.system_columns());
+        let error = plan_schema_migration(&accepted, &desired)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("matching system column spellings"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn plan_refuses_adding_edge_key_to_existing_type() {
         // The `is_key` committed-lookup skip is sound only because a key
@@ -1193,7 +1304,7 @@ edge Knows: Person -> Person {
 node Person { name: String @key }
 edge Knows: Person -> Person {
     since: String?
-    @key(src, dst)
+    @key(@src, @dst)
 }
 "#,
         );
@@ -1657,6 +1768,14 @@ node Pair {
 
     #[test]
     fn plan_classifies_property_constraint_provenance_and_satisfaction_changes() {
+        let accepted = ir("node N { value: String } edge E: N -> N {}");
+        let desired = evolve(
+            &accepted,
+            "node N { value: String } edge E: N -> N { @unique(@src, @dst) }",
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.steps.iter().any(|step| matches!(step, UnsupportedChange { reason, .. }
+            if reason == "adding constraint '@unique(@dst, @src)' to 'E' is not supported in schema migration v1")));
         let accepted = ir("node N { value: String @unique }");
         let desired = evolve(&accepted, "node N { value: String @unique(value) }");
         let plan = plan_schema_migration(&accepted, &desired).unwrap();

@@ -9,6 +9,12 @@
 # notes: leave d00, d04 and d08 only. Rust twin:
 # notes: issue_567_nearest_traversal_prefilters_then_overfetches (tests/search.rs).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -29,9 +35,9 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d07","embedding":[7.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d08","embedding":[8.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d09","embedding":[9.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d00","to":"d01","data":{"id":"e00"}}
-{"edge":"Knows","from":"d04","to":"d05","data":{"id":"e04"}}
-{"edge":"Knows","from":"d08","to":"d09","data":{"id":"e08"}}
+{"edge":"Knows","id":"e00","from":"d00","to":"d01","data":{}}
+{"edge":"Knows","id":"e04","from":"d04","to":"d05","data":{}}
+{"edge":"Knows","id":"e08","from":"d08","to":"d09","data":{}}
 
 --- query
 query nearest_with_edge($q: Vector(4)) {

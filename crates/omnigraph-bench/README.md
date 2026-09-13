@@ -404,7 +404,7 @@ evidence.
 
 ## Runner-v1 support envelope
 
-Execution currently supports only synthetic builder v2 with seed `0`. Its even
+Execution currently supports only synthetic builder v3 with seed `0`. Its even
 total table count is split equally between immutable node endpoint tables and
 uniform-ring edge tables; declared divergence applies to edge tables. It uses
 scalar uniform bulk-loaded data, no indexes or pre-existing deletion history,

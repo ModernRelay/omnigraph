@@ -181,7 +181,7 @@ node BenchmarkRun {
 }
 
 edge Measures: BenchmarkRun -> BenchmarkPoint @card(1..1) {
-    @unique(src, dst)
+    @unique(@src, @dst)
 }
 "#;
 
@@ -654,15 +654,14 @@ struct NodeEnvelope<'a, T> {
 #[derive(Serialize)]
 struct EdgeEnvelope<'a, T> {
     edge: &'a str,
+    id: String,
     from: &'a str,
     to: &'a str,
     data: T,
 }
 
 #[derive(Serialize)]
-struct EdgeIdentity {
-    id: String,
-}
+struct MeasuresProperties {}
 
 #[derive(Debug)]
 struct ValidatedInventory {
@@ -1779,11 +1778,10 @@ async fn load_runs(db: &Omnigraph, records: ArchiveRecordIter) -> Result<(), Pro
         })?;
         let edge_line = serialize_graph_row(&EdgeEnvelope {
             edge: "Measures",
+            id: format!("measures:{}", record.invocation.invocation_id),
             from: &record.invocation.invocation_id,
             to: &record.run.point_id,
-            data: EdgeIdentity {
-                id: format!("measures:{}", record.invocation.invocation_id),
-            },
+            data: MeasuresProperties {},
         })?;
         if let Some(body) = batch.push_group(&[run_line, edge_line])? {
             load_batch(db, &body).await?;
@@ -4640,20 +4638,18 @@ mod tests {
         let second_run_line = serde_json::to_string(&second_run).unwrap();
         let edge_line = serialize_graph_row(&EdgeEnvelope {
             edge: "Measures",
+            id: format!("measures:{first_invocation_id}"),
             from: first_invocation_id,
             to: &point_id,
-            data: EdgeIdentity {
-                id: format!("measures:{first_invocation_id}"),
-            },
+            data: MeasuresProperties {},
         })
         .unwrap();
         let second_edge_line = serialize_graph_row(&EdgeEnvelope {
             edge: "Measures",
+            id: format!("measures:{second_invocation_id}"),
             from: second_invocation_id,
             to: &point_id,
-            data: EdgeIdentity {
-                id: format!("measures:{second_invocation_id}"),
-            },
+            data: MeasuresProperties {},
         })
         .unwrap();
         load_batch(

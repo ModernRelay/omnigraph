@@ -141,6 +141,18 @@ pub enum Constraint {
     },
 }
 
+impl std::fmt::Display for Constraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Key(columns) => write!(f, "@key({})", columns.join(", ")),
+            Self::Unique(columns) => write!(f, "@unique({})", columns.join(", ")),
+            Self::Index(columns) => write!(f, "@index({})", columns.join(", ")),
+            Self::Range { property, min, max } => write!(f, "@range({property}, {min:?}, {max:?})"),
+            Self::Check { property, pattern } => write!(f, "@check({property}, {pattern:?})"),
+        }
+    }
+}
+
 /// A numeric bound used in `@range` constraints.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConstraintBound {

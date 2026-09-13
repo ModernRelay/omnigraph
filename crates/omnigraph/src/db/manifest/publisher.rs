@@ -279,11 +279,6 @@ impl GraphNamespacePublisher {
             crate::failpoints::names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION,
         )?;
         let dataset = self.dataset().await?;
-        // Refuse a graph this binary cannot serve before publishing. Fresh and
-        // already-current graphs pass; a sub-CURRENT stamp (an older storage
-        // format) is refused with the rebuild-via-export/import message. There is
-        // no in-place migration — storage-format changes are a cutover. See
-        // `db/manifest/migrations.rs`.
         guard_stamp(&dataset)?;
         // ONE `__manifest` scan for everything the publish needs: table
         // locations, version entries, tombstones, `graph_commit` lineage rows

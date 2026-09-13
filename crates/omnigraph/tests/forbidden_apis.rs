@@ -160,6 +160,7 @@ const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     "db/manifest/namespace.rs",
     "db/manifest/tests.rs",
     "db/manifest/upgrade/tests.rs",
+    "db/manifest/system_roles_tests.rs", // Test-only raw Lance rename fixture.
 ];
 
 const SENTINEL: &str = "// forbidden-api-allow:";
@@ -236,7 +237,7 @@ write_surfaces! {
         "ensure_indices", "ensure_indices_on",
         "rebuild_full_text_indices_on", "rebuild_full_text_indices_on_as",
     ],
-    "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test"],
+    "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test", "init_with_legacy_system_columns_for_tests"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
     "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
     "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
@@ -840,7 +841,8 @@ durable_calls! {
     // First-touch write: enumerate native refs before arming recovery; no mutation.
     ("db/omnigraph.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/table_ops.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/export.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    // Two pinned entity row scans and one schema read for system-role resolution.
+    ("db/omnigraph/export.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
     // Blob live-branch recheck: lists the table's refs to prove a vanished
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
@@ -853,9 +855,10 @@ durable_calls! {
     // Read-only — it stages and publishes nothing.
     ("changes/candidate_scan.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // Net-diff cross-branch path: the same typed row comparison over two
-    // pinned snapshot handles. Read-only — the diff stages and publishes
-    // nothing.
-    ("changes/mod.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    // pinned snapshot handles, plus the same-lineage path reading each
+    // side's schema to resolve its system column spellings (RFC 0040
+    // Historical reads). Read-only — the diff stages and publishes nothing.
+    ("changes/mod.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable

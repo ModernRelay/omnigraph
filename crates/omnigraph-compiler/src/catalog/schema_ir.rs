@@ -6,7 +6,7 @@
 //! preserving identities only for exact matches and explicit, same-kind,
 //! same-owner renames.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::str::FromStr;
@@ -25,32 +25,121 @@ use super::schema_shape::{
     SchemaShape, ShapePropertyRef, constraint_sort_key, schema_shape_hash,
 };
 
+/// The base `ir_version`: an IR whose feature set is empty. Graphs at this
+/// number keep the legacy system column spellings (`id`, `src`, `dst`) and the
+/// legacy reservation of those three property names.
 pub const SCHEMA_IR_VERSION: u32 = 2;
 
-/// Minted only when a schema declares an edge `@key` (RFC 0044); unkeyed
-/// schemas keep stamping [`SCHEMA_IR_VERSION`]. 3 is burned: the withdrawn
-/// actor-provenance build stamped it and RFC 0054 refuses it before recovery.
+/// RFC 0044's edge-key number as merged: accepted on load for keyed schemas
+/// stamped before RFC 0040's feature set existed, never emitted again (a keyed
+/// accept now stamps [`SCHEMA_IR_VERSION_FEATURES`] with `edge-keys` in the
+/// set). 3 is burned: the withdrawn actor-provenance build stamped it and RFC
+/// 0054 refuses it before recovery.
 pub const SCHEMA_IR_VERSION_EDGE_KEYS: u32 = 4;
+
+/// The scalar's last value (RFC 0040): an IR at this number carries
+/// `features`, a set of feature names, and every later schema feature adds a
+/// name, never a number.
+pub const SCHEMA_IR_VERSION_FEATURES: u32 = 5;
+
+/// Feature name: system columns spelled `__id`/`__src`/`__dst`, with `id`,
+/// `src`, `dst` free for user properties. Recorded at graph creation or added
+/// by the upgrade, never derived from declarations, so no ordinary schema
+/// apply can flip a graph's spellings.
+pub const FEATURE_SYSTEM_COLUMNS: &str = "system-columns";
+
+/// Feature name: the schema declares an edge `@key` (RFC 0044). Derived from
+/// the declarations at every accept.
+pub const FEATURE_EDGE_KEYS: &str = "edge-keys";
+
+/// The per-graph spellings of the implicit stored columns. Resolved from the
+/// accepted IR's feature set; no other code path may assume a spelling
+/// (RFC 0040).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemColumns {
+    pub id: &'static str,
+    pub src: &'static str,
+    pub dst: &'static str,
+}
+
+pub const SYSTEM_COLUMNS_META: SystemColumns = SystemColumns {
+    id: "@id",
+    src: "@src",
+    dst: "@dst",
+};
+
+pub const SYSTEM_COLUMNS_LEGACY: SystemColumns = SystemColumns {
+    id: "id",
+    src: "src",
+    dst: "dst",
+};
+
+/// Spellings for graphs whose feature set carries [`FEATURE_SYSTEM_COLUMNS`].
+pub const SYSTEM_COLUMNS_V3: SystemColumns = SystemColumns {
+    id: "__id",
+    src: "__src",
+    dst: "__dst",
+};
+
+/// The system column spellings a feature set records: the vintage is
+/// `system-columns` membership, never the number.
+pub fn system_columns_for_features(features: &BTreeSet<String>) -> SystemColumns {
+    if features.contains(FEATURE_SYSTEM_COLUMNS) {
+        SYSTEM_COLUMNS_V3
+    } else {
+        SYSTEM_COLUMNS_LEGACY
+    }
+}
 
 /// The one owner of "which stamped `ir_version`s this build opens": the
 /// contract validator and the engine's pre-recovery envelope gate both ask here.
 pub fn is_supported_ir_version(version: u32) -> bool {
-    version == SCHEMA_IR_VERSION || version == SCHEMA_IR_VERSION_EDGE_KEYS
+    version == SCHEMA_IR_VERSION
+        || version == SCHEMA_IR_VERSION_EDGE_KEYS
+        || version == SCHEMA_IR_VERSION_FEATURES
 }
 
-/// The `ir_version` an accepted schema is stamped with: the highest version
-/// its declared features require.
-pub fn required_ir_version(ir: &SchemaIR) -> u32 {
+/// Every feature name this build knows; an IR naming any other is refused.
+pub fn is_known_feature(name: &str) -> bool {
+    name == FEATURE_SYSTEM_COLUMNS || name == FEATURE_EDGE_KEYS
+}
+
+/// The feature set an accepted schema must carry: the names its declarations
+/// derive (`edge-keys` when any edge declares a `@key`) plus the one name that
+/// is never derived, `system-columns`, preserved from the IR it evolves.
+pub fn required_features(ir: &SchemaIR) -> BTreeSet<String> {
+    let mut features = BTreeSet::new();
+    if ir.features.contains(FEATURE_SYSTEM_COLUMNS) {
+        features.insert(FEATURE_SYSTEM_COLUMNS.to_string());
+    }
     let has_edge_key = ir.edges.iter().any(|edge| {
         edge.constraints
             .iter()
             .any(|constraint| matches!(constraint, ConstraintIR::Key { .. }))
     });
     if has_edge_key {
-        SCHEMA_IR_VERSION_EDGE_KEYS
-    } else {
-        SCHEMA_IR_VERSION
+        features.insert(FEATURE_EDGE_KEYS.to_string());
     }
+    features
+}
+
+/// The `ir_version` an accept stamps: the base number for an empty feature
+/// set, [`SCHEMA_IR_VERSION_FEATURES`] for any name. The rule is total;
+/// [`SCHEMA_IR_VERSION_EDGE_KEYS`] is never emitted again.
+pub fn required_ir_version(features: &BTreeSet<String>) -> u32 {
+    if features.is_empty() {
+        SCHEMA_IR_VERSION
+    } else {
+        SCHEMA_IR_VERSION_FEATURES
+    }
+}
+
+/// The legacy-vintage twin of an accepted IR: drop `system-columns` and
+/// re-derive the version. The one place the vintage is ever stripped.
+pub fn into_legacy_vintage(mut ir: SchemaIR) -> SchemaIR {
+    ir.features.remove(FEATURE_SYSTEM_COLUMNS);
+    ir.ir_version = required_ir_version(&ir.features);
+    ir
 }
 
 /// Opaque namespace for every numeric identity in one graph root.
@@ -167,6 +256,11 @@ identity_newtype!(TableIncarnationId, "table incarnation id");
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaIR {
     pub ir_version: u32,
+    /// The feature names this graph requires (RFC 0040). Absent below
+    /// [`SCHEMA_IR_VERSION_FEATURES`], so an IR with no names serializes to
+    /// exactly the pre-feature bytes.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub features: BTreeSet<String>,
     pub schema_identity_domain: SchemaIdentityDomain,
     /// The next value to consume.  Type, property, and incarnation IDs share
     /// this monotonically increasing, no-reuse sequence.
@@ -174,6 +268,13 @@ pub struct SchemaIR {
     pub interfaces: Vec<InterfaceIR>,
     pub nodes: Vec<NodeIR>,
     pub edges: Vec<EdgeIR>,
+}
+
+impl SchemaIR {
+    /// This graph's system column spellings, fixed by its feature set.
+    pub fn system_columns(&self) -> SystemColumns {
+        system_columns_for_features(&self.features)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -376,20 +477,30 @@ pub fn initialize_schema_ir(
 /// Resolve evolution against the one accepted identity authority.
 pub fn resolve_schema_ir(accepted: &SchemaIR, shape: &SchemaShape) -> Result<SchemaResolution> {
     validate_schema_ir(accepted)?;
+    let shape =
+        shape.canonicalized_for_system_columns(system_columns_for_features(&accepted.features));
     resolve(
         accepted.schema_identity_domain.clone(),
         accepted.next_identity_id,
         Some(accepted),
-        shape,
+        &shape,
     )
 }
 
+/// Resolves a shape into IR. The `system-columns` feature is never derived from
+/// the shape: a new graph is born with it, an evolving graph keeps exactly what
+/// its accepted IR carried.
 fn resolve(
     domain: SchemaIdentityDomain,
     next_identity_id: u64,
     accepted: Option<&SchemaIR>,
     shape: &SchemaShape,
 ) -> Result<SchemaResolution> {
+    let mut carried_features = BTreeSet::new();
+    if accepted.is_none_or(|ir| ir.features.contains(FEATURE_SYSTEM_COLUMNS)) {
+        carried_features.insert(FEATURE_SYSTEM_COLUMNS.to_string());
+    }
+    let system_columns = system_columns_for_features(&carried_features);
     let accepted_types = accepted.map(accepted_types).unwrap_or_default();
     let accepted_by_key = accepted_types
         .iter()
@@ -643,6 +754,7 @@ fn resolve(
                     incarnation,
                     &node.constraints,
                     &property_assignments,
+                    system_columns,
                 )?,
             })
         })
@@ -675,6 +787,7 @@ fn resolve(
                     incarnation,
                     &edge.constraints,
                     &property_assignments,
+                    system_columns,
                 )?,
             })
         })
@@ -682,13 +795,15 @@ fn resolve(
 
     let mut schema_ir = SchemaIR {
         ir_version: SCHEMA_IR_VERSION,
+        features: carried_features,
         schema_identity_domain: domain,
         next_identity_id: allocator.next,
         interfaces,
         nodes,
         edges,
     };
-    schema_ir.ir_version = required_ir_version(&schema_ir);
+    schema_ir.features = required_features(&schema_ir);
+    schema_ir.ir_version = required_ir_version(&schema_ir.features);
     validate_schema_ir(&schema_ir)?;
     Ok(SchemaResolution {
         schema_ir,
@@ -877,6 +992,7 @@ fn build_constraints(
     incarnation: TableIncarnationId,
     constraints: &[Constraint],
     properties: &BTreeMap<(StableTypeId, String), StablePropertyId>,
+    system_columns: SystemColumns,
 ) -> Result<Vec<ConstraintIR>> {
     constraints
         .iter()
@@ -889,6 +1005,7 @@ fn build_constraints(
                     incarnation,
                     name,
                     properties,
+                    system_columns,
                 )
             };
             let fields = |names: &[String]| {
@@ -921,6 +1038,9 @@ fn build_constraints(
         .collect()
 }
 
+/// Resolves a constraint argument to a field. `@id`/`@src`/`@dst` name system
+/// fields on every vintage; a legacy graph additionally answers to the bare
+/// `id`/`src`/`dst` its persisted constraints were written under.
 fn field_ref(
     kind: TypeKind,
     owner_type_id: StableTypeId,
@@ -928,12 +1048,21 @@ fn field_ref(
     incarnation: TableIncarnationId,
     name: &str,
     properties: &BTreeMap<(StableTypeId, String), StablePropertyId>,
+    system_columns: SystemColumns,
 ) -> Result<FieldRefIR> {
-    let system_role = match name {
-        "id" => Some(SystemFieldRole::Id),
-        "src" if kind == TypeKind::Edge => Some(SystemFieldRole::Src),
-        "dst" if kind == TypeKind::Edge => Some(SystemFieldRole::Dst),
-        _ => None,
+    let legacy_bare = system_columns == SYSTEM_COLUMNS_LEGACY;
+    let system_role = if name == SYSTEM_COLUMNS_META.id || (legacy_bare && name == "id") {
+        Some(SystemFieldRole::Id)
+    } else if (name == SYSTEM_COLUMNS_META.src || (legacy_bare && name == "src"))
+        && kind == TypeKind::Edge
+    {
+        Some(SystemFieldRole::Src)
+    } else if (name == SYSTEM_COLUMNS_META.dst || (legacy_bare && name == "dst"))
+        && kind == TypeKind::Edge
+    {
+        Some(SystemFieldRole::Dst)
+    } else {
+        None
     };
     if let Some(role) = system_role {
         return Ok(FieldRefIR::System(SystemFieldRefIR {
@@ -942,6 +1071,26 @@ fn field_ref(
             table_incarnation_id: incarnation,
             role,
         }));
+    }
+    if !properties.contains_key(&(owner_type_id, name.to_string())) {
+        let meta = if name == SYSTEM_COLUMNS_LEGACY.id || name == SYSTEM_COLUMNS_V3.id {
+            Some(SYSTEM_COLUMNS_META.id)
+        } else if kind == TypeKind::Edge
+            && (name == SYSTEM_COLUMNS_LEGACY.src || name == SYSTEM_COLUMNS_V3.src)
+        {
+            Some(SYSTEM_COLUMNS_META.src)
+        } else if kind == TypeKind::Edge
+            && (name == SYSTEM_COLUMNS_LEGACY.dst || name == SYSTEM_COLUMNS_V3.dst)
+        {
+            Some(SYSTEM_COLUMNS_META.dst)
+        } else {
+            None
+        };
+        if let Some(meta) = meta {
+            return resolution_error(format!(
+                "unknown property reference '{owner_name}.{name}'; the system field is '{meta}'"
+            ));
+        }
     }
     Ok(FieldRefIR::Property(property_ref(
         owner_type_id,
@@ -976,6 +1125,7 @@ pub fn schema_ir_hash(ir: &SchemaIR) -> Result<String> {
 /// This never allocates or reconstructs identities from names.
 pub fn schema_shape_from_ir(ir: &SchemaIR) -> Result<SchemaShape> {
     validate_schema_ir(ir)?;
+    let system_columns = ir.system_columns();
     let interfaces = ir
         .interfaces
         .iter()
@@ -1008,7 +1158,11 @@ pub fn schema_shape_from_ir(ir: &SchemaIR) -> Result<SchemaShape> {
                 annotations: node.annotations.clone(),
                 implements,
                 properties: node.properties.iter().map(property_shape_from_ir).collect(),
-                constraints: node.constraints.iter().map(constraint_from_ir).collect(),
+                constraints: node
+                    .constraints
+                    .iter()
+                    .map(|constraint| constraint_from_ir(constraint, system_columns))
+                    .collect(),
             }
         })
         .collect();
@@ -1023,7 +1177,11 @@ pub fn schema_shape_from_ir(ir: &SchemaIR) -> Result<SchemaShape> {
             cardinality: edge.cardinality.clone(),
             annotations: edge.annotations.clone(),
             properties: edge.properties.iter().map(property_shape_from_ir).collect(),
-            constraints: edge.constraints.iter().map(constraint_from_ir).collect(),
+            constraints: edge
+                .constraints
+                .iter()
+                .map(|constraint| constraint_from_ir(constraint, system_columns))
+                .collect(),
         })
         .collect();
     Ok(SchemaShape {
@@ -1066,13 +1224,38 @@ fn property_shape_from_ir(property: &PropertyIR) -> PropertyShape {
     }
 }
 
-pub(crate) fn constraint_from_ir(constraint: &ConstraintIR) -> Constraint {
+/// The constraint as `.pg` source spells it: a system field is `@id`/`@src`/
+/// `@dst` on a current-vintage graph and the historical bare `id`/`src`/`dst`
+/// on a legacy graph, so a shape rendered from the IR hashes equal to the
+/// parsed source (RFC 0040: storage spellings never appear in source).
+pub(crate) fn constraint_from_ir(
+    constraint: &ConstraintIR,
+    system_columns: SystemColumns,
+) -> Constraint {
+    let spellings = if system_columns == SYSTEM_COLUMNS_LEGACY {
+        SYSTEM_COLUMNS_LEGACY
+    } else {
+        SYSTEM_COLUMNS_META
+    };
+    constraint_with_spellings(constraint, spellings)
+}
+
+/// The constraint over the graph's physical column names, for the catalog's
+/// Arrow-facing constraint lists.
+pub(crate) fn physical_constraint_from_ir(
+    constraint: &ConstraintIR,
+    system_columns: SystemColumns,
+) -> Constraint {
+    constraint_with_spellings(constraint, system_columns)
+}
+
+fn constraint_with_spellings(constraint: &ConstraintIR, spellings: SystemColumns) -> Constraint {
     let field_name = |field: &FieldRefIR| match field {
         FieldRefIR::Property(reference) => reference.property_name.clone(),
         FieldRefIR::System(reference) => match reference.role {
-            SystemFieldRole::Id => "id".to_string(),
-            SystemFieldRole::Src => "src".to_string(),
-            SystemFieldRole::Dst => "dst".to_string(),
+            SystemFieldRole::Id => spellings.id.to_string(),
+            SystemFieldRole::Src => spellings.src.to_string(),
+            SystemFieldRole::Dst => spellings.dst.to_string(),
         },
     };
     match constraint {
@@ -1099,16 +1282,48 @@ pub(crate) fn constraint_from_ir(constraint: &ConstraintIR) -> Constraint {
 pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
     if !is_supported_ir_version(ir.ir_version) {
         return invalid_ir(format!(
-            "unsupported ir_version {} (supported {SCHEMA_IR_VERSION} and {SCHEMA_IR_VERSION_EDGE_KEYS})",
+            "unsupported ir_version {} (supported {SCHEMA_IR_VERSION}, \
+             {SCHEMA_IR_VERSION_EDGE_KEYS} and {SCHEMA_IR_VERSION_FEATURES})",
             ir.ir_version
         ));
     }
-    let required = required_ir_version(ir);
-    if ir.ir_version != required {
+    if let Some(unknown) = ir.features.iter().find(|name| !is_known_feature(name)) {
         return invalid_ir(format!(
-            "ir_version {} does not match the declared features (expected {required})",
-            ir.ir_version
+            "schema feature '{unknown}' is unknown to this build; upgrade omnigraph before \
+             opening this graph"
         ));
+    }
+    let required = required_features(ir);
+    if ir.ir_version == SCHEMA_IR_VERSION_FEATURES {
+        if ir.features.is_empty() {
+            return invalid_ir(format!(
+                "ir_version {SCHEMA_IR_VERSION_FEATURES} carries no feature name"
+            ));
+        }
+        if ir.features != required {
+            return invalid_ir(format!(
+                "feature set {:?} does not match the declared features (expected {:?})",
+                ir.features, required
+            ));
+        }
+    } else {
+        if !ir.features.is_empty() {
+            return invalid_ir(format!(
+                "ir_version {} cannot carry a feature set",
+                ir.ir_version
+            ));
+        }
+        let expected = if required.contains(FEATURE_EDGE_KEYS) {
+            SCHEMA_IR_VERSION_EDGE_KEYS
+        } else {
+            SCHEMA_IR_VERSION
+        };
+        if ir.ir_version != expected {
+            return invalid_ir(format!(
+                "ir_version {} does not match the declared features (expected {expected})",
+                ir.ir_version
+            ));
+        }
     }
     SchemaIdentityDomain::parse(ir.schema_identity_domain.as_str())?;
     if ir.next_identity_id == 0 {
@@ -1145,13 +1360,45 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
         }
         let mut property_names = HashSet::new();
         for property in entry.properties {
-            if is_reserved_storage_system_column(&property.name) {
-                return invalid_ir(format!(
-                    "property '{}.{}' uses a name reserved for a virtual storage system column; \
-                     a graph created with a pre-RC Lance binary must be exported with that binary, \
-                     renamed, and rebuilt",
-                    entry.name, property.name
-                ));
+            if ir.features.contains(FEATURE_SYSTEM_COLUMNS) {
+                if crate::schema::is_reserved_system_column_name(&property.name) {
+                    return invalid_ir(format!(
+                        "property '{}.{}' uses a name reserved for system columns \
+                         (names starting with '_')",
+                        entry.name, property.name
+                    ));
+                }
+            } else {
+                if is_reserved_storage_system_column(&property.name) {
+                    return invalid_ir(format!(
+                        "property '{}.{}' uses a name reserved for a virtual storage system \
+                         column; a graph created with a pre-RC Lance binary must be exported \
+                         with that binary, renamed, and rebuilt",
+                        entry.name, property.name
+                    ));
+                }
+                let legacy = SYSTEM_COLUMNS_LEGACY;
+                let collides = property.name == legacy.id
+                    || (entry.kind == TypeKind::Edge
+                        && (property.name == legacy.src || property.name == legacy.dst));
+                if collides {
+                    return invalid_ir(format!(
+                        "property '{}.{}' collides with this graph's physical column of \
+                         the same name; only graphs created with the system-columns feature admit this property",
+                        entry.name, property.name
+                    ));
+                }
+                let current = SYSTEM_COLUMNS_V3;
+                let claims_upgrade_target = property.name == current.id
+                    || (entry.kind == TypeKind::Edge
+                        && (property.name == current.src || property.name == current.dst));
+                if claims_upgrade_target {
+                    return invalid_ir(format!(
+                        "property '{}.{}' is reserved for the system column upgrade (RFC 0040), \
+                         this build does not rename existing graphs",
+                        entry.name, property.name
+                    ));
+                }
             }
             if !property_names.insert(property.name.as_str()) {
                 return invalid_ir(format!(
@@ -1309,7 +1556,7 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
                 }
             }
         }
-        validate_constraint_order(&node.constraints, &node.name)?;
+        validate_constraint_order(&node.constraints, &node.name, ir.system_columns())?;
         validate_constraints(
             TypeKind::Node,
             node.type_id,
@@ -1334,7 +1581,7 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
         }
         validate_type_ref(&edge.from_type, TypeKind::Node, &type_by_id)?;
         validate_type_ref(&edge.to_type, TypeKind::Node, &type_by_id)?;
-        validate_constraint_order(&edge.constraints, &edge.name)?;
+        validate_constraint_order(&edge.constraints, &edge.name, ir.system_columns())?;
         validate_constraints(
             TypeKind::Edge,
             edge.type_id,
@@ -1373,10 +1620,17 @@ fn validate_annotations(annotations: &[Annotation], entity: &str) -> Result<()> 
     Ok(())
 }
 
-fn validate_constraint_order(constraints: &[ConstraintIR], entity: &str) -> Result<()> {
+/// Checks that persisted constraints are sorted and unique. The sort key is
+/// projected with the IR's own system column spellings, because the stored
+/// order was established under them and must not shift underneath it.
+fn validate_constraint_order(
+    constraints: &[ConstraintIR],
+    entity: &str,
+    system_columns: SystemColumns,
+) -> Result<()> {
     let keys = constraints
         .iter()
-        .map(|constraint| constraint_sort_key(&constraint_from_ir(constraint)))
+        .map(|constraint| constraint_sort_key(&constraint_from_ir(constraint, system_columns)))
         .collect::<Vec<_>>();
     if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
         return invalid_ir(format!(
@@ -1517,16 +1771,36 @@ fn validate_constraints(
                 ));
             }
         }
+        if kind == TypeKind::Edge
+            && matches!(
+                constraint,
+                ConstraintIR::Range { .. } | ConstraintIR::Check { .. }
+            )
+        {
+            return invalid_ir(format!(
+                "edge '{}' carries a constraint kind edges do not support",
+                types[&owner_id].name
+            ));
+        }
         let fields: Vec<&FieldRefIR> = match constraint {
             ConstraintIR::Key { fields }
             | ConstraintIR::Unique { fields }
             | ConstraintIR::Index { fields } => fields.iter().collect(),
             ConstraintIR::Range { field, .. } | ConstraintIR::Check { field, .. } => vec![field],
         };
+        let system_refs_allowed = !matches!(
+            constraint,
+            ConstraintIR::Range { .. } | ConstraintIR::Check { .. }
+        );
         for field in fields {
             match field {
                 FieldRefIR::Property(reference) => {
                     validate_property_ref(reference, Some(owner_id), types, properties)?;
+                }
+                FieldRefIR::System(_) if !system_refs_allowed => {
+                    return invalid_ir(
+                        "range and check constraints cannot reference system columns".to_string(),
+                    );
                 }
                 FieldRefIR::System(reference) => {
                     if reference.stable_table_id != owner_id
@@ -1758,7 +2032,7 @@ node Pair {
             r#"
 interface Named { name: String }
 node Person implements Named { vector: Vector(3) @embed("name") }
-edge Knows: Person -> Person { @unique(src, dst) }
+edge Knows: Person -> Person { @unique(@src, @dst) }
 "#,
         );
         let desired = parse_schema(
@@ -1767,7 +2041,7 @@ interface Named { name: String }
 node Human @rename_from("Person") implements Named {
   vector: Vector(3) @embed("name")
 }
-edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
+edge Relates: Human -> Human @rename_from("Knows") { @unique(@src, @dst) }
 "#,
         )
         .unwrap();
@@ -1846,50 +2120,128 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
         assert!(validate_schema_ir(&v1).is_err());
     }
 
-    #[test]
-    fn ir_version_stamps_the_highest_declared_feature() {
-        let unkeyed = initialize("node P { n: String } edge E: P -> P { s: String }");
-        assert_eq!(unkeyed.ir_version, SCHEMA_IR_VERSION);
-        let keyed =
-            initialize("node P { n: String } edge E: P -> P { s: String @key(src, dst, s) }");
-        assert_eq!(keyed.ir_version, SCHEMA_IR_VERSION_EDGE_KEYS);
+    fn features(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
     }
 
     #[test]
-    fn ir_version_restamps_the_base_number_when_the_last_edge_key_drops() {
-        let keyed = initialize("node P { n: String } edge E: P -> P { @key(src, dst) }");
-        assert_eq!(keyed.ir_version, SCHEMA_IR_VERSION_EDGE_KEYS);
+    fn new_graphs_stamp_the_feature_version_with_system_columns() {
+        let shape = compile_schema_shape(
+            &parse_schema("node P { n: String } edge E: P -> P { @unique(src, dst) }").unwrap(),
+        )
+        .unwrap();
+        let error = initialize_schema_ir(domain(), &shape).unwrap_err();
+        assert!(
+            error.to_string().contains("the system field is '@dst'"),
+            "{error}"
+        );
+        let unkeyed = initialize("node P { n: String } edge E: P -> P { s: String }");
+        assert_eq!(unkeyed.ir_version, SCHEMA_IR_VERSION_FEATURES);
+        assert_eq!(unkeyed.features, features(&[FEATURE_SYSTEM_COLUMNS]));
+        let keyed =
+            initialize("node P { n: String } edge E: P -> P { s: String @key(@src, @dst, s) }");
+        assert_eq!(keyed.ir_version, SCHEMA_IR_VERSION_FEATURES);
+        assert_eq!(
+            keyed.features,
+            features(&[FEATURE_EDGE_KEYS, FEATURE_SYSTEM_COLUMNS])
+        );
+    }
+
+    #[test]
+    fn legacy_graphs_stamp_the_base_number_and_return_to_it_when_the_last_key_drops() {
+        let keyed = into_legacy_vintage(initialize(
+            "node P { n: String } edge E: P -> P { @key(@src, @dst) }",
+        ));
+        assert_eq!(keyed.ir_version, SCHEMA_IR_VERSION_FEATURES);
+        assert_eq!(keyed.features, features(&[FEATURE_EDGE_KEYS]));
+        assert_eq!(keyed.system_columns(), SYSTEM_COLUMNS_LEGACY);
         let unkeyed_shape =
             compile_schema_shape(&parse_schema("node P { n: String }").unwrap()).unwrap();
         let resolved = resolve_schema_ir(&keyed, &unkeyed_shape).unwrap().schema_ir;
+        assert_eq!(resolved.ir_version, SCHEMA_IR_VERSION);
+        assert!(resolved.features.is_empty());
+        assert_eq!(resolved.system_columns(), SYSTEM_COLUMNS_LEGACY);
+    }
+
+    #[test]
+    fn evolution_preserves_system_columns_membership() {
+        let born_new = initialize("node P { n: String }");
+        let keyed_shape = compile_schema_shape(
+            &parse_schema("node P { n: String } edge E: P -> P { @key(@src, @dst) }").unwrap(),
+        )
+        .unwrap();
+        let resolved = resolve_schema_ir(&born_new, &keyed_shape)
+            .unwrap()
+            .schema_ir;
+        assert_eq!(
+            resolved.features,
+            features(&[FEATURE_EDGE_KEYS, FEATURE_SYSTEM_COLUMNS])
+        );
+        assert_eq!(resolved.system_columns(), SYSTEM_COLUMNS_V3);
+    }
+
+    #[test]
+    fn merged_edge_key_number_is_accepted_on_load_and_never_emitted() {
+        let mut merged = into_legacy_vintage(initialize(
+            "node P { n: String } edge E: P -> P { @key(@src, @dst) }",
+        ));
+        merged.features.clear();
+        merged.ir_version = SCHEMA_IR_VERSION_EDGE_KEYS;
+        validate_schema_ir(&merged).expect("a keyed IR stamped 4 before the feature set loads");
+        let unkeyed_shape =
+            compile_schema_shape(&parse_schema("node P { n: String }").unwrap()).unwrap();
+        let resolved = resolve_schema_ir(&merged, &unkeyed_shape)
+            .unwrap()
+            .schema_ir;
         assert_eq!(resolved.ir_version, SCHEMA_IR_VERSION);
     }
 
     #[test]
     fn validation_rejects_ir_version_feature_mismatch() {
-        let keyed = initialize("node P { n: String } edge E: P -> P { @key(src, dst) }");
-        let mut spoofed_low = keyed;
+        let keyed = initialize("node P { n: String } edge E: P -> P { @key(@src, @dst) }");
+        let mut spoofed_low = keyed.clone();
         spoofed_low.ir_version = SCHEMA_IR_VERSION;
         assert!(validate_schema_ir(&spoofed_low).is_err());
 
         let unkeyed = initialize("node P { n: String }");
-        let mut spoofed_high = unkeyed;
-        spoofed_high.ir_version = SCHEMA_IR_VERSION_EDGE_KEYS;
-        assert!(validate_schema_ir(&spoofed_high).is_err());
+        let mut spoofed_number = unkeyed.clone();
+        spoofed_number.ir_version = SCHEMA_IR_VERSION_EDGE_KEYS;
+        assert!(validate_schema_ir(&spoofed_number).is_err());
+
+        let mut empty_set = unkeyed.clone();
+        empty_set.features.clear();
+        assert!(validate_schema_ir(&empty_set).is_err());
+
+        let mut dropped_name = keyed.clone();
+        dropped_name.features.remove(FEATURE_EDGE_KEYS);
+        assert!(validate_schema_ir(&dropped_name).is_err());
+
+        let mut unknown = unkeyed.clone();
+        unknown.features.insert("time-travel-v9".to_string());
+        assert!(
+            validate_schema_ir(&unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("time-travel-v9")
+        );
+
+        let mut legacy_unkeyed_at_edge_key_number = into_legacy_vintage(unkeyed);
+        legacy_unkeyed_at_edge_key_number.ir_version = SCHEMA_IR_VERSION_EDGE_KEYS;
+        assert!(validate_schema_ir(&legacy_unkeyed_at_edge_key_number).is_err());
     }
 
     #[test]
     fn edge_key_catalog_orders_endpoints_first_then_stable_property_ids() {
         let ir = initialize(
-            "node P { n: String } edge E: P -> P { a: String b: String @key(b, dst, src, a) }",
+            "node P { n: String } edge E: P -> P { a: String b: String @key(b, @dst, @src, a) }",
         );
         let catalog = build_catalog_from_ir(&ir).unwrap();
         assert_eq!(
             catalog.edge_types["E"].key.as_deref(),
             Some(
                 &[
-                    "src".to_string(),
-                    "dst".to_string(),
+                    "__src".to_string(),
+                    "__dst".to_string(),
                     "a".to_string(),
                     "b".to_string()
                 ][..]
@@ -1921,11 +2273,107 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(src, dst) }
                     _ => unreachable!(),
                 }
                 let error = validate_schema_ir(&malformed).unwrap_err().to_string();
-                assert!(error.contains("reserved"), "unexpected error: {error}");
+                assert!(
+                    error.contains("reserved for system columns"),
+                    "unexpected error: {error}"
+                );
                 assert!(error.contains(name), "unexpected error: {error}");
-                assert!(error.contains("exported"), "unexpected error: {error}");
             }
         }
+
+        let legacy = into_legacy_vintage(accepted.clone());
+        for name in RESERVED {
+            let mut malformed = legacy.clone();
+            malformed.nodes[0].properties[0].name = name.to_string();
+            let error = validate_schema_ir(&malformed).unwrap_err().to_string();
+            assert!(
+                error.contains("exported"),
+                "legacy IRs keep the historical Lance-name refusal for {name}: {error}"
+            );
+        }
+        let mut similar = legacy.clone();
+        similar.nodes[0].properties[0].name = "_row_id".to_string();
+        validate_schema_ir(&similar)
+            .expect("legacy graphs may carry underscore-leading user properties");
+        for (owner, name) in [
+            ("node", "id"),
+            ("edge", "id"),
+            ("edge", "src"),
+            ("edge", "dst"),
+        ] {
+            let mut malformed = legacy.clone();
+            match owner {
+                "node" => malformed.nodes[0].properties[0].name = name.to_string(),
+                "edge" => malformed.edges[0].properties[0].name = name.to_string(),
+                _ => unreachable!(),
+            }
+            let error = validate_schema_ir(&malformed).unwrap_err().to_string();
+            assert!(
+                error.contains("collides with this graph's physical"),
+                "unexpected error for legacy {owner}.{name}: {error}"
+            );
+        }
+        let mut node_src = legacy.clone();
+        node_src.nodes[0].properties[0].name = "src".to_string();
+        validate_schema_ir(&node_src)
+            .expect("'src' collides with nothing on legacy nodes and stays valid");
+
+        for (owner, name) in [("node", "__id"), ("edge", "__src"), ("edge", "__dst")] {
+            let mut malformed = legacy.clone();
+            match owner {
+                "node" => malformed.nodes[0].properties[0].name = name.to_string(),
+                "edge" => malformed.edges[0].properties[0].name = name.to_string(),
+                _ => unreachable!(),
+            }
+            let error = validate_schema_ir(&malformed).unwrap_err().to_string();
+            assert!(
+                error.contains("reserved for the system column upgrade"),
+                "unexpected error for legacy {owner}.{name}: {error}"
+            );
+        }
+        let mut node_dunder_src = legacy.clone();
+        node_dunder_src.nodes[0].properties[0].name = "__src".to_string();
+        validate_schema_ir(&node_dunder_src)
+            .expect("'__src' collides with nothing on legacy nodes and stays valid");
+    }
+
+    #[test]
+    fn validation_rejects_ir_only_constraint_shapes() {
+        let accepted = initialize("node N { np: String } edge E: N -> N { ep: String }");
+
+        let mut edge_key = accepted.clone();
+        edge_key.edges[0]
+            .constraints
+            .push(ConstraintIR::Key { fields: vec![] });
+        edge_key.features.insert(FEATURE_EDGE_KEYS.to_string());
+        let error = validate_schema_ir(&edge_key).unwrap_err().to_string();
+        assert!(
+            error.contains("@key must include both endpoints"),
+            "unexpected error: {error}"
+        );
+
+        let mut range_on_system = accepted.clone();
+        let node = &range_on_system.nodes[0];
+        let field = FieldRefIR::System(SystemFieldRefIR {
+            stable_table_id: node.type_id,
+            table_type_name: node.name.clone(),
+            table_incarnation_id: node.table_incarnation_id,
+            role: SystemFieldRole::Id,
+        });
+        range_on_system.nodes[0]
+            .constraints
+            .push(ConstraintIR::Range {
+                field,
+                min: None,
+                max: None,
+            });
+        let error = validate_schema_ir(&range_on_system)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot reference system columns"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -4,6 +4,12 @@
 # notes: expect may depend on: it is the `@key` value for keyed node types and a
 # notes: per-load ULID otherwise; the second key here is what makes the order total.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

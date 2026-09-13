@@ -4,6 +4,12 @@
 # notes: which has no out-edge; the scan's top-1 is dropped by the traversal and
 # notes: the under-fill retry reruns with the same k, so the answer stays empty.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -16,7 +22,7 @@ edge Knows: Doc -> Doc {
 --- seed
 {"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d001","to":"d000","data":{"id":"e001"}}
+{"edge":"Knows","id":"e001","from":"d001","to":"d000","data":{}}
 
 --- query
 query nearest_with_edge($q: Vector(4)) {

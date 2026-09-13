@@ -98,11 +98,11 @@ const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","e
 {"type":"RankedDoc","data":{"slug":"rank-2","embedding":[1.0,0.0,0.0,0.0]}}
 {"type":"RankedDoc","data":{"slug":"rank-3","embedding":[2.0,0.0,0.0,0.0]}}
 {"type":"RankedDoc","data":{"slug":"sink","embedding":[9.0,0.0,0.0,0.0]}}
-{"edge":"RankedLink","from":"rank-3","to":"sink","data":{"id":"edge-c","label":"C"}}
-{"edge":"RankedLink","from":"rank-2","to":"sink","data":{"id":"edge-b","label":"B"}}
-{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a2","label":"A2"}}
-{"edge":"RankedLink","from":"rank-1","to":"sink","data":{"id":"edge-a1","label":"A1"}}
-{"edge":"RankedLink","from":"sink","to":"rank-3","data":{"id":"edge-d","label":"D"}}"#;
+{"edge":"RankedLink","id":"edge-c","from":"rank-3","to":"sink","data":{"label":"C"}}
+{"edge":"RankedLink","id":"edge-b","from":"rank-2","to":"sink","data":{"label":"B"}}
+{"edge":"RankedLink","id":"edge-a2","from":"rank-1","to":"sink","data":{"label":"A2"}}
+{"edge":"RankedLink","id":"edge-a1","from":"rank-1","to":"sink","data":{"label":"A1"}}
+{"edge":"RankedLink","id":"edge-d","from":"sink","to":"rank-3","data":{"label":"D"}}"#;
 
 const RANKED_EDGE_QUERIES: &str = r#"
 query nearest_edges($q: Vector(4)) {
@@ -213,7 +213,7 @@ fn underfill_seed_data() -> String {
     }
     for chunk in UNDERFILL_LINKED {
         rows.push(format!(
-            r#"{{"edge":"ChunkOfArtifact","from":"chunk-{chunk:02}","to":"art-0","data":{{"id":"e-{chunk:02}","label":"of"}}}}"#
+            r#"{{"edge":"ChunkOfArtifact","id":"e-{chunk:02}","from":"chunk-{chunk:02}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
     rows.join("\n")
@@ -259,7 +259,7 @@ fn starvation_seed_data() -> String {
     }
     for slug in ["x", "y", "n"] {
         rows.push(format!(
-            r#"{{"edge":"ChunkOfArtifact","from":"{slug}","to":"art-0","data":{{"id":"e-{slug}","label":"of"}}}}"#
+            r#"{{"edge":"ChunkOfArtifact","id":"e-{slug}","from":"{slug}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
     rows.join("\n")
@@ -826,13 +826,13 @@ async fn issue_567_optimized_docs(uri: &str) -> Omnigraph {
         .collect::<Vec<_>>();
     for row in 0..ISSUE_567_EDGE_DOCS {
         lines.push(format!(
-            r#"{{"edge":"Knows","from":"n{row:05}","to":"n{next:05}","data":{{"id":"e{row:05}"}}}}"#,
+            r#"{{"edge":"Knows","id":"e{row:05}","from":"n{row:05}","to":"n{next:05}","data":{{}}}}"#,
             next = row + 1
         ));
     }
     for row in ISSUE_567_FAR_DOCS {
         lines.push(format!(
-            r#"{{"edge":"Far","from":"n{row:05}","to":"n{next:05}","data":{{"id":"f{row:05}"}}}}"#,
+            r#"{{"edge":"Far","id":"f{row:05}","from":"n{row:05}","to":"n{next:05}","data":{{}}}}"#,
             next = row + 1
         ));
     }
@@ -1573,7 +1573,7 @@ async fn issue_567_line_docs(uri: &str, rows: usize, edge_every: Option<usize>) 
     if let Some(edge_every) = edge_every {
         for row in (0..rows - 1).step_by(edge_every) {
             lines.push(format!(
-                r#"{{"edge":"Knows","from":"n{row:05}","to":"n{next:05}","data":{{"id":"e{row:05}"}}}}"#,
+                r#"{{"edge":"Knows","id":"e{row:05}","from":"n{row:05}","to":"n{next:05}","data":{{}}}}"#,
                 next = row + 1
             ));
         }
@@ -3538,7 +3538,7 @@ query nearest_whole($q: Vector(4)) {
     assert_eq!(projections.len(), 1, "one NodeScan, one projection");
     assert_eq!(
         sorted(&projections[0]),
-        strings(&["_distance", "id", "slug"]),
+        strings(&["__id", "_distance", "slug"]),
         "a `return {{ $d.slug }}` nearest scan reads id, the key and `_distance` only"
     );
     assert!(
@@ -3568,7 +3568,7 @@ query nearest_whole($q: Vector(4)) {
     assert_eq!(projections.len(), 1, "limit filled: no uncapped retry scan");
     assert_eq!(
         sorted(&projections[0]),
-        strings(&["_score", "id", "slug"]),
+        strings(&["__id", "_score", "slug"]),
         "a `return {{ $d.slug }}` bm25 scan reads id, the key and `_score` only"
     );
 

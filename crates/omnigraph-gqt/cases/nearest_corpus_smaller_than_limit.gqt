@@ -4,6 +4,12 @@
 # notes: no error. One case for both spellings of this regime (a 1-doc corpus
 # notes: under limit 3 and a 50-doc corpus under limit 100 sat on this path).
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

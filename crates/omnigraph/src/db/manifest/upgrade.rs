@@ -126,7 +126,7 @@ impl UpgradeReport {
         self.recovery = Some(UpgradeRecovery {
             failed_handler: self.route.get(self.completed_handlers.len()).cloned()
                 .unwrap_or_else(|| "storage-upgrade".into()),
-            executable_compatibility: "this storage-upgrade-capable v8 executable; preserve the exact pending intent and do not use the source executable".into(),
+            executable_compatibility: "this storage-upgrade-capable executable; preserve the exact pending intent and do not use the source executable".into(),
             action: format!("stop all writers and maintenance, retain the backup, then rerun the same upgrade command with --to-format {} without --check", self.target_format),
         });
     }
@@ -247,11 +247,11 @@ fn intent_from(dataset: &Dataset) -> Result<Option<UpgradeIntent>> {
 pub(super) fn recovery_guidance(dataset: &Dataset) -> String {
     match intent_from(dataset) {
         Ok(Some(intent)) => format!(
-            "storage upgrade recovery required: stop all writers and maintenance and rerun `omnigraph upgrade <graph> --to-format {}` with this upgrade-capable v8 executable; preserve the existing attempt.{}",
+            "storage upgrade recovery required: stop all writers and maintenance and rerun `omnigraph upgrade <graph> --to-format {}` with this upgrade-capable executable; preserve the existing attempt.{}",
             intent.target_format,
             if intent.target_format == 7 { " After completion, run `omnigraph upgrade <graph> --to-format 8` before serving with this executable." } else { "" },
         ),
-        _ => "storage upgrade ownership is unknown: preserve the graph and original upgrade options; use this upgrade-capable v8 executable for read-only `omnigraph upgrade <graph> --check` diagnostics before recovery".into(),
+        _ => "storage upgrade ownership is unknown: preserve the graph and original upgrade options; use this upgrade-capable executable for read-only `omnigraph upgrade <graph> --check` diagnostics before recovery".into(),
     }
 }
 
@@ -263,6 +263,9 @@ async fn run(
     report: &mut UpgradeReport,
 ) -> Result<()> {
     if !matches!(report.target_format, 7 | 8) {
+        if let Ok(main) = open(root, None).await {
+            report.observed_format = read_stamp(&main);
+        }
         report.finding(
             "unsupported_target",
             "this binary has registered routes to formats 7 and 8 only",
@@ -375,12 +378,21 @@ async fn run_step(
         });
         return Ok(());
     }
-    if pending.is_none() && read_stamp(&main) == Some(step_target) {
-        if step_target == 8 {
+    let stamp = read_stamp(&main);
+    let served_at_or_above_target = stamp.is_some_and(|stamp| {
+        stamp >= step_target
+            && step_target >= super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+            && stamp <= super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+    });
+    if pending.is_none()
+        && let Some(expected) = stamp
+        && (expected == step_target || served_at_or_above_target)
+    {
+        if expected >= 8 {
             super::migrations::guard_stamp(&main)?;
         }
         read_manifest_state(&main).await?;
-        let branches = if step_target == 8 {
+        let branches = if expected >= 8 {
             crate::branch_control::list_live_manifest_branch_contents(&main).await?
         } else {
             legacy_branch_contents(&main).await?
@@ -404,7 +416,7 @@ async fn run_step(
                 .checkout_branch(native)
                 .await
                 .map_err(OmniError::storage)?;
-            if read_stamp(&branch) != Some(step_target)
+            if read_stamp(&branch) != Some(expected)
                 || branch.schema().metadata.contains_key(UPGRADE_PENDING_KEY)
             {
                 return Err(invalid(
@@ -418,6 +430,33 @@ async fn run_step(
         } else {
             UpgradeOutcome::Completed
         };
+        return Ok(());
+    }
+    if pending.is_none()
+        && let Some(stamp) = stamp
+        && stamp > super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+    {
+        report.finding(
+            "newer_than_binary",
+            format!(
+                "this graph is stamped v{stamp}, newer than the v{} this executable serves; upgrade omnigraph before touching it",
+                super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+            ),
+        );
+        return Ok(());
+    }
+    if pending.is_none()
+        && let Some(stamp) = stamp
+        && stamp > step_target
+        && step_target < super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+    {
+        report.finding(
+            "target_below_stamp",
+            format!(
+                "this graph is stamped v{stamp}; the requested target v{step_target} is below the oldest format this executable serves (v{}), and no downgrade route exists",
+                super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+            ),
+        );
         return Ok(());
     }
     if pending.is_none()

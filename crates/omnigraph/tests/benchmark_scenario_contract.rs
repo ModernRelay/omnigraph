@@ -182,7 +182,7 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
     assert!(source_opener.contains("entry.native_dataset_branch.as_deref()"));
     assert!(source_opener.contains("builder.with_branch(native_ref, None)"));
     assert!(baseline.contains(".with_session(main_table.session())"));
-    assert!(baseline.contains(".filter(\"id LIKE 'adopt-new-%'\")"));
+    assert!(baseline.contains(".filter(&format!(\"{id_column} LIKE 'adopt-new-%'\"))"));
     assert!(baseline.contains(".execute_stream(source)"));
     assert!(baseline.contains("WriteMode::Append"));
     assert!(
@@ -238,7 +238,7 @@ fn adopt_comparator_is_phased_and_streams_only_the_operation_substitution() {
         .split_once("/// Phase 3:")
         .expect("exact content verifier boundary")
         .0;
-    assert!(exact_verifier.contains(".project(&[\"id\", \"slug\", \"embedding\"])"));
+    assert!(exact_verifier.contains(".project(&[id_column, \"slug\", \"embedding\"])"));
     for limit in [
         "scanner.batch_size(scan_batch_rows)",
         "scanner.batch_size_bytes(scan_batch_bytes_target)",
@@ -377,8 +377,18 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
         verify
             .contains("args.rows <= 256 || args.history_commits > 0 || args.retired_branches > 0")
     );
-    assert!(verify.contains("verify_general_all_rows(&table, args, true)"));
-    assert!(verify.contains("verify_general_all_rows(&source_table, args, false)"));
+    let compact_verify = verify
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")");
+    assert!(
+        compact_verify
+            .contains("verify_general_all_rows(&table,db.catalog().system_columns.id,args,true)")
+    );
+    assert!(compact_verify.contains(
+        "verify_general_all_rows(&source_table,db.catalog().system_columns.id,args,false)"
+    ));
     assert!(source.contains("scanner.batch_size(256)"));
     assert!(source.contains("duplicate aged fixture ID"));
     assert!(source.contains("aged fixture row missing"));
@@ -530,7 +540,12 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
         .0;
     assert!(age.contains("after.checked_sub(before)"));
     assert!(age.contains("Some(args.history_commits)"));
-    assert!(age.contains("verify_fixture_row(&table, \"base\", 0, args.dims, args.seed)"));
+    assert!(
+        age.split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")")
+            .contains("verify_fixture_row(&table,db.catalog().system_columns.id,\"base\",0,args.dims,args.seed)")
+    );
     assert!(!age.contains("wait_for_fork_reclaims"));
     assert!(age.contains("retired native fork must remain until cleanup"));
     assert!(age.contains("retirement must not publish on main"));

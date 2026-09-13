@@ -17,11 +17,13 @@ POST /graphs/{graph_id}/load/ndjson
 The engine equivalent is `load_graph_batch_as`. Each nonblank line is exactly one logical envelope:
 
 ```json
-{"type":"Person","data":{"id":"p1","name":"Ada"}}
+{"type":"Person","id":"p1","data":{"name":"Ada"}}
 {"edge":"Knows","from":"p1","to":"p2","data":{"since":2026}}
 ```
 
-The strict parser rejects duplicate members, unknown fields, reserved physical columns, malformed envelopes, and noncanonical supplied node IDs. It accepts logical type and property names only; callers never select physical datasets, lanes, fragments, or bindings.
+The optional top-level `id` supplies entity identity. `data` holds user properties; on new graphs `data.id` is a user property only when declared in the schema. Legacy-vintage graphs also accept `data.id` as identity when top-level `id` is absent, and refuse both placements together. Before rebuilding an older export into a new graph, move `data.id` to the top level as shown in the [upgrade procedure](../user/operations/upgrade.md#rebuild).
+
+The strict parser rejects duplicate members, unknown fields, reserved physical columns, malformed envelopes, and noncanonical supplied entity IDs. It accepts logical type and property names only; callers never select physical datasets, lanes, fragments, or bindings.
 
 The HTTP handler authorizes both change and any requested branch creation before polling the body. It verifies `Content-Type`, rejects an oversized `Content-Length` early, and otherwise collects at most 32 MiB. The parser also bounds individual lines and per-table retained rows/Arrow bytes before durable effects.
 

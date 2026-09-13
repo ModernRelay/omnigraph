@@ -1,0 +1,42 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [42]
+
+--- schema
+node Person {
+    name: String @key
+}
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+--- mutate
+branch create source
+--- expect ok
+--- mutate branch: source
+query add() { insert Person { name: "bob" } }
+--- expect affected: nodes=1 edges=0
+--- mutate
+branch merge source into main
+--- expect ok
+--- mutate branch: source
+query add_again() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+--- fault
+at: branch_merge.post_authority_capture
+occurrence: 1
+action: return_error
+scope: next_step
+
+--- mutate
+branch merge source into main
+--- expect error: injected failpoint triggered: branch_merge.post_authority_capture
+--- query
+query accepted() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String

@@ -17,7 +17,9 @@ use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{compile_schema_shape, schema_shape_from_ir, schema_shape_json};
+use omnigraph_compiler::{
+    SystemColumns, compile_schema_shape, schema_shape_from_ir, schema_shape_json,
+};
 use sha2::{Digest, Sha256};
 
 use crate::ValidatedCase;
@@ -203,7 +205,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
             return Err(unsupported(
                 "fixture.builder.seed",
                 format!(
-                    "seed {} was requested; deterministic builder v2 currently defines only seed {SUPPORTED_SEED}",
+                    "seed {} was requested; deterministic builder v3 currently defines only seed {SUPPORTED_SEED}",
                     case.fixture.builder.seed
                 ),
             ));
@@ -211,19 +213,19 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
         if case.fixture.data.provenance != DataProvenance::Synthetic {
             return Err(unsupported(
                 "fixture.data.provenance",
-                "builder v2 requires synthetic data",
+                "builder v3 requires synthetic data",
             ));
         }
         if case.fixture.data.column_shape != ColumnShape::Scalars {
             return Err(unsupported(
                 "fixture.data.column_shape",
-                "builder v2 implements the scalar schema only",
+                "builder v3 implements the scalar schema only",
             ));
         }
         if case.fixture.data.topology_skew != TopologySkew::Uniform {
             return Err(unsupported(
                 "fixture.data.topology_skew",
-                "builder v2 implements uniform topology only",
+                "builder v3 implements uniform topology only",
             ));
         }
         if case.fixture.state.aging != Aging::BulkLoaded {
@@ -265,7 +267,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
         if case.workload.contention != Contention::DistinctKey {
             return Err(unsupported(
                 "workload.contention",
-                "builder v2 creates disjoint source and target edge cohorts",
+                "builder v3 creates disjoint source and target edge cohorts",
             ));
         }
         if !matches!(&case.environment.backend, Backend::LocalFs { .. }) {
@@ -319,13 +321,13 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
 
         if tables < 2 || !tables.is_multiple_of(2) || rows_per_table == 0 {
             return Err(invalid_plan(
-                "builder v2 requires an even total table count >= 2 and rows_per_table >= 1",
+                "builder v3 requires an even total table count >= 2 and rows_per_table >= 1",
             ));
         }
         let edge_tables = tables / 2;
         if diverged_tables == 0 || diverged_tables > edge_tables {
             return Err(invalid_plan(format!(
-                "builder v2 diverges edge tables and requires diverged_tables in 1..={edge_tables}, got {diverged_tables}"
+                "builder v3 diverges edge tables and requires diverged_tables in 1..={edge_tables}, got {diverged_tables}"
             )));
         }
         if delta_rows_per_side == 0 {
@@ -393,7 +395,7 @@ impl TryFrom<&ValidatedCase> for BranchMergePlan {
                     return Err(unsupported(
                         "workload.delta_rows_per_side",
                         format!(
-                            "edge table {table} has {inserts} {side} inserts; builder v2's exact I32 payload can represent at most {} insert ordinals",
+                            "edge table {table} has {inserts} {side} inserts; builder v3's exact I32 payload can represent at most {} insert ordinals",
                             i32::MAX
                         ),
                     ));
@@ -530,7 +532,7 @@ fn chunk_count(rows: usize, chunk_rows: usize) -> usize {
 }
 
 impl BranchMergePlan {
-    /// Derive and bound the exact builder-v2 publication recipe plus
+    /// Derive and bound the exact builder-v3 publication recipe plus
     /// conservative local scratch requirements before initialization.
     pub fn preflight(&self) -> BranchMergeResult<FixturePreflight> {
         if self.tables > MAX_RUNNER_TABLES {
@@ -561,7 +563,7 @@ impl BranchMergePlan {
             return Err(unsupported(
                 "fixture.state.compaction_recency",
                 format!(
-                    "builder-v2 optimized fixtures require at least two base fragments per table for productive compaction; rows_per_table={} and chunk_rows={chunk_rows} produce {chunks_per_table}",
+                    "builder-v3 optimized fixtures require at least two base fragments per table for productive compaction; rows_per_table={} and chunk_rows={chunk_rows} produce {chunks_per_table}",
                     self.rows_per_table
                 ),
             ));
@@ -589,7 +591,7 @@ impl BranchMergePlan {
         let target_divergence_commits = divergence_commits(Side::Target)?;
         if source_divergence_commits != target_divergence_commits {
             return Err(invalid_plan(format!(
-                "builder v2 requires symmetric branch publication recipes, got source={source_divergence_commits}, target={target_divergence_commits}"
+                "builder v3 requires symmetric branch publication recipes, got source={source_divergence_commits}, target={target_divergence_commits}"
             )));
         }
         let optimize_commits = usize::from(self.compaction_recency == CompactionRecency::Optimized);
@@ -612,7 +614,7 @@ impl BranchMergePlan {
             return Err(unsupported(
                 "fixture.state.history_depth",
                 format!(
-                    "builder-v2 recipe requires exactly {expected_history_depth} reachable commits per frozen branch (genesis 1 + base loads {base_load_commits} + optimize {optimize_commits} + divergence {source_divergence_commits}), but the case declares {}",
+                    "builder-v3 recipe requires exactly {expected_history_depth} reachable commits per frozen branch (genesis 1 + base loads {base_load_commits} + optimize {optimize_commits} + divergence {source_divergence_commits}), but the case declares {}",
                     self.requested_history_depth
                 ),
             ));
@@ -814,7 +816,7 @@ pub async fn initialize_local_fixture(
     let base_load_commits = load_base(&db, plan).await?;
     if u64::try_from(base_load_commits).ok() != Some(preflight.base_load_commits) {
         return Err(fixture_error(format!(
-            "builder-v2 base-load recipe drifted: preflight declared {} publications, execution produced {base_load_commits}",
+            "builder-v3 base-load recipe drifted: preflight declared {} publications, execution produced {base_load_commits}",
             preflight.base_load_commits
         )));
     }
@@ -923,7 +925,7 @@ pub async fn initialize_local_fixture(
         return Err(unsupported(
             "fixture.state.history_depth",
             format!(
-                "requested exactly {} reachable commits per branch, but deterministic construction produced {source_history_depth} on {SOURCE_BRANCH} and {target_history_depth} on {TARGET_BRANCH}; builder v2 does not silently pad or squash history — declare the observed depth or revise the versioned deterministic builder contract",
+                "requested exactly {} reachable commits per branch, but deterministic construction produced {source_history_depth} on {SOURCE_BRANCH} and {target_history_depth} on {TARGET_BRANCH}; builder v3 does not silently pad or squash history; declare the observed depth or revise the versioned deterministic builder contract",
                 plan.requested_history_depth
             ),
         ));
@@ -950,12 +952,12 @@ fn verified_schema_shape_json(db: &Omnigraph, plan: &BranchMergePlan) -> BranchM
     })?;
     let expected_source = schema_source(plan.tables);
     let expected_ast = parse_schema(&expected_source)
-        .map_err(|error| verification_error(format!("parse builder-v2 schema: {error}")))?;
+        .map_err(|error| verification_error(format!("parse builder-v3 schema: {error}")))?;
     let expected = compile_schema_shape(&expected_ast)
-        .map_err(|error| verification_error(format!("compile builder-v2 schema shape: {error}")))?;
+        .map_err(|error| verification_error(format!("compile builder-v3 schema shape: {error}")))?;
     if observed != expected {
         return Err(verification_error(
-            "accepted fixture schema differs from the complete canonical builder-v2 schema shape",
+            "accepted fixture schema differs from the complete canonical builder-v3 schema shape",
         ));
     }
     schema_shape_json(&observed)
@@ -1011,7 +1013,7 @@ fn logical_edge_row_sha256(
 }
 
 /// Hash deterministic node rows only after the physical scan proved exact
-/// equality with the builder-v2 model.
+/// equality with the builder-v3 model.
 fn hash_verified_node_rows(
     digest: &mut Sha256,
     table: usize,
@@ -1033,7 +1035,7 @@ fn hash_verified_node_rows(
 }
 
 /// Hash deterministic edge rows only after the physical scan proved exact
-/// equality with the builder-v2 model.
+/// equality with the builder-v3 model.
 fn hash_verified_edge_rows(
     digest: &mut Sha256,
     table: usize,
@@ -1128,6 +1130,7 @@ pub async fn warm_read_set(
         ));
     }
     let batch_rows = load_chunk_rows(plan.payload_bytes)?;
+    let system_columns = db.catalog().system_columns;
     for iteration in 0..iterations {
         for branch in [MAIN_BRANCH, SOURCE_BRANCH, TARGET_BRANCH] {
             let commits = db.list_commits(Some(branch)).await.map_err(|error| {
@@ -1161,14 +1164,21 @@ pub async fn warm_read_set(
                 .map(|(table, _)| {
                     (
                         node_table_key(table),
-                        &["id", "name", "cohort", "val", "payload"][..],
+                        vec![system_columns.id, "name", "cohort", "val", "payload"],
                     )
                 })
                 .collect::<Vec<_>>();
             read_set.extend((0..plan.diverged_tables).map(|table| {
                 (
                     edge_table_key(table),
-                    &["id", "src", "dst", "cohort", "val", "payload"][..],
+                    vec![
+                        system_columns.id,
+                        system_columns.src,
+                        system_columns.dst,
+                        "cohort",
+                        "val",
+                        "payload",
+                    ],
                 )
             }));
             for (table_key, projection) in read_set {
@@ -1179,7 +1189,7 @@ pub async fn warm_read_set(
                 })?;
                 let mut scanner = dataset.scan();
                 scanner
-                    .project(projection)?
+                    .project(&projection)?
                     .batch_size(batch_rows)
                     .batch_size_bytes(WARM_SCAN_TARGET_BYTES);
                 let mut stream = scanner.try_into_stream().await?;
@@ -1371,10 +1381,10 @@ fn jsonl_edge_row(
 ) -> String {
     serde_json::json!({
         "edge": ty,
+        "id": id,
         "from": from,
         "to": to,
         "data": {
-            "id": id,
             "cohort": cohort,
             "val": val,
             "payload": payload,
@@ -1405,7 +1415,7 @@ async fn load_base(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<
             for row in start..end {
                 let val = i32::try_from(row).map_err(|_| {
                     invalid_plan(format!(
-                        "base node ordinal {row} cannot be represented by builder v2's I32 val"
+                        "base node ordinal {row} cannot be represented by builder v3's I32 val"
                     ))
                 })?;
                 chunk.push_str(&jsonl_node_row(
@@ -1437,7 +1447,7 @@ async fn load_base(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<
             for row in start..end {
                 let val = i32::try_from(row).map_err(|_| {
                     invalid_plan(format!(
-                        "base edge ordinal {row} cannot be represented by builder v2's I32 val"
+                        "base edge ordinal {row} cannot be represented by builder v3's I32 val"
                     ))
                 })?;
                 let (from, to) = edge_endpoints(plan, table, row);
@@ -1566,7 +1576,7 @@ async fn diverge(
             for row in start..end {
                 let val = i32::try_from(row).map_err(|_| {
                     invalid_plan(format!(
-                        "edge insert ordinal {row} cannot be represented by builder v2's I32 val"
+                        "edge insert ordinal {row} cannot be represented by builder v3's I32 val"
                     ))
                 })?;
                 let (from, to) = edge_endpoints(plan, table, row);
@@ -1634,19 +1644,33 @@ async fn verify_branch(
         }
         if dataset.has_raw_index_section() {
             return Err(verification_error(format!(
-                "node table {table} on {branch} carries a raw Lance index-metadata section, but builder v2 declares indexes: []"
+                "node table {table} on {branch} carries a raw Lance index-metadata section, but builder v3 declares indexes: []"
             )));
         }
         if let Some(digest) = logical_digest.as_deref_mut() {
             hash_logical_field(digest, b"type", ty.as_bytes());
         }
         let mut scanner = dataset.scan();
-        scanner.project(&["id", "name", "cohort", "val", "payload"])?;
+        scanner.project(&[
+            catalog.system_columns.id,
+            "name",
+            "cohort",
+            "val",
+            "payload",
+        ])?;
         let mut stream = scanner.try_into_stream().await?;
         let mut seen_base = SeenBits::new(plan.rows_per_table)?;
         let mut actual_rows = 0usize;
         while let Some(batch) = stream.try_next().await? {
-            verify_node_batch(&batch, branch, table, plan, &base_payload, &mut seen_base)?;
+            verify_node_batch(
+                &batch,
+                catalog.system_columns,
+                branch,
+                table,
+                plan,
+                &base_payload,
+                &mut seen_base,
+            )?;
             actual_rows = actual_rows.checked_add(batch.num_rows()).ok_or_else(|| {
                 verification_error(format!(
                     "row count overflow on node table {table} of {branch}"
@@ -1690,14 +1714,21 @@ async fn verify_branch(
         }
         if dataset.has_raw_index_section() {
             return Err(verification_error(format!(
-                "edge table {table} on {branch} carries a raw Lance index-metadata section, but builder v2 declares indexes: []"
+                "edge table {table} on {branch} carries a raw Lance index-metadata section, but builder v3 declares indexes: []"
             )));
         }
         if let Some(digest) = logical_digest.as_deref_mut() {
             hash_logical_field(digest, b"type", ty.as_bytes());
         }
         let mut scanner = dataset.scan();
-        scanner.project(&["id", "src", "dst", "cohort", "val", "payload"])?;
+        scanner.project(&[
+            catalog.system_columns.id,
+            catalog.system_columns.src,
+            catalog.system_columns.dst,
+            "cohort",
+            "val",
+            "payload",
+        ])?;
         let mut stream = scanner.try_into_stream().await?;
         let mut seen_base = SeenBits::new(plan.rows_per_table)?;
         let delta = plan.table_deltas.get(table).copied().unwrap_or(TableDelta {
@@ -1710,6 +1741,7 @@ async fn verify_branch(
         while let Some(batch) = stream.try_next().await? {
             verify_edge_batch(
                 &batch,
+                catalog.system_columns,
                 branch,
                 table,
                 plan,
@@ -1764,13 +1796,14 @@ fn checked_add_verified_rows(
 
 fn verify_node_batch(
     batch: &RecordBatch,
+    system_columns: SystemColumns,
     branch: &str,
     table: usize,
     plan: &BranchMergePlan,
     base_payload: &str,
     seen_base: &mut SeenBits,
 ) -> BranchMergeResult<()> {
-    let id = required_column(batch, "id", branch, table)?;
+    let id = required_column(batch, system_columns.id, branch, table)?;
     let name = required_column(batch, "name", branch, table)?;
     let cohort = required_column(batch, "cohort", branch, table)?;
     let val = required_column(batch, "val", branch, table)?;
@@ -1815,6 +1848,7 @@ fn verify_node_batch(
 #[allow(clippy::too_many_arguments)]
 fn verify_edge_batch(
     batch: &RecordBatch,
+    system_columns: SystemColumns,
     branch: &str,
     table: usize,
     plan: &BranchMergePlan,
@@ -1825,9 +1859,9 @@ fn verify_edge_batch(
     seen_source_inserts: &mut SeenBits,
     seen_target_inserts: &mut SeenBits,
 ) -> BranchMergeResult<()> {
-    let id = required_column(batch, "id", branch, table)?;
-    let src = required_column(batch, "src", branch, table)?;
-    let dst = required_column(batch, "dst", branch, table)?;
+    let id = required_column(batch, system_columns.id, branch, table)?;
+    let src = required_column(batch, system_columns.src, branch, table)?;
+    let dst = required_column(batch, system_columns.dst, branch, table)?;
     let cohort = required_column(batch, "cohort", branch, table)?;
     let val = required_column(batch, "val", branch, table)?;
     let payload = required_column(batch, "payload", branch, table)?;
@@ -2305,7 +2339,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let error = initialize_local_fixture(directory.path().to_str().unwrap(), &plan)
             .await
-            .expect_err("optimized manifests cannot certify builder v2's indexes: [] state");
+            .expect_err("optimized manifests cannot certify builder v3's indexes: [] state");
         let fixture_error = error
             .downcast_ref::<BranchMergeError>()
             .expect("fixture certification must return a classified scenario error");
@@ -2313,7 +2347,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("raw Lance index-metadata section, but builder v2 declares indexes: []"),
+                .contains("raw Lance index-metadata section, but builder v3 declares indexes: []"),
             "unexpected error: {error}"
         );
     }
@@ -2504,7 +2538,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_v2_schema_is_balanced_and_ring_endpoints_are_uniform() {
+    fn builder_v3_schema_is_balanced_and_ring_endpoints_are_uniform() {
         let schema = schema_source(8);
         assert_eq!(schema.matches("node BenchN").count(), 4);
         assert_eq!(schema.matches("edge BenchE").count(), 4);

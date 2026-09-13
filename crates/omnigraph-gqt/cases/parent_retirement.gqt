@@ -4,6 +4,12 @@
 # notes: Cleanup and native storage assertions live
 # notes: in branching.rs::branch_delete_retires_native_parent_and_cleanup_preserves_live_child.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

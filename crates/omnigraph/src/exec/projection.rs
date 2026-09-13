@@ -2,6 +2,7 @@ use super::*;
 
 use arrow_array::StructArray;
 use arrow_schema::Fields;
+use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::NodeType;
 
 /// Node type per pipeline binding, for projecting a bare `$p` as one struct.
@@ -477,7 +478,7 @@ fn evaluate_projection(
             let wide_schema = wide_batch.schema();
             let mut fields: Vec<Field> = Vec::new();
             let mut columns: Vec<ArrayRef> = Vec::new();
-            for field in node_type.node_object_fields() {
+            for (member, field) in node_type.node_object_members() {
                 let col_name = format!("{}.{}", name, field.name());
                 let (idx, wide_field) =
                     wide_schema.column_with_name(&col_name).ok_or_else(|| {
@@ -488,7 +489,7 @@ fn evaluate_projection(
                     })?;
                 let col = wide_batch.column(idx).clone();
                 fields.push(Field::new(
-                    field.name(),
+                    member,
                     col.data_type().clone(),
                     wide_field.is_nullable(),
                 ));
@@ -516,6 +517,7 @@ pub(super) fn apply_ordering(
     // returns at most n indices, discarding the rest. The CALLER owns the
     // precondition that nothing after the sort consumes rows beyond n.
     fetch: Option<usize>,
+    system_columns: SystemColumns,
 ) -> Result<RecordBatch> {
     use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 
@@ -566,12 +568,13 @@ pub(super) fn apply_ordering(
     // a result row, so the order is total and reproducible. (Aggregate results
     // have no `.id` columns; their group rows are already distinct on the
     // projected group keys.)
+    let id_suffix = format!(".{}", system_columns.id);
     let mut tiebreak_cols: Vec<String> = source
         .schema()
         .fields()
         .iter()
         .map(|f| f.name().to_string())
-        .filter(|name| name.ends_with(".id"))
+        .filter(|name| name.ends_with(&id_suffix))
         .collect();
     tiebreak_cols.sort();
     for name in &tiebreak_cols {

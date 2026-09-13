@@ -4,6 +4,12 @@
 # notes: eligible rows in row order and the unfiltered top-2 (0, 1) has no edge,
 # notes: so the fused set is the two nearest docs with an edge (3 > 2): d003, d006.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key
@@ -27,9 +33,9 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d007","n":7,"name":"doc-007","embedding":[7.0,0.0,0.0,0.0],"text":"needle needle needle filler"}}
 {"type":"Doc","data":{"slug":"d008","n":8,"name":"doc-008","embedding":[8.0,0.0,0.0,0.0],"text":"needle needle filler"}}
 {"type":"Doc","data":{"slug":"d009","n":9,"name":"doc-009","embedding":[9.0,0.0,0.0,0.0],"text":"needle filler"}}
-{"edge":"Knows","from":"d003","to":"d004","data":{"id":"e003_0"}}
-{"edge":"Knows","from":"d006","to":"d007","data":{"id":"e006_0"}}
-{"edge":"Knows","from":"d009","to":"d000","data":{"id":"e009_0"}}
+{"edge":"Knows","id":"e003_0","from":"d003","to":"d004","data":{}}
+{"edge":"Knows","id":"e006_0","from":"d006","to":"d007","data":{}}
+{"edge":"Knows","id":"e009_0","from":"d009","to":"d000","data":{}}
 
 --- query
 query fused($q: Vector(4), $t: String) {

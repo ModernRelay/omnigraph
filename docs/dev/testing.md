@@ -43,6 +43,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `failpoint_names_guard.rs`, in-source manifest/recovery tests |
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
+| Legacy-vintage graphs (`id`/`src`/`dst` spellings, stamp 8) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
 | Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and `benchmark_scenario_contract.rs` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.
@@ -88,20 +89,20 @@ Server suites are organized by public route: `auth_policy`, `data_routes`, `sche
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
-The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V8 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
+The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V9 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
 
 ```bash
-OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v8_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v8 -- --exact --nocapture
+OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9 -- --exact --nocapture
 ```
 
-The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v8 fence. RFC 0062 introduced v7's registration clock; RFC 0042's native-ref retirement metadata requires the current v8 stamp. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request with the releases it installs.
+The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v9 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, and RFC 0040's system columns stamp new graphs v9. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires genuine v0.9 and
 v0.10 local standalone journeys through the default v6 → v7 → v8 route. It fails
 missing predecessor binaries, missing cases and skipped required cases. Engine
 storage-upgrade tests own direct v7 → v8 conversion, exact pending v6 → v7
 recovery before composition, explicit target 7, deferred check reporting, and
-current v8 no-op admission with retained retired refs. Keep the normal-open
+v8 no-op admission with retained retired refs. Keep the normal-open
 format fences: explicit conversion does not grant serving support for v6/v7.
 See the [support matrix](versioning.md#storage-upgrade-support-matrix).
 
@@ -114,13 +115,19 @@ Focused iteration:
 ```bash
 cargo test -p omnigraph-engine --test traversal
 cargo test -p omnigraph-engine --test writes concurrent
-cargo test -p omnigraph-gqt                                      # every .gqt case + the format self-tests
-cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # the cases whose file name contains issue_563
-cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 cargo test -p omnigraph-server --test data_routes
 cargo test -p omnigraph-cli --test cli_data
 cargo test -p omnigraph-cluster --test failpoints --features failpoints
 cargo test -p omnigraph-bench --locked
+```
+
+Run GQT commands from `crates/omnigraph-gqt` so its Cargo configuration enables
+the DST runtime requested by corpus files:
+
+```bash
+cargo test -p omnigraph-gqt --locked                            # complete corpus and harness tests
+cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # matching case names
+cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 ```
 
 Every `.gqt` case is its own libtest test named `case::<file>.gqt`, registered
@@ -146,11 +153,12 @@ that matches no case is libtest's ordinary green zero-test run; read the
 Canonical workspace graph:
 
 ```bash
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```
 
-The feature-superset command is the canonical graph because it compiles the current tree once with failpoint hooks present but inert unless a test enables one. Also run formatting and both Clippy graphs before pushing; [ci.md](ci.md) lists the exact gates.
+The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one. The separate `GQ Logic Tests` context owns GQT: the root command above tests unavailable-DST refusal, and the complete corpus command from the GQT crate runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
 
 AWS server support has a separate feature owner:
 
@@ -159,6 +167,20 @@ cargo test -p omnigraph-server --features aws
 ```
 
 S3-backed tests skip unless `OMNIGRAPH_S3_TEST_BUCKET` and the corresponding AWS endpoint/credential variables are set. Azure-backed tests skip unless `OMNIGRAPH_AZURE_TEST_CONTAINER` and the documented Azure/Azurite variables are set. A configured CI backend treats a skip as failure.
+
+### GQT execution through DST
+
+GQT files select their execution target in a `--- runner` YAML section before
+the schema. The file owns its storage, seeds and explicit faults;
+the runner preserves GQT assertions and uses isolated seeded processes.
+Build from `crates/omnigraph-gqt` to enable its Tokio configuration.
+Workspace-root builds without that configuration explicitly refuse DST
+cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
+defines supported targets, hooks, replay observations, and limits. The configured
+CI owner enrolls the complete corpus. A strict `--- known_failure` marker admits only
+the recorded typed recovery failure at its declared step, with verified fault
+delivery and matching replay. Reports label it `known_failure`; changed failures
+and unexpected passes fail CI. The healthy assertion stays in the case.
 
 ### OpenAPI
 

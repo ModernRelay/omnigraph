@@ -5424,6 +5424,41 @@ async fn roll_back_schema_apply_v7(
     Ok(())
 }
 
+/// Resolve only the failed merge whose schema, branch and table gates remain held.
+/// The caller must have awaited its effect phase to completion; cancelled writers
+/// are left to the ordinary recovery entry points.
+pub(crate) async fn recover_failed_branch_merge_under_gates(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    failed: &RecoverySidecar,
+) -> Result<bool> {
+    assert_eq!(failed.writer_kind, SidecarKind::BranchMerge);
+    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_PRE_ERROR_RECOVERY)?;
+    let Some(sidecar) = reread_sidecar_under_gates(root_uri, storage.as_ref(), failed).await?
+    else {
+        return Ok(true);
+    };
+    if !sidecar
+        .protocol_v4
+        .as_ref()
+        .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed)
+    {
+        return Ok(false);
+    }
+    let coordinator = match sidecar.branch.as_deref() {
+        Some(branch) => GraphCoordinator::open_branch(root_uri, branch, storage.clone()).await?,
+        None => GraphCoordinator::open(root_uri, storage.clone()).await?,
+    };
+    process_branch_merge_sidecar_v4(
+        root_uri,
+        storage,
+        &coordinator.snapshot(),
+        &sidecar,
+        RecoveryMode::Full,
+    )
+    .await
+}
+
 async fn process_branch_merge_sidecar_v4(
     root_uri: &str,
     storage: &std::sync::Arc<dyn StorageAdapter>,
@@ -8717,7 +8752,7 @@ mod tests {
 
     fn person_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
+            Field::new("__id", DataType::Utf8, false),
             Field::new("age", DataType::Int32, true),
         ]))
     }
@@ -10121,7 +10156,7 @@ mod tests {
             .stage_create_indices(
                 &after_data,
                 &[IndexBuildSpec::BTree {
-                    column: "id".to_string(),
+                    column: "__id".to_string(),
                     name: None,
                 }],
             )
@@ -10221,7 +10256,7 @@ node Person {
 
         db.load(
             "main",
-            r#"{"type":"Person","data":{"id":"winner","age":22}}"#,
+            r#"{"type":"Person","id":"winner","data":{"age":22}}"#,
             crate::loader::LoadMode::Append,
         )
         .await
@@ -10318,7 +10353,7 @@ node Person {
             .iter()
             .flat_map(|batch| {
                 let ids = batch
-                    .column_by_name("id")
+                    .column_by_name("__id")
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()
@@ -10554,7 +10589,7 @@ node Person { age: I32? }
 
         db.load(
             "main",
-            r#"{"type":"Person","data":{"id":"winner","age":22}}"#,
+            r#"{"type":"Person","id":"winner","data":{"age":22}}"#,
             crate::loader::LoadMode::Append,
         )
         .await
@@ -10666,7 +10701,7 @@ node Person { age: I32? }
             .iter()
             .flat_map(|batch| {
                 let ids = batch
-                    .column_by_name("id")
+                    .column_by_name("__id")
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()

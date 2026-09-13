@@ -3,6 +3,12 @@
 # notes: unkeyed edge type (RFC 0044): b0's re-insert of a pair main holds is a fresh row, b1's delete
 # notes: removes the inherited row; merge b1 empties main, merge b0 adopts the fresh row. DST nightly seed 221206.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key

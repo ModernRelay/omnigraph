@@ -17,7 +17,7 @@
 //! integration tests carry.
 #![recursion_limit = "512"]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -45,6 +45,16 @@ use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{JsonParamMode, QueryResult, json_params_to_param_map};
 use serde_json::Value;
 
+mod dst_runner;
+mod runner_config;
+pub use dst_runner::{
+    replay_report, report_cli_refusal, run_corpus_case, run_selected, run_worker_if_requested,
+};
+use omnigraph::storage::StorageAdapter;
+use runner_config::{
+    Execution, Fault, KnownFailure, RunnerConfig, parse_fault, parse_known_failure, parse_runner,
+};
+
 mod shape;
 use shape::{ShapeExpect, bless_shape_lines, parse_shape_body, shape_mismatch};
 
@@ -54,6 +64,11 @@ pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
 
 #[derive(Debug)]
 struct Case {
+    input_text: String,
+    runner: RunnerConfig,
+    known_failure: Option<KnownFailure>,
+    faults: BTreeMap<usize, Fault>,
+    source_lines: BTreeMap<usize, usize>,
     schema: String,
     seed: String,
     /// The `# traversal:` pin; `None` runs the production path unscoped.
@@ -88,6 +103,16 @@ enum Step {
 }
 
 impl Step {
+    fn ordinal(&self) -> usize {
+        match self {
+            Self::Query(s) => s.ordinal,
+            Self::Mutate(s) => s.ordinal,
+            Self::Control(s) => s.ordinal,
+            Self::List(s) => s.ordinal,
+            Self::Restart { ordinal } => *ordinal,
+        }
+    }
+
     /// The rows-or-error expect of a read step (`--- query`), which is the
     /// one kind that carries a shape section.
     fn read_expect(&self) -> Option<&QueryExpect> {
@@ -1086,6 +1111,31 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let header = parse_header(&header_lines)?;
     check_file_name(stem, &header.issue)?;
 
+    let (runner, sections) = if sections.first().is_some_and(|s| s.name == "runner") {
+        let body = sections[0]
+            .body
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        (parse_runner(&body)?, &sections[1..])
+    } else {
+        return Err(
+            "invalid_case: the first section must be `--- runner` with explicit configuration"
+                .into(),
+        );
+    };
+    let (known_failure, sections) = if sections.first().is_some_and(|s| s.name == "known_failure") {
+        let body = sections[0]
+            .body
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        (Some(parse_known_failure(&body)?), &sections[1..])
+    } else {
+        (None, sections)
+    };
     if sections.first().map(|s| s.name.as_str()) != Some("schema") {
         return Err("the first section must be `--- schema`".into());
     }
@@ -1116,6 +1166,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
     let mut ordinal = 0usize;
+    let mut faults = BTreeMap::new();
+    let mut source_lines = BTreeMap::new();
+    let mut awaiting_fault_step = false;
     let mut qm_steps = 0usize;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
 
@@ -1152,8 +1205,38 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         {
             return Err(missing_shape(waiting));
         }
+        if awaiting_fault_step && !matches!(kind, "query" | "mutate") {
+            return Err(
+                "invalid_case: a fault must directly precede its query or mutate step".into(),
+            );
+        }
+        if matches!(kind, "query" | "mutate" | "restart") {
+            source_lines.insert(ordinal + 1, section.header_line + 1);
+            awaiting_fault_step = false;
+        }
         match kind {
-            "schema" | "seed" => {
+            "fault" => {
+                if open_loop.is_some() {
+                    return Err(
+                        "invalid_case: fault directives inside loops are not supported".into(),
+                    );
+                }
+                if faults.len() >= 16 {
+                    return Err("invalid_case: a case admits at most 16 fault directives".into());
+                }
+                if !rest.is_empty() || pending.is_some() {
+                    return Err("invalid_case: fault takes no header arguments and must precede a complete step".into());
+                }
+                let body = section
+                    .body
+                    .iter()
+                    .map(|(_, line)| *line)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                faults.insert(ordinal + 1, parse_fault(&body)?);
+                awaiting_fault_step = true;
+            }
+            "runner" | "schema" | "seed" => {
                 return Err(format!(
                     "line {}: `--- {kind}` is out of position; schema then seed lead the file, once each",
                     section.header_line + 1
@@ -1379,6 +1462,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             _ => return Err(format!("unknown section `--- {}`", section.name)),
         }
     }
+    if awaiting_fault_step {
+        return Err("invalid_case: fault has no following operation".into());
+    }
     if pending.is_some() {
         return Err("the final step is missing its `--- expect`".into());
     }
@@ -1401,13 +1487,20 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             ));
         }
     }
-    Ok(Case {
+    let case = Case {
+        input_text: text.into(),
+        runner,
+        known_failure,
+        faults,
+        source_lines,
         schema,
         seed,
         traversal: header.traversal,
         items,
         needs_indices,
-    })
+    };
+    dst_runner::validate_known_failure(&case)?;
+    Ok(case)
 }
 
 fn normalize_number(n: &serde_json::Number) -> String {
@@ -1720,7 +1813,10 @@ async fn run_query_step(
         Ok(params) => params,
         Err(e) => {
             return match &step.expect {
-                QueryExpect::Error { needle } if e.contains(needle) => Ok(()),
+                QueryExpect::Error { needle } if e.contains(needle) => {
+                    dst_runner::record("parameter_error", serde_json::json!({"message": e}));
+                    Ok(())
+                }
                 QueryExpect::Error { needle } => {
                     Err(fail(format!("error does not contain \"{needle}\": {e}")))
                 }
@@ -1738,6 +1834,10 @@ async fn run_query_step(
         ),
     )
     .await;
+    dst_runner::observe_query(
+        &outcome,
+        matches!(step.expect, QueryExpect::Rows { ordered: true, .. }),
+    );
     let require_expand =
         step.expects_expand && outcome.is_ok() && matches!(step.expect, QueryExpect::Rows { .. });
     if let Some(violation) = check_pin(mode, &counts, require_expand) {
@@ -1805,6 +1905,13 @@ fn check_rows(
     let Value::Array(actual) = rows else {
         return Err(fail("engine returned a non-array row set".into()));
     };
+    dst_runner::observe(|| {
+        let mut rows = actual.iter().map(Value::to_string).collect::<Vec<_>>();
+        if !ordered {
+            rows.sort();
+        }
+        format!("{label} rows: {rows:?}")
+    });
     let expected = parse_expect_rows(&substitute(body_raw, binding)).map_err(&fail)?;
     compare_rows(&expected, &actual, ordered).map_err(|(message, rows)| StepFail {
         label: label.to_string(),
@@ -1826,6 +1933,7 @@ fn check_error_expect<T, E: std::fmt::Display>(
         )),
         Err(e) => {
             let msg = e.to_string();
+            dst_runner::observe(|| format!("error: {msg}"));
             if msg.contains(needle) {
                 Ok(())
             } else {
@@ -1859,7 +1967,14 @@ async fn run_list_step(
         message,
         bless_lines: None,
     };
-    let outcome = db.branch_list().await;
+    let outcome = match db.branch_list().await {
+        Ok(names) => Ok(list_result(names).map_err(&fail)?),
+        Err(error) => Err(error),
+    };
+    dst_runner::observe_query(
+        &outcome,
+        matches!(step.expect, QueryExpect::Rows { ordered: true, .. }),
+    );
     match &step.expect {
         QueryExpect::Rows {
             ordered,
@@ -1867,8 +1982,7 @@ async fn run_list_step(
             span,
             shape,
         } => {
-            let names = outcome.map_err(|e| fail(format!("`branch list` failed: {e}")))?;
-            let result = list_result(names).map_err(&fail)?;
+            let result = outcome.map_err(|e| fail(format!("`branch list` failed: {e}")))?;
             let catalog = db.catalog();
             if let Some(mismatch) = shape_mismatch(&shape.lines, &result, result.schema(), &catalog)
             {
@@ -1930,6 +2044,7 @@ async fn run_control_step(
             let outcome = db
                 .branch_create_from_as(ReadTarget::branch(parent), branch, None)
                 .await;
+            dst_runner::observe(|| format!("actual control: {outcome:?}"));
             check_write_expect(name, expect, outcome).map_err(fail)
         }
         ControlWrite::Delete {
@@ -1937,6 +2052,7 @@ async fn run_control_step(
             expect,
         } => {
             let outcome = db.branch_delete_as(branch, None).await;
+            dst_runner::observe(|| format!("actual control: {outcome:?}"));
             check_write_expect(name, expect, outcome).map_err(fail)
         }
         ControlWrite::Merge {
@@ -1945,9 +2061,14 @@ async fn run_control_step(
             expect,
         } => {
             let target = into.as_deref().unwrap_or(MAIN_BRANCH);
-            let outcome = db.branch_merge_as(source, target, None).await;
+            let outcome = db
+                .branch_merge_as(source, target, None)
+                .await
+                .inspect_err(dst_runner::observe_fault);
+            dst_runner::observe(|| format!("actual merge: {outcome:?}"));
             match expect {
                 MergeExpect::Write(expect) => {
+                    dst_runner::observe(|| format!("actual control: {outcome:?}"));
                     check_write_expect(name, expect, outcome).map_err(fail)
                 }
                 MergeExpect::Outcome(want) => match outcome {
@@ -1980,7 +2101,10 @@ async fn run_mutate_step(
         Ok(params) => params,
         Err(e) => {
             return match &step.expect {
-                MutateExpect::Error { needle } if e.contains(needle) => Ok(()),
+                MutateExpect::Error { needle } if e.contains(needle) => {
+                    dst_runner::record("parameter_error", serde_json::json!({"message": e}));
+                    Ok(())
+                }
                 MutateExpect::Error { needle } => {
                     Err(fail(format!("error does not contain \"{needle}\": {e}")))
                 }
@@ -1993,6 +2117,23 @@ async fn run_mutate_step(
         db.mutate(&step.branch, &step.source, &step.name, &params),
     )
     .await;
+    let outcome = outcome.inspect_err(dst_runner::observe_fault);
+    dst_runner::record(
+        "mutation_result",
+        match &outcome {
+            Ok(result) => {
+                serde_json::json!({"nodes": result.affected_nodes, "edges": result.affected_edges})
+            }
+            Err(error) => serde_json::json!({"error": error.to_string()}),
+        },
+    );
+    dst_runner::observe(|| match &outcome {
+        Ok(result) => format!(
+            "actual affected: nodes={} edges={}",
+            result.affected_nodes, result.affected_edges
+        ),
+        Err(error) => format!("actual mutation error: {error}"),
+    });
     if let Some(violation) = check_pin(mode, &counts, false) {
         return Err(fail(violation));
     }
@@ -2030,8 +2171,13 @@ async fn open_case_store(case: &Case) -> Result<(Omnigraph, String, tempfile::Te
     let db = Omnigraph::init(&uri, &case.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
+    seed_case(&db, case).await?;
+    Ok((db, uri, dir))
+}
+
+async fn seed_case(db: &Omnigraph, case: &Case) -> Result<(), String> {
     if !case.seed.trim().is_empty() {
-        load_jsonl(&db, &case.seed, LoadMode::Overwrite)
+        load_jsonl(db, &case.seed, LoadMode::Overwrite)
             .await
             .map_err(|e| format!("seed load failed: {e}"))?;
     }
@@ -2040,7 +2186,7 @@ async fn open_case_store(case: &Case) -> Result<(Omnigraph, String, tempfile::Te
             .await
             .map_err(|e| format!("ensure_indices failed: {e}"))?;
     }
-    Ok((db, uri, dir))
+    Ok(())
 }
 
 // Keep the complete case state machine off its callers' stack. In particular,
@@ -2055,9 +2201,46 @@ fn execute_case<'a>(
 }
 
 async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(), String> {
-    let (mut db, uri, _dir) = open_case_store(case).await?;
+    let (db, uri, _dir) = open_case_store(case).await?;
+    execute_steps(case, path, bless, db, &uri, None).await
+}
 
+#[cfg(tokio_unstable)]
+async fn execute_case_with_storage(
+    case: &Case,
+    path: &Path,
+    uri: &str,
+    storage: Arc<dyn StorageAdapter>,
+) -> Result<(), String> {
+    let db = Omnigraph::init_with_storage(uri, &case.schema, storage.clone(), Default::default())
+        .await
+        .map_err(|e| format!("init failed: {e}"))?;
+    seed_case(&db, case).await?;
+    execute_steps(case, path, false, db, uri, Some(storage)).await
+}
+
+fn execute_steps<'a>(
+    case: &'a Case,
+    path: &'a Path,
+    bless: bool,
+    db: Omnigraph,
+    uri: &'a str,
+    storage: Option<Arc<dyn StorageAdapter>>,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    execute_steps_inner(case, path, bless, db, uri, storage).boxed()
+}
+
+async fn execute_steps_inner(
+    case: &Case,
+    path: &Path,
+    bless: bool,
+    mut db: Omnigraph,
+    uri: &str,
+    storage: Option<Arc<dyn StorageAdapter>>,
+) -> Result<(), String> {
     let mut first_fail: Option<StepFail> = None;
+    let mut generation = 0usize;
+    dst_runner::observe(|| "lifetime: initialized generation 0".into());
     'run: for item in &case.items {
         let (values, var, steps): (Vec<Option<&str>>, Option<&str>, Vec<&Step>) = match item {
             Item::Step(step) => (vec![None], None, vec![step]),
@@ -2070,6 +2253,41 @@ async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(),
         for value in values {
             let binding = var.zip(value);
             for step in &steps {
+                let ordinal = step.ordinal();
+                dst_runner::observe(|| {
+                    format!(
+                        "operation: ordinal={ordinal} line={:?} binding={binding:?} generation={generation} expected={step:?}",
+                        case.source_lines.get(&ordinal)
+                    )
+                });
+                dst_runner::begin_operation(
+                    serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": generation}),
+                );
+                dst_runner::record(
+                    "expectation",
+                    match step {
+                        Step::Query(q) => read_expect_evidence(&q.expect),
+                        Step::List(l) => read_expect_evidence(&l.expect),
+                        Step::Mutate(m) => match &m.expect {
+                            MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
+                            MutateExpect::Affected { nodes, edges } => {
+                                serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
+                            }
+                            MutateExpect::Error { needle } => {
+                                serde_json::json!({"kind": "error", "contains": needle})
+                            }
+                        },
+                        Step::Control(c) => {
+                            serde_json::json!({"control": c.name, "expectation": format!("{:?}", c.write)})
+                        }
+                        Step::Restart { .. } => {
+                            serde_json::json!({"kind": "restart", "storage": "preserved"})
+                        }
+                    },
+                );
+                let fault = case.faults.get(&ordinal);
+                let guard = dst_runner::arm_fault(fault)?;
+                let lifetime_before = dst_runner::lifetime_counts();
                 let outcome = match step {
                     Step::Query(q) => run_query_step(&db, case.traversal, q, binding).await,
                     Step::Mutate(m) => run_mutate_step(&db, case.traversal, m, binding).await,
@@ -2077,7 +2295,15 @@ async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(),
                     Step::List(l) => run_list_step(&db, l, binding).await,
                     Step::Restart { ordinal } => {
                         drop(db);
-                        db = Omnigraph::open(&uri).await.map_err(|e| {
+                        generation += 1;
+                        dst_runner::observe(|| format!("lifetime: reopen generation {generation}"));
+                        let reopened = match &storage {
+                            Some(storage) => {
+                                Omnigraph::open_with_storage(uri, storage.clone()).await
+                            }
+                            None => Omnigraph::open(uri).await,
+                        };
+                        db = reopened.map_err(|e| {
                             format!(
                                 "{}: reopen failed: {e}",
                                 step_label(*ordinal, "restart", binding)
@@ -2086,6 +2312,52 @@ async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(),
                         Ok(())
                     }
                 };
+                #[cfg(tokio_unstable)]
+                drop(guard);
+                #[cfg(not(tokio_unstable))]
+                let _ = guard;
+                let lifetime_after = dst_runner::lifetime_counts();
+                dst_runner::record(
+                    "engine_lifetime",
+                    serde_json::json!({"before": lifetime_before, "after": lifetime_after}),
+                );
+                if let (Some(before), Some(after)) = (lifetime_before, lifetime_after) {
+                    let opens = u64::from(matches!(step, Step::Restart { .. }));
+                    if after != [before[0], before[1] + opens] {
+                        return Err(format!(
+                            "worker_failed: unexpected engine init/open call during step {ordinal}: {before:?} -> {after:?}"
+                        ));
+                    }
+                }
+                let fault_result = dst_runner::finish_fault(fault);
+                dst_runner::record(
+                    "assertion",
+                    match &outcome {
+                        Ok(()) => serde_json::json!({"status": "passed"}),
+                        Err(error) => {
+                            serde_json::json!({"status": "failed", "code": "assertion_failed", "message": error.message})
+                        }
+                    },
+                );
+                dst_runner::observe(|| {
+                    format!(
+                        "operation result: {:?}",
+                        outcome.as_ref().map_err(|f| (&f.label, &f.message))
+                    )
+                });
+                if let Err(error) = fault_result {
+                    return Err(format!(
+                        "{error}; operation result: {:?}",
+                        outcome.as_ref().map_err(|f| (&f.label, &f.message))
+                    ));
+                }
+                if storage.is_some() {
+                    let snapshot = db
+                        .resolve_snapshot("main")
+                        .await
+                        .map_err(|e| format!("observe main snapshot: {e}"))?;
+                    dst_runner::observe(|| format!("main snapshot: {snapshot}"));
+                }
                 if let Err(fail) = outcome {
                     first_fail = Some(fail);
                     break 'run;
@@ -2102,7 +2374,7 @@ async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(),
             if case.has_loops() {
                 detail.push_str("\nbless: refused, the case contains loops");
             } else {
-                bless_rewrite(path, *span, lines)?;
+                bless_rewrite(path, *span, lines, &case.input_text)?;
                 let _ = write!(
                     detail,
                     "\nbless: expect rewritten in place ({} lines), re-run to confirm",
@@ -2112,6 +2384,20 @@ async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(),
         }
     }
     Err(detail)
+}
+
+fn read_expect_evidence(expect: &QueryExpect) -> Value {
+    match expect {
+        QueryExpect::Rows {
+            ordered,
+            body_raw,
+            shape,
+            ..
+        } => {
+            serde_json::json!({"kind": "rows", "ordered": ordered, "rows_jsonl": body_raw, "shape": format!("{:?}", shape.lines)})
+        }
+        QueryExpect::Error { needle } => serde_json::json!({"kind": "error", "contains": needle}),
+    }
 }
 
 fn splice_lines(original: &str, span: BodySpan, lines: &[String]) -> String {
@@ -2131,9 +2417,17 @@ fn splice_lines(original: &str, span: BodySpan, lines: &[String]) -> String {
     joined
 }
 
-fn bless_rewrite(path: &Path, span: BodySpan, lines: &[String]) -> Result<(), String> {
+fn bless_rewrite(
+    path: &Path,
+    span: BodySpan,
+    lines: &[String],
+    expected: &str,
+) -> Result<(), String> {
     let original =
         std::fs::read_to_string(path).map_err(|e| format!("bless: cannot re-read case: {e}"))?;
+    if original != expected {
+        return Err("environment_changed: case changed before bless".into());
+    }
     std::fs::write(path, splice_lines(&original, span, lines))
         .map_err(|e| format!("bless: cannot write case: {e}"))
 }
@@ -2145,6 +2439,15 @@ pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
     let stem = stem_of(&path);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read case file: {e}"))?;
     let case = parse_case(&stem, &text).map_err(|e| format!("refused: {e}"))?;
+    if case.runner.environments.len() != 1
+        || !matches!(
+            case.runner.environments[0].execution,
+            Execution::Engine { .. }
+        )
+    {
+        return Err("DST cases require the file dispatcher; the async normal runner cannot execute mode: dst".into());
+    }
+    case.runner.environments[0].admit(!case.faults.is_empty())?;
     execute_case(&case, &path, bless).await
 }
 
@@ -2157,15 +2460,20 @@ pub fn corpus_root() -> PathBuf {
 
 /// `OMNIGRAPH_GQ_BLESS=1` turns bless on; unset, empty, or `0` leaves it off.
 ///
-/// # Panics
+/// # Errors
 ///
-/// On any other value: the knob is refused, not ignored.
-pub fn bless_from_env() -> bool {
+/// Refuses any other value, including non-UTF-8 values.
+pub fn bless_from_env() -> Result<bool, String> {
     match std::env::var(BLESS_ENV) {
-        Err(_) => false,
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
-        Ok(v) => panic!("{BLESS_ENV} takes 1 (or 0/unset), got `{v}`"),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(v)) => Err(format!(
+            "invalid_case: {BLESS_ENV} requires UTF-8, got {v:?}"
+        )),
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" || v.is_empty() => Ok(false),
+        Ok(v) => Err(format!(
+            "invalid_case: {BLESS_ENV} takes 1 (or 0/empty/unset), got `{v}`"
+        )),
     }
 }
 

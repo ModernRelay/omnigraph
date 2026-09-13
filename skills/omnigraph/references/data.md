@@ -35,8 +35,8 @@ edits.
 > escapes the row ceiling but not the 32 MiB strict-input Arrow preflight
 > (`strict_input_arrow_bytes`), so a bulk replacement above ~32 MiB is one
 > `overwrite` chunk followed by `merge` chunks. Also: against a non-local
-> target, `--mode overwrite` (like `cleanup` and `branch delete`, verb or
-> statement) requires explicit `--yes` consent in non-interactive runs.
+> target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
+> explicit `--yes` consent in non-interactive runs.
 >
 > **Direct and served are one command.** `load` works against a graph store
 > (writing storage directly) *and* an `omnigraph-server` endpoint (the
@@ -180,28 +180,6 @@ omnigraph branch delete <branch-name> --store $REPO
 All support `--json` for automation-friendly output. Address the graph with a
 positional `file://`/`s3://`/preview `az://` URI (shown), `--store <uri>`, or
 `--server <name>`.
-
-The same four operations are GQ statements, for a client that already sends
-`.gq` source. Wrong-door rule: the control writes go through `mutate`, the
-listing through `query`; the other verb refuses the statement. A statement
-names its branches itself, so `--branch`, `--snapshot`, `--if-commit`, a
-positional name, and `--params` are refused beside it.
-
-```bash
-omnigraph mutate -e 'branch create "<branch-name>" from main' --store $REPO
-omnigraph query  -e 'branch list' --format table --store $REPO
-omnigraph mutate -e 'branch merge "<branch-name>" into main' --store $REPO
-omnigraph mutate -e 'branch delete "<branch-name>"' --store $REPO
-```
-
-A name outside the identifier alphabet `[a-z_][a-z0-9_]*` (an uppercase
-letter, a leading digit, `/`, `-`, or `.`) is quoted: `branch create
-"staging-2026-04-14"`. Quoting a name that needs no quotes is always allowed.
-`from` and `into` default to `main`.
-`--json` on a control write prints a `ChangeOutput` with `outcome.kind`
-(`created`, `deleted`, `merged`) and, for a merge, `outcome.merge`; the
-statement form has no `--delete-branch`, so delete the source with a second
-statement.
 
 ## Inspecting State After Changes
 

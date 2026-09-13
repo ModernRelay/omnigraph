@@ -96,7 +96,7 @@ Choose the mode explicitly:
 
 For a keyed edge the existing-id column applies to its derived id: `append`
 reports `key_conflict` on an already-committed pair, `merge` upserts it, and
-a supplied `data.id` must equal the derivation exactly.
+a supplied top-level `id` must equal the derivation exactly.
 
 ```bash
 omnigraph load --data batch.jsonl --mode merge graph.omni

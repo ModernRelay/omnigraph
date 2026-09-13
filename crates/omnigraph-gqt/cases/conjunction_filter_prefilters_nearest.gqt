@@ -4,6 +4,12 @@
 # notes: 0..9, the conjunction admits 7, 8, 9: exactly limit 3, so the scan
 # notes: returns k matching rows and the unfiltered top-3 (0, 1, 2) is not it.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Doc {
     slug: String @key

@@ -23,6 +23,8 @@ use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use lance_core::datatypes::BlobHandling;
 use lance_table::format::Fragment;
 
+use omnigraph_compiler::{SYSTEM_COLUMNS_META, SystemColumns};
+
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
 use crate::db::{STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values};
@@ -33,10 +35,15 @@ use crate::table_store::TableStore;
 /// proof both change surfaces rely on: per field, its Arrow type, nullability,
 /// stable property identity marker, and whether it is a Blob. Name-keyed map
 /// comparison is order-insensitive, so a physical column reorder is not a false
-/// boundary. Shared by the per-commit enumerator (parent→child gate) and the
-/// cross-branch net diff so the two cannot drift.
+/// boundary. The system roles are keyed by role (`@id`, `@src`, `@dst`), not
+/// by the spelling `system_columns` resolved for this image, so the two
+/// vintages of one table fingerprint equal. The upgrade belongs to RFC 0040
+/// Rollout step 3. Shared by the per-commit enumerator (parent→child
+/// gate) and the cross-branch net diff so the two cannot drift.
 pub(crate) fn user_schema_fingerprint(
     dataset: &Dataset,
+    system_columns: SystemColumns,
+    is_edge: bool,
 ) -> HashMap<String, (String, bool, Option<String>, bool)> {
     dataset
         .schema()
@@ -45,7 +52,8 @@ pub(crate) fn user_schema_fingerprint(
         .filter(|field| !is_reserved_storage_system_column(&field.name))
         .map(|field| {
             (
-                field.name.clone(),
+                column_name_at_vintage(&field.name, system_columns, SYSTEM_COLUMNS_META, is_edge)
+                    .to_string(),
                 (
                     format!("{:?}", field.data_type()),
                     field.nullable,
@@ -142,8 +150,9 @@ impl RawRow {
         dataset: &Dataset,
         batch: &RecordBatch,
         row_index: usize,
+        id_col: &str,
     ) -> Result<RawRow> {
-        let mut cursor = BatchCursor::try_new(dataset, batch.clone())?;
+        let mut cursor = BatchCursor::try_new(dataset, batch.clone(), id_col)?;
         cursor.next_row = row_index;
         cursor.next(dataset)?.ok_or_else(|| {
             OmniError::manifest_internal("single-row batch produced no comparison row")
@@ -172,10 +181,10 @@ struct BatchCursor {
 }
 
 impl BatchCursor {
-    fn try_new(dataset: &Dataset, batch: RecordBatch) -> Result<Self> {
+    fn try_new(dataset: &Dataset, batch: RecordBatch, id_col: &str) -> Result<Self> {
         let id_index = batch
             .schema_ref()
-            .index_of("id")
+            .index_of(id_col)
             .map_err(|_| OmniError::manifest_internal("change row is missing string id"))?;
         batch
             .column(id_index)
@@ -311,11 +320,24 @@ pub(crate) struct OrderedRows {
     stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
     batch: Option<BatchCursor>,
     pending: Option<RawRow>,
+    id_col: &'static str,
 }
 
 impl OrderedRows {
-    pub(crate) async fn open(dataset: Dataset, after_id: Option<&str>) -> Result<Self> {
-        Self::open_scan(dataset, after_id, None, None, ScanTargets::default()).await
+    pub(crate) async fn open(
+        dataset: Dataset,
+        after_id: Option<&str>,
+        id_col: &'static str,
+    ) -> Result<Self> {
+        Self::open_scan(
+            dataset,
+            after_id,
+            None,
+            None,
+            ScanTargets::default(),
+            id_col,
+        )
+        .await
     }
 
     /// The full scan surface. `fragments` scopes the scan to exactly those
@@ -328,6 +350,7 @@ impl OrderedRows {
         extra_filter: Option<Expr>,
         fragments: Option<Vec<Fragment>>,
         targets: ScanTargets,
+        id_col: &'static str,
     ) -> Result<Self> {
         if fragments.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Self {
@@ -335,6 +358,7 @@ impl OrderedRows {
                 stream: None,
                 batch: None,
                 pending: None,
+                id_col,
             });
         }
         let after_id = after_id.map(str::to_string);
@@ -343,13 +367,13 @@ impl OrderedRows {
                 &dataset,
                 None,
                 None,
-                Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+                Some(vec![ColumnOrdering::asc_nulls_last(id_col.to_string())]),
                 true,
                 move |scanner| {
                     if let Some(fragments) = fragments {
                         scanner.with_fragments(fragments);
                     }
-                    let resume = after_id.map(|after_id| col("id").gt(lit(after_id)));
+                    let resume = after_id.map(|after_id| col(id_col).gt(lit(after_id)));
                     if let Some(filter) = match (resume, extra_filter) {
                         (Some(resume), Some(extra)) => Some(resume.and(extra)),
                         (Some(resume), None) => Some(resume),
@@ -384,6 +408,7 @@ impl OrderedRows {
             stream: Some(stream),
             batch: None,
             pending: None,
+            id_col,
         })
     }
 
@@ -410,7 +435,9 @@ impl OrderedRows {
                 return Ok(());
             };
             match stream.try_next().await {
-                Ok(Some(batch)) => self.batch = Some(BatchCursor::try_new(&self.dataset, batch)?),
+                Ok(Some(batch)) => {
+                    self.batch = Some(BatchCursor::try_new(&self.dataset, batch, self.id_col)?)
+                }
                 Ok(None) => {
                     self.stream = None;
                     return Ok(());
@@ -483,6 +510,48 @@ pub(crate) async fn rows_equal(
     to_dataset: &Dataset,
     right: &RawRow,
 ) -> Result<bool> {
+    rows_equal_by_column(from_dataset, left, to_dataset, right, |name| name).await
+}
+
+pub(crate) async fn rows_equal_across_vintages(
+    from_dataset: &Dataset,
+    left: &RawRow,
+    to_dataset: &Dataset,
+    right: &RawRow,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
+) -> Result<bool> {
+    rows_equal_by_column(from_dataset, left, to_dataset, right, |name| {
+        column_name_at_vintage(name, from_columns, to_columns, is_edge)
+    })
+    .await
+}
+
+fn column_name_at_vintage(
+    name: &str,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
+) -> &str {
+    if name == from_columns.id {
+        to_columns.id
+    } else if is_edge && name == from_columns.src {
+        to_columns.src
+    } else if is_edge && name == from_columns.dst {
+        to_columns.dst
+    } else {
+        name
+    }
+}
+
+async fn rows_equal_by_column(
+    from_dataset: &Dataset,
+    left: &RawRow,
+    to_dataset: &Dataset,
+    right: &RawRow,
+    right_name: impl Fn(&str) -> &str,
+) -> Result<bool> {
     let blob_columns: HashSet<&str> = left
         .blob_signatures
         .iter()
@@ -499,11 +568,14 @@ pub(crate) async fn rows_equal(
         if is_reserved_storage_system_column(name) || blob_columns.contains(name.as_str()) {
             continue;
         }
-        let other = right.slice.column_by_name(name).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "schema-gated change row is missing column '{name}'"
-            ))
-        })?;
+        let other = right
+            .slice
+            .column_by_name(right_name(name))
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "schema-gated change row is missing column '{name}'"
+                ))
+            })?;
         if column.to_data() != other.to_data() {
             return Ok(false);
         }
