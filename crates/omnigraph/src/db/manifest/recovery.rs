@@ -4376,8 +4376,7 @@ async fn observe_branch_merge_target_ref(
         .as_deref()
         .filter(|branch| *branch != "main")
     else {
-        let branch_identifier = dataset
-            .branch_identifier()
+        let branch_identifier = crate::branch_control::dataset_branch_identifier(&dataset)
             .await
             .map_err(OmniError::storage)?;
         let version = dataset.version().version;

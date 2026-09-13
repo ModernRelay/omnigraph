@@ -709,8 +709,7 @@ async fn run_step(
     crate::failpoints::maybe_fail(crate::failpoints::names::UPGRADE_AFTER_FENCE)?;
     for branch in &intent.branches {
         let current = open(root, branch.native.as_deref()).await?;
-        if current
-            .branch_identifier()
+        if crate::branch_control::dataset_branch_identifier(&current)
             .await
             .map_err(OmniError::storage)?
             != branch.identity
@@ -794,13 +793,17 @@ async fn inventory(main: &Dataset, graph_identity: String) -> Result<UpgradeInte
             .map_err(OmniError::storage)?;
         sources.push(SourceBranch {
             native: Some(native),
-            identity: ds.branch_identifier().await.map_err(OmniError::storage)?,
+            identity: crate::branch_control::dataset_branch_identifier(&ds)
+                .await
+                .map_err(OmniError::storage)?,
             version: ds.version().version,
         });
     }
     sources.push(SourceBranch {
         native: None,
-        identity: main.branch_identifier().await.map_err(OmniError::storage)?,
+        identity: crate::branch_control::dataset_branch_identifier(main)
+            .await
+            .map_err(OmniError::storage)?,
         version: main.version().version,
     });
     let source_format = read_stamp(main).ok_or_else(|| invalid("source stamp is missing"))?;
@@ -915,8 +918,7 @@ async fn verify_inventory(root: &str, intent: &UpgradeIntent, fenced: bool) -> R
     }
     for source in &intent.branches {
         let dataset = open(root, source.native.as_deref()).await?;
-        if dataset
-            .branch_identifier()
+        if crate::branch_control::dataset_branch_identifier(&dataset)
             .await
             .map_err(OmniError::storage)?
             != source.identity
@@ -1248,8 +1250,7 @@ pub(super) async fn historical_source(snapshot: Dataset, source_format: u32) -> 
         || transaction.read_version != main.version
         || lance_table::format::pb::Transaction::from(&transaction).operation
             != lance_table::format::pb::Transaction::from(&operation).operation
-        || snapshot
-            .branch_identifier()
+        || crate::branch_control::dataset_branch_identifier(&snapshot)
             .await
             .map_err(OmniError::storage)?
             != main.identity
