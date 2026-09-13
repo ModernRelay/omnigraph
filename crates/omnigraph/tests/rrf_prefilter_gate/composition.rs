@@ -3,7 +3,9 @@
 //! invalid rewrites, not compiler lowering, native retrieval or resource bounds.
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
 use datafusion::dataframe::DataFrame;
@@ -11,7 +13,9 @@ use datafusion::functions::core::expr_fn::{coalesce, named_struct};
 use datafusion::functions_aggregate::count::count_distinct;
 use datafusion::functions_aggregate::expr_fn::{array_agg, count, min};
 use datafusion::functions_window::row_number::row_number;
-use datafusion::logical_expr::{ExprFunctionExt, JoinType, Partitioning, when};
+use datafusion::logical_expr::{ExprFunctionExt, JoinType, Operator, Partitioning, when};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column};
 use datafusion::prelude::{SessionConfig, SessionContext, col, lit};
 use omnigraph_compiler::result::QueryResult;
 use serde_json::{Value, json};
@@ -32,6 +36,182 @@ async fn rows(frame: DataFrame) -> Value {
     QueryResult::new(schema, frame.collect().await.unwrap())
         .to_rust_json()
         .unwrap()
+}
+
+// A mechanism probe, not a GQ regression: the future scalar operators cannot
+// execute through GQT yet. Default native evaluation is a negative control.
+#[tokio::test]
+async fn staged_composition_numeric_and_null_contracts() {
+    let ctx = SessionContext::new();
+    let booleans = [Some(true), Some(false), None];
+    let pairs: Vec<_> = booleans
+        .iter()
+        .flat_map(|a| booleans.iter().map(move |b| (*a, *b)))
+        .collect();
+    let input = RecordBatch::try_from_iter([
+        (
+            "left",
+            Arc::new(BooleanArray::from(
+                pairs.iter().map(|p| p.0).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        (
+            "right",
+            Arc::new(BooleanArray::from(
+                pairs.iter().map(|p| p.1).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let output = ctx
+        .read_batch(input)
+        .unwrap()
+        .select(vec![
+            col("left").and(col("right")).alias("both"),
+            col("left").or(col("right")).alias("either"),
+            (!col("left")).alias("negated"),
+            col("left").eq(col("right")).alias("equal"),
+        ])
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(false),
+            Some(false),
+            Some(false),
+            None,
+            Some(false),
+            None,
+        ],
+        vec![
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            None,
+            None,
+        ],
+        vec![
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+            None,
+            None,
+            None,
+        ],
+        vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(false),
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        ],
+    ];
+    for (column, expected) in expected.iter().enumerate() {
+        let actual: Vec<_> = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect();
+        assert_eq!(&actual, expected);
+    }
+
+    let binary = |op| {
+        BinaryExpr::new(
+            Arc::new(Column::new("left", 0)),
+            op,
+            Arc::new(Column::new("right", 1)),
+        )
+    };
+    for (op, left, right, wrapped) in [
+        (Operator::Plus, i64::MAX, 1, i64::MIN),
+        (Operator::Minus, i64::MIN, 1, i64::MAX),
+        (Operator::Multiply, i64::MAX, 2, -2),
+    ] {
+        let input = RecordBatch::try_from_iter([
+            ("left", Arc::new(Int64Array::from(vec![left])) as ArrayRef),
+            ("right", Arc::new(Int64Array::from(vec![right])) as ArrayRef),
+        ])
+        .unwrap();
+        let value = binary(op).evaluate(&input).unwrap().into_array(1).unwrap();
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            wrapped
+        );
+        let error = binary(op)
+            .with_fail_on_overflow(true)
+            .evaluate(&input)
+            .unwrap_err();
+        assert!(error.to_string().contains("overflow"), "{error}");
+    }
+    let nullable = RecordBatch::try_from_iter([
+        (
+            "left",
+            Arc::new(Int64Array::from(vec![Some(8), None])) as ArrayRef,
+        ),
+        (
+            "right",
+            Arc::new(Int64Array::from(vec![Some(2), Some(1)])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let difference = binary(Operator::Minus)
+        .with_fail_on_overflow(true)
+        .evaluate(&nullable)
+        .unwrap()
+        .into_array(2)
+        .unwrap();
+    let difference = difference.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(difference.value(0), 6);
+    assert!(difference.is_null(1));
+
+    // The integer overflow switch does not make floating arithmetic finite.
+    let floats = RecordBatch::try_from_iter([
+        (
+            "left",
+            Arc::new(Float64Array::from(vec![1.0, 0.0, f64::MAX])) as ArrayRef,
+        ),
+        (
+            "right",
+            Arc::new(Float64Array::from(vec![0.0, 0.0, 0.5])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let quotient = binary(Operator::Divide)
+        .with_fail_on_overflow(true)
+        .evaluate(&floats)
+        .unwrap()
+        .into_array(3)
+        .unwrap();
+    let quotient = quotient.as_any().downcast_ref::<Float64Array>().unwrap();
+    assert!(quotient.value(0).is_infinite());
+    assert!(quotient.value(1).is_nan());
+    assert!(quotient.value(2).is_infinite());
 }
 
 #[tokio::test]

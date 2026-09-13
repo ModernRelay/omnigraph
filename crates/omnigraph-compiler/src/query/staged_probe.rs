@@ -2724,6 +2724,20 @@ query expressions($q: String, $threshold: I64, $missing: Bool?) {
     };
     assert_eq!(*op, BinaryOp::Add);
     assert!(matches!(right.as_ref(), Value::Binary { op, .. } if *op == BinaryOp::Multiply));
+    for (params, expression, scalar, nullable) in [
+        ("$a: I64?, $b: I64", "$a - $b", ScalarType::I64, true),
+        ("$a: F64, $b: F64", "$a / $b", ScalarType::F64, false),
+        ("$a: Bool?, $b: Bool", "$a and $b", ScalarType::Bool, true),
+    ] {
+        let input = format!(
+            "query numeric({params}) {{ match {{ $o: Organization }} return {{ {expression} as value }} }}"
+        );
+        let plan = check(&catalog(), parse(&input).unwrap()).unwrap();
+        assert_eq!(
+            plan.projection_types[0].scalar(),
+            Some(PropType::scalar(scalar, nullable))
+        );
+    }
     let grouped = input.replace("1 + 2 * 3", "(1 + 2) * 3");
     let grouped = check(&catalog(), parse(&grouped).unwrap()).unwrap();
     assert!(
@@ -2746,6 +2760,8 @@ query expressions($q: String, $threshold: I64, $missing: Bool?) {
         ),
         ("is_null(metric(words, rank))", "is_null($unknown.name)"),
         ("1 + 2 * 3", "unknown(1)"),
+        ("1 + 2 * 3", "1 + 2.0"),
+        ("1 + 2 * 3", "3 / 2"),
         ("is_null(metric(words, rank))", "amount"),
     ] {
         let invalid = input.replace(from, to);

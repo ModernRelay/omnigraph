@@ -15,7 +15,7 @@ blocked_on:
   - "RFC 0047 plan-truth guarantees reconciled with named stages; its interim Option<RetrievalIR> shape and scan-root restriction are not permanent dependencies"
   - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
   - "Language evolution contract: shared expressions, contextual keywords, scope transitions, and compatibility fixtures before syntax stabilization; explicit yield output is compiler-prototyped"
-  - "Mixed analytical/graph/retrieval composition: C1–C4 have checked logical goldens and scoped DataFusion building-block probes; scorer semantics, integrated lowering and resource qualification remain open"
+  - "Mixed analytical/graph/retrieval composition: C1–C4 have checked logical goldens; scorer/null/arithmetic policies are decided, but production evaluation, integrated lowering and resource qualification remain open"
   - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
   - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
   - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
@@ -25,7 +25,7 @@ blocked_on:
   - "Snapshot-visible live-row statistics, canonical float64/log1p implementation, and full boundary-tie handling"
   - "Whole-query admission and accounting for token construction, graph fan-out, coverage, sorting, scoring, fallback, and output bytes"
   - "Snapshot-coherent follow-up read and stored-query fingerprint contracts through the existing read surface"
-  - "All-node scope, representation selection, typed union/narrowing grammar, and an explicit disposition for cross-type search in the initial release"
+  - "Global-search extension proof: typed identity, source/table independence and union/narrowing compatibility; cross-type and all-node execution explicitly deferred"
   - "Maintained retrieval judgments and mixed analytical/graph/retrieval agent tasks beyond the document pilot; bounded ann_default_v1 recall/latency qualification per index family"
 ---
 
@@ -66,8 +66,9 @@ The initial release covers analyzed Boolean matching, exact/fuzzy lexical
 retrieval, exact `knn`, approximate `ann`, named fusion, graph-defined
 populations, per-group selection, terminal aggregates and coherent source
 reads. The [capability matrix](#query-capability-matrix) distinguishes this
-scope from deferred operators. All-node search still needs an explicit
-include/defer decision and typed union/projection design.
+scope from deferred operators. Cross-type, all-node and all-edge search are
+deferred; their typed union/projection and source contracts remain required
+language-evolution work, not an implied capability of same-type fusion.
 
 The pre-stable cutover deliberately breaks search queries and representation
 declarations, with one coordinated format rebuild. The
@@ -520,7 +521,29 @@ as dedicated nodes; a call-shaped retriever is not a scalar. Unknown
 constructors/options fail. Fix precedence, associativity, null rules, name
 resolution and positional/named arguments before stabilization. Scalar
 negation must not inherit correlated graph `not` semantics; score arithmetic
-retains explicit domain policies.
+retains explicit domain policies. The following Phase 0 expression decisions
+apply when the corresponding operators are implemented:
+
+| Boundary | Decision |
+|---|---|
+| Precedence | Parentheses/calls, then `*` and `/`, then `+` and `-`, then one comparison, then scalar `not(...)`, then `and`, then `or`. Arithmetic at one level associates left; chained comparisons fail. Graph `not { ... }` retains its separate scope. |
+| Numeric types | Arithmetic requires the same scalar numeric type; no implicit widening, integer/float mixing or conversion of metrics to numbers. Integer division remains unavailable until an explicit quotient/rounding contract; future casts must be named. |
+| Null values | Arithmetic/comparison with null yields null. Boolean composition uses three-valued logic: false dominates `and`, true dominates `or`, otherwise an unknown operand yields null; `not(null)` is null. `is_null` returns non-null Bool; filters and `count_if` accept only true. |
+| Numeric errors | Integer overflow/underflow is a typed failure, never wrapping, saturation or null. New floating arithmetic rejects non-finite operands/results and division by either signed zero. Null operands yield null without applying that arithmetic operation. These rules do not retroactively redefine stored scalar values or existing aggregate signatures. |
+| Evaluation | Operands have no promised left-to-right or short-circuit evaluation. Boolean guards cannot make an invalid arithmetic expression safe; future conditional/try expressions need explicit evaluation rules. Constant folding must use the same types, null and error rules as execution. |
+| Aliases | Sibling `let`/return expressions read the incoming scope; they cannot read an alias declared beside them. A later stage can read exported values. Final ordering can read output aliases. |
+
+The staged compiler checks precedence, same-type arithmetic and nullable
+results. The native `staged_composition_numeric_and_null_contracts` probe
+checks all nine Boolean pairs and exposes two adapter obligations:
+DataFusion 54's default integer `BinaryExpr` wraps; its explicit
+`with_fail_on_overflow(true)` path refuses the tested I64 overflows. That
+switch still permits floating infinity/NaN, so finite arithmetic needs a
+checked expression adapter. This is a physical-expression proof, not proof
+that logical optimization, aggregate accumulators or GQ lowering preserve
+these rules. Those remain qualification gates; a session default is
+insufficient. See the pinned [binary evaluator](https://docs.rs/crate/datafusion-physical-expr/54.0.0/source/src/expressions/binary.rs)
+and [Arrow arithmetic](https://docs.rs/crate/arrow-arith/58.3.0/source/src/numeric.rs).
 
 Every operator declares its scope and population effect:
 
@@ -596,8 +619,6 @@ remain open. **RFC release** uses these dispositions:
 - `Foundation`: fix the shared grammar/type/scope rules now; the broader
   user-facing operator remains deferred.
 - `Defer`: outside the initial implementation; preserve the stated extension.
-- `Decision`: Phase 0 must explicitly include or defer it before release scope
-  is frozen. It is not currently a delivered capability.
 - `Separate`: an adjacent capability governed by its own contract, not a new
   search feature.
 
@@ -640,9 +661,9 @@ change the tested RFC query examples.
 | Optional graph enrichment | No | Foundation | Example C4 must preserve unmatched inputs and nullable exports; distinguish inner predicates from later filters. Multiple matches may still fan out; implementation remains deferred. |
 | Graph matching before, between and after retrieval cuts | Limited; one `match` and terminal search ordering | Deliver | Repeated stages retain their input population; later filters cannot move before an earlier selection cut. |
 | Logical system identity projection and filtering | Limited; whole-node objects expose `id`, but `.id` is an ordinary declared property lookup | Deliver with RFC 0040 | Qualify `$binding.@id` and type/incarnation-aware follow-up; never expose native row IDs as graph identity. |
-| Explicit unions of typed graph bindings | No; interfaces do not provide polymorphic query scans | Decision | Add typed branches with explicit exports, bag/set semantics and original entity identity. |
-| All-node discovery, representation expansion and type narrowing | No | Decision | Resolve type scope separately from searchable representations at one snapshot; common fields and type-specific projections must typecheck. |
-| Global all-edge or mixed node/edge discovery | No; a concrete edge can be reached through traversal | Decision alongside global scope | Make entity kind and selected scope explicit; an all-node selector must not silently start including edges. |
+| Explicit unions of typed graph bindings | No; interfaces do not provide polymorphic query scans | Foundation | Execution deferred. Preserve typed branches, explicit exports, bag/set semantics and original entity identity. |
+| All-node discovery, representation expansion and type narrowing | No | Foundation | Execution deferred. Resolve type scope separately from searchable representations at one snapshot; common fields and type-specific projections must typecheck. |
+| Global all-edge or mixed node/edge discovery | No; a concrete edge can be reached through traversal | Defer | Make entity kind and selected scope explicit; an all-node selector must not silently start including edges. |
 | Cross-graph federation | No combined `.gq` population; graph selection is external | Separate | Requires explicit authority, identity, snapshot and budget rules; global search in this RFC means one graph. |
 
 #### Projection and result shape
@@ -700,7 +721,7 @@ change the tested RFC query examples.
 | Search a traversal-introduced node or a bound edge | Limited; node search shapes have gaps and edge search is rejected | Deliver | Every source targets a property of the declared eligible binding; do not require a textual scan root. |
 | Search, traverse and search again | No explicit staged surface | Deliver | Each stage retains population and metric origin; earlier candidates cannot be reopened implicitly. |
 | Multiple fields on the same target as separate sources | Limited by legacy inline source forms | Deliver | Named sources may select different compatible field capabilities; fusion remains explicit. |
-| One logical multi-field/cross-type lexical corpus | No unified contract | Decision for global-search scope | Specify field reduction and shared live statistics before candidate cuts; per-table BM25 values are not globally comparable by default. |
+| One logical multi-field/cross-type lexical corpus | No unified contract | Defer | Specify field reduction and shared live statistics before candidate cuts; per-table BM25 values are not globally comparable by default. Multiple named fields of one target type can still use explicit fusion. |
 | Phrase, token-prefix, proximity and Boolean lexical queries | No portable typed contract | Defer | Add `LexicalQuery` variants shared by matching/ranking consumers; avoid a vendor query-string sublanguage. |
 | Geometric range retrieval and exact distance predicates | No dedicated public contract | Defer | Distinguish a complete eligible-population range query from a filter on ANN candidates. |
 | Candidate rescoring, learned reranking and general feature combination | No general stage | Foundation | Example C3 fixes membership-preserving scoring, domains, statistics/normalization populations and resource behavior. Scoring/model/formula operators remain deferred. |
@@ -739,9 +760,9 @@ their authored syntax belongs to `.pg` or request options rather than `.gq`.
 
 #### Syntax decisions needed now
 
-Every `Deliver`/`Replace` row needs accepted syntax and typing/lowering;
-every `Decision` row needs an explicit release disposition. `Foundation`
-requires C1–C4 design proofs now while its broader implementation stays deferred.
+Every `Deliver`/`Replace` row needs accepted syntax and typing/lowering.
+`Foundation` requires C1–C4 and global-extension design proofs now while its
+broader implementation stays deferred.
 All extensions follow the [language rules](#language-evolution-and-compatibility).
 
 Current-state evidence is the production
@@ -1080,12 +1101,13 @@ A hidden lexical top-K followed by a join can drop d2 and is invalid.
 Scoring uses accepted corpus statistics and charges their work even for a
 small target set.
 
-**Open:** define scorer behavior for nonmatches, token-empty and nullable fields.
-An `all` query can fail membership while some terms contribute positive BM25:
-decide zero versus partial score, and missing-value null behavior.
-Positive/zero/null fixture features test preservation, not their production.
-Invalid queries, incompatible representations and resource failures remain
-explicit errors.
+**Decision:** scoring evaluates the term contributions independently of
+`all`/`any` membership. A partial `all` match can have a positive feature;
+a present value with no matching terms, including a token-empty value, has
+zero; a null field has a null feature. The
+[lexical contract](#lexical-scoring-and-shared-matching-semantics) owns the
+complete rules and numerical oracle. The native composition fixture still
+uses precomputed features: it proves preservation, not their production.
 
 **C4 — Computed facts, optional graph facts and bounded evidence.** A has one
 owner and three reports; B has neither. Both survive with their original
@@ -1157,9 +1179,9 @@ Symbolic bindings and omitted options do not freeze defaults/fingerprints.
 
 | Example / checked logical plan | Prototype evidence | Still unproved / required falsifier |
 |---|---|---|
-| [C1](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c1.json) | Group retains `$s`, exports counts and drops `$i`; selection precedes report retrieval. Native filtered counts produce A=2/8, B=6/7, C=1/0, selecting A. A report-driven prefilter selects B instead; `count(Boolean)` counts false; a duplicate path changes A's count. | Actual GQ lowering and optimized population barriers, entity rehydration, arithmetic/null/overflow rules and resource ownership. The native probe models the report filter; it does not retrieve reports. |
+| [C1](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c1.json) | Group retains `$s`, exports counts and drops `$i`; selection precedes report retrieval. Native filtered counts produce A=2/8, B=6/7, C=1/0, selecting A. A report-driven prefilter selects B instead; `count(Boolean)` counts false; a duplicate path changes A's count. | Actual GQ lowering and optimized population barriers, entity rehydration, enforcement of the decided arithmetic/null/overflow rules and resource ownership. The native probe models the report filter; it does not retrieve reports. |
 | [C2](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c2.json) | Group retains project identity and reduced metric origin while dropping member bindings/order. Native selection of p1/p2 yields three binding rows and two distinct passages; removing the cut admits p3 and changes both counts. | Graph target-ID mapping, GQ aggregate lowering, general equality/null semantics, distinct-state memory and the complete optimized graph/retrieval plan. |
-| [C3](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c3.json) | The scorer creates a separate feature with no candidate window or rank; dense output remains the comparator. A native fixture preserves p2 with absent lexical-arm rank and a positive feature; filtering on lexical membership incorrectly drops it. Zero/null feature inputs also survive. | The scorer itself, nonmatch/empty/missing-field policy, fixed live statistics and numeric parity. Precomputed fixture features prove neither BM25 values nor scorer cost. |
+| [C3](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c3.json) | The scorer creates a separate feature with no candidate window or rank; dense output remains the comparator. A native fixture preserves p2 with absent lexical-arm rank and a positive feature; filtering on lexical membership incorrectly drops it. Zero/null feature inputs also survive. The Decimal oracle separately checks partial/zero/null feature values. | Production scorer and enforcement of the decided nonmatch/empty/missing-field policy, fixed live statistics and numeric parity. Precomputed native features prove neither BM25 values nor scorer cost. |
 | [C4](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c4.json) | Checked imports/exports and separate child source IDs. Native ordered object lists preserve two rows for A and an empty B; presence markers distinguish absent objects from present null payloads. Duplicate paths consume collection rows, and fan-out exceeds the source window. An aggregate detects multiple owners. | Correlated GQ lowering, generation/preservation of parent-row identity, actual typed cardinality refusal, full entity-object projection, total row ties and shared budget/cancellation under many parents. Detection of ambiguous owners is not the query refusal path. |
 
 The [native probe](../../crates/omnigraph/tests/rrf_prefilter_gate/composition.rs)
@@ -1364,6 +1386,33 @@ or fuzzy scorer selector. Query-term repetition and order carry no extra
 weight; intentional source weighting belongs to explicit fusion or a separately
 specified future scoring operator.
 
+The deferred membership-preserving `score` operator uses this same kernel
+over its incoming targets, including targets that fail `Terms` membership:
+
+| Field/query outcome | Retrieval membership before its cut | Lexical feature |
+|---|---|---|
+| At least one matching term group, but not every group of an `all` query | False | Positive sum of the matching contributions |
+| Nonempty field with no matching group | False | `0.0` |
+| Present field with zero analyzed tokens | False | `0.0` |
+| Null field | False | Null: no field value to score |
+| Full query match | True | Same finite positive value as retrieval scoring |
+
+`mode` controls the Boolean consumer; it never masks term contributions.
+Changing `all` to `any` alone cannot change a feature value. Changing the terms,
+edit budget, analyzer or statistics can. A score of zero is observed absence
+of term evidence; null remains missing representation. Neither adds a source
+rank or fusion vote. Feature nullability follows field nullability, while a
+retrieval metric can also be absent because its target missed that source's
+window. A future explicit conditional can gate features by membership; no
+second implicitly gated BM25 formula is introduced.
+
+An empty analyzed **query** is an error before any target evaluation, even for
+an empty population or all-null fields. An empty corpus has no positive
+contributions: return zero for present token-empty fields and null for null
+fields without dividing by corpus length. Invalid representations/statistics,
+non-finite arithmetic and resource failures remain errors. Scoring never
+turns them into zero, null or dropped targets.
+
 The statistics population is part of source identity, independently of its
 eligible population and candidate window. The initial contract uses the
 snapshot-visible field corpus: distinct, policy-visible targets owning that
@@ -1483,6 +1532,12 @@ path must implement fuzzy ranking against these oracles; leaving it to a later
 release is not completion. Scan-based correctness may ship before native
 acceleration, with bounded failure when the work cannot complete.
 
+The same oracle now checks separate feature expectations, including partial
+`all` matches, all-null/token-empty corpora, unchanged features under `all`/`any`
+and eligibility changes, and identical retrieval/feature values for matches.
+These settle C3's numeric meaning; they do not deliver the deferred scorer
+operator or qualify analysis, live-row accounting and execution bounds.
+
 An exact physical baseline can compute field statistics in one snapshot-pinned
 pass, then score eligible values in a second pass. For each query term, count
 at most one family occurrence per document in the first pass; the second uses
@@ -1529,6 +1584,27 @@ score threshold likewise requires an explicit source/domain contract and must
 never be presented as a probability that an answer is correct.
 
 ### Graph-wide discovery across entity types
+
+**Phase 0 disposition:** defer cross-type union execution, all-node search,
+all-edge search and mixed-kind search from the initial release. Concrete
+node targets, and concrete edge targets reached through graph traversal,
+retain their specified scope. A loop of independent client queries is not
+the promised one-snapshot global query. This decision keeps the coordinated
+release focused on the existing search correctness failures while the common
+language acquires the union, narrowing and heterogeneous result machinery.
+
+Before stabilizing the initial grammar/IR, preserve these extension boundaries:
+target identity carries entity kind and accepted type/incarnation as well as
+entity ID; a logical source/window is independent of physical table count;
+type scope and representation selection are separate typed plan facts.
+Common-property projection requires compatible property types in every union
+arm, with nullability widened when necessary. A property absent from an arm
+requires explicit type narrowing or branch projection, never implicit null
+or stringification. Union construction preserves binding rows; deduplication
+and target selection remain explicit. An all-node expansion is the union of
+the snapshot's concrete node scans, with each node identity once before any
+graph fan-out. No wildcard or union punctuation is accepted by this decision;
+its parser/type/plan compatibility proof remains a Phase 0 gate.
 
 Here, global search means discovery across eligible entity types in one
 logical graph at one accepted snapshot. Its scope includes the target types,
@@ -1623,8 +1699,8 @@ rows and invalidated coverage before using them for a global candidate cut.
 Any cache remains derived from the accepted snapshot and representation
 identities. Native index statistics alone are not a new source of truth.
 
-Qualification must cover two unrelated node types, an explicitly selected
-edge type, equal id strings across types, multiple searchable fields,
+Before enabling that extension, qualification must cover two unrelated node
+types, an explicitly selected edge type, equal id strings across types, multiple searchable fields,
 incompatible vector spaces, empty/unavailable sources, snapshot changes,
 policy and shared-resource refusal. Compare the physical fan-out plan with an
 independent evaluator over the full logical union. Include disjoint-source
@@ -2183,11 +2259,12 @@ independent Unicode-scalar evaluator at budgets zero through two. This covers
 the primitive, not the revised NFC pipeline, indexed completeness or budgets.
 
 The [Decimal oracle](../../crates/omnigraph/tests/fixtures/lexical_scoring_v1.py)
-generates twelve 80-digit reference cases. The float64 evaluator uses pinned
+generates thirteen 80-digit reference cases. The float64 evaluator uses pinned
 `libm 0.2.16`, tolerance `2e-14 * max(1, expected)`, exact fixture order,
-repeated-term invariance, eligibility-independent scores and edit-budget
-inclusion. Inputs already represent analyzed tokens. Native/indexed numeric
-parity, complete ties and relevance defaults remain unqualified.
+repeated-term invariance, eligibility-independent scores/features, all/any
+feature invariance and edit-budget inclusion. Inputs already represent
+analyzed tokens. Native/indexed numeric parity, complete ties and relevance
+defaults remain unqualified.
 
 The [native matrix](#contract-to-code-qualification) and
 [composition evidence](#required-composition-examples) own the remaining
@@ -2569,13 +2646,27 @@ mechanism, not weakening the promised result.
 **Input:** fresh production baseline, capability matrix, open gates and
 archived experiments inspected at their recorded bases.
 
+**2026-09-13 decision checkpoint:** C3 retains partial term scores, distinguishes
+zero from null and preserves membership. Shared expressions have explicit
+precedence, typing, null and checked-arithmetic rules. Global execution is
+deferred with compatibility obligations retained. On base `dd6959c8` plus this
+change, Rust 1.97.1 passes all 367 compiler tests, the 13-case lexical oracle
+and both `staged_composition` native tests. This settles the stated policies;
+it does not complete any production evaluator or the phase's remaining gates.
+
+```bash
+cargo +1.97.1 test --locked -p omnigraph-compiler
+cargo +1.97.1 test --locked -p omnigraph-engine --test search lexical_scoring_v1_reference_oracle -- --exact
+cargo +1.97.1 test --locked -p omnigraph-engine --test rrf_prefilter_gate staged_composition
+```
+
 | Decision package | Required disposition and proof |
 |---|---|
 | [Language](#language-evolution-and-compatibility) | Shared expressions, explicit output, namespaces, precedence, parameters and scope; parser/type/plan fixtures |
 | [Composition](#required-composition-examples) | C1–C4 syntax, type derivation, golden plans, physical feasibility and invalid-rewrite counterexamples |
 | [Selection/scoring](#target-identity-fan-out-grouping-and-metrics) | Target/binding/group multiplicity, total ties, live statistics, lexical/vector numeric policy and checked fusion arithmetic |
 | [Representations](#representation-identity-and-source-attribution) | Schema defaults and overrides, resolved encoder/Unicode/analyzer identity, export/reapplication and format coordination with RFCs 0040/0043/0044 |
-| [Global search](#graph-wide-discovery-across-entity-types) | Explicit initial-release include/defer decision, all-type/representation scope, narrowing and heterogeneous projection |
+| [Global search](#graph-wide-discovery-across-entity-types) | Execution deferred by explicit decision; prove typed identity/source/table separation and future union/narrowing/projection compatibility before stabilization |
 | [Execution/read contract](#result-metadata-coherent-continuation-and-budgets) | Resource units, admission/interfaces, error/result types, fingerprints, replay and retention |
 | [Workload](#mixed-workload-qualification) | Fixed tasks/corpus, exact oracles, relevance judgments, recipes, budgets and acceptance criteria before tuning |
 
@@ -2590,8 +2681,8 @@ supply the evidence.
 C1–C4 lowering, numeric/null evaluation or whole-query bounds. The archived
 lexical integration proves only its recorded slice. Full production C1/C3/C4
 and general C2 grouping are deferred, but their design proofs are due here.
-Do not silently defer the global-search decision or start a dependent package
-before its interfaces are resolved.
+Global execution is explicitly deferred; its compatibility proof is still due.
+Do not start a dependent package before its interfaces are resolved.
 
 #### Phase 1: build representation, plan, and resource foundations
 
@@ -2743,8 +2834,7 @@ tests do not count as completion of a new phase.
 The [query capability matrix](#query-capability-matrix) owns the extension
 inventory, including projection, grouping, optional matching, typed unions,
 advanced retrieval and representation forms. Its deferred rows do not claim
-support or require implementation for the initial release. A `Decision` row
-requires an explicit Phase 0 disposition; it is not automatically deferred.
+support or require implementation for the initial release.
 Every later extension retains the stated semantic and qualification boundary.
 `Foundation` rows require their grammar/type/composition proofs before syntax
 stabilization while their broader operators remain deferred. These design
@@ -2754,8 +2844,9 @@ proofs do not enlarge the advertised initial-release feature set.
 
 After the initial release, implement C1, C4 and C2's general distinct/intermediate
 group extensions using the accepted common grammar, IR and execution context.
-C3 remains a separate scorer extension; this milestone does not settle global
-search's release-scope decision.
+C3 remains a separate scorer extension. Global search is also deferred; its
+union, representation expansion and cross-type ranking require their own
+implementation milestone after the compatibility proof.
 
 Build reusable computation/grouping first, then local selection and correlated
 retrieval, then optional facts and typed collections. Preserve group identities,
@@ -2803,13 +2894,17 @@ before optimizing batching, and measure per-group rescan cost.
    fixed-corpus evaluation across the supported mixed workloads. The document
    pilot alone cannot close this gate. Further multilingual profiles require
    matched-set evidence and new versioned identities.
-7. General all-node/type-union selection, compatible representation expansion,
-   type narrowing and heterogeneous projection. Explicitly decide its initial
-   release scope in Phase 0; the same-binding fusion implementation alone
-   cannot satisfy cross-type global discovery.
+7. General all-node/type-union grammar, compatible representation expansion,
+   type narrowing and heterogeneous projection. Execution is explicitly
+   deferred; the compatibility proof remains due in Phase 0. The initial
+   same-binding fusion implementation cannot satisfy cross-type discovery.
 
 ## Decision log
 
+- 2026-09-13 — decided membership-independent lexical features, null and checked
+  arithmetic policies, and deferred global execution. Extended the existing
+  Decimal, compiler and DataFusion probes; default native arithmetic is not
+  sufficient for the new numeric contract. Phase 0 remains incomplete.
 - 2026-09-13 — retained the full long-form version as an
   [agent context document](assets/0048-agent-context.md) alongside this concise
   RFC. The context records its original revision; this RFC owns current decisions.

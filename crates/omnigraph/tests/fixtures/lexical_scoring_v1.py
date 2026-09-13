@@ -33,6 +33,7 @@ cases = [
     ("two_edits_and_transposition", ["abcd", "abce", "abef", "ab", "acbd", "zxyz"], ["abcd"], 2, False),
     ("unicode_scalar_edit", ["café", "cafe", "other"], ["cafe"], 1, False),
     ("empty_corpus", [], ["beta"], 1, False),
+    ("only_missing_and_token_empty", [None, "", " "], ["beta"], 1, False),
     ("no_matching_family", [None, "", "gamma"], ["beta"], 1, False),
 ]
 
@@ -46,6 +47,7 @@ with localcontext() as ctx:
         n = sum(bool(c) for c in counts)
         total_length = sum(sum(c.values()) for c in counts)
         scores = [None] * len(docs)
+        features = [None if doc is None else D(0) for doc in docs]
         if n:
             avg = D(total_length) / n
             dfs = {q: sum(any(distance(q, t) <= edits for t in c) for c in counts) for q in terms}
@@ -64,11 +66,14 @@ with localcontext() as ctx:
                         idf = (1 + (D(n - dfs[q]) + D("0.5")) / (D(dfs[q]) + D("0.5"))).ln()
                         contributions.append(idf * max(weights))
                 matched = all(v > 0 for v in contributions) if all_terms else any(v > 0 for v in contributions)
+                if docs[i] is not None:
+                    features[i] = sum(contributions)
                 if matched:
-                    scores[i] = sum(contributions)
+                    scores[i] = features[i]
         rank = sorted((i for i, s in enumerate(scores) if s is not None), key=lambda i: (-scores[i], i))
         out.append(dict(name=name, docs=docs, query=query, edits=edits, all_terms=all_terms,
                         expected_scores=[str(s) if s is not None else None for s in scores],
+                        expected_features=[str(s) if s is not None else None for s in features],
                         expected_order=rank))
         print(name, rank, [round(float(s), 9) if s is not None else None for s in scores])
 
