@@ -2271,6 +2271,9 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// Cleanup GET/LIST 227/136 -> 209/134. Other counts are unchanged.
 /// A branch first-touch write lists the table's refs once before arming, so
 /// an orphan ref is dropped pre-arm: AddFriend/InsertLegacy LIST 75/58 -> 76/59.
+/// A SnapshotId read opens one pinned dataset to detect the image's
+/// system-column vintage (RFC 0040 historical reads); the audit's first such
+/// read is a cold open: _audit l.get 1220 -> 1228.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

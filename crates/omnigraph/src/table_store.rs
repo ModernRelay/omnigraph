@@ -3891,6 +3891,63 @@ impl TableStore {
         Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
     }
 
+    /// The dataset schema with `renames` applied in place: each source field
+    /// keeps its id, nullability, metadata (the unenforced primary key marker
+    /// included) and indexes; only its name changes. Shared by the staged
+    /// rename primitive and the writer's pre-arm dry run so both build one shape.
+    pub(crate) fn renamed_schema(
+        ds: &Dataset,
+        renames: &[(String, String)],
+    ) -> Result<LanceSchema> {
+        let mut schema = ds.schema().clone();
+        for (from, to) in renames {
+            let field_id = ds
+                .schema()
+                .field(from)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "rename source column '{from}' does not exist in the dataset"
+                    ))
+                })?
+                .id;
+            if ds.schema().field(to).is_some() {
+                return Err(OmniError::manifest_internal(format!(
+                    "rename target column '{to}' already exists in the dataset"
+                )));
+            }
+            let field = schema.mut_field_by_id(field_id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "rename source column '{from}' (field {field_id}) is missing from the cloned schema"
+                ))
+            })?;
+            field.name.clone_from(to);
+        }
+        schema.validate().map_err(OmniError::lance_internal)?;
+        Ok(schema)
+    }
+
+    /// Stage a rename-only column alteration: `Operation::Project` over the
+    /// same field ids, no fragment written or rewritten, nullability asserted
+    /// preserved exactly as Lance's own `alter_columns` does for a rename (the
+    /// RFC 0040 system-column upgrade's per-table effect). HEAD does NOT
+    /// advance until [`Self::commit_staged_exact`].
+    pub async fn stage_rename_columns(
+        &self,
+        ds: &Dataset,
+        renames: &[(String, String)],
+    ) -> Result<StagedWrite> {
+        let schema = Self::renamed_schema(ds, renames)?;
+        let transaction = TransactionBuilder::new(
+            ds.manifest.version,
+            Operation::Project {
+                schema,
+                preserves_nullability: true,
+            },
+        )
+        .build();
+        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
+    }
+
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
     /// Returns a StagedWrite carrying the replacement fragments. HEAD does
     /// NOT advance.

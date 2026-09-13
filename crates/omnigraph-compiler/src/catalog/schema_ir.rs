@@ -142,6 +142,118 @@ pub fn into_legacy_vintage(mut ir: SchemaIR) -> SchemaIR {
     ir
 }
 
+/// The current-vintage twin of a legacy accepted IR: add `system-columns` and
+/// re-derive the version (RFC 0040 upgrade); graph creation records the
+/// vintage through [`initialize_schema_ir`] instead.
+pub fn into_system_columns_vintage(mut ir: SchemaIR) -> SchemaIR {
+    ir.features.insert(FEATURE_SYSTEM_COLUMNS.to_string());
+    ir.ir_version = required_ir_version(&ir.features);
+    ir
+}
+
+/// The catalog a pre-upgrade image of an upgraded graph plans against:
+/// [`into_legacy_vintage`] minus every user property whose name the legacy
+/// physical namespace reserves (`id`; `src`/`dst` on edges), together with
+/// the constraints, embeddings and interface links that name one. A legacy
+/// accept refused those names, so such a property was declared after the
+/// upgrade and the image has no column for it (RFC 0040 Historical reads).
+pub fn into_legacy_image_vintage(ir: SchemaIR) -> SchemaIR {
+    let mut ir = into_legacy_vintage(ir);
+    let legacy = SYSTEM_COLUMNS_LEGACY;
+    let node_reserved = [legacy.id];
+    let edge_reserved = [legacy.id, legacy.src, legacy.dst];
+    let mut removed = BTreeSet::new();
+    for interface in &mut ir.interfaces {
+        remove_reserved_properties(
+            &interface.name,
+            &mut interface.properties,
+            &node_reserved,
+            &mut removed,
+        );
+    }
+    for node in &mut ir.nodes {
+        remove_reserved_properties(
+            &node.name,
+            &mut node.properties,
+            &node_reserved,
+            &mut removed,
+        );
+    }
+    for edge in &mut ir.edges {
+        remove_reserved_properties(
+            &edge.name,
+            &mut edge.properties,
+            &edge_reserved,
+            &mut removed,
+        );
+    }
+    let names_removed = |property: &PropertyRefIR| {
+        removed.contains(&(
+            property.owner_type_name.clone(),
+            property.property_name.clone(),
+        ))
+    };
+    let field_removed = |field: &FieldRefIR| match field {
+        FieldRefIR::Property(property) => names_removed(property),
+        FieldRefIR::System(_) => false,
+    };
+    let constraint_removed = |constraint: &ConstraintIR| match constraint {
+        ConstraintIR::Key { fields }
+        | ConstraintIR::Unique { fields }
+        | ConstraintIR::Index { fields } => fields.iter().any(field_removed),
+        ConstraintIR::Range { field, .. } | ConstraintIR::Check { field, .. } => {
+            field_removed(field)
+        }
+    };
+    for interface in &mut ir.interfaces {
+        prune_removed_links(&mut interface.properties, &names_removed);
+    }
+    for node in &mut ir.nodes {
+        prune_removed_links(&mut node.properties, &names_removed);
+        node.constraints
+            .retain(|constraint| !constraint_removed(constraint));
+    }
+    for edge in &mut ir.edges {
+        prune_removed_links(&mut edge.properties, &names_removed);
+        edge.constraints
+            .retain(|constraint| !constraint_removed(constraint));
+    }
+    ir
+}
+
+fn remove_reserved_properties(
+    owner: &str,
+    properties: &mut Vec<PropertyIR>,
+    reserved: &[&str],
+    removed: &mut BTreeSet<(String, String)>,
+) {
+    properties.retain(|property| {
+        let keep = !reserved.contains(&property.name.as_str());
+        if !keep {
+            removed.insert((owner.to_string(), property.name.clone()));
+        }
+        keep
+    });
+}
+
+fn prune_removed_links(
+    properties: &mut [PropertyIR],
+    names_removed: &dyn Fn(&PropertyRefIR) -> bool,
+) {
+    for property in properties {
+        property
+            .satisfies_interface_properties
+            .retain(|link| !names_removed(link));
+        if property
+            .embed_source
+            .as_ref()
+            .is_some_and(|embed| names_removed(&embed.source))
+        {
+            property.embed_source = None;
+        }
+    }
+}
+
 /// Opaque namespace for every numeric identity in one graph root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -2161,6 +2273,43 @@ edge Relates: Human -> Human @rename_from("Knows") { @unique(@src, @dst) }
         assert_eq!(resolved.ir_version, SCHEMA_IR_VERSION);
         assert!(resolved.features.is_empty());
         assert_eq!(resolved.system_columns(), SYSTEM_COLUMNS_LEGACY);
+    }
+
+    #[test]
+    fn legacy_image_vintage_drops_the_properties_only_the_upgraded_namespace_admits() {
+        let accepted = initialize(
+            "node P { n: String @key\n id: String?\n @unique(id) }\n\
+             edge E: P -> P { src: String?\n dst: I32?\n w: String?\n @unique(src, dst) }",
+        );
+        validate_schema_ir(&accepted).expect("the upgraded namespace admits id/src/dst");
+        let names = |properties: &[PropertyIR]| {
+            properties
+                .iter()
+                .map(|property| property.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let image = into_legacy_image_vintage(accepted);
+        assert_eq!(image.system_columns(), SYSTEM_COLUMNS_LEGACY);
+        validate_schema_ir(&image).expect("the image catalog validates at the legacy vintage");
+        assert_eq!(names(&image.nodes[0].properties), ["n"]);
+        assert_eq!(names(&image.edges[0].properties), ["w"]);
+        assert!(
+            matches!(&image.nodes[0].constraints[..], [ConstraintIR::Key { .. }]),
+            "only the @key on n survives, the @unique(id) goes with its property: {:?}",
+            image.nodes[0].constraints
+        );
+        assert!(image.edges[0].constraints.is_empty());
+
+        let untouched = into_legacy_image_vintage(initialize(
+            "node P { n: String } edge E: P -> P { w: String? @unique(@src, @dst) }",
+        ));
+        assert_eq!(names(&untouched.nodes[0].properties), ["n"]);
+        assert_eq!(names(&untouched.edges[0].properties), ["w"]);
+        assert_eq!(
+            untouched.edges[0].constraints.len(),
+            1,
+            "a constraint on system fields survives"
+        );
     }
 
     #[test]

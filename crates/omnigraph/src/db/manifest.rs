@@ -58,7 +58,7 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{
     OMNIGRAPH_ROW_COUNT_KEY, object_store_path_from_uri, table_version_metadata_for_state,
 };
-pub(crate) use migrations::stamp_for_system_columns;
+pub(crate) use migrations::{publish_stamp_advance, stamp_for_system_columns};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
@@ -69,14 +69,15 @@ pub(crate) use recovery::{
     HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
     RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
     RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
+    RecoverySidecar, RecoverySidecarHandle, RecoverySystemColumnUpgrade, RecoveryTableUpdateSlot,
+    SidecarKind, SidecarTablePin, SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
     confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
     confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
     finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
     new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
-    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_failed_branch_merge_under_gates,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, new_system_column_upgrade_sidecar_v9,
+    recover_failed_branch_merge_under_gates, recover_manifest_drift, schema_apply_serial_queue_key,
+    write_sidecar,
 };
 pub use state::DatasetEntry;
 #[cfg(test)]

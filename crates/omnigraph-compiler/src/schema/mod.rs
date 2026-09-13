@@ -11,7 +11,7 @@ pub mod parser;
 /// (RFC 0040). Covers Lance's virtual columns and OmniGraph's own implicit
 /// stored columns, present and future; enforced at schema admission and
 /// again for current-version IRs in `validate_schema_ir`.
-pub(crate) fn is_reserved_system_column_name(name: &str) -> bool {
+pub fn is_reserved_system_column_name(name: &str) -> bool {
     name.starts_with('_')
 }
 

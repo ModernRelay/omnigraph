@@ -18,7 +18,9 @@ pub use omnigraph::{
     CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
     Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction, RepairClassification,
-    RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason,
+    RepairOptions, RepairStats, SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyOptions, SchemaApplyResult,
+    SkipReason, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
+    SystemColumnUpgradeReport,
 };
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};

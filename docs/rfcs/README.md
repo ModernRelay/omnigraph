@@ -169,7 +169,7 @@ This table is the human index for the canonical RFC corpus.
 | [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | accepted | in-progress |
 | [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
 | [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
-| [0040](0040-system-column-namespace.md) | System column namespace | public | draft | in-progress |
+| [0040](0040-system-column-namespace.md) | System column namespace | public | accepted | in-progress |
 | [0041](0041-inline-stored-queries.md) | Inline and stored queries | maintainer | accepted | partial |
 | [0042](0042-incarnation-suffixed-branch-refs.md) | Incarnation-suffixed native branch refs | maintainer | accepted | complete |
 | [0043](0043-full-text-index-compatibility.md) | Full-text index compatibility and explicit rebuild | maintainer | accepted | complete |
@@ -187,5 +187,5 @@ This table is the human index for the canonical RFC corpus.
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
-| [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | draft | in-progress |
+| [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | accepted | in-progress |
 | [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |

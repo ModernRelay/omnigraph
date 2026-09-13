@@ -779,6 +779,14 @@ pub(crate) enum RecoverySchemaApplyEffectKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confirmed_transaction: Option<StagedTransactionIdentity>,
     },
+    /// A rename-only `Operation::Project` on an existing table (RFC 0040
+    /// system-column upgrade). Idempotent per table and never compensated:
+    /// recovery completes it or verifies it is complete.
+    SystemColumnRename {
+        planned_transaction: StagedTransactionIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_transaction: Option<StagedTransactionIdentity>,
+    },
 }
 
 impl RecoverySchemaApplyEffectKind {
@@ -789,6 +797,10 @@ impl RecoverySchemaApplyEffectKind {
                 ..
             }
             | Self::FirstTouchDataset {
+                planned_transaction,
+                ..
+            }
+            | Self::SystemColumnRename {
                 planned_transaction,
                 ..
             } => planned_transaction,
@@ -804,6 +816,10 @@ impl RecoverySchemaApplyEffectKind {
             | Self::FirstTouchDataset {
                 confirmed_transaction,
                 ..
+            }
+            | Self::SystemColumnRename {
+                confirmed_transaction,
+                ..
             } => confirmed_transaction.as_ref(),
         }
     }
@@ -817,6 +833,10 @@ impl RecoverySchemaApplyEffectKind {
             | Self::FirstTouchDataset {
                 confirmed_transaction,
                 ..
+            }
+            | Self::SystemColumnRename {
+                confirmed_transaction,
+                ..
             } => *confirmed_transaction = Some(transaction),
         }
     }
@@ -824,6 +844,22 @@ impl RecoverySchemaApplyEffectKind {
     fn is_first_touch(&self) -> bool {
         matches!(self, Self::FirstTouchDataset { .. })
     }
+
+    fn is_system_column_rename(&self) -> bool {
+        matches!(self, Self::SystemColumnRename { .. })
+    }
+}
+
+/// RFC 0040 system-column upgrade marker on a SchemaApply intent: every
+/// effect is a rename-only table commit and the only recovery outcome is
+/// roll-forward. The stamp advance is re-checked from the live `__manifest`;
+/// the recorded post-stamp version is a floor that manifest must have reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoverySystemColumnUpgrade {
+    pub from_stamp: u32,
+    pub to_stamp: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version_after_stamp: Option<u64>,
 }
 
 /// Schema-v7 exact recovery payload. The accepted/old schema identity lives in
@@ -840,6 +876,8 @@ pub(crate) struct RecoveryProtocolV7 {
     pub effect_phase: RecoveryEffectPhase,
     pub effects: Vec<RecoverySchemaApplyEffect>,
     pub intended_delta: RecoveryManifestDelta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_column_upgrade: Option<RecoverySystemColumnUpgrade>,
 }
 
 /// One exact per-table index reconciliation effect. `source_fork_version` is
@@ -2239,6 +2277,37 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
             "schema-v7 pins, effects, transaction UUIDs, and delta slots must be unique and one-to-one"
                 .to_string(),
         ));
+    }
+    let rename_effects = protocol
+        .effects
+        .iter()
+        .filter(|effect| effect.kind.is_system_column_rename())
+        .count();
+    match protocol.system_column_upgrade.as_ref() {
+        Some(upgrade) => {
+            if rename_effects != protocol.effects.len()
+                || !protocol.intended_delta.registrations.is_empty()
+                || !protocol.intended_delta.renames.is_empty()
+                || !protocol.intended_delta.tombstones.is_empty()
+                || (upgrade.from_stamp, upgrade.to_stamp)
+                    != (
+                        super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+                    )
+            {
+                return Err(malformed(format!(
+                    "a system-column upgrade intent carries rename-only effects, no registration, rename, or tombstone, and the served stamp pair v{} to v{}",
+                    super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                    super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+                )));
+            }
+        }
+        None if rename_effects != 0 => {
+            return Err(malformed(
+                "rename-only effects require a system-column upgrade intent".to_string(),
+            ));
+        }
+        None => {}
     }
 
     let registration_ids: HashSet<TableIdentity> = protocol
@@ -4954,8 +5023,14 @@ async fn process_schema_apply_sidecar_v7(
         .as_ref()
         .expect("caller checked protocol_v7");
 
+    if protocol.system_column_upgrade.is_some() {
+        return match detect_visible_v7_outcome(root_uri, sidecar).await? {
+            Some(outcome) => finalize_visible_v7_outcome(root_uri, storage, sidecar, outcome).await,
+            None => roll_forward_system_column_upgrade(root_uri, storage, snapshot, sidecar).await,
+        };
+    }
     if let Some(outcome) = detect_visible_v7_outcome(root_uri, sidecar).await? {
-        return finalize_visible_v7_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+        return finalize_visible_v7_outcome(root_uri, storage, sidecar, outcome).await;
     }
 
     let mut states = Vec::with_capacity(sidecar.tables.len());
@@ -5130,13 +5205,7 @@ async fn process_schema_apply_sidecar_v7(
             Ok(published) => published,
             Err(error) if error.is_read_set_changed() => {
                 if let Some(outcome) = detect_visible_v7_outcome(root_uri, sidecar).await? {
-                    return finalize_visible_v7_outcome(
-                        root_uri,
-                        storage.as_ref(),
-                        sidecar,
-                        outcome,
-                    )
-                    .await;
+                    return finalize_visible_v7_outcome(root_uri, storage, sidecar, outcome).await;
                 }
                 if matches!(mode, RecoveryMode::RollForwardOnly) {
                     return Ok(false);
@@ -5179,6 +5248,334 @@ async fn process_schema_apply_sidecar_v7(
     .await?;
     delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
     Ok(true)
+}
+
+/// Complete an interrupted RFC 0040 system-column upgrade by roll-forward only
+/// (stamp, remaining renames under their planned identities, staging, publish,
+/// promote); it never restores, so both recovery modes run it.
+async fn roll_forward_system_column_upgrade(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v7
+        .as_ref()
+        .expect("caller checked protocol_v7");
+    let upgrade = protocol
+        .system_column_upgrade
+        .as_ref()
+        .expect("caller checked system_column_upgrade");
+
+    let manifest_version_after_stamp =
+        super::migrations::publish_stamp_advance(root_uri, upgrade.from_stamp, upgrade.to_stamp)
+            .await?;
+    if let Some(recorded) = upgrade.manifest_version_after_stamp
+        && manifest_version_after_stamp < recorded
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column upgrade '{}' recorded __manifest version {} after its stamp advance but the live manifest is at {}; refusing to continue",
+            sidecar.operation_id, recorded, manifest_version_after_stamp
+        )));
+    }
+
+    let mut committed_transactions = HashMap::new();
+    let mut updates = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("validated schema-v7 key sets");
+        let planned = effect.kind.planned_transaction();
+        let manifest_entry = snapshot_entry_for_schema_pin(snapshot, pin, protocol)?.ok_or_else(
+            || {
+                OmniError::manifest_internal(format!(
+                    "system-column upgrade '{}' table '{}' is no longer registered in the manifest; refusing to continue",
+                    sidecar.operation_id, pin.table_key
+                ))
+            },
+        )?;
+        if manifest_entry.published_dataset_version != pin.expected_version {
+            return Err(OmniError::manifest_internal(format!(
+                "system-column upgrade '{}' table '{}' is pinned at version {} but the intent expected {}; refusing to continue",
+                sidecar.operation_id,
+                pin.table_key,
+                manifest_entry.published_dataset_version,
+                pin.expected_version
+            )));
+        }
+        let observation = open_lance_head_if_present(
+            &pin.table_path,
+            pin.table_branch.as_deref(),
+            Some((
+                pin.post_commit_pin,
+                planned,
+                manifest_entry.published_dataset_version,
+            )),
+            false,
+            false,
+        )
+        .await?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "system-column upgrade '{}' table '{}' has no Lance dataset at '{}'",
+                sidecar.operation_id, pin.table_key, pin.table_path
+            ))
+        })?;
+        let committed = match (observation.effect_ownership, observation.version) {
+            (EffectOwnership::None, version) if version == pin.expected_version => {
+                commit_planned_system_column_rename(root_uri, pin, planned).await?
+            }
+            (EffectOwnership::OwnAtHead, version) if version == pin.post_commit_pin => observation
+                .transaction
+                .clone()
+                .expect("own effect at head carries its transaction"),
+            (ownership, version) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "system-column upgrade '{}' table '{}' is at Lance version {} with effect ownership {:?}; neither the pinned pre-rename version nor this intent's rename, refusing to continue",
+                    sidecar.operation_id, pin.table_key, version, ownership
+                )));
+            }
+        };
+        if committed != *planned {
+            return Err(OmniError::manifest_internal(format!(
+                "system-column upgrade '{}' table '{}' landed transaction {:?} instead of the planned {:?}",
+                sidecar.operation_id, pin.table_key, committed, planned
+            )));
+        }
+        updates.push(system_column_rename_update(root_uri, pin).await?);
+        committed_transactions.insert(pin.identity, committed);
+    }
+
+    regenerate_system_column_upgrade_staging(root_uri, storage, protocol).await?;
+
+    let mut confirmed = sidecar.clone();
+    if protocol.effect_phase == RecoveryEffectPhase::Armed {
+        confirmed
+            .protocol_v7
+            .as_mut()
+            .expect("cloned schema-v7 protocol")
+            .system_column_upgrade
+            .as_mut()
+            .expect("cloned system-column upgrade intent")
+            .manifest_version_after_stamp = Some(manifest_version_after_stamp);
+        confirm_schema_apply_sidecar_v9(
+            root_uri,
+            storage.as_ref(),
+            &mut confirmed,
+            &updates,
+            &committed_transactions,
+        )
+        .await?;
+    }
+    let confirmed_protocol = confirmed
+        .protocol_v7
+        .as_ref()
+        .expect("confirmed schema-v7 protocol");
+
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let (_manifest_version, graph_commit_id) =
+        match publish_schema_apply_v7_forward(root_uri, &confirmed).await {
+            Ok(published) => published,
+            Err(error) if error.is_read_set_changed() => {
+                if let Some(outcome) = detect_visible_v7_outcome(root_uri, &confirmed).await? {
+                    return finalize_visible_v7_outcome(root_uri, storage, &confirmed, outcome)
+                        .await;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+    crate::db::schema_state::promote_exact_schema_staging(
+        root_uri,
+        storage.as_ref(),
+        &confirmed_protocol.target_schema_ir_hash,
+    )
+    .await?;
+    let outcomes = confirmed_protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| {
+            let confirmed = slot
+                .confirmed
+                .as_ref()
+                .expect("confirmed system-column upgrade delta");
+            TableOutcome {
+                table_key: slot.table_key.clone(),
+                from_version: slot.expected_version,
+                to_version: confirmed.table_version,
+            }
+        })
+        .collect();
+    record_audit(
+        root_uri,
+        &confirmed,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    reclaim_stale_schema_apply_lock(root_uri, storage).await?;
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM,
+    )?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+/// A crashed writer's `__schema_apply_lock__`: no live writer can own it while
+/// its upgrade intent is still on disk (every writer heals first), and it is
+/// reclaimed before the sidecar goes, the only record that re-enters cleanup.
+async fn reclaim_stale_schema_apply_lock(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+) -> Result<()> {
+    let mut coordinator = GraphCoordinator::open(root_uri, std::sync::Arc::clone(storage)).await?;
+    if coordinator
+        .all_branches()
+        .await?
+        .iter()
+        .any(|branch| crate::db::is_schema_apply_lock_branch(branch))
+    {
+        coordinator
+            .branch_delete(crate::db::SCHEMA_APPLY_LOCK_BRANCH)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Commit one table's rename with the intent's planned transaction identity,
+/// exactly at the pinned read version, through the same sealed `TableStore`
+/// primitives as the writer; the table's own head then proves the effect is ours.
+async fn commit_planned_system_column_rename(
+    root_uri: &str,
+    pin: &SidecarTablePin,
+    planned: &StagedTransactionIdentity,
+) -> Result<StagedTransactionIdentity> {
+    let ds = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let ds = match pin.table_branch.as_deref() {
+        Some(branch) if branch != "main" => ds
+            .checkout_branch(branch)
+            .await
+            .map_err(OmniError::storage)?,
+        _ => ds,
+    };
+    if ds.version().version != planned.read_version {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column rename of '{}' expected Lance version {}, found {}",
+            pin.table_key,
+            planned.read_version,
+            ds.version().version
+        )));
+    }
+    let renames = crate::db::omnigraph::system_column_renames(&pin.table_key);
+    let store =
+        crate::table_store::TableStore::new(root_uri, crate::lance_access::control_session());
+    let mut staged = store.stage_rename_columns(&ds, &renames).await?;
+    staged.bind_transaction_identity(planned)?;
+    let (committed, identity) = store
+        .commit_staged_exact(std::sync::Arc::new(ds), staged)
+        .await?;
+    if committed.version().version != pin.post_commit_pin {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column rename of '{}' landed at Lance version {}, expected {}",
+            pin.table_key,
+            committed.version().version,
+            pin.post_commit_pin
+        )));
+    }
+    Ok(identity)
+}
+
+/// The manifest update slot for one renamed table, read from its post-rename
+/// head: the row count is unchanged by a rename, the version metadata is not.
+async fn system_column_rename_update(
+    root_uri: &str,
+    pin: &SidecarTablePin,
+) -> Result<DatasetUpdate> {
+    let ds = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let ds = match pin.table_branch.as_deref() {
+        Some(branch) if branch != "main" => ds
+            .checkout_branch(branch)
+            .await
+            .map_err(OmniError::storage)?,
+        _ => ds,
+    };
+    if ds.version().version != pin.post_commit_pin {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column upgrade table '{}' is at Lance version {} after its rename, expected {}",
+            pin.table_key,
+            ds.version().version,
+            pin.post_commit_pin
+        )));
+    }
+    let row_count = ds.count_rows(None).await.map_err(OmniError::storage)? as u64;
+    let table_relative_path = super::table_path_for_identity(&pin.table_key, pin.identity)?;
+    let version_metadata =
+        super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
+    Ok(DatasetUpdate {
+        identity: pin.identity,
+        type_key: pin.table_key.clone(),
+        published_dataset_version: pin.post_commit_pin,
+        native_dataset_branch: pin.table_branch.clone(),
+        entity_count: row_count,
+        version_metadata,
+    })
+}
+
+/// Rewrite the three schema staging files from the live legacy contract; the
+/// derivation is deterministic, so any crash point regenerates byte-identical
+/// files, and the intent's target identity must still be what it derives.
+async fn regenerate_system_column_upgrade_staging(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    protocol: &RecoveryProtocolV7,
+) -> Result<()> {
+    let accepted_ir =
+        crate::db::schema_state::read_accepted_schema_ir(root_uri, std::sync::Arc::clone(storage))
+            .await?;
+    let source = storage
+        .read_text(&crate::db::schema_state::schema_source_uri(root_uri))
+        .await?;
+    let target = crate::db::omnigraph::render_system_column_upgrade_target(&accepted_ir, &source)?;
+    let target_hash = omnigraph_compiler::schema_ir_hash(&target.desired_ir)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    if target_hash != protocol.target_schema_ir_hash {
+        return Err(OmniError::manifest_internal(format!(
+            "the live schema contract derives target identity {} but the system-column upgrade intent recorded {}; refusing to regenerate staging",
+            target_hash, protocol.target_schema_ir_hash
+        )));
+    }
+    storage
+        .write_text(&schema_source_staging_uri(root_uri), &target.desired_source)
+        .await?;
+    crate::db::schema_state::write_schema_contract_staging(
+        root_uri,
+        storage.as_ref(),
+        &target.desired_ir,
+    )
+    .await?;
+    crate::db::schema_state::validate_exact_schema_staging_target(
+        root_uri,
+        storage.as_ref(),
+        &protocol.target_schema_ir_hash,
+    )
+    .await
 }
 
 async fn publish_schema_apply_v7_forward(
@@ -6566,6 +6963,14 @@ pub(crate) async fn ensure_read_only_schema_coherent(
             .map_err(|error| {
                 OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
             })?;
+        if protocol.system_column_upgrade.is_some()
+            && !matches!(outcome, Some(VisibleExactOutcome::Original))
+        {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id,
+                "graph carries an unfinished system-column upgrade; open read-write to complete it",
+            ));
+        }
         let live = read_schema_state_identity(root_uri, storage)
             .await
             .map_err(|error| {
@@ -6689,7 +7094,7 @@ async fn detect_visible_v7_outcome(
 
 async fn finalize_visible_v7_outcome(
     root_uri: &str,
-    storage: &dyn StorageAdapter,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
     sidecar: &RecoverySidecar,
     outcome: VisibleExactOutcome,
 ) -> Result<bool> {
@@ -6701,7 +7106,7 @@ async fn finalize_visible_v7_outcome(
         VisibleExactOutcome::Original => {
             crate::db::schema_state::promote_exact_schema_staging(
                 root_uri,
-                storage,
+                storage.as_ref(),
                 &protocol.target_schema_ir_hash,
             )
             .await?;
@@ -6730,7 +7135,7 @@ async fn finalize_visible_v7_outcome(
         VisibleExactOutcome::RolledBack => {
             crate::db::schema_state::discard_exact_schema_staging(
                 root_uri,
-                storage,
+                storage.as_ref(),
                 &protocol.authority.schema_ir_hash,
                 &protocol.target_schema_ir_hash,
             )
@@ -6768,7 +7173,13 @@ async fn finalize_visible_v7_outcome(
             })
             .await?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    if protocol.system_column_upgrade.is_some() {
+        reclaim_stale_schema_apply_lock(root_uri, storage).await?;
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM,
+        )?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
     Ok(true)
 }
 
@@ -8320,11 +8731,63 @@ pub(crate) fn new_schema_apply_sidecar_v9(
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
             intended_delta,
+            system_column_upgrade: None,
         }),
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Arm the RFC 0040 system-column upgrade: a SchemaApply intent whose effects
+/// are all rename-only table commits and whose only recovery outcome is
+/// roll-forward (see [`RecoverySystemColumnUpgrade`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_system_column_upgrade_sidecar_v9(
+    actor_id: Option<String>,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    effects: Vec<RecoverySchemaApplyEffect>,
+    intended_delta: RecoveryManifestDelta,
+    target_schema_ir_hash: String,
+    upgrade: RecoverySystemColumnUpgrade,
+) -> Result<RecoverySidecar> {
+    let sidecar = RecoverySidecar {
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        operation_id: crate::dst_ids::new_ulid().to_string(),
+        started_at: match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+        {
+            Ok(duration) => duration.as_micros().to_string(),
+            Err(_) => "0".to_string(),
+        },
+        branch: None,
+        actor_id,
+        writer_kind: SidecarKind::SchemaApply,
+        tables,
+        merge_source_commit_id: None,
+        additional_registrations: Vec::new(),
+        tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
+        protocol_v3: None,
+        protocol_v4: None,
+        protocol_v7: Some(RecoveryProtocolV7 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
+            rollback_audit_outcomes: None,
+            target_schema_ir_hash,
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects,
+            intended_delta,
+            system_column_upgrade: Some(upgrade),
+        }),
+        protocol_v8: None,
+        ensure_indices_rollback_v6: None,
+    };
+    validate_sidecar_shape("<new-system-column-upgrade-v9-sidecar>", &sidecar)?;
     Ok(sidecar)
 }
 
@@ -8976,6 +9439,98 @@ mod tests {
     }
 
     #[test]
+    fn system_column_upgrade_sidecar_shape_is_pinned_to_rename_effects_and_the_served_stamps() {
+        let planned = transaction(3, "system-columns-company");
+        let identity = test_identity("node:Company");
+        let effect = |kind: RecoverySchemaApplyEffectKind| RecoverySchemaApplyEffect {
+            identity,
+            table_key: "node:Company".to_string(),
+            kind,
+        };
+        let build = |effects: Vec<RecoverySchemaApplyEffect>,
+                     registrations: Vec<SidecarTableRegistration>,
+                     to_stamp: u32| {
+            new_system_column_upgrade_sidecar_v9(
+                Some("act-upgrade".to_string()),
+                vec![make_pin(
+                    "node:Company",
+                    "memory://graph/nodes/company",
+                    3,
+                    4,
+                )],
+                RecoveryAuthorityToken {
+                    branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                    graph_head: Some("01H000000000000000000000U0".to_string()),
+                    schema_identity_domain: "domain-a".to_string(),
+                    schema_ir_hash: "accepted-schema".to_string(),
+                    schema_identity_version: 1,
+                },
+                RecoveryLineageIntent {
+                    graph_commit_id: "01H000000000000000000000U1".to_string(),
+                    branch: None,
+                    actor_id: Some("act-upgrade".to_string()),
+                    merged_parent_commit_id: None,
+                    created_at: 790,
+                },
+                effects,
+                RecoveryManifestDelta {
+                    table_updates: vec![RecoveryTableUpdateSlot {
+                        identity,
+                        table_key: "node:Company".to_string(),
+                        expected_version: 3,
+                        table_branch: None,
+                        confirmed: None,
+                    }],
+                    registrations,
+                    renames: Vec::new(),
+                    tombstones: Vec::new(),
+                },
+                "target-schema".to_string(),
+                RecoverySystemColumnUpgrade {
+                    from_stamp: 8,
+                    to_stamp,
+                    manifest_version_after_stamp: None,
+                },
+            )
+        };
+        let rename = || RecoverySchemaApplyEffectKind::SystemColumnRename {
+            planned_transaction: planned.clone(),
+            confirmed_transaction: None,
+        };
+
+        let sidecar = build(vec![effect(rename())], Vec::new(), 9).unwrap();
+        let json = serde_json::to_string(&sidecar).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/upgrade-v9.json", &json).unwrap();
+        assert_eq!(
+            parsed
+                .protocol_v7
+                .unwrap()
+                .system_column_upgrade
+                .unwrap()
+                .to_stamp,
+            9
+        );
+
+        assert!(build(vec![effect(rename())], Vec::new(), 10).is_err());
+        assert!(
+            build(
+                vec![effect(RecoverySchemaApplyEffectKind::ExistingOverwrite {
+                    planned_transaction: planned.clone(),
+                    confirmed_transaction: None,
+                })],
+                Vec::new(),
+                9,
+            )
+            .is_err()
+        );
+
+        let mut unmarked = sidecar;
+        unmarked.protocol_v7.as_mut().unwrap().system_column_upgrade = None;
+        let json = serde_json::to_string(&unmarked).unwrap();
+        assert!(parse_sidecar("memory://graph/__recovery/unmarked.json", &json).is_err());
+    }
+
+    #[test]
     fn schema_apply_v7_sidecar_round_trips_exact_first_touch_envelope() {
         let planned = transaction(0, "schema-create-company");
         let identity = test_identity("node:Company");
@@ -9395,6 +9950,7 @@ mod tests {
             lineage: protocol_v3.lineage.clone(),
             rollback_graph_commit_id: "01H000000000000000000000BC".to_string(),
             rollback_audit_outcomes: None,
+            system_column_upgrade: None,
             target_schema_ir_hash: "foreign-schema-payload".to_string(),
             effect_phase: RecoveryEffectPhase::Armed,
             effects: Vec::new(),

@@ -27,7 +27,8 @@ pub(super) const UPGRADE_PENDING_KEY: &str = "omnigraph:storage_upgrade_pending"
 const UPGRADE_RECEIPT_KEY: &str = "omnigraph:storage_upgrade_receipt";
 const HANDLER: &str = "registration-clocks-v6-to-v7";
 const RETIREMENT_HANDLER: &str = "native-retirement-v7-to-v8";
-const DEFAULT_TARGET: u32 = 8;
+const SYSTEM_COLUMNS_HANDLER: &str = "system-columns-v8-to-v9";
+const DEFAULT_TARGET: u32 = 9;
 const RETIREMENT_KEY: &str = "omnigraph.retired_manifest_branch";
 const MAX_BRANCHES: usize = 1024;
 const MAX_VERSIONS: usize = 100_000;
@@ -262,13 +263,13 @@ async fn run(
     policy: Option<&dyn omnigraph_policy::PolicyChecker>,
     report: &mut UpgradeReport,
 ) -> Result<()> {
-    if !matches!(report.target_format, 7 | 8) {
+    if !matches!(report.target_format, 7..=9) {
         if let Ok(main) = open(root, None).await {
             report.observed_format = read_stamp(&main);
         }
         report.finding(
             "unsupported_target",
-            "this binary has registered routes to formats 7 and 8 only",
+            "this binary has registered routes to formats 7, 8 and 9 only",
         );
         return Ok(());
     }
@@ -277,10 +278,11 @@ async fn run(
     } else {
         Some(crate::db::reserve_export_root_exclusion(root)?)
     };
-    for _ in 0..2 {
+    for _ in 0..3 {
         let main = open(root, None).await?;
+        let stamp = read_stamp(&main);
         if report.observed_format.is_none() {
-            report.observed_format = read_stamp(&main);
+            report.observed_format = stamp;
         }
         let pending = match intent_from(&main) {
             Ok(pending) => pending,
@@ -305,26 +307,49 @@ async fn run(
         let step_target = pending
             .as_ref()
             .map(|intent| intent.target_format)
-            .unwrap_or_else(|| {
-                if read_stamp(&main) == Some(6) {
-                    7
-                } else {
-                    report.target_format
-                }
+            .unwrap_or_else(|| match stamp {
+                Some(6) => 7,
+                Some(7) => report.target_format.min(8),
+                Some(8) | Some(9) => report.target_format,
+                _ => report.target_format.min(8),
             });
         let initial_step = pending
             .as_ref()
             .map(|intent| intent.source_format)
-            .unwrap_or_else(|| read_stamp(&main).unwrap_or(0));
-        if initial_step == 6 && report.target_format == 8 {
+            .unwrap_or_else(|| stamp.unwrap_or(0));
+        if initial_step == 6 && report.target_format >= 8 {
             report.route = vec![HANDLER.into(), RETIREMENT_HANDLER.into()];
-        } else if initial_step == 7 && report.target_format == 8 && report.route.is_empty() {
+        } else if initial_step == 7 && report.target_format >= 8 && report.route.is_empty() {
             report.route.push(RETIREMENT_HANDLER.into());
+        }
+        if matches!(initial_step, 6..=8)
+            && report.target_format == 9
+            && !report
+                .route
+                .iter()
+                .any(|entry| entry == SYSTEM_COLUMNS_HANDLER)
+        {
+            report.route.push(SYSTEM_COLUMNS_HANDLER.into());
+        }
+        if step_target == 9 {
+            run_system_columns_step(root, options, actor, policy, report).await?;
+            return Ok(());
+        }
+        if report.target_format == 9 && matches!(stamp, Some(6) | Some(7)) {
+            refuse_system_columns_offenders_before_conversion(root, &main, report).await?;
+            if !report.findings.is_empty() {
+                return Ok(());
+            }
         }
         run_step(root, options, actor, policy, report, step_target).await?;
         if options.check {
             if step_target < report.target_format && report.success() {
-                report.work.deferred_checks.insert("v7-to-v8 preflight must validate the converted v7 output before the second handler has effects".into());
+                if step_target == 7 {
+                    report.work.deferred_checks.insert("v7-to-v8 preflight must validate the converted v7 output before the second handler has effects".into());
+                }
+                if report.target_format == 9 {
+                    report.work.deferred_checks.insert("the system-column preflight (property names, source respelling) runs on the converted v8 graph before the v8-to-v9 step has effects".into());
+                }
             }
             return Ok(());
         }
@@ -334,8 +359,159 @@ async fn run(
         report.work.deferred_checks.clear();
     }
     Err(invalid(
-        "storage upgrade route exceeded its two registered handlers",
+        "storage upgrade route exceeded its three registered steps",
     ))
+}
+
+/// The route's final step, the RFC 0040 system-column upgrade: the operation
+/// itself owns preflight, effects and roll-forward recovery; this adapter maps
+/// its report onto the route report and opens the graph read-only for a check.
+async fn run_system_columns_step(
+    root: &str,
+    options: UpgradeOptions,
+    actor: Option<&str>,
+    policy: Option<&dyn omnigraph_policy::PolicyChecker>,
+    report: &mut UpgradeReport,
+) -> Result<()> {
+    report.outcome = UpgradeOutcome::CheckFailed;
+    let main = open(root, None).await?;
+    if let Some(stamp) = read_stamp(&main)
+        && stamp > super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+    {
+        report.finding(
+            "newer_than_binary",
+            format!(
+                "this graph is stamped v{stamp}, newer than the v{} this executable serves; upgrade omnigraph before touching it",
+                super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+            ),
+        );
+        return Ok(());
+    }
+    if let Some(checker) = policy {
+        let actor = actor.ok_or_else(|| {
+            OmniError::Policy("storage upgrade requires an actor when policy is installed".into())
+        })?;
+        checker
+            .check(
+                omnigraph_policy::PolicyAction::SchemaApply,
+                &omnigraph_policy::ResourceScope::TargetBranch("main".into()),
+                actor,
+            )
+            .map_err(|e| OmniError::Policy(e.to_string()))?;
+    }
+    let opened = if options.check {
+        crate::db::Omnigraph::open_read_only(root).await
+    } else {
+        crate::db::Omnigraph::open(root).await
+    };
+    let db = match opened {
+        Ok(db) => db,
+        Err(error @ OmniError::RecoveryRequired { .. }) => {
+            report.recover("system_columns_recovery_pending", error.to_string());
+            if let Some(recovery) = &mut report.recovery {
+                recovery.failed_handler = SYSTEM_COLUMNS_HANDLER.into();
+                recovery.action = "stop all writers and maintenance, retain the backup, then open the graph read-write (rerun this command without --check, or run `omnigraph snapshot`): the open completes the system-column upgrade and the rerun reports already_current".into();
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let storage = storage_for_uri(root)?;
+    let (_, schema_state) =
+        crate::db::schema_state::load_validated_schema_contract(root, Arc::clone(&storage)).await?;
+    report.graph_identity = Some(schema_state.schema_identity_domain.clone());
+    let outcome = match db
+        .upgrade_system_columns_as(
+            crate::db::SystemColumnUpgradeOptions {
+                check: options.check,
+            },
+            actor,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error @ OmniError::RecoveryRequired { .. }) => {
+            report.recover("upgrade_interrupted", error.to_string());
+            if let Some(recovery) = &mut report.recovery {
+                recovery.failed_handler = SYSTEM_COLUMNS_HANDLER.into();
+                recovery.action = "stop all writers and maintenance, retain the backup, then open the graph read-write (rerun this command without --check, or run `omnigraph snapshot`): the open completes the system-column upgrade and the rerun reports already_current".into();
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    for finding in &outcome.findings {
+        report.finding(finding.code, finding.message.clone());
+    }
+    match outcome.outcome {
+        crate::db::SystemColumnUpgradeOutcome::Refused => {}
+        crate::db::SystemColumnUpgradeOutcome::CheckPassed => {
+            report.outcome = UpgradeOutcome::CheckPassed;
+        }
+        crate::db::SystemColumnUpgradeOutcome::AlreadyCurrent => {
+            report.outcome = if report.completed_handlers.is_empty() {
+                UpgradeOutcome::AlreadyCurrent
+            } else {
+                UpgradeOutcome::Completed
+            };
+        }
+        crate::db::SystemColumnUpgradeOutcome::Completed => {
+            report
+                .completed_handlers
+                .push(SYSTEM_COLUMNS_HANDLER.into());
+            report.last_durable_completed_boundary = Some(SYSTEM_COLUMNS_HANDLER.into());
+            report.outcome = UpgradeOutcome::Completed;
+        }
+    }
+    Ok(())
+}
+
+/// A route ending at v9 needs a graph with only main, no `_`-prefixed property
+/// and a source that respells (RFC 0040). Refuse a v6/v7 source that fails any
+/// of them before the storage steps have any effect.
+async fn refuse_system_columns_offenders_before_conversion(
+    root: &str,
+    main: &Dataset,
+    report: &mut UpgradeReport,
+) -> Result<()> {
+    let branches = legacy_branch_contents(main).await?;
+    let blocking = branches
+        .keys()
+        .map(|native| crate::branch_names::logical_branch_name(native).to_string())
+        .filter(|logical| logical != "main" && !crate::db::is_internal_system_branch(logical))
+        .collect::<Vec<_>>();
+    if !blocking.is_empty() {
+        report.finding(
+            crate::db::SYSTEM_COLUMNS_PREFLIGHT,
+            format!(
+                "the route ends at v9, which requires a graph with only main; found non-main branches: {}; merge what you need, then delete them, or request --to-format 8",
+                blocking.join(", ")
+            ),
+        );
+    }
+    let storage = storage_for_uri(root)?;
+    let (accepted_ir, _) =
+        crate::db::schema_state::load_validated_schema_contract(root, Arc::clone(&storage)).await?;
+    let offenders = crate::db::omnigraph::reserved_property_offenders(&accepted_ir);
+    if !offenders.is_empty() {
+        report.finding(
+            crate::db::SYSTEM_COLUMNS_PREFLIGHT,
+            format!(
+                "the route ends at v9, which reserves property names starting with '_': {}; rename them with @rename_from in a schema apply first, or request --to-format 8",
+                offenders.join(", ")
+            ),
+        );
+        return Ok(());
+    }
+    let source = storage
+        .read_text(&crate::db::schema_state::schema_source_uri(root))
+        .await?;
+    if let Err(error) =
+        crate::db::omnigraph::render_system_column_upgrade_target(&accepted_ir, &source)
+    {
+        report.finding(crate::db::SYSTEM_COLUMNS_PREFLIGHT, error.to_string());
+    }
+    Ok(())
 }
 
 async fn run_step(

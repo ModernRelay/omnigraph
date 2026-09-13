@@ -866,6 +866,18 @@ pub(crate) enum SchemaCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
+    /// `__id`/`__src`/`__dst`, storage format v8 to v9; RFC 0040)
+    #[command(name = "upgrade-system-columns")]
+    UpgradeSystemColumns {
+        /// Standalone graph storage URI; alternatively use --store
+        uri: Option<String>,
+        /// Run the preflight only; write nothing
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

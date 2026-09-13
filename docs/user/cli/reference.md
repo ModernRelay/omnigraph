@@ -53,6 +53,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `schema show` | Read the accepted schema | direct or served |
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
+| `schema upgrade-system-columns` | Respell a v8 graph's system columns in place (storage format v8 to v9) | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
 | `upgrade` | Check or execute a registered offline storage migration | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
@@ -127,12 +128,15 @@ when it changed unrelated data. A mismatch has no effect and exits with code
 ## Storage upgrade
 
 ```bash
-omnigraph upgrade ./graph.omni --check --to-format 8 --json
-omnigraph upgrade ./graph.omni --to-format 8 --json
+omnigraph upgrade ./graph.omni --check --json
+omnigraph upgrade ./graph.omni --json
+omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
 `--store` is an alternative to the positional storage URI. Target format defaults
-to 8: qualified v6 inputs run v6 → v7 → v8, and v7 inputs run v7 → v8.
+to 9: qualified v6 inputs run v6 → v7 → v8 and then the system-column step,
+v7 inputs run v7 → v8 and the step, v8 inputs run the step alone; `--to-format 8`
+stops at v8 with the legacy system column spellings.
 Explicit target 7 remains available, but the current binary refuses normal open
 of v7. `--check` performs read-only preflight and reports output-dependent checks
 in `work.deferred_checks`; execution validates those before the affected handler

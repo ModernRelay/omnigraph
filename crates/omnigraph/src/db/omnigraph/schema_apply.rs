@@ -38,7 +38,7 @@ fn promote_drops_to_hard(plan: &mut SchemaMigrationPlan, allow_data_loss: bool) 
     }
 }
 
-fn pre_minted_schema_transaction(
+pub(super) fn pre_minted_schema_transaction(
     read_version: u64,
 ) -> crate::table_store::StagedTransactionIdentity {
     crate::table_store::StagedTransactionIdentity {
