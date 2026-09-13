@@ -12,21 +12,12 @@ discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "RFC 0047 plan-truth guarantees reconciled with named stages; its interim Option<RetrievalIR> shape and scan-root restriction are not permanent dependencies"
-  - "Parser/typechecker prototype and golden plans for staged graph scope, target identity, metric scope, aggregation, and per-group selection"
-  - "Language evolution contract: shared expressions, contextual keywords, scope transitions, and compatibility fixtures before syntax stabilization; explicit yield output is compiler-prototyped"
-  - "Mixed analytical/graph/retrieval composition: C1–C4 have checked logical goldens; scorer/null/arithmetic policies are decided, but production evaluation, integrated lowering and resource qualification remain open"
-  - "SchemaIR version-assignment coordination with RFCs 0040 and 0044, and analyzer fingerprint mapping to RFC 0043 artifact certificates"
-  - "Resolved representation identity including source mapping, model revision, and compatible query/record encoding recipes"
-  - "Schema-owned default embedding declaration, omission/override rules, resolved export and reapplication, and per-field migration visibility"
-  - "NFC preprocessing implementation and Unicode identity, with query/scan/index parity and bounded normalization"
-  - "Vector arithmetic, normalization, invalid-value handling, exact-rescore precision, and checked fusion/effort arithmetic"
-  - "Exact lexical evaluator and unified BM25 implementation qualified against the score oracle across index states and boundary ties"
-  - "Snapshot-visible live-row statistics, canonical float64/log1p implementation, and full boundary-tie handling"
-  - "Whole-query admission and accounting for token construction, graph fan-out, coverage, sorting, scoring, fallback, and output bytes"
-  - "Snapshot-coherent follow-up read and stored-query fingerprint contracts through the existing read surface"
-  - "Global-search extension proof: typed identity, source/table independence and union/narrowing compatibility; cross-type and all-node execution explicitly deferred"
-  - "Maintained retrieval judgments and mixed analytical/graph/retrieval agent tasks beyond the document pilot; bounded ann_default_v1 recall/latency qualification per index family"
+  - "Phase 0 language/type/plan proofs for staged scope, C1–C4, identity, grouping and future unions; reconcile RFC 0047 without freezing its interim IR restrictions"
+  - "Phase 0 resolved-schema syntax/serialization prototype, default/reapplication fixtures, qualified encoder identity and format coordination with RFCs 0040/0043/0044"
+  - "Phase 0 vector/fusion numeric policies and independent oracles; bounded NFC, live-statistics and exact-tie route dispositions against pinned upstream code"
+  - "Phase 0 shared resource/read interfaces and discriminating admission, fingerprint, follow-up and refusal prototypes"
+  - "Phase 0 minimal compiler/engine/GQT vertical slice with later-stage discovery and shared-resource refusal"
+  - "Phase 0 fixed mixed-workload corpus, judgments, budgets and acceptance protocol; production qualification belongs to Phases 1–6"
 ---
 
 # RFC 0048: Search contracts and retrieval algebra
@@ -81,6 +72,10 @@ complete production feature; four recorded GQT regressions remain open.
 those boundaries. The [phase handoffs](#implementation-phases) name the
 remaining decisions, owners and required proof. Implementers must investigate
 open claims rather than treating proposed syntax or passing probes as truth.
+Frontmatter lists remaining design-acceptance gates; the
+[release gates](#phase-0-acceptance-versus-release-qualification) retain full
+production obligations. Moving a check to its implementation phase does not
+waive it or make the current code correct.
 
 ## Summary
 
@@ -289,6 +284,17 @@ Changes to a schema default must
 expose any proposed field rebinding as a semantic migration, subject to the
 existing refusal/rebuild rules. A changed runtime provider configuration or a
 no-op reapplication cannot silently rebind an accepted field.
+
+**Default lifetime decision:** a default supplies a recipe when a field first
+acquires an embedding binding. Changing or removing the schema default alone
+does not rebind existing fields; it affects newly introduced bindings. Rebinding
+an existing field requires an explicit field recipe change, visible in
+`schema plan`. An unrelated property edit and a no-op apply retain the accepted
+recipe. Drop/re-add creates a new field lifetime and resolves the current
+default. Canonical export spells out every accepted field's resolved choice,
+including previously inherited choices, so reinitialization does not require
+the old deployment's defaults. This rule requires accepted-state-aware schema
+resolution; parsing the desired source alone cannot implement it.
 
 #### Analyzer profiles
 
@@ -1724,13 +1730,46 @@ execution bindings never depend on a mutable default name. Schema export and
 reapplication must preserve them, including on another deployment.
 
 Embedding space identity includes immutable model revision and the compatible
-record/query encoding recipes: source mapping, preprocessing, prompts or role
-selection, pooling/normalization, and representation shape where applicable.
+record/query encoding recipes: preprocessing, prompts or role selection,
+pooling/normalization, and representation shape where applicable.
 Query and record encoders may differ intentionally while producing compatible
 representations. Equal dimensions, matching labels, or identical provider
 names are insufficient. Mutable aliases must resolve to a pinned identity or
 fail when compatibility cannot be established. Credentials and endpoint
 configuration remain runtime concerns, not accepted-schema secrets.
+
+Keep the following identities separate. All are versioned typed descriptors;
+their hashes are derived views, not an alternative source of authority.
+
+| Identity | Included meaning | Excluded distinctions |
+|---|---|---|
+| Encoding recipe / embedding space | Qualified immutable model revision, compatible query/record transforms and roles, pooling, normalization, output shape/component type and numeric policy | Owning node type, field name, source-property identity, index layout, endpoint and credentials |
+| Field representation binding | Graph schema identity domain, owner/type/incarnation/property identities, source mapping, resolved analyzer/scorer or encoding recipe, and field geometry | Display names, inherited-versus-explicit authoring provenance, physical indexes and current source values |
+| Query encoding invocation | Query-side recipe identity and exact typed input/options, with actual resulting vector values in resolved execution identity | Stored-query name alone, model label alone, dimensions alone |
+
+Two fields can have different bindings and the same space. Reading `title`
+instead of `body` changes the binding; identical encoder transforms can still
+produce comparable vectors. Changing a prompt or normalization changes the
+space. Distance comparability additionally requires the same field geometry
+and numeric comparator; equal space identity alone does not authorize mixing
+`dot` and `cosine`. Renames preserve field identity; drop/re-add and a new graph
+root do not. Export/rebuild can preserve encoding semantics and vector values
+while minting new graph-bound identities. It does not preserve old snapshots.
+
+Use domain-separated SHA-256 over a versioned, canonical typed encoding,
+consistent with the repository's existing hash family. Freeze field ordering,
+enum tags, integer widths, optional values and float bit encoding in fixtures
+before serialization is accepted; never hash `Debug` text or incidental map
+iteration. The existing `schema_ir_hash` covers the whole accepted IR and is
+not a substitute for these narrower equivalence relations. Source mapping is
+not evidence that a supplied vector was generated from the current row value;
+representation-generation validity still needs its own admission contract.
+
+Do not reserve a numeric SchemaIR stamp in this draft. Extend the existing
+`required_ir_version`/validation owner for the combined declared features and
+prove mutual format refusal. The current owner accepts base version 2 and
+edge-key version 4; version 3 is already burned. A parallel version selector
+or reusing an apparently available number would bypass that authority.
 
 The current provider adapters check model labels and already distinguish
 Gemini query/document roles, but they do not prove an immutable hosted-model
@@ -1779,6 +1818,36 @@ wire types and namespace choices must be checked before implementation:
 | Metric origin | Named source instance, target, domain, scoring/encoding fingerprints, and missing-arm membership |
 | Attribution | Graph snapshot context, graph binding identities, and selected properties; application-defined source relationships remain ordinary data |
 | Follow-up | A supported way to read/expand those bindings at that snapshot, or an explicit expired/unavailable outcome |
+
+**Interface decision:** add one typed `execution` option to canonical inline
+and stored-query requests, with the same options on the embedded entry point:
+`coverage: report | exact` (default `report`), `require_replay: Bool` (default
+false), and optional `limits`. This is request admission/metadata policy;
+retrieval sources, windows and effort remain in the typed query. Unknown keys,
+invalid units and unsupported requirements fail before query work. An omitted
+limit inherits a finite operator-configured default; an explicit request may
+tighten that cap; a value above the cap is an admission error. Zero means no
+allowance for a counted resource, never unlimited. A deadline must be positive.
+
+Retain `ReadOutput.graph_commit_id` as the replay identifier and `target` as
+the requested target. Add an `execution` result descriptor with its format
+version, completion, effective limits, usage, fingerprints and replay state.
+Replay is `available` when `graph_commit_id` is present, or `unavailable` with
+a reason such as `no_graph_commit`; do not manufacture a second snapshot ID.
+`require_replay: true` rejects unavailable identity after snapshot resolution
+and before source execution. Available means addressable under current
+retention, not reserved against subsequent cleanup.
+
+JSONL's metadata record and Arrow response metadata must carry the same
+descriptor and graph commit as JSON. Human tables/CSV remain presentations,
+not a lossless continuation protocol. Versioned wire structs, OpenAPI and
+renderer/client fixtures must prove these additions; naming them here does
+not make them accepted request fields today.
+The current owners are [API types](../../crates/omnigraph-api-types/src/lib.rs),
+[engine query admission](../../crates/omnigraph/src/exec/query.rs) and
+[CLI renderers](../../crates/omnigraph-cli/src/read_format.rs). The engine
+currently captures its view before compiling and has no such shared execution
+argument; implementing this decision requires changing that entry sequence.
 
 Coverage knowledge is separate from query completion. By default, report exact
 counts only when required retrieval work or qualified snapshot-bound metadata
@@ -1844,25 +1913,89 @@ retention behavior, including deleted branches or cleaned-up versions, are
 acceptance gates for completing the coherent-read path;
 no new durable search-result store is implied.
 
+**Retention decision:** a read creates no persistent pin, native tag or lease.
+Within an execution, every participant uses the captured accepted view; a
+concurrent destructive maintenance operation may cause an explicit unavailable
+history failure, never substitution with current data. Between calls, replay
+depends on the existing graph retention policy. Return an expiry timestamp
+only if an actual retention guarantee supplies one. Recheck authorization
+before resolving or disclosing historical state. Unknown identifiers, reclaimed
+history and authorization refusal remain distinct typed outcomes internally;
+public mapping must preserve the existing policy's disclosure boundary.
+
+**Fingerprint decision:** distinguish the selected stored/inline definition,
+the resolved semantic plan and one execution. The definition digest covers the
+submitted source, selected query name and tool metadata; whitespace or
+instructions may change it. The semantic digest covers the versioned typed
+plan, resolved identities/defaults, result shape, sources and metric origins.
+Execution identity additionally binds parameters, snapshot, authorization
+context, actual query vectors and effective execution options. Neither a
+definition digest nor an execution identifier promises repeatable ANN
+candidates or deterministic hosted encoding. Keep sensitive parameter/vector
+material and authorization details out of public descriptors; an opaque
+execution ID can refer to internal diagnostics. Public fingerprints never
+authorize cache reuse across actors. The canonical encodings and compatibility
+fixtures remain an acceptance gate, shared with representation fingerprints.
+
 Ranked pagination is deferred. Snapshot, query digest, and semantic
 fingerprints alone do not freeze an ANN candidate execution. A stable cursor
 needs bounded preservation of the actual candidate order or a qualified
 reproducible execution, plus retention, policy, expiry, and failure contracts.
 A deterministic sort of one returned subset does not establish that guarantee.
 
-Query budgets account for input/value bytes, analyzer and edit state, eligible
-population scans, graph fan-out, all candidate windows, coverage/statistics,
-sort/spill, model calls, cancellation, and result bytes. Fallback spends the
-remaining budget; it does not receive a fresh allowance. A small final `limit`
-is not proof of bounded intermediate work. Admission must cover graph stages
-after the final ranking/selection stage as well as stages between sources.
-Keep the same resource context alive through projection and output; charging
-a decoded batch afterward cannot establish a bound on its allocation peak.
-Output byte limits fail explicitly or use a separately declared partial-result
-protocol; they never silently
-truncate returned properties. Compact discovery and selective property reads
-support context control initially. Token-budget packing and source snippets
-are deferred, with encoding/source attribution requirements retained.
+A small final `limit` does not bound intermediate work, including graph stages
+after the final ranking cut. Fallback spends the remaining query budget.
+Compact discovery and selective property reads support context control;
+token-budget packing and source snippets remain deferred, with their
+encoding/source attribution requirements retained.
+
+**Resource interface decision:** create one request-owned execution context
+before snapshot capture/compilation and retain it through serialization. It
+owns the accepted view once resolved, cancellation/deadline, resource ledger
+and diagnostics. Every stage, nested invocation, scanner, encoder and fallback
+borrows that context; cloning a handle does not clone its allowance. Extend
+the sealed storage/embedding adapters and DataFusion runtime integration,
+rather than adding a parallel executor or storage manager.
+
+| Limit field / unit | Admission boundary |
+|---|---|
+| `deadline_ms` / elapsed milliseconds from engine admission | Includes queueing after admission, compilation, reads, retries, encoding and output preparation; transport/body admission has its own earlier bounds. No fresh deadline per stage. |
+| `input_bytes` / decoded query and parameter bytes | Bound transport input before parsing; bound internal expansion and retained values through memory/work reservations. |
+| `memory_bytes` / simultaneously reserved query-owned allocation bytes | Reserve before allocation/decode, including operator state, native buffers and output. Shared buffers count once while retained; process caches also need a separate finite service cap. This is not a whole-process RSS promise. |
+| `storage_requests`, `storage_read_bytes` / admitted storage operations and read payload bytes | Reserve before dispatch; range sizes and bounded metadata bodies determine reservations. Record hidden retry behavior separately and qualify it before promising attempt/transfer caps. |
+| `binding_rows` / cumulative rows produced by population-changing operators | Charge scans, traversal fan-out, joins and grouping output before retaining/emitting each batch. Counts measure operator work, not distinct entities or final result rows. |
+| `analysis_bytes`, `edit_cells`, `distance_components` / processed text bytes, edit-DP cells, vector components | Bound normalization/tokenization, complete fuzzy evaluation and vector distance work in their adapters. Accelerated algorithms need an explicit conservative charging rule; these are separate units, not one weighted cost score. |
+| `embedding_calls` / provider request attempts | Reserve before each call, including retries; bound request/response bytes and concurrency as well. Cache hits do not consume a provider attempt. |
+| `spill_bytes` / simultaneously reserved scratch bytes | Reserve before writes; release only when files are retired. Spill reads/writes and processing still consume deadline and relevant I/O/work budgets. |
+| `output_bytes` / uncompressed serialized response bytes in the selected format | Enforce with a bounded encoder before publishing a complete success, including descriptors. A small row count never permits an unbounded field. |
+
+The ledger separates cumulative charges from live reservations. A failed
+reservation performs no corresponding allocation, dispatch or batch emission;
+checked counter overflow fails. Releasing memory does not refund consumed
+work. Multi-resource reservation must either acquire all required allowances
+or unwind them before effects. Cancellation stops new work and drains owned
+tasks/permits under a bounded cleanup policy; an already dispatched remote
+operation cannot be described as undone.
+
+These units settle the interface, not numeric defaults or enforcement proof.
+Default values and adapter chunk/reservation bounds must be fixed in the
+implementation and qualification configuration. A native route that cannot
+reserve its material allocations/work is unavailable under this contract;
+use a qualified bounded route or fail admission. Ordinary Lance metrics,
+sampled RSS and charging a completed batch are insufficient proof. In the
+pinned `lance-io` GET wrapper, byte counters are recorded after the body is
+drained or dropped; they are observations rather than pre-dispatch controls.
+See the [pinned wrapper](https://docs.rs/crate/lance-io/11.0.0/source/src/object_store/metrics.rs)
+and the [upstream metric definitions](https://lance.org/guide/observability/).
+
+Extend the existing `OmniError::ResourceLimitExceeded` owner and add typed
+deadline/cancellation outcomes through that same error surface; these are
+not all existing variants. Include stage, resource, effective limit and
+attempted reservation where safe to disclose.
+Failures carry no complete-success descriptor. The initial protocol buffers
+or boundedly spools the result before success; transport interruption still
+means the client did not receive a complete result. A future streaming-success
+protocol needs an explicit terminal completion record, not silent partial rows.
 
 ### Exact lexical execution and qualified acceleration
 
@@ -2608,12 +2741,35 @@ by this draft.
 
 ## Rollout
 
-Acceptance requires the frontmatter gates to have concrete dispositions and
-owned evidence. Phase 0 supplies the decision work and prototypes needed for
-acceptance; the later phases implement and qualify the accepted contracts.
+Acceptance requires the frontmatter design gates to have concrete dispositions
+and owned evidence. Phase 0 supplies the decision work and prototypes needed
+for acceptance; the later phases implement and qualify the accepted contracts.
 Each phase can be reviewed in separate PRs. The public contract ships as one
 coordinated pre-stable change with one necessary format rebuild, without
 requiring users to adopt an interim language or rebuild after each phase.
+
+### Phase 0 acceptance versus release qualification
+
+An accepted design must name a feasible route, the interfaces it requires and
+the tests that can disprove it. It does not assert that all production routes
+already implement the contract. These obligations have separate completion
+points:
+
+| Package | Phase 0 acceptance gate | Production release gate / owner |
+|---|---|---|
+| Language and composition | Checked syntax/types/plans for the initial stages and C1–C4; global-union compatibility proof; invalid-rewrite counterexamples; one actual compiler/engine/GQT slice with refusal | Phases 1/3: every enabled stage, walker, result type and optimized population boundary through GQT and mechanism owners. Deferred C1/C3/C4 execution remains outside this release. |
+| Schema and identity | Default lifetime, space/binding separation, concrete `.pg` syntax and canonical serialization prototype; export/reapply/rename/drop-readd fixtures; coordinated format disposition | Phases 1/6: accepted SchemaIR, provider qualification, migration and predecessor/rebuild tests. No unresolved provider identity silently accepted. |
+| Lexical/vector numerics | Complete numeric policies and independent oracles; discriminating native probes; explicit exact scan/fallback or upstream-dependency decisions | Phases 2/5: NFC/index parity, live statistics, fuzzy scoring, raw-vector rescoring, complete ties and all supported lifecycle states/targets. |
+| Resource/read interfaces | Typed request/result/error contracts and charging units; minimal shared-budget refusal and snapshot/fingerprint round-trip proofs; every unaccounted native allocation/dispatch assigned a route decision | Phases 1/4/5: actual preallocation/dispatch gates, bounded cancellation/cleanup, every renderer and policy/retention path, whole-query and fallback accounting. |
+| Retrieval evaluation | Frozen mixed tasks/corpus, judgment provenance, budgets, comparisons and acceptance criteria before tuning | Phase 5: measured correctness/quality/cost, source defaults and each enabled ANN family's effort mapping; retain failures and unsupported cases. |
+
+An unresolved design choice or a missing required prototype keeps Phase 0
+open. Production work scheduled above does not. An explicit upstream dependency
+can close a route decision, but cannot qualify or enable that route; the release
+still needs a working bounded implementation of every required capability.
+No production gate is waived by this classification. The four recorded GQT
+regressions remain release blockers even though they need not be repaired to
+accept the design.
 
 ### Implementation phases
 
@@ -2670,8 +2826,9 @@ cargo +1.97.1 test --locked -p omnigraph-engine --test rrf_prefilter_gate staged
 | [Execution/read contract](#result-metadata-coherent-continuation-and-budgets) | Resource units, admission/interfaces, error/result types, fingerprints, replay and retention |
 | [Workload](#mixed-workload-qualification) | Fixed tasks/corpus, exact oracles, relevance judgments, recipes, budgets and acceptance criteria before tuning |
 
-**Exit:** concrete dispositions for every blocker and native-matrix row:
-proved route, bounded fallback or explicit upstream dependency. Carry a minimal
+**Exit:** concrete design dispositions for every frontmatter gate and
+native-matrix row: a prototype-supported route, specified bounded fallback
+with its feasibility proof, or explicit upstream dependency. Carry a minimal
 query through the actual compiler/engine/GQT with success and shared-resource
 refusal; include later-stage descriptors, column demand, GQT detection and
 pre-scan parameter admission. Existing compiler, search, schema and read owners
@@ -2867,7 +3024,11 @@ before optimizing batching, and measure per-group rescan cost.
 
 ## Unresolved questions
 
-1. Complete grammar/typechecker/lowering qualification for the stated stage
+The [acceptance/release matrix](#phase-0-acceptance-versus-release-qualification)
+assigns the completion point for each proof. In particular, decided interfaces
+still require prototypes; full production qualification belongs to its phase.
+
+1. Complete Phase 0 grammar/type/plan qualification for the stated stage
    and metric scopes, per-group key types and tuple ordering, and any
    user-defined selection tie keys. The partial compiler
    prototype does not close the full result-schema and aggregation contract.
@@ -2875,25 +3036,29 @@ before optimizing batching, and measure per-group rescan cost.
    their lowering and retain RFC 0040 namespace coordination. Complete the
    C1–C4 syntax/type/plan proofs, including the analytical population and
    deferred correlation/scoring boundaries, before syntax stabilization.
-2. Qualification of the specified BM25 policy: the pinned numeric kernel across
-   supported targets, exact live-row statistics, polymorphic field-corpus
-   resolution, and native/fallback score and winner parity. Validate its edit
-   weights and maximum reduction on the owned retrieval/task corpus before
-   release; numerical fixtures alone do not establish a good relevance default.
+2. Close the Phase 0 numeric policies/oracles and native route dispositions.
+   Phases 2/5 must qualify BM25 across supported targets, exact live-row
+   statistics and native/fallback score/winner parity. Polymorphic field-corpus
+   execution is deferred. Validate edit weights and maximum reduction on the
+   owned task corpus before release; numerical fixtures alone do not establish
+   a good relevance default.
 3. Resolved representation serialization and immutable encoding revisions,
    schema-wide default declaration syntax and migration integration,
    normalizer/Unicode identity and analyzer/artifact fingerprint mapping, and
    shared SchemaIR version assignment with RFCs 0040/0043/0044. Omission and
    override semantics are specified above; their implementation must prove
    that accepted bindings cannot drift with deployment defaults.
-4. Concrete resource units/limits and sealed adapter interfaces for graph
-   masks, exact scoring, coverage, sort/spill, and output accounting.
-5. Read-envelope and stored-query definition fingerprints, snapshot-bound
-   follow-up transport and retention. Stable ranked cursors remain deferred.
-6. Initial ANN effort mappings and agent recipe defaults, chosen by the owned
-   fixed-corpus evaluation across the supported mixed workloads. The document
-   pilot alone cannot close this gate. Further multilingual profiles require
-   matched-set evidence and new versioned identities.
+4. Prototype the decided resource units and shared reservation interfaces;
+   resolve native allocation/dispatch gaps for graph masks, scoring, coverage,
+   sort/spill and output. Actual default limits, complete enforcement and
+   cancellation qualification belong to Phases 1/4/5.
+5. Prototype the decided read options, envelope, retention/refusal boundaries
+   and canonical definition/semantic/execution identities. Phase 4 qualifies
+   all transports and authorization paths. Stable ranked cursors remain deferred.
+6. Freeze the mixed-workload corpus, judgments and acceptance protocol in
+   Phase 0. Phase 5 chooses ANN effort mappings and agent recipe defaults from
+   the resulting evaluation. The document pilot alone is insufficient. Further
+   multilingual profiles require matched-set evidence and versioned identities.
 7. General all-node/type-union grammar, compatible representation expansion,
    type narrowing and heterogeneous projection. Execution is explicitly
    deferred; the compatibility proof remains due in Phase 0. The initial
@@ -2901,6 +3066,12 @@ before optimizing batching, and measure per-group rescan cost.
 
 ## Decision log
 
+- 2026-09-13 — separated Phase 0 acceptance from production release gates.
+  Decided default-binding lifetime, space versus field identity, read options
+  and replay/fingerprint boundaries, and shared resource units/reservations.
+  These are design dispositions; schema syntax/serialization and interface
+  prototypes remain open. Fresh checks on base `22d0472b` pass 367 compiler
+  and seven historical-read tests, establishing current owner baselines only.
 - 2026-09-13 — decided membership-independent lexical features, null and checked
   arithmetic policies, and deferred global execution. Extended the existing
   Decimal, compiler and DataFusion probes; default native arithmetic is not
