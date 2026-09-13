@@ -31,10 +31,11 @@ edits.
 > **Per-load bounds.** One keyed load (`append`/`merge`)
 > stages at most **8,192 entities and 32 MiB of Arrow memory per touched type**; a larger
 > batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
-> effect — split it into chunks, each an atomic graph commit. `overwrite`
-> escapes the row ceiling but not the 32 MiB strict-input Arrow preflight
-> (`strict_input_arrow_bytes`), so a bulk replacement above ~32 MiB is one
-> `overwrite` chunk followed by `merge` chunks. Also: against a non-local
+> effect — split it into chunks, each an atomic graph commit. The strict NDJSON
+> input path also limits its request body and decoded Arrow memory to 32 MiB,
+> including `overwrite`; ordinary streamed overwrite can exceed the keyed
+> envelope. Check the selected transport's limits before splitting an import.
+> Against a non-local
 > target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
 > explicit `--yes` consent in non-interactive runs.
 >
@@ -72,11 +73,24 @@ JSONL format:
 {"edge":"FormsPattern","from":"sig-foo","to":"pat-bar","data":{}}
 ```
 
-- Nodes: `{"type":"<NodeType>","data":{...props...}}`. A keyed node derives
-  `id` from its complete typed key tuple; omit `id` in hand-authored keyed
-  input. An unkeyed node gets a generated id unless one is supplied.
+- Nodes: `{"type":"<NodeType>","id":"<optional-id>","data":{...props...}}`.
+  A keyed node derives identity from its complete typed key tuple; omit top-level
+  `id` in hand-authored keyed input. An unkeyed node gets a generated id unless
+  top-level `id` supplies one.
 - Edges: `{"edge":"<EdgeType>","from":"<src_id>","to":"<dst_id>","data":{...edge_props...}}`.
-  Edges also use generated or supplied ids.
+  Edges also use generated or top-level supplied `id` values.
+
+`data` holds user properties. On new v9 graphs, `data.id` is a declared user
+property and `data.__id` is refused. v8 also accepts legacy `data.id` as identity
+when top-level `id` is absent; supplying both identity placements is refused.
+Exports put entity `id` at the top level on both vintages. Before loading a
+predecessor export into a new graph, relocate its identity as described in
+[migration guidance](migrations.md).
+
+`Date` accepts integer day counts or calendar-date strings; a datetime string is
+refused. `DateTime` accepts integer millisecond counts or datetime strings.
+Query/export JSON uses date strings, renders `DateTime` without a trailing `Z`,
+and omits null-valued property keys; change images keep explicit nulls.
 
 Load command:
 
@@ -103,6 +117,10 @@ one-shot review-branch flow below). Without `--from`, the target `--branch`
 With `--json`, an effectful `mutate` or `load` returns the exact published
 `commit`; a no-op mutation returns `commit: null`. For compare-and-swap writes,
 feeds, and diff inspection, see [`changes.md`](changes.md).
+
+These are data-mutation receipts. A GQ branch statement through `mutate` instead
+reports an `outcome`; zero affected counts and `commit: null` do not mean a
+branch operation had no effect. See [branch outcome details](changes.md#branch-statements).
 
 ### Embeddings are explicit input
 
@@ -150,6 +168,10 @@ Use `--from` for anything you want reviewed before it touches `main`.
 Long-lived branches compound merge risk. The usual flow is: create → load →
 verify → `merge --delete-branch`, all in the same session. Source deletion only
 happens after a successful merge publication.
+
+Deleting a parent branch is supported while descendants remain. Logical deletion
+retains the native history descendants need; only explicit `cleanup` reclaims
+unneeded table forks and retired refs. `optimize` does not perform that collection.
 
 ### Schema apply blocks non-main branches
 

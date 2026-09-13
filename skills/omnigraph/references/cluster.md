@@ -100,8 +100,9 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
 | `cluster.yaml` | the deployment: graph set, schemas, stored queries, policy bindings, storage | `cluster` commands; the `--cluster` server |
 | `~/.omnigraph/config.yaml` | per-operator: identity (`operator.actor`), named `servers:`, output defaults, personal aliases | data-plane CLI commands (tokens live in `~/.omnigraph/credentials` via `omnigraph login`) |
 
-Cluster commands read the operator config for **exactly one thing**: the actor
-default when `--as` is omitted (`--as` > `operator.actor`). A `--cluster` server
+Direct cluster commands use the operator actor default when `--as` is omitted
+(`--as` > `operator.actor`). Managed context selects a separate API route, as
+described below. A `--cluster` server
 reads it for **nothing** — boot from cluster state XOR the operator file, never
 a merge.
 Address a cluster-managed graph's data directly with `--store <storage>/graphs/<id>.omni`,
@@ -122,6 +123,12 @@ exposed (`GET /graphs/<id>/queries`, `POST
 graph's gate incl. `invoke_query`). Bearer tokens and bind stay process-level
 (env/flags).
 
+`GET /readyz` reports the booted applied digest, ledger revision/CAS and
+served/quarantined counts; it turns HTTP 503 when draining. An applied empty
+cluster can serve a ready zero-graph inventory. A nonempty cluster with no
+healthy graphs still refuses startup. `GET /graphs` requires `graph_list` and
+includes quarantined graph identities; readiness itself exposes counts only.
+
 **Config-free serving.** `--cluster` also accepts a `file://`, `s3://`, or
 preview `az://` storage-root URI
 directly — `omnigraph-server --cluster s3://bucket/prefix` boots from the
@@ -132,6 +139,35 @@ container shape is **bucket, no volume** (AWS ECS / Railway recipes in the
 omnigraph repo's `docs/user/deployment.md`). For a mounted config directory
 instead, `OMNIGRAPH_CLUSTER=<dir>` works and the image ships the CLI for
 in-container `cluster apply`.
+
+## Managed clusters
+
+An Intent API can own the control plane while the same CLI operates it:
+
+```bash
+omnigraph login --api https://control.example
+omnigraph use CLUSTER_ID --api https://control.example --config .
+omnigraph cluster plan --config . --json
+omnigraph cluster apply --plan PLAN_RUN_ID --config . --json
+omnigraph cluster token --graph knowledge --actions read,change,invoke_query --ttl 1h
+```
+
+`use` writes `.omnigraph/context` in the selected directory. API sessions and
+data credentials are separate OS-keychain entries, never plaintext config.
+Managed `query`/`mutate` read context only in the current directory, require
+`--graph`, and use the cached data endpoint/credential. They can operate during
+a control-API outage until that credential expires. Other data commands keep
+ordinary addressing. Explicit `--server`/`--profile`/`--store`/`--cluster` selects
+ordinary routing; global `--direct` selects ordinary ambient defaults. Missing
+or malformed managed authority refuses without fallback, and competing ambient
+targets require an explicit choice.
+
+Managed creation, config upload, deletion and undo use `cluster create`, `push`,
+`delete` and `undo-delete`; durable operation records bind uncertain submissions
+to their exact identity. Reconcile the existing operation before issuing another.
+See the authoritative [managed command reference](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/cli/reference.md#managed-cluster-commands),
+[lifecycle](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/cli/managed-lifecycle.md) and
+[data-access guide](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/cli/managed-data.md) for flags and limits.
 
 ## Recovery cheat-sheet
 

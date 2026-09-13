@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-azure-admission"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 description = "Azure Blob lease admission wrapper for OmniGraph deployments."
 license = "MIT"
@@ -13,7 +13,7 @@ base64 = { workspace = true }
 clap = { workspace = true }
 hmac = { workspace = true }
 httpdate = { workspace = true }
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.10.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.11.0" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

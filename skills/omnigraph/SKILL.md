@@ -2,10 +2,10 @@
 name: omnigraph
 description: Operate OmniGraph graphs and deployments. Use for `.pg` schemas, `.gq` queries, OmniGraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
 license: MIT (see LICENSE at repo root)
-compatibility: Covers released OmniGraph CLI and server 0.10.0. The CLI, server, and client bindings must be upgraded together.
+compatibility: Covers OmniGraph CLI and server 0.11.0. Coordinate client compatibility before upgrading a deployment; storage formats v8 and v9 are served without automatic migration.
 metadata:
   author: ModernRelay
-  version: "0.10.0"
+  version: "0.11.0"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -14,9 +14,11 @@ metadata:
 This skill captures the operational rules for working with a locally or remotely deployed Omnigraph. Follow them when authoring schema, writing queries, loading data, evolving schema, or automating graph operations.
 
 Check `omnigraph version` and the command's `--help` before using these
-instructions. This skill targets the [v0.10.0 release](https://github.com/ModernRelay/omnigraph/releases/tag/v0.10.0),
-which reports `internal-schema 6`. Use the matching release's source and docs
-when verifying behavior.
+instructions. This skill targets the [v0.11.0 release](https://github.com/ModernRelay/omnigraph/releases/tag/v0.11.0),
+which reports `internal-schema 9` and serves both v8 and v9 graphs. New graphs
+use v9; opening v8 preserves its physical columns. A v0.10 graph uses v6 and
+requires an explicit upgrade or rebuild. Read [migration guidance](references/migrations.md)
+before replacing a deployed binary.
 
 ## The Seven Rules
 
@@ -28,7 +30,7 @@ when verifying behavior.
 6. **Expose agent reads as aliases** — aliases decouple a read operation name
    from its stored-query implementation. Aliases are read-only; invoke a served
    stored mutation with `omnigraph mutate <name> --server ...`.
-7. **Treat a lost remote response as unknown** — an effectful `mutate --json` or `load --json` response contains the exact commit published by that attempt, but a proxy can return 504 after publication. On timeout, verify the intended branch/entity effect before retrying. See `references/remote-ops.md`.
+7. **Treat a lost remote response as unknown** — an effectful data mutation or load returns its exact commit, but a proxy can return 504 after publication. Branch statements have different outcome/receipt semantics. On timeout, reconcile the intended effect and relevant history before replay. See `references/remote-ops.md`.
 
 ## Essentials: Queries, Mutations, Loads
 
@@ -50,6 +52,11 @@ query get_signal($slug: String) {
 
 - **Parameterize, never interpolate.** Declare `$var: Type` in the signature; pass via `--params '{"slug":"sig-foo"}'`. An empty signature still needs parens: `query foo() { ... }`.
 - **Edge traversal is lowerCamelCase** even though the schema declares edges PascalCase (`FormsPattern` → `formsPattern`).
+- **System identity uses `@`.** Read `$s.@id` and `$e.@src`/`$e.@dst`;
+  bare `id`, `src`, and `dst` name declared user properties. `return { $s }`
+  returns an object containing `@id` and its non-Blob/non-Vector properties.
+  `schema show --json` reports the graph's physical `system_columns`; do not
+  substitute physical `__id` names into GQ.
 - **List/sort** by appending `order { $s.stagingTimestamp desc } limit 50` after `return`.
 - **`nearest` and `rrf` require a trailing `limit N`** — omitting it is a compile error. `bm25` does not require a limit, but use one to keep ranked output bounded. Ranking operators live in `order { }`, not as filters. Scope with `match`/filters first, then rank (`order { nearest($d.embedding, $q) } limit 10`).
 
@@ -68,7 +75,7 @@ query remove($slug: String)              { delete Signal where slug = $slug }
 ```
 
 - **Every non-nullable property must be supplied.** Lint normally reports T12
-  when one is missing. In v0.10, a non-null Vector target carrying `@embed`
+  when one is missing. A non-null Vector target carrying `@embed`
   is a known exception: source-only insert can lint successfully even though
   execution still requires the vector. Supply it explicitly; writes never
   embed automatically.
@@ -146,6 +153,10 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 - `init --schema <f.pg> <uri> [--force]`
 - `schema plan --schema <f.pg> [--allow-data-loss] [--json]`
+- `upgrade <uri> [--check] [--to-format <7|8|9>] [--json]` — offline standalone
+  conversion; defaults to v9. `schema upgrade-system-columns <uri> [--check]
+  [--json]` is the v8→v9 step. Read [migration preconditions](references/migrations.md)
+  first; cluster-managed roots refuse.
 - `lint --query <f.gq> [--schema <f.pg>] [<uri>] [--json]` — offline with `--schema`, graph-backed with a URI
 - `optimize [--json]` · `repair [--confirm] [--force] [--json]` · `cleanup [--keep <N>] [--older-than <7d>] --confirm [--json]` (at least one retention option; both may be combined)
 - `rebuild-full-text-indexes [--branch <b>] [--json]` — replace full-text indexes on one branch with default English analysis; custom tokenizer settings are replaced. Stop overlapping writers and retain a whole-store backup for upgrades. `--as` records attribution; direct access does not load server policy. See [maintenance commands](references/commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).
@@ -160,6 +171,11 @@ accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 - `alias <name> [args…]` — invoke an operator alias's bound stored read query; `[--params … | --params-file <p>] [--format <fmt> | --json]` (server/graph/query come from the binding)
 - `embed (--seed <embed.yaml> | --input <raw.jsonl> --output <out.jsonl> --spec <spec.json>) [--reembed-all | --clean] [--type <T>…] [--select "<Type>:<field>=<value>"]`
 - `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `profile <list | show [<name>]>` · `version`
+
+Managed folders can select an Intent API with `login --api` and `use`, then
+obtain a separate data credential with `cluster token`. Global `--direct`
+selects ordinary addressing. See [managed routing](references/cluster.md#managed-clusters)
+before using ambient targets or credentials.
 
 Pre-0.7.0 spellings (`read`/`change`/`ingest`, `--target`, positional `http://`) → [`references/migrations.md`](references/migrations.md).
 
@@ -284,7 +300,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Standalone `enum Foo { ... }` block | `parse error: expected EOI or schema_decl` | Inline: `kind: enum(a, b)` |
 | `[Category]` (list of enum) | compile error | Use `[String]`; lists must contain scalars |
 | Assuming `@embed` must quote its source | unnecessary schema churn | `@embed(text)` and `@embed("text")` are both valid; quoted form is canonical |
-| `@unique(src)` on edge without body block | parse error | `@card(1..1) { @unique(src) }` |
+| Endpoint constraint on a new edge schema | unknown user property `src` | Put `@unique(@src)` inside the edge body; `src` means a declared user property |
 | Expecting `@embed` to populate vectors during load | missing/stale vectors | `@embed` is metadata; run the offline `omnigraph embed ... --reembed-all` file pipeline, then load its output |
 | `schema apply` with feature branches open | rejected | Merge or delete branches first |
 | `nearest(...)` / `rrf(...)` without `limit` | compile error | Add `limit N`; a BM25-only query may omit it, though bounded output is recommended |
@@ -301,11 +317,14 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Reading a large schema via stdout-capped tool | Truncated, garbled, or duplicated output | `omnigraph schema show --server <name> --graph <id> > /tmp/schema.pg`, then read the file in chunks |
 | `omnigraph load` without `--mode` | error: `--mode` is required | Pass `--mode merge\|append\|overwrite` — there is no default (overwrite is destructive, so it is never implicit). Address direct storage or a served graph |
 | Blind retry after 504 | duplicate unkeyed nodes/edges or a repeated effect | compare the intended branch/entity state first; retry only after proving the attempt did not land |
-| Stale empty branches at `main`'s head | 504-orphaned forks from a timed-out `load --from`; eventually block writes | List branches, find ones at `main`'s `graph_commit_id`, `omnigraph branch delete <name> --store <graph-uri>` |
+| Review branch left after a timed-out `load --from` | uncertain load result | Inspect its content and history; matching `main`'s head alone is not proof of abandonment or authorization to delete it |
 | `omnigraph schema apply` / `init` on a cluster-managed graph | refused — bypasses the cluster ledger | Evolve cluster graphs via `omnigraph cluster apply --config .`; `schema apply`/`init` are for a non-cluster store |
 | Assuming Blob-bearing data cannot compact | unnecessary skipped maintenance | Lance 11 Blob compaction is supported; `optimize` preserves null/empty/non-empty values |
 | `@unique`/`@index` on a Blob column | schema parse/validation rejection | Blob properties cannot be keys, unique, or indexed |
 | Full-text search after upgrading an old store to 0.10 | explicit rebuild-required error | stop mixed-version access and run `rebuild-full-text-indexes` on every live branch that needs text search |
+| Reopening a v0.10/v6 graph with v0.11 | unsupported storage format | Stop the old fleet and use the explicit standalone upgrade or cluster rebuild procedure |
+| Using `data.id` for identity on a new graph | user-property error or wrong identity | Put identity in top-level JSONL `id`; `data` contains user properties |
+| Assuming every JSON result cell has a key | absent keys for null values | Query/export JSON omits null cells; change images retain explicit nulls |
 
 ## Deep Dives
 
@@ -325,4 +344,4 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 | [`references/stored-queries.md`](references/stored-queries.md) | Cluster stored-query registry: declaration, `queries validate/list --cluster`, served invocation, and `invoke_query` Cedar gating |
 | [`references/server-policy.md`](references/server-policy.md) | Starting the HTTP server, routes, bearer auth, Cedar policy gating, multi-graph mode |
 | [`references/commands.md`](references/commands.md) | Current command shapes, addressing, output, and maintenance |
-| [`references/migrations.md`](references/migrations.md) | Pre-0.7 vocabulary and the coordinated v0.9→v0.10 upgrade boundary |
+| [`references/migrations.md`](references/migrations.md) | v0.11 storage/system-column upgrades and wire changes; older v0.9→v0.10 and pre-0.7 boundaries |

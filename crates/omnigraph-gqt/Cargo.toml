@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-gqt"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 description = "GQ logic-test corpus (`cases/*.gqt`) and its runner; one named test per case."
 license = "MIT"
@@ -16,8 +16,8 @@ doctest = false
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 futures = { workspace = true }
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.10.0" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.10.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.11.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
 serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }

@@ -5,6 +5,7 @@
 - Linting
 - Parameterization
 - Query structure
+- System fields and result values
 - Search functions
 - Aggregations
 - Filter operators
@@ -172,6 +173,30 @@ query orphan_signals() {
 }
 ```
 
+## System Fields and Result Values
+
+Use `$p.@id` for a node's identity and `$w.@id`, `$w.@src`, `$w.@dst` for a
+bound edge's identity and endpoints. These meta-fields work in filters,
+projections, and ordering on both current and legacy graphs. `$p.id` always
+means a declared user property named `id`; it is not an identity shorthand.
+
+`return { $p }` returns one column named `p` containing the node object:
+`{"@id":"alice","name":"Alice"}`. It includes declared properties except
+Blob and Vector properties. Project `$p.@id` for just the identity or
+`$p.embedding` for a vector; Blob values require the Blob API. Bare edge
+bindings cannot be projected.
+
+Each projection needs a distinct result column name (`T25`): use aliases when
+expressions would collide. Aliases can be used in `order`, but cannot be
+projected again in `return` (`T36`).
+
+In JSON results, null fields are omitted from rows and node objects; null
+elements within lists remain `null`. Dates are `"2026-04-29"`; DateTime values
+are UTC strings such as `"2026-04-29T10:00:00"`, without a trailing `Z` and
+with a fractional part only when nonzero. Read the `columns` in the JSON
+envelope to retain fields that are null in every row. Integers remain JSON
+numbers, so JavaScript consumers must account for values beyond 2^53.
+
 ## Search Functions
 
 ### Text search
@@ -212,6 +237,11 @@ query vector_search($q: Vector(3072)) {
 `rrf` require `limit N`; BM25 alone does not, though a limit is recommended for
 bounded output.
 
+`nearest(...)` and `bm25(...)` can also be projected as scores when the
+expression exactly repeats the leading `order` key; see
+[`search.md`](search.md#projecting-scores). `rrf(...)` and search predicates
+cannot be projected.
+
 ### Hybrid (reciprocal rank fusion)
 
 ```gq
@@ -247,8 +277,8 @@ Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggr
 `starts_with`, `contains`, `>=`, `<=`, `!=`, `>`, `<`, `=`
 
 Both String predicates are exact and case-sensitive: `contains` matches a
-substring and `starts_with` matches a prefix. Either can use an index when one
-is available and must retain correct scan fallback.
+substring and `starts_with` matches a prefix. They remain correct without an
+index; a free-text String index does not accelerate these exact predicates.
 
 ```gq
 match {
@@ -286,10 +316,11 @@ ones as:
 error: T12: insert for 'Signal' must provide non-nullable property 'brief'
 ```
 
-One v0.10 exception matters: lint permits omission of a non-null Vector target
-annotated with `@embed(source)`, but mutation execution does not auto-embed and
-still rejects the missing vector. Supply that target explicitly; use the
-offline embedding pipeline for generated values.
+Lint permits omission of a non-null Vector target annotated with
+`@embed(source)` when its source is supplied, but mutation execution does not
+auto-embed and still rejects the missing vector. Supply that target explicitly;
+use the offline embedding pipeline for generated values. A nullable target may
+remain null even when its source is present.
 
 ### Insert edge
 
@@ -300,7 +331,8 @@ query link_signal_forms_pattern($signal: String, $pattern: String) {
 ```
 
 A propertyless edge needs only `from` and `to`, which are logical endpoint IDs.
-GQ has no nested `data {}` block.
+GQ has no nested `data {}` block. These assignments are distinct from the
+endpoint meta-fields used in filters: `delete FormsPattern where @src = $signal`.
 
 ### Update
 
@@ -328,7 +360,11 @@ query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updat
 }
 ```
 
-There's no `upsert` keyword at the query level — use `load --mode merge` for bulk upsert.
+There is no `upsert` keyword: `insert` on a node or edge with `@key` upserts
+the derived identity. Without a key, `insert` is strict; inserting an unkeyed
+edge twice creates two edges. Use `load --mode merge` for bulk upsert. Edge
+`update` is unsupported; reinsert a keyed edge to change non-key properties,
+or delete and reinsert an unkeyed edge.
 
 > **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is rejected at parse time. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
 
@@ -342,7 +378,10 @@ Prefer ISO strings on both paths:
 | `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` |
 
 Integer epoch days remain useful for generated Arrow-oriented input, but are
-not required for hand-authored JSONL.
+not required for hand-authored JSONL. A `Date` string must name a calendar day;
+a string containing a time of day is refused, even at midnight. Use `DateTime`
+for an instant. Loads refuse floats, booleans, and objects for either date
+type, and refuse counts outside the JSON writer's supported calendar range.
 
 ## Naming Convention
 

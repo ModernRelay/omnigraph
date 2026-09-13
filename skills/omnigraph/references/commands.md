@@ -43,6 +43,9 @@ omnigraph export $REPO --branch main --type Signal > signals.jsonl
 
 Use repeatable `--type` to filter node or edge types.
 
+Entity identity is top-level `id`; `data` holds user properties. Query/export
+JSON omits null cells and renders dates as strings. See [data envelopes](data.md).
+
 ## Blob Reads
 
 ```bash
@@ -66,6 +69,10 @@ omnigraph branch delete <branch-name> --store $REPO
 
 All support `--json`. `--delete-branch` removes the source only after a
 successful merge publication.
+
+Canonical query/mutation routes also accept GQ branch statements. Their
+`outcome` and optional `commit` have different meanings from data-mutation
+receipts; see [branch statements](changes.md#branch-statements).
 
 ## Commits (History)
 
@@ -97,6 +104,20 @@ omnigraph schema apply --schema next.pg $REPO
 ```
 
 See `references/schema.md` for the full workflow.
+
+### Offline storage upgrade
+
+```bash
+omnigraph upgrade "$REPO" --check --json
+omnigraph upgrade "$REPO" --json
+omnigraph schema upgrade-system-columns "$REPO" --check --json
+```
+
+The default target is v9; `--to-format 8` retains legacy system spellings and
+can preserve live branches. The v9 step requires only `main` and no user
+property starting with `_`. These standalone operations require stopped writers
+and a verified whole-root backup; cluster-managed roots refuse. Read
+[migration preconditions](migrations.md) before executing.
 
 ## Lint
 
@@ -206,6 +227,11 @@ anything pruned. **Destructive** — requires `--confirm`. At least one of
 `--keep` and `--older-than` is required; with both, a version must be outside
 both windows. Duration units: `s`, `m`, `h`, `d`, `w`.
 
+Cleanup also reclaims unneeded table forks and retired branch refs while
+preserving live branches, retained native ancestry, tags and recovery pins.
+`--keep` bounds versions within retained datasets, not the number of graph
+commits or unused forks. Branch deletion and `optimize` defer this reclamation.
+
 ## Stored Queries
 
 ```bash
@@ -279,7 +305,11 @@ structured output, otherwise human text. Policy subcommands do not offer JSON.
 curl http://127.0.0.1:8080/healthz
 ```
 
-Returns `200 OK` if the server is up.
+`/healthz` is process health. Use `GET /readyz` for rollout readiness: it reports
+the booted applied digest, ledger revision/CAS, served/quarantined counts and
+shutdown grace. It returns `503` once draining starts. Readiness is not proof
+that every configured graph is healthy; authorized `graphs list --json` includes
+the quarantined graph inventory.
 
 ## Cluster Control Plane
 

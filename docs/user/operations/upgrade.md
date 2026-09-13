@@ -240,7 +240,7 @@ mapping is:
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
 | v7 | the exact unreleased development build that wrote it |
-| v8 | 0.11 development builds before the system-column namespace change, and every `omnigraph upgrade` output; still served by the current binary without export/import |
+| v8 | 0.11 development builds before the system-column namespace change, and conversions completed with `omnigraph upgrade --to-format 8`; still served by the current binary without export/import |
 | v9 | current 0.11.x line; entity export/import normally not required within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary rather

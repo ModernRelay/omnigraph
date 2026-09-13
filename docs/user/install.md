@@ -42,8 +42,8 @@ iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/mai
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ReleaseChannel edge
 ```
 
-Install a specific tag with `VERSION=v0.10.0` on macOS/Linux or
-`-Version v0.10.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
+Install a specific tag with `VERSION=v0.11.0` on macOS/Linux or
+`-Version v0.11.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
 different destination.
 
 Documentation on `main` may describe behavior newer than the latest stable
