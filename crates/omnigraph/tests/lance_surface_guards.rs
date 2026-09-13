@@ -4327,9 +4327,9 @@ async fn fts_prefilter_does_not_change_covered_fragment_scores() {
 /// the ref is never deleted, so any error is a torn read (Lance 11.0.0 read refs
 /// as `head` then `get_range`, and a rewrite between the two calls yields a prefix).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a Lance whose `from_path` reads a ref in one `get` (the 0179 Lance PR); red on \
-            11.0.0, which reads `head` then `get_range`. Un-ignore at that bump, where the \
-            `branch_control` stale-head tests go red and the retry arm leaves"]
+#[ignore = "lance-one-get-ref-read: needs a Lance whose `from_path` reads a ref in one `get` \
+            (the 0179 Lance PR); red on 11.0.0, which reads `head` then `get_range`. Un-ignore \
+            at that bump, where the `branch_control` stale-head tests go red and the retry arm leaves"]
 async fn branch_ref_read_survives_concurrent_metadata_rewrite() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
