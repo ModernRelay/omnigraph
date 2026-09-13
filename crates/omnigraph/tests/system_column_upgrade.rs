@@ -373,6 +373,106 @@ async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property()
 }
 
 #[tokio::test]
+async fn system_column_upgrade_history_survives_unrelated_reclaimed_tables() {
+    use lance::Dataset;
+    use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
+    use omnigraph::error::OmniError;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = legacy_graph_with_data(&dir).await;
+    let version_before = version_main(&db).await.unwrap();
+    let snapshot_before = db.resolve_snapshot("main").await.unwrap();
+    let report = db
+        .upgrade_system_columns(SystemColumnUpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let first = snap.datasets().next().unwrap().type_key.clone();
+    let first_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        snap.dataset(&first)
+            .unwrap()
+            .dataset_path
+            .trim_start_matches('/')
+    );
+    let dataset = Dataset::open(&first_uri).await.unwrap();
+    let removed = cleanup_old_versions(
+        &dataset,
+        CleanupPolicy {
+            before_version: Some(dataset.version().version),
+            delete_unverified: true,
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.old_versions > 0,
+        "precondition: {first} history was reclaimed"
+    );
+
+    let (source, name, column, expected, reclaimed_id) = if first == "node:Person" {
+        (
+            COMPANY_QUERY,
+            "company_identity",
+            "c.@id",
+            vec!["company-1"],
+            "Alice",
+        )
+    } else if first == "node:Company" {
+        (
+            OLD_PEOPLE_QUERY,
+            "old_people",
+            "p.@id",
+            vec!["Alice", "Bob"],
+            "company-1",
+        )
+    } else {
+        (
+            OLD_PEOPLE_QUERY,
+            "old_people",
+            "p.@id",
+            vec!["Alice", "Bob"],
+            "works-alice",
+        )
+    };
+    let historical = db
+        .run_query_at(version_before, source, name, &ParamMap::new())
+        .await
+        .expect("a pinned read that never touches the reclaimed table still plans");
+    assert_eq!(
+        collect_column_strings(historical.batches(), column),
+        expected
+    );
+    let at_snapshot = db
+        .query(
+            ReadTarget::snapshot(snapshot_before),
+            source,
+            name,
+            &ParamMap::new(),
+        )
+        .await
+        .expect("the SnapshotId read never touches the reclaimed table either");
+    assert_eq!(
+        collect_column_strings(at_snapshot.batches(), column),
+        expected
+    );
+    let error = db
+        .entity_at(&first, reclaimed_id, version_before)
+        .await
+        .expect_err("the reclaimed table's own history stays a typed refusal");
+    assert!(
+        matches!(error, OmniError::HistoricalVersionReclaimed { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn system_column_upgrade_refuses_before_any_effect() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();

@@ -2,12 +2,12 @@
 rfc: "0064"
 title: "Explicit storage upgrades"
 track: maintainer
-status: draft
+status: accepted
 implementation: in-progress
 authors:
   - Azim Afroozeh
 created: 2026-09-09
-updated: 2026-09-10
+updated: 2026-09-13
 discussion: null
 supersedes: []
 superseded_by: []
@@ -432,6 +432,14 @@ enforcement itself.
    only if execution unavailability is explicit.
 4. Integrate RFC 0040 and settled fork handlers under their own gates; refuse unsupported
    chains before effects.
+
+The local standalone route implements v6 → v7 → v8 and delegates v8 → v9
+to RFC 0040's system-column operation. Cluster execution and object-store
+qualification remain outside that implemented scope. A genuine pinned-v8
+upgrade fixture remains a follow-up; the existing predecessor journeys use
+an explicit v8 target on their branched graphs and verify default-route
+refusal. These implementation steps do not close the acceptance decisions
+listed below.
 
 Target v0.11 only if gates pass. The release maintainer chooses delay for this
 work or the documented rebuild path; v1.0 goals waive no gates or imply a date.

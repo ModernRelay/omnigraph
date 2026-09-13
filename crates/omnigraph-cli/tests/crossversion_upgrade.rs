@@ -1916,18 +1916,33 @@ fn genuine_v09_storage_upgrade_refuses_ambiguous_branch_names() {
             &run_old(&old, &["branch", "create", name, "--uri", uri]),
         );
         let before = graph_files(&graph);
-        for check in [true, false] {
+        for (check, target) in [
+            (true, None),
+            (false, None),
+            (true, Some("8")),
+            (false, Some("8")),
+        ] {
             let mut command = cli();
             command.args(["upgrade", uri, "--json"]);
             if check {
                 command.arg("--check");
             }
+            if let Some(format) = target {
+                command.args(["--to-format", format]);
+            }
             let report = support::parse_stdout_json(&output_failure(&mut command));
-            assert_eq!(report["outcome"], "check_failed");
-            assert!(
-                report["findings"].to_string().contains("branch identity"),
-                "{report}"
-            );
+            assert_eq!(report["outcome"], "check_failed", "{report}");
+            let findings = report["findings"].to_string();
+            match target {
+                Some(_) => assert!(
+                    findings.contains("branch identity"),
+                    "the v7 -> v8 step refuses the ambiguous lifetime: {report}"
+                ),
+                None => assert!(
+                    findings.contains("system_columns_preflight") && findings.contains("only main"),
+                    "the default route refuses every non-main branch before its first effect: {report}"
+                ),
+            }
             assert_eq!(graph_files(&graph), before);
             assert_ok(
                 "legacy source still opens",

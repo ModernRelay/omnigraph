@@ -2,12 +2,12 @@
 rfc: "0040"
 title: "System column namespace"
 track: public
-status: draft
+status: accepted
 implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-08-23
-updated: 2026-09-09
+updated: 2026-09-13
 discussion: https://github.com/ModernRelay/omnigraph/issues/529
 supersedes: []
 superseded_by: []
@@ -862,6 +862,11 @@ per-test enumeration.
    boot-time registry check validates the stored queries against the
    upgraded catalog as it does today. `implementation` advances to
    `complete` when this lands.
+
+The engine operation, standalone CLI, historical query planning and Lance
+surface guard in step 3 are implemented. The cluster-config surface and the
+end-to-end change-feed gate across the upgrade remain follow-ups. The
+standalone operation does not complete those parts of step 3.
 
 Stopping after step 1 leaves the bug fenced; stopping after step 2 leaves
 every graph fully working with the upgrade not yet offered. No step

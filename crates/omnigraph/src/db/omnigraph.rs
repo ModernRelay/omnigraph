@@ -747,6 +747,7 @@ impl Omnigraph {
         // still performs the non-mutating coherence proof below: an exact
         // SchemaApply manifest outcome cannot be served with the old schema
         // contract merely because promotion is pending.
+        let mut recovery_advanced_manifest = false;
         if matches!(mode, OpenMode::ReadWrite) {
             // Schema staging is itself mutable recovery state. Hold the shared
             // schema gate across BOTH its file pre-pass and the complete Full
@@ -763,6 +764,7 @@ impl Omnigraph {
             // heal (`heal_pending_sidecars_roll_forward`); only
             // rollback-eligible sidecars it can neither roll forward nor
             // retire as provably effect-free wait for this open-time sweep.
+            let manifest_version_before_sweep = coordinator.version();
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 Arc::clone(&storage),
@@ -772,6 +774,7 @@ impl Omnigraph {
                 write_queue.as_ref(),
             )
             .await?;
+            recovery_advanced_manifest = coordinator.version() != manifest_version_before_sweep;
         } else {
             // ReadOnly performs no repair, but it must not expose a manifest
             // that already contains a fixed SchemaApply outcome with the old
@@ -780,7 +783,7 @@ impl Omnigraph {
             // read-write open resolves them.
             crate::db::manifest::ensure_read_only_schema_coherent(&root, storage.as_ref()).await?;
         }
-        let internal_schema_version = if matches!(mode, OpenMode::ReadWrite) {
+        let internal_schema_version = if recovery_advanced_manifest {
             crate::db::manifest::read_supported_internal_schema_version(&root).await?
         } else {
             internal_schema_version
@@ -2502,19 +2505,30 @@ impl Omnigraph {
     }
 
     /// The catalog a pinned image plans against: the accepted one, or its
-    /// re-rendering at the image's own system-column vintage (a pre-upgrade
-    /// image on an upgraded graph, RFC 0040 historical reads).
+    /// re-rendering at the image's own vintage (RFC 0040 historical reads); one
+    /// upgrade publication renames every table, so any retained table tells it.
     async fn catalog_for_image_vintage(
         &self,
         snapshot: &Snapshot,
         catalog: Arc<Catalog>,
     ) -> Result<Arc<Catalog>> {
-        let Some(entry) = snapshot.datasets().next() else {
+        let mut image_vintage = None;
+        for entry in snapshot.datasets() {
+            match snapshot.open_dataset(&entry.type_key).await {
+                Ok(image) => {
+                    image_vintage = Some(crate::db::manifest::system_columns_at_image(
+                        image.schema(),
+                        &entry.type_key,
+                    )?);
+                    break;
+                }
+                Err(OmniError::HistoricalVersionReclaimed { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(image_vintage) = image_vintage else {
             return Ok(catalog);
         };
-        let image = snapshot.open_dataset(&entry.type_key).await?;
-        let image_vintage =
-            crate::db::manifest::system_columns_at_image(image.schema(), &entry.type_key)?;
         if image_vintage == catalog.system_columns {
             return Ok(catalog);
         }

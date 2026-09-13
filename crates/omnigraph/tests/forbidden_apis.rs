@@ -804,7 +804,7 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
     ("db/manifest/recovery.rs", ".write_text(", 7, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "CommitBuilder::new(", 1, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".commit_staged_exact(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "confirm_schema_apply_sidecar_v9(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "write_schema_contract_staging(", 1, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),

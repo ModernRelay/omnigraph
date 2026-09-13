@@ -5326,7 +5326,7 @@ async fn roll_forward_system_column_upgrade(
         })?;
         let committed = match (observation.effect_ownership, observation.version) {
             (EffectOwnership::None, version) if version == pin.expected_version => {
-                commit_planned_system_column_rename(pin, planned).await?
+                commit_planned_system_column_rename(root_uri, pin, planned).await?
             }
             (EffectOwnership::OwnAtHead, version) if version == pin.post_commit_pin => observation
                 .transaction
@@ -5448,9 +5448,10 @@ async fn reclaim_stale_schema_apply_lock(
 }
 
 /// Commit one table's rename with the intent's planned transaction identity,
-/// exactly at the pinned read version. The table's own head is the proof the
-/// effect is ours afterwards, the same ownership marker the writer path leaves.
+/// exactly at the pinned read version, through the same sealed `TableStore`
+/// primitives as the writer; the table's own head then proves the effect is ours.
 async fn commit_planned_system_column_rename(
+    root_uri: &str,
     pin: &SidecarTablePin,
     planned: &StagedTransactionIdentity,
 ) -> Result<StagedTransactionIdentity> {
@@ -5477,34 +5478,13 @@ async fn commit_planned_system_column_rename(
         )));
     }
     let renames = crate::db::omnigraph::system_column_renames(&pin.table_key);
-    let schema = crate::table_store::TableStore::renamed_schema(&ds, &renames)?;
-    let mut transaction = lance::dataset::transaction::Transaction::new(
-        planned.read_version,
-        lance::dataset::transaction::Operation::Project {
-            schema,
-            preserves_nullability: true,
-        },
-        None,
-    );
-    transaction.uuid.clone_from(&planned.uuid);
-    let committed = lance::dataset::CommitBuilder::new(std::sync::Arc::new(ds))
-        .with_max_retries(0)
-        .with_skip_auto_cleanup(true)
-        .execute(transaction)
-        .await
-        .map_err(OmniError::storage)?;
-    let identity = committed
-        .read_transaction()
-        .await
-        .map_err(OmniError::storage)?
-        .as_ref()
-        .map(StagedTransactionIdentity::from)
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "system-column rename of '{}' committed without a readable transaction identity",
-                pin.table_key
-            ))
-        })?;
+    let store =
+        crate::table_store::TableStore::new(root_uri, crate::lance_access::control_session());
+    let mut staged = store.stage_rename_columns(&ds, &renames).await?;
+    staged.bind_transaction_identity(planned)?;
+    let (committed, identity) = store
+        .commit_staged_exact(std::sync::Arc::new(ds), staged)
+        .await?;
     if committed.version().version != pin.post_commit_pin {
         return Err(OmniError::manifest_internal(format!(
             "system-column rename of '{}' landed at Lance version {}, expected {}",

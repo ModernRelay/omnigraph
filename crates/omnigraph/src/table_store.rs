@@ -3894,7 +3894,7 @@ impl TableStore {
     /// The dataset schema with `renames` applied in place: each source field
     /// keeps its id, nullability, metadata (the unenforced primary key marker
     /// included) and indexes; only its name changes. Shared by the staged
-    /// rename primitive and the recovery executor so both build one shape.
+    /// rename primitive and the writer's pre-arm dry run so both build one shape.
     pub(crate) fn renamed_schema(
         ds: &Dataset,
         renames: &[(String, String)],
