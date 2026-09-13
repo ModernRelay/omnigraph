@@ -417,8 +417,8 @@ effects run in this order.
 1. The `__manifest` internal-schema stamp on main advances from 8 to 9, by a
    schema-metadata commit on the `__manifest` dataset (today only init writes
    the stamp, inside its Create commit), recorded in the intent with the
-   dataset version before and after, so the publish in (3) validates its read
-   set against the post-stamp version. It publishes no graph content
+   dataset version after it, the floor recovery requires the live
+   `__manifest` to have reached before it trusts the stamp. It publishes no graph content
    (RFC 0022 §3.5), and internal system branch refs keep their forked stamp,
    which
    the publisher's per-branch guard accepts within {8, 9}. Every binary
@@ -427,14 +427,19 @@ effects run in this order.
    in `crates/omnigraph/src/db/manifest/migrations.rs`, run by the
    publisher's `load_publish_state`; Compatibility and
    reversibility).
-2. One `alter_columns` commit per node and edge table, carrying one
-   rename-only alteration on a node table and three on an edge table,
-   recorded in the intent with its exact transaction identity, the table's
-   dataset version before and after, as the existing `SchemaApply` effect
-   kinds record theirs.
-3. The three staging files written and the `SchemaApply` outcome published in
-   `__manifest`, as today.
-4. Today's staging-to-final promotion, unchanged in shape and position:
+2. The three staging files written and validated against the intent's
+   target hash, before any table changes: a predecessor binary's read-only
+   open refuses a graph with staging present (`ensure_read_only_schema_coherent`),
+   so from here no reader that predates this RFC serves a half-renamed
+   graph. Recovery regenerates the staging from the accepted source when it
+   is missing (the derivation is deterministic), so this step needs no
+   ownership record of its own.
+3. One rename-only `Project` commit per node and edge table (one rename on a
+   node table, three on an edge table), recorded in the intent with its
+   exact transaction identity, the table's dataset version before and after,
+   as the existing `SchemaApply` effect kinds record theirs.
+4. The `SchemaApply` outcome published in `__manifest`, as today.
+5. Today's staging-to-final promotion, unchanged in shape and position:
    `_schema.ir.json` re-stamped at `ir_version` 5 with `system-columns` added
    to the recomputed set, `_schema.pg` with constraint references respelled
    to `@src`/`@dst`, `__schema_state.json` promoted last. The graph is

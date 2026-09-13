@@ -59,7 +59,9 @@ omnigraph upgrade <graph> --to-format 8 --json
 
 The binary selects registered handlers from the stored format/capabilities to
 one declared default target, independent of its serving range and release
-number. The current default is v8. `--to-format` overrides the target, never
+number. The current default is v9: the registered handlers end at v8 and the
+RFC 0040 system-column step follows them (amended when that step landed;
+the examples above keep the explicit v8 target). `--to-format` overrides the target, never
 names a handler: explicit v7 stops after registration conversion for a
 v7-compatible executable, while normal open in the current binary still requires
 v8. The default does not adapt to the graph.
@@ -282,8 +284,10 @@ v7-to-v8 attempt. Normal serving still requires v8 after the complete route.
 
 RFC 0040 owns main-only admission, preflight, `SchemaApply` recovery, and ordered
 stamp/schema effects. Its CLI can delegate here without changing its cluster
-declaration or branch restriction; this RFC does not activate it. Its early
-stamp fence precludes a universal stamp-last rule.
+declaration or branch restriction; this RFC did not activate it, and the
+route later adopted it as the final default step (`system-columns-v8-to-v9`),
+refusing before any handler effect when that step's own preflight would fail.
+Its early stamp fence precludes a universal stamp-last rule.
 
 Fork conversion requires an accepted ownership representation and durable proof
 of existing ownership. Never infer it from plausible names, recreate missing

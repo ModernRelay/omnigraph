@@ -373,6 +373,16 @@ pub mod names {
     /// After each exact SchemaApply table transaction commits, before the next
     /// table effect or durable EffectsConfirmed transition.
     pub const SCHEMA_APPLY_POST_TABLE_COMMIT: &str = "schema_apply.post_table_commit";
+    /// The RFC 0040 system-column upgrade advanced main's `__manifest` stamp
+    /// but has renamed no table yet: stamp 9 over legacy spellings under an
+    /// Armed intent, the one state no other writer can produce.
+    pub const SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE: &str =
+        "system_column_upgrade.after_stamp_advance";
+    /// Recovery of a system-column upgrade reclaimed the crashed writer's
+    /// `__schema_apply_lock__` but has not retired the intent yet: the sidecar
+    /// alone re-enters cleanup, the lock is already gone.
+    pub const SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM: &str =
+        "system_column_upgrade.after_lock_reclaim";
     /// Reload owns the schema gate and is about to read/publish one contract view.
     pub const SCHEMA_RELOAD_BEFORE_CONTRACT_READ: &str = "schema_reload.before_contract_read";
     /// Injects a retryable `RowLevelCasContention` from `load_publish_state` so a

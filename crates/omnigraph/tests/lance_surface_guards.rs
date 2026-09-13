@@ -86,6 +86,109 @@ fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
     }
 }
 
+/// Guard: a rename-only `Operation::Project` (the RFC 0040 system-column
+/// upgrade's per-table effect) keeps every fragment file, field id, the
+/// unenforced primary-key marker, and the index on the renamed field.
+#[tokio::test]
+async fn rename_only_project_keeps_fragments_field_ids_pk_marker_and_indexes() {
+    use lance::dataset::transaction::{Operation, Transaction};
+    use lance::dataset::{CommitBuilder, WriteMode, WriteParams};
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(metadata),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let before_fragments = dataset.get_fragments().len();
+    let before_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .flat_map(|fragment| fragment.metadata().files.iter().map(|f| f.path.clone()))
+        .collect();
+    let id_field = dataset.schema().field("id").unwrap().id;
+
+    let mut renamed = dataset.schema().clone();
+    renamed.mut_field_by_id(id_field).unwrap().name = "__id".to_string();
+    renamed.validate().unwrap();
+    let transaction = Transaction::new(
+        dataset.version().version,
+        Operation::Project {
+            schema: renamed,
+            preserves_nullability: true,
+        },
+        None,
+    );
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .with_max_retries(0)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await
+        .unwrap();
+
+    assert!(dataset.schema().field("id").is_none());
+    assert_eq!(dataset.schema().field("__id").unwrap().id, id_field);
+    assert_eq!(
+        dataset
+            .schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["__id"]
+    );
+    assert_eq!(dataset.get_fragments().len(), before_fragments);
+    let after_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .flat_map(|fragment| fragment.metadata().files.iter().map(|f| f.path.clone()))
+        .collect();
+    assert_eq!(
+        after_files, before_files,
+        "a rename-only Project writes no data file"
+    );
+    let indices = dataset.load_indices().await.unwrap();
+    assert!(
+        indices.iter().any(|index| index.fields.contains(&id_field)),
+        "the scalar index follows the field id across the rename"
+    );
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+}
+
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
 async fn fresh_dataset(uri: &str) -> Dataset {

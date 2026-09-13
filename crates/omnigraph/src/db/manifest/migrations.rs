@@ -30,10 +30,17 @@
 //! omnigraph first" error. An old binary cannot clobber a newer schema by
 //! silently treating "unknown stamp" as "missing stamp".
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use lance::Dataset;
+use lance::dataset::CommitBuilder;
+use lance::dataset::transaction::{Operation, Transaction, UpdateMap};
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3, SystemColumns};
 
 use crate::error::{OmniError, Result};
+
+use super::layout::open_manifest_dataset_native_with_session;
 
 /// The internal schema version this binary writes for a new-vintage graph and
 /// the ceiling it serves.
@@ -142,6 +149,66 @@ pub(crate) fn read_stamp(dataset: &Dataset) -> Option<u32> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Advance main's `__manifest` stamp from `from` to `to` in one
+/// schema-metadata commit carrying nothing else: the first effect of the RFC
+/// 0040 system-column upgrade, published under its `SchemaApply` intent.
+/// Returns the `__manifest` version after the stamp. Idempotent on a manifest
+/// already at `to` (the roll-forward re-runs it); every other stamp, and a
+/// pending storage-upgrade intent, is refused.
+pub(crate) async fn publish_stamp_advance(root_uri: &str, from: u32, to: u32) -> Result<u64> {
+    if from < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+        || to > INTERNAL_MANIFEST_SCHEMA_VERSION
+        || from >= to
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "stamp advance v{from} to v{to} lies outside the served range v{MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION} to v{INTERNAL_MANIFEST_SCHEMA_VERSION}"
+        )));
+    }
+    let dataset = open_manifest_dataset_native_with_session(
+        root_uri,
+        None,
+        &crate::lance_access::control_session(),
+    )
+    .await?;
+    if dataset
+        .schema()
+        .metadata
+        .contains_key(super::upgrade::UPGRADE_PENDING_KEY)
+    {
+        return Err(OmniError::manifest(super::upgrade::recovery_guidance(
+            &dataset,
+        )));
+    }
+    match read_stamp(&dataset) {
+        Some(stamp) if stamp == to => return Ok(dataset.version().version),
+        Some(stamp) if stamp == from => {}
+        other => {
+            return Err(OmniError::manifest(format!(
+                "__manifest is stamped at {}; the system-column upgrade advances only v{from} to v{to}",
+                other.map_or_else(|| "no version".to_string(), |stamp| format!("v{stamp}")),
+            )));
+        }
+    }
+    let (key, value) = stamp_entry(to);
+    let operation = Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+        schema_metadata_updates: Some(UpdateMap {
+            update_entries: vec![(key, value).into()],
+            replace: false,
+        }),
+    };
+    let transaction = Transaction::new(dataset.version().version, operation, None);
+    let committed = CommitBuilder::new(Arc::new(dataset))
+        .with_max_retries(0)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await
+        .map_err(OmniError::storage)?;
+    Ok(committed.version().version)
+}
+
 /// The single stamp gate for every open path: read the stamp and refuse
 /// anything this binary cannot serve, with an honest diagnosis for each shape.
 ///
@@ -231,7 +298,7 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     }
     if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
         let explicit_upgrade = if matches!(stamp, 6 | 7) {
-            " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check --to-format 8` before execution."
+            " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check` before execution (add `--to-format 8` to stop at v8 and keep the legacy system column spellings)."
         } else {
             ""
         };

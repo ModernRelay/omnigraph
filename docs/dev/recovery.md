@@ -31,7 +31,7 @@ mean an active sidecar uses an old outer schema.
 |---|---|
 | Mutation / Load | Exact one-transaction effect identity and confirmation |
 | BranchMerge | Fixed bounded transaction chain, source/target authority, and lineage |
-| SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta |
+| SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta; the RFC 0040 system-column upgrade adds rename-only table effects and a `__manifest` stamp advance, recovered by roll-forward only |
 | EnsureIndices / full-text rebuild | Exact CreateIndex effects and complete pointer delta; rebuild retains the same fixed actor and lineage |
 | Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
 

@@ -20,8 +20,9 @@ The current binary serves **internal manifest schema v8 and v9**:
 `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` is 8 and
 `INTERNAL_MANIFEST_SCHEMA_VERSION` is 9. The two values are the two system
 column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.md): a
-supported existing graph with legacy spellings `id`/`src`/`dst` retains stamp 8,
-and every registered upgrade route ends there. New graphs use
+supported existing graph with legacy spellings `id`/`src`/`dst` retains stamp 8
+until the system-column upgrade converts it (the default `omnigraph upgrade`
+route ends at v9; `--to-format 8` ends at v8). New graphs use
 `__id`/`__src`/`__dst` and stamp 9. The stamp is a storage-format fence for
 older binaries; the vintage itself is read from the schema IR's feature set.
 A stamp is the floor for the vintage it names: a legacy-vintage graph is served
@@ -48,8 +49,10 @@ at stamp 8 or 9, a new-vintage graph only at 9.
   upgrade to v8.
 - v9 preserves v8's `__manifest` layout and retirement metadata and marks the
   RFC 0040 system column spellings `__id`/`__src`/`__dst` in every node and
-  edge table. A v8 graph retains its stamp. RFC 0040 defines an in-place
-  upgrade in Rollout step 3, which is not available in this build.
+  edge table. A v8 graph retains its stamp until
+  `omnigraph schema upgrade-system-columns` converts it in place (RFC 0040
+  Rollout step 3: stamp advance first, one rename-only commit per table,
+  schema promotion last, recovered by roll-forward only).
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
   and are not supported migration inputs. Reuse of a numeric stamp by another
   design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
@@ -58,9 +61,11 @@ at stamp 8 or 9, a new-vintage graph only at 9.
 
 Normal open refuses lower and higher stamps before recovery or table decoding;
 neither served stamp is rewritten on open.
-`omnigraph upgrade` defaults to v8: qualified standalone v6 graphs run the
-registered v6 → v7 → v8 route, and qualified v7 graphs run v7 → v8. No route
-targets v9. Original retained snapshots remain unchanged; historical v6
+`omnigraph upgrade` defaults to v9: qualified standalone v6 graphs run the
+registered v6 → v7 → v8 route and then the system-column step, qualified v7
+graphs run v7 → v8 and the step, and v8 graphs run the step alone;
+`--to-format 8` stops at v8. The step is also available on its own as
+`omnigraph schema upgrade-system-columns`. Original retained snapshots remain unchanged; historical v6
 registrations use an explicit legacy decoder after main-root admission. A
 pending upgrade marker refuses normal opens until every branch validates and
 main activation completes. Explicit `--to-format 7` retains the intermediate
@@ -119,11 +124,11 @@ see the [admission limits](../user/operations/upgrade.md).
 
 | Source executable / format | Normal open | Default explicit route | Required coverage owner |
 |---|---|---|---|
-| 0.9.0 / v6 | Refused | v6 → v7 → v8 | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history` |
-| 0.10.0 / v6 | Refused | v6 → v7 → v8 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
-| Qualified development / v7 | Refused | v7 → v8 | Engine storage-upgrade tests: metadata-only conversion, history and retry |
-| Legacy vintage / v8 | Accepted | Already-current no-op | Both predecessor journeys after conversion; engine retired-ref admission tests |
-| Current / v9 | Accepted | No route; already the newest vintage | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
+| 0.9.0 / v6 | Refused | v6 → v7 → v8 → v9 (`--to-format 8` stops at v8; a graph with branches is refused before any effect) | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history` (v8 journey and the v9 refusal on its branched fixture); `upgrade/tests.rs::storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v9` |
+| 0.10.0 / v6 | Refused | v6 → v7 → v8 → v9 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
+| Qualified development / v7 | Refused | v7 → v8 → v9 | Engine storage-upgrade tests: metadata-only conversion, history and retry (pinned to `--to-format 8`), plus the synthetic v6 default-route test above |
+| Legacy vintage / v8 | Accepted | v8 → v9 (`system-columns-v8-to-v9`; `--to-format 8` is an already-current no-op) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v9`; `tests/system_column_upgrade.rs` (operation, refusals, crash points) |
+| Current / v9 | Accepted | Already the newest vintage; every served target is already current | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
 | Older, future or unqualified experimental format | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
 
 Source v6/v7 admission rejects any reserved native-ref retirement metadata.

@@ -33,6 +33,7 @@ mod export;
 mod optimize;
 mod repair;
 mod schema_apply;
+mod system_column_upgrade;
 mod table_ops;
 
 #[doc(hidden)]
@@ -43,6 +44,13 @@ pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
+pub use system_column_upgrade::{
+    SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
+    SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
+};
+pub(crate) use system_column_upgrade::{
+    render_system_column_upgrade_target, reserved_property_offenders, system_column_renames,
+};
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
@@ -772,6 +780,11 @@ impl Omnigraph {
             // read-write open resolves them.
             crate::db::manifest::ensure_read_only_schema_coherent(&root, storage.as_ref()).await?;
         }
+        let internal_schema_version = if matches!(mode, OpenMode::ReadWrite) {
+            crate::db::manifest::read_supported_internal_schema_version(&root).await?
+        } else {
+            internal_schema_version
+        };
         crate::failpoints::maybe_fail(crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
         // The stamp guard and coordinator open above both read `__manifest`,
@@ -1091,6 +1104,23 @@ impl Omnigraph {
     ) -> Result<SchemaApplyResult> {
         self.apply_schema_as_with_catalog_check(desired_schema_source, options, actor, |_| Ok(()))
             .await
+    }
+
+    /// Respell this graph's system columns in place, v8 to v9; the operation
+    /// and its preflight live in `system_column_upgrade` (RFC 0040 step 3).
+    pub async fn upgrade_system_columns(
+        &self,
+        options: SystemColumnUpgradeOptions,
+    ) -> Result<SystemColumnUpgradeReport> {
+        self.upgrade_system_columns_as(options, None).await
+    }
+
+    pub async fn upgrade_system_columns_as(
+        &self,
+        options: SystemColumnUpgradeOptions,
+        actor: Option<&str>,
+    ) -> Result<SystemColumnUpgradeReport> {
+        system_column_upgrade::upgrade_system_columns(self, options, actor).await
     }
 
     pub async fn apply_schema_as_with_catalog_check<F>(
@@ -2413,8 +2443,14 @@ impl Omnigraph {
         let mut resolved = self.resolve_target_after_schema_validation(target).await?;
         if validate_live_snapshot {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
-        } else if bind_historical_aliases {
+            return Ok((resolved, catalog));
+        }
+        if bind_historical_aliases {
+            let catalog = self
+                .catalog_for_image_vintage(&resolved.snapshot, catalog)
+                .await?;
             resolved.snapshot.bind_catalog_aliases(&catalog)?;
+            return Ok((resolved, catalog));
         }
         Ok((resolved, catalog))
     }
@@ -2460,8 +2496,42 @@ impl Omnigraph {
             version,
         )
         .await?;
+        let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
         snapshot.bind_catalog_aliases(&catalog)?;
         Ok((snapshot, catalog))
+    }
+
+    /// The catalog a pinned image plans against: the accepted one, or its
+    /// re-rendering at the image's own system-column vintage (a pre-upgrade
+    /// image on an upgraded graph, RFC 0040 historical reads).
+    async fn catalog_for_image_vintage(
+        &self,
+        snapshot: &Snapshot,
+        catalog: Arc<Catalog>,
+    ) -> Result<Arc<Catalog>> {
+        let Some(entry) = snapshot.datasets().next() else {
+            return Ok(catalog);
+        };
+        let image = snapshot.open_dataset(&entry.type_key).await?;
+        let image_vintage =
+            crate::db::manifest::system_columns_at_image(image.schema(), &entry.type_key)?;
+        if image_vintage == catalog.system_columns {
+            return Ok(catalog);
+        }
+        let accepted_ir = read_accepted_schema_ir(self.uri(), Arc::clone(&self.storage)).await?;
+        let vintage_ir = if image_vintage == omnigraph_compiler::SYSTEM_COLUMNS_LEGACY {
+            omnigraph_compiler::into_legacy_image_vintage(accepted_ir)
+        } else {
+            omnigraph_compiler::into_system_columns_vintage(accepted_ir)
+        };
+        omnigraph_compiler::validate_schema_ir(&vintage_ir).map_err(|error| {
+            OmniError::manifest(format!(
+                "the pinned image spells its system columns at another vintage than the accepted schema, which cannot be rendered there: {error}"
+            ))
+        })?;
+        let mut rendered = build_catalog_from_ir(&vintage_ir)?;
+        fixup_physical_schemas(&mut rendered)?;
+        Ok(Arc::new(rendered))
     }
 
     /// Resolve a read target to its snapshot, without attaching read caches.

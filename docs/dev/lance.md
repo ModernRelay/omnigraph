@@ -163,7 +163,7 @@ history of dependency bumps.
 | Surface | Current fence | Test owner |
 |---|---|---|
 | File format | Every production write explicitly selects stable V2_2; experimental V2_3 is not part of the graph contract. | `lifecycle.rs`, write-site source guards |
-| Graph keys | Current schema-v8 node/edge tables retain the exact non-null `id` unenforced primary key introduced in v6. Strict insert/upsert uses the sealed filter-bearing adapter; raw keyed Append is forbidden. | `lance_surface_guards.rs`, staged-table tests, `forbidden_apis.rs` |
+| Graph keys | Schema-v9 node/edge tables carry the exact non-null `__id` unenforced primary key (edges also `__src`/`__dst`); v8 tables keep the `id`/`src`/`dst` spellings introduced in v6, and the explicit system-column upgrade (RFC 0040) renames them with one rename-only `Operation::Project` commit per table (`TableStore::renamed_schema`), which must keep every fragment, field id, the primary-key marker and index attachments. Strict insert/upsert uses the sealed filter-bearing adapter; raw keyed Append is forbidden. | `lance_surface_guards.rs`, staged-table tests, `forbidden_apis.rs`, `system_column_upgrade.rs` |
 | Stable row IDs | Graph tables use stable row IDs; delete/update/index maintenance must retain their mapping. Overwrite allocates fresh IDs and restore retains the allocation high-water marks. Staged-view IDs are provisional, not committed identity. | `lance_surface_guards.rs`, staged-table tests, `writes.rs` |
 | KNN result order | A late payload-hydration plan can lose global ordering metadata, so nearest requests one final output partition. Internal reads remain parallel. | `lance_surface_guards.rs`, `search.rs` |
 | KNN probe budget | A `nearest` scan sets `maximum_nprobes` per index delta and widens it from Lance's execution summary (`partitions_searched` / `partitions_ranked`, read through `scan_stats_callback`); a prefilter admitting fewer rows than `k` makes Lance emit the unreached rows at `_distance = +inf`, which the engine resolves with a flat exact rescan (`use_index(false)`); `count_rows(None)` is the live row count (deletions excluded), read for the ladder's exhaustion stop and as the overfetch loop's exact-pass `k`. A renamed counter or marker turns the ladder fail-closed. | `lance_surface_guards.rs`, `search.rs` |
@@ -196,8 +196,10 @@ preserves this stock Lance representation. The existing adapter tests cover
 successive mixed-base clones, cold full-text/vector queries, and local and
 inherited external fragment-reuse origins.
 
-Schema v8 defines native-ref retirement metadata. Normal open requires v8;
-qualified v6/v7 graphs have explicit offline routes to it. The v7 → v8 handler
+Schema v8 defines native-ref retirement metadata; schema v9 adds the
+system-column namespace (RFC 0040). Normal open serves v8 and v9; qualified
+v6/v7 graphs have explicit offline routes to v8, and the default route
+continues to v9. The v7 → v8 handler
 changes only manifest configuration metadata and does not infer fork ownership
 or retire branches. Source v6/v7 graphs with reserved retirement metadata refuse;
 v8 no-op admission validates markers and counts only live logical refs
