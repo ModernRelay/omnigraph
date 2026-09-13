@@ -831,9 +831,7 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<lance::dataset::refs::BranchIdentifier> {
-        snapshot
-            .dataset()
-            .branch_identifier()
+        crate::branch_control::dataset_branch_identifier(snapshot.dataset())
             .await
             .map_err(OmniError::storage)
     }
