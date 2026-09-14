@@ -583,8 +583,10 @@ for: the workspace member list (`Cargo.toml:35-40`), the crate table in
 `docs/dev/testing.md:23`, and the RFC README registry row plus the
 next-available bump.
 
-The PR amends two accepted RFCs, each by naming the sentences it replaces, as
-`docs/rfcs/README.md:119-122` requires. RFC 0045 §Faults: the hook form of
+The PR amends two RFCs, RFC 0045 (a draft) and RFC 0037 (accepted), each by
+naming the sentences it replaces, as `docs/rfcs/README.md:119-122` requires
+for an accepted RFC and as the draft's own decision log expects. RFC 0045
+§Faults: the hook form of
 `--- fault` (the `action: return_error` sentence and the five-hook paragraph,
 `0045:806-846` and `:1128-1132`) is replaced by `--- seam`, and the decision
 log of RFC 0045 names each replaced sentence. RFC 0037 §Deferred: the P1-5 row
