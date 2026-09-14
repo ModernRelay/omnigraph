@@ -47,8 +47,9 @@ aliases:
     format: table|kv|csv|jsonl|json   # optional: output format
 ```
 
-Dispatch with `omnigraph alias <name> [args]`. Operator aliases are read-only;
-the CLI rejects a bound stored mutation. Invoke stored mutations with
+Dispatch with `omnigraph alias <name> [args]`. Operator aliases are read-only:
+the alias asserts a read, so the server refuses a bound stored mutation with
+`400`. Invoke stored mutations with
 `omnigraph mutate <name> --server <server> --graph <id>`. Aliases live in their
 own namespace, so one can never shadow or be shadowed by a built-in verb.
 
@@ -66,7 +67,7 @@ omnigraph alias foo sig-bar "Some Name" 29
 
 Each arg is parsed as JSON first, then falls back to string:
 - `29` → integer
-- `"29"` → string
+- `'"29"'` → string (shell-quote the JSON quotes; a bare `"29"` reaches the CLI as `29`)
 - `true` → boolean
 - `Alice` → string (JSON parse fails, falls back)
 - `{"x":1}` → object
@@ -91,6 +92,9 @@ Or per-alias (`format: jsonl`), or per-call (`--format jsonl`).
 - **`kv`** — `key: value` per line; good for single-row lookups
 - **`csv`** — for spreadsheets or line-count-heavy analysis
 - **`table`** — default human view; don't use in automation
+
+`--format arrow` is accepted by the parser in 0.11.0 but always fails with "has
+no text rendering"; never set it as an alias or `defaults.output` format.
 
 Query row spelling follows [`queries.md`](queries.md#system-fields-and-result-values):
 null fields are omitted, bare node projections are objects, and DateTime
