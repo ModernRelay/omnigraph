@@ -16,6 +16,11 @@ blocked_on: []
 
 # RFC 0052: Managed control-plane CLI
 
+> Proposed extension: [RFC 0064](0064-identity-credentials-and-applied-policy.md#proposed-provider-native-access-and-standard-clients)
+> specifies provider-native login, automatic identity acquisition and an
+> additional offline OAuth resource profile. Its draft status does not
+> retroactively change this RFC’s accepted historical contract.
+
 ## Summary
 
 Add an HTTP client for the managed Intent API to the existing CLI. A folder's
@@ -96,16 +101,51 @@ origins, without userinfo, path, query, or fragment. HTTPS is mandatory except
 exact loopback hosts for local integration. Redirects are refused; each
 request has a 10-second deadline and 8 MiB body limit.
 
-`login --api` calls the Intent API's device authorization and polling routes.
+`login --api` first reuses cached access or renews it and reads fresh session
+metadata. Missing, expired or explicitly unrecoverable sessions use the
+Intent API's device authorization and polling routes.
 The service brokers WorkOS's native device flow and reuses its browser login
 JWT, membership, enrollment, and grant checks. The CLI prints the verification
 URL/user code, never the device secret. It respects expiry and polling
-interval, including slowdown, and saves only the returned opaque session in
-the OS keychain under the canonical API origin. Sessions live at most 15
-minutes and no longer than the provider token. No provider access/refresh
-token is stored by the CLI. An unavailable keychain refuses without a
-plaintext fallback. Logout revokes the service session and removes the local
-entry; session expiry requires a new login. Accepted runs continue normally.
+interval, including slowdown. Access credentials live at most 15 minutes and
+no longer than the verified provider access token. A renewable response also
+contains `refresh_token` and `refresh_expires_at`: the refresh credential and
+opaque access credential are stored only in the OS keychain under the
+canonical API origin. The refresh deadline is absolute, at most eight hours
+from the original sign-in; rotation never extends it. Public output contains
+only metadata. An unavailable keychain refuses without a plaintext fallback.
+Maximum-lifetime comparisons against the local clock allow 30 seconds of
+clock difference, consistently for legacy access, renewable cache and fresh
+session metadata. The issued timestamps remain unchanged, actual expiry has
+no grace period, and rotation must preserve the exact original refresh
+deadline. A rejected condition has a fixed diagnostic without credential or
+identity values.
+
+`POST /v1/auth/refresh` carries the previous opaque access bearer, even when
+its short lifetime has expired, and `{ "refresh_token": "..." }`. Its response
+has the login envelope with a new access credential, a new refresh credential,
+the same principal/subject/account and unchanged refresh deadline. The API
+owns provider verification, current grants, revocation and the single-use
+exchange claim. The CLI does not infer authority from cached scopes.
+
+A separate version-2 keychain namespace holds renewable sessions; an absent
+entry permits reading the unchanged version-1 format. Malformed or pending
+version-2 entries never fall back to version 1. A private, stable per-origin
+file lock serializes local cache changes, waiting at most 40 seconds. Before
+an exchange the CLI persists a pending marker in the keychain. A crash or
+uncertain response preserves both credentials and the marker; it never
+resubmits that exchange. Only `refresh_unavailable` with HTTP 503 and
+`exchange_started: false` permits another attempt. `refresh_in_progress` and
+`refresh_outcome_unknown` require explicit login to repair renewal. Unexpired
+access remains usable until expiry or a terminal refusal.
+
+The refresh request has a 35-second deadline; other requests keep their
+10-second deadline and all responses keep the 8 MiB limit. New managed
+requests, including status polls, obtain current access before submission.
+They never open a browser or replay a write after an authentication failure.
+Logout revokes the current session even after short access expiry and then
+removes local entries. Unconfirmed revocation preserves the cache; a terminal
+`login_required` or `unauthenticated` removes it. Accepted runs continue normally.
 
 Scoped automation may supply `OMNIGRAPH_CONTROL_TOKEN` only together with
 `OMNIGRAPH_CONTROL_API` matching the selected canonical origin. Data-plane
@@ -147,8 +187,9 @@ The server SDK and Python SDK gain no new authority or dependencies.
   the existing cluster command model and duplicates discoverability/docs.
 - Inferring managed mode from storage roots or existing server aliases risks
   forwarding the wrong credential; explicit context and origin binding win.
-- Refresh-token persistence adds rotation/revocation/storage behavior beyond
-  the bounded pilot. Re-login after expiry keeps the browser contract.
+- Requiring browser sign-in after every short access lifetime is simpler but
+  interrupts long-running commands. Bounded renewal keeps provider credentials
+  in the existing OS keychain and leaves exchange authority at the API.
 - Plaintext fallback helps headless setup but silently weakens human secret
   storage. Explicit scoped automation credentials cover unattended execution.
 
@@ -179,8 +220,8 @@ Land the public contract and implementation together with CLI user docs and
 release notes. The companion API adds device sessions and plan abandonment
 without changing executor or engine gates. Existing CLI/direct and managed
 HTTP tests must pass before recommending the managed client. Data-plane
-tokens, managed-store editing, provisioning, console, SSE, and persistent
-refresh tokens remain out of scope for this increment. Managed-store editing
+tokens, managed-store editing, provisioning, console and SSE were outside the
+initial increment. Managed-store editing
 and service provisioning are extended by
 [RFC 0061](0061-managed-cluster-lifecycle.md).
 

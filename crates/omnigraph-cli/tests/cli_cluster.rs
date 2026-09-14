@@ -821,7 +821,7 @@ fn managed_data_direct_override_uses_only_explicit_legacy_transport() {
 fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
     for malformed in [false, true] {
         for selector in ["--server", "--profile"] {
-            for verb in ["query", "mutate"] {
+            for verb in ["query", "mutate", "load"] {
                 let temp = tempdir().unwrap();
                 let api = IntentApiFixture::new(vec![]);
                 write_managed_context(temp.path(), &api.origin);
@@ -833,10 +833,16 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                         "query_name":"q", "target":{"branch":"main"}, "row_count":1,
                         "columns":["value"], "rows":[{"value":42}], "graph_commit_id":"head-a"
                     })
-                } else {
+                } else if verb == "mutate" {
                     serde_json::json!({
                         "branch":"main", "query_name":"q", "affected_nodes":1,
                         "affected_edges":0, "actor_id":"legacy-actor", "commit":null
+                    })
+                } else {
+                    serde_json::json!({
+                        "branch":"main", "base_branch":null, "branch_created":false,
+                        "mode":"append", "nodes":[{"name":"Person", "entities_loaded":1}],
+                        "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null
                     })
                 };
                 let data = IntentApiFixture::new(vec![IntentReply::json(200, reply)]);
@@ -859,8 +865,14 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                     .env("OMNIGRAPH_BEARER_TOKEN", "unused-legacy-fallback")
                     .env("OMNIGRAPH_CONTROL_API", &api.origin)
                     .env("OMNIGRAPH_CONTROL_TOKEN", "never-data")
-                    .args([verb, "q", selector, "staging", "--json"])
+                    .args([verb, selector, "staging", "--json"])
                     .timeout(std::time::Duration::from_secs(15));
+                if verb == "load" {
+                    fs::write(temp.path().join("batch.jsonl"), "{}\n").unwrap();
+                    command.args(["--data", "batch.jsonl", "--mode", "append"]);
+                } else {
+                    command.arg("q");
+                }
                 if selector == "--server" {
                     command.args(["--graph", "knowledge"]);
                 }
@@ -868,12 +880,21 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 let payload = parse_stdout_json(&output);
                 if verb == "query" {
                     assert_eq!(payload["rows"], serde_json::json!([{"value":42}]));
-                } else {
+                } else if verb == "mutate" {
                     assert_eq!(payload["affected_nodes"], 1);
+                } else {
+                    assert_eq!(payload["total_entities"], 1);
                 }
                 let requests = data.requests();
                 assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0].path, "/graphs/knowledge/queries/q");
+                assert_eq!(
+                    requests[0].path,
+                    if verb == "load" {
+                        "/graphs/knowledge/load/ndjson?branch=main&mode=append"
+                    } else {
+                        "/graphs/knowledge/queries/q"
+                    }
+                );
                 assert_eq!(
                     requests[0].headers["authorization"],
                     "Bearer explicit-legacy-token"
@@ -899,15 +920,20 @@ fn managed_data_issue_633_ambient_targets_refuse_without_selecting_either() {
         let home = temp.path().join("operator");
         fs::create_dir(&home).unwrap();
         fs::write(home.join("config.yaml"), config).unwrap();
-        for verb in ["query", "mutate"] {
+        for verb in ["query", "mutate", "load"] {
             let mut command = cli();
             command
                 .current_dir(temp.path())
                 .env("OMNIGRAPH_HOME", &home)
                 .env_remove("OMNIGRAPH_PROFILE")
                 .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
-                .args([verb, "q", "--json"])
+                .args([verb, "--json"])
                 .timeout(std::time::Duration::from_secs(15));
+            if verb == "load" {
+                command.args(["--data", "missing.jsonl", "--mode", "append"]);
+            } else {
+                command.arg("q");
+            }
             if let Some(profile) = profile {
                 command.env("OMNIGRAPH_PROFILE", profile);
             }

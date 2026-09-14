@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-14
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -248,3 +248,59 @@ unmerged until that review is complete.
 - 2026-09-09: Proposed the separate identity profile, authenticated minimal
   discovery, and authorization against applied policy, retaining legacy
   restrictions and direct storage-holder behavior.
+
+## Proposed provider-native access and standard clients
+
+This extension remains draft and unmerged. It replaces the opaque managed
+login/session brokerage described in RFC 0052 with direct AuthKit public-client
+device login and refresh through the official SDK. Login metadata pins the
+provider family, client, issuer, organization and fixed endpoints. The API
+verifies the raw access token and returns stable principal identity. The CLI
+uses a new OS-keychain namespace, an eight-hour absolute renewable deadline,
+serialized refresh with a pending-before-send marker and atomic credential
+replacement, and no automatic retry after an uncertain exchange. Old managed
+sessions require new login; direct/static configuration remains supported.
+
+Normal native data commands acquire a self-only identity credential before
+execution. A permission refusal never triggers login or mutation replay.
+Native restricted credentials retain their existing verifier semantics; a
+restricted cache is never silently promoted to a less restricted profile.
+
+An additional generic server profile accepts externally signed human OAuth
+resource tokens. `--oidc-identity-trust FILE` loads public JSON containing a
+fixed issuer/resource/organization/account/cluster/incarnation/root binding,
+RSA signing keys and explicit subject-to-principal admission. It validates the
+root against the same Core snapshot before any engine opens. Admission has no
+Cedar roles, groups, actions or graph grants. Tokens require RS256, exact
+single-string audience, organization and issuer, an admitted subject, and
+a signed lifetime of at most 300 seconds. Actor attribution uses the stable
+local principal, preserving the existing policy engine and graph discovery.
+
+Public snapshots are at most 256 KiB, four keys and 1,000 principals, with a
+positive monotonic revision, Unix-second `generated_at` and `expires_at`,
+and a lifetime of at most 300 seconds. Local checks run every five seconds;
+new bytes must retain the original binding and advance the revision without
+rewriting an existing revision. Invalid refresh leaves the prior snapshot
+usable only until its original expiry. Every new request checks that expiry.
+There is no network verification or implicit fallback. Publication failures
+can therefore close OAuth access after five minutes while the server process
+continues to run. Thirty seconds of clock skew makes the maximum stale
+admission bound 330 seconds. This is an authentication deadline, never a
+writer fence. Shared issuer compromise has a different scope than a
+per-cluster native signing key.
+
+When OIDC trust is configured, the server exposes protected-resource metadata
+and a stateless `/mcp` transport built on the official Rust MCP SDK. Its
+initial tools provide graph existence, stored-read catalog and stored-read
+invocation through the same HTTP handler functions and Cedar gates. The
+read-kind assertion prevents invoking a mutation through the read tool.
+Protocol framing, negotiation and cancellation use the SDK. Requests are
+bounded to 64 KiB, returned tool data to 1 MiB, read attempts to 30 seconds
+and concurrent tools to 16. Tool visibility is not permission to invoke.
+
+Provider resource ownership and public-trust publication are deployment
+responsibilities outside the engine. Tokens with default/environment audiences
+cannot stand in for exact resources; refresh must request and verify the
+exact audience again. Unqualified machine or delegated profiles remain
+disabled. Public metadata alone is not proof that OAuth or MCP was qualified
+against a live client.

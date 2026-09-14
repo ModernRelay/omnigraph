@@ -152,6 +152,59 @@ async fn data_trust_root_mismatch_refuses_before_recovery_open() {
 }
 
 #[tokio::test]
+async fn oidc_root_mismatch_refuses_even_beside_valid_native_trust_before_recovery() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey as _, traits::PublicKeyParts as _};
+    use serde_json::json;
+
+    let temp = converged_cluster_dir("").await;
+    let staging = temp.path().join("graphs/knowledge.omni/_schema.pg.staging");
+    fs::copy(temp.path().join("people.pg"), &staging).unwrap();
+    let root = format!(
+        "file://{}",
+        fs::canonicalize(temp.path()).unwrap().display()
+    );
+    let mut native = data_tokens::DataTokens::new();
+    native.document["canonical_root"] = json!(root);
+    let native_path = temp.path().join("native-trust.json");
+    fs::write(&native_path, serde_json::to_vec(&native.document).unwrap()).unwrap();
+
+    let key = RsaPrivateKey::from_pkcs8_pem(include_str!("fixtures/oidc-test-key.pem")).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let oidc = json!({"version":1,"revision":1,"generated_at":now,"expires_at":now+300,
+        "issuer":"https://identity.example","audience":"https://data.example/clusters/A",
+        "organization_id":"org_example","account_id":"account_1","cluster_id":"A",
+        "cluster_incarnation":"one","canonical_root":"s3://wrong/root",
+        "keys":[{"kid":"one","kty":"RSA","alg":"RS256","use":"sig",
+            "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}],
+        "principals":[]});
+    let oidc_path = temp.path().join("oidc-trust.json");
+    fs::write(&oidc_path, serde_json::to_vec(&oidc).unwrap()).unwrap();
+    let refused = omnigraph_server::load_server_settings_with_identity_trust(
+        Some(&temp.path().to_path_buf()),
+        Some("127.0.0.1:0".into()),
+        true,
+        true,
+        Some(&native_path),
+        Some(&oidc_path),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("OIDC identity snapshot or serving-root binding")
+    );
+    assert!(
+        staging.exists(),
+        "OIDC failure opened the graph for recovery"
+    );
+}
+
+#[tokio::test]
 async fn managed_settings_bind_the_applied_store_not_the_config_directory() {
     let mut tokens = data_tokens::DataTokens::new();
     let store = converged_cluster_dir("").await;

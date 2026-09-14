@@ -1,7 +1,7 @@
 //! Cached data credentials have a separate keychain namespace and transport.
 use super::auth::{self, Store};
 use super::{Api, Context, Failure, Method, Output, Result, canonical_origin, json};
-use crate::cli::{Cli, Command, GraphsCommand};
+use crate::cli::{Cli, Command, CommitCommand, GraphsCommand};
 use crate::client::GraphClient;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -270,6 +270,17 @@ async fn mint_profile(
     grant: Option<Grant>,
     ttl: u64,
 ) -> Result<Value> {
+    mint_for_principal(store, context, api, grant, ttl, None).await
+}
+
+async fn mint_for_principal(
+    store: &impl Store,
+    context: &Context,
+    api: &Api,
+    grant: Option<Grant>,
+    ttl: u64,
+    expected_principal: Option<&str>,
+) -> Result<Value> {
     // Fail early if the platform cannot access its credential store.
     let _ = store.get(&key(context))?;
     let body = api
@@ -336,6 +347,9 @@ async fn mint_profile(
         },
     };
     credential.validate(context)?;
+    if expected_principal.is_some_and(|id| credential.actor != format!("principal:{id}")) {
+        return Err(Failure::protocol());
+    }
     if grant.as_ref().is_some_and(|grant| {
         credential.grants.len() != 1
             || credential.grants[0].graph_id != grant.graph_id
@@ -392,10 +406,7 @@ pub(super) async fn token(
         }
         None
     };
-    let api = Api::new(
-        context.api.clone(),
-        Some(auth::credential(&auth::CONTROL_STORE, &context.api)?),
-    )?;
+    let api = Api::authenticated(context.api.clone())?;
     match grant {
         Some(grant) => mint(&auth::DATA_STORE, context, &api, grant, ttl.unwrap_or(3600)).await,
         None => mint_profile(&auth::DATA_STORE, context, &api, None, ttl.unwrap_or(3600)).await,
@@ -462,6 +473,11 @@ fn skips_context(cli: &Cli) -> bool {
                 | Command::Mutate { .. }
                 | Command::Graphs {
                     command: GraphsCommand::List { .. }
+                }
+                | Command::Load { uri: None, .. }
+                | Command::Commit {
+                    command: CommitCommand::List { uri: None, .. }
+                        | CommitCommand::Show { uri: None, .. }
                 }
         )
         || cli.server.is_some()
@@ -530,18 +546,38 @@ fn resolve(
                 )
             });
     }
-    let (action, named) = match &cli.command {
+    let required = match &cli.command {
         Command::Query {
             query,
             query_string,
             ..
-        } => ("read", query.is_none() && query_string.is_none()),
+        } => {
+            if query.is_none() && query_string.is_none() {
+                vec!["read", "invoke_query"]
+            } else {
+                vec!["read"]
+            }
+        }
         Command::Mutate {
             query,
             query_string,
             ..
-        } => ("change", query.is_none() && query_string.is_none()),
-        _ => unreachable!("only implicit query/mutate consult data context"),
+        } => {
+            if query.is_none() && query_string.is_none() {
+                vec!["change", "invoke_query"]
+            } else {
+                vec!["change"]
+            }
+        }
+        Command::Load { from, .. } => {
+            if from.is_some() {
+                vec!["change", "branch_create"]
+            } else {
+                vec!["change"]
+            }
+        }
+        Command::Commit { .. } => vec!["read"],
+        _ => unreachable!("only implicit query/mutate/load and commit reads consult data context"),
     };
     scope(cli)?;
     let graph = cli
@@ -549,15 +585,78 @@ fn resolve(
         .as_deref()
         .ok_or_else(|| Failure::refused("graph_required", "managed data requires --graph"))?;
     graph_id(graph)?;
-    let required = if named {
-        vec![action, "invoke_query"]
-    } else {
-        vec![action]
-    };
     load(store, &context, graph, &required).map(Some)
 }
 
-pub(crate) fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Output> {
+/// Acquire authority before constructing the operation request. An expired
+/// restricted credential is never silently replaced by a broader identity.
+async fn resolve_with_acquisition(
+    cli: &Cli,
+    cwd: &std::path::Path,
+    store: &impl Store,
+    ambient: impl Fn() -> Result<bool>,
+    identity: impl AsyncFn(&Context) -> Result<Option<String>>,
+    api: impl AsyncFn(&Context) -> Result<Api>,
+) -> Result<Option<GraphClient>> {
+    let mut resolved = resolve(cli, cwd, store, &ambient);
+    let expected = if matches!(&resolved, Ok(Some(_))) {
+        let context = super::read_context(cwd)?.ok_or_else(Failure::protocol)?;
+        let expected = identity(&context).await?;
+        if expected.as_ref().is_some_and(|id| {
+            load_credential(store, &context)
+                .is_ok_and(|saved| saved.actor != format!("principal:{id}"))
+        }) {
+            resolved = Err(Failure::refused(
+                "data_credential_identity_mismatch",
+                "the cached graph credential belongs to another signed-in principal",
+            ));
+        }
+        expected
+    } else {
+        None
+    };
+    match resolved {
+        Ok(client) => Ok(client),
+        Err(failure)
+            if matches!(
+                failure.body["type"].as_str(),
+                Some(
+                    "data_credential_required"
+                        | "data_credential_expired"
+                        | "data_credential_identity_mismatch"
+                )
+            ) =>
+        {
+            let context = super::read_context(cwd)?.ok_or_else(Failure::protocol)?;
+            let expected = match expected {
+                Some(id) => Some(id),
+                None => identity(&context).await?,
+            };
+            // A cluster cache lock serializes independent CLI invocations. The
+            // control credential lock is acquired only inside this one.
+            let _lock = auth::cache_lock(&format!("data:{}", key(&context))).await?;
+            if let Some(raw) = store.get(&key(&context))? {
+                let saved: Credential = serde_json::from_str(&raw).map_err(|_| invalid())?;
+                if saved.version != 2 {
+                    return Err(failure);
+                }
+                if saved.validate(&context).is_ok()
+                    && expected
+                        .as_ref()
+                        .is_none_or(|id| saved.actor == format!("principal:{id}"))
+                {
+                    return resolve(cli, cwd, store, ambient);
+                }
+            }
+            let api = api(&context).await?;
+            mint_for_principal(store, &context, &api, None, 3600, expected.as_deref()).await?;
+            resolve(cli, cwd, store, ambient)
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+pub(crate) async fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Output> {
     if skips_context(cli) {
         return Ok(None);
     }
@@ -565,15 +664,35 @@ pub(crate) fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>, Outp
         Command::Query { json, format, .. } => {
             *json || matches!(format, Some(crate::read_format::ReadOutputFormat::Json))
         }
-        Command::Mutate { json, .. } => *json,
+        Command::Mutate { json, .. } | Command::Load { json, .. } => *json,
+        Command::Commit {
+            command: CommitCommand::List { json, .. } | CommitCommand::Show { json, .. },
+        } => *json,
         Command::Graphs {
             command: GraphsCommand::List { json, .. },
         } => *json,
         _ => false,
     };
-    let result = std::env::current_dir()
-        .map_err(|_| Failure::refused("context_invalid", "cannot resolve the current directory"))
-        .and_then(|cwd| resolve(cli, &cwd, &auth::DATA_STORE, has_ambient_target));
+    let result = async {
+        let cwd = std::env::current_dir().map_err(|_| {
+            Failure::refused("context_invalid", "cannot resolve the current directory")
+        })?;
+        resolve_with_acquisition(
+            cli,
+            &cwd,
+            &auth::DATA_STORE,
+            has_ambient_target,
+            async |context| auth::selected_principal(&context.api).await,
+            async |context| {
+                Api::new(
+                    context.api.clone(),
+                    Some(auth::credential(&context.api).await?),
+                )
+            },
+        )
+        .await
+    }
+    .await;
     result.map_err(|e| Output::from_result(Err(e), json, 2))
 }
 

@@ -137,6 +137,67 @@ access. Restart to change public trust. Install new and old keys together
 before issuing with a new key, and retain the old key for at least 86,430
 seconds after its final issuance before removing it with another restart.
 
+### OIDC resource identities and MCP
+
+Enable OIDC with a public admission file alongside signed or static credentials:
+
+```bash
+omnigraph-server --cluster s3://company-data/company-brain \
+  --oidc-identity-trust /run/omnigraph/provider-access.json
+```
+
+The file binds an exact HTTPS issuer, resource audience, organization, account,
+cluster incarnation and canonical root. Public RSA keys verify RS256 tokens;
+explicit subject mappings select stable `principal:<id>` actors. Tokens carry
+no graph permissions: applied Cedar governs graph and schema operations, while
+every admitted identity can discover graph IDs and names.
+
+Human access tokens must name exactly one configured resource audience, the
+configured organization and an admitted subject, and expire within 300 seconds
+of issuance. OAuth-client ID tokens, delegated or impersonated credentials and
+unqualified machine identities refuse. Every refresh must request the exact
+resource again and check the returned audience.
+
+Supply at most four RSA keys, 1,000 subject mappings and 256 KiB per public file.
+The [resource identity proposal](../../rfcs/0064-identity-credentials-and-applied-policy.md#proposed-provider-native-access-and-standard-clients)
+defines the versioned format. Authority is held by whoever can publish this
+file; it contains no provider secret or graph policy. Protect its filesystem
+permissions and publish complete updates atomically.
+
+Boot validates identity and root before opening graphs. Local refresh runs every
+five seconds: the binding stays fixed, revisions increase, and equal revisions
+require identical bytes. Every request checks the original snapshot deadline,
+at most 300 seconds after capture; invalid updates cannot extend it. Requests
+never fetch keys or call a control service, so publisher outages eventually
+prevent new OIDC access; accepted operations can finish. Admission refresh does
+not restart writers. Graph configuration retains its normal activation.
+
+With this profile configured, the server additionally exposes:
+
+- `GET /.well-known/oauth-protected-resource`: public resource identifier,
+  authorization server and supported bearer delivery, without identity lists.
+- `/mcp`: Streamable HTTP MCP using the maintained Rust SDK. Authentication
+  failures advertise protected-resource metadata for standard OAuth clients.
+
+The initial MCP tools are `graphs` (IDs and names), `queries` (permitted stored
+read names for one graph), and `query` (a named stored read with parameters and
+an optional branch). Mutation definitions are excluded and cannot be invoked
+through a read tool. These tools use the same actor and Cedar checks as HTTP
+graph requests. A 30-second deadline, 16 concurrent tool calls, 64 KiB request
+body and 1 MiB complete tool result bound this interface. Client cancellation
+cancels the waiting tool call; it does not create a background operation.
+
+`omnigraph_server::init_tracing()` limits `rmcp` and `rmcp::*` logging to warnings
+and errors even with `RUST_LOG=trace`: verbose SDK logs contain query arguments
+and results. Other targets keep their configured levels. Embedders using their
+own subscriber must enforce the same SDK filter.
+
+Requests require the resource authority or a loopback host; browsers must use
+the resource origin, while native clients can omit `Origin`. The deployment
+must separately supply a reachable server URL and public metadata at the
+advertised resource location. Direct/static deployments without this option
+keep their existing routes and do not expose MCP.
+
 ## Route families
 
 | Route family | Purpose |
@@ -145,6 +206,8 @@ seconds after its final issuance before removing it with another restart.
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
 | `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
+| `GET /.well-known/oauth-protected-resource` | Public OIDC resource metadata; only when OIDC trust is configured |
+| `/mcp` | Stored reads and discovery over MCP; only when OIDC trust is configured |
 | `/graphs/{id}/query`, `/mutate` | Run inline GQ source |
 | `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |

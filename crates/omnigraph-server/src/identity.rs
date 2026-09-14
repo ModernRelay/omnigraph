@@ -207,6 +207,7 @@ pub struct AuthenticatedActor {
 enum VerifiedDataToken {
     Restricted(Arc<crate::data_tokens::DataTokenClaims>),
     Identity(Arc<crate::data_tokens::IdentityTokenClaims>),
+    Oidc,
 }
 
 impl std::ops::Deref for AuthenticatedActor {
@@ -218,6 +219,27 @@ impl std::ops::Deref for AuthenticatedActor {
 }
 
 impl AuthenticatedActor {
+    pub(crate) fn oidc_identity(claims: crate::oidc_identity::VerifiedIdentity) -> Self {
+        Self {
+            actor: ResolvedActor {
+                actor_id: Arc::from(format!("principal:{}", claims.principal_id)),
+                tenant_id: None,
+                scopes: vec![Scope::IdentityToken],
+                source: AuthSource::SignedData,
+            },
+            data_token: Some(VerifiedDataToken::Oidc),
+            selected_graph: None,
+        }
+    }
+
+    /// An admitted identity profile carries no graph-action ceiling. Applied
+    /// policy still authorizes each graph operation independently.
+    pub(crate) fn is_identity(&self) -> bool {
+        matches!(
+            self.data_token,
+            Some(VerifiedDataToken::Identity(_) | VerifiedDataToken::Oidc)
+        )
+    }
     pub(crate) fn cluster_static(actor_id: Arc<str>) -> Self {
         Self {
             actor: ResolvedActor::cluster_static(actor_id),
@@ -274,7 +296,7 @@ impl AuthenticatedActor {
     }
 
     pub(crate) fn select_graph(&mut self, graph_id: &GraphId) -> bool {
-        if self.source == AuthSource::Static || self.identity_claims().is_some() {
+        if self.source == AuthSource::Static || self.is_identity() {
             return true;
         }
         if self.data_claims().is_some_and(|claims| {
@@ -290,7 +312,7 @@ impl AuthenticatedActor {
     }
 
     pub(crate) fn permits_action(&self, action: omnigraph_policy::PolicyAction) -> bool {
-        if self.source == AuthSource::Static || self.identity_claims().is_some() {
+        if self.source == AuthSource::Static || self.is_identity() {
             return true;
         }
         self.data_claims().is_some_and(|claims| {
@@ -305,7 +327,7 @@ impl AuthenticatedActor {
 
     pub(crate) fn permits_graph_listing(&self, graph_id: &str) -> bool {
         self.source == AuthSource::Static
-            || self.identity_claims().is_some()
+            || self.is_identity()
             || self.data_claims().is_some_and(|claims| {
                 claims.grants.iter().any(|grant| {
                     grant.graph_id.as_str() == graph_id

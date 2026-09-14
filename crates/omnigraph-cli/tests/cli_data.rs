@@ -1582,9 +1582,14 @@ fn load_json_outputs_summary_for_main_branch() {
     let graph = graph_path(temp.path());
     init_graph(&graph);
     let data = fixture("test.jsonl");
+    // A positional URI remains an explicit ordinary target, even beside a
+    // broken managed context. It must not consult the managed keychain.
+    fs::create_dir(temp.path().join(".omnigraph")).unwrap();
+    fs::write(temp.path().join(".omnigraph/context"), "invalid").unwrap();
 
     let output = output_success(
         cli()
+            .current_dir(temp.path())
             .arg("load")
             .arg("--mode")
             .arg("overwrite")
