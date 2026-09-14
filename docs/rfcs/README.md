@@ -211,3 +211,4 @@ then dated RFCs by date.
 | [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | accepted | in-progress |
 | [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |
 | [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |
+| [0069](0069-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
