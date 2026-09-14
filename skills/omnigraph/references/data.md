@@ -20,7 +20,7 @@ edits.
 | Task | Command | Why |
 |------|---------|-----|
 | Add/update a single entity | `mutate` with a named mutation | typechecked, parameterized, auditable |
-| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file; keyed node IDs derive from `@key` |
+| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file; keyed node and edge IDs derive from `@key` |
 | Additive-only bulk | `load --mode append` | fails on key collision |
 | Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
 | Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
@@ -75,10 +75,13 @@ JSONL format:
 
 - Nodes: `{"type":"<NodeType>","id":"<optional-id>","data":{...props...}}`.
   A keyed node derives identity from its complete typed key tuple; omit top-level
-  `id` in hand-authored keyed input. An unkeyed node gets a generated id unless
+  `id` in hand-authored keyed input (a supplied `id` that differs from the
+  derived value is refused). An unkeyed node gets a generated id unless
   top-level `id` supplies one.
-- Edges: `{"edge":"<EdgeType>","from":"<src_id>","to":"<dst_id>","data":{...edge_props...}}`.
-  Edges also use generated or top-level supplied `id` values.
+- Edges: `{"edge":"<EdgeType>","id":"<optional-id>","from":"<src_id>","to":"<dst_id>","data":{...edge_props...}}`.
+  An edge type declaring `@key(@src, @dst, …)` derives its id as a JSON array
+  string such as `["alice","bob"]`; omit `id` or supply exactly that value. An
+  unkeyed edge gets a generated id unless top-level `id` supplies one.
 
 `data` holds user properties. On new v9 graphs, `data.id` is a declared user
 property and `data.__id` is refused. v8 also accepts legacy `data.id` as identity
@@ -89,6 +92,10 @@ predecessor export into a new graph, relocate its identity as described in
 
 `Date` accepts integer day counts or calendar-date strings; a datetime string is
 refused. `DateTime` accepts integer millisecond counts or datetime strings.
+Whole-number floats (`19723.0`), booleans, objects, and counts outside the
+renderable calendar range are refused; `mutate --params` takes date strings
+only. Rows stored with out-of-range counts by an earlier release fail reads and
+exports of that column until corrected.
 Query/export JSON uses date strings, renders `DateTime` without a trailing `Z`,
 and omits null-valued property keys; change images keep explicit nulls.
 
@@ -109,8 +116,11 @@ one-shot review-branch flow below). Without `--from`, the target `--branch`
   The loader validates constraints and referential integrity before publication.
   Use a review branch for an established graph.
 - **`merge`** (upsert) — inserts or updates each row by logical entity `id`
-  (derived from the typed `@key` tuple for keyed nodes). Rows not in the file
-  are preserved. The safe default for incremental bulk updates.
+  (derived from the typed `@key` tuple for keyed nodes and keyed edges). Rows
+  not in the file are preserved. The safe default for incremental bulk updates.
+  An unkeyed edge without a supplied `id` never matches an existing row, so
+  re-running the same merge file duplicates it; declare `@key(@src, @dst)` when
+  creating the edge type if repeated loads must converge.
 - **`append`** (strict insert) — fails on entity-ID collision. Use when you're
   certain every row is new.
 
@@ -173,9 +183,22 @@ Deleting a parent branch is supported while descendants remain. Logical deletion
 retains the native history descendants need; only explicit `cleanup` reclaims
 unneeded table forks and retired refs. `optimize` does not perform that collection.
 
+### Merge conflicts
+
+A conflicting merge publishes nothing and returns typed conflicts
+(`divergent_insert`, `divergent_update`, `delete_vs_update`, `orphan_edge`,
+`unique_violation`, `cardinality_violation`, `value_constraint_violation`;
+HTTP `409`). The same edge inserted on both branches depends on its identity:
+unkeyed edges are both kept; `@unique(@src, @dst)` reports `unique_violation`;
+`@key(@src, @dst)` converges identical inserts to one row and reports
+`divergent_insert` (with the derived id) when non-key properties differ —
+re-insert the agreed values on one branch, then merge again. If a branch both
+sides merged earlier has since been deleted, an entity both received from it
+can still report `divergent_update`.
+
 ### Schema apply blocks non-main branches
 
-`omnigraph schema apply` rejects the request if any non-main branches exist. Merge or delete them first. This is enforced — it's not just a guideline.
+`omnigraph schema apply` rejects the request if any non-main branches exist. Delete them first (`branch merge … --delete-branch` or `branch delete`); a merge alone leaves the source branch live. This is enforced — it's not just a guideline.
 
 ## Destructive Ops Go Through a Branch
 

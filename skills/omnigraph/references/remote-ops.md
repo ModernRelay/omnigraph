@@ -54,7 +54,8 @@ omnigraph export --server production --graph knowledge \
 For `load --from <base> --branch <review>`, inspect the review branch rather
 than assuming branch creation means the load landed. Strict inserts of unkeyed
 nodes and edges can duplicate on a blind retry. Mutation `insert` and
-`load --mode merge` upsert keyed nodes by their derived logical IDs;
+`load --mode merge` upsert keyed nodes and keyed edges (`@key(@src, @dst, …)`)
+by their derived logical IDs;
 `load --mode append` remains strict and reports an ID collision. Verification
 is still safer when the requested value matters.
 
@@ -70,8 +71,15 @@ omnigraph mutate update_person --server production --graph knowledge \
 ```
 
 Any intervening branch commit makes the condition fail without effects. The CLI
-exits `4`; HTTP returns `412` with the expected and actual positions. Re-read
-and decide again. Fetching a head id after the read does not close the race.
+exits `4`; HTTP returns `412` with `precondition_failure: {expected, actual?}`.
+Re-read and decide again. Fetching a head id after the read does not close the
+race.
+
+Over HTTP, send the raw id in the `Omnigraph-If-Graph-Commit` header to
+`POST /graphs/{id}/mutate/if-graph-commit` or
+`POST /graphs/{id}/queries/{name}/if-graph-commit`. The plain routes reject that
+header; an older server answers `404`, so never fall back to the unconditional
+route.
 
 ## Typed failures and recovery
 
@@ -86,14 +94,17 @@ and decide again. Fetching a head id after the read does not close the race.
   into an upsert.
 - `recovery_required`: durable work needs reconciliation; effects may be absent,
   partial, or already published. Write entry can heal some proven cases even on
-  a running server, but an unresolved intent remains a refusal. Follow its
-  recovery action, using operator recovery/reopen when needed, and reconcile the
+  a running server, but an unresolved intent remains a refusal (HTTP `503` with
+  `recovery_required.operation_id`). Follow the error message's remedy, using
+  operator recovery/reopen when needed, and reconcile the
   original outcome before replaying. A failed branch merge now cleans up work it
   can prove safe; cancellation and ambiguous ownership still require recovery.
 
 The effect-free conflict details are distinct from a lost response or a recovery
 requirement. Neither HTTP `409`/`503` nor the CLI's generic failure exit `1` is
-a universal retry signal; conditional precondition failure has its own exit `4`.
+a universal retry signal; conditional precondition failure has its own exit `4`
+on data-plane commands (managed `cluster plan`/`apply` use exit `4` for
+recovery required instead).
 
 ## Read large output safely
 
