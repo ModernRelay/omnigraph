@@ -4,15 +4,15 @@
 - Inspect state (snapshot, export)
 - Branches · commits · changes · graphs
 - Blob reads
-- Schema · lint · embed · init
+- Schema · offline storage upgrade · lint · embed · init
 - Load (bulk JSONL)
 - Query / mutate
 - Maintenance (optimize, full-text rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
-- Config resolution order
-- Output formats · health check
-- Cluster control plane
+- Addressing a graph
+- Output formats and positions · health check
+- Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
 
@@ -67,12 +67,24 @@ omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
 omnigraph branch delete <branch-name> --store $REPO
 ```
 
-All support `--json`. `--delete-branch` removes the source only after a
-successful merge publication.
+All support `--json`. `--from` and `--into` default to `main`.
+`--delete-branch` removes the source only after a successful merge publication.
+A served `branch delete --json` needs `--yes`.
 
-Canonical query/mutation routes also accept GQ branch statements. Their
-`outcome` and optional `commit` have different meanings from data-mutation
-receipts; see [branch statements](changes.md#branch-statements).
+The same operations are GQ branch statements, useful when a client already
+sends `.gq` source:
+
+```bash
+omnigraph mutate -e 'branch create "review/x" from main' --server <name> --graph <id>
+omnigraph mutate -e 'branch merge "review/x" into main' --server <name> --graph <id>
+omnigraph mutate -e 'branch delete "review/x"' --server <name> --graph <id>
+omnigraph query  -e 'branch list' --server <name> --graph <id>
+```
+
+Quote names containing `/`, `-`, `.`, or a leading uppercase letter or digit.
+Statements take no name, `--params`, `--branch`, `--snapshot`, or
+`--if-commit`. Their `outcome` and optional `commit` have different meanings
+from data-mutation receipts; see [branch statements](changes.md#branch-statements).
 
 ## Commits (History)
 
@@ -200,6 +212,8 @@ null,
 valid-empty, and non-empty Blob values remain distinct. Existing full-text
 indexes are preserved and any uncovered tail is scanned; use the explicit
 rebuild command when full-text coverage or analyzer compatibility must change.
+`optimize` also persists the derived traversal adjacency used to speed up
+traversal startup; it does not collect unused forks (that is `cleanup`).
 
 ### `rebuild-full-text-indexes` — explicit analyzer upgrade
 
@@ -249,9 +263,11 @@ Distinct from `lint`, which validates authoring source. See
 ```bash
 echo "$TOKEN" | omnigraph login <server>   # store a bearer token in ~/.omnigraph/credentials (0600)
 omnigraph logout <server>                  # remove it (idempotent)
+omnigraph login --api <origin>             # managed Intent API session (OS keychain)
+omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. Only `cluster` subcommands accept `--config`.
+The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. Only `cluster` subcommands and `use` accept `--config`.
 
 ## Addressing a Graph
 
@@ -264,6 +280,14 @@ Precedence (highest first):
 3. **`--profile <name>`** (or `$OMNIGRAPH_PROFILE`) — a named scope bundle from `profiles:` in the operator config (binds one of server/cluster/store + a default graph).
 4. **Operator defaults** — `defaults.server` + `defaults.default_graph`, or `defaults.store` for a zero-flag local scope (mutually exclusive with `defaults.server`).
 
+**Managed folders.** In a directory with `.omnigraph/context` (written by
+`omnigraph use`) and no explicit `--server`/`--profile`/`--store`/`--cluster`,
+`query` and `mutate` go to the managed data endpoint with the cached
+`cluster token` credential and require `--graph`. If `OMNIGRAPH_PROFILE` or an
+operator default server/store competes, they refuse with
+`managed_target_ambiguous`. Global `--direct` restores the ordinary resolution
+above. Other data commands are unaffected.
+
 Cluster subcommands use `--config <dir>`; policy and stored-query control-plane
 commands use `--cluster <dir|uri>`. Maintenance against a
 cluster-managed graph uses `--cluster <dir|file://|s3://|az://> --graph <id>`.
@@ -272,7 +296,7 @@ Each command declares a **capability** — `any` / `served` / `direct` /
 
 For query source (`query`/`mutate`):
 
-1. **`--query <file>`** or **`-e/--query-string '<gq>'`** — exactly one (operator aliases are invoked via the separate `alias` subcommand)
+1. **`--query <file>`** or **`-e/--query-string '<gq>'`** — at most one; omit both to invoke a served stored query or mutation by its positional `<name>`. Either source may instead hold one branch statement. (Operator aliases are invoked via the separate `alias` subcommand.)
 2. Relative `--query` paths resolve from the current working directory
 
 For params:
@@ -288,7 +312,11 @@ For params:
 - `kv` — `key: value` per line; good for single rows
 - `csv` — comma-separated
 - `jsonl` — NDJSON, one per line, with metadata line first
-- `json` — pretty `ReadOutput` envelope (metadata, columns, and rows)
+- `json` — pretty `ReadOutput` envelope (metadata, columns, and rows); the `rows` array is printed compact and verbatim
+
+`--format arrow` appears in `--help` but 0.11.0 has no Arrow output: it always
+fails with "has no text rendering". Do not use it, or set it as
+`defaults.output`.
 
 Mutations do not take `--format`; use `--json`. Successful `mutate --json` and
 `load --json` include the exact published `commit` (`null` for a no-op
@@ -320,9 +348,39 @@ omnigraph cluster plan         --config <dir> [--json] # preview (schema changes
 omnigraph cluster apply        --config <dir> --as <actor>   # converge; idempotent
 omnigraph cluster approve <resource> --config <dir> --as <actor>  # gate destructive changes (graph deletes)
 omnigraph cluster status       --config <dir> [--json] # read the ledger (read-only)
+omnigraph cluster observe      --config <dir> [--json] # what refresh would record: no lock, no sweep, no write
+omnigraph cluster plan --observe --config <dir>        # plan without taking the lock
 omnigraph cluster refresh      --config <dir>          # re-observe live graphs; flags drift
 omnigraph cluster force-unlock <LOCK_ID> --config <dir>  # clear a crashed run's lock (exact id from status)
 ```
+
+`observe` and `plan --observe` report an existing lock instead of refusing, and
+print `authority: "observed"` with the `state_cas` they read (`plan`/`refresh`/
+`import` output carries `authority: locked|observed|unlocked`).
+
+A managed folder (see [`cluster.md`](cluster.md#managed-clusters)) uses a
+different verb set; `validate`, `import`, `approve`, `observe`, `refresh`, and
+`force-unlock` refuse there unless `--direct` is given:
+
+```bash
+omnigraph use <CLUSTER_ID> --api <origin> [--config <dir>]
+omnigraph cluster create <name> --api <origin>
+omnigraph cluster push --expected-revision <rev> --message <msg>
+omnigraph cluster plan [--rev <revision>]
+omnigraph cluster apply --plan <PLAN_RUN_ID>
+omnigraph cluster status [RUN_ID | --operation <id> [--wait]]
+omnigraph cluster history [--limit N] [--since <RFC3339>]
+omnigraph cluster cancel <RUN_ID>
+omnigraph cluster token --graph <id> (--actions read,change,… [--ttl 1h] | --clear)
+omnigraph cluster delete --incarnation <id> [--retention-seconds 86400]
+omnigraph cluster undo-delete --incarnation <id> --deletion-id <id>
+```
+
+Managed runs take `--no-wait`, `--timeout <1..3600>`, and
+`--idempotency-key` (reuse the same key after an uncertain response). Managed
+plan/apply/lifecycle exit codes: 0 converged, 1 failed or transport error, 2
+refused or blocked, 3 partially converged, 4 recovery required, 5 stalled or
+wait deadline, 6 cancelled.
 
 Topology rule: `omnigraph schema apply` and `omnigraph init` **refuse a
 cluster-managed graph** — in a cluster their jobs belong to `cluster apply`.

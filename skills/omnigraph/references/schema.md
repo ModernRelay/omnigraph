@@ -49,13 +49,24 @@ target explicitly; nullable targets may remain null. See [`search.md`](search.md
 
 ### System identity is separate from user properties
 
-Use `@id`, `@src`, and `@dst` for system fields in queries and constraints.
-New graphs store them as `__id`, `__src`, and `__dst`, and may declare ordinary
-properties named `id`, `src`, or `dst`. Property names beginning `_` are
-reserved; edge property names `from` and `to` are reserved for insert endpoints.
-Existing supported legacy graphs retain their physical spellings and reserve
-`id` on all types plus `src`/`dst` on edges. Inspect `system_columns` in
-`schema show --json` rather than inferring the graph vintage from the binary.
+Use `@id`, `@src`, and `@dst` for system fields in queries. Edge constraints may
+name `@src`/`@dst`; no constraint may name `@id` (identity is already the row
+key). Name rules depend on the graph's vintage:
+
+- **New (v9) graphs** store system fields as `__id`, `__src`, and `__dst`,
+  and may declare ordinary properties named `id`, `src`, or `dst`. Every
+  property name beginning `_` is reserved.
+- **Legacy (v8) graphs** retain physical `id`/`src`/`dst` and refuse `id` on
+  any type, `src`/`dst` on edges, and `__id`/`__src`/`__dst`. Other `_` names
+  are still accepted there, but they block the v9 upgrade.
+- **All vintages:** `from` and `to` are reserved edge property names (insert
+  endpoints), and `_distance`/`_score` are refused as property names.
+
+Inspect `system_columns` in `schema show --json` rather than inferring the
+graph vintage from the binary. Writing bare `src` in an edge constraint on a
+new graph fails at `init`/`schema plan` (offline `lint` does not catch it) with
+`unknown property reference 'Knows.src'; the system field is '@src'`; respell
+local `.pg` files after an upgrade to v9.
 
 ### Edge constraints go inside a body block
 
@@ -69,9 +80,14 @@ edge PartOfArtifact: Chunk -> InformationArtifact @card(1..1) {
 
 An edge may declare `@key(@src, @dst)` (plus additional non-null scalar
 properties) to derive identity from that tuple. Both endpoints are required
-key members. Declare it when creating the type: adding a key to an existing
-edge type is unsupported. Repeated inserts of the same key upsert the edge;
-without a key, repeated endpoint pairs remain distinct edges.
+key members. Declare it when creating the type: adding, removing, or changing
+a key on an existing edge type is refused by the planner. Repeated inserts of
+the same key upsert the edge; without a key, repeated endpoint pairs remain
+distinct edges. The derived id orders `@src`, `@dst`, then scalar members in
+catalog order (not declaration order), so omit `id` rather than building it by
+hand. Edges cannot be `update`d (`T16`): re-insert a keyed edge to change its
+non-key properties. The property-level `@key` shorthand is refused on edge
+properties.
 
 ### Lint after every edit
 
@@ -112,7 +128,7 @@ drop semantics. A cluster-only server rejects
 
 ### Apply is main-only
 
-`omnigraph schema apply` rejects any non-`main` branches. Delete or merge feature branches first. This is deliberate: schema changes don't go through review branches. They go straight to main via `plan` + `apply`.
+`omnigraph schema apply` rejects any non-`main` branches. Delete feature branches first (`branch merge … --delete-branch` or `branch delete`); a merge alone leaves the branch live. This is deliberate: schema changes don't go through review branches. They go straight to main via `plan` + `apply`.
 
 ### Rename, don't replace
 
@@ -148,7 +164,15 @@ remain rebuild territory. Value *order* never matters (values are normalized).
 
 ### Keep `@key` stable
 
-Changing the key field is effectively a replace — it invalidates every external reference to the node. Treat identity changes as deliberate, multi-step migrations, not casual field renames.
+Changing the key field is effectively a replace — it invalidates every external reference to the node. `schema plan` refuses adding, removing, or changing `@key` on an existing node or edge type; an identity change is an export/rebuild migration, not a casual field rename.
+
+### Constraints: only `@index` is added in place
+
+Adding a constraint other than `@index` (`@key`, `@unique`, `@range`, `@check`)
+to an existing type, removing any constraint, and changing edge cardinality or
+endpoints are refused as unsupported. In-place migrations are additions of
+nullable properties and types, `@index` additions, enum widening, renames, and
+drops; tightening a constraint means a rebuild.
 
 ### `schema apply` blocks writes while running
 
@@ -171,7 +195,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@description("...")` — metadata (no migration impact)
 
 **Edge-level:**
-- `@card(min..max)` — edge cardinality (default: `0..*`)
+- `@card(min..max)` — edge cardinality (default: unbounded from zero; write an open upper bound as `@card(1..)`)
 
 **Type-level (nodes/edges):**
 - `@instruction("...")` — semantic hint for LLMs/operators

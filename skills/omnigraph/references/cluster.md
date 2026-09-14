@@ -4,7 +4,8 @@
 - The model
 - The loop (validate → import → plan → apply → serve)
 - The config contract (`cluster.yaml` vs `~/.omnigraph/config.yaml`)
-- Serving (`--cluster`, config-free bucket boot)
+- Serving (`--cluster`, config-free bucket boot, readiness, shutdown)
+- Managed clusters
 - Recovery cheat-sheet
 
 The cluster control plane manages a whole deployment —
@@ -43,6 +44,12 @@ graphs:
 `queries` also accepts a file list (`[a.gq, b.gq]`) or a fine-grained
 `name: { file: ... }` map. Discovery is loud: unparseable files and duplicate
 names across files fail validation.
+
+Relative `schema`, `queries`, and policy `file` paths must stay inside the
+config directory: a `..` segment fails with `config_path_escape`, and a
+symbolic link anywhere on the path (including a discovered `.gq` file) fails
+with `config_path_symlink`. Absolute paths are not checked; prefer relative
+paths.
 
 ## The loop (memorize this)
 
@@ -90,6 +97,11 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
   digest-bound approval. Any config/state drift after approving invalidates it.
 - **Drift**: `cluster refresh` re-observes live graphs and marks out-of-band
   changes `drifted`; the next `apply` converges them back to the declaration.
+  To inspect without side effects, `cluster observe --config .` reports what
+  `refresh` would record, and `cluster plan --observe` plans, without taking
+  the lock, running the recovery sweep, or writing. Their output carries
+  `authority: "observed"` and the `state_cas` they read, and an existing lock
+  is reported rather than refused.
 - **Data is NOT cluster's job**: rows flow through `omnigraph load / mutate`
   against the derived roots, with branches as usual.
 
@@ -127,7 +139,14 @@ graph's gate incl. `invoke_query`). Bearer tokens and bind stay process-level
 served/quarantined counts; it turns HTTP 503 when draining. An applied empty
 cluster can serve a ready zero-graph inventory. A nonempty cluster with no
 healthy graphs still refuses startup. `GET /graphs` requires `graph_list` and
-includes quarantined graph identities; readiness itself exposes counts only.
+includes quarantined graph identities (the `quarantined` key is omitted when
+empty); readiness itself exposes counts only.
+
+**Bounded shutdown.** `--shutdown-grace-seconds` (else
+`OMNIGRAPH_SHUTDOWN_GRACE_SECONDS`, default 25; `0` cuts off immediately)
+bounds the drain: at SIGTERM readiness turns off and in-flight requests drain;
+a clean drain exits 0, reaching the deadline exits 2. Set the orchestrator's
+termination grace longer than this value.
 
 **Config-free serving.** `--cluster` also accepts a `file://`, `s3://`, or
 preview `az://` storage-root URI
@@ -135,10 +154,11 @@ directly — `omnigraph-server --cluster s3://bucket/prefix` boots from the
 applied revision on the bucket with **no checkout of the config repo**. The
 ledger and catalog on the bucket are the whole deployment artifact; policy
 bundles serve as digest-verified content from the catalog. The preferred
-container shape is **bucket, no volume** (AWS ECS / Railway recipes in the
-omnigraph repo's `docs/user/deployment.md`). For a mounted config directory
-instead, `OMNIGRAPH_CLUSTER=<dir>` works and the image ships the CLI for
-in-container `cluster apply`.
+container shape is **bucket, no volume** (see the container section of the
+omnigraph repo's `docs/user/deployment.md`). The container entrypoint reads
+`OMNIGRAPH_CLUSTER` (a storage URI or a mounted config directory) and passes
+it as `--cluster`; the server binary itself reads only `--cluster`. The image
+ships the CLI for in-container `cluster apply`.
 
 ## Managed clusters
 
@@ -165,6 +185,26 @@ targets require an explicit choice.
 Managed creation, config upload, deletion and undo use `cluster create`, `push`,
 `delete` and `undo-delete`; durable operation records bind uncertain submissions
 to their exact identity. Reconcile the existing operation before issuing another.
+
+- **Schema/config changes**: commit, `cluster push --expected-revision <rev>
+  --message …`, `cluster plan --rev <new>`, then `cluster apply --plan <run>`.
+  The Intent API executes the apply; there is no local `--as` or approval step.
+- **Supported verbs** with a managed context: `plan`, `apply --plan`,
+  `status`, `history`, `cancel`, `token`, and the lifecycle verbs. `validate`,
+  `import`, `approve`, `observe`, `refresh`, and `force-unlock` refuse unless
+  `--direct` is given; `--as`, `--server`, `--profile`, `--store`, and
+  `--cluster` do not apply to managed cluster operations.
+- **Sessions** from `login --api` expire within 15 minutes with no refresh
+  token. For unattended runs, set `OMNIGRAPH_CONTROL_API` and
+  `OMNIGRAPH_CONTROL_TOKEN` together; reuse the same `--idempotency-key` after
+  an uncertain response.
+- **Data credentials**: `cluster token` actions are `read`, `export`, `change`,
+  `branch_create`, `branch_delete`, `branch_merge`, `invoke_query`, and
+  `graph_list` (`admin`/`schema_apply` refuse); TTL 60s–24h, default 1h. The
+  graph's Cedar policy must still permit the credential's actor.
+- **Exit codes** for plan/apply/lifecycle runs: 0 converged, 1 failed or
+  transport error, 2 refused or blocked, 3 partially converged, 4 recovery
+  required, 5 stalled or wait deadline, 6 cancelled.
 See the authoritative [managed command reference](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/cli/reference.md#managed-cluster-commands),
 [lifecycle](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/cli/managed-lifecycle.md) and
 [data-access guide](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/cli/managed-data.md) for flags and limits.
@@ -174,7 +214,8 @@ See the authoritative [managed command reference](https://github.com/ModernRelay
 | Symptom | Fix |
 |---|---|
 | Apply crashed mid-run | run `cluster apply` again — sidecars + sweep reconcile |
-| Held lock | First prove no `plan`/`apply`/`refresh`/`import` is still live; then use `cluster status` and clear that exact id with `cluster force-unlock <LOCK_ID> --config .` |
+| Held lock | `cluster observe` shows state and the holder without refusing. First prove no `plan`/`apply`/`refresh`/`import` is still live; then use `cluster status` and clear that exact id with `cluster force-unlock <LOCK_ID> --config .` |
+| `config_path_escape` / `config_path_symlink` | move the referenced file inside the config directory and reference it by a plain relative path |
 | Missing `state.json` | `cluster import` bootstraps state from config + live graphs, then `apply` |
 | Corrupt `state.json` | restore a trusted cluster-state backup or follow the diagnostic; `cluster import` never overwrites existing state |
 | Server refuses to boot | the error names its remedy (usually `cluster refresh` + `apply`, restart) |

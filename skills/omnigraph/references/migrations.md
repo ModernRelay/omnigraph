@@ -20,22 +20,39 @@ omnigraph upgrade ./graph.omni --json
 
 The default route is v6→v7→v8→v9 (or its remaining suffix). It preserves data,
 identity, retained commits and snapshots, but ending at v9 requires only `main`
-and no user property beginning with `_`. Merge/delete unneeded branches or
-rename offending properties with compatible tooling first. To preserve live
-branches and legacy system spellings, use `--to-format 8` on both check and
-execution; v0.11 serves the result. Explicit target 7 is an intermediate format
+and no user property beginning with `_`. v0.11 cannot open a v6 graph, so
+either delete non-main branches and `@rename_from` offending properties with
+the v0.10 binary first, or convert with `--to-format 8`, fix both with v0.11
+(`branch delete`, `schema apply`), then run `schema upgrade-system-columns`.
+A merge alone leaves a branch live. To preserve live branches and legacy
+system spellings, use `--to-format 8` on both check and execution; v0.11
+serves the result. Explicit target 7 is an intermediate format
 that v0.11 refuses on ordinary open. Checks are advisory and execution validates
 again; inspect findings, deferred checks and any required recovery action.
 
 Already-v8 graphs can use `omnigraph schema upgrade-system-columns
 ./graph.omni --check --json` and then omit `--check` for the v9 step. This is
-irreversible; retain the backup and stop overlapping processes. Follow an
-interruption's recovery instructions without deleting protocol markers. Rollback
-restores the entire pre-upgrade backup with the old executable.
+irreversible; retain the backup and stop overlapping processes. The stored
+schema's edge constraints are respelled automatically, but local `.pg` files
+still saying `@unique(src, dst)` must become `@unique(@src, @dst)` before the
+next `schema plan`/`apply`. An interrupted run is completed by the next
+read-write open. Follow an interruption's recovery instructions without
+deleting protocol markers. Rollback restores the entire pre-upgrade backup with
+the old executable.
 
 Cluster-managed roots and unqualified sources refuse in-place upgrade. Rebuild
 with a source-compatible export into a newly applied graph or parallel cluster,
-then verify and cut over. Do not point `init --force` at the old root. The
+then verify and cut over. Before the new `init`, edit the old `schema show`
+output (`src`/`dst` → `@src`/`@dst` in edge constraints; rename `_`-prefixed,
+`_distance`, and `_score` properties in both schema and JSONL `data`) and
+relocate export identity:
+
+```bash
+jq -c 'if has("id") then . else .id = .data.id | del(.data.id) end' \
+  graph.jsonl > graph-current.jsonl
+```
+
+Do not point `init --force` at the old root. The
 [upgrade guide](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/operations/upgrade.md) owns qualification,
 interruption handling, external Blob caveats and cluster cutover details.
 
@@ -45,6 +62,17 @@ interruption handling, external Blob caveats and cluster cutover details.
   and `dst` are user properties. New v9 schemas reserve leading `_`; new edge
   endpoint constraints use `@unique(@src, @dst)`. `GET /schema` and
   `schema show --json` report each graph's `system_columns`.
+- **Rewrite existing `.gq` before restarting on v0.11**, including every
+  stored-query registry: `$x.id`/`.src`/`.dst` → `$x.@id`/`.@src`/`.@dst`,
+  `{ id: $v }` match filters → `$x.@id = $v`, and `where id = …` →
+  `where @id = …`. Unless the type declares a user property named `id`, a bare
+  `id` is an unknown property (`T6` in projections, `T2` in match filters,
+  `T11` in mutation predicates) on either vintage, and a registry that fails typecheck quarantines its graph.
+  Run `lint` or `cluster validate` first. Unaliased result columns change name
+  (`p.id` → `p.@id`).
+- Inputs that v0.10 accepted can now fail: a `Date` string with a time of day,
+  whole-number float or boolean date values, and out-of-range stored date
+  counts (reads/exports of that column fail until corrected).
 - JSONL identity is top-level `id`, beside `type` or `edge`. On v9, `data.id`
   is a declared user property and `data.__id` is refused. v8 also accepts legacy
   `data.id` when top-level `id` is absent. Move predecessor export identity out
@@ -64,7 +92,12 @@ interruption handling, external Blob caveats and cluster cutover details.
 
 Full-text compatibility is independent of the storage conversion. Existing
 Lance-11-compatible indexes do not need a new rebuild solely for v0.11. Indexes
-from the older Lance transition still need the explicit procedure below.
+from the older Lance transition still need the explicit procedure below;
+`omnigraph upgrade` does not rebuild them.
+
+Released v0.10 graphs need no action for the withdrawn interim actor-provenance
+feature. Graphs or cluster ledgers written by a development build with it
+(schema IR v3, `actor_provenance` config, `--actor-provenance`) are refused.
 
 ## Upgrade v0.9 to v0.10
 
@@ -107,7 +140,7 @@ entity, property, graph-manifest, and published-dataset terms plus
 
 ## Pre-0.7 configuration
 
-| Before | v0.10 |
+| Before | Current |
 |---|---|
 | `omnigraph.yaml` | `cluster.yaml` for team deployment plus `~/.omnigraph/config.yaml` for operator settings |
 | `cli.actor` | `operator.actor` |
@@ -120,7 +153,7 @@ servers, output defaults, profiles, and aliases into the operator file.
 
 ## Retired addressing and verbs
 
-| Before | v0.10 |
+| Before | Current |
 |---|---|
 | `--target <name>` | `--server`, `--store`, `--cluster`, or `--profile`, as the command permits |
 | positional HTTP URL | `--server <name|url>` |
