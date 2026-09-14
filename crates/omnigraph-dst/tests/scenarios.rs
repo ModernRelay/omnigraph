@@ -103,13 +103,13 @@ fn dst_harness_same_seed_identical_universes_including_ids() {
 #[test]
 #[serial]
 fn dst_harness_crash_recovery_deterministic() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 21,
         ops: 24,
         crash_at: Some((
             7,
-            omnigraph::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+            omnigraph::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE.name(),
         )),
         ..Default::default()
     };
@@ -133,7 +133,7 @@ fn dst_harness_crash_recovery_deterministic() {
 #[test]
 #[ignore = "hunt: targeted-scheduling catalog run; run explicitly with -- --ignored"]
 fn dst_hunt_crash_window_sweep() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
 
     // Per schedulable window: a (seed × skip) matrix — different seeds sample
     // different op streams, skip k schedules the crash on the (k+1)-th
@@ -249,7 +249,7 @@ fn dst_hunt_crash_window_sweep() {
 #[test]
 #[serial]
 fn dst_discovery5_stale_sidecar_blocks_maintenance_until_reopen() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 10,
         ops: 24,
@@ -392,27 +392,27 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
 #[serial]
 fn dst_birth_contract_sweep() {
     use omnigraph_dst::harness::{BirthOutcome, run_birth_universe};
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
 
     #[allow(clippy::type_complexity)]
     let cases: [(&'static str, &dyn Fn(&BirthOutcome) -> bool, &str); 4] = [
         (
-            omnigraph::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN,
+            omnigraph::seams::catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.name(),
             &|o| *o == BirthOutcome::DiedThenReinitRecovers,
             "DiedThenReinitRecovers",
         ),
         (
-            omnigraph::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
+            omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN.name(),
             &|o| *o == BirthOutcome::DiedThenReinitRecovers,
             "DiedThenReinitRecovers",
         ),
         (
-            omnigraph::failpoints::names::INIT_POST_MANIFEST_CREATE,
+            omnigraph::seams::catalog::INIT_POST_MANIFEST_CREATE.name(),
             &|o| *o == BirthOutcome::DiedThenOpensClean,
             "DiedThenOpensClean (post-#495 init-cleanup fix)",
         ),
         (
-            omnigraph::failpoints::names::INIT_AFTER_COORDINATOR_INIT,
+            omnigraph::seams::catalog::INIT_AFTER_COORDINATOR_INIT.name(),
             &|o| *o == BirthOutcome::DiedThenOpensClean,
             "DiedThenOpensClean (post-#495 init-cleanup fix)",
         ),
@@ -445,18 +445,18 @@ fn dst_birth_contract_sweep() {
 #[serial]
 fn dst_open_crash_is_effect_free() {
     use omnigraph_dst::harness::run_open_crash_universe;
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
     assert!(
         run_open_crash_universe(
             "shared-memory://dst-opencrash-contract",
-            omnigraph::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+            omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ.name(),
         ),
         "open.before_schema_contract_read is no longer hit on the open path"
     );
     assert!(
         !run_open_crash_universe(
             "shared-memory://dst-opencrash-reload",
-            omnigraph::failpoints::names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
+            omnigraph::seams::catalog::SCHEMA_RELOAD_BEFORE_CONTRACT_READ.name(),
         ),
         "schema_reload.before_contract_read started firing on the PLAIN open path — \
          update the birth/open sweeps (it was reload-verb-only when pinned)"
@@ -987,8 +987,12 @@ fn concurrent_universe(root: &'static str, seed: u64) -> (Vec<(String, i64)>, us
     runtime.block_on(async move {
         // Identity + clock seams installed: ULIDs and wall-time reads in this
         // universe come from the seed tree / logical clock.
-        omnigraph::dst_ids::install_seeded_ulids(seeds.next_u64());
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(seeds.next_u64()),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             root,
@@ -2037,7 +2041,7 @@ fn dst_crash_state_enumeration_full() {
 #[test]
 #[serial]
 fn dst_maintenance_obligations_bite_and_replay() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let cells: [(&str, u64, usize); 3] = [
         ("optimize.before_compact", 7, 24),
         ("cleanup.post_recovery_check_pre_gates", 7, 24),
@@ -2076,7 +2080,7 @@ fn dst_maintenance_obligations_bite_and_replay() {
 #[test]
 #[serial]
 fn dst_sensitivity_maintenance_rerun_failure_is_red() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 7,
         ops: 24,
@@ -2150,7 +2154,7 @@ fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
 #[serial]
 #[ignore = "instrument: law-8 predict_merge disagreement triage — run explicitly"]
 fn dst_predict_triage() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let windows = [
         "branch_merge.adopt_after_append_pre_upsert",
         "branch_merge.adopt_after_upsert_pre_delete",
@@ -2205,7 +2209,7 @@ fn dst_predict_triage() {
 #[test]
 #[serial]
 fn dst_milestone_never_remerges_merged_branch() {
-    let _scenario = omnigraph::failpoints::FailScenario::setup();
+    let _scenario = omnigraph::seams::FailScenario::setup();
     let window = "branch_merge.adopt_between_insert_chunks";
     let sc = Scenario {
         seed: 218120,
@@ -2277,7 +2281,7 @@ fn dst_milestone_never_remerges_merged_branch() {
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 7,
         ops: 30,
@@ -2346,8 +2350,12 @@ fn dst_lance_bytes_canary() {
         .build_local(Default::default())
         .expect("canary runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(11_002);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(11_002),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             root,
@@ -2447,8 +2455,8 @@ fn dst_lance_bytes_canary() {
             "the canary never bit — no fired cell affected a read (all \
              miss/unfired); target substring or read path needs rework"
         );
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     }));
 }
 
@@ -2466,7 +2474,7 @@ fn dst_lance_bytes_canary() {
 #[serial]
 #[ignore = "instrument: reborn-branch cache-poison reader ablation — run explicitly"]
 fn dst_reborn_branch_cache_poison_reader_ablation() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     #[allow(clippy::type_complexity)] // (label, knob-mutator) cells
     let cells: [(&str, fn(&mut Scenario)); 14] = [
         ("baseline", |_| {}),
@@ -2538,13 +2546,6 @@ fn dst_reborn_branch_cache_poison_standalone_repro() {
 }
 
 fn reborn_branch_cache_poison_body() {
-    struct DstHookGuard;
-    impl Drop for DstHookGuard {
-        fn drop(&mut self) {
-            omnigraph::dst_clock::uninstall_logical_clock();
-            omnigraph::dst_ids::uninstall_seeded_ulids();
-        }
-    }
     let mut seeds = SplitMix64(9401);
     let runtime_seed = seeds.next_u64();
     let ulid_seed = seeds.next_u64();
@@ -2557,11 +2558,12 @@ fn reborn_branch_cache_poison_body() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
-        // Uninstall on BOTH exits: a failing assertion below must not leak
-        // the process-global DST hooks into the next #[serial] test.
-        let _dst_hooks = DstHookGuard;
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             "shared-memory://dst-f9-standalone",
@@ -2772,7 +2774,7 @@ fn reborn_branch_cache_poison_body() {
 #[test]
 #[serial]
 fn dst_reborn_branch_cache_poison_wide_face_regression() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 10_133,
         ops: 30,
@@ -2807,8 +2809,12 @@ fn dst_reborn_branch_cache_poison_minimal_shape_probe() {
         .build_local(Default::default())
         .expect("probe runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(9_002);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(9_002),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
 
         // EXACTLY observe_world's reads: person traversal + edge traversal
         // on the branch (the query channel — graph index machinery), not a
@@ -2896,8 +2902,8 @@ fn dst_reborn_branch_cache_poison_minimal_shape_probe() {
             );
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     }));
 }
 
@@ -2921,8 +2927,12 @@ fn dst_predict_born_on_both_person_probe() {
         .build_local(Default::default())
         .expect("probe runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(8_002);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(8_002),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let mut db = Omnigraph::init_with_storage(
             root,
             TEST_SCHEMA,
@@ -2982,8 +2992,8 @@ fn dst_predict_born_on_both_person_probe() {
             }
         }
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     }));
 }
 
@@ -2999,7 +3009,7 @@ fn dst_predict_born_on_both_person_probe() {
 #[serial]
 #[ignore = "instrument: 66-window one-universe-each milestone reach census"]
 fn dst_window_reach_probe() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let mut crossed: Vec<&str> = Vec::new();
     let mut dark: Vec<&str> = Vec::new();
     let mut errored: Vec<&str> = Vec::new();
@@ -3103,7 +3113,7 @@ fn known_failure_family(msg: &str) -> Option<&'static str> {
 fn dst_fleet() {
     // The window arm schedules real crash windows — same setup the hunt
     // and the reach probe perform.
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let n: u64 = std::env::var("DST_FLEET_SEEDS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -3367,7 +3377,7 @@ fn fleet_replay_bundle(
 #[test]
 #[serial]
 fn dst_seeded_violation_is_auto_bundled() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 7,
         ops: 24,
@@ -3438,8 +3448,12 @@ fn dst_v11_conservation_transfers() {
             .build_local(Default::default())
             .expect("seeded runtime");
         runtime.block_on(async move {
-            omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-            omnigraph::dst_clock::install_logical_clock();
+            let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+                omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+            ));
+            let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+                omnigraph::dst_clock::LogicalClock::default(),
+            ));
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
             let mut db = Omnigraph::init_with_storage(
                 root,
@@ -3517,8 +3531,8 @@ fn dst_v11_conservation_transfers() {
             }
 
             let rows = person_rows(&db).await;
-            omnigraph::dst_clock::uninstall_logical_clock();
-            omnigraph::dst_ids::uninstall_seeded_ulids();
+            drop(_clock);
+            drop(_ids);
             rows
         })
     }
@@ -3539,8 +3553,13 @@ fn dst_lever1_crash_during_recovery() {
     let sc = Scenario {
         seed: 4242,
         ops: 20,
-        crash_at: Some((6, omnigraph::failpoints::names::MUTATION_POST_TABLE_COMMIT)),
-        recovery_crash: Some(omnigraph::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH),
+        crash_at: Some((
+            6,
+            omnigraph::seams::catalog::MUTATION_POST_TABLE_COMMIT.name(),
+        )),
+        recovery_crash: Some(
+            omnigraph::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH.name(),
+        ),
         ..Default::default()
     };
     let a = run_universe("shared-memory://dst-l1-a", &sc);
@@ -3595,8 +3614,12 @@ fn dst_lever2_branch_lifecycle() {
             .build_local(Default::default())
             .expect("seeded runtime");
         runtime.block_on(async move {
-            omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-            omnigraph::dst_clock::install_logical_clock();
+            let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+                omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+            ));
+            let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+                omnigraph::dst_clock::LogicalClock::default(),
+            ));
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
             let db = Omnigraph::init_with_storage(
                 root,
@@ -3632,8 +3655,8 @@ fn dst_lever2_branch_lifecycle() {
             db.branch_delete("feature").await.expect("branch delete");
             let after = db.branch_list().await.expect("branch list 2");
 
-            omnigraph::dst_clock::uninstall_logical_clock();
-            omnigraph::dst_ids::uninstall_seeded_ulids();
+            drop(_clock);
+            drop(_ids);
             (main_before, after.len())
         })
     }
@@ -3663,8 +3686,12 @@ fn dst_merge_version_collision_diverged_edge_table() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             "shared-memory://dst-merge-collision",
@@ -3749,8 +3776,8 @@ fn dst_merge_version_collision_diverged_edge_table() {
             );
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -3771,8 +3798,12 @@ fn dst_merge_duplicates_born_on_both_edge() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             "shared-memory://dst-class-probe",
@@ -3873,8 +3904,8 @@ fn dst_merge_duplicates_born_on_both_edge() {
             }
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -3912,8 +3943,12 @@ edge WorksAt: Person -> Company
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             "shared-memory://dst-keyed-born-on-both",
@@ -4000,8 +4035,8 @@ edge WorksAt: Person -> Company
             );
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -4054,8 +4089,8 @@ fn dst_classa_ablation_matrix_body() {
         .unwrap_or_else(|e| panic!("upsert {name} v{ver} on {br}: {e:?}"));
     }
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(omnigraph::dst_clock::LogicalClock::default()));
         let mut verdicts: Vec<(bool, bool, bool, String)> = Vec::new();
         for combo in 0u8..8 {
             let (o, c, r) = (combo & 1 != 0, combo & 2 != 0, combo & 4 != 0);
@@ -4209,8 +4244,8 @@ fn dst_classa_ablation_matrix_body() {
                 }
             }
         }
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -4237,8 +4272,12 @@ fn dst_liveness_oracle_survives_cross_thread_work() {
         .build_local(Default::default())
         .expect("seeded runtime");
     runtime.block_on(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS.install(std::sync::Arc::new(
+            omnigraph::dst_ids::SeededUlids::new(ulid_seed),
+        ));
+        let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
+            omnigraph::dst_clock::LogicalClock::default(),
+        ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
         let db = Omnigraph::init_with_storage(
             "shared-memory://dst-liveness-bound",
@@ -4264,8 +4303,8 @@ fn dst_liveness_oracle_survives_cross_thread_work() {
             .expect("liveness bound tripped on a converging ensure_indices")
             .expect("ensure_indices");
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        drop(_clock);
+        drop(_ids);
     })
 }
 
@@ -5193,7 +5232,7 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
 #[serial]
 #[ignore = "0044 analysis instrument — run by hand with --ignored"]
 fn dst_bench_same_ruler_floor_probe() {
-    let _s = omnigraph::failpoints::FailScenario::setup();
+    let _s = omnigraph::seams::FailScenario::setup();
     // kind -> (seed, calls table); BTreeMap so the printout is stable.
     let mut cells: std::collections::BTreeMap<String, (u64, String)> = Default::default();
     for seed in 0..120u64 {

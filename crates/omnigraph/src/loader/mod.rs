@@ -362,9 +362,7 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::LOAD_POST_BRANCH_CREATE_PRE_STAGE,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -837,7 +835,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let staged = staging
         .stage_all_with_concurrency(db, branch, crate::exec::staging::stage_write_concurrency())
         .await?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    crate::seams::fail(&crate::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
     let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
     // `_queue_guards` holds the root-shared schema → branch → sorted-table
     // gates across manifest publication. This closes same-process
@@ -849,6 +847,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         updates,
         expected_versions,
         sidecar_handle,
+        sidecar_confirm_lost,
         guards: _queue_guards,
     } = staged
         .commit_all(
@@ -864,7 +863,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // have advanced and the v3 sidecar contains their exact transaction
     // identities, but the graph manifest has not published the result. Reuse
     // the mutation failpoint name so one failpoint pins the shared boundary.
-    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    crate::seams::fail(&crate::seams::catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
     let publish_result = db
         .commit_updates_on_branch_with_expected(
             branch,
@@ -894,7 +893,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // through the one manifest visibility point. Phase C succeeded — clean up
     // best-effort: failing the user here would error out a write that already
     // landed durably; a leftover fixed outcome is idempotently finalized later.
-    if let Some(handle) = sidecar_handle {
+    if let Some(handle) = sidecar_handle
+        && !sidecar_confirm_lost
+    {
         if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
             tracing::warn!(
                 error = %err,

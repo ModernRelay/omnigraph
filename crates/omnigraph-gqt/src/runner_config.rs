@@ -71,11 +71,11 @@ impl Environment {
         }
     }
 
-    pub(crate) fn admit(&self, has_faults: bool) -> Result<(), String> {
+    pub(crate) fn admit(&self, has_seams: bool) -> Result<(), String> {
         match self.execution {
             Execution::Engine {
                 storage: Storage::LocalFilesystem,
-            } if !has_faults => Ok(()),
+            } if !has_seams => Ok(()),
             Execution::Dst {
                 storage: Storage::InMemoryObjectStore,
                 ..
@@ -87,7 +87,7 @@ impl Environment {
                 }
             }
             _ => Err(format!(
-                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without faults and omnigraph-engine-dst/in-memory-object-store",
+                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams and omnigraph-engine-dst/in-memory-object-store",
                 self
             )),
         }
@@ -96,11 +96,11 @@ impl Environment {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Fault {
+pub(crate) struct SeamDirective {
     pub(crate) at: String,
     pub(crate) occurrence: usize,
-    pub(crate) action: FaultAction,
-    pub(crate) scope: FaultScope,
+    pub(crate) action: SeamAction,
+    pub(crate) scope: SeamScope,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -111,21 +111,41 @@ pub(crate) struct KnownFailure {
     pub(crate) matcher: ErrorMatch,
 }
 
+/// The typed failure a known-failure marker names: a `RecoveryRequired`
+/// returned by a mutate step with its exact reason, or an `Internal`
+/// manifest refusal from a restart whose message opens with `reason_prefix`
+/// (the rest of that message carries a per-run operation id).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "error", deny_unknown_fields)]
 pub(crate) enum ErrorMatch {
     RecoveryRequired { reason: String },
+    Internal { reason_prefix: String },
+}
+
+/// What the site does when the installed decision fires; must match the
+/// effect the seam declares in the engine's catalog.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SeamAction {
+    Fail,
+    Skip,
+    Hold,
+}
+
+impl SeamAction {
+    /// The spelling a case file uses.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SeamAction::Fail => "fail",
+            SeamAction::Skip => "skip",
+            SeamAction::Hold => "hold",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum FaultAction {
-    ReturnError,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FaultScope {
+pub(crate) enum SeamScope {
     NextStep,
 }
 
@@ -166,19 +186,28 @@ pub(crate) fn parse_runner(body: &str) -> Result<RunnerConfig, String> {
     Ok(config)
 }
 
-pub(crate) fn parse_fault(body: &str) -> Result<Fault, String> {
-    let fault: Fault = yaml(body)?;
-    if !(1..=1_000_000).contains(&fault.occurrence) {
-        return Err("invalid_case: fault occurrence must be between 1 and 1000000".into());
+pub(crate) fn parse_seam(body: &str) -> Result<SeamDirective, String> {
+    let seam: SeamDirective = yaml(body)?;
+    if !(1..=1_000_000).contains(&seam.occurrence) {
+        return Err("invalid_case: seam occurrence must be between 1 and 1000000".into());
     }
-    Ok(fault)
+    if seam.action == SeamAction::Hold {
+        return Err(
+            "invalid_case: `action: hold` is refused until a case can express two concurrent steps"
+                .into(),
+        );
+    }
+    Ok(seam)
 }
 
 pub(crate) fn parse_known_failure(body: &str) -> Result<KnownFailure, String> {
     let known_failure: KnownFailure = yaml(body)?;
-    let ErrorMatch::RecoveryRequired { reason } = &known_failure.matcher;
-    if known_failure.step == 0 || reason.trim().is_empty() || reason.len() > 2048 {
-        return Err("invalid_case: known_failure requires a positive step and a nonempty RecoveryRequired reason (at most 2048 bytes)".into());
+    let text = match &known_failure.matcher {
+        ErrorMatch::RecoveryRequired { reason } => reason,
+        ErrorMatch::Internal { reason_prefix } => reason_prefix,
+    };
+    if known_failure.step == 0 || text.trim().is_empty() || text.len() > 2048 {
+        return Err("invalid_case: known_failure requires a positive step and a nonempty RecoveryRequired reason or Internal reason_prefix (at most 2048 bytes)".into());
     }
     Ok(known_failure)
 }
@@ -264,16 +293,34 @@ mod tests {
     }
 
     #[test]
-    fn fault_fields_are_required_and_closed() {
-        let fault = "at: branch_merge.post_authority_capture\noccurrence: 1\naction: return_error\nscope: next_step";
-        assert!(parse_fault(fault).is_ok());
+    fn seam_fields_are_required_and_closed() {
+        let seam = "at: branch_merge.post_authority_capture\noccurrence: 1\naction: fail\nscope: next_step";
+        assert!(parse_seam(seam).is_ok());
+        assert!(parse_seam(&seam.replace("action: fail", "action: skip")).is_ok());
         for text in [
-            fault.replace("scope: next_step", ""),
-            fault.replace("next_step", "workload"),
-            fault.replace("occurrence: 1", "occurrence: 0"),
-            fault.replace("return_error", "panic"),
+            seam.replace("scope: next_step", ""),
+            seam.replace("next_step", "workload"),
+            seam.replace("occurrence: 1", "occurrence: 0"),
+            seam.replace("action: fail", "action: return_error"),
+            seam.replace("action: fail", "action: panic"),
+            seam.replace("action: fail", "action: hold"),
         ] {
-            assert!(parse_fault(&text).is_err());
+            assert!(parse_seam(&text).is_err());
         }
+    }
+
+    #[test]
+    fn known_failure_accepts_both_matchers() {
+        assert!(
+            parse_known_failure(
+                "step: 4\nmatch:\n  error: Internal\n  reason_prefix: \"OCC recovery sidecar '\""
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_known_failure("step: 4\nmatch:\n  error: Internal\n  reason_prefix: \"\"")
+                .is_err()
+        );
+        assert!(parse_known_failure("step: 4\nmatch:\n  error: Unknown\n  reason: \"x\"").is_err());
     }
 }

@@ -54,7 +54,7 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
 #[tokio::test]
 async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v9() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture_with_branch(root, false).await;
@@ -126,7 +126,7 @@ fn stored_files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTim
 #[tokio::test]
 async fn storage_upgrade_check_has_no_local_store_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -181,16 +181,17 @@ async fn storage_upgrade_check_has_no_local_store_effects() {
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility() {
-    use crate::failpoints::{FailScenario, ScopedFailPoint, names};
+    use crate::seams::{FailScenario, catalog};
     let _scenario = FailScenario::setup();
     for source_format in [6, 7] {
-        for boundary in [
-            names::UPGRADE_AFTER_FENCE,
-            names::UPGRADE_AFTER_STAGE,
-            names::UPGRADE_AFTER_BRANCH,
-            names::UPGRADE_BEFORE_ACTIVATION,
-            names::UPGRADE_AFTER_ACTIVATION,
+        for seam in [
+            &catalog::UPGRADE_AFTER_FENCE,
+            &catalog::UPGRADE_AFTER_STAGE,
+            &catalog::UPGRADE_AFTER_BRANCH,
+            &catalog::UPGRADE_BEFORE_ACTIVATION,
+            &catalog::UPGRADE_AFTER_ACTIVATION,
         ] {
+            let boundary = seam.name();
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_str().unwrap();
             synthetic_v6_fixture(root).await;
@@ -207,7 +208,7 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
                 assert_eq!(first.outcome, UpgradeOutcome::Completed, "{first:?}");
             }
             let report = {
-                let _fault = ScopedFailPoint::new(boundary, "return");
+                let _fault = seam.fire_always();
                 upgrade_storage(
                     root,
                     UpgradeOptions {
@@ -223,8 +224,10 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
                 UpgradeOutcome::RecoveryRequired,
                 "{boundary}: {report:?}"
             );
-            let activated = boundary == names::UPGRADE_AFTER_ACTIVATION && source_format == 7;
-            let intermediate = boundary == names::UPGRADE_AFTER_ACTIVATION && source_format == 6;
+            let activated =
+                boundary == catalog::UPGRADE_AFTER_ACTIVATION.name() && source_format == 7;
+            let intermediate =
+                boundary == catalog::UPGRADE_AFTER_ACTIVATION.name() && source_format == 6;
             assert_eq!(Omnigraph::open(root).await.is_ok(), activated, "{boundary}");
             assert_eq!(
                 Omnigraph::open_read_only(root).await.is_ok(),
@@ -298,13 +301,13 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn storage_upgrade_recovery_refuses_foreign_head_movement() {
-    use crate::failpoints::{FailScenario, ScopedFailPoint, names};
+    use crate::seams::FailScenario;
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
     {
-        let _fault = ScopedFailPoint::new(names::UPGRADE_AFTER_FENCE, "return");
+        let _fault = crate::seams::catalog::UPGRADE_AFTER_FENCE.fire_always();
         let interrupted = upgrade_storage(
             root,
             UpgradeOptions {
@@ -355,7 +358,7 @@ async fn storage_upgrade_recovery_refuses_foreign_head_movement() {
 #[tokio::test]
 async fn storage_upgrade_tracks_metadata_writes_and_no_payload_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -424,7 +427,7 @@ async fn storage_upgrade_tracks_metadata_writes_and_no_payload_effects() {
 #[tokio::test]
 async fn storage_upgrade_policy_denial_precedes_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     struct DenySchemaApply;
     impl omnigraph_policy::PolicyChecker for DenySchemaApply {
         fn check(
@@ -470,7 +473,7 @@ async fn storage_upgrade_policy_denial_precedes_effects() {
 #[tokio::test]
 async fn storage_upgrade_refuses_unknown_ownership_and_source() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     for (source_format, expected_code) in [("5", "unsupported_source"), ("99", "newer_than_binary")]
     {
         let dir = tempfile::tempdir().unwrap();
@@ -538,7 +541,7 @@ async fn storage_upgrade_refuses_unknown_ownership_and_source() {
 #[tokio::test]
 async fn storage_upgrade_refuses_preexisting_recovery_without_healing() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -606,7 +609,7 @@ async fn storage_upgrade_refuses_preexisting_recovery_without_healing() {
 #[tokio::test]
 async fn storage_upgrade_current_main_refuses_legacy_branch_without_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -640,7 +643,7 @@ async fn storage_upgrade_current_main_refuses_legacy_branch_without_effects() {
 #[tokio::test]
 async fn storage_upgrade_history_budget_precedes_manifest_reads() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -684,7 +687,7 @@ async fn storage_upgrade_history_budget_precedes_manifest_reads() {
 #[tokio::test]
 async fn storage_upgrade_v7_to_v8_preserves_manifest_fragments_and_history() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -797,13 +800,13 @@ async fn storage_upgrade_v7_to_v8_preserves_manifest_fragments_and_history() {
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continuing() {
-    use crate::failpoints::{FailScenario, ScopedFailPoint, names};
+    use crate::seams::FailScenario;
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
     {
-        let _fault = ScopedFailPoint::new(names::UPGRADE_AFTER_FENCE, "return");
+        let _fault = crate::seams::catalog::UPGRADE_AFTER_FENCE.fire_always();
         let report = upgrade_storage(
             root,
             UpgradeOptions {
@@ -965,7 +968,7 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
 #[tokio::test]
 async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_name() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let db =
@@ -1041,7 +1044,7 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
 #[tokio::test]
 async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     drop(
@@ -1139,7 +1142,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
 #[tokio::test]
 async fn storage_upgrade_legacy_source_refuses_reserved_retirement_metadata_without_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     for source in [6, 7] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
@@ -1197,7 +1200,7 @@ async fn storage_upgrade_legacy_source_refuses_reserved_retirement_metadata_with
 #[tokio::test]
 async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v9() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     drop(

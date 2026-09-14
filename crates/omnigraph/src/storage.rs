@@ -308,6 +308,44 @@ pub fn normalize_root_uri(uri: &str) -> Result<String> {
     Ok(omnigraph_storage::normalize_root_uri(uri)?)
 }
 
+/// What the storage seam holds: a decorator over the adapter a handle is
+/// about to use. The trait itself only asks for a wrapper. The harness's
+/// decorator builds its failing adapter once and hands back the same `Arc` on
+/// every call, so all handles of one universe share it.
+#[cfg(feature = "dst")]
+pub trait DecorateStorage: omnigraph_seams::Behavior + Send + Sync {
+    fn wrap(&self, base: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter>;
+}
+
+/// The storage seam, consulted wherever an adapter enters a handle: init,
+/// read-write open and read-only open alike, so a reopen after a crash and a
+/// bystander open see the same decoration as the first handle.
+#[cfg(feature = "dst")]
+pub static STORAGE: omnigraph_seams::Seam<
+    dyn DecorateStorage,
+    omnigraph_seams::Global<dyn DecorateStorage>,
+> = omnigraph_seams::Seam::new(
+    "storage",
+    omnigraph_seams::Op::Unreachable,
+    omnigraph_seams::Global::new(),
+);
+
+/// Apply the installed storage decoration, or return `base` unchanged.
+#[cfg(feature = "dst")]
+pub(crate) fn decorate(base: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter> {
+    match STORAGE.with(|decorator| decorator.wrap(Arc::clone(&base))) {
+        Some(wrapped) => wrapped,
+        None => base,
+    }
+}
+
+/// Without the `dst` feature no decoration authority exists.
+#[cfg(not(feature = "dst"))]
+#[inline(always)]
+pub(crate) fn decorate(base: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter> {
+    base
+}
+
 pub(crate) fn write_queue_root_identity(normalized_root: &str) -> Result<String> {
     Ok(omnigraph_storage::write_queue_root_identity(
         normalized_root,

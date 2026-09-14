@@ -721,6 +721,7 @@ durable_calls! {
     ("instrumentation.rs", ".rename_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("instrumentation.rs", ".delete_prefix(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
+    ("lance_access.rs", ".put_opts(", 1, WriteProtocol::Composed("Lance-realm object-store seam forwarding (dst only)")),
     ("storage.rs", ".write_bytes(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".write_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("storage.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),

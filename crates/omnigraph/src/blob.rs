@@ -1027,7 +1027,7 @@ impl Omnigraph {
         let stable_table_id = entry.identity.stable_table_id;
         let table_incarnation_id = entry.identity.table_incarnation_id;
 
-        crate::failpoints::maybe_fail(crate::failpoints::names::BLOB_READ_POST_CAPTURE)?;
+        crate::seams::fail(&crate::seams::catalog::BLOB_READ_POST_CAPTURE)?;
 
         let dataset = Arc::new(if entry.native_dataset_branch.is_some() {
             // Local filesystems provide no manifest e-tag, so the ordinary

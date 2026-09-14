@@ -9,7 +9,7 @@ use omnigraph_compiler::QueryResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::runner_config::{Environment, Execution, Fault};
+use crate::runner_config::{Environment, Execution, SeamAction, SeamDirective};
 use crate::{CaseOutcome, parse_case, stem_of};
 
 mod known_failure;
@@ -32,7 +32,6 @@ struct Observations {
     values: Vec<String>,
     bytes: usize,
     overflow: bool,
-    fault_hits: Vec<String>,
     operation: Option<serde_json::Value>,
     evidence: Vec<serde_json::Value>,
     lifecycle: Option<[std::sync::Arc<std::sync::atomic::AtomicU64>; 2]>,
@@ -69,24 +68,31 @@ pub(crate) fn lifetime_counts() -> Option<[u64; 2]> {
         .flatten()
 }
 
+/// The guard a decision seam's installer returns.
+#[cfg(tokio_unstable)]
+type DecideGuard = omnigraph::seams::Installed<
+    dyn omnigraph::seams::Decide,
+    omnigraph::seams::Global<dyn omnigraph::seams::Decide>,
+>;
+
 #[cfg(tokio_unstable)]
 fn lifecycle_probe() -> (
     [std::sync::Arc<std::sync::atomic::AtomicU64>; 2],
-    Vec<omnigraph::failpoints::ScopedFailPoint>,
+    Vec<DecideGuard>,
 ) {
     let counts = [
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ];
     let guards = [
-        omnigraph::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
-        omnigraph::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+        &omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
+        &omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
     ]
     .into_iter()
     .zip(counts.iter())
-    .map(|(name, count)| {
+    .map(|(seam, count)| {
         let count = count.clone();
-        omnigraph::failpoints::ScopedFailPoint::with_callback(name, move || {
+        seam.observe(move || {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
     })
@@ -151,93 +157,163 @@ pub(crate) fn observe_query<E: std::fmt::Display>(result: &Result<QueryResult, E
     }
 }
 
+/// Record the typed shape of a step's error, the evidence a known-failure
+/// marker is matched against: a `RecoveryRequired` with its reason, or a
+/// `Manifest` error with its kind.
 pub(crate) fn observe_fault(error: &OmniError) {
-    if let OmniError::RecoveryRequired {
-        operation_id,
-        reason,
-    } = error
-    {
-        record(
+    match error {
+        OmniError::RecoveryRequired {
+            operation_id,
+            reason,
+        } => record(
             "typed_error",
             serde_json::json!({"error": "RecoveryRequired", "reason": reason, "operation_id": operation_id, "message": error.to_string()}),
-        );
-    }
-    let message = match error {
-        OmniError::Manifest(error) => &error.message,
-        OmniError::RecoveryRequired { reason, .. } => reason,
-        _ => return,
-    };
-    if let Some(name) = message.strip_prefix("injected failpoint triggered: ") {
-        OBSERVATIONS
-            .try_with(|events| events.borrow_mut().fault_hits.push(name.to_string()))
-            .unwrap_or_default();
-        record("fault_delivered", serde_json::json!({"hook": name}));
-        observe(|| format!("fault delivered: {name}"));
+        ),
+        OmniError::Manifest(manifest) => record(
+            "typed_error",
+            serde_json::json!({"error": "Manifest", "kind": format!("{:?}", manifest.kind), "reason": manifest.message, "message": error.to_string()}),
+        ),
+        _ => {}
     }
 }
 
-fn supported_fault(fault: &Fault) -> bool {
-    [
-        "branch_merge.post_authority_capture",
-        "branch_merge.post_sidecar_pre_fork",
-        "branch_merge.post_effects_pre_confirm",
-        "branch_merge.post_phase_b_pre_manifest_commit",
-        "mutation.post_sidecar_pre_fork",
-    ]
-    .contains(&fault.at.as_str())
+/// Admission of one seam directive against the engine's catalog and the step
+/// it precedes: the seam must exist, the action must match the effect the
+/// site declares, and the step must be of a kind that crosses the seam's
+/// operation.
+pub(crate) fn admit_seam(
+    seam: &SeamDirective,
+    step: Option<&crate::Step>,
+) -> Result<&'static omnigraph::seams::DecideSeam, String> {
+    use omnigraph::seams::{Effect, Op};
+    let Some(entry) = omnigraph::seams::catalog::decide(&seam.at) else {
+        return Err(format!(
+            "unsupported_environment: unknown seam: {}",
+            seam.at
+        ));
+    };
+    let effect_ok = matches!(
+        (seam.action, entry.effect()),
+        (SeamAction::Fail, Some(Effect::Fail | Effect::Contention))
+            | (SeamAction::Skip, Some(Effect::Skip))
+    );
+    if !effect_ok {
+        return Err(format!(
+            "unsupported_environment: seam {} declares effect {} and does not admit action {}",
+            seam.at,
+            entry.effect().map_or("none", |effect| effect.as_str()),
+            seam.action.as_str()
+        ));
+    }
+    let compatible = matches!(
+        (entry.op(), step),
+        (Op::Mutation | Op::AnyWrite, Some(crate::Step::Mutate(_)))
+            | (
+                Op::BranchMerge | Op::AnyWrite,
+                Some(crate::Step::Control(crate::ControlStep {
+                    write: crate::ControlWrite::Merge { .. },
+                    ..
+                })),
+            )
+            | (
+                Op::BranchCreate | Op::AnyWrite,
+                Some(crate::Step::Control(crate::ControlStep {
+                    write: crate::ControlWrite::Create { .. },
+                    ..
+                })),
+            )
+            | (
+                Op::BranchDelete | Op::AnyWrite,
+                Some(crate::Step::Control(crate::ControlStep {
+                    write: crate::ControlWrite::Delete { .. },
+                    ..
+                })),
+            )
+    );
+    if !compatible {
+        return Err(format!(
+            "unsupported_environment: seam {} (operation {}) is not crossed by the step it precedes",
+            seam.at,
+            entry.op().as_str()
+        ));
+    }
+    Ok(entry)
+}
+
+/// One armed seam: the guard that keeps the decider installed for the step,
+/// and the counter that proves the site was crossed and fired.
+#[cfg(tokio_unstable)]
+pub(crate) struct ArmedSeam {
+    at: String,
+    occurrence: usize,
+    guard: Option<DecideGuard>,
+    counted: std::sync::Arc<omnigraph::seams::Counted>,
 }
 
 #[cfg(tokio_unstable)]
-pub(crate) fn arm_fault(
-    fault: Option<&Fault>,
-) -> Result<Option<omnigraph::failpoints::ScopedFailPoint>, String> {
-    OBSERVATIONS
-        .try_with(|events| events.borrow_mut().fault_hits.clear())
-        .unwrap_or_default();
-    fault
-        .map(|fault| {
-            if !supported_fault(fault) {
-                return Err(format!(
-                    "unsupported_environment: unsupported DST failpoint: {}",
-                    fault.at
-                ));
-            }
-            let action = if fault.occurrence == 1 {
-                "1*return".into()
-            } else {
-                format!("{}*off->1*return", fault.occurrence - 1)
-            };
-            Ok(omnigraph::failpoints::ScopedFailPoint::new(
-                &fault.at, &action,
-            ))
+pub(crate) fn arm_seam(
+    seam: Option<&SeamDirective>,
+    step: &crate::Step,
+) -> Result<Option<ArmedSeam>, String> {
+    seam.map(|seam| {
+        let entry = admit_seam(seam, Some(step))?;
+        let (guard, counted) = entry.count_and_fire_at(seam.occurrence as u64);
+        Ok(ArmedSeam {
+            at: seam.at.clone(),
+            occurrence: seam.occurrence,
+            guard: Some(guard),
+            counted,
         })
-        .transpose()
+    })
+    .transpose()
 }
 
 #[cfg(not(tokio_unstable))]
-pub(crate) fn arm_fault(fault: Option<&Fault>) -> Result<Option<()>, String> {
-    if fault.is_some() {
+pub(crate) struct ArmedSeam;
+
+#[cfg(not(tokio_unstable))]
+pub(crate) fn arm_seam(
+    seam: Option<&SeamDirective>,
+    _step: &crate::Step,
+) -> Result<Option<ArmedSeam>, String> {
+    if seam.is_some() {
         Err("unsupported_environment: DST runner is unavailable".into())
     } else {
         Ok(None)
     }
 }
 
-pub(crate) fn finish_fault(fault: Option<&Fault>) -> Result<(), String> {
-    let Some(fault) = fault else {
+/// Uninstall the decider and check delivery: the site fired exactly on the
+/// declared crossing. The record is the proof a case's report carries.
+#[cfg(tokio_unstable)]
+pub(crate) fn finish_seam(armed: Option<ArmedSeam>) -> Result<(), String> {
+    let Some(mut armed) = armed else {
         return Ok(());
     };
-    let hits = OBSERVATIONS
-        .try_with(|events| events.borrow().fault_hits.clone())
-        .unwrap_or_default();
-    if hits != [fault.at.clone()] {
-        Err(format!(
-            "fault_unobserved: configured faults were not observed exactly once by the selected operation: {}; observed: {hits:?}",
-            fault.at
-        ))
-    } else {
-        Ok(())
+    drop(armed.guard.take());
+    let crossings = armed.counted.crossings();
+    if !armed.counted.fired() {
+        return Err(format!(
+            "seam_unobserved: seam {} was not crossed on occurrence {} by the selected operation; crossings observed: {crossings}",
+            armed.at, armed.occurrence
+        ));
     }
+    record(
+        "seam_delivered",
+        serde_json::json!({"at": armed.at, "occurrence": armed.occurrence, "crossings": crossings}),
+    );
+    observe(|| {
+        format!(
+            "seam delivered: {} on crossing {}",
+            armed.at, armed.occurrence
+        )
+    });
+    Ok(())
+}
+
+#[cfg(not(tokio_unstable))]
+pub(crate) fn finish_seam(_armed: Option<ArmedSeam>) -> Result<(), String> {
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -378,7 +454,7 @@ fn error_code(error: &str) -> &'static str {
         "invalid_case",
         "unsupported_environment",
         "environment_changed",
-        "fault_unobserved",
+        "seam_unobserved",
         "fault_cleanup_failed",
         "replay_mismatch",
         "worker_failed",
@@ -692,8 +768,13 @@ fn run_invocation(
         String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))?;
     let text: std::sync::Arc<str> = text.into();
     summary.case_digest = Some(digest(text.as_bytes()));
-    let case =
-        parse_case(&stem_of(path), &text).map_err(|error| format!("invalid_case: {error}"))?;
+    let case = parse_case(&stem_of(path), &text).map_err(|error| {
+        if error.starts_with("invalid_case:") {
+            error
+        } else {
+            format!("invalid_case: {error}")
+        }
+    })?;
     summary.declared = Some(case.runner.environments.clone());
     for env in &case.runner.environments {
         for seed in env.seeds() {
@@ -734,15 +815,9 @@ fn run_invocation(
         return Err("invalid_case: environment selector matches no declared environment".into());
     }
     for env in &selected_envs {
-        env.admit(!case.faults.is_empty())?;
+        env.admit(!case.seams.is_empty())?;
     }
-    for (ordinal, fault) in &case.faults {
-        if !supported_fault(fault) {
-            return Err(format!(
-                "unsupported_environment: unsupported DST failpoint: {}",
-                fault.at
-            ));
-        }
+    for (ordinal, seam) in &case.seams {
         let step = case
             .items
             .iter()
@@ -751,20 +826,7 @@ fn run_invocation(
                 crate::Item::Loop { steps, .. } => steps.as_slice(),
             })
             .find(|step| step.ordinal() == *ordinal);
-        let compatible = match step {
-            Some(crate::Step::Mutate(_)) => fault.at.starts_with("mutation."),
-            Some(crate::Step::Control(crate::ControlStep {
-                write: crate::ControlWrite::Merge { .. },
-                ..
-            })) => fault.at.starts_with("branch_merge."),
-            _ => false,
-        };
-        if !compatible {
-            return Err(format!(
-                "unsupported_environment: fault {} is incompatible with operation {ordinal}",
-                fault.at
-            ));
-        }
+        admit_seam(seam, step)?;
     }
     if bless && case.known_failure.is_some() {
         return Err("invalid_case: bless is refused for known_failure cases".into());
@@ -1021,7 +1083,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     {
         return Err("environment_changed: worker selection is not declared".into());
     }
-    input.environment.admit(!case.faults.is_empty())?;
+    input.environment.admit(!case.seams.is_empty())?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
@@ -1146,7 +1208,7 @@ fn dst_report(
             ));
         }
     }
-    let _failpoints = omnigraph::failpoints::FailScenario::setup();
+    let _seams = omnigraph::seams::FailScenario::setup();
     let environment = omnigraph_dst::memory::MemoryEnvironment::new(
         "shared-memory://gqt-dst/case",
         seed,

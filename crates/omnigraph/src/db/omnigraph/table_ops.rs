@@ -399,9 +399,7 @@ async fn maintain_indices_for_branch(
                         pin.table_key, work.specs
                     ))
                 })?;
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
             planned_transactions.insert(pin.identity, staged.transaction_identity());
             existing_staged.insert(pin.table_key.clone(), staged);
         }
@@ -484,8 +482,8 @@ async fn maintain_indices_for_branch(
     let graph_commit_id = if recovery_pins.is_empty() {
         // Preserve the no-work failpoint contract without manufacturing durable
         // recovery state or graph lineage.
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        crate::seams::fail(
+            &crate::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
         )?;
         None
     } else {
@@ -551,9 +549,7 @@ async fn maintain_indices_for_branch(
 
         let post_arm_result = async {
             if !first_touch_sources.is_empty() {
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::ENSURE_INDICES_POST_SIDECAR_PRE_FORK,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_SIDECAR_PRE_FORK)?;
             }
 
             let mut updates = Vec::with_capacity(recovery_pins.len());
@@ -612,8 +608,8 @@ async fn maintain_indices_for_branch(
                                 work.specs
                             ))
                         })?;
-                    crate::failpoints::maybe_fail(
-                        crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+                    crate::seams::fail(
+                        &crate::seams::catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
                     )?;
                     staged
                 };
@@ -650,14 +646,10 @@ async fn maintain_indices_for_branch(
                         .version_metadata
                         .with_table_fork_owner(pin.table_fork_owner.as_deref()),
                 });
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::ENSURE_INDICES_POST_TABLE_EFFECT,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_TABLE_EFFECT)?;
             }
 
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM)?;
             crate::db::manifest::confirm_ensure_indices_sidecar_v9(
                 db.root_uri(),
                 db.storage_adapter(),
@@ -667,8 +659,8 @@ async fn maintain_indices_for_branch(
                 &confirmed_ref_identifiers,
             )
             .await?;
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            crate::seams::fail(
+                &crate::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
             )?;
             let published = commit_updates_on_branch_with_expected(
                 db,
@@ -1327,7 +1319,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             Ok((ds, Some(branch.to_string())))
         }
         source_branch => {
-            crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_CLASSIFY)?;
+            crate::seams::fail(&crate::seams::catalog::FORK_BEFORE_CLASSIFY)?;
             let live = db.snapshot_for_branch(Some(active_branch)).await?;
             let current = live.dataset(table_key).ok_or_else(|| {
                 OmniError::manifest_read_set_changed(
@@ -1445,7 +1437,7 @@ pub(crate) async fn classify_fork_ref_with_references(
     excluding_operation_id: Option<&str>,
     references: &crate::db::manifest::NativeForkReferences,
 ) -> ForkRefStatus {
-    if crate::failpoints::maybe_fail(crate::failpoints::names::CLASSIFY_FRESH_READ).is_err() {
+    if crate::seams::fail(&crate::seams::catalog::CLASSIFY_FRESH_READ).is_err() {
         return ForkRefStatus::Indeterminate;
     }
     let sidecars =
@@ -1555,9 +1547,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     // boundary. EnsureIndices itself stages existing targets before its gates;
     // legacy callers of this shared helper still exercise the same no-HEAD-
     // movement guarantee.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
     let new_ds = db
         .storage()
         .commit_staged(ds.clone(), staged)

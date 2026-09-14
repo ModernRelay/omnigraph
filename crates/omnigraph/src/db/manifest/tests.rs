@@ -283,7 +283,7 @@ async fn exact_genesis_probe_rejects_another_initialization_attempt() {
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     for legacy in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -305,12 +305,12 @@ async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
         let test_thread = std::thread::current().id();
         let _probes = (!legacy).then(|| {
             [
-                crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE,
-                crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+                &crate::seams::catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
+                &crate::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
             ]
-            .map(|name| {
+            .map(|seam| {
                 let reached_effects = Arc::clone(&reached_effects);
-                crate::failpoints::ScopedFailPoint::with_callback(name, move || {
+                seam.observe(move || {
                     if std::thread::current().id() == test_thread {
                         reached_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
@@ -356,7 +356,7 @@ async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn open_refuses_unknown_schema_features_before_recovery() {
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     for staged in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -388,12 +388,12 @@ async fn open_refuses_unknown_schema_features_before_recovery() {
         let reached_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let test_thread = std::thread::current().id();
         let _probes = [
-            crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE,
-            crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+            &crate::seams::catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
+            &crate::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
         ]
-        .map(|name| {
+        .map(|seam| {
             let reached_effects = Arc::clone(&reached_effects);
-            crate::failpoints::ScopedFailPoint::with_callback(name, move || {
+            seam.observe(move || {
                 if std::thread::current().id() == test_thread {
                     reached_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }

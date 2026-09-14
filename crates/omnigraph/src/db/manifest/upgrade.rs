@@ -706,7 +706,7 @@ async fn run_step(
         publish_fence(main, json, intent.target_format).await?;
     }
     report.last_durable_completed_boundary = Some("source_fenced".into());
-    crate::failpoints::maybe_fail(crate::failpoints::names::UPGRADE_AFTER_FENCE)?;
+    crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_FENCE)?;
     for branch in &intent.branches {
         let current = open(root, branch.native.as_deref()).await?;
         if crate::branch_control::dataset_branch_identifier(&current)
@@ -729,7 +729,7 @@ async fn run_step(
             "converted:{}",
             branch.native.as_deref().unwrap_or("main")
         ));
-        crate::failpoints::maybe_fail(crate::failpoints::names::UPGRADE_AFTER_BRANCH)?;
+        crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_BRANCH)?;
     }
     for branch in &intent.branches {
         let current = open(root, branch.native.as_deref()).await?;
@@ -747,10 +747,10 @@ async fn run_step(
     if intent_from(&main)?.as_ref() != Some(&intent) {
         return Err(invalid("activation ownership changed"));
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::UPGRADE_BEFORE_ACTIVATION)?;
+    crate::seams::fail(&crate::seams::catalog::UPGRADE_BEFORE_ACTIVATION)?;
     publish_activation(main).await?;
     report.last_durable_completed_boundary = Some("activated".into());
-    crate::failpoints::maybe_fail(crate::failpoints::names::UPGRADE_AFTER_ACTIVATION)?;
+    crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_ACTIVATION)?;
     report.outcome = UpgradeOutcome::Completed;
     report.completed_handlers.push(handler.into());
     report.recovery = None;
@@ -1443,7 +1443,7 @@ async fn publish_conversion(
             .await
             .map_err(OmniError::storage)?
     };
-    crate::failpoints::maybe_fail(crate::failpoints::names::UPGRADE_AFTER_STAGE)?;
+    crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_STAGE)?;
     let target = CommitBuilder::new(destination)
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)

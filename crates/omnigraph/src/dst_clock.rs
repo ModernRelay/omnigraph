@@ -1,16 +1,15 @@
-//! DST: thread-local injectable wall clock — the time seam,
-//! twin of `dst_ids`. Routes the engine's behavior-feeding and stamp-feeding
-//! wall-clock reads (optimize cutoff, schema-apply cutoff, recovery
-//! `started_at` stamps) through one function.
+//! The time seam: every behavior-feeding and stamp-feeding wall-clock read
+//! in the engine (optimize cutoff, schema-apply cutoff, recovery `started_at`
+//! stamps) goes through [`now_utc`] or [`system_time_now`].
 //!
 //! Uninstalled (default, production): real `Utc::now()` / `SystemTime::now()`.
-//! Installed (harness thread): a logical clock — fixed epoch + strictly-monotonic
-//! counter, one millisecond per read — deterministic across runs and
-//! processes. Monotonic so stamp ordering matches event ordering, like real
-//! time would.
+//! Installed (a harness thread): a [`LogicalClock`], a fixed epoch plus a
+//! strictly monotonic counter, one millisecond per read, deterministic across
+//! runs and processes. The slot is thread-local: each harness thread owns its
+//! own clock, and a thread with no clock reads the real one.
 
 #[cfg(feature = "dst")]
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 #[cfg(feature = "dst")]
 use std::time::{Duration, UNIX_EPOCH};
@@ -19,39 +18,48 @@ use std::time::{Duration, UNIX_EPOCH};
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 
-/// 2026-01-01T00:00:00Z — the logical epoch when installed.
 #[cfg(feature = "dst")]
-const LOGICAL_EPOCH_MS: u64 = 1_767_225_600_000;
+use omnigraph_seams::{Behavior, Op};
 
+/// 2026-01-01T00:00:00Z, the logical epoch when installed.
 #[cfg(feature = "dst")]
-thread_local! {
-    static INSTALLED: Cell<bool> = const { Cell::new(false) };
-    static TICKS: Cell<u64> = const { Cell::new(0) };
+pub const LOGICAL_EPOCH_MS: u64 = 1_767_225_600_000;
+
+/// What the clock seam holds: a source of milliseconds since the Unix epoch.
+#[cfg(feature = "dst")]
+pub trait Clock: Behavior {
+    fn now_ms(&self) -> u64;
 }
 
-/// Install the logical clock on THIS thread (harness/test API).
+/// Fixed epoch plus one millisecond per read, so stamp order matches event
+/// order the way real time would. Atomic so the `Arc` a seam holds is `Sync`;
+/// the slot is thread-local, so no two threads ever share one.
 #[cfg(feature = "dst")]
-pub fn install_logical_clock() {
-    INSTALLED.with(|installed| installed.set(true));
-    TICKS.with(|ticks| ticks.set(0));
+#[derive(Default)]
+pub struct LogicalClock {
+    ticks: AtomicU64,
 }
 
-/// Uninstall: reads on this thread return to the real clock.
 #[cfg(feature = "dst")]
-pub fn uninstall_logical_clock() {
-    INSTALLED.with(|installed| installed.set(false));
+impl Behavior for LogicalClock {}
+
+#[cfg(feature = "dst")]
+impl Clock for LogicalClock {
+    fn now_ms(&self) -> u64 {
+        let t = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        LOGICAL_EPOCH_MS + t
+    }
+}
+
+#[cfg(feature = "dst")]
+omnigraph_seams::thread_local_seam! {
+    /// The clock seam. Install a [`LogicalClock`] on the harness thread.
+    pub static CLOCK: dyn Clock = ("clock", Op::Unreachable);
 }
 
 #[cfg(feature = "dst")]
 fn next_logical_ms() -> Option<u64> {
-    if !INSTALLED.with(|installed| installed.get()) {
-        return None;
-    }
-    TICKS.with(|ticks| {
-        let t = ticks.get() + 1;
-        ticks.set(t);
-        Some(LOGICAL_EPOCH_MS + t)
-    })
+    CLOCK.with(|clock| clock.now_ms())
 }
 
 /// Seam for `chrono::Utc::now()` call sites. Without the `dst` feature:

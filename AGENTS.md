@@ -32,8 +32,10 @@ Tools that support `@` imports include these automatically:
 - Version surveyed: 0.11.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
-- Workspace: compiler, storage, engine (`omnigraph-engine` package), policy,
-  API types, cluster, CLI, server, Azure admission wrapper, benchmark harness,
+- Workspace: compiler, storage, `omnigraph-seams` (the one seam type every
+  test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
+  package), policy, API types, cluster, CLI, server, Azure admission
+  wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
   test per case), and `omnigraph-dst` (deterministic simulation testing; needs
   `--cfg tokio_unstable`, set by its crate-local `.cargo/config.toml` when

@@ -1166,7 +1166,7 @@ impl TableStore {
         // failpoint seam simulates the e_tag-less-store configuration so tests
         // can prove the logical witness alone refuses a branch delete/recreate.
         let etag_witness_unavailable =
-            crate::failpoints::is_enabled(crate::failpoints::names::CHANGE_FEED_SKIP_ETAG_WITNESS);
+            crate::seams::skip(&crate::seams::catalog::CHANGE_FEED_SKIP_ETAG_WITNESS);
         if !etag_witness_unavailable
             && let Some(expected) = entry.version_metadata.e_tag()
             && dataset.manifest_location().e_tag.as_deref() != Some(expected)
@@ -1319,7 +1319,7 @@ impl TableStore {
         // The ref is now independently durable. Any error from this point is an
         // ambiguous/post-effect outcome to the caller and must retain an armed
         // recovery intent rather than being treated as a safe pre-effect retry.
-        crate::failpoints::maybe_fail(crate::failpoints::names::FORK_POST_CREATE_PRE_OPEN)?;
+        crate::seams::fail(&crate::seams::catalog::FORK_POST_CREATE_PRE_OPEN)?;
 
         // Re-open through the shared session for normal cache behavior. The
         // returned handle above is used only as proof that the matching branch

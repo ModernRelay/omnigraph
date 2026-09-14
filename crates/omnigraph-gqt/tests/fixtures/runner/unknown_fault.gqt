@@ -12,10 +12,10 @@ node Person {
 }
 --- seed
 {"type":"Person","data":{"name":"alice"}}
---- fault
+--- seam
 at: branch_merge.typo
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate
