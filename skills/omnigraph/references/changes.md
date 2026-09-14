@@ -67,7 +67,12 @@ terminal page reached the captured head.
 Delivery is at least once. Apply each block idempotently by `graph_commit_id`,
 then atomically persist the terminal cursor with the applied blocks. Cursors are
 opaque and bound to graph, branch lifetime, and filter scope; the server stores
-no consumer position.
+no consumer position. Reusing a cursor with a different scope, or passing a
+page token as a cursor, returns `400`.
+
+A feed that reaches a user-schema change returns the blocks completed before it
+with `caught_up: false`; the next poll returns `409 change_diff_refusal`
+(`reason: schema_boundary`). Capture a new baseline, as for a retention gap.
 
 ## Recover from retention gaps
 
