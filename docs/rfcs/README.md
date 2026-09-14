@@ -38,10 +38,11 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0066**; lower gaps are historical and must
+The next available number is **0068**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0058 by
-PR #662 for retained merged ancestry; 0059 by PR #675; 0060 by PR #677).
+PR #662 for retained merged ancestry; 0059 by PR #675; 0060 by PR #677;
+0066 by PR #697 for server lifecycle and online deployment).
 
 ## Required frontmatter
 
@@ -189,3 +190,4 @@ This table is the human index for the canonical RFC corpus.
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
 | [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | accepted | in-progress |
 | [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |
+| [0067](0067-engine-version-2.md) | Engine version 2 | maintainer | draft | not-started |
