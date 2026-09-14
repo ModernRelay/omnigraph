@@ -9,7 +9,7 @@
 //! own clock, and a thread with no clock reads the real one.
 
 #[cfg(feature = "dst")]
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 #[cfg(feature = "dst")]
 use std::time::{Duration, UNIX_EPOCH};
@@ -32,11 +32,12 @@ pub trait Clock: Behavior {
 }
 
 /// Fixed epoch plus one millisecond per read, so stamp order matches event
-/// order the way real time would.
+/// order the way real time would. Atomic so the `Arc` a seam holds is `Sync`;
+/// the slot is thread-local, so no two threads ever share one.
 #[cfg(feature = "dst")]
 #[derive(Default)]
 pub struct LogicalClock {
-    ticks: Cell<u64>,
+    ticks: AtomicU64,
 }
 
 #[cfg(feature = "dst")]
@@ -45,8 +46,7 @@ impl Behavior for LogicalClock {}
 #[cfg(feature = "dst")]
 impl Clock for LogicalClock {
     fn now_ms(&self) -> u64 {
-        let t = self.ticks.get() + 1;
-        self.ticks.set(t);
+        let t = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
         LOGICAL_EPOCH_MS + t
     }
 }

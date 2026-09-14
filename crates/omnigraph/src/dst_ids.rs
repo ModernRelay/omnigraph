@@ -13,7 +13,7 @@
 //! construction, so one installed thread covers every mint in a simulation.
 
 #[cfg(feature = "dst")]
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "dst")]
 use omnigraph_seams::{Behavior, Op};
@@ -24,27 +24,31 @@ pub trait IdSource: Behavior {
     fn next_ulid(&self) -> ulid::Ulid;
 }
 
-/// Seeded SplitMix64 stream with a counter timestamp.
+/// Seeded SplitMix64 stream with a counter timestamp. Atomic so the `Arc` a
+/// seam holds is `Sync`; the slot is thread-local, so the stream stays
+/// single-threaded and byte-identical.
 #[cfg(feature = "dst")]
 pub struct SeededUlids {
-    state: Cell<u64>,
-    counter: Cell<u64>,
+    state: AtomicU64,
+    counter: AtomicU64,
 }
 
 #[cfg(feature = "dst")]
 impl SeededUlids {
     pub fn new(seed: u64) -> Self {
         Self {
-            state: Cell::new(seed),
-            counter: Cell::new(0),
+            state: AtomicU64::new(seed),
+            counter: AtomicU64::new(0),
         }
     }
 }
 
 #[cfg(feature = "dst")]
-fn splitmix64(state: &Cell<u64>) -> u64 {
-    let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
-    state.set(next);
+fn splitmix64(state: &AtomicU64) -> u64 {
+    let next = state
+        .load(Ordering::Relaxed)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    state.store(next, Ordering::Relaxed);
     let mut z = next;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -57,11 +61,11 @@ impl Behavior for SeededUlids {}
 #[cfg(feature = "dst")]
 impl IdSource for SeededUlids {
     fn next_ulid(&self) -> ulid::Ulid {
-        self.counter.set(self.counter.get() + 1);
+        let counter = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         let hi = splitmix64(&self.state) as u128;
         let lo = splitmix64(&self.state) as u128;
         let random = ((hi << 64) | lo) & ((1u128 << 80) - 1);
-        ulid::Ulid::from_parts(self.counter.get(), random)
+        ulid::Ulid::from_parts(counter, random)
     }
 }
 
