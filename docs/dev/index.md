@@ -33,7 +33,7 @@ change boundaries, and test ownership. Design history and proposals belong in
 |---|---|
 | Find the owning suite, helpers, failpoints, and cloud gates | [Testing](testing.md) |
 | Understand PR and release workflows | [CI and releases](ci.md) |
-| Change required checks or repository policy | [Branch protection](branch-protection.md) |
+| Change required checks, repository policy, or who is requested to review | [Branch protection](branch-protection.md) |
 | Write or reorganize documentation | [Documentation guide](documentation.md) |
 | Review a parser boundary regression example | [Camel-case filtering case study](case-studies/camel-case-filtering.md) |
 

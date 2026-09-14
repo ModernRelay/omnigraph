@@ -92,6 +92,9 @@ CI runs both.
 - Keep changes focused; one logical change per PR.
 - Include tests for behavior changes when practical.
 - Update public docs when the user-facing surface changes.
+- GitHub requests reviewers from `.github/CODEOWNERS` when a change touches an
+  owned crate; the request is advisory, not a merge gate (see
+  [docs/dev/branch-protection.md](docs/dev/branch-protection.md)).
 
 New to the codebase? Read [AGENTS.md](AGENTS.md) — the architecture map and the
 always-on invariants every change is reviewed against.
