@@ -139,28 +139,24 @@ seconds after its final issuance before removing it with another restart.
 
 ### OIDC resource identities and MCP
 
-An operator can enable a separate OIDC identity profile with a public admission
-file. It can coexist with signed data credentials and static recovery tokens:
+Enable OIDC with a public admission file alongside signed or static credentials:
 
 ```bash
 omnigraph-server --cluster s3://company-data/company-brain \
   --oidc-identity-trust /run/omnigraph/provider-access.json
 ```
 
-The file binds an exact HTTPS issuer and resource audience, organization,
-account, cluster incarnation and canonical storage root. Its public RSA keys
-verify RS256 access tokens; an explicit subject mapping selects the stable
-`principal:<id>` actor. Merely having an account at the issuer does not admit a
-caller. Tokens and admission entries carry no graph permissions. Applied Cedar
-continues to govern reads, writes, stored queries and schema operations, while
-all admitted identities can discover graph IDs and names.
+The file binds an exact HTTPS issuer, resource audience, organization, account,
+cluster incarnation and canonical root. Public RSA keys verify RS256 tokens;
+explicit subject mappings select stable `principal:<id>` actors. Tokens carry
+no graph permissions: applied Cedar governs graph and schema operations, while
+every admitted identity can discover graph IDs and names.
 
-This is a bounded human identity profile, not acceptance of arbitrary JWTs.
-Tokens must name exactly one configured resource audience, the configured
-organization and an admitted subject, with a signed lifetime of at most 300
-seconds. ID tokens for an OAuth client, delegated or impersonated credentials,
-and unqualified machine identities refuse. Clients must request the exact
-resource again when refreshing and check the returned audience.
+Human access tokens must name exactly one configured resource audience, the
+configured organization and an admitted subject, and expire within 300 seconds
+of issuance. OAuth-client ID tokens, delegated or impersonated credentials and
+unqualified machine identities refuse. Every refresh must request the exact
+resource again and check the returned audience.
 
 Supply at most four RSA keys, 1,000 subject mappings and 256 KiB per public file.
 The [resource identity proposal](../../rfcs/0064-identity-credentials-and-applied-policy.md#proposed-provider-native-access-and-standard-clients)
@@ -168,15 +164,13 @@ defines the versioned format. Authority is held by whoever can publish this
 file; it contains no provider secret or graph policy. Protect its filesystem
 permissions and publish complete updates atomically.
 
-Boot validates identity and root before opening graphs. The server subsequently
-checks the local file every five seconds, accepting only increasing revisions
-with the same boot binding. An identical revision must have identical bytes.
-The last valid snapshot expires at its original deadline, at most 300 seconds
-after capture; a broken update cannot renew it. Each new request checks expiry.
-No request fetches provider keys or calls a control service. An unavailable
-publisher eventually prevents OIDC access even if graph storage remains healthy.
-Already accepted operations can finish. Applied graph configuration still
-requires its normal activation; admission refresh does not restart a writer.
+Boot validates identity and root before opening graphs. Local refresh runs every
+five seconds: the binding stays fixed, revisions increase, and equal revisions
+require identical bytes. Every request checks the original snapshot deadline,
+at most 300 seconds after capture; invalid updates cannot extend it. Requests
+never fetch keys or call a control service, so publisher outages eventually
+prevent new OIDC access; accepted operations can finish. Admission refresh does
+not restart writers. Graph configuration retains its normal activation.
 
 With this profile configured, the server additionally exposes:
 
@@ -193,18 +187,16 @@ graph requests. A 30-second deadline, 16 concurrent tool calls, 64 KiB request
 body and 1 MiB complete tool result bound this interface. Client cancellation
 cancels the waiting tool call; it does not create a background operation.
 
-Native server logging limits the MCP SDK's `rmcp` and `rmcp::*` targets to
-warnings and errors, even with `RUST_LOG=trace`, because its verbose messages
-include query arguments and results. Other targets retain their configured
-levels. Embedders installing their own tracing subscriber must enforce the
-same SDK filter; `omnigraph_server::init_tracing()` installs it automatically.
+`omnigraph_server::init_tracing()` limits `rmcp` and `rmcp::*` logging to warnings
+and errors even with `RUST_LOG=trace`: verbose SDK logs contain query arguments
+and results. Other targets keep their configured levels. Embedders using their
+own subscriber must enforce the same SDK filter.
 
-Requests must use the configured resource authority or a loopback host. Browser
-clients must use the configured resource origin; native clients can omit
-`Origin`. A resource identifier is not network routing: the deployment must
-separately supply a reachable server URL and public metadata at the advertised
-resource location. Direct/static deployments without this option keep their
-existing routes and do not expose MCP.
+Requests require the resource authority or a loopback host; browsers must use
+the resource origin, while native clients can omit `Origin`. The deployment
+must separately supply a reachable server URL and public metadata at the
+advertised resource location. Direct/static deployments without this option
+keep their existing routes and do not expose MCP.
 
 ## Route families
 

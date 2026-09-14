@@ -188,14 +188,9 @@ clusters:
     root: s3://company-data/omnigraph
 
 profiles:
-  prod-knowledge:
-    server: prod
-    default_graph: knowledge
-  company-admin:
-    cluster: company
-    default_graph: knowledge
-  local-dev:
-    store: file:///tmp/dev.omni
+  prod-knowledge: {server: prod, default_graph: knowledge}
+  company-admin: {cluster: company, default_graph: knowledge}
+  local-dev: {store: file:///tmp/dev.omni}
 
 aliases:
   experts:
@@ -218,20 +213,16 @@ invocation.
 
 ## Managed cluster commands
 
-`omnigraph login --api ORIGIN` reuses a valid cached session and returns fresh
-identity metadata. Otherwise it uses the public WorkOS AuthKit SDK device flow
-and prints a browser verification URL and user code while polling the provider.
-No client secret is embedded. The API's validated authentication profile fixes
-the provider endpoints and application. Access and rotating refresh credentials
-stay in the OS keychain, bound to the API, issuer, application, account and
-principal; an unavailable keychain refuses without plaintext fallback.
-Access lasts at most 15 minutes, with
-silent renewal until the original sign-in's eight-hour deadline.
-APIs must support the direct AuthKit authentication profile; old opaque sessions
-are not reused. Normal commands never open browser login.
-Issue time allows 60 seconds of clock skew without extending signed expiry.
-Login JSON includes identity, `expires_at`, and renewable `refresh_expires_at`,
-never credentials.
+`omnigraph login --api ORIGIN` reuses valid cached access and returns fresh
+identity metadata. Otherwise the public WorkOS AuthKit SDK device flow prints
+a verification URL and user code while polling. The API's validated AuthKit
+profile fixes endpoints and application; no client secret is embedded and old
+opaque sessions are not reused. Normal commands never open browser login.
+The OS keychain holds access and rotating refresh credentials, bound to API,
+issuer, application, account and principal; no plaintext fallback is allowed.
+Access lasts at most 15 minutes; silent renewal ends eight hours after sign-in.
+The 60-second issue-time clock tolerance never extends signed expiry. Login
+JSON contains identity, `expires_at` and `refresh_expires_at`, never credentials.
 
 Temporary errors preserve the cache. An uncertain refresh never replays:
 unexpired access remains usable; explicit login repairs the session if needed.
@@ -329,12 +320,10 @@ context is present. API failures never trigger direct execution.
 
 After login and cluster selection, use `graphs list` to discover graphs, then
 `query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
-Missing or expired identity credentials are acquired automatically before the
-operation. A valid graph credential remains usable while the API is offline.
-An expired legacy restricted credential is never widened automatically.
-Explicit `cluster token --graph ... --actions ...` remains a restricted-profile
-request for an issuer that supports it; provider-authenticated version-2-only
-services reject that request.
+Missing or expired identity credentials are acquired before the operation;
+valid graph credentials remain usable offline. Expired restricted credentials
+are never widened automatically. Explicit `cluster token --graph ... --actions
+...` requires a restricted-profile issuer; version-2-only services reject it.
 An explicit automation token verifies its principal through the API before
 reusing the graph cache, so it cannot inherit another signed-in identity.
 Applied Cedar policy decides permissions. An explicitly addressed server uses
