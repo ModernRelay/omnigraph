@@ -44,13 +44,30 @@ stop-the-line until fixed or reverted. See [ci.md](ci.md).
 
 The remaining policy is:
 
-- zero required approvals and no code-owner review;
+- zero required approvals and no code-owner review gate;
 - all review conversations resolved;
 - linear history only;
 - force pushes and deletion of `main` disabled;
 - administrator bypass retained (`enforce_admins: false`).
 
 The JSON is authoritative for every exact setting.
+
+## Code owners
+
+`.github/CODEOWNERS` names the reviewers GitHub requests for each workspace
+member: one anchored line per crate under `crates/` and under `tools/`. Paths
+outside those directories request nobody. GitHub reads the copy on `main`,
+requests the listed people when a pull request is opened ready for review,
+marked ready, or gains a matching path in a later push, and never requests the
+pull request's own author. Two handles on
+one line means both are requested; when patterns overlap, the last matching
+line wins. It is advisory only: `require_code_owner_reviews` stays false, so
+nobody's approval is required and a green pull request merges as before.
+Listed handles need write access to the repository. GitHub reports an invalid
+line only on the file view and under Settings, never on a pull request, and
+that line then requests nobody. Nothing in CI checks the file, so a crate added
+to the workspace needs its line added by hand. Add or move your handle in a
+normal pull request.
 
 ## Preview and apply
 
