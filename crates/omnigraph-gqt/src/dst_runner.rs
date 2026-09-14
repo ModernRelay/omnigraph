@@ -68,15 +68,17 @@ pub(crate) fn lifetime_counts() -> Option<[u64; 2]> {
         .flatten()
 }
 
+/// The guard a decision seam's installer returns.
+#[cfg(tokio_unstable)]
+type DecideGuard = omnigraph::seams::Installed<
+    dyn omnigraph::seams::Decide,
+    omnigraph::seams::Global<dyn omnigraph::seams::Decide>,
+>;
+
 #[cfg(tokio_unstable)]
 fn lifecycle_probe() -> (
     [std::sync::Arc<std::sync::atomic::AtomicU64>; 2],
-    Vec<
-        omnigraph::seams::Installed<
-            dyn omnigraph::seams::Decide,
-            omnigraph::seams::Global<dyn omnigraph::seams::Decide>,
-        >,
-    >,
+    Vec<DecideGuard>,
 ) {
     let counts = [
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -244,12 +246,7 @@ pub(crate) fn admit_seam(
 pub(crate) struct ArmedSeam {
     at: String,
     occurrence: usize,
-    guard: Option<
-        omnigraph::seams::Installed<
-            dyn omnigraph::seams::Decide,
-            omnigraph::seams::Global<dyn omnigraph::seams::Decide>,
-        >,
-    >,
+    guard: Option<DecideGuard>,
     counted: std::sync::Arc<omnigraph::seams::Counted>,
 }
 
