@@ -79,7 +79,7 @@ A directory lets the server resolve the storage root from `cluster.yaml`; a URI 
 
 Serving verifies ledger/resource digests, builds each graph's query registry and embedding provider, projects external-Blob policy to the server-safe subset, and binds at most one Cedar bundle per graph plus one cluster-level bundle. A graph-local open or registry failure quarantines that graph while healthy graphs may continue. `--require-all-graphs` makes any quarantine a startup failure; zero healthy graphs always fails.
 
-Servers do not hot-reload. Apply the new revision and restart every server that should serve it.
+Servers do not hot-reload applied graph configuration. Apply the new revision and restart every server that should serve it. Explicit OIDC public-admission snapshots have a separate bounded refresh contract below.
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
@@ -114,8 +114,8 @@ responses are additive to the existing public catalog types.
 The CLI's versioned keychain cache records the issuance profile and verifies
 its endpoint and identity bindings before replacement. A legacy issuance
 request cannot return an identity profile, and restricted caches are never
-silently upgraded. Only cached identity credentials select discovery
-automatically in a managed folder. Explicit server addressing keeps the
+silently upgraded. The provider-native client acquires missing/expired identity
+credentials before an operation and selects discovery in a managed folder. Explicit server addressing keeps the
 existing catalog unless `graphs list --discovery` is requested; the CLI never
 infers routing from an arbitrary bearer token's unverified shape.
 
@@ -186,3 +186,22 @@ Every mutation-capable Azure server, apply job, direct writer, and maintenance p
 - Azure lease wrapper: `crates/omnigraph-azure-admission/`.
 
 The public operating loop and configuration schema live in [Operating a cluster](../user/clusters/index.md) and its [configuration reference](../user/clusters/config.md).
+
+## OIDC resource identity and MCP
+
+The optional `--oidc-identity-trust FILE` profile validates the same canonical
+serving root before opening graphs. Public JSON binds exact issuer, audience,
+organization, account, cluster and incarnation, plus RSA keys and explicit
+subject-to-stable-principal admission. Cedar remains the graph/schema authority.
+The server reads no provider secret and performs no request-time network calls.
+An external publisher refreshes a bounded, revisioned snapshot; local checks
+run every five seconds and access refuses at the original 300-second snapshot
+or token expiry. The exact format and limits are in
+[RFC 0064](../rfcs/0064-identity-credentials-and-applied-policy.md#proposed-provider-native-access-and-standard-clients).
+
+This profile enables `/.well-known/oauth-protected-resource` and `/mcp`. MCP
+uses the official Rust SDK and the existing stored-query/discovery handlers.
+The initial tools are read-only; invocation checks the stored query kind and
+the same Cedar policy as HTTP. A registered resource or listed tool is never
+a permission grant. Static-token deployments and the native signed-token
+profiles retain their existing behavior.

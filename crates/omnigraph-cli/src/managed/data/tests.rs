@@ -6,6 +6,151 @@ use omnigraph::db::ReadTarget;
 
 const DATA_TOKEN: &str = "header.payload.signature";
 
+#[tokio::test]
+async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before_submission() {
+    for expired in [false, true] {
+        let mut context = context();
+        let cp = IntentApiFixture::with_origin(|origin| {
+            context.api = origin.to_owned();
+            let credential = identity_credential(&context, "https://data.example");
+            let mut response = credential.metadata();
+            response["token"] = json!(credential.token);
+            vec![IntentReply::json(
+                200,
+                json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
+            )]
+        });
+        let store = MemoryStore::default();
+        if expired {
+            let mut saved = identity_credential(&context, "https://data.example");
+            saved.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
+                .format(&Rfc3339)
+                .unwrap();
+            save(&store, &context, &saved);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        super::super::save_context(dir.path(), &context).unwrap();
+        let cli =
+            Cli::try_parse_from(["omnigraph", "mutate", "m", "--graph", "knowledge"]).unwrap();
+        let client = resolve_with_acquisition(
+            &cli,
+            dir.path(),
+            &store,
+            || Ok(false),
+            async |_| Ok(Some("alice".into())),
+            async |context| Api::new(context.api.clone(), Some("provider-access".into())),
+        )
+        .await
+        .unwrap();
+        assert!(client.is_some());
+        assert_eq!(cp.requests().len(), 1);
+        assert_eq!(cp.requests()[0].path, "/v1/clusters/cluster-a/tokens");
+        assert_eq!(
+            cp.requests()[0].body,
+            json!({"version":2,"ttl_seconds":3600})
+        );
+        assert!(
+            resolve_with_acquisition(
+                &cli,
+                dir.path(),
+                &store,
+                || Ok(false),
+                async |_| Ok(Some("alice".into())),
+                async |_| { panic!("valid graph credential must not call the API") }
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        cp.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn acquisition_preserves_explicit_target_priority_and_never_widens_restricted_credentials() {
+    let context = context();
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let store = MemoryStore::default();
+    let explicit = Cli::try_parse_from([
+        "omnigraph",
+        "query",
+        "q",
+        "--server",
+        "https://explicit.example",
+        "--graph",
+        "knowledge",
+    ])
+    .unwrap();
+    assert!(
+        resolve_with_acquisition(
+            &explicit,
+            dir.path(),
+            &store,
+            || panic!("explicit target reads ambient state"),
+            async |_| panic!("explicit target reads managed identity"),
+            async |_| panic!("explicit target calls issuer")
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let mut restricted = credential(&context, "https://data.example");
+    restricted.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
+        .format(&Rfc3339)
+        .unwrap();
+    save(&store, &context, &restricted);
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    let failure = resolve_with_acquisition(
+        &cli,
+        dir.path(),
+        &store,
+        || Ok(false),
+        async |_| Ok(None),
+        async |_| panic!("restricted credential widened"),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(failure.body["type"], "data_credential_expired");
+}
+
+#[tokio::test]
+async fn acquisition_never_reuses_another_principal_or_accepts_a_wrong_issued_identity() {
+    let mut context = context();
+    let cp = IntentApiFixture::with_origin(|origin| {
+        context.api = origin.into();
+        let credential = identity_credential(&context, "https://data.example");
+        let mut response = credential.metadata();
+        response["token"] = json!(credential.token);
+        vec![IntentReply::json(
+            200,
+            json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
+        )]
+    });
+    let store = MemoryStore::default();
+    let old = identity_credential(&context, "https://data.example");
+    save(&store, &context, &old);
+    let before = store.get(&key(&context)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    assert!(
+        resolve_with_acquisition(
+            &cli,
+            dir.path(),
+            &store,
+            || Ok(false),
+            async |_| Ok(Some("bob".into())),
+            async |context| Api::new(context.api.clone(), Some("bob-provider-token".into()))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(store.get(&key(&context)).unwrap(), before);
+    cp.assert_complete();
+}
+
 fn context() -> Context {
     Context {
         version: 1,

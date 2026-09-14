@@ -1,4 +1,4 @@
-//! Local credential rotation coordination; the API owns session authority.
+//! Local credential rotation coordination; the provider owns session authority.
 use super::*;
 use sha2::{Digest as _, Sha256};
 use std::fs::{File, OpenOptions};
@@ -104,7 +104,7 @@ fn open(directory: &Path, origin: &str) -> Result<File> {
     Ok(file)
 }
 
-async fn lock_at(directory: &Path, origin: &str, wait: Duration) -> Result<File> {
+pub(super) async fn lock_at(directory: &Path, origin: &str, wait: Duration) -> Result<File> {
     let file = open(directory, origin)?;
     let deadline = Instant::now() + wait;
     loop {
@@ -182,43 +182,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn concurrent_refresh_waiter_rereads_the_published_rotation() {
-        use crate::managed::auth::tests::MemoryStore;
-        use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
-        let deadline = (OffsetDateTime::now_utc() + time::Duration::hours(1))
-            .format(&Rfc3339)
-            .unwrap();
-        let access_expiry = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
-            .format(&Rfc3339)
-            .unwrap();
-        let api = IntentApiFixture::with_response_delay(
-            vec![IntentReply::json(
-                200,
-                json!({"data":{"access_token":"new-access","token_type":"Bearer","expires_at":(OffsetDateTime::now_utc()+time::Duration::minutes(2)).format(&Rfc3339).unwrap(),"refresh_token":"new-refresh","refresh_expires_at":deadline,"principal_id":"p","subject":"s","account_id":"a","scopes":{}},"meta":{}}),
-            )],
-            Duration::from_millis(100),
-        );
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("locks");
-        let current = MemoryStore::default();
-        let legacy = MemoryStore::default();
-        current.put(&api.origin, &json!({"version":2,"access_token":"old-access","expires_at":access_expiry,"refresh_token":"old-refresh","refresh_expires_at":deadline,"identity":{"principal_id":"p","subject":"s","account_id":"a"},"state":"ready"}).to_string()).unwrap();
-        let acquire = || async {
-            let _lock = lock_at(&directory, &api.origin, Duration::from_secs(2))
-                .await
-                .unwrap();
-            renewal::credential(&legacy, &current, &api.origin)
-                .await
-                .unwrap()
-        };
-        let (first, second) = tokio::join!(acquire(), acquire());
-        assert_eq!(first, "new-access");
-        assert_eq!(second, first);
-        assert_eq!(api.requests().len(), 1);
-        api.assert_complete();
     }
 
     #[test]

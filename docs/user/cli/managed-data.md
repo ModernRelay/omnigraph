@@ -4,14 +4,21 @@ This guide covers data credentials for an existing managed cluster. Complete
 [managed login and cluster selection](reference.md#managed-cluster-commands)
 first; data authority is separate from that control-plane session.
 
-After selecting a managed cluster with `use`, cache an identity credential:
+After login and selecting a managed cluster with `use`, run graph commands:
 
 ```bash
-omnigraph cluster token --ttl 1h
 omnigraph graphs list
 omnigraph query find_person --graph knowledge --params '{"name":"Alice"}' --json
 omnigraph mutate add_person --graph knowledge --params '{"name":"Alice"}' --json
 ```
+
+The CLI acquires a missing or expired identity credential before submitting
+the operation and caches it in the OS keychain. No separate token command is
+needed. A valid cached graph credential for your cached sign-in avoids an
+unrelated API session check; an explicit automation token verifies its own
+principal before reusing that cache. Authentication refresh never replays a
+submitted mutation. Explicit
+`cluster token --ttl 1h` remains available for credential administration.
 
 The issuer must support identity credentials and admit your principal to the
 selected cluster. The credential proves who you are and which cluster you
@@ -118,12 +125,18 @@ managed context, existing data commands retain their behavior.
 
 ## Legacy restricted credentials
 
-To request the older restricted profile explicitly, supply both a graph and
+For an issuer that still supports the older restricted profile, request it
+explicitly by supplying both a graph and
 the exact action ceiling:
 
 ```bash
 omnigraph cluster token --graph knowledge --actions read,change,invoke_query --ttl 1h
 ```
+
+The provider-authenticated service uses version-2 identity issuance only and
+rejects this legacy request. The CLI retains the syntax for compatible older
+issuers; it never converts requested action restrictions into identity-only
+authority.
 
 Accepted actions are `read`, `export`, `change`, `branch_create`,
 `branch_delete`, `branch_merge`, `invoke_query`, and `graph_list`. Duplicate
@@ -158,7 +171,6 @@ graph and mode. The native CLI sends the exact UTF-8 NDJSON body to the
 authenticated data endpoint; it does not write storage directly.
 
 ```bash
-omnigraph cluster token --ttl 1h
 omnigraph load --graph knowledge --data batch-01.jsonl --mode append --branch review --from main --json
 omnigraph load --graph knowledge --data batch-02.jsonl --mode append --branch review --json
 ```

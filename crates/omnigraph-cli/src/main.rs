@@ -180,7 +180,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
-    let managed_data = match managed::data::client(&cli) {
+    let managed_data = match managed::data::client(&cli).await {
         Ok(client) => client,
         Err(output) => {
             let code = output.emit()?;

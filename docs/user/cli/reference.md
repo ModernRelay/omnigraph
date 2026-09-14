@@ -219,13 +219,17 @@ invocation.
 ## Managed cluster commands
 
 `omnigraph login --api ORIGIN` reuses a valid cached session and returns fresh
-identity metadata. Otherwise it prints a browser verification URL and user
-code to stderr while polling. Access and rotating refresh credentials stay
-in the OS keychain under the canonical API origin; an unavailable keychain
-refuses without plaintext fallback. Access lasts at most 15 minutes, with
-silent renewal until the original sign-in's eight-hour deadline when supported.
-Older APIs retain short sessions. Normal commands never open browser login.
-Metadata allows 30 seconds of clock skew without extending issued expiries.
+identity metadata. Otherwise it uses the public WorkOS AuthKit SDK device flow
+and prints a browser verification URL and user code while polling the provider.
+No client secret is embedded. The API's validated authentication profile fixes
+the provider endpoints and application. Access and rotating refresh credentials
+stay in the OS keychain, bound to the API, issuer, application, account and
+principal; an unavailable keychain refuses without plaintext fallback.
+Access lasts at most 15 minutes, with
+silent renewal until the original sign-in's eight-hour deadline.
+APIs must support the direct AuthKit authentication profile; old opaque sessions
+are not reused. Normal commands never open browser login.
+Issue time allows 60 seconds of clock skew without extending signed expiry.
 Login JSON includes identity, `expires_at`, and renewable `refresh_expires_at`,
 never credentials.
 
@@ -235,9 +239,9 @@ Concurrent updates coordinate for at most 40 seconds. Refresh requests have
 a 35-second deadline; ordinary control requests retain 10 seconds. Status
 polling can renew between requests without replaying the observed operation.
 
-`omnigraph logout --api ORIGIN` removes that origin's cache after confirmed
-revocation. Temporary failures preserve it and report `revocation_confirmed:
-false`; terminal `login_required` or `unauthenticated` refusals clear it.
+`omnigraph logout --api ORIGIN` requests revocation of the caller's provider
+session and clears local credential custody. The result separately reports
+`provider_revocation_confirmed`; a false value does not claim provider revocation.
 Accepted runs continue. Named-server login and logout remain unchanged.
 
 `omnigraph use CLUSTER_ID --api ORIGIN [--config DIR] [--json]` verifies access
@@ -323,8 +327,16 @@ context is present. API failures never trigger direct execution.
 
 ## Managed data access
 
-Use `cluster token` to cache an identity credential, `graphs list` to discover
-graphs, then `query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
+After login and cluster selection, use `graphs list` to discover graphs, then
+`query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
+Missing or expired identity credentials are acquired automatically before the
+operation. A valid graph credential remains usable while the API is offline.
+An expired legacy restricted credential is never widened automatically.
+Explicit `cluster token --graph ... --actions ...` remains a restricted-profile
+request for an issuer that supports it; provider-authenticated version-2-only
+services reject that request.
+An explicit automation token verifies its principal through the API before
+reusing the graph cache, so it cannot inherit another signed-in identity.
 Applied Cedar policy decides permissions. An explicitly addressed server uses
 `graphs list --discovery` for the minimal identity catalog; without the flag,
 its existing metadata listing requires `graph_list` permission. See

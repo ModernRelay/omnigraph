@@ -32,6 +32,9 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+workos = { version = "=3.4.0", default-features = false }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 time = { workspace = true, features = ["parsing"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]

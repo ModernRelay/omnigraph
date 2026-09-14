@@ -16,6 +16,11 @@ blocked_on: []
 
 # RFC 0053: Offline data-token verification
 
+> Proposed extension: [RFC 0064](0064-identity-credentials-and-applied-policy.md#proposed-provider-native-access-and-standard-clients)
+> specifies provider-native login, automatic identity acquisition and an
+> additional offline OAuth resource profile. Its draft status does not
+> retroactively change this RFC’s accepted historical contract.
+
 ## Summary
 
 Accept bounded, short-lived ES256 data credentials at the existing HTTP

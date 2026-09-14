@@ -1,221 +1,325 @@
 use super::*;
 use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use workos::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 
 #[derive(Default)]
-pub(in crate::managed) struct MemoryStore(RefCell<HashMap<String, String>>);
+pub(in crate::managed) struct MemoryStore(pub RefCell<HashMap<String, String>>);
 impl Store for MemoryStore {
-    fn get(&self, origin: &str) -> Result<Option<String>> {
-        Ok(self.0.borrow().get(origin).cloned())
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.0.borrow().get(key).cloned())
     }
-    fn put(&self, origin: &str, value: &str) -> Result<()> {
-        self.0
-            .borrow_mut()
-            .insert(origin.to_string(), value.to_string());
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        self.0.borrow_mut().insert(key.into(), value.into());
         Ok(())
     }
-    fn remove(&self, origin: &str) -> Result<()> {
-        self.0.borrow_mut().remove(origin);
+    fn remove(&self, key: &str) -> Result<()> {
+        self.0.borrow_mut().remove(key);
         Ok(())
     }
 }
 
-pub(in crate::managed::auth) fn saved(token: &str, seconds: i64) -> String {
-    serde_json::to_string(&Session {
+pub(super) fn config() -> provider::Config {
+    provider::Config {
         version: 1,
-        access_token: token.into(),
-        expires_at: (OffsetDateTime::now_utc() + time::Duration::seconds(seconds))
-            .format(&Rfc3339)
-            .unwrap(),
-    })
-    .unwrap()
+        provider: "workos_authkit".into(),
+        client_id: "client_test".into(),
+        issuer: "https://issuer.example".into(),
+        organization_id: "org_test".into(),
+        authorization_endpoint: "https://api.workos.com/user_management/authorize".into(),
+        device_authorization_endpoint: "https://api.workos.com/user_management/authorize/device"
+            .into(),
+        token_endpoint: "https://api.workos.com/user_management/authenticate".into(),
+    }
+}
+
+pub(super) fn jwt(seconds: i64, user: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let expires = OffsetDateTime::now_utc().unix_timestamp() + seconds;
+    let claims = json!({"iss":"https://issuer.example","sub":user,"sid":"session_one","org_id":"org_test","client_id":"client_test","iat":expires-300,"exp":expires});
+    format!(
+        "{}.{}.signature",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"key"}"#),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    )
+}
+
+pub(super) fn tokens(seconds: i64, user: &str) -> Value {
+    json!({"user":{"object":"user","id":user,"email":"test@example.com","email_verified":true,"created_at":"2026-09-14T00:00:00Z","updated_at":"2026-09-14T00:00:00Z"},
+        "organization_id":"org_test","access_token":jwt(seconds,user),"refresh_token":"rotated-refresh"})
+}
+
+pub(super) fn metadata(seconds: i64, principal: &str) -> IntentReply {
+    IntentReply::json(
+        200,
+        json!({"data":{"principal_id":principal,"account_id":"org_test","kind":"human","scopes":{},
+        "expires_at":OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()+seconds).unwrap().format(&Rfc3339).unwrap()},"meta":{}}),
+    )
+}
+
+#[derive(Default)]
+pub(super) struct MockTransport {
+    pub requests: Mutex<Vec<HttpRequest>>,
+    pub responses: Mutex<VecDeque<(u16, Value)>>,
+}
+
+impl MockTransport {
+    pub fn with(responses: Vec<(u16, Value)>) -> Arc<Self> {
+        Arc::new(Self {
+            requests: Mutex::new(vec![]),
+            responses: Mutex::new(responses.into()),
+        })
+    }
+    pub fn provider(self: &Arc<Self>) -> provider::Provider {
+        provider::Provider::with_transport(&config(), self.clone()).unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpTransport for MockTransport {
+    async fn execute(
+        &self,
+        request: HttpRequest,
+    ) -> std::result::Result<HttpResponse, TransportError> {
+        self.requests.lock().unwrap().push(request);
+        let (status, value) = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+            TransportError::other(std::io::Error::other("unexpected provider call"))
+        })?;
+        Ok(HttpResponse {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            body: value.to_string().into(),
+        })
+    }
 }
 
 #[test]
-fn origin_bound_automation_never_reads_human_or_data_plane_credentials() {
-    let store = MemoryStore::default();
-    store
-        .put("https://control.example", &saved("human-secret", 60))
-        .unwrap();
+fn explicit_automation_requires_its_exact_origin_and_never_uses_human_cache() {
     assert_eq!(
-        credential_from(
-            &store,
-            "https://control.example",
-            Some("automation".into()),
-            Some("https://CONTROL.example:443".into())
+        automation(
+            "https://api.example",
+            Some("token".into()),
+            Some("https://API.example:443".into())
         )
         .unwrap(),
-        "automation"
+        Some("token".into())
     );
-    for (token, api) in [
-        (Some("automation".into()), None),
-        (None, Some("https://control.example".into())),
-        (
-            Some("automation".into()),
-            Some("https://other.example".into()),
-        ),
+    assert!(automation("https://api.example", Some("token".into()), None).is_err());
+    assert!(
+        automation(
+            "https://api.example",
+            None,
+            Some("https://api.example".into())
+        )
+        .is_err()
+    );
+    assert!(
+        automation(
+            "https://api.example",
+            Some("token".into()),
+            Some("https://other.example".into())
+        )
+        .is_err()
+    );
+    assert_eq!(automation("https://api.example", None, None).unwrap(), None);
+}
+
+#[tokio::test]
+async fn explicit_automation_resolves_its_own_principal_before_data_cache_reuse() {
+    let api = IntentApiFixture::new(vec![metadata(120, "automation_principal")]);
+    let store = MemoryStore::default();
+    // Even unreadable local human custody cannot override an explicit identity.
+    store.put(&api.origin, "unrelated-human-record").unwrap();
+    let principal = selected_principal_with(
+        &store,
+        &api.origin,
+        Some("automation-access".into()),
+        Some(api.origin.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(principal.as_deref(), Some("automation_principal"));
+    assert_eq!(api.requests()[0].path, "/v1/auth/session");
+    api.assert_complete();
+}
+
+#[test]
+fn provider_configuration_rejects_credential_exfiltration_and_other_profiles() {
+    config().validate().unwrap();
+    for field in [
+        "token_endpoint",
+        "device_authorization_endpoint",
+        "authorization_endpoint",
+        "issuer",
     ] {
-        assert_eq!(
-            credential_from(&store, "https://control.example", token, api)
-                .unwrap_err()
-                .exit,
-            2
+        let mut value = serde_json::to_value(config()).unwrap();
+        value[field] = json!("http://127.0.0.1/steal");
+        assert!(
+            serde_json::from_value::<provider::Config>(value)
+                .unwrap()
+                .validate()
+                .is_err()
         );
     }
-    assert_eq!(
-        credential_from(&store, "https://control.example", None, None).unwrap(),
-        "human-secret"
-    );
-    assert!(credential_from(&store, "https://other.example", None, None).is_err());
+    let mut wrong = config();
+    wrong.provider = "connect".into();
+    assert!(wrong.validate().is_err());
+    for value in [0.0, 4.0, 601.0, 5.5, f64::INFINITY, f64::NAN] {
+        assert!(seconds(value, 5, 600).is_err());
+    }
 }
 
 #[test]
-fn expired_and_unbounded_sessions_are_refused_without_secret_diagnostics() {
-    for value in [
-        saved("opaque-secret", -1),
-        saved("opaque-secret", 1000),
-        "opaque-secret".into(),
-    ] {
-        let failure = session(&value).err().unwrap();
-        assert!(!failure.body.to_string().contains("opaque-secret"));
-    }
-    assert!(session(&saved("valid", 899)).is_ok());
-    assert!(validate_token("secret\nheader").is_err());
-}
-
-#[test]
-fn device_poll_intervals_are_bounded_and_secrets_are_scrubbed() {
-    for n in [0, 4, 601] {
-        assert!(interval(&json!({"interval":n})).is_err());
-    }
-    for n in [5, 10, 600] {
-        assert_eq!(interval(&json!({"interval":n})).unwrap(), n);
-    }
-    let failure = scrub(
-        Failure::new("device_expired", "device secret-code was consumed", 2),
-        "secret-code",
-    );
-    assert!(!failure.body.to_string().contains("secret-code"));
-    let mut reflected_keys = json!({"secret-code":{"nested-secret-code":"value"}});
-    scrub_value(&mut reflected_keys, "secret-code");
-    assert!(!reflected_keys.to_string().contains("secret-code"));
-    assert!(verification_uri("https://auth.example/device?user_code=ABCD").is_ok());
-    assert!(verification_uri("javascript:alert(1)").is_err());
-    assert!(verification_uri("http://127.0.0.1/verify").is_err());
-}
-
-fn device(expires: u64) -> IntentReply {
-    IntentReply::json(
-        200,
-        json!({"data":{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://auth.example/device","verification_uri_complete":null,"expires_in":expires,"interval":5},"meta":{"provenance":"service_db"}}),
-    )
-}
-
-fn logged_in() -> IntentReply {
-    IntentReply::json(
-        200,
-        json!({"data":{"access_token":"opaque-service-secret","token_type":"Bearer","expires_at":(OffsetDateTime::now_utc()+time::Duration::seconds(120)).format(&Rfc3339).unwrap(),"principal_id":"principal-one","subject":"actor-one","account_id":"account-one","scopes":{"actions":["plan","apply"]},"refresh_token":"must-never-persist"},"meta":{"provenance":"service_db","assurance":"verified_human","unexpected":"opaque-service-secret device-secret"}}),
-    )
+fn redaction_covers_secret_values_and_object_keys_without_provider_error_text() {
+    let mut value =
+        json!({"access_token":"bearer","nested":{"bearer-key":"bearer","refresh_token":"refresh"}});
+    scrub_value(&mut value, "bearer");
+    assert!(!value.to_string().contains("bearer"));
+    assert!(!value.to_string().contains("refresh"));
+    assert!(validate_token("token\nheader").is_err());
+    assert!(verification_uri("http://auth.example/device").is_err());
 }
 
 #[tokio::test]
-async fn login_reuses_a_valid_cached_session_without_device_authorization() {
+async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_retry() {
+    let transport = MockTransport::with(vec![
+        (
+            200,
+            json!({"device_code":"secret-device","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":600,"interval":5}),
+        ),
+        (200, tokens(120, "user_one")),
+        (
+            503,
+            json!({"error":"unavailable","message":"secret-provider-reflection"}),
+        ),
+    ]);
+    let provider = transport.provider();
+    provider.device(&config()).await.unwrap();
+    provider.poll("secret-device").await.unwrap();
+    let error = provider
+        .refresh("secret-refresh", &config())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        !provider::failure(&error)
+            .body
+            .to_string()
+            .contains("secret-provider-reflection")
+    );
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        assert!(!request.headers.contains_key(reqwest::header::AUTHORIZATION));
+        let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["client_id"], "client_test");
+        assert!(body.get("client_secret").is_none());
+    }
+    assert_eq!(requests[0].url, config().device_authorization_endpoint);
+    assert_eq!(requests[1].url, config().token_endpoint);
+}
+
+#[tokio::test]
+async fn api_verifies_new_provider_identity_before_the_cache_accepts_it() {
+    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    let response = serde_json::from_value(tokens(120, "user_one")).unwrap();
+    let (saved, output) = renewal::accept(&api.origin, config(), response, None)
+        .await
+        .unwrap();
+    let store = MemoryStore::default();
+    renewal::save(&store, &saved).unwrap();
+    assert!(renewal::load(&store, &api.origin).unwrap().is_some());
+    assert!(!output.to_string().contains("rotated-refresh"));
+    assert!(!output.to_string().contains(".signature"));
+    let requests = api.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/auth/session");
+    assert!(requests[0].headers["authorization"].starts_with("Bearer ey"));
+    api.assert_complete();
+}
+
+#[tokio::test]
+async fn cached_login_does_not_restart_provider_authorization() {
+    let api = IntentApiFixture::new(vec![
+        metadata(120, "principal_one"),
+        metadata(120, "principal_one"),
+    ]);
+    let tokens = serde_json::from_value(tokens(120, "user_one")).unwrap();
+    let (saved, _) = renewal::accept(&api.origin, config(), tokens, None)
+        .await
+        .unwrap();
+    let store = MemoryStore::default();
+    renewal::save(&store, &saved).unwrap();
+    let provider = MockTransport::with(vec![]);
+    let output = login_with(&store, &api.origin, config(), &provider.provider())
+        .await
+        .unwrap();
+    assert_eq!(output["data"]["principal_id"], "principal_one");
+    assert!(output["data"]["refresh_expires_at"].is_string());
+    assert!(provider.requests.lock().unwrap().is_empty());
+    api.assert_complete();
+}
+
+#[tokio::test]
+async fn device_login_polls_the_provider_and_never_the_old_broker() {
+    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    let transport = MockTransport::with(vec![
+        (
+            200,
+            json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":30,"interval":5}),
+        ),
+        (400, json!({"error":"authorization_pending"})),
+        (400, json!({"error":"slow_down"})),
+        (200, tokens(120, "user_one")),
+    ]);
+    let store = MemoryStore::default();
+    let output = login_with(&store, &api.origin, config(), &transport.provider())
+        .await
+        .unwrap();
+    assert_eq!(output["data"]["principal_id"], "principal_one");
+    assert_eq!(transport.requests.lock().unwrap().len(), 4);
+    assert_eq!(api.requests()[0].path, "/v1/auth/session");
+    api.assert_complete();
+}
+
+#[tokio::test]
+async fn rejected_resource_identity_never_becomes_a_cached_session() {
     let api = IntentApiFixture::new(vec![IntentReply::json(
+        401,
+        json!({"type":"unauthenticated"}),
+    )]);
+    let tokens = serde_json::from_value(tokens(120, "user_one")).unwrap();
+    assert!(
+        renewal::accept(&api.origin, config(), tokens, None)
+            .await
+            .is_err()
+    );
+    api.assert_complete();
+}
+
+#[tokio::test]
+async fn device_deadline_prevents_a_poll_or_resource_request_after_expiry() {
+    let api = IntentApiFixture::new(vec![]);
+    let transport = MockTransport::with(vec![(
         200,
-        json!({"data":{"expires_at":(OffsetDateTime::now_utc()+time::Duration::seconds(120)).format(&Rfc3339).unwrap(),"principal_id":"principal-one","subject":"actor-one","account_id":"account-one","scopes":{}},"meta":{"assurance":"verified_human"}}),
+        json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
     )]);
     let store = MemoryStore::default();
-    store
-        .put(&api.origin, &saved("cached-secret", 120))
-        .unwrap();
-    let output = login_with(&store, &MemoryStore::default(), api.origin.clone())
-        .await
-        .unwrap();
-    assert_eq!(output["data"]["principal_id"], "principal-one");
-    assert_eq!(api.requests()[0].path, "/v1/auth/session");
-    assert_eq!(
-        api.requests()[0].headers["authorization"],
-        "Bearer cached-secret"
-    );
-    assert!(!output.to_string().contains("cached-secret"));
-    api.assert_complete();
-}
-
-#[tokio::test]
-async fn device_login_pending_slowdown_then_opaque_keychain_session() {
-    let api = IntentApiFixture::new(vec![
-        device(60),
-        IntentReply::json(428, json!({"type":"authorization_pending","interval":5})),
-        IntentReply::json(429, json!({"type":"slow_down","interval":10})),
-        logged_in(),
-    ]);
-    let store = MemoryStore::default();
-    let started = Instant::now();
-    let output = login_with(&store, &MemoryStore::default(), api.origin.clone())
-        .await
-        .unwrap();
-    assert!(started.elapsed() >= Duration::from_secs(20));
-    assert_eq!(output["data"]["principal_id"], "principal-one");
-    for secret in [
-        "device-secret",
-        "opaque-service-secret",
-        "must-never-persist",
-    ] {
-        assert!(!output.to_string().contains(secret));
-    }
-    let stored = store.get(&api.origin).unwrap().unwrap();
-    assert_eq!(
-        session(&stored).unwrap().access_token,
-        "opaque-service-secret"
-    );
-    assert!(!stored.contains("must-never-persist"));
-    assert!(!stored.contains("device-secret"));
-    let requests = api.requests();
-    assert_eq!(requests[0].path, "/v1/auth/device");
-    assert_eq!(requests[0].body, json!({}));
-    for request in &requests[1..] {
-        assert_eq!(request.path, "/v1/auth/device/token");
-        assert_eq!(request.body, json!({"device_code":"device-secret"}));
-        assert!(!request.headers.contains_key("authorization"));
-    }
-    api.assert_complete();
-}
-
-#[tokio::test]
-async fn uncertain_device_consumption_and_expiry_require_fresh_login() {
-    let api = IntentApiFixture::new(vec![
-        device(60),
-        IntentReply::json(409, json!({"type":"device_poll_in_progress","interval":5})),
-    ]);
-    let store = MemoryStore::default();
-    let failure = login_with(&store, &MemoryStore::default(), api.origin.clone())
+    let error = login_with(&store, &api.origin, config(), &transport.provider())
         .await
         .unwrap_err();
-    assert_eq!(failure.body["type"], "device_poll_in_progress");
-    assert!(
-        failure.body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("start login again")
-    );
-    assert!(store.get(&api.origin).unwrap().is_none());
-    api.assert_complete();
-    let expired = IntentApiFixture::new(vec![device(1)]);
-    assert_eq!(
-        login_with(&store, &MemoryStore::default(), expired.origin.clone())
-            .await
-            .unwrap_err()
-            .body["type"],
-        "device_expired"
-    );
-    expired.assert_complete();
+    assert_eq!(error.body["type"], "device_expired");
+    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    assert!(store.0.borrow().is_empty());
+    assert!(api.requests().is_empty());
 }
 
 #[tokio::test]
-async fn keychain_failure_revokes_the_unstored_session_without_plaintext_fallback() {
-    struct Unwritable;
-    impl Store for Unwritable {
+async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
+    struct RefusingStore;
+    impl Store for RefusingStore {
         fn get(&self, _: &str) -> Result<Option<String>> {
             Ok(None)
         }
@@ -227,48 +331,21 @@ async fn keychain_failure_revokes_the_unstored_session_without_plaintext_fallbac
         }
     }
     let api = IntentApiFixture::new(vec![
-        device(60),
-        logged_in(),
+        metadata(120, "principal_one"),
         IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
     ]);
-    assert_eq!(
-        login_with(&Unwritable, &MemoryStore::default(), api.origin.clone())
-            .await
-            .unwrap_err()
-            .body["type"],
-        "keychain_unavailable"
-    );
-    assert_eq!(api.requests()[2].path, "/v1/auth/logout");
-    assert_eq!(
-        api.requests()[2].headers["authorization"],
-        "Bearer opaque-service-secret"
-    );
-    api.assert_complete();
-}
-
-#[tokio::test]
-async fn logout_preserves_cached_sessions_when_revocation_is_unconfirmed() {
-    let api = IntentApiFixture::new(vec![IntentReply::json(
-        503,
-        json!({"type":"provider_unavailable","detail":"temporary"}),
-    )]);
-    let store = MemoryStore::default();
-    store
-        .put(&api.origin, &saved("opaque-service-secret", 60))
-        .unwrap();
-    store
-        .put("https://other.example", &saved("other-secret", 60))
-        .unwrap();
-    let failure = renewal::logout(&store, &MemoryStore::default(), &api.origin)
+    let transport = MockTransport::with(vec![
+        (
+            200,
+            json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":30,"interval":5}),
+        ),
+        (200, tokens(120, "user_one")),
+    ]);
+    let error = login_with(&RefusingStore, &api.origin, config(), &transport.provider())
         .await
         .unwrap_err();
-    assert_eq!(failure.body["local_credential_removed"], false);
-    assert_eq!(failure.body["revocation_confirmed"], false);
-    assert!(store.get(&api.origin).unwrap().is_some());
-    assert!(store.get("https://other.example").unwrap().is_some());
-    assert_eq!(
-        api.requests()[0].headers["authorization"],
-        "Bearer opaque-service-secret"
-    );
+    assert_eq!(error.body["type"], "keychain_unavailable");
+    assert_eq!(api.requests()[1].path, "/v1/auth/logout");
+    assert!(api.requests()[1].headers["authorization"].starts_with("Bearer ey"));
     api.assert_complete();
 }
