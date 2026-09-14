@@ -43,10 +43,10 @@ query advance_target() {
 
 --- expect affected: nodes=1 edges=0
 
---- fault
+--- seam
 at: branch_merge.post_effects_pre_confirm
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate

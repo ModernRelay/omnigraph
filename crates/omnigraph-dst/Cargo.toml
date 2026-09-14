@@ -11,7 +11,7 @@ publish = false
 
 [features]
 default = ["failpoints"]
-failpoints = ["omnigraph-engine/failpoints", "dep:fail-parallel"]
+failpoints = ["omnigraph-engine/failpoints"]
 
 [dependencies]
 omnigraph-engine = { path = "../omnigraph", version = "0.11.0", features = ["dst"] }
@@ -30,7 +30,6 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-fail-parallel = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

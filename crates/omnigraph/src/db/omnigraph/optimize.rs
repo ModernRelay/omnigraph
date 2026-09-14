@@ -231,18 +231,14 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     // but main's branch-writer gate is not held yet. A writer may arm recovery
     // in this window; the load-bearing check below runs only after Optimize owns
     // the branch authority every sidecar-enrolled main writer must cross.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE)?;
 
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
     // graph or schema publish therefore refuses this attempt before physical
     // maintenance effects or recovery ownership.
     let authority_txn = db.open_write_txn(None).await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
 
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
@@ -364,9 +360,9 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 
         // One graph-wide Phase-B -> Phase-C crash seam, after every physical
         // effect and before the only graph visibility point.
-        if let Err(error) = crate::failpoints::maybe_fail(
-            crate::failpoints::names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-        ) {
+        if let Err(error) =
+            crate::seams::fail(&crate::seams::catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)
+        {
             return Err(optimize_recovery_required(&recovery_handle, error));
         }
 
@@ -753,7 +749,7 @@ async fn apply_optimize_table_effects(
 
         // Test seam: a concurrent (cross-process) writer can interleave here, before
         // any Phase-B commit lands, to exercise the reopen+replan path.
-        crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_BEFORE_COMPACT)?;
+        crate::seams::fail(&crate::seams::catalog::OPTIMIZE_BEFORE_COMPACT)?;
 
         // Phase B: scrub stale auto_cleanup (keeps optimize non-destructive on a
         // graph upgraded from a pre-v7 binary whose `compact_files`/`optimize_indices`
@@ -793,8 +789,7 @@ async fn apply_optimize_table_effects(
         // committed (so HEAD is already ahead of the manifest from our own work),
         // exercising the own-HEAD (not external) drift classification on the next
         // reopened attempt.
-        if crate::failpoints::maybe_fail(crate::failpoints::names::OPTIMIZE_INJECT_REINDEX_CONFLICT)
-            .is_err()
+        if crate::seams::fail(&crate::seams::catalog::OPTIMIZE_INJECT_REINDEX_CONFLICT).is_err()
             && attempt < COMPACTION_RETRY_BUDGET
         {
             continue;
@@ -1191,7 +1186,7 @@ pub async fn cleanup_all_datasets(
              recovery sweep before garbage-collecting versions",
         ));
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
+    crate::seams::fail(&crate::seams::catalog::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
 
     // GC must be bound to one accepted graph view. Capture before acquiring
     // writer gates, and revalidate after the complete schema/branch/table
@@ -1341,7 +1336,7 @@ pub async fn cleanup_all_datasets(
     let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path, live_main_floor)| async move {
             let outcome: Result<RemovalStats> = async {
-                crate::failpoints::maybe_fail(crate::failpoints::names::CLEANUP_TABLE_GC)?;
+                crate::seams::fail(&crate::seams::catalog::CLEANUP_TABLE_GC)?;
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. It only needs a raw read borrow.
@@ -1702,9 +1697,7 @@ async fn reconcile_orphaned_branches_under_control_gates(
             continue;
         }
         if references.is_none() {
-            let captured = match crate::failpoints::maybe_fail(
-                crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
-            ).and_then(|()| crate::failpoints::maybe_fail(crate::failpoints::names::CLASSIFY_FRESH_READ)) {
+            let captured = match crate::seams::fail(&crate::seams::catalog::CLEANUP_RESOLVE_BRANCH_SNAPSHOT).and_then(|()| crate::seams::fail(&crate::seams::catalog::CLASSIFY_FRESH_READ)) {
                 Ok(()) => {
                     crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
                         db.root_uri(),
@@ -1801,9 +1794,7 @@ async fn collect_native_forks(
         }
         for branch in leaves {
             candidates.remove(&branch);
-            let outcome = match crate::failpoints::maybe_fail(
-                crate::failpoints::names::CLEANUP_RECONCILE_FORK,
-            ) {
+            let outcome = match crate::seams::fail(&crate::seams::catalog::CLEANUP_RECONCILE_FORK) {
                 Ok(()) => db.storage().force_delete_branch(full_path, &branch).await,
                 Err(injected) => Err(injected),
             };
@@ -1871,7 +1862,6 @@ pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> 
 #[cfg(all(test, feature = "failpoints"))]
 mod tests {
     use super::*;
-    use crate::failpoints::ScopedFailPoint;
     use crate::loader::{LoadMode, load_jsonl};
 
     /// The internal-table compaction retry classifier: a concurrent live writer
@@ -1919,7 +1909,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_caches_live_branch_snapshot_resolution_failure() {
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let schema = "node Person { name: String @key }\nnode Company { name: String @key }\n";
@@ -1943,10 +1933,7 @@ mod tests {
             ds.create_branch(&feature_native, base, None).await.unwrap();
         }
 
-        let _fp = ScopedFailPoint::new(
-            crate::failpoints::names::CLEANUP_RESOLVE_BRANCH_SNAPSHOT,
-            "return",
-        );
+        let _fp = crate::seams::catalog::CLEANUP_RESOLVE_BRANCH_SNAPSHOT.fire_always();
         let stats = reconcile_orphaned_branches(&db).await.unwrap();
 
         assert_eq!(

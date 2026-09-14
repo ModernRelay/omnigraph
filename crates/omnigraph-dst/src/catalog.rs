@@ -1,14 +1,11 @@
 //! The full crash-window catalog for the hunt
-//! (`dst_hunt_crash_window_sweep`): the engine's `src/failpoints.rs`
-//! name set, 70 windows at the pinned engine version. A window added to
-//! the engine enters here as never-reached until its workload exists.
+//! (`dst_hunt_crash_window_sweep`): 70 of the engine's decision seams
+//! (`omnigraph::seams::catalog`) at the pinned engine version. A seam added
+//! to the engine enters here as never-reached until its workload exists.
 //!
-//! Kept honest by `catalog_names_are_engine_failpoints` below: every
-//! entry must be a name the engine's `names` module defines, so a
-//! typo'd or renamed-away window fails the suite instead of compiling
-//! and silently never firing. (Swapping the literals for the
-//! `names::*` consts directly would be stronger still; the guard covers
-//! the failure mode until then.)
+//! Kept honest by `catalog_names_are_engine_seams` below: every entry must
+//! be a name the engine catalog declares, so a typo'd or renamed-away window
+//! fails the suite instead of compiling and silently never firing.
 
 pub const CRASH_WINDOWS: [&str; 70] = [
     "blob_read.post_capture",
@@ -89,41 +86,14 @@ pub const CRASH_WINDOWS: [&str; 70] = [
 mod tests {
     use super::CRASH_WINDOWS;
 
-    /// The catalog's names-guard (module doc): every entry must be a
-    /// string the engine's `names` module defines. Textual, like the
-    /// engine's own `failpoint_names_guard.rs` — the engine exposes no
-    /// iterable of its failpoint names, so the source is the authority.
+    /// The catalog's names-guard (module doc): every entry must be a seam
+    /// the engine catalog declares.
     #[test]
-    fn catalog_names_are_engine_failpoints() {
-        let engine_src =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../omnigraph/src/failpoints.rs");
-        let text = std::fs::read_to_string(&engine_src)
-            .expect("read the engine's failpoints.rs beside this crate");
-        let mut engine_names = std::collections::BTreeSet::new();
-        let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            // `pub const NAME: &str = "the.window.name";` — rustfmt may
-            // wrap the string literal onto the following line.
-            if !line.contains(": &str =") {
-                continue;
-            }
-            let value_src = if line.contains('"') {
-                *line
-            } else {
-                lines.get(i + 1).copied().unwrap_or("")
-            };
-            if let Some(start) = value_src.find('"')
-                && let Some(rest) = value_src.get(start + 1..)
-                && let Some(end) = rest.find('"')
-            {
-                engine_names.insert(rest[..end].to_string());
-            }
-        }
-        assert!(
-            engine_names.len() >= CRASH_WINDOWS.len(),
-            "parsed only {} engine failpoint names — the source scan is broken",
-            engine_names.len()
-        );
+    fn catalog_names_are_engine_seams() {
+        let engine_names: std::collections::BTreeSet<&str> = omnigraph::seams::catalog::ALL
+            .iter()
+            .map(|seam| seam.name())
+            .collect();
         let missing: Vec<&&str> = CRASH_WINDOWS
             .iter()
             .filter(|w| !engine_names.contains(**w))

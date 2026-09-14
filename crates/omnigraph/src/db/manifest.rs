@@ -1589,9 +1589,7 @@ impl ManifestCoordinator {
         let lineage_rows = match known_state.graph_heads.get(branch_key) {
             Some(head) if projection_has_head(head) => None,
             _ => {
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
                 Some(read_graph_lineage(&dataset).await?.0)
             }
         };

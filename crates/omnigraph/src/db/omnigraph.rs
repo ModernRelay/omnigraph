@@ -405,6 +405,7 @@ impl Omnigraph {
         options: InitOptions,
         legacy_system_columns: bool,
     ) -> Result<Self> {
+        let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
         let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
@@ -508,9 +509,9 @@ impl Omnigraph {
                     return Err(err);
                 }
             }
-            if let Err(err) = crate::failpoints::maybe_fail(
-                crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN,
-            ) {
+            if let Err(err) =
+                crate::seams::fail(&crate::seams::catalog::INIT_AFTER_SCHEMA_PG_WRITTEN)
+            {
                 best_effort_cleanup_owned_init_artifacts(&root, storage.as_ref(), &init_claim)
                     .await;
                 return Err(err);
@@ -691,6 +692,7 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
+        let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
         let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
@@ -788,7 +790,7 @@ impl Omnigraph {
         } else {
             internal_schema_version
         };
-        crate::failpoints::maybe_fail(crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
+        crate::seams::fail(&crate::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
         // The stamp guard and coordinator open above both read `__manifest`,
         // so reaching this point proves that manifest is readable; it does not
@@ -2317,9 +2319,7 @@ impl Omnigraph {
             .write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_RELOAD_BEFORE_CONTRACT_READ)?;
         let schema_path = schema_source_uri(&self.root_uri);
         let schema_source = self.storage.read_text(&schema_path).await?;
         let (accepted_ir, accepted_state) = load_validated_schema_contract_for_source(
@@ -2871,7 +2871,7 @@ impl Omnigraph {
         // happens after this and lock-free. Tests delete/recreate the polled
         // branch here to prove `commit_snapshot`'s incarnation re-prove fails
         // closed instead of emitting a replacement branch's rows.
-        crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_CAPTURE)?;
+        crate::seams::fail(&crate::seams::catalog::CHANGE_FEED_POST_CAPTURE)?;
         let graph_identity = self.schema_view.load().schema_identity_domain.clone();
         crate::changes::feed::poll(
             self.uri(),
@@ -3206,9 +3206,7 @@ impl Omnigraph {
         // schema -> source/target branch gates.
         self.heal_pending_recovery_sidecars_for_write(&relevant)
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3300,9 +3298,7 @@ impl Omnigraph {
         let relevant = [branch.as_deref(), Some(target_branch.as_str())];
         self.heal_pending_recovery_sidecars_for_write(&relevant)
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3370,9 +3366,7 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         self.heal_pending_recovery_sidecars_for_branch_delete(&branch)
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3396,7 +3390,7 @@ impl Omnigraph {
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_branch_delete_recovery_safe_under_gates(&branch)
             .await?;
-        crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_TABLE_GATES)?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_DELETE_POST_TABLE_GATES)?;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         self.ensure_schema_state_valid().await?;
         let mut target_control = self
@@ -3962,7 +3956,7 @@ async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter)
     if storage_kind_for_uri(root)? != StorageKind::Local {
         return Ok(());
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE)?;
+    crate::seams::fail(&crate::seams::catalog::LOCAL_CREATE_IF_ABSENT_PROBE)?;
     for _ in 0..CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS {
         let probe_name = format!(
             "{CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX}_{}",
@@ -4032,14 +4026,14 @@ async fn init_commit_phase(
             .write_text(&schema_path, &contract.source)
             .await
             .map_err(InitCommitError::BeforePhysicalInit)?;
-        crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)
+        crate::seams::fail(&crate::seams::catalog::INIT_AFTER_SCHEMA_PG_WRITTEN)
             .map_err(InitCommitError::BeforePhysicalInit)?;
     }
 
     write_schema_contract(root, storage.as_ref(), contract)
         .await
         .map_err(InitCommitError::BeforePhysicalInit)?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)
+    crate::seams::fail(&crate::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)
         .map_err(InitCommitError::BeforePhysicalInit)?;
 
     // From this invocation onward, per-table Dataset::write(Create) calls may
@@ -4075,7 +4069,7 @@ async fn finish_init_coordinator(
     schema_ir: &SchemaIR,
 ) -> Result<GraphCoordinator> {
     validate_schema_ir_against_snapshot(schema_ir, &coordinator.snapshot())?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
+    crate::seams::fail(&crate::seams::catalog::INIT_AFTER_COORDINATOR_INIT)?;
     Ok(coordinator)
 }
 
@@ -4119,9 +4113,8 @@ async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAda
         schema_ir_uri(root),
         schema_state_uri(root),
     ] {
-        let deletion = match crate::failpoints::maybe_fail(
-            crate::failpoints::names::INIT_SCHEMA_CLEANUP_DELETE,
-        ) {
+        let deletion = match crate::seams::fail(&crate::seams::catalog::INIT_SCHEMA_CLEANUP_DELETE)
+        {
             Ok(()) => storage.delete(&uri).await,
             Err(err) => Err(err),
         };

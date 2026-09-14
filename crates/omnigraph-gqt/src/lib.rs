@@ -52,7 +52,8 @@ pub use dst_runner::{
 };
 use omnigraph::storage::StorageAdapter;
 use runner_config::{
-    Execution, Fault, KnownFailure, RunnerConfig, parse_fault, parse_known_failure, parse_runner,
+    Execution, KnownFailure, RunnerConfig, SeamDirective, parse_known_failure, parse_runner,
+    parse_seam,
 };
 
 mod shape;
@@ -67,7 +68,7 @@ struct Case {
     input_text: String,
     runner: RunnerConfig,
     known_failure: Option<KnownFailure>,
-    faults: BTreeMap<usize, Fault>,
+    seams: BTreeMap<usize, SeamDirective>,
     source_lines: BTreeMap<usize, usize>,
     schema: String,
     seed: String,
@@ -1166,9 +1167,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
     let mut ordinal = 0usize;
-    let mut faults = BTreeMap::new();
+    let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
-    let mut awaiting_fault_step = false;
+    let mut awaiting_seam_step = false;
     let mut qm_steps = 0usize;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
 
@@ -1205,27 +1206,27 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         {
             return Err(missing_shape(waiting));
         }
-        if awaiting_fault_step && !matches!(kind, "query" | "mutate") {
+        if awaiting_seam_step && kind != "mutate" {
             return Err(
-                "invalid_case: a fault must directly precede its query or mutate step".into(),
+                "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement); no seam is crossed by a query step yet".into(),
             );
         }
         if matches!(kind, "query" | "mutate" | "restart") {
             source_lines.insert(ordinal + 1, section.header_line + 1);
-            awaiting_fault_step = false;
+            awaiting_seam_step = false;
         }
         match kind {
-            "fault" => {
+            "seam" => {
                 if open_loop.is_some() {
                     return Err(
-                        "invalid_case: fault directives inside loops are not supported".into(),
+                        "invalid_case: seam directives inside loops are not supported".into(),
                     );
                 }
-                if faults.len() >= 16 {
-                    return Err("invalid_case: a case admits at most 16 fault directives".into());
+                if seams.len() >= 16 {
+                    return Err("invalid_case: a case admits at most 16 seam directives".into());
                 }
                 if !rest.is_empty() || pending.is_some() {
-                    return Err("invalid_case: fault takes no header arguments and must precede a complete step".into());
+                    return Err("invalid_case: seam takes no header arguments and must precede a complete step".into());
                 }
                 let body = section
                     .body
@@ -1233,8 +1234,14 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     .map(|(_, line)| *line)
                     .collect::<Vec<_>>()
                     .join("\n");
-                faults.insert(ordinal + 1, parse_fault(&body)?);
-                awaiting_fault_step = true;
+                seams.insert(ordinal + 1, parse_seam(&body)?);
+                awaiting_seam_step = true;
+            }
+            "fault" => {
+                return Err(format!(
+                    "line {}: `--- fault` no longer names a code seam; write `--- seam` with the same `at`, `occurrence` and `scope`, and `action: fail` (was `return_error`) or `action: skip`",
+                    section.header_line + 1
+                ));
             }
             "runner" | "schema" | "seed" => {
                 return Err(format!(
@@ -1462,8 +1469,8 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             _ => return Err(format!("unknown section `--- {}`", section.name)),
         }
     }
-    if awaiting_fault_step {
-        return Err("invalid_case: fault has no following operation".into());
+    if awaiting_seam_step {
+        return Err("invalid_case: seam has no following operation".into());
     }
     if pending.is_some() {
         return Err("the final step is missing its `--- expect`".into());
@@ -1491,7 +1498,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         input_text: text.into(),
         runner,
         known_failure,
-        faults,
+        seams,
         source_lines,
         schema,
         seed,
@@ -2285,8 +2292,8 @@ async fn execute_steps_inner(
                         }
                     },
                 );
-                let fault = case.faults.get(&ordinal);
-                let guard = dst_runner::arm_fault(fault)?;
+                let seam = case.seams.get(&ordinal);
+                let armed = dst_runner::arm_seam(seam, step)?;
                 let lifetime_before = dst_runner::lifetime_counts();
                 let outcome = match step {
                     Step::Query(q) => run_query_step(&db, case.traversal, q, binding).await,
@@ -2303,19 +2310,46 @@ async fn execute_steps_inner(
                             }
                             None => Omnigraph::open(uri).await,
                         };
-                        db = reopened.map_err(|e| {
-                            format!(
-                                "{}: reopen failed: {e}",
-                                step_label(*ordinal, "restart", binding)
-                            )
-                        })?;
+                        db = match reopened {
+                            Ok(db) => db,
+                            Err(error) => {
+                                dst_runner::observe_fault(&error);
+                                let lifetime_after = dst_runner::lifetime_counts();
+                                dst_runner::record(
+                                    "engine_lifetime",
+                                    serde_json::json!({"before": lifetime_before, "after": lifetime_after}),
+                                );
+                                if let (Some(before), Some(after)) =
+                                    (lifetime_before, lifetime_after)
+                                    && (after[0] != before[0] || after[1] > before[1] + 1)
+                                {
+                                    return Err(format!(
+                                        "worker_failed: unexpected engine init/open call during step {ordinal}: {before:?} -> {after:?}"
+                                    ));
+                                }
+                                let fail = StepFail {
+                                    label: step_label(*ordinal, "restart", binding),
+                                    message: format!("reopen failed: {error}"),
+                                    bless_lines: None,
+                                };
+                                dst_runner::record(
+                                    "assertion",
+                                    serde_json::json!({"status": "failed", "code": "assertion_failed", "message": fail.message}),
+                                );
+                                dst_runner::observe(|| {
+                                    format!(
+                                        "operation result: Err({:?})",
+                                        (&fail.label, &fail.message)
+                                    )
+                                });
+                                first_fail = Some(fail);
+                                break 'run;
+                            }
+                        };
                         Ok(())
                     }
                 };
-                #[cfg(tokio_unstable)]
-                drop(guard);
-                #[cfg(not(tokio_unstable))]
-                let _ = guard;
+                let seam_result = dst_runner::finish_seam(armed);
                 let lifetime_after = dst_runner::lifetime_counts();
                 dst_runner::record(
                     "engine_lifetime",
@@ -2329,7 +2363,6 @@ async fn execute_steps_inner(
                         ));
                     }
                 }
-                let fault_result = dst_runner::finish_fault(fault);
                 dst_runner::record(
                     "assertion",
                     match &outcome {
@@ -2345,7 +2378,7 @@ async fn execute_steps_inner(
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
                     )
                 });
-                if let Err(error) = fault_result {
+                if let Err(error) = seam_result {
                     return Err(format!(
                         "{error}; operation result: {:?}",
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
@@ -2447,7 +2480,7 @@ pub async fn run_case(path: PathBuf, bless: bool) -> Result<(), String> {
     {
         return Err("DST cases require the file dispatcher; the async normal runner cannot execute mode: dst".into());
     }
-    case.runner.environments[0].admit(!case.faults.is_empty())?;
+    case.runner.environments[0].admit(!case.seams.is_empty())?;
     execute_case(&case, &path, bless).await
 }
 

@@ -1135,7 +1135,7 @@ pub(crate) async fn write_sidecar(
 ) -> Result<RecoverySidecarHandle> {
     // Failpoint: models a storage put failure (S3 PutObject / fs write)
     // in Phase A — every writer must abort before any HEAD advance.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_WRITE)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_WRITE)?;
     debug_assert!(sidecar.schema_version <= SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
@@ -1179,7 +1179,7 @@ pub(crate) async fn confirm_sidecar_phase_b_v9(
 ) -> Result<()> {
     // Failpoint: models a storage failure on the confirmation write — the
     // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     for pin in &mut sidecar.tables {
         // Every pinned table MUST have an achieved version. A miss means the
         // pin set and the publish `updates` diverged — fail loudly at the
@@ -1211,7 +1211,7 @@ pub(crate) async fn delete_sidecar(
     // Failpoint: models a storage delete failure (S3 DeleteObject) in
     // Phase D — callers swallow it (the write already published) and the
     // stale sidecar is healed by the next write or open.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_DELETE)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_DELETE)?;
     storage.delete(&handle.sidecar_uri).await
 }
 
@@ -1229,7 +1229,7 @@ pub(crate) async fn list_sidecars(
     // Failpoint: models a storage list failure (S3 ListObjectsV2) — every
     // consumer (open-time sweep, write-entry heal) must fail loudly
     // rather than silently skipping recovery.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_LIST)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_LIST)?;
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
     // Sort by URI so the sweep processes sidecars deterministically.
@@ -1248,9 +1248,7 @@ pub(crate) async fn list_sidecars(
             continue;
         }
         if before_first_json_read {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ)?;
             before_first_json_read = false;
         }
         let Some(body) = storage.read_text_if_exists(&uri).await? else {
@@ -1285,9 +1283,7 @@ async fn list_parseable_sidecars_for_read_only(
             continue;
         }
         if before_first_json_read {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ)?;
             before_first_json_read = false;
         }
         let Some(body) = storage.read_text_if_exists(&uri).await? else {
@@ -3223,7 +3219,7 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
             unresolved: Vec::new(),
         });
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_LIST_PRE_GATES)?;
     let mut processed_any = false;
     let mut unresolved = Vec::new();
     for sidecar in sidecars {
@@ -3393,9 +3389,7 @@ async fn discard_orphaned_branch_sidecar(
             .await?;
         // Failpoint: the residual window above — commit published, audit
         // not yet durable.
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id: intent.graph_commit_id,
@@ -3462,7 +3456,7 @@ pub(crate) async fn recover_manifest_drift(
     if sidecars.is_empty() {
         return Ok(());
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_LIST_PRE_GATES)?;
 
     // For each sidecar, classify against a FRESH snapshot AT THE
     // SIDECAR'S BRANCH. Two reasons:
@@ -4248,9 +4242,7 @@ async fn process_sidecar(
             // pin) and the publish CAS below, a concurrent live writer can
             // advance the manifest past our expected version. The failpoint
             // lets a test force that interleave deterministically.
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
             // RFC-013 Phase 7: `roll_forward_all` folds the recovery commit into the
             // manifest publish CAS, so it also returns the minted `graph_commit_id`
             // for the audit row below.
@@ -4890,9 +4882,7 @@ async fn roll_back_ensure_indices_v8(
                 state.manifest_pinned,
             )
             .await?;
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH)?;
         }
         push_table_update(
             root_uri,
@@ -4918,9 +4908,7 @@ async fn roll_back_ensure_indices_v8(
         &expected,
     )
     .await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT)?;
     record_audit(
         root_uri,
         &prepared,
@@ -4976,7 +4964,7 @@ async fn roll_forward_ensure_indices_v8(
             to_version: confirmed.table_version,
         });
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
     let graph_commit_id = match publish_recovery_commit(
         root_uri,
         sidecar,
@@ -5199,7 +5187,7 @@ async fn process_schema_apply_sidecar_v7(
         &protocol.target_schema_ir_hash,
     )
     .await?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
     let (_manifest_version, graph_commit_id) =
         match publish_schema_apply_v7_forward(root_uri, sidecar).await {
             Ok(published) => published,
@@ -5375,7 +5363,7 @@ async fn roll_forward_system_column_upgrade(
         .as_ref()
         .expect("confirmed schema-v7 protocol");
 
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
     let (_manifest_version, graph_commit_id) =
         match publish_schema_apply_v7_forward(root_uri, &confirmed).await {
             Ok(published) => published,
@@ -5419,9 +5407,7 @@ async fn roll_forward_system_column_upgrade(
     )
     .await?;
     reclaim_stale_schema_apply_lock(root_uri, storage).await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM)?;
     delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
     Ok(true)
 }
@@ -5770,9 +5756,7 @@ async fn roll_back_schema_apply_v7(
         }
         if state.effect_ownership != EffectOwnership::OwnCompensatedAtHead {
             restore_table_to_version(&pin.table_path, None, state.manifest_pinned).await?;
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH)?;
         }
         let restored_table_key = schema_apply_rollback_table_key(protocol, pin);
         push_table_update(
@@ -5805,9 +5789,7 @@ async fn roll_back_schema_apply_v7(
         &expected,
     )
     .await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT)?;
     record_audit(
         root_uri,
         &prepared,
@@ -5829,7 +5811,7 @@ pub(crate) async fn recover_failed_branch_merge_under_gates(
     failed: &RecoverySidecar,
 ) -> Result<bool> {
     assert_eq!(failed.writer_kind, SidecarKind::BranchMerge);
-    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_PRE_ERROR_RECOVERY)?;
+    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_PRE_ERROR_RECOVERY)?;
     let Some(sidecar) = reread_sidecar_under_gates(root_uri, storage.as_ref(), failed).await?
     else {
         return Ok(true);
@@ -6158,7 +6140,7 @@ async fn roll_forward_branch_merge_v4(
         });
     }
 
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
     let graph_commit_id = match publish_recovery_commit(
         root_uri,
         sidecar,
@@ -6659,8 +6641,8 @@ async fn roll_back_sidecar(
                     state.manifest_pinned,
                 )
                 .await?;
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
+                crate::seams::fail(
+                    &crate::seams::catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
                 )?;
             }
             // Publish the post-restore HEAD (the restore commit we just made),
@@ -6702,9 +6684,7 @@ async fn roll_back_sidecar(
         &expected,
     )
     .await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT)?;
     let outcomes = sidecar
         .protocol_v3
         .as_ref()
@@ -6859,7 +6839,7 @@ async fn finalize_visible_ensure_indices_rollback(
             && record.recovery_kind == RecoveryKind::RolledBack
     });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id: protocol.rollback_graph_commit_id.clone(),
@@ -7160,7 +7140,7 @@ async fn finalize_visible_v7_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -7175,9 +7155,7 @@ async fn finalize_visible_v7_outcome(
     }
     if protocol.system_column_upgrade.is_some() {
         reclaim_stale_schema_apply_lock(root_uri, storage).await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM)?;
     }
     delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
     Ok(true)
@@ -7316,7 +7294,7 @@ async fn finalize_visible_v8_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -7475,7 +7453,7 @@ async fn finalize_visible_v3_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -7626,7 +7604,7 @@ async fn finalize_visible_v4_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -7959,7 +7937,7 @@ async fn record_audit(
     // Failpoint: models an audit write failure after the roll-forward /
     // roll-back publish (with its folded-in recovery commit) already landed —
     // the sweep aborts, the sidecar stays, and re-entry records the audit row.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
     let mut audit = RecoveryAudit::open(root_uri).await?;
     audit
         .append(RecoveryAuditRecord {
@@ -8310,7 +8288,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v8.as_ref().ok_or_else(|| {
@@ -8555,7 +8533,8 @@ pub(crate) fn new_occ_sidecar_v9(
 }
 
 /// Bind every physical output slot of an RFC-022 sidecar and durably transition
-/// it from `Armed` to `EffectsConfirmed`.
+/// it from `Armed` to `EffectsConfirmed`. Returns whether the confirm put was
+/// made; only the `MUTATION_SIDECAR_CONFIRM_ACK_LOST` seam makes it `false`.
 ///
 /// Validation happens against a clone first. A missing table, a rebased Lance
 /// transaction, or a version/branch mismatch leaves the on-disk sidecar Armed,
@@ -8567,8 +8546,8 @@ pub(crate) async fn confirm_occ_sidecar_v9(
     sidecar: &mut RecoverySidecar,
     updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
-) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+) -> Result<bool> {
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
 
     let protocol = sidecar.protocol_v3.as_ref().ok_or_else(|| {
@@ -8683,9 +8662,12 @@ pub(crate) async fn confirm_occ_sidecar_v9(
             error
         ))
     })?;
-    storage.write_text(&uri, &json).await?;
+    let durable = !crate::seams::skip(&crate::seams::catalog::MUTATION_SIDECAR_CONFIRM_ACK_LOST);
+    if durable {
+        storage.write_text(&uri, &json).await?;
+    }
     *sidecar = confirmed;
-    Ok(())
+    Ok(durable)
 }
 
 /// Arm an exact schema-v9 SchemaApply intent. `tables`/`effects` name every
@@ -8801,7 +8783,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v9(
     updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
     let protocol = sidecar.protocol_v7.as_ref().ok_or_else(|| {
         OmniError::manifest_internal("confirm_schema_apply_sidecar_v9 requires a schema-v9 sidecar")
@@ -8969,7 +8951,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
     updates: &[DatasetUpdate],
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v4.as_ref().ok_or_else(|| {
@@ -10772,7 +10754,7 @@ mod tests {
     async fn exact_preflight_rebase_recovery_preserves_published_winner() {
         // This unarmed recovery must not consume a neighboring test's fault.
         #[cfg(feature = "failpoints")]
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         // Lance may preflight-rebase an Append even when CommitBuilder's retry
         // budget is zero. Reproduce the exact availability hazard:
         //
@@ -10947,7 +10929,7 @@ node Person {
 node Person { age: I32? }
 node Company { age: I32? }
 "#;
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
@@ -11048,10 +11030,8 @@ node Company { age: I32? }
         drop(txn);
         drop(db);
 
-        let failpoint = crate::failpoints::ScopedFailPoint::new(
-            crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-            "return",
-        );
+        let failpoint =
+            crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
         let error = crate::db::Omnigraph::open(root)
             .await
             .err()
@@ -11121,7 +11101,7 @@ node Company { age: I32? }
         const SCHEMA: &str = r#"
 node Person { age: I32? }
 "#;
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
@@ -11205,10 +11185,8 @@ node Person { age: I32? }
         drop(txn);
         drop(db);
 
-        let failpoint = crate::failpoints::ScopedFailPoint::new(
-            crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-            "return",
-        );
+        let failpoint =
+            crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
         let error = crate::db::Omnigraph::open(root)
             .await
             .err()

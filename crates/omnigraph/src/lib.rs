@@ -27,12 +27,12 @@ pub(crate) mod dst_ids;
 pub mod embedding;
 pub mod error;
 mod exec;
-pub mod failpoints;
 pub mod graph_index;
 pub mod instrumentation;
 pub(crate) mod lance_access;
 pub mod loader;
 pub(crate) mod runtime_cache;
+pub mod seams;
 pub mod storage;
 pub(crate) mod storage_layer;
 pub(crate) mod table_store;
@@ -62,3 +62,7 @@ pub struct MutationReceipt {
 #[cfg(feature = "dst")]
 #[doc(hidden)]
 pub use lance_access::store_registry as dst_lance_store_registry;
+
+/// The Lance-realm object-store seam; see `lance_access::object_store_seam`.
+#[cfg(feature = "dst")]
+pub use lance_access::object_store_seam;

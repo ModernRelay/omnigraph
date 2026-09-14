@@ -58,6 +58,7 @@ pub(crate) fn clear_process_slots() {
     crate::lance_faults::set_kill(None);
     crate::lance_faults::set_seam_scheduler(None);
     crate::lance_faults::set_bytes_canary(None);
+    omnigraph::storage::STORAGE.clear();
     FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
 }
 
@@ -3634,8 +3635,11 @@ async fn maintenance_obligations(
     // (1) Idempotent convergence.
     let rerun = {
         #[cfg(feature = "failpoints")]
-        let _sensitivity =
-            fail_rerun.then(|| omnigraph::failpoints::ScopedFailPoint::new(rerun_window, "return"));
+        let _sensitivity = fail_rerun.then(|| {
+            omnigraph::seams::catalog::decide(rerun_window)
+                .unwrap_or_else(|| panic!("harness window {rerun_window} names no catalog seam"))
+                .fire_always()
+        });
         #[cfg(not(feature = "failpoints"))]
         let _ = (rerun_window, fail_rerun);
         exec_world_op(db, wop).await
@@ -3702,7 +3706,9 @@ async fn reopen_under_storm(
 ) -> Omnigraph {
     #[cfg(feature = "failpoints")]
     if let Some(rc) = recovery_crash {
-        let _fp = omnigraph::failpoints::ScopedFailPoint::new(rc, "return");
+        let _fp = omnigraph::seams::catalog::decide(rc)
+            .unwrap_or_else(|| panic!("harness window {rc} names no catalog seam"))
+            .fire_always();
         // Best-effort double fault: if the window IS on this crash's recovery
         // path, the first recovery sweep dies here and we prove a SECOND clean reopen
         // still converges (below). If it isn't reached, no double fault
@@ -4308,7 +4314,9 @@ async fn crash_op(
     );
     let mut db = db;
     let result = {
-        let _fp = omnigraph::failpoints::ScopedFailPoint::new(failpoint, "return");
+        let _fp = omnigraph::seams::catalog::decide(failpoint)
+            .unwrap_or_else(|| panic!("harness window {failpoint} names no catalog seam"))
+            .fire_always();
         exec_world_op(&mut db, wop).await
     };
     match result {
@@ -4435,7 +4443,9 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
 
         let init_result = {
-            let _fp = omnigraph::failpoints::ScopedFailPoint::new(window, "return");
+            let _fp = omnigraph::seams::catalog::decide(window)
+                .unwrap_or_else(|| panic!("harness window {window} names no catalog seam"))
+                .fire_always();
             Box::pin(Omnigraph::init_with_storage(
                 root,
                 TEST_SCHEMA,
@@ -4577,7 +4587,9 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
         drop(db);
 
         let crashing_open = {
-            let _fp = omnigraph::failpoints::ScopedFailPoint::new(window, "return");
+            let _fp = omnigraph::seams::catalog::decide(window)
+                .unwrap_or_else(|| panic!("harness window {window} names no catalog seam"))
+                .fire_always();
             Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await
         };
         let died = crashing_open.is_err();
@@ -5128,13 +5140,44 @@ struct RustEnvironment {
     die_at_write: Option<usize>,
 }
 
-#[derive(Debug)]
 struct RustResources {
     memory: MemoryStorage,
     storage: Arc<dyn StorageAdapter>,
     failing: Option<Arc<FailingStorage>>,
     lance_faults_state: Option<Arc<crate::lance_faults::LanceFaultState>>,
     kill_state: Option<Arc<KillState>>,
+    /// Holds the storage seam for the universe's lifetime: every handle the
+    /// engine opens (init, reopen, read-only bystander) is decorated with the
+    /// same `FailingStorage` the universe built.
+    _storage_seam: Option<
+        omnigraph::seams::Installed<
+            dyn omnigraph::storage::DecorateStorage,
+            omnigraph::seams::Global<dyn omnigraph::storage::DecorateStorage>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for RustResources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustResources")
+            .field("memory", &self.memory)
+            .field("failing", &self.failing)
+            .field("lance_faults_state", &self.lance_faults_state)
+            .field("kill_state", &self.kill_state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The storage-seam behavior: hands back the universe's one `FailingStorage`,
+/// ignoring the base adapter the engine offers (the instance already wraps it).
+struct FailingStorageDecorator(Arc<FailingStorage>);
+
+impl omnigraph::seams::Behavior for FailingStorageDecorator {}
+
+impl omnigraph::storage::DecorateStorage for FailingStorageDecorator {
+    fn wrap(&self, _base: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter> {
+        self.0.clone()
+    }
 }
 
 impl UniverseEnvironment for RustEnvironment {
@@ -5185,6 +5228,9 @@ impl UniverseEnvironment for RustEnvironment {
             Some(f) => f.clone(),
             None => base,
         };
+        let _storage_seam = failing.as_ref().map(|f| {
+            omnigraph::storage::STORAGE.install(Arc::new(FailingStorageDecorator(f.clone())))
+        });
 
         Ok(RustResources {
             memory,
@@ -5192,6 +5238,7 @@ impl UniverseEnvironment for RustEnvironment {
             failing,
             lance_faults_state,
             kill_state,
+            _storage_seam,
         })
     }
 
@@ -5358,9 +5405,9 @@ impl UniverseScenario<RustResources> for Scenario {
         #[cfg(feature = "failpoints")]
         let _persistent_probe = sc.probe_window.map(|w| {
             let flag = crossed_flag.clone();
-            omnigraph::failpoints::ScopedFailPoint::with_callback(w, move || {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst)
-            })
+            omnigraph::seams::catalog::decide(w)
+                .unwrap_or_else(|| panic!("harness window {w} names no catalog seam"))
+                .observe(move || flag.store(true, std::sync::atomic::Ordering::SeqCst))
         });
 
         for i in 0..sc.ops {
@@ -5574,10 +5621,15 @@ impl UniverseScenario<RustResources> for Scenario {
                 let _probe_guard = match crash_now {
                     Some(failpoint) if sc.probe_only => {
                         let flag = crossed_flag.clone();
-                        Some(omnigraph::failpoints::ScopedFailPoint::with_callback(
-                            failpoint,
-                            move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
-                        ))
+                        Some(
+                            omnigraph::seams::catalog::decide(failpoint)
+                                .unwrap_or_else(|| {
+                                    panic!("harness window {failpoint} names no catalog seam")
+                                })
+                                .observe(move || {
+                                    flag.store(true, std::sync::atomic::Ordering::SeqCst)
+                                }),
+                        )
                     }
                     _ => None,
                 };
@@ -6460,8 +6512,8 @@ impl UniverseScenario<RustResources> for Scenario {
             }
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        omnigraph::dst_clock::CLOCK.clear();
+        omnigraph::dst_ids::IDS.clear();
         crate::lance_faults::set_active(None);
         crate::lance_faults::set_kill(None);
         // WRITE CENSUS bottom listings: with weather and kill cleared,

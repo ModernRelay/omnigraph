@@ -5,10 +5,10 @@ use std::process::Command;
 fn refuses_unknown_or_unobserved_faults() {
     let expected = if cfg!(tokio_unstable) {
         [
-            "unsupported DST failpoint",
-            "configured faults were not observed",
-            "configured faults were not observed",
-            "configured faults were not observed",
+            "unknown seam",
+            "was not crossed on occurrence",
+            "was not crossed on occurrence",
+            "was not crossed on occurrence",
         ]
     } else {
         [
@@ -297,7 +297,7 @@ fn occurrence_is_counted_inside_the_selected_operation() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("fault_unobserved"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("seam_unobserved"));
     let (_, summary) = report(&output);
     assert_eq!(
         summary["attempts"].as_array().unwrap().len(),
@@ -447,7 +447,7 @@ fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass
         ),
         (
             selected.replace("occurrence: 1", "occurrence: 2"),
-            "fault_unobserved",
+            "seam_unobserved",
         ),
         (
             selected.replace("step: 4", "step: 5").replace(

@@ -6,7 +6,6 @@ use lance::Dataset;
 use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
-use crate::failpoints;
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, CommitGraphSnapshot, FirstParentEdge, GraphCommit};
@@ -750,7 +749,7 @@ impl GraphCoordinator {
         intent: LineageIntent,
         precondition: &PublishPrecondition,
     ) -> Result<PublishedSnapshot> {
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        crate::seams::fail(&crate::seams::catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let mut outcome = self
             .manifest
             .commit_changes_with_lineage_and_precondition(
@@ -760,7 +759,7 @@ impl GraphCoordinator {
                 precondition,
             )
             .await?;
-        failpoints::maybe_fail(crate::failpoints::names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
+        crate::seams::fail(&crate::seams::catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let commit = self.apply_lineage_to_cache(intent, &outcome);
         self.manifest.acknowledge_published_lineage(&mut outcome);
         Ok(PublishedSnapshot {

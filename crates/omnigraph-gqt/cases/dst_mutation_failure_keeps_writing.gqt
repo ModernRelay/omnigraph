@@ -22,10 +22,10 @@ node Person {
 --- mutate
 branch create work
 --- expect ok
---- fault
+--- seam
 at: mutation.post_sidecar_pre_fork
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate branch: work

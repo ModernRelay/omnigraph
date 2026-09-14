@@ -2915,18 +2915,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fail-parallel"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c29b33a0187823f1fa88b36980227dc96c7504ede2288e7d2a77d9d6d88b260c"
-dependencies = [
- "log",
- "once_cell",
- "rand 0.9.4",
- "tokio",
-]
-
-[[package]]
 name = "fancy-regex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5511,10 +5499,10 @@ dependencies = [
 name = "omnigraph-cluster"
 version = "0.11.0"
 dependencies = [
- "fail-parallel",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
+ "omnigraph-seams",
  "omnigraph-storage",
  "serde",
  "serde_json",
@@ -5556,7 +5544,6 @@ dependencies = [
  "arrow-array",
  "async-trait",
  "bytes",
- "fail-parallel",
  "futures",
  "lance-core",
  "lance-io",
@@ -5588,7 +5575,6 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
- "fail-parallel",
  "frostem",
  "futures",
  "lance",
@@ -5607,6 +5593,7 @@ dependencies = [
  "object_store",
  "omnigraph-compiler",
  "omnigraph-policy",
+ "omnigraph-seams",
  "omnigraph-storage",
  "proptest",
  "prost",
@@ -5660,6 +5647,10 @@ dependencies = [
  "serde_yaml",
  "tempfile",
 ]
+
+[[package]]
+name = "omnigraph-seams"
+version = "0.11.0"
 
 [[package]]
 name = "omnigraph-server"

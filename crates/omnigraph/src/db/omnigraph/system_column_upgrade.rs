@@ -466,9 +466,7 @@ async fn execute_with_lock(
     let recovery_operation_id = recovery_handle.operation_id.clone();
 
     let post_arm_result = async {
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
         let manifest_version_after_stamp =
             crate::db::manifest::publish_stamp_advance(db.root_uri(), from_stamp, to_stamp)
                 .await?;
@@ -481,13 +479,9 @@ async fn execute_with_lock(
             .expect("new system-column upgrade sidecar carries its intent")
             .manifest_version_after_stamp = Some(manifest_version_after_stamp);
         db.refresh_coordinator_only().await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE)?;
 
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
         db.storage
             .write_text(&schema_source_staging_uri(&db.root_uri), &desired_source)
             .await?;
@@ -536,9 +530,7 @@ async fn execute_with_lock(
                 entity_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::SCHEMA_APPLY_POST_TABLE_COMMIT,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
         crate::db::manifest::confirm_schema_apply_sidecar_v9(
@@ -549,9 +541,7 @@ async fn execute_with_lock(
             &committed_transactions,
         )
         .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_AFTER_STAGING_WRITE,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
 
         let mut manifest_changes = Vec::with_capacity(confirmed_updates.len());
         let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
@@ -592,9 +582,7 @@ async fn execute_with_lock(
                 &precondition,
             )
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         crate::db::schema_state::promote_exact_schema_staging(
             db.root_uri(),
             db.storage_adapter(),

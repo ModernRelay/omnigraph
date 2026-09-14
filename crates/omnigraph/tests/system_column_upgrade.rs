@@ -13,8 +13,8 @@ use omnigraph::db::{
     Omnigraph, ReadTarget, SnapshotDataset, SnapshotId, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome,
 };
-use omnigraph::failpoints::{FailScenario, ScopedFailPoint, names};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::seams::{DecideSeam, FailScenario, catalog};
 use omnigraph_compiler::ir::ParamMap;
 
 const LEGACY_SCHEMA: &str = r#"
@@ -524,7 +524,8 @@ async fn system_column_upgrade_refuses_before_any_effect() {
     );
 }
 
-async fn crash_then_roll_forward(failpoint: &str) {
+async fn crash_then_roll_forward(seam: &'static DecideSeam) {
+    let failpoint = seam.name();
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -532,7 +533,7 @@ async fn crash_then_roll_forward(failpoint: &str) {
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
 
     let error = {
-        let _failpoint = ScopedFailPoint::new(failpoint, "return");
+        let _failpoint = seam.fire_always();
         db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
             .await
             .expect_err("the failpoint must stop the upgrade")
@@ -607,8 +608,7 @@ async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
     let mut db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT.fire_always();
         db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
             .await
             .expect_err("the failpoint must stop the upgrade after arming");
@@ -636,15 +636,14 @@ async fn system_column_upgrade_survives_an_interrupted_recovery() {
     let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_POST_TABLE_COMMIT, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
         db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
             .await
             .expect_err("the failpoint must stop the upgrade after the first rename");
     }
     drop(db);
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH, "return");
+        let _failpoint = catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH.fire_always();
         Omnigraph::open(uri)
             .await
             .err()
@@ -669,7 +668,7 @@ async fn system_column_upgrade_recovery_reclaims_a_dead_writers_lock() {
     let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     let crashed = {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT, "panic");
+        let _failpoint = catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT.panic_at();
         tokio::spawn(async move {
             db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
                 .await
@@ -718,15 +717,14 @@ async fn system_column_upgrade_recovery_survives_a_crash_after_the_lock_reclaim(
     let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_POST_TABLE_COMMIT, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
         db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
             .await
             .expect_err("the failpoint must stop the upgrade after the first rename");
     }
     drop(db);
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM, "return");
+        let _failpoint = catalog::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM.fire_always();
         Omnigraph::open(uri).await.err().expect(
             "the first recovery stops after reclaiming the lock, before retiring the intent",
         );
@@ -750,30 +748,30 @@ async fn system_column_upgrade_recovery_survives_a_crash_after_the_lock_reclaim(
 
 #[tokio::test]
 async fn system_column_upgrade_rolls_forward_before_the_stamp_advance() {
-    crash_then_roll_forward(names::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT).await;
+    crash_then_roll_forward(&catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT).await;
 }
 
 #[tokio::test]
 async fn system_column_upgrade_rolls_forward_after_the_stamp_advance() {
-    crash_then_roll_forward(names::SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE).await;
+    crash_then_roll_forward(&catalog::SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE).await;
 }
 
 #[tokio::test]
 async fn system_column_upgrade_rolls_forward_after_the_first_rename() {
-    crash_then_roll_forward(names::SCHEMA_APPLY_POST_TABLE_COMMIT).await;
+    crash_then_roll_forward(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT).await;
 }
 
 #[tokio::test]
 async fn system_column_upgrade_rolls_forward_after_the_stamp_before_staging() {
-    crash_then_roll_forward(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE).await;
+    crash_then_roll_forward(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE).await;
 }
 
 #[tokio::test]
 async fn system_column_upgrade_rolls_forward_after_confirmation() {
-    crash_then_roll_forward(names::SCHEMA_APPLY_AFTER_STAGING_WRITE).await;
+    crash_then_roll_forward(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE).await;
 }
 
 #[tokio::test]
 async fn system_column_upgrade_rolls_forward_after_the_manifest_commit() {
-    crash_then_roll_forward(names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT).await;
+    crash_then_roll_forward(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT).await;
 }

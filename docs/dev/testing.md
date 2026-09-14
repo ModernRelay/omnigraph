@@ -18,6 +18,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 |---|---|---|
 | `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
+| `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors | None |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
@@ -60,6 +61,13 @@ Recovery tests must cover the protocol layer, the writer, and the user-visible r
 - `tests/recovery.rs` owns deterministic completed, partial, ambiguous, and foreign-effect outcomes;
 - `tests/failpoints.rs` owns crash windows around durable effects;
 - the writer's normal integration owner proves pre-arm failures leave no residue.
+
+To add a seam: declare its static in `crates/omnigraph/src/seams/catalog.rs`
+with `Seam::decide(name, Op, Effect, Global::new())`, list it in `ALL`, and
+call `crate::seams::fail`, `skip` or `contention` with it at the site.
+`tests/failpoint_names_guard.rs` checks the listing, that the helper matches
+the declared effect, and that some site or case references it;
+`scripts/seam_corpus.py` lists which seams a case covers.
 
 When adding a new writer or sidecar field, update all three layers. See [recovery.md](recovery.md).
 
