@@ -6867,6 +6867,12 @@ async fn finalize_visible_ensure_indices_rollback(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisibleExactOutcome {
     Original,
+    /// The original commit is visible with matching lineage while the sidecar
+    /// is still `Armed`: the `EffectsConfirmed` write was lost. The commit is
+    /// the authority; `manifest_version` names the committed snapshot (#602).
+    OriginalUnconfirmed {
+        manifest_version: u64,
+    },
     RolledBack,
 }
 
@@ -6957,7 +6963,10 @@ pub(crate) async fn ensure_read_only_schema_coherent(
                 OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
             })?;
         let expected_hash = match outcome {
-            Some(VisibleExactOutcome::Original) => &protocol.target_schema_ir_hash,
+            Some(VisibleExactOutcome::Original)
+            | Some(VisibleExactOutcome::OriginalUnconfirmed { .. }) => {
+                &protocol.target_schema_ir_hash
+            }
             Some(VisibleExactOutcome::RolledBack) | None => &protocol.authority.schema_ir_hash,
         };
         if &live.schema_ir_hash != expected_hash
@@ -7083,6 +7092,13 @@ async fn finalize_visible_v7_outcome(
         .as_ref()
         .expect("caller checked protocol_v7");
     let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::OriginalUnconfirmed { .. } => {
+            return Err(OmniError::manifest_internal(format!(
+                "SchemaApply recovery sidecar '{}' cannot finalize an unconfirmed original \
+                 outcome; only the mutation/load detector produces one",
+                sidecar.operation_id
+            )));
+        }
         VisibleExactOutcome::Original => {
             crate::db::schema_state::promote_exact_schema_staging(
                 root_uri,
@@ -7251,6 +7267,13 @@ async fn finalize_visible_v8_outcome(
         .as_ref()
         .expect("caller checked protocol_v8");
     let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::OriginalUnconfirmed { .. } => {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices recovery sidecar '{}' cannot finalize an unconfirmed original \
+                 outcome; only the mutation/load detector produces one",
+                sidecar.operation_id
+            )));
+        }
         VisibleExactOutcome::Original => {
             let outcomes = protocol
                 .intended_delta
@@ -7327,6 +7350,7 @@ async fn detect_visible_v3_outcome(
     let rollback_visible = commits
         .iter()
         .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let mut stale_manifest_version = None;
     let original_visible = if let Some(commit) = original_commit {
         let expected_branch = protocol
             .lineage
@@ -7348,29 +7372,46 @@ async fn detect_visible_v3_outcome(
                 sidecar.operation_id, protocol.lineage.graph_commit_id
             )));
         }
-        let committed_snapshot = ManifestCoordinator::snapshot_at(
-            root_uri,
-            sidecar.branch.as_deref(),
-            commit.graph_manifest_version,
-        )
-        .await?;
-        let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
-            let Some(confirmed) = slot.confirmed.as_ref() else {
-                return false;
-            };
-            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
-                entry.type_key == slot.table_key
-                    && entry.published_dataset_version == confirmed.table_version
-                    && entry.native_dataset_branch == confirmed.table_branch
-                    && entry.entity_count == confirmed.row_count
-                    && entry.version_metadata == confirmed.version_metadata
-            })
-        });
-        if !delta_matches {
-            return Err(OmniError::manifest_internal(format!(
-                "OCC recovery sidecar '{}' found original commit id '{}' but its manifest delta differs",
-                sidecar.operation_id, protocol.lineage.graph_commit_id
-            )));
+        let slots = &protocol.intended_delta.table_updates;
+        if protocol.effect_phase == RecoveryEffectPhase::Armed {
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                graph_commit_id = protocol.lineage.graph_commit_id.as_str(),
+                "recovery: OCC sidecar is still Armed beside its visible original commit; \
+                 the confirmation write was lost and the sidecar is stale"
+            );
+            stale_manifest_version = Some(commit.graph_manifest_version);
+        } else {
+            let committed_snapshot = ManifestCoordinator::snapshot_at(
+                root_uri,
+                sidecar.branch.as_deref(),
+                commit.graph_manifest_version,
+            )
+            .await?;
+            let delta_matches = slots.iter().all(|slot| {
+                let Some(confirmed) = slot.confirmed.as_ref() else {
+                    return false;
+                };
+                snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(
+                    |entry| {
+                        entry.type_key == slot.table_key
+                            && entry.published_dataset_version == confirmed.table_version
+                            && entry.native_dataset_branch == confirmed.table_branch
+                            && entry.entity_count == confirmed.row_count
+                            && entry.version_metadata == confirmed.version_metadata
+                    },
+                )
+            });
+            if !delta_matches {
+                return Err(OmniError::manifest_internal(format!(
+                    "OCC recovery sidecar '{}' found original commit id '{}' but its manifest \
+                     delta differs; the confirmed sidecar '{}' contradicts the committed \
+                     snapshot, inspect it rather than deleting it by hand",
+                    sidecar.operation_id,
+                    protocol.lineage.graph_commit_id,
+                    sidecar_uri(root_uri, &sidecar.operation_id)
+                )));
+            }
         }
         true
     } else {
@@ -7378,7 +7419,10 @@ async fn detect_visible_v3_outcome(
     };
 
     match (original_visible, rollback_visible) {
-        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (true, false) => Ok(Some(match stale_manifest_version {
+            Some(manifest_version) => VisibleExactOutcome::OriginalUnconfirmed { manifest_version },
+            None => VisibleExactOutcome::Original,
+        })),
         (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
         (false, false) => Ok(None),
         (true, true) => Err(OmniError::manifest_internal(format!(
@@ -7422,6 +7466,48 @@ async fn finalize_visible_v3_outcome(
                     }
                 })
                 .collect();
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+        VisibleExactOutcome::OriginalUnconfirmed { manifest_version } => {
+            let committed_snapshot = ManifestCoordinator::snapshot_at(
+                root_uri,
+                sidecar.branch.as_deref(),
+                manifest_version,
+            )
+            .await?;
+            let outcomes = sidecar
+                .tables
+                .iter()
+                .map(|pin| {
+                    let planned = snapshot_entry_by_identity(&committed_snapshot, pin.identity)
+                        .is_some_and(|entry| {
+                            entry.type_key == pin.table_key
+                                && entry.published_dataset_version == pin.post_commit_pin
+                                && entry.native_dataset_branch == pin.table_branch
+                        });
+                    if !planned {
+                        return Err(OmniError::manifest_internal(format!(
+                            "OCC recovery sidecar '{}' is Armed beside its visible original \
+                             commit '{}' but the committed snapshot does not carry the planned \
+                             version of table '{}'; inspect the sidecar '{}' rather than \
+                             deleting it by hand",
+                            sidecar.operation_id,
+                            protocol.lineage.graph_commit_id,
+                            pin.table_key,
+                            sidecar_uri(root_uri, &sidecar.operation_id)
+                        )));
+                    }
+                    Ok(TableOutcome {
+                        table_key: pin.table_key.clone(),
+                        from_version: pin.expected_version,
+                        to_version: pin.post_commit_pin,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             (
                 RecoveryKind::RolledForward,
                 protocol.lineage.graph_commit_id.clone(),
@@ -7560,6 +7646,13 @@ async fn finalize_visible_v4_outcome(
         .as_ref()
         .expect("caller checked protocol_v4");
     let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::OriginalUnconfirmed { .. } => {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' cannot finalize an unconfirmed original \
+                 outcome; only the mutation/load detector produces one",
+                sidecar.operation_id
+            )));
+        }
         VisibleExactOutcome::Original => {
             let outcomes = protocol
                 .intended_delta

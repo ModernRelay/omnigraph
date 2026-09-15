@@ -122,6 +122,21 @@ Roll-forward publishes the sidecar's pre-minted lineage and complete manifest
 delta; it does not create a new semantic commit. Compensation restores the
 previous accepted graph view and never acknowledges the failed operation.
 
+A mutation/load sidecar found still `Armed` beside its visible original commit
+is stale, not a plan: the writer confirms before it publishes, so this state is
+reachable only when the confirmation write was lost (acknowledged, effect
+absent) or the object rotted back to arm-time bytes. The commit is the
+authority for the operation. Recovery re-runs the check the lost confirmation
+would have made: the committed snapshot at the original commit must carry each
+owned table at the sidecar's planned post-commit version and branch. It then
+finishes the outcome like a confirmed original: one `RolledForward` audit row
+against the original commit, and the sidecar is deleted. A sidecar whose
+recorded or planned values contradict the committed snapshot is damage and
+still fails the read-write open; the error names the sidecar object, which
+must be inspected rather than deleted by hand. The same lost-confirmation
+shape on a `BranchMerge`, `SchemaApply`, or `EnsureIndices` sidecar still
+refuses the open; healing those is a follow-up.
+
 ## Initialization ownership
 
 Fresh-graph initialization uses a separate root-scoped

@@ -1120,6 +1120,9 @@ pub struct UniverseReport {
     /// structural miss, not a trial). Counts through suspension, since
     /// stored damage flows through any read.
     pub persisted_consumed: usize,
+    /// The consumed reads themselves, `<verb> <op> <uri>` with the root
+    /// normalized, so a pin can name WHICH stale object the engine read.
+    pub persisted_consumed_reads: Vec<String>,
     /// Sidecar residue at the final audit attributed
     /// to injected lost/misdirected writes — recorded (never silently
     /// excused) and then REQUIRED to heal on one reopen (the
@@ -2242,6 +2245,7 @@ struct FailingStorage {
     writes_lost: std::sync::atomic::AtomicUsize,
     writes_misdirected: std::sync::atomic::AtomicUsize,
     persisted_consumed: std::sync::atomic::AtomicUsize,
+    persisted_consumed_reads: Mutex<Vec<String>>,
     /// the staleness clock and memory. `staleness_tick`
     /// advances on every LANDED write-class call (count-landed-only, the
     /// kill enumerator's lesson); `key_history` keeps, per URI, the
@@ -2293,6 +2297,7 @@ impl FailingStorage {
             writes_lost: std::sync::atomic::AtomicUsize::new(0),
             writes_misdirected: std::sync::atomic::AtomicUsize::new(0),
             persisted_consumed: std::sync::atomic::AtomicUsize::new(0),
+            persisted_consumed_reads: Mutex::new(Vec::new()),
             staleness_tick: std::sync::atomic::AtomicU64::new(0),
             key_history: Mutex::new(std::collections::BTreeMap::new()),
             stale_reads_served: std::sync::atomic::AtomicUsize::new(0),
@@ -2378,6 +2383,17 @@ impl FailingStorage {
             .insert(uri.to_string(), verb);
     }
 
+    /// Every consumed read as `<verb> <op> <uri>`, root-normalized so the
+    /// report replay-compares across roots.
+    fn persisted_consumed_reads(&self, root: &str) -> Vec<String> {
+        self.persisted_consumed_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|read| read.replace(root, "<root>"))
+            .collect()
+    }
+
     /// CORRUPTION AXIS (persisted tier) — consumption tracking: a read touching a URI in
     /// the persisted ledger consumed damaged (or injected-absent) state.
     /// Counts regardless of the fault gates — suspension stops CALL-PATH
@@ -2388,6 +2404,10 @@ impl FailingStorage {
         if let Some(verb) = verb {
             self.persisted_consumed
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.persisted_consumed_reads
+                .lock()
+                .unwrap()
+                .push(format!("{verb} {op} {uri}"));
             println!("dst s11 damage-consumed: {verb} {op} {uri}");
         }
     }
@@ -6551,6 +6571,10 @@ impl UniverseScenario<RustResources> for Scenario {
             .as_ref()
             .map(|f| f.persisted_consumed())
             .unwrap_or(0);
+        let persisted_consumed_reads = failing
+            .as_ref()
+            .map(|f| f.persisted_consumed_reads(root))
+            .unwrap_or_default();
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
         // Persisted tier: drain the foreign-sidecar carve-out rows into the
@@ -6586,6 +6610,7 @@ impl UniverseScenario<RustResources> for Scenario {
             writes_lost,
             writes_misdirected,
             persisted_consumed,
+            persisted_consumed_reads,
             attributed_residue,
             reconcile_verdicts,
             known_issues,
