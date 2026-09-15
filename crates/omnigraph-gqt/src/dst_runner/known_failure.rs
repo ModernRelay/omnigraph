@@ -147,12 +147,14 @@ pub(super) fn classify(case: &Case, report: &WorkerReport) -> Result<bool, Strin
     let required = case
         .seams
         .iter()
-        .map(|(ordinal, seam)| {
-            (
-                u64::try_from(*ordinal).ok(),
-                Some(seam.at.clone()),
-                u64::try_from(seam.occurrence).ok(),
-            )
+        .flat_map(|(ordinal, seams)| {
+            seams.iter().map(move |seam| {
+                (
+                    u64::try_from(*ordinal).ok(),
+                    Some(seam.at.clone()),
+                    u64::try_from(seam.occurrence).ok(),
+                )
+            })
         })
         .collect::<Vec<_>>();
     if delivered != required {

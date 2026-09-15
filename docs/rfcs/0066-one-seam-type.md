@@ -122,10 +122,13 @@ mismatch is refused before the case runs. A bare `--- seam` without `action`
 is refused: a seam is a place, not an action. `--- fault` keeps its name for
 storage-boundary faults, specified in a separate amendment to RFC 0045.
 
-A `--- seam` block inherits the placement rules of `--- fault`: at most one
-per step, directly before the step it arms, never inside a loop body, at most
-16 per case, and refused before a `--- restart`, since no installed behavior
-survives a restart. `occurrence: N` counts crossings of the site, retries
+A `--- seam` block inherits the placement rules of `--- fault`: directly
+before the step it arms, never inside a loop body, at most 16 per case, and
+refused before a `--- restart`, since no installed behavior survives a
+restart. Several blocks may precede one step when they name distinct seams,
+each with its own delivery record; the same seam twice before one step is
+refused (the one-per-step rule of the first draft was lifted by the #602 fix,
+whose case loses two independent writes on one mutation). `occurrence: N` counts crossings of the site, retries
 included: the installed behavior passes the first N-1 crossings, fires on the
 Nth, and passes every later one, with N in `1..=1000000`. The expectation
 shape follows the action and the seam's declared effect: a `fail` action on a
@@ -138,18 +141,18 @@ carries `seam_delivered` with the seam name and the crossing index that
 fired, which is the proof the seam was reached.
 
 The first case of the skip kind is the one the motivation names,
-`crates/omnigraph-gqt/cases/issue_602_stale_sidecar_bricks_reopen.gqt`; the
+`crates/omnigraph-gqt/cases/issue_602_stale_sidecar_heals_on_reopen.gqt`; the
 excerpt below omits its `--- runner`, `--- schema` and `--- seed` sections:
 
 ```
 # issue: 602
---- known_failure
-step: 2
-match:
-  error: Internal
-  reason_prefix: "OCC recovery sidecar '"
 --- seam
-at: mutation.sidecar_confirm_ack_lost
+at: mutation.sidecar_confirm_put
+occurrence: 1
+action: skip
+scope: next_step
+--- seam
+at: mutation.sidecar_post_publish_delete
 occurrence: 1
 action: skip
 scope: next_step
@@ -164,11 +167,13 @@ query all() { match { $p: Person } return { $p.name } }
 {"p.name":"bob"}
 ```
 
-The skipped confirm leaves a sidecar the mutation never acknowledges, and on
-today's tree the reopen at `--- restart` refuses with `kind: Internal`. The
-refusal embeds the operation id of that run, so the marker matches its stable
-head rather than the whole string, and the case lands carrying that marker
-until the heal ships.
+The skipped confirm and the skipped delete leave a sidecar the mutation never
+acknowledges beside its visible commit. Before the #602 heal the reopen at
+`--- restart` refused with `kind: Internal`, and the case was first drafted
+carrying a `--- known_failure` marker on that step (the refusal embeds the
+operation id of the run, so the marker matched its stable head); the heal
+landed in the same change as the two seams, so the case asserts the reopen
+and the rows instead.
 
 ## Design
 
@@ -309,17 +314,17 @@ assertions hold either way.
 **The first skip seam.** No reachable skip seam exists in the engine today: the
 only `is_enabled` site is `CHANGE_FEED_SKIP_ETAG_WITNESS`
 (`crates/omnigraph/src/db/table_store.rs:1168`), whose op no GQ step reaches.
-This PR adds the first one, `mutation.sidecar_confirm_ack_lost` (op `Mutation`,
+This PR adds the first one, `mutation.sidecar_confirm_put` (op `Mutation`,
 effect `Skip`): read once, through `skip` inside `confirm_occ_sidecar_v9`
-(`crates/omnigraph/src/db/manifest/recovery.rs`), to skip the confirm put.
-The function returns whether the put was made; `commit_all` carries a `false`
-as `sidecar_confirm_lost`, and the post-commit `delete_sidecar`
-(`crates/omnigraph/src/exec/mutation.rs`) is skipped on it while the sidecar
-handle stays, so a publish failure after the lost confirm still classifies as
-recovery. One crossing models both lost writes because a lost confirm alone
-is repaired by the delete: the pair leaves the stale sidecar that
-[#602](https://github.com/ModernRelay/omnigraph/issues/602) reports, and
-leaves it from a logic test.
+(`crates/omnigraph/src/db/manifest/recovery.rs`), to skip the confirm put
+while the in-memory sidecar still confirms. Its sibling
+`mutation.sidecar_post_publish_delete` skips the post-commit delete inside
+`delete_sidecar_after_publish`, the one helper both `exec/mutation.rs` and
+`loader/mod.rs` call. The two are independent: a lost confirm alone is
+repaired by the delete, a lost delete alone leaves a confirmed residual the
+existing roll-forward finalizes, and the pair leaves the stale sidecar that
+[#602](https://github.com/ModernRelay/omnigraph/issues/602) reports, each
+shape its own logic-test case.
 
 **The two storage seams.** `STORAGE` is consulted at the one point where an
 adapter enters a handle, `open_with_storage_and_mode`
@@ -527,8 +532,9 @@ Owners extended (`docs/dev/testing.md:23,43,60`): `crates/omnigraph/tests/failpo
   reports equivalent up to the renamed delivery record (`fault_delivered
   {hook}` became `seam_delivered {at, occurrence, crossings}`);
   `scripts/seam_corpus.py --check` clean over the corpus;
-  `issue_602_stale_sidecar_bricks_reopen.gqt` landing red and carrying its
-  `known_failure` marker until the heal ships.
+  `issue_602_stale_sidecar_heals_on_reopen.gqt` green with the #602 heal in the
+  same change (first drafted as `…_bricks_reopen.gqt`, red with a
+  `known_failure` marker, before the heal joined this PR).
 
 The `--- seam` admission rule and the source walker are rules applied to
 people, so both tables below are part of the evidence. The walker's own
@@ -564,10 +570,12 @@ One PR, carrying:
 - `fail-parallel` removed from the three manifests and the workspace table;
 - the `--- seam` block in GQT with catalog-driven admission, the runner's
   `Decide`, the corpus rewrite and the coverage listing;
-- the new skip seam `mutation.sidecar_confirm_ack_lost`, the `reason_prefix`
-  matcher and `--- restart` support in `known_failure`, and the case
-  `issue_602_stale_sidecar_bricks_reopen.gqt`, which lands carrying that marker
-  until the heal, a separate PR, flips it.
+- the two skip seams `mutation.sidecar_confirm_put` and
+  `mutation.sidecar_post_publish_delete`, the `reason_prefix` matcher and
+  `--- restart` support in `known_failure`, several `--- seam` blocks before
+  one step, and the case `issue_602_stale_sidecar_heals_on_reopen.gqt`, which
+  lands green because the #602 heal ships in the same change (its first draft
+  carried a `known_failure` marker on the restart).
 
 The harness holds the guards for the run: `InstalledEnvironment`
 (`crates/omnigraph-dst/src/environment.rs:66-76`) holds `CLOCK` and `IDS`, each

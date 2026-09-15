@@ -1065,10 +1065,6 @@ pub(crate) struct CommittedMutation {
     /// Recovery sidecar to delete during Stage H after manifest CAS succeeds
     /// (`None` when nothing staged).
     pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
-    /// The confirm put was skipped by the `MUTATION_SIDECAR_CONFIRM_ACK_LOST`
-    /// seam; Stage H then skips the delete too (the second lost write) while
-    /// the handle stays, so a publish failure still classifies as recovery.
-    pub(crate) sidecar_confirm_lost: bool,
     /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
     /// caller MUST hold the complete set across manifest publish (see
     /// `commit_all`) so no same-process writer interleaves after revalidation.
@@ -1239,7 +1235,6 @@ impl StagedMutation {
                 updates: Vec::new(),
                 expected_versions,
                 sidecar_handle: None,
-                sidecar_confirm_lost: false,
                 guards,
             });
         }
@@ -1561,7 +1556,7 @@ impl StagedMutation {
             )?;
         }
 
-        let sidecar_confirm_lost = match confirm_occ_sidecar_v9(
+        confirm_occ_sidecar_v9(
             db.root_uri(),
             db.storage_adapter(),
             &mut sidecar,
@@ -1569,21 +1564,12 @@ impl StagedMutation {
             &committed_transactions,
         )
         .await
-        {
-            Err(error) => {
-                return Err(OmniError::recovery_required(
-                    operation_id,
-                    error.to_string(),
-                ));
-            }
-            Ok(durable) => !durable,
-        };
+        .map_err(|error| OmniError::recovery_required(operation_id, error.to_string()))?;
 
         Ok(CommittedMutation {
             updates,
             expected_versions,
             sidecar_handle,
-            sidecar_confirm_lost,
             guards,
         })
     }

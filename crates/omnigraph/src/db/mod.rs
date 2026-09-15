@@ -24,6 +24,8 @@ pub use omnigraph::{
 };
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
+#[cfg(feature = "dst")]
+pub use recovery_audit::dst_recovery_audit_rows;
 pub(crate) use schema_state::SchemaContractText;
 
 use crate::error::{OmniError, Result};

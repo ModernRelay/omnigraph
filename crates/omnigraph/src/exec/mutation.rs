@@ -1000,7 +1000,6 @@ impl Omnigraph {
                     updates,
                     expected_versions,
                     sidecar_handle,
-                    sidecar_confirm_lost,
                     guards: _queue_guards,
                 } = staged
                     .commit_all(
@@ -1047,17 +1046,18 @@ impl Omnigraph {
                         };
                     }
                 };
-                if let Some(handle) = sidecar_handle
-                    && !sidecar_confirm_lost
-                {
+                if let Some(handle) = sidecar_handle {
                     // Best-effort cleanup: the manifest publish already
                     // succeeded, so the user's mutation is durable. A failed
                     // delete leaves a fixed, idempotent v3 outcome for the next
                     // synchronous heal or read-write open to audit and remove.
                     // Failing the user here would report an error for a write
                     // that already landed.
-                    if let Err(err) =
-                        crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
+                    if let Err(err) = crate::db::manifest::delete_sidecar_after_publish(
+                        &handle,
+                        self.storage_adapter(),
+                    )
+                    .await
                     {
                         tracing::warn!(
                             error = %err,
