@@ -47,7 +47,11 @@ assertion remains a failure unless it meets the explicit known-failure contract 
 ## Seam placement
 
 Place a seam directly before its mutate operation, a GQ mutation or a branch
-statement; no seam is crossed by a query step yet:
+statement; no seam is crossed by a query step yet. Several seam blocks may
+precede one operation when they name distinct seams (two lost writes on one
+mutation, `cases/issue_602_stale_sidecar_heals_on_reopen.gqt`); each carries
+its own delivery record, and the same seam twice before one operation is
+refused:
 
 ```yaml
 --- seam
@@ -66,8 +70,9 @@ injects a retryable error that the publisher retries, so the step succeeds
 and the `seam_delivered` record is its only proof; on a seam of effect fail
 the step states the injected error in its `--- expect error:` row. A `skip`
 action carries the healthy expectation the skipped path produces; a lost
-durable write is then pinned by a `--- restart` with a `--- known_failure`
-marker (`cases/issue_602_stale_sidecar_bricks_reopen.gqt`). The occurrence counts crossings inside that
+durable write is then proven healed by a `--- restart` and the query after it
+(`cases/issue_602_stale_sidecar_heals_on_reopen.gqt`), or, while the defect
+stands, pinned by a `--- known_failure` marker on that restart. The occurrence counts crossings inside that
 operation, including production retries; setup and preceding operations
 cannot consume it. The installed decision is removed before the next
 operation or restart. Seam directives inside loops are refused. GQT does not

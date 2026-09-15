@@ -678,13 +678,23 @@ pub static PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION: DecideSeam = Seam::decide(
     Global::new(),
 );
 
-/// The mutation's sidecar confirm put and its post-commit delete are both
-/// lost (acknowledged, effect absent): the `__manifest` commit publishes
-/// while the sidecar keeps its arm-time bytes. One crossing models both
-/// losses (the confirm's outcome gates the delete), because a lost confirm
-/// alone is repaired by the delete and leaves no residue.
-pub static MUTATION_SIDECAR_CONFIRM_ACK_LOST: DecideSeam = Seam::decide(
-    "mutation.sidecar_confirm_ack_lost",
+/// The put that moves a mutation's sidecar from `Armed` to `EffectsConfirmed`,
+/// after every confirm-time check. Skipped: the engine believes it confirmed
+/// and publishes, the object keeps its arm-time bytes (a lost write). Alone
+/// the post-publish delete removes the stale object; skipped together with
+/// `MUTATION_SIDECAR_POST_PUBLISH_DELETE` it leaves the Armed-beside-visible-
+/// commit shape of issue #602.
+pub static MUTATION_SIDECAR_CONFIRM_PUT: DecideSeam = Seam::decide(
+    "mutation.sidecar_confirm_put",
+    Op::Mutation,
+    Effect::Skip,
+    Global::new(),
+);
+/// The delete of a mutation's sidecar once its `__manifest` commit is visible.
+/// Skipped: the object survives the publish with whatever bytes it holds (a
+/// lost write), the residue the next read-write open finalizes.
+pub static MUTATION_SIDECAR_POST_PUBLISH_DELETE: DecideSeam = Seam::decide(
+    "mutation.sidecar_post_publish_delete",
     Op::Mutation,
     Effect::Skip,
     Global::new(),
@@ -692,7 +702,8 @@ pub static MUTATION_SIDECAR_CONFIRM_ACK_LOST: DecideSeam = Seam::decide(
 
 /// Every decision seam in this crate.
 pub static ALL: &[&'static dyn SeamEntry] = &[
-    &MUTATION_SIDECAR_CONFIRM_ACK_LOST,
+    &MUTATION_SIDECAR_CONFIRM_PUT,
+    &MUTATION_SIDECAR_POST_PUBLISH_DELETE,
     &UPGRADE_AFTER_FENCE,
     &UPGRADE_AFTER_STAGE,
     &UPGRADE_AFTER_BRANCH,

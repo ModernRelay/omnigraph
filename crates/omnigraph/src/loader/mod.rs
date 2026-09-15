@@ -847,7 +847,6 @@ async fn load_jsonl_reader_once<R: BufRead>(
         updates,
         expected_versions,
         sidecar_handle,
-        sidecar_confirm_lost,
         guards: _queue_guards,
     } = staged
         .commit_all(
@@ -893,10 +892,10 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // through the one manifest visibility point. Phase C succeeded — clean up
     // best-effort: failing the user here would error out a write that already
     // landed durably; a leftover fixed outcome is idempotently finalized later.
-    if let Some(handle) = sidecar_handle
-        && !sidecar_confirm_lost
-    {
-        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
+    if let Some(handle) = sidecar_handle {
+        if let Err(err) =
+            crate::db::manifest::delete_sidecar_after_publish(&handle, db.storage_adapter()).await
+        {
             tracing::warn!(
                 error = %err,
                 operation_id = handle.operation_id.as_str(),

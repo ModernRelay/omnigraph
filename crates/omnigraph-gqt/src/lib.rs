@@ -68,7 +68,7 @@ struct Case {
     input_text: String,
     runner: RunnerConfig,
     known_failure: Option<KnownFailure>,
-    seams: BTreeMap<usize, SeamDirective>,
+    seams: BTreeMap<usize, Vec<SeamDirective>>,
     source_lines: BTreeMap<usize, usize>,
     schema: String,
     seed: String,
@@ -1206,7 +1206,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         {
             return Err(missing_shape(waiting));
         }
-        if awaiting_seam_step && kind != "mutate" {
+        if awaiting_seam_step && !matches!(kind, "mutate" | "seam") {
             return Err(
                 "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement); no seam is crossed by a query step yet".into(),
             );
@@ -1222,7 +1222,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         "invalid_case: seam directives inside loops are not supported".into(),
                     );
                 }
-                if seams.len() >= 16 {
+                if seams.values().map(Vec::len).sum::<usize>() >= 16 {
                     return Err("invalid_case: a case admits at most 16 seam directives".into());
                 }
                 if !rest.is_empty() || pending.is_some() {
@@ -1234,7 +1234,15 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     .map(|(_, line)| *line)
                     .collect::<Vec<_>>()
                     .join("\n");
-                seams.insert(ordinal + 1, parse_seam(&body)?);
+                let seam = parse_seam(&body)?;
+                let step_seams: &mut Vec<SeamDirective> = seams.entry(ordinal + 1).or_default();
+                if step_seams.iter().any(|earlier| earlier.at == seam.at) {
+                    return Err(format!(
+                        "invalid_case: seam {} is declared twice before one step; one directive per seam per step",
+                        seam.at
+                    ));
+                }
+                step_seams.push(seam);
                 awaiting_seam_step = true;
             }
             "fault" => {
@@ -2292,8 +2300,8 @@ async fn execute_steps_inner(
                         }
                     },
                 );
-                let seam = case.seams.get(&ordinal);
-                let armed = dst_runner::arm_seam(seam, step)?;
+                let seams = case.seams.get(&ordinal).map_or(&[][..], Vec::as_slice);
+                let armed = dst_runner::arm_seams(seams, step)?;
                 let lifetime_before = dst_runner::lifetime_counts();
                 let outcome = match step {
                     Step::Query(q) => run_query_step(&db, case.traversal, q, binding).await,
@@ -2349,7 +2357,7 @@ async fn execute_steps_inner(
                         Ok(())
                     }
                 };
-                let seam_result = dst_runner::finish_seam(armed);
+                let seam_result = dst_runner::finish_seams(armed);
                 let lifetime_after = dst_runner::lifetime_counts();
                 dst_runner::record(
                     "engine_lifetime",
