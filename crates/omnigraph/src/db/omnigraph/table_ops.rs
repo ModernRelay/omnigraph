@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::missing_graph_type_at_snapshot;
+use crate::seams::{decide_seam, fail};
 use lance::index::DatasetIndexExt;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
@@ -195,6 +196,29 @@ pub(super) async fn ensure_indices_for_branch(
             .await?
             .pending,
     )
+}
+
+decide_seam! {
+    /// Every exact index transaction and first-touch ref effect is durable,
+    /// but the v8 sidecar is still Armed. Recovery must therefore compensate
+    /// rather than infer the intended manifest delta from physical state.
+    pub static ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM = ("ensure_indices.post_effects_pre_confirm", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static ENSURE_INDICES_POST_TABLE_EFFECT = ("ensure_indices.post_table_effect", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static ENSURE_INDICES_POST_SIDECAR_PRE_FORK = ("ensure_indices.post_sidecar_pre_fork", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT = ("ensure_indices.post_phase_b_pre_manifest_commit", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE = ("ensure_indices.post_stage_pre_commit_btree", Unreachable, [Fail]);
 }
 
 async fn maintain_indices_for_branch(
@@ -399,7 +423,7 @@ async fn maintain_indices_for_branch(
                         pin.table_key, work.specs
                     ))
                 })?;
-            crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
+            fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
             planned_transactions.insert(pin.identity, staged.transaction_identity());
             existing_staged.insert(pin.table_key.clone(), staged);
         }
@@ -482,9 +506,7 @@ async fn maintain_indices_for_branch(
     let graph_commit_id = if recovery_pins.is_empty() {
         // Preserve the no-work failpoint contract without manufacturing durable
         // recovery state or graph lineage.
-        crate::seams::fail(
-            &crate::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-        )?;
+        fail(&ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
         None
     } else {
         let expected_versions = recovery_pins
@@ -549,7 +571,7 @@ async fn maintain_indices_for_branch(
 
         let post_arm_result = async {
             if !first_touch_sources.is_empty() {
-                crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_SIDECAR_PRE_FORK)?;
+                fail(&ENSURE_INDICES_POST_SIDECAR_PRE_FORK)?;
             }
 
             let mut updates = Vec::with_capacity(recovery_pins.len());
@@ -608,9 +630,7 @@ async fn maintain_indices_for_branch(
                                 work.specs
                             ))
                         })?;
-                    crate::seams::fail(
-                        &crate::seams::catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
-                    )?;
+                    fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
                     staged
                 };
                 let planned = planned_transactions.get(&pin.identity).ok_or_else(|| {
@@ -646,10 +666,10 @@ async fn maintain_indices_for_branch(
                         .version_metadata
                         .with_table_fork_owner(pin.table_fork_owner.as_deref()),
                 });
-                crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_TABLE_EFFECT)?;
+                fail(&ENSURE_INDICES_POST_TABLE_EFFECT)?;
             }
 
-            crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM)?;
+            fail(&ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM)?;
             crate::db::manifest::confirm_ensure_indices_sidecar_v9(
                 db.root_uri(),
                 db.storage_adapter(),
@@ -659,9 +679,7 @@ async fn maintain_indices_for_branch(
                 &confirmed_ref_identifiers,
             )
             .await?;
-            crate::seams::fail(
-                &crate::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            )?;
+            fail(&ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
             let published = commit_updates_on_branch_with_expected(
                 db,
                 active_branch.as_deref(),
@@ -1087,6 +1105,10 @@ pub(crate) struct DeferredTableFork {
     pub(crate) target_branch: String,
 }
 
+decide_seam! {
+    pub static FORK_BEFORE_CLASSIFY = ("fork.before_classify", AnyWrite, [Fail]);
+}
+
 #[cfg(test)]
 impl OpenedForMutation {
     /// Raw-write fixtures use the no-transaction path, which must open a handle.
@@ -1319,7 +1341,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             Ok((ds, Some(branch.to_string())))
         }
         source_branch => {
-            crate::seams::fail(&crate::seams::catalog::FORK_BEFORE_CLASSIFY)?;
+            fail(&FORK_BEFORE_CLASSIFY)?;
             let live = db.snapshot_for_branch(Some(active_branch)).await?;
             let current = live.dataset(table_key).ok_or_else(|| {
                 OmniError::manifest_read_set_changed(
@@ -1437,7 +1459,7 @@ pub(crate) async fn classify_fork_ref_with_references(
     excluding_operation_id: Option<&str>,
     references: &crate::db::manifest::NativeForkReferences,
 ) -> ForkRefStatus {
-    if crate::seams::fail(&crate::seams::catalog::CLASSIFY_FRESH_READ).is_err() {
+    if fail(&crate::seams::catalog::CLASSIFY_FRESH_READ).is_err() {
         return ForkRefStatus::Indeterminate;
     }
     let sidecars =
@@ -1547,7 +1569,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     // boundary. EnsureIndices itself stages existing targets before its gates;
     // legacy callers of this shared helper still exercise the same no-HEAD-
     // movement guarantee.
-    crate::seams::fail(&crate::seams::catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
+    fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
     let new_ds = db
         .storage()
         .commit_staged(ds.clone(), staged)

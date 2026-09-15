@@ -1,7 +1,7 @@
 pub mod commit_graph;
-mod graph_coordinator;
+pub(crate) mod graph_coordinator;
 pub mod manifest;
-mod omnigraph;
+pub(crate) mod omnigraph;
 mod recovery_audit;
 mod schema_state;
 pub(crate) mod write_queue;

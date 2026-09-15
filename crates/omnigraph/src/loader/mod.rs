@@ -25,6 +25,7 @@ use serde_json::Value as JsonValue;
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
 use crate::exec::staging::{MutationStaging, PendingMode};
+use crate::seams::{catalog, decide_seam, fail};
 use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
 
 /// Result of a load operation.
@@ -96,6 +97,14 @@ pub async fn load_jsonl_file(db: &Omnigraph, path: &str, mode: LoadMode) -> Resu
     let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load_file(branch, path, mode).await
+}
+
+decide_seam! {
+    /// The implicit fork-if-missing branch
+    /// create completed durably, before any load staging byte is written.
+    /// The load "never happened" yet its target branch exists — a failed
+    /// load's surviving empty branch.
+    pub static LOAD_POST_BRANCH_CREATE_PRE_STAGE = ("load.post_branch_create_pre_stage", Unreachable, [Fail]);
 }
 
 impl Omnigraph {
@@ -362,7 +371,7 @@ impl Omnigraph {
                 branch_created = true;
                 // DST window (loader walk D1 → D2): the implicit fork is
                 // durable, the load has not begun.
-                crate::seams::fail(&crate::seams::catalog::LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
+                fail(&LOAD_POST_BRANCH_CREATE_PRE_STAGE)?;
             }
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
@@ -835,7 +844,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let staged = staging
         .stage_all_with_concurrency(db, branch, crate::exec::staging::stage_write_concurrency())
         .await?;
-    crate::seams::fail(&crate::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
     let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
     // `_queue_guards` holds the root-shared schema → branch → sorted-table
     // gates across manifest publication. This closes same-process
@@ -862,7 +871,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // have advanced and the v3 sidecar contains their exact transaction
     // identities, but the graph manifest has not published the result. Reuse
     // the mutation failpoint name so one failpoint pins the shared boundary.
-    crate::seams::fail(&crate::seams::catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
     let publish_result = db
         .commit_updates_on_branch_with_expected(
             branch,

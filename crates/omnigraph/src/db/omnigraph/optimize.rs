@@ -38,6 +38,7 @@ use lance_index::optimize::OptimizeOptions;
 
 use super::*;
 use crate::error::missing_graph_type_at_snapshot;
+use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
 /// Lance dataset so there is no shared state; the bound is there to avoid
@@ -202,6 +203,25 @@ struct OptimizeEffectOutcome {
     update: Option<crate::db::DatasetUpdate>,
 }
 
+decide_seam! {
+    pub static OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT = ("optimize.post_phase_b_pre_manifest_commit", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After Optimize captures its authority token, before the schema -> main
+    /// -> table gates and the revalidation that consumes it. Tests advance the
+    /// graph in this window and prove Optimize refuses rather than planning
+    /// against authority that has already moved.
+    pub static OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES = ("optimize.post_authority_capture_pre_gates", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After Optimize's broad recovery fast-path check, before the main-branch
+    /// writer gate is acquired. Tests arm a late recovery intent in this window
+    /// and prove the under-branch-gate check refuses to advance around it.
+    pub static OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE = ("optimize.post_recovery_check_pre_main_gate", Unreachable, [Fail]);
+}
+
 /// Run Lance maintenance across every node + edge dataset on `main` under one
 /// graph visibility envelope. Physical dataset work remains bounded-parallel,
 /// but every productive dataset shares one recovery sidecar and one monotonic
@@ -231,14 +251,14 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     // but main's branch-writer gate is not held yet. A writer may arm recovery
     // in this window; the load-bearing check below runs only after Optimize owns
     // the branch authority every sidecar-enrolled main writer must cross.
-    crate::seams::fail(&crate::seams::catalog::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE)?;
+    fail(&OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE)?;
 
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
     // graph or schema publish therefore refuses this attempt before physical
     // maintenance effects or recovery ownership.
     let authority_txn = db.open_write_txn(None).await?;
-    crate::seams::fail(&crate::seams::catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
+    fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
 
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
@@ -360,9 +380,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 
         // One graph-wide Phase-B -> Phase-C crash seam, after every physical
         // effect and before the only graph visibility point.
-        if let Err(error) =
-            crate::seams::fail(&crate::seams::catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)
-        {
+        if let Err(error) = fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT) {
             return Err(optimize_recovery_required(&recovery_handle, error));
         }
 
@@ -639,6 +657,18 @@ async fn append_deferred_full_text_indexes(
     Ok(())
 }
 
+decide_seam! {
+    /// After compaction has committed (HEAD already ahead of the manifest from
+    /// our own work), before the reindex of the next attempt. A failure here is
+    /// the retryable reindex conflict that exercises own-HEAD drift
+    /// classification on the reopened attempt.
+    pub static OPTIMIZE_POST_COMPACT_PRE_REINDEX = ("optimize.post_compact_pre_reindex", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static OPTIMIZE_BEFORE_COMPACT = ("optimize.before_compact", Unreachable, [Fail]);
+}
+
 /// Apply one productive dataset's physical maintenance work. This helper owns no
 /// locks, sidecar, or graph publish; those are graph-wide responsibilities of
 /// `optimize_all_datasets`.
@@ -749,7 +779,7 @@ async fn apply_optimize_table_effects(
 
         // Test seam: a concurrent (cross-process) writer can interleave here, before
         // any Phase-B commit lands, to exercise the reopen+replan path.
-        crate::seams::fail(&crate::seams::catalog::OPTIMIZE_BEFORE_COMPACT)?;
+        fail(&OPTIMIZE_BEFORE_COMPACT)?;
 
         // Phase B: scrub stale auto_cleanup (keeps optimize non-destructive on a
         // graph upgraded from a pre-v7 binary whose `compact_files`/`optimize_indices`
@@ -789,9 +819,7 @@ async fn apply_optimize_table_effects(
         // committed (so HEAD is already ahead of the manifest from our own work),
         // exercising the own-HEAD (not external) drift classification on the next
         // reopened attempt.
-        if crate::seams::fail(&crate::seams::catalog::OPTIMIZE_INJECT_REINDEX_CONFLICT).is_err()
-            && attempt < COMPACTION_RETRY_BUDGET
-        {
+        if fail(&OPTIMIZE_POST_COMPACT_PRE_REINDEX).is_err() && attempt < COMPACTION_RETRY_BUDGET {
             continue;
         }
         // FTS folding merges existing postings into a new UUID without an
@@ -1154,6 +1182,16 @@ async fn compact_internal_table(
     )))
 }
 
+decide_seam! {
+    pub static CLEANUP_TABLE_GC = ("cleanup.table_gc", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After cleanup's fast empty-sidecar probe, before it acquires the closed
+    /// schema/branch/table GC gate set and performs the authoritative recheck.
+    pub static CLEANUP_POST_RECOVERY_CHECK_PRE_GATES = ("cleanup.post_recovery_check_pre_gates", Unreachable, [Fail]);
+}
+
 /// Run Lance `cleanup_old_versions` on every node + edge dataset on `main`,
 /// using [`CleanupPolicyOptions`]. The latest manifest is always preserved
 /// regardless (Lance invariant), and the requested cutoff is capped at the
@@ -1186,7 +1224,7 @@ pub async fn cleanup_all_datasets(
              recovery sweep before garbage-collecting versions",
         ));
     }
-    crate::seams::fail(&crate::seams::catalog::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
+    fail(&CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
 
     // GC must be bound to one accepted graph view. Capture before acquiring
     // writer gates, and revalidate after the complete schema/branch/table
@@ -1336,7 +1374,7 @@ pub async fn cleanup_all_datasets(
     let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path, live_main_floor)| async move {
             let outcome: Result<RemovalStats> = async {
-                crate::seams::fail(&crate::seams::catalog::CLEANUP_TABLE_GC)?;
+                fail(&CLEANUP_TABLE_GC)?;
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. It only needs a raw read borrow.
@@ -1641,6 +1679,14 @@ async fn native_fork_inventory(
     })
 }
 
+decide_seam! {
+    pub static CLASSIFY_FRESH_READ = ("classify.fresh_read", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static CLEANUP_RESOLVE_BRANCH_SNAPSHOT = ("cleanup.resolve_branch_snapshot", Unreachable, [Fail]);
+}
+
 async fn reconcile_orphaned_branches_under_control_gates(
     db: &Omnigraph,
     before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
@@ -1697,7 +1743,7 @@ async fn reconcile_orphaned_branches_under_control_gates(
             continue;
         }
         if references.is_none() {
-            let captured = match crate::seams::fail(&crate::seams::catalog::CLEANUP_RESOLVE_BRANCH_SNAPSHOT).and_then(|()| crate::seams::fail(&crate::seams::catalog::CLASSIFY_FRESH_READ)) {
+            let captured = match fail(&CLEANUP_RESOLVE_BRANCH_SNAPSHOT).and_then(|()| fail(&CLASSIFY_FRESH_READ)) {
                 Ok(()) => {
                     crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
                         db.root_uri(),
@@ -1742,6 +1788,10 @@ async fn reconcile_orphaned_branches_under_control_gates(
     }
     reconcile_retired_manifest_forks(db, before_timestamp, &mut stats).await;
     Ok(stats)
+}
+
+decide_seam! {
+    pub static CLEANUP_RECONCILE_FORK = ("cleanup.reconcile_fork", Unreachable, [Fail]);
 }
 
 async fn collect_native_forks(
@@ -1794,7 +1844,7 @@ async fn collect_native_forks(
         }
         for branch in leaves {
             candidates.remove(&branch);
-            let outcome = match crate::seams::fail(&crate::seams::catalog::CLEANUP_RECONCILE_FORK) {
+            let outcome = match fail(&CLEANUP_RECONCILE_FORK) {
                 Ok(()) => db.storage().force_delete_branch(full_path, &branch).await,
                 Err(injected) => Err(injected),
             };
@@ -1933,7 +1983,7 @@ mod tests {
             ds.create_branch(&feature_native, base, None).await.unwrap();
         }
 
-        let _fp = crate::seams::catalog::CLEANUP_RESOLVE_BRANCH_SNAPSHOT.fire_always();
+        let _fp = CLEANUP_RESOLVE_BRANCH_SNAPSHOT.fire_always();
         let stats = reconcile_orphaned_branches(&db).await.unwrap();
 
         assert_eq!(

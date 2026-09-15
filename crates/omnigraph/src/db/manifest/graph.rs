@@ -23,6 +23,7 @@ use super::state::{
     manifest_schema, read_manifest_state, read_manifest_state_and_lineage,
 };
 use super::{TableIdentity, table_path_for_identity};
+use crate::seams::{decide_seam, fail};
 
 /// The manifest version the init `Dataset::write` produces (Lance datasets start
 /// at version one). The genesis graph commit pins this version — a snapshot at
@@ -90,6 +91,21 @@ impl From<OmniError> for ManifestInitError {
     }
 }
 
+decide_seam! {
+    /// Before the durable exact-genesis probe used to classify an
+    /// acknowledgement-unknown manifest Create. An injected failure proves the
+    /// caller preserves schema artifacts when the outcome cannot be observed.
+    pub static INIT_MANIFEST_CREATE_PROBE = ("init.manifest_create_probe", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After Lance has durably returned the new `__manifest` Dataset, but
+    /// before OmniGraph's create half can acknowledge it. Returning an error
+    /// here models a lost object-store acknowledgement and must route through
+    /// exact-genesis classification rather than schema cleanup.
+    pub static INIT_MANIFEST_CREATE_POST_NATIVE = ("init.manifest_create_post_native", Unreachable, [Fail]);
+}
+
 impl From<ManifestInitError> for OmniError {
     fn from(error: ManifestInitError) -> Self {
         error.into_source()
@@ -155,7 +171,7 @@ pub(super) async fn init_manifest_graph(
     // acknowledgement was lost before `Dataset::write` returned success to
     // OmniGraph.  It deliberately sits inside the create half, before the
     // caller can classify the returned Dataset as proof of commitment.
-    crate::seams::fail(&crate::seams::catalog::INIT_MANIFEST_CREATE_ACK_LOST)
+    fail(&INIT_MANIFEST_CREATE_POST_NATIVE)
         .map_err(ManifestInitError::ManifestCreateOutcomeUnknown)?;
     Ok(dataset)
 }
@@ -168,7 +184,7 @@ pub(super) async fn open_exact_genesis_manifest(
     attempt: &GenesisManifestAttempt,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
-    crate::seams::fail(&crate::seams::catalog::INIT_MANIFEST_CREATE_PROBE)?;
+    fail(&INIT_MANIFEST_CREATE_PROBE)?;
     let (dataset, known_state, lineage_rows, _) =
         open_manifest_graph_with_lineage(root_uri, None, control_session).await?;
 
@@ -229,6 +245,14 @@ pub(super) async fn open_exact_genesis_manifest(
     Ok((dataset, known_state, lineage_rows))
 }
 
+decide_seam! {
+    /// The first ordinary post-commit read-back failpoint after the graph's
+    /// `__manifest` Create has been positively classified. A crash OR an error
+    /// return here must leave an openable graph; init's schema cleanup is
+    /// unreachable from this window (issue #495).
+    pub static INIT_POST_MANIFEST_CREATE = ("init.post_manifest_create", Unreachable, [Fail]);
+}
+
 fn genesis_probe_mismatch(root_uri: &str, detail: impl std::fmt::Display) -> OmniError {
     OmniError::manifest_conflict(format!(
         "__manifest at '{}' is not the exact genesis created by this initialization attempt: {detail}",
@@ -242,7 +266,7 @@ fn genesis_probe_mismatch(root_uri: &str, detail: impl std::fmt::Display) -> Omn
 pub(super) async fn load_initial_manifest_state(
     dataset: &Dataset,
 ) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
-    crate::seams::fail(&crate::seams::catalog::INIT_POST_MANIFEST_CREATE)?;
+    fail(&INIT_POST_MANIFEST_CREATE)?;
     read_manifest_state_and_lineage(dataset).await
 }
 
@@ -401,6 +425,14 @@ async fn build_initial_entries(
     Ok((entries, version_metadata))
 }
 
+decide_seam! {
+    /// After a per-type Lance dataset Create returns success, before graph
+    /// initialization can acknowledge it. The graph manifest does not exist
+    /// yet, but retry and schema cleanup are unsafe because the table Create
+    /// may be durable.
+    pub static INIT_TABLE_CREATE_POST_NATIVE = ("init.table_create_post_native", Unreachable, [Fail]);
+}
+
 async fn create_empty_dataset(
     uri: &str,
     schema: &SchemaRef,
@@ -432,7 +464,7 @@ async fn create_empty_dataset(
     let dataset = Dataset::write(reader, uri, Some(params))
         .await
         .map_err(OmniError::storage)?;
-    crate::seams::fail(&crate::seams::catalog::INIT_TABLE_CREATE_ACK_LOST)?;
+    fail(&INIT_TABLE_CREATE_POST_NATIVE)?;
     Ok(dataset)
 }
 

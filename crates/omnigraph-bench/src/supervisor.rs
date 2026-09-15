@@ -1373,7 +1373,6 @@ mod tests {
     };
     use crate::worker_protocol::ChildFrameV1;
     use crate::{ValidatedCase, parse_case};
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, MutexGuard};
 
     use super::*;
@@ -1582,16 +1581,32 @@ mod tests {
         format!("printf '%s\\n' {}\n", shell_quote(&encoded))
     }
 
+    /// Create the executable in an isolated process so concurrent test forks
+    /// cannot retain writable script handles and make Linux exec return ETXTBSY.
     fn worker_script(body: &str) -> (MutexGuard<'static, ()>, tempfile::TempDir, PathBuf) {
         let guard = WORKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("worker-stub");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).unwrap();
+        let mut creator = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 077; cat > \"$1\" && chmod 700 \"$1\"",
+                "worker-script-creator",
+            ])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let written = creator
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("#!/bin/sh\n{body}").as_bytes());
+        let status = creator.wait().unwrap();
+        written.unwrap();
+        assert!(status.success(), "worker script creation failed: {status}");
         (guard, directory, path)
     }
 

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Seam coverage over the GQ logic test corpus.
 
-Reads every decision seam from the engine catalog
-(`crates/omnigraph/src/seams/catalog.rs`), every `at:` a corpus case names
-(`crates/omnigraph-gqt/cases/*.gqt`), and prints one row per seam: name,
-operation, effect, and the cases that prove it. Seams whose operation no GQ
-step starts are the reachability debt; reachable seams with no case are the
-coverage debt. `--check` exits non-zero when a case names a seam the catalog
-does not have, or an action that its effect does not admit.
+Reads every decision seam declared in the engine's sources
+(`crates/omnigraph/src/**/*.rs`, each static beside the site it guards and
+indexed by `crates/omnigraph/src/seams/catalog.rs`), every `at:` a corpus
+case names (`crates/omnigraph-gqt/cases/*.gqt`), and prints one row per
+seam: name, where it is declared, operation, declared effects, and the cases
+that prove it. Seams whose
+operation no GQ step starts are the reachability debt; reachable seams with
+no case are the coverage debt. `--check` exits non-zero when a case names a
+seam the catalog does not have, or an action that none of its effects admits.
 """
 
 from __future__ import annotations
@@ -18,22 +20,32 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-CATALOG = ROOT / "crates" / "omnigraph" / "src" / "seams" / "catalog.rs"
+ENGINE_SRC = ROOT / "crates" / "omnigraph" / "src"
 CASES = ROOT / "crates" / "omnigraph-gqt" / "cases"
 
 STATIC = re.compile(
-    r'Seam::decide\(\s*"(?P<name>[^"]+)"\s*,\s*Op::(?P<op>\w+)\s*,\s*Effect::(?P<effect>\w+)',
+    r'(?P<invocation>(?:\b\w+\s*::\s*)*\bdecide_seam)\s*!\s*\{'
+    r'(?:\s|//[^\n]*|/\*.*?\*/)*'
+    r'pub\s+static\s+\w+\s*=\s*\(\s*"(?P<name>[^"]+)"\s*,\s*(?P<op>\w+)\s*,\s*\[(?P<effects>[^\]]*)\]',
     re.S,
 )
+EFFECT = re.compile(r"\w+")
 DIRECTIVE = re.compile(r"^--- seam\s*\n(?P<body>(?:(?!^---).*\n)*)", re.M)
 FIELD = re.compile(r"^\s*(\w+):\s*(.+?)\s*$", re.M)
 
-ADMITS = {"fail": {"Fail", "Contention"}, "skip": {"Skip"}}
+ADMITS = {"fail": {"Fail", "Contention"}, "skip": {"Skip"}, "contention": {"Contention"}}
 
 
-def catalog() -> dict[str, tuple[str, str]]:
-    text = CATALOG.read_text()
-    return {m["name"]: (m["op"], m["effect"]) for m in STATIC.finditer(text)}
+def catalog() -> dict[str, tuple[str, str, tuple[str, ...]]]:
+    """name -> (declared at `file:line`, op, effects), from every static under the engine's src."""
+    seams = {}
+    for path in sorted(ENGINE_SRC.rglob("*.rs")):
+        text = path.read_text()
+        for m in STATIC.finditer(text):
+            line = text.count("\n", 0, m.start("invocation")) + 1
+            where = f"{path.relative_to(ROOT)}:{line}"
+            seams[m["name"]] = (where, m["op"], tuple(EFFECT.findall(m["effects"])))
+    return seams
 
 
 def scalar(value: str) -> str:
@@ -86,18 +98,18 @@ def main() -> int:
         if at not in seams:
             problems.append(f"{case}: names unknown seam {at!r}")
             continue
-        effect = seams[at][1]
-        if effect not in ADMITS.get(action, set()):
-            problems.append(f"{case}: action {action!r} is not admitted by seam {at} (effect {effect})")
+        effects = seams[at][2]
+        if not ADMITS.get(action, set()) & set(effects):
+            problems.append(f"{case}: action {action!r} is not admitted by seam {at} (effects {', '.join(effects)})")
             continue
         by_seam[at].append(case)
 
-    print("| seam | op | effect | cases |")
-    print("|---|---|---|---|")
-    for name, (op, effect) in seams.items():
+    print("| seam | declared at | op | effects | cases |")
+    print("|---|---|---|---|---|")
+    for name, (where, op, effects) in sorted(seams.items()):
         cases = ", ".join(sorted(set(by_seam[name]))) or ("unreachable" if op == "Unreachable" else "none")
-        print(f"| {name} | {op} | {effect} | {cases} |")
-    reachable = [n for n, (op, _) in seams.items() if op != "Unreachable"]
+        print(f"| {name} | {where} | {op} | {', '.join(effects)} | {cases} |")
+    reachable = [n for n, (_, op, _) in seams.items() if op != "Unreachable"]
     covered = [n for n in reachable if by_seam[n]]
     print()
     print(f"seams: {len(seams)}, reachable: {len(reachable)}, with a case: {len(covered)}, "

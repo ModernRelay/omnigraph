@@ -62,12 +62,22 @@ Recovery tests must cover the protocol layer, the writer, and the user-visible r
 - `tests/failpoints.rs` owns crash windows around durable effects;
 - the writer's normal integration owner proves pre-arm failures leave no residue.
 
-To add a seam: declare its static in `crates/omnigraph/src/seams/catalog.rs`
-with `Seam::decide(name, Op, Effect, Global::new())`, list it in `ALL`, and
-call `crate::seams::fail`, `skip` or `contention` with it at the site.
-`tests/failpoint_names_guard.rs` checks the listing, that the helper matches
-the declared effect, and that some site or case references it;
-`scripts/seam_corpus.py` lists which seams a case covers.
+To add a seam: declare it beside the site it guards, above the item that
+crosses it, with
+`decide_seam! { pub static NAME = ("area.place", Op, [Effect, ..]); }`
+(imported from `crate::seams`; the compiler records the file and line as
+the seam's `site()`, and a hand-written `Seam::decide` is refused); add its
+path to the `catalog!` list in `crates/omnigraph/src/seams/catalog.rs`; call
+`fail`, `skip` or `contention` (imported from `crate::seams`) with it at a
+site between two steps (one declared effect), or `guarded` around the one
+operation it wraps (every outcome that operation can have; a further action
+there is then a case, not an edit). A private module on the path from the
+crate root to the declaring file becomes `pub(crate)` for the re-export.
+`tests/failpoint_names_guard.rs` checks the index, that no static is left
+in the catalog, under a test module or without `pub`, that a single-effect
+helper takes a seam declaring exactly its effect, and that some site or case
+references it; `scripts/seam_corpus.py` lists every seam with where it is
+declared and which cases cover it.
 
 When adding a new writer or sidecar field, update all three layers. See [recovery.md](recovery.md).
 

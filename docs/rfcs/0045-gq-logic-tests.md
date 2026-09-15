@@ -830,10 +830,12 @@ query unrelated_write() {
 ```
 
 All four seam fields are required. `scope` accepts only `next_step`;
-`action` is `fail` or `skip`, and must match the effect the seam declares
-in the engine's catalog (`fail` admits the fail and contention effects,
-`skip` admits the skip effect); `hold` is refused until a case can express
-two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
+`action` is `fail`, `contention`, or `skip`. `fail` selects the declared
+`Fail` effect, falling back to `Contention` for compatibility when `Fail`
+is absent. Explicit `contention` selects only `Contention`, and `skip`
+selects only `Skip`; undeclared effects are refused. Thus a seam declaring
+both `Fail` and `Contention` lets a case choose either. `hold` is refused
+until a case can express two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
 that seam attributable to the selected operation, including its production
 retries. It starts at zero when the operation is armed. The installed
 decision passes the first N-1 crossings, fires on the Nth, and passes every
@@ -845,8 +847,11 @@ of `branch_merge`, `branch_create` or `branch_delete` before the matching
 branch statement, one of `any_write` before either; a seam whose operation
 no step starts is refused as unreachable. No caller-supplied code or
 arbitrary action string is accepted. A new seam requires an implementation,
-a declared effect and operation in the catalog, and a proof case before a
-case may name it.
+a declared operation and set of effects in the catalog, and a proof case
+before a case may name it; the action must be among the declared effects. A
+seam that wraps one operation declares every outcome that operation can
+have, so a further action at a seam the catalog already lists needs a case
+and nothing else.
 
 The selected operation must finish before seam cleanup can be considered
 complete. On cancellation or timeout, stop the isolated worker or quarantine
@@ -857,12 +862,12 @@ worker or quarantined graph does not count as a successful replay.
 
 Delivery is proven by the installed decision itself: the runner's decision
 counts every crossing and records `seam_delivered` with the seam name, the
-declared occurrence and the crossings seen once the site has fired. A
-`fail` action on a seam of effect fail states the injected error in its
-`--- expect error:` row; on a seam of effect contention the injected error
-is retryable, the publisher retries it, the step succeeds, and the delivery
-record is the proof. A `skip` step carries the healthy expectation the
-skipped path produces.
+declared occurrence, the crossings seen once the site has fired and the
+effect that fired. A `fail` action on a seam declaring fail states the
+injected error in its `--- expect error:` row; on a seam declaring
+contention the injected error is retryable, the publisher retries it, the
+step succeeds, and the delivery record is the proof. A `skip` step carries
+the healthy expectation the skipped path produces.
 The runner uninstalls the decision before the following operation,
 including after an assertion failure. An unreached seam or a missing
 delivery record fails the execution with `seam_unobserved`; a failed
@@ -1723,6 +1728,14 @@ historical command and configuration descriptions are not migration aliases.
   mutate steps only (no seam is crossed by a query step), the contention
   pairing and the per-cause failure codes are stated, and the
   contract-code list says `seam_unobserved`.
+- 2026-09-15, from the RFC 0066 amendment on effect sets: a seam declares
+  the set of effects its site honors and the action must be among them.
+  Replaced sentences in §Seams at an explicit step: "A new seam requires an
+  implementation, a declared effect and operation in the catalog, and a
+  proof case before a case may name it" (now a declared operation and set
+  of effects, with the membership rule and the wrapped-operation sentence),
+  the `seam_delivered` record sentence (now carries the effect that fired),
+  and "on a seam of effect fail/contention" (now "declaring").
 - 2026-09-02, from review of the RFC PR: the fix-PR gate is a diff check
   whose execution guarantee differs by shape (a corpus match ran green in
   the required job; a Rust match is a naming check), and the Rust shape

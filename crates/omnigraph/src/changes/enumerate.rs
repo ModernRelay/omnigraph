@@ -30,6 +30,7 @@ use crate::db::DatasetEntry;
 use crate::db::logical_row_image;
 use crate::db::manifest::{Snapshot, system_columns_at_image};
 use crate::error::{OmniError, Result};
+use crate::seams::{decide_seam, fail};
 use crate::table_store::TableStore;
 
 /// Validate caller-supplied page limits against the server-owned ceilings.
@@ -320,6 +321,26 @@ fn schema_boundary(graph_commit_id: &str, table_key: &str) -> OmniError {
     }
 }
 
+decide_seam! {
+    /// A change-feed poll has passed the final post-open logical head witness
+    /// for one commit, and is about to plan each interval's emitter. Tests
+    /// delete and recreate a named branch here: any live read of the branch's
+    /// numeric-path history after this point (the replaceable read — version
+    /// manifests sit at numeric paths, unlike UUID-named data and transaction
+    /// files) would classify the interval from the REPLACEMENT branch's
+    /// transactions and can silently omit the original commit's deletes.
+    pub static CHANGE_FEED_POST_HEAD_WITNESS = ("change_feed.post_head_witness", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// A change-feed poll has reopened and re-proven a commit's manifest
+    /// snapshot, but has not yet opened the per-table datasets it names. Tests
+    /// delete and recreate a named branch here to prove the physical table open
+    /// re-proves the branch incarnation (via the manifest e_tag) rather than
+    /// reading the replacement branch's rows at the same path and version.
+    pub static CHANGE_FEED_PRE_TABLE_OPEN = ("change_feed.pre_table_open", Unreachable, [Fail]);
+}
+
 /// Prove the P→C pair compatible for entity diff and open every surviving
 /// paired lifetime, in the frozen `(kind rank, published type id)` order —
 /// the same opaque identity the emitted changes and continuation keys carry,
@@ -348,7 +369,7 @@ async fn plan_intervals(
     // (defense-in-depth; unavailable on an e_tag-less store) and the logical
     // post-open `reprove_named_branch_heads` below (load-bearing on every
     // store). Tests park here to exercise the window.
-    crate::seams::fail(&crate::seams::catalog::CHANGE_FEED_PRE_TABLE_OPEN)?;
+    fail(&CHANGE_FEED_PRE_TABLE_OPEN)?;
 
     let mut plans = Vec::with_capacity(intervals.len());
     for interval in intervals {
@@ -422,7 +443,7 @@ async fn plan_intervals(
     // UUID-named data and transaction files), so a later live read would see a
     // recreated branch's history under this commit's label. Tests park here
     // and recreate the branch to pin that contract.
-    crate::seams::fail(&crate::seams::catalog::CHANGE_FEED_POST_HEAD_WITNESS)?;
+    fail(&CHANGE_FEED_POST_HEAD_WITNESS)?;
     // The opaque ids are domain-scoped SHA-256 projections of distinct
     // immutable identities, so this order is total and deterministic.
     plans.sort_by(|left, right| {

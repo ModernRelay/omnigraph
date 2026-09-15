@@ -11,6 +11,7 @@ use lance::Dataset;
 use lance::dataset::refs::{BranchContents, BranchIdentifier, check_valid_branch};
 
 use crate::error::{OmniError, Result};
+use crate::seams::{decide_seam, fail};
 
 /// Result of a recoverable native create attempt.
 pub(crate) enum BranchCreateOutcome {
@@ -237,6 +238,13 @@ pub(crate) async fn get_live_manifest_branch_contents(
     Ok(contents)
 }
 
+decide_seam! {
+    /// After Lance returns success from native delete, before OmniGraph
+    /// acknowledges it. Recovery must classify the absent BranchContents as a
+    /// completed logical deletion.
+    pub static BRANCH_DELETE_POST_NATIVE = ("branch_delete.post_native", BranchDelete, [Fail]);
+}
+
 /// Retire logical authority through public metadata; cleanup owns physical refs.
 /// Callers hold schema, branch, and table gates in one writer process.
 /// The metadata replacement is one-object publication, without a native CAS.
@@ -290,7 +298,7 @@ pub(crate) async fn retire_branch_recoverably(
     let mut metadata = contents.metadata;
     metadata.insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), value);
     let result = match dataset.branches().replace_metadata(branch, metadata).await {
-        Ok(()) => crate::seams::fail(&crate::seams::catalog::BRANCH_DELETE_POST_NATIVE),
+        Ok(()) => fail(&BRANCH_DELETE_POST_NATIVE),
         Err(error) => Err(OmniError::storage(error)),
     };
     let Err(error) = result else { return Ok(()) };
@@ -444,6 +452,13 @@ fn matches_create_expectation(
             .is_some_and(|(version, uuid)| *version == parent_version && !uuid.is_empty())
 }
 
+decide_seam! {
+    /// After Lance returns success from its two-phase native create, before
+    /// OmniGraph acknowledges it. Recovery must classify the matching
+    /// BranchContents as a completed create (lost acknowledgement).
+    pub static BRANCH_CREATE_POST_NATIVE = ("branch_create.post_native", BranchCreate, [Fail]);
+}
+
 /// Create a fresh table fork once; the caller's persisted intent owns any effects.
 /// Errors retain recovery ownership until classification. Cleanup reclaims garbage.
 pub(crate) async fn create_unique_table_fork(
@@ -462,7 +477,7 @@ pub(crate) async fn create_unique_table_fork(
     let created = crate::storage_layer::lance_clone::create_branch(source, branch, source_version)
         .await
         .map_err(OmniError::storage)?;
-    crate::seams::fail(&crate::seams::catalog::BRANCH_CREATE_POST_NATIVE)?;
+    fail(&BRANCH_CREATE_POST_NATIVE)?;
     Ok(created)
 }
 
@@ -515,12 +530,10 @@ pub(crate) async fn create_branch_recoverably(
                 .await
                 .map_err(OmniError::storage)
             {
-                Ok(_) => {
-                    match crate::seams::fail(&crate::seams::catalog::BRANCH_CREATE_POST_NATIVE) {
-                        Ok(()) => return Ok(BranchCreateOutcome::Created),
-                        Err(error) => error,
-                    }
-                }
+                Ok(_) => match fail(&BRANCH_CREATE_POST_NATIVE) {
+                    Ok(()) => return Ok(BranchCreateOutcome::Created),
+                    Err(error) => error,
+                },
                 Err(error) => error,
             };
 
@@ -1140,7 +1153,7 @@ mod tests {
             .unwrap();
         let original = dataset.branches().get("feature").await.unwrap();
         {
-            let _lost_ack = crate::seams::catalog::BRANCH_DELETE_POST_NATIVE.fire_always();
+            let _lost_ack = BRANCH_DELETE_POST_NATIVE.fire_always();
             retire_branch_recoverably(&dataset, "feature", &original.identifier)
                 .await
                 .unwrap();

@@ -8,7 +8,7 @@
 #![recursion_limit = "256"]
 
 pub(crate) mod blob;
-mod branch_control;
+pub(crate) mod branch_control;
 mod branch_names;
 pub mod changes;
 pub mod db;
@@ -26,7 +26,7 @@ pub mod dst_ids;
 pub(crate) mod dst_ids;
 pub mod embedding;
 pub mod error;
-mod exec;
+pub(crate) mod exec;
 pub mod graph_index;
 pub mod instrumentation;
 pub(crate) mod lance_access;

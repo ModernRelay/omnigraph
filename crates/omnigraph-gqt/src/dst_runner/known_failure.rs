@@ -141,6 +141,7 @@ pub(super) fn classify(case: &Case, report: &WorkerReport) -> Result<bool, Strin
                 event["operation"]["ordinal"].as_u64(),
                 event["value"]["at"].as_str().map(str::to_string),
                 event["value"]["occurrence"].as_u64(),
+                event["value"]["effect"].as_str().map(str::to_string),
             )
         })
         .collect::<Vec<_>>();
@@ -153,6 +154,9 @@ pub(super) fn classify(case: &Case, report: &WorkerReport) -> Result<bool, Strin
                     u64::try_from(*ordinal).ok(),
                     Some(seam.at.clone()),
                     u64::try_from(seam.occurrence).ok(),
+                    omnigraph::seams::catalog::decide(&seam.at)
+                        .and_then(|entry| super::admitted_effect(seam.action, entry.effects()))
+                        .map(|effect| effect.as_str().to_string()),
                 )
             })
         })
