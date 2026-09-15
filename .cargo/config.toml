@@ -1,9 +1,29 @@
 # Cargo config for the omnigraph workspace.
 #
+# `[build] rustflags` is the ONE place this repo sets compiler flags, so the
+# flags no longer depend on the directory cargo runs from (rustflags are
+# part of every fingerprint; a directory-dependent set built each crate
+# twice). Overrides, in Cargo's precedence order: CARGO_ENCODED_RUSTFLAGS,
+# RUSTFLAGS (empty included), target.<triple>.rustflags — each REPLACES
+# this list; a cargo run outside the checkout (`--manifest-path`) never
+# reads it. Every release build (release.yml, release-edge.yml,
+# publish-image.yml, omnigraph-package.yml, scripts/install-source.sh, the
+# documented source build) and the benchmark build set an empty RUSTFLAGS:
+# shipped binaries never carry the cfg below, it serves the test suites only.
+#
 # `[env]` entries here apply to anything cargo launches in this repo —
 # `cargo build`, `cargo test`, `cargo run`. Shipped binaries are NOT
 # affected: the env var lives only in the cargo-launched process, not in
 # release artifacts or Docker images.
+
+[build]
+# tokio's seeded scheduler (`Builder::rng_seed`) sits behind this cfg;
+# `omnigraph-dst` and the GQT DST runner need it, no other crate names it.
+# In tokio 1.52 the cfg also compiles in runtime metrics counters, a
+# spawn-location pointer per task and per-poll checks of optional (unset)
+# hooks; that runtime cost is unmeasured. The DST suite stays out of
+# `cargo test --workspace` by an explicit `--exclude omnigraph-dst`.
+rustflags = ["--cfg", "tokio_unstable"]
 
 [env]
 # Lance's DataFusion memory pool per `Omnigraph` instance. Lance defaults

@@ -130,7 +130,7 @@ Container entrypoint and Azure deployment-validation jobs test argument composit
 The workspace suite (`Test Workspace`) runs on every non-documentation pull request, on every push to `main`, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request drops `--no-fail-fast`):
 
 ```bash
-cargo test --workspace --exclude omnigraph-gqt --locked --no-fail-fast \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --no-fail-fast \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
@@ -181,9 +181,11 @@ CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intenti
 
 ## DST tiers
 
-Two workflows own the simulator's pinned tests and generated fleets; both set
-`RUSTFLAGS: --cfg tokio_unstable` themselves (the `omnigraph-dst` crate
-compiles empty without it, so the default jobs are unaffected):
+Two workflows own the simulator's pinned tests and generated fleets. The
+`omnigraph-dst` crate builds with the workspace `--cfg tokio_unstable` like
+every other crate; the default test jobs exclude it by name, and neither
+workflow sets `RUSTFLAGS` (an env `RUSTFLAGS` would replace the configured
+list):
 
 - **`dst.yml`** (per PR and on `main` pushes): the pinned deterministic
   suite — every failure line carries the universe seed, so a red run is
@@ -196,9 +198,10 @@ compiles empty without it, so the default jobs are unaffected):
   seed intervals. Failures are logs with seed rows, not required contexts;
   the concurrent fleet's `wild` mode makes no replay claim.
 
-`gq-logic-tests.yml` separately owns authored GQT execution through DST. Its
-configured step runs from `crates/omnigraph-gqt` to load `tokio_unstable`.
-An unavailable-runtime refusal test does not replace executing the DST cases.
+`gq-logic-tests.yml` separately owns authored GQT execution through DST. Every
+step runs from the repo root under the workspace Cargo configuration; the
+refusal step clears `RUSTFLAGS` to build the one flagless shape. An
+unavailable-runtime refusal test does not replace executing the DST cases.
 
 ## Local pre-push checks
 
@@ -210,7 +213,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_ma
 cargo clippy --workspace --all-targets --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
   -- -D warnings -W clippy::dbg_macro
-cargo test --workspace --exclude omnigraph-gqt --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```
@@ -250,6 +253,8 @@ shellcheck scripts/*.sh
 | `refresh-docs-site.yml` | Documentation changes on `main` or manual dispatch; requests a docs-site redeploy. |
 
 Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
+
+Every release build sets an empty `RUSTFLAGS` (`release.yml`, `release-edge.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, the documented source build): a set `RUSTFLAGS` replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. The cfg serves the DST suite and the GQT DST runner only.
 
 ## Changing CI
 

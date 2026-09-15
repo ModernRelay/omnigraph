@@ -55,11 +55,15 @@ Install the Rust stable toolchain and the Protocol Buffers compiler (`protoc`),
 then:
 
 ```bash
-cargo build --release --locked \
+RUSTFLAGS= cargo build --release --locked \
   -p omnigraph-cli \
   -p omnigraph-server \
   -p omnigraph-azure-admission
 ```
+
+The empty `RUSTFLAGS` replaces the workspace `.cargo/config.toml` build flags,
+which exist for the development test suites; release binaries build without
+them.
 
 Or use the source installer:
 

@@ -357,10 +357,12 @@ runner slice.
 
 ### CaseV1 suite runner
 
-Wall-clock execution is available only from a release-profile binary:
+Wall-clock execution is available only from a flag-free release-profile binary
+(`RUSTFLAGS=` clears the workspace's development `--cfg tokio_unstable`; the
+runner refuses a build whose build script saw encoded Rust flags):
 
 ```bash
-cargo run --release --locked -p omnigraph-bench -- \
+RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml \
   --archive .bench/archive
 
@@ -492,7 +494,7 @@ Build the CLI in release mode and run the checked-in FinGraph declaration and
 logical reference against a local registered bundle:
 
 ```bash
-cargo build --release --locked -p omnigraph-bench
+RUSTFLAGS= cargo build --release --locked -p omnigraph-bench
 
 target/release/omnigraph-bench fixture run-graph \
   benchmarks/real-graph/finbench-2026-08-21-sf10-v1.run-v1.yaml \
@@ -588,8 +590,9 @@ slice.
 2. Reference it from a suite with a path relative to that suite.
 3. Run both `case validate` and `suite validate`.
 4. Inspect `suite plan` before executing the suite.
-5. Run from a release build on a host that can prove every declared environment
-   fact; an unsupported factor is a refusal, not permission to approximate it.
+5. Run from a flag-free release build (`RUSTFLAGS= cargo …`) on a host that can
+   prove every declared environment fact; an unsupported factor is a refusal,
+   not permission to approximate it.
 
 Do not encode a profile such as `micro` or `realistic` in a case. Profiles are
 derived from the declared factor levels. Benchmark timing is evidence and does

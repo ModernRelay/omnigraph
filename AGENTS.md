@@ -38,8 +38,8 @@ Tools that support `@` imports include these automatically:
   wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
   test per case), and `omnigraph-dst` (deterministic simulation testing; needs
-  `--cfg tokio_unstable`, set by its crate-local `.cargo/config.toml` when
-  cargo runs from the crate dir — compiles empty without it)
+  `--cfg tokio_unstable`, set by the workspace `.cargo/config.toml` for every
+  build — the workspace test gate excludes the crate by name)
 - License: MIT
 
 OmniGraph is a typed property-graph engine coordinating many versioned Lance
@@ -123,7 +123,7 @@ its Cargo package is `omnigraph-engine`.
 cargo build --workspace --locked
 
 # Canonical CI test graph
-cargo test --workspace --exclude omnigraph-gqt --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
@@ -142,11 +142,16 @@ python3 scripts/check-workflow-action-pins.py
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
 
-The separate `GQ Logic Tests` context owns the complete GQT corpus. From
-`crates/omnigraph-gqt`, also run `cargo test -p omnigraph-gqt --locked` and
-`cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`.
-Its crate-local Cargo configuration enables DST; an unconfigured build must
-refuse requested DST execution, not skip those cases.
+The separate `GQ Logic Tests` context owns the complete GQT corpus. Also run
+`cargo test -p omnigraph-gqt --locked` and
+`cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`
+from any directory inside the checkout: the workspace `.cargo/config.toml`
+enables DST by default there. `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS` (empty
+included) or a `target.*.rustflags` config entry replaces that list, and a
+cargo run outside the checkout (`--manifest-path`) never reads it; such a
+build must refuse requested DST execution, not skip those cases. The DST suite itself runs from
+`crates/omnigraph-dst` (`cargo test`): its `[env]`-only Cargo configuration
+supplies the pool trio the suite asserts at process start.
 
 S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`
 environment. Azure suites require `OMNIGRAPH_AZURE_TEST_CONTAINER` and the

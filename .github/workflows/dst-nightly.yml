@@ -33,7 +33,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: --cfg tokio_unstable
+  # `--cfg tokio_unstable` comes from the workspace .cargo/config.toml;
+  # never set RUSTFLAGS here (an env RUSTFLAGS replaces that list).
   # Pool-quiescing trio (`env_knobs::QUIESCE_ENV`) — same keys and
   # reason as dst.yml. Wild-arm steps override the VALUES;
   # require_pool_env asserts presence only.

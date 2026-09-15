@@ -16,9 +16,10 @@
 //! passthrough no-ops in production, gated behind the non-default `dst`
 //! feature); THIS crate owns everything else.
 //!
-//! Build: needs `--cfg tokio_unstable` (seeded scheduler); this crate's own
-//! `.cargo/config.toml` sets it when cargo runs from the crate directory:
-//! `cd crates/omnigraph-dst && cargo test`. From elsewhere, set `RUSTFLAGS`
+//! Build: needs `--cfg tokio_unstable` (seeded scheduler), set by the
+//! workspace `.cargo/config.toml` for every build. Run from the crate
+//! directory (`cd crates/omnigraph-dst && cargo test`): its `[env]`-only
+//! `.cargo/config.toml` supplies the pool trio; elsewhere export the trio
 //! yourself (the DST CI workflows do).
 //!
 //! Known gaps (deliberate, TODO): fixture schema only (no schema
