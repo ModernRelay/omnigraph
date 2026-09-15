@@ -50,9 +50,13 @@ Substitute the owning package and existing test target; the coverage map in
 non-trivial change, run the canonical feature-superset gate:
 
 ```bash
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
+
+The GQT corpus and the DST suite are excluded by name: each has its own
+command and process environment, listed in
+[`docs/dev/testing.md`](docs/dev/testing.md).
 
 If you touch S3-backed flows, the CI model uses a local RustFS instance for
 integration tests.

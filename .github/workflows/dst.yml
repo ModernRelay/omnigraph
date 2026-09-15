@@ -19,12 +19,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # The dst crate is `#![cfg(tokio_unstable)]`-gated (tokio's seeded
-  # scheduler RNG needs it). Scoped to this workflow only.
-  RUSTFLAGS: --cfg tokio_unstable
+  # scheduler RNG needs it); the workspace .cargo/config.toml sets the cfg
+  # for every build. Never set RUSTFLAGS here: an env RUSTFLAGS replaces
+  # that configured list.
   # Pool-quiescing trio (`env_knobs::QUIESCE_ENV`): the crate-local
   # .cargo/config.toml [env] copy applies only when cargo runs FROM the
-  # crate dir; this job runs from repo root, so supply it here — same
-  # reason RUSTFLAGS is set here.
+  # crate dir; this job runs from repo root, so supply it here.
   RAYON_NUM_THREADS: "1"
   LANCE_CPU_THREADS: "1"
   LANCE_DETERMINISTIC_BACKOFF: "1"

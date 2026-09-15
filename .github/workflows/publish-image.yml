@@ -78,6 +78,9 @@ jobs:
           docker run --rm -v "$PWD:/work" -w /work rust:1-bookworm bash -euxc '
             apt-get update
             apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+            # A set RUSTFLAGS, empty included, replaces the workspace `[build]
+            # rustflags` (.cargo/config.toml): the image builds without the cfg.
+            export RUSTFLAGS=
             # --features omnigraph-server/aws: include the AWS Secrets Manager
             # bearer-token source so one public image serves both token modes.
             cargo build --release --locked \

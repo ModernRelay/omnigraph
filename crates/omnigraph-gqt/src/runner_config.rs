@@ -83,7 +83,7 @@ impl Environment {
                 if cfg!(tokio_unstable) {
                     Ok(())
                 } else {
-                    Err("unsupported_environment: DST runner is unavailable in this build; build from crates/omnigraph-gqt".into())
+                    Err("unsupported_environment: DST runner is unavailable in this build; the workspace .cargo/config.toml sets --cfg tokio_unstable, an env RUSTFLAGS without it overrides that".into())
                 }
             }
             _ => Err(format!(

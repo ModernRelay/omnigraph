@@ -92,6 +92,8 @@ jobs:
             asset_name: omnigraph-windows-x86_64
     env:
       CARGO_TERM_COLOR: always
+      # A set RUSTFLAGS, empty included, replaces the workspace `[build]
+      # rustflags` (.cargo/config.toml): archives build without the cfg.
       RUSTFLAGS: ${{ matrix.rustflags || '' }}
     steps:
       - name: Checkout source

@@ -4,10 +4,13 @@
 records, and the rebuildable result projection. It parses strict, versioned
 YAML case and suite documents, validates their semantics, computes stable
 experiment identities, and can execute supported local `branch-merge-v1`
-points. Run wall-clock measurements from a clean release build only:
+points. Run wall-clock measurements from a clean, flag-free release build only
+(the workspace `.cargo/config.toml` sets `--cfg tokio_unstable` for
+development builds; the empty `RUSTFLAGS` clears it, and the runner refuses a
+build whose build script saw any encoded Rust flags):
 
 ```bash
-cargo run --release --locked -p omnigraph-bench -- \
+RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml \
   --archive .bench/archive
 ```

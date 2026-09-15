@@ -153,8 +153,8 @@ status. Blessing a marked case is refused.
 
 ## Run and reproduce
 
-Run the complete package from this directory, whose Cargo configuration enables
-seeded Tokio:
+Run the complete package (the workspace Cargo configuration enables seeded
+Tokio from any directory; the commands below use crate-relative paths):
 
 ```bash
 cd crates/omnigraph-gqt
