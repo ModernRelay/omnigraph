@@ -249,13 +249,14 @@ omnigraph query --store ./graph.omni \
 
 ```bash
 cargo build --workspace
-cargo test  --workspace
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst
 ```
 
 Notes:
 
 - Rust stable toolchain, edition 2024
-- CI runs `cargo test --workspace --locked`
+- The GQT corpus (`cargo test -p omnigraph-gqt`) and the DST suite (`cargo test` from `crates/omnigraph-dst`, which supplies its process environment) run separately; a plain `cargo test --workspace` starts the DST binaries without that environment and they refuse. Commands and CI gates: [docs/dev/testing.md](docs/dev/testing.md)
+- CI runs the same excluded command with `--locked` and the failpoint features
 - Full CI and some local test flows require `protobuf-compiler`
 - S3 integration tests expect an S3-compatible endpoint such as RustFS
 
