@@ -254,7 +254,7 @@ shellcheck scripts/*.sh
 
 Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
 
-Every release build sets an empty `RUSTFLAGS` (`release.yml`, `release-edge.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, the documented source build): a set `RUSTFLAGS` replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. The cfg serves the DST suite and the GQT DST runner only.
+Every release build sets `RUSTFLAGS` itself (`release.yml`, `release-edge.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, the documented source build): empty everywhere except the macOS archive row's `-C code-model=large`. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
 
 ## Changing CI
 

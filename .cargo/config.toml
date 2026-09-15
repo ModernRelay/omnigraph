@@ -8,8 +8,12 @@
 # this list; a cargo run outside the checkout (`--manifest-path`) never
 # reads it. Every release build (release.yml, release-edge.yml,
 # publish-image.yml, omnigraph-package.yml, scripts/install-source.sh, the
-# documented source build) and the benchmark build set an empty RUSTFLAGS:
-# shipped binaries never carry the cfg below, it serves the test suites only.
+# documented source build) sets RUSTFLAGS itself, empty or the macOS
+# archive's `-C code-model=large`, and the documented benchmark commands
+# (`RUSTFLAGS= cargo run --release -p omnigraph-bench …`, see
+# crates/omnigraph-bench/README.md) set it empty; either replaces this list,
+# so shipped binaries and benchmark records never carry the cfg below. It
+# serves the test suites only.
 #
 # `[env]` entries here apply to anything cargo launches in this repo —
 # `cargo build`, `cargo test`, `cargo run`. Shipped binaries are NOT
