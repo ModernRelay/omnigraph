@@ -1,0 +1,95 @@
+# issue: none
+# notes: keyed twin of unkeyed_edge_dup_fast_forward.gqt: with @key(@src, @dst) (RFC 0044) the branch's
+# notes: re-insert of an inherited pair upserts the one row, so the fast-forward merge and the restart
+# notes: keep exactly one copy.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+
+--- seed
+{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"type": "Person", "data": {"name": "Charlie"}}
+{"type": "Person", "data": {"name": "Diana"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob"}
+{"edge": "Knows", "from": "Alice", "to": "Charlie"}
+{"edge": "Knows", "from": "Bob", "to": "Diana"}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query change() { insert Knows { from: "Bob", to: "Diana" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- query branch: b0
+query edges() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { $p.name, $q.name }
+}
+
+--- expect unordered
+{"p.name": "Alice", "q.name": "Bob"}
+{"p.name": "Alice", "q.name": "Charlie"}
+{"p.name": "Bob", "q.name": "Diana"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate
+branch merge b0
+
+--- expect ok
+
+--- query branch: main
+query edge_count() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { count($q.name) as n }
+}
+
+--- expect unordered
+{"n": 3}
+
+--- expect shape
+n: I64
+
+--- restart
+
+--- query branch: main
+query edges() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { $p.name, $q.name }
+}
+
+--- expect unordered
+{"p.name": "Alice", "q.name": "Bob"}
+{"p.name": "Alice", "q.name": "Charlie"}
+{"p.name": "Bob", "q.name": "Diana"}
+
+--- expect shape
+p.name: String
+q.name: String

@@ -1,0 +1,54 @@
+# issue: 602
+# red_on: 47abb75f (2026-09-14): step 2 reopen refuses with kind Internal, "OCC recovery sidecar '<opid>' found original commit id '<id>' but its manifest delta differs"
+# notes: Two lost writes on one mutation, one seam each: the sidecar confirm put and the post-commit delete, so the `__manifest` commit publishes while the sidecar keeps its arm-time bytes.
+# notes: The next read-write open finds the Armed sidecar beside its own visible commit, proves the commit carries the sidecar's planned table version, records one RolledForward audit row, deletes the sidecar, and serves the row.
+# notes: Before the heal the reopen refused with kind Internal and every later open refused the same way; the trailing query pins the row the reopen used to hide.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: mutation.sidecar_confirm_put
+occurrence: 1
+action: skip
+scope: next_step
+
+--- seam
+at: mutation.sidecar_post_publish_delete
+occurrence: 1
+action: skip
+scope: next_step
+
+--- mutate
+query add_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query rows_after_reopen() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+
+--- expect shape
+p.name: String

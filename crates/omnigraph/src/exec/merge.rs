@@ -1288,7 +1288,9 @@ async fn proven_insert_history_segments(
             return None;
         }
         let branch = dataset.manifest.branch.as_deref()?;
-        let contents = dataset.branches().get(branch).await.ok()?;
+        let contents = crate::branch_control::get_branch_contents(&dataset, branch)
+            .await
+            .ok()?;
         if contents.identifier != identifier || contents.parent_version != fork_version {
             return None;
         }
@@ -1299,7 +1301,9 @@ async fn proven_insert_history_segments(
             ))
             .await
             .ok()?;
-        let parent_identifier = parent.branch_identifier().await.ok()?;
+        let parent_identifier = crate::branch_control::dataset_branch_identifier(&parent)
+            .await
+            .ok()?;
         if parent.manifest.branch != contents.parent_branch
             || parent.version().version != fork_version
             || parent_identifier.version_mapping.as_slice()
@@ -1372,9 +1376,10 @@ async fn try_proven_pure_insert_history(
     {
         return Ok(None);
     }
-    let base_identifier = base.branch_identifier().await.map_err(OmniError::storage)?;
-    let source_identifier = source
-        .branch_identifier()
+    let base_identifier = crate::branch_control::dataset_branch_identifier(&base)
+        .await
+        .map_err(OmniError::storage)?;
+    let source_identifier = crate::branch_control::dataset_branch_identifier(&source)
         .await
         .map_err(OmniError::storage)?;
     if base_entry.native_dataset_branch == source_entry.native_dataset_branch
@@ -2937,16 +2942,14 @@ async fn plan_lineage_merge(
     }
 
     if let (Some(base_dataset), Some(base_entry)) = (&base, base_entry) {
-        let base_identifier = base_dataset
-            .branch_identifier()
+        let base_identifier = crate::branch_control::dataset_branch_identifier(base_dataset)
             .await
             .map_err(OmniError::storage)?;
         for (side_dataset, side_entry) in [(&source, source_entry), (&target, target_entry)] {
             let (Some(side_dataset), Some(side_entry)) = (side_dataset, side_entry) else {
                 continue;
             };
-            let side_identifier = side_dataset
-                .branch_identifier()
+            let side_identifier = crate::branch_control::dataset_branch_identifier(side_dataset)
                 .await
                 .map_err(OmniError::storage)?;
             if side_entry.native_dataset_branch == base_entry.native_dataset_branch {
@@ -4715,9 +4718,7 @@ async fn commit_staged_delete_chunks(
         *planned_index += 1;
         current = commit_exact_merge_stage(target_db, current, staged_delete, planned).await?;
         if chunk_index + 1 < deleted_ids.chunks.len() {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::BRANCH_MERGE_BETWEEN_DELETE_CHUNKS,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_BETWEEN_DELETE_CHUNKS)?;
         }
     }
     Ok(current)
@@ -4782,8 +4783,8 @@ async fn publish_rewritten_merge_table(
         )
         .await?;
         if semantics == KeyedWriteSemantics::StrictInsert {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
+            crate::seams::fail(
+                &crate::seams::catalog::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
             )?;
         }
     }
@@ -4793,9 +4794,7 @@ async fn publish_rewritten_merge_table(
     // rows are on Lance HEAD but the delete has not committed and the
     // achieved-version intent has not been recorded, so recovery must roll BACK.
     // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_rolls_back.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via deletion vectors. Each row/byte-bounded
     // filter chunk is staged through `stage_delete` and consumes one exact
@@ -4823,9 +4822,7 @@ async fn publish_rewritten_merge_table(
     // deletes are on Lance HEAD but the achieved-version intent has not been
     // recorded, so recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM)?;
 
     // Index coverage is reconciler-owned derived state. As on the adopt path,
     // publish the logical merge without waiting for BTREE / FTS / vector work;
@@ -4916,7 +4913,7 @@ async fn commit_staged_keyed_chunks(
     current: SnapshotHandle,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
     planned_index: &mut usize,
-    between_chunk_failpoint: Option<&str>,
+    between_chunk_failpoint: Option<&'static crate::seams::DecideSeam>,
     system_columns: SystemColumns,
 ) -> Result<SnapshotHandle> {
     let source = SnapshotHandle::new(table.dataset.clone());
@@ -4963,7 +4960,7 @@ async fn commit_keyed_stream_chunks(
     mut current: SnapshotHandle,
     planned_transactions: &[crate::table_store::StagedTransactionIdentity],
     planned_index: &mut usize,
-    between_chunk_failpoint: Option<&str>,
+    between_chunk_failpoint: Option<&'static crate::seams::DecideSeam>,
     system_columns: SystemColumns,
 ) -> Result<SnapshotHandle> {
     let mut carry = None;
@@ -5012,7 +5009,7 @@ async fn commit_keyed_stream_chunks(
         if chunk_index + 1 < chunk_rows.len()
             && let Some(failpoint) = between_chunk_failpoint
         {
-            crate::failpoints::maybe_fail(failpoint)?;
+            crate::seams::fail(failpoint)?;
         }
     }
 
@@ -5081,7 +5078,7 @@ async fn publish_proven_pure_insert_adopt(
         current,
         planned_transactions,
         &mut planned_index,
-        Some(crate::failpoints::names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+        Some(&crate::seams::catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
         system_columns,
     )
     .await?;
@@ -5154,7 +5151,7 @@ async fn publish_adopted_delta(
             current_ds,
             planned_transactions,
             &mut planned_index,
-            Some(crate::failpoints::names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+            Some(&crate::seams::catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
             target_txn.catalog.system_columns,
         )
         .await?;
@@ -5165,9 +5162,7 @@ async fn publish_adopted_delta(
     // have not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK (not publish the inserts-only state). See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_append_rolls_back.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT)?;
 
     // Phase 1b: update the CHANGED rows. Classification proved these ids present
     // in the target-equals-base image; the sealed update-only adapter forbids
@@ -5196,9 +5191,7 @@ async fn publish_adopted_delta(
     // has not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_rolls_back.
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via row/byte-bounded deletion-vector
     // transactions (same exact-chain helper as the three-way path; MR-A).
@@ -5516,9 +5509,7 @@ impl Omnigraph {
             )
             .await?
         };
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE)?;
         // The handle remains bound to its original branch throughout the merge.
         // The captured transaction supplies every physical and publish target.
         let target_was_active = self.active_branch().await == target_branch;
@@ -5902,9 +5893,7 @@ impl Omnigraph {
             validate_merge_candidates(catalog, target_snapshot, &changeset).await?;
             validation_timing.finish();
         }
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_CANDIDATE_VALIDATION)?;
 
         // Recovery sidecar: protect the complete physical effect set. Every
         // `RewriteMerged` / `AdoptWithDelta` logical data step receives a
@@ -6311,9 +6300,7 @@ impl Omnigraph {
         // transition storage while polling the substrate publisher.
         let post_arm_result = Box::pin(async {
             if recovery.is_some() && !first_touch_effects.is_empty() {
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::BRANCH_MERGE_POST_SIDECAR_PRE_FORK,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_SIDECAR_PRE_FORK)?;
             }
 
             let physical_publish_timing = crate::instrumentation::start_merge_timing(
@@ -6451,9 +6438,7 @@ impl Omnigraph {
             // The Armed body remains rollback-only until every physical effect,
             // every first-touch ref identity, and every logical output slot are
             // durably confirmed together.
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM)?;
             if let Some((sidecar, _)) = recovery.as_mut() {
                 let recovery_confirm_timing = crate::instrumentation::start_merge_timing(
                     crate::instrumentation::MergeTimingPhase::RecoveryConfirm,
@@ -6469,9 +6454,7 @@ impl Omnigraph {
                 recovery_confirm_timing.finish();
             }
 
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
             // Publish the complete merge delta and its pre-minted lineage under
             // the exact target authority captured before classification.

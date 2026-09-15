@@ -466,8 +466,8 @@ optional `--- known_failure` (Known recovery failures), then `--- schema`, then
 which at least one is a query or mutate step; a file missing any of these
 three leading sections, ordering them differently, or carrying no query or
 mutate step (nothing would be asserted, a restart-only step list
-included) is refused. A `--- fault` may precede an operation as specified
-in Faults at an explicit step. A step is one of:
+included) is refused. A `--- seam` may precede an operation as specified
+in Seams at an explicit step. A step is one of:
 
 - `--- query` holding exactly one GQ declaration with a read body, followed
   by an optional `--- params` section (JSON object) and a mandatory
@@ -695,7 +695,7 @@ compatibility or change its existing qualification status.
 
 `Intended` means potential support gated by Rollout; it does not mean
 implemented or qualified. Initial implementation admission is limited to
-`omnigraph-engine` with `local-filesystem` and no fault directives, and
+`omnigraph-engine` with `local-filesystem` and no seam directives, and
 `omnigraph-engine-dst` with `in-memory-object-store`. Every other combination
 must report `unsupported_environment` before case setup. Further targets,
 storage combinations and controls require their own acceptance evidence.
@@ -801,18 +801,19 @@ meaning. Rust generated scenarios and GQT scenarios retain their own loops,
 fixture setup, checks, and outputs; neither language is interpreted by the
 shared executor.
 
-### Faults at an explicit step
+### Seams at an explicit step
 
-A ***fault directive*** is a `--- fault` YAML section immediately before
-one query or mutate step. It arms a named engine hook only during that
-operation; schema creation, seed loading, and earlier steps cannot consume
-it. The following example begins after branch setup:
+A ***seam directive*** is a `--- seam` YAML section immediately before
+one mutate step (a GQ mutation or a branch statement). It installs a decision at a named engine seam
+(RFC 0066) only during that operation; schema creation, seed loading, and
+earlier steps cannot consume it. The following example begins after branch
+setup:
 
 ```text
---- fault
+--- seam
 at: branch_merge.post_sidecar_pre_fork
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate
@@ -828,52 +829,68 @@ query unrelated_write() {
 --- expect affected: nodes=1 edges=0
 ```
 
-All four fault fields are required. `scope` accepts only `next_step`;
-`action` accepts only `return_error`. `occurrence` is 1 to 1000000 and
-counts crossings of that hook attributable to the selected operation,
-including its production retries. It starts at zero when the operation
-is armed. The selected crossing injects once; subsequent crossings do
-not inject. Target and storage do not change this meaning.
+All four seam fields are required. `scope` accepts only `next_step`;
+`action` is `fail` or `skip`, and must match the effect the seam declares
+in the engine's catalog (`fail` admits the fail and contention effects,
+`skip` admits the skip effect); `hold` is refused until a case can express
+two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
+that seam attributable to the selected operation, including its production
+retries. It starts at zero when the operation is armed. The installed
+decision passes the first N-1 crossings, fires on the Nth, and passes every
+later one. Target and storage do not change this meaning.
 
-The hook must be supported for the operation and selected environment.
-No caller-supplied code or arbitrary failpoint action string is accepted.
-Initial hook ownership is the prototype's merge hooks
-(`branch_merge.post_authority_capture`,
-`branch_merge.post_sidecar_pre_fork`,
-`branch_merge.post_effects_pre_confirm`,
-`branch_merge.post_phase_b_pre_manifest_commit`) and mutation hook
-`mutation.post_sidecar_pre_fork`. New hooks require an implementation,
-scope proof, and negative tests before the parser accepts them.
+The seam must exist in the engine's catalog and be crossed by the kind of
+step it precedes: a seam of operation `mutation` before a mutate step, one
+of `branch_merge`, `branch_create` or `branch_delete` before the matching
+branch statement, one of `any_write` before either; a seam whose operation
+no step starts is refused as unreachable. No caller-supplied code or
+arbitrary action string is accepted. A new seam requires an implementation,
+a declared effect and operation in the catalog, and a proof case before a
+case may name it.
 
-The selected operation must finish before fault cleanup can be considered
+The selected operation must finish before seam cleanup can be considered
 complete. On cancellation or timeout, stop the isolated worker or quarantine
-the dedicated server graph until outstanding work has stopped and hooks are
-disarmed. Use a bounded supervisor cleanup deadline; failure to establish
+the dedicated server graph until outstanding work has stopped and seams are
+uninstalled. Use a bounded supervisor cleanup deadline; failure to establish
 cleanup prevents reuse and is reported, never an unbounded wait. A killed
 worker or quarantined graph does not count as a successful replay.
 
-The operation must observe the exact injected error through a typed error
-or an equivalent correlated server result. Matching text in query rows or
-an unrelated error is insufficient. The runner verifies delivery and
-disarms the hook before the following operation, including after an
-assertion failure. An unreached hook, failed cleanup, timeout, or lost
-delivery evidence fails the execution. A fault that leaked into another
-operation or graph fails isolation even if the expected rows match.
+Delivery is proven by the installed decision itself: the runner's decision
+counts every crossing and records `seam_delivered` with the seam name, the
+declared occurrence and the crossings seen once the site has fired. A
+`fail` action on a seam of effect fail states the injected error in its
+`--- expect error:` row; on a seam of effect contention the injected error
+is retryable, the publisher retries it, the step succeeds, and the delivery
+record is the proof. A `skip` step carries the healthy expectation the
+skipped path produces.
+The runner uninstalls the decision before the following operation,
+including after an assertion failure. An unreached seam or a missing
+delivery record fails the execution with `seam_unobserved`; a failed
+cleanup fails it with `fault_cleanup_failed` and a timeout with `timeout`.
+A decision that leaked into another operation or graph
+fails isolation even if the expected rows match.
 
-One fault directive attaches to one operation; adjacent directives,
-directives before restart/setup, orphan directives, and directives inside
-loops are refused in this phase. Multiple faults in one operation and
-faults during setup remain out of scope. A case may contain up to 16
-fault directives at separate operations. No fault state survives a
-restart, environment change, seed, or replay.
+A seam directive attaches to the one operation it precedes. Several
+directives may precede one operation when they name distinct seams (two
+independent lost writes on one mutation); each is armed, counted and
+recorded on its own, and the same seam named twice before one operation is
+refused. Directives before restart/setup, orphan directives, and directives
+inside loops are refused in this phase; seams during setup remain out of
+scope. A case may contain up to 16 seam directives. No installed decision
+survives a restart, environment change, seed, or replay.
 
-Initial `omnigraph-engine` admission rejects faults. A future fault-capable
-direct-engine implementation can use process isolation where failpoints are
-global. A server implementation needs equivalent isolation and explicit
-operation attribution; a shared server-wide toggle does not satisfy it.
-This amendment defines no production fault-control endpoint. HTTP fault
-execution stays unavailable until the test-only lifecycle/control owner
-proves this contract.
+Initial `omnigraph-engine` admission rejects seams. A future seam-capable
+direct-engine implementation can use process isolation where the decision
+seams are process-wide. A server implementation needs equivalent isolation
+and explicit operation attribution; a shared server-wide toggle does not
+satisfy it. This amendment defines no production seam-control endpoint.
+HTTP seam execution stays unavailable until the test-only
+lifecycle/control owner proves this contract.
+
+`--- fault` is reserved for storage-boundary faults, injected at the object
+store rather than at a code seam; its grammar is a separate amendment, and
+until it lands a `--- fault` section is refused with a pointer to
+`--- seam`.
 
 `--- restart` continues to mean closing the graph handle and reopening
 the same stored graph. It does not mean process crash or HTTP reconnect.
@@ -897,26 +914,34 @@ match:
 ```
 
 `step` and `match` are required, and other fields are refused. `step` is a
-positive operation ordinal. `match` is a typed error matcher: the only supported
-variant is `error: RecoveryRequired`, with a nonempty exact `reason` of at most
-2048 bytes. It names `OmniError::RecoveryRequired` directly; there is no wildcard
-or fallback variant. Unknown error names, including `Unknown`, are refused,
-as is the old `--- fixme` syntax. The existing `# issue` and `# notes` headers
-provide issue identity and context; `none` remains valid for an unassigned
-issue. The marker does not repeat notes or contain the generated operation ID.
+positive operation ordinal. `match` is a typed error matcher with two
+variants: `error: RecoveryRequired`, with a nonempty exact `reason` of at
+most 2048 bytes, naming `OmniError::RecoveryRequired` returned by a mutate;
+and `error: Internal`, with a nonempty `reason_prefix` of at most 2048
+bytes, naming an `OmniError::Manifest` of kind `Internal` returned by the
+reopen at a `--- restart` (the prefix, because such a refusal embeds a
+per-run operation id). There is no wildcard or fallback variant. Unknown
+error names, including `Unknown`, are refused, as is the old `--- fixme`
+syntax. The existing `# issue` and `# notes` headers provide issue identity
+and context; `none` remains valid for an unassigned issue. The marker does
+not repeat notes or contain the generated operation ID.
 
 Admission requires only `omnigraph-engine-dst` with
-`in-memory-object-store`, no loops, and an ordinary mutate at the declared
-step with its healthy `ok` or `affected` expectation. At least one supported
-fault must precede that step. Faults at or after the marked step are refused.
+`in-memory-object-store`, no loops, and at the declared step either an
+ordinary mutate with its healthy `ok` or `affected` expectation (for the
+`RecoveryRequired` matcher) or a `--- restart` (for the `Internal`
+matcher). At least one seam must precede that step. Seams at or after the
+marked step are refused.
 
 An execution qualifies only when every preceding assertion passes, every
-declared fault has exact typed delivery evidence at its own operation, and
-the marked assertion fails because that mutate returned the typed
-`OmniError::RecoveryRequired` variant with exactly the declared reason.
-The operation's typed error and the failed assertion must identify the same
-step and actual error. Matching text in data, a different error variant,
-another reason or step, and missing fault evidence never qualify.
+declared seam has its delivery record at its own operation, and the marked
+assertion fails because that mutate returned the typed
+`OmniError::RecoveryRequired` variant with exactly the declared reason, or
+that reopen returned an `Internal` manifest error whose message opens with
+the declared prefix. The operation's typed error and the failed assertion
+must identify the same step and actual error. Matching text in data, a
+different error variant, another reason or step, and missing seam evidence
+never qualify.
 
 The step loop still stops at its first failure; later healthy assertions
 remain unchanged and unexecuted. Every selected seed and mandatory fresh
@@ -958,7 +983,7 @@ external and excluded from the recorded input. This binds tested inputs;
 it does not freeze the external service's internal execution schedule.
 
 Capability requirements are derived from actual steps and configuration.
-For example, `--- fault` requires its exact hook, and `--- expect shape`
+For example, `--- seam` requires its exact catalog seam, and `--- expect shape`
 requires result type evidence. There is no second hand-maintained
 `requires` list that can disagree with the case. A server cannot substitute
 inferred types for missing executed types or omit an existing comparison.
@@ -992,7 +1017,7 @@ fails explicitly and cannot truncate compared evidence into success.
 Structured failures retain applicable expected/actual values and a stable
 error code alongside the readable explanation. Contract codes include
 `invalid_case`, `unsupported_environment`, `environment_changed`,
-`fault_unobserved`, `fault_cleanup_failed`, `assertion_failed`,
+`seam_unobserved`, `fault_cleanup_failed`, `assertion_failed`,
 `replay_mismatch`, `worker_failed`, `report_failed`, `timeout`, and
 `unexpected_pass`. `known_failure` is a separate accepted status defined
 in Known recovery failures; its raw worker result remains an assertion failure.
@@ -1682,6 +1707,22 @@ supersedes their implicit execution and ambient-budget rules and assigns the
 complete corpus to the separate configured `GQ Logic Tests` context. Their
 historical command and configuration descriptions are not migration aliases.
 
+- 2026-09-14, from the implementation of RFC 0066: the hook form of
+  `--- fault` is replaced by `--- seam`. Replaced sentences: the directive
+  definition ("A fault directive is a `--- fault` YAML section..."), the
+  action sentence ("`action` accepts only `return_error`"), the hook
+  ownership paragraph naming the five prototype hooks, the delivery
+  paragraph ("The operation must observe the exact injected error through
+  a typed error..."), and the isolation paragraph's fault vocabulary.
+  Delivery proof now comes from the installed decision's own crossing
+  count (`seam_delivered`), admission from the engine's seam catalog, and
+  the action word must match the seam's declared effect. `--- fault` is
+  reserved for storage-boundary faults. The known-failure matcher gains
+  `error: Internal` with `reason_prefix` for a refused reopen at a
+  `--- restart`. Second pass, same date: the placement sentence names
+  mutate steps only (no seam is crossed by a query step), the contention
+  pairing and the per-cause failure codes are stated, and the
+  contract-code list says `seam_unobserved`.
 - 2026-09-02, from review of the RFC PR: the fix-PR gate is a diff check
   whose execution guarantee differs by shape (a corpus match ran green in
   the required job; a Rust match is a naming check), and the Rust shape

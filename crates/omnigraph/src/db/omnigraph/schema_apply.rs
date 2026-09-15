@@ -38,7 +38,7 @@ fn promote_drops_to_hard(plan: &mut SchemaMigrationPlan, allow_data_loss: bool) 
     }
 }
 
-fn pre_minted_schema_transaction(
+pub(super) fn pre_minted_schema_transaction(
     read_version: u64,
 ) -> crate::table_store::StagedTransactionIdentity {
     crate::table_store::StagedTransactionIdentity {
@@ -872,9 +872,7 @@ where
     let recovery_operation_id = recovery_handle.operation_id.clone();
 
     let post_arm_result = async {
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
         let mut committed_transactions = HashMap::new();
 
         for table_key in &added_tables {
@@ -920,9 +918,7 @@ where
                     version_metadata: state.version_metadata,
                 },
             );
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::SCHEMA_APPLY_POST_TABLE_COMMIT,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
         for table_key in &rewritten_tables {
@@ -998,9 +994,7 @@ where
                     version_metadata: state.version_metadata,
                 },
             );
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::SCHEMA_APPLY_POST_TABLE_COMMIT,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
         // Index-only changes (AddConstraint, i.e. adding an `@index`) are pure
@@ -1103,9 +1097,7 @@ where
         // Atomic schema apply: schema staging is part of the exact Phase-B
         // confirmation. Armed always means rollback; EffectsConfirmed is eligible
         // for the fixed exact-head manifest commit and subsequent promotion.
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
 
         let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
         db.storage
@@ -1137,9 +1129,7 @@ where
         // recoverable roll-forward seam immediately before manifest publication.
         // In v7 the exact physical identities and complete manifest delta must be
         // durably confirmed before that seam is exposed.
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_AFTER_STAGING_WRITE,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
 
         let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
             crate::db::manifest::GraphHeadExpectation::new(
@@ -1163,9 +1153,7 @@ where
             )
             .await?;
 
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         crate::db::schema_state::promote_exact_schema_staging(
             db.root_uri(),
             db.storage_adapter(),

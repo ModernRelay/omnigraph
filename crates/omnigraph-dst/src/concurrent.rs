@@ -439,8 +439,8 @@ pub struct FinishOnDrop {
 
 impl Drop for FinishOnDrop {
     fn drop(&mut self) {
+        omnigraph::dst_gate::GATE.clear();
         self.sched.finish(self.actor);
-        omnigraph::dst_gate::uninstall_gate_hook();
     }
 }
 
@@ -1305,19 +1305,21 @@ fn writer_life(
     runtime.block_on(Box::pin(async move {
         // Thread-local seams: this writer's ULIDs/timestamps are its own
         // seeded stream — deterministic per writer, interleaving aside.
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
+        let _ids = omnigraph::dst_ids::IDS
+            .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK
+            .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
         // The write-gate seam (`omnigraph::dst_gate`'s doc has the why):
         // gate acquisition takes turns through the same arbiter; unarmed,
         // the hook returns None (plain blocking locks).
-        if let Some(s) = &sched {
+        let _gate = sched.as_ref().map(|s| {
             let hook_sched = s.clone();
-            omnigraph::dst_gate::install_gate_hook(Box::new(move || {
+            omnigraph::dst_gate::GATE.install(Arc::new(omnigraph::dst_gate::TurnFn(move || {
                 hook_sched
                     .enter(writer)
                     .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
-            }));
-        }
+            })))
+        });
 
         // Survivors reopen with their own storage view on RecoveryRequired.
         let storage_for_reopen = storage.clone();
@@ -1495,9 +1497,8 @@ fn writer_life(
         // synchronous and the adapter surface is async, so the drops
         // issue no gated calls.)
         drop(_finish);
+        drop(_gate);
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
         (claims, reopens, fault_retries)
     }))
 }
@@ -1527,16 +1528,18 @@ fn maintenance_life(
         .build_local(Default::default())
         .expect("maintenance runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
-        if let Some((s, actor)) = &sched_ctx {
+        let _ids = omnigraph::dst_ids::IDS
+            .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK
+            .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
+        let _gate = sched_ctx.as_ref().map(|(s, actor)| {
             let (hook_sched, hook_actor) = (s.clone(), *actor);
-            omnigraph::dst_gate::install_gate_hook(Box::new(move || {
+            omnigraph::dst_gate::GATE.install(Arc::new(omnigraph::dst_gate::TurnFn(move || {
                 hook_sched
                     .enter(hook_actor)
                     .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
-            }));
-        }
+            })))
+        });
         let mut db = Omnigraph::open_with_storage(root, storage)
             .await
             .expect("maintenance handle on shared root");
@@ -1592,9 +1595,8 @@ fn maintenance_life(
             tokio::time::sleep(std::time::Duration::from_micros(think_us)).await;
         }
         drop(_finish);
+        drop(_gate);
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
         (committed, retries, cleanups)
     }))
 }
@@ -1625,16 +1627,18 @@ fn branch_life(
         .build_local(Default::default())
         .expect("branch actor runtime");
     runtime.block_on(Box::pin(async move {
-        omnigraph::dst_ids::install_seeded_ulids(ulid_seed);
-        omnigraph::dst_clock::install_logical_clock();
-        if let Some(s) = &sched {
+        let _ids = omnigraph::dst_ids::IDS
+            .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(ulid_seed)));
+        let _clock = omnigraph::dst_clock::CLOCK
+            .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
+        let _gate = sched.as_ref().map(|s| {
             let (hook_sched, hook_actor) = (s.clone(), actor);
-            omnigraph::dst_gate::install_gate_hook(Box::new(move || {
+            omnigraph::dst_gate::GATE.install(Arc::new(omnigraph::dst_gate::TurnFn(move || {
                 hook_sched
                     .enter(hook_actor)
                     .map(|g| Box::new(g) as Box<dyn std::any::Any + Send>)
-            }));
-        }
+            })))
+        });
         let mut db = Omnigraph::open_with_storage(root, storage)
             .await
             .expect("branch actor handle on shared root");
@@ -1710,9 +1714,8 @@ fn branch_life(
             tokio::time::sleep(std::time::Duration::from_micros(think_us)).await;
         }
         drop(_finish);
+        drop(_gate);
         drop(db);
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
         (claims, merges, retries)
     }))
 }
@@ -1861,8 +1864,11 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                 let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
 
                 // ---- setup (sequential, this thread's seams) ----
-                omnigraph::dst_ids::install_seeded_ulids(setup_ulid_seed);
-                omnigraph::dst_clock::install_logical_clock();
+                let _setup_ids = omnigraph::dst_ids::IDS.install(Arc::new(
+                    omnigraph::dst_ids::SeededUlids::new(setup_ulid_seed),
+                ));
+                let _setup_clock = omnigraph::dst_clock::CLOCK
+                    .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
                 let (setup_ids, base_map) = runtime.block_on(Box::pin(async {
                     let db = Omnigraph::init_with_storage(
                         root,
@@ -2410,8 +2416,8 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                     }
                 }));
 
-                omnigraph::dst_clock::uninstall_logical_clock();
-                omnigraph::dst_ids::uninstall_seeded_ulids();
+                drop(_setup_clock);
+                drop(_setup_ids);
                 report
             })
             .expect("spawn concurrent universe thread")

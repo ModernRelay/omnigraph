@@ -962,9 +962,7 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
                 if txn.caller_expected_graph_head.is_some() {
-                    crate::failpoints::maybe_fail(
-                        crate::failpoints::names::MUTATION_POST_NO_EFFECT_PRE_GATE,
-                    )?;
+                    crate::seams::fail(&crate::seams::catalog::MUTATION_POST_NO_EFFECT_PRE_GATE)?;
                     // A no-op has no table transaction, so it never reaches
                     // `commit_all`. It still needs a linearization point for
                     // the caller's CAS promise: under the same schema -> branch
@@ -988,9 +986,7 @@ impl Omnigraph {
             Ok(total) => {
                 self.validate_staged_mutation(&staging, &txn).await?;
                 let staged = staging.stage_all(self, requested.as_deref()).await?;
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
                 let lineage_intent = self
                     .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
                     .await?;
@@ -1022,9 +1018,7 @@ impl Omnigraph {
                 // Any failure from here is `RecoveryRequired`; synchronous heal
                 // or a read-write open converges the recorded outcome. See
                 // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
                 let publish_result = self
                     .commit_updates_on_branch_with_expected(
                         requested.as_deref(),
@@ -1059,8 +1053,11 @@ impl Omnigraph {
                     // synchronous heal or read-write open to audit and remove.
                     // Failing the user here would report an error for a write
                     // that already landed.
-                    if let Err(err) =
-                        crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
+                    if let Err(err) = crate::db::manifest::delete_sidecar_after_publish(
+                        &handle,
+                        self.storage_adapter(),
+                    )
+                    .await
                     {
                         tracing::warn!(
                             error = %err,
@@ -1544,9 +1541,7 @@ impl Omnigraph {
         // HEAD only at the unified end-of-query commit — no inline residual.
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
         staging.record_deleted_ids(&table_key, &deleted_ids);
         staging.record_delete(&table_key, pred_sql.clone());
 

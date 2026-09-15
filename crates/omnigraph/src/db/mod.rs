@@ -18,10 +18,14 @@ pub use omnigraph::{
     CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
     Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction, RepairClassification,
-    RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason,
+    RepairOptions, RepairStats, SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyOptions, SchemaApplyResult,
+    SkipReason, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
+    SystemColumnUpgradeReport,
 };
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
+#[cfg(feature = "dst")]
+pub use recovery_audit::dst_recovery_audit_rows;
 pub(crate) use schema_state::SchemaContractText;
 
 use crate::error::{OmniError, Result};

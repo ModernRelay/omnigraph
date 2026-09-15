@@ -733,6 +733,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
     ) -> Result<StagedHandle>;
 
+    /// Stage a rename-only column alteration; see
+    /// `TableStore::stage_rename_columns`. Committed through `commit_staged_exact`.
+    async fn stage_rename_columns(
+        &self,
+        snapshot: &SnapshotHandle,
+        renames: &[(String, String)],
+    ) -> Result<StagedHandle>;
+
     /// Stage a delete (two-phase, no HEAD advance). `None` when 0 rows match —
     /// the table is not touched (no transaction, no version). See
     /// `TableStore::stage_delete`.
@@ -831,9 +839,7 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<lance::dataset::refs::BranchIdentifier> {
-        snapshot
-            .dataset()
-            .branch_identifier()
+        crate::branch_control::dataset_branch_identifier(snapshot.dataset())
             .await
             .map_err(OmniError::storage)
     }
@@ -1253,6 +1259,16 @@ impl TableStorage for TableStore {
         batch: RecordBatch,
     ) -> Result<StagedHandle> {
         TableStore::stage_overwrite(self, snapshot.dataset(), batch)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_rename_columns(
+        &self,
+        snapshot: &SnapshotHandle,
+        renames: &[(String, String)],
+    ) -> Result<StagedHandle> {
+        TableStore::stage_rename_columns(self, snapshot.dataset(), renames)
             .await
             .map(StagedHandle::new)
     }

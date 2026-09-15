@@ -27,8 +27,9 @@ node Chunk {
   correctness falls back to an exact scan when coverage is missing
 
 The schema says **where** embeddings live and **what** they come from. It does
-not populate vectors during a load. Supply vectors in input or prepare JSONL
-with the offline command.
+not populate vectors during mutation or load. Supply required vectors in input
+or prepare JSONL with the offline command. A nullable `Vector(N)?` target may
+remain null even when its source text is supplied.
 
 ## Offline Embedding Pipeline
 
@@ -55,8 +56,18 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 
 ## Search Functions in Queries
 
-Ranking functions are order operators, not filters. `nearest` and `rrf` require
-`limit N`; BM25 alone does not, though a limit keeps output bounded.
+Ranking functions lead the `order` clause. `nearest` and `rrf` require `limit N`;
+BM25 alone does not, though a limit keeps output bounded. `nearest` sorts by
+ascending distance and `bm25` by descending relevance; secondary keys follow
+the score, then entity IDs break ties. This order also holds through traversals.
+A bounded BM25 scan with no secondary keys may select equal-score rows at its
+cutoff by scan order before the final sort.
+
+Omit a direction on a search key: `bm25(...)` always ranks by descending score
+(`asc`/`desc` are ignored), and a direction after `nearest(...)` is a parse
+error. Only one search function may lead `order`; a second one fails when the
+query runs ("search functions must lead the order clause"), even though `lint`
+passes.
 
 ### Vector similarity
 
@@ -68,6 +79,10 @@ query nearest_chunks($q: Vector(1536)) {
     limit 10
 }
 ```
+
+The query value may also be a `String` (`$q: String`): the configured embedding
+provider embeds it at query time. When `@embed(..., model=...)` records a
+model, the resolved provider model must match it exactly.
 
 ### BM25 text ranking
 
@@ -90,6 +105,31 @@ query hybrid($vq: Vector(1536), $tq: String) {
     limit 10
 }
 ```
+
+### Projecting scores
+
+Repeat the leading order expression to return its score:
+
+```gq
+query scored_titles($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.title, $q) as score }
+    order { bm25($d.title, $q) }
+    limit 10
+}
+```
+
+`nearest(...) as distance` works the same way and returns squared L2 distance.
+Without an alias, the result column is `d._score` or `d._distance`. A different
+expression or one without the matching leading order key is refused (`T33`).
+Ranks under aggregates (`T32`), `rrf(...)` (`T37`), and full-text predicates
+(`T35`) cannot be projected; an expression used only as an `rrf` arm is not a
+projectable score either.
+
+A search ordering may accompany aggregates, but it only selects the rows that
+are aggregated: the top-`limit` window under `nearest`, every text match under
+`bm25`. Groups are not score-ranked, and projecting a score beside an aggregate
+is refused (`T9`).
 
 ### Text filter (not ranking — no `limit` required)
 
@@ -119,6 +159,22 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 ```
 
 Don't rank over the entire chunk set if you know a traversal can narrow it first.
+
+A standalone `nearest` ordering widens an underfilled candidate set, finally
+using an exact scan if needed to fill the limit with available survivors.
+An `rrf` vector arm retains a top-k window: an entity outside that window has
+no vector contribution, so filtering through a traversal can shorten or change
+the fused answer. Full-text arms in `rrf` remain unbounded over their eligible
+matches.
+
+An indexed `nearest` scan reads a bounded number of partitions per index delta
+(`OMNIGRAPH_ANN_NPROBES`, default 20; `0` removes the cap) and widens only to
+fill the limit, so a filled limit does not make the ANN ranking exact. A scoped
+`nearest` whose survivors are always fewer than `limit` pays an exact
+whole-type pass on every execution. `OMNIGRAPH_RRF_GATE_RATIO`,
+`OMNIGRAPH_RRF_GATE_MAX_IDS`, and `OMNIGRAPH_RRF_PLAN` tune and diagnose the
+prefilter that a selective traversal pushes into a `nearest` or `rrf` scan;
+leave them unset in normal operation.
 
 ## Model / Config
 

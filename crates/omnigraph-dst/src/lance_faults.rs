@@ -4,12 +4,9 @@
 //! (manifest / write queue / sidecars) via `FailingStorage`, and — this
 //! module — Lance's own table IO (data files, txn files, its commit
 //! protocol), which resolves through the engine's process-wide Lance
-//! `ObjectStoreRegistry`. It interposes a wrapping provider over the
-//! registry's `shared-memory` scheme (the registry IS the seam — zero
-//! Lance changes):
-//! the provider delegates store construction to the original provider, then
-//! swaps the store's `inner` for a decorator that consults the active
-//! universe's [`LanceFaultState`] on every call.
+//! `ObjectStoreRegistry`. The engine's `object_store_seam` hooks the stores;
+//! this module installs the decorator, wrapping each store so it consults the
+//! active universe's [`LanceFaultState`].
 //!
 //! Discipline mirrors the adapter-realm injector (`FailingStorage`):
 //! - the state's OWN SplitMix64 stream (derived from `FaultPlan.seed` with a
@@ -24,7 +21,7 @@
 //!   child runs an unpaused runtime, so its weather latency sleeps real
 //!   (bounded) milliseconds.
 //!
-//! The provider is installed once per process ([`install`]); with no active
+//! The decorator is installed once per process ([`install`]); with no active
 //! state (or a disabled one) it is a pure passthrough, so clean universes
 //! and non-fault tests are unaffected.
 
@@ -36,9 +33,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use lance_io::object_store::{
-    ObjectStore as LanceObjectStore, ObjectStoreParams, ObjectStoreProvider,
-};
+use omnigraph::object_store_seam::DecorateObjectStore;
+use omnigraph::seams::{Behavior, Global, Installed};
+
 use object_store::ObjectStoreExt as _;
 use object_store::path::Path as OsPath;
 use object_store::{
@@ -354,7 +351,8 @@ async fn fault(
     Ok(turn)
 }
 
-static INSTALLED: OnceLock<()> = OnceLock::new();
+static INSTALLED: OnceLock<Installed<dyn DecorateObjectStore, Global<dyn DecorateObjectStore>>> =
+    OnceLock::new();
 
 /// WRITE CENSUS bottom-count: every key the Lance realm's store currently
 /// holds for `root`, flat. Constructed through the registry provider (the
@@ -379,7 +377,7 @@ pub(crate) async fn list_realm_keys(root: &str) -> Vec<String> {
     let url = Url::parse(root)
         .unwrap_or_else(|e| panic!("census bottom listing: unparseable root {root}: {e}"));
     let store = provider
-        .new_store(url, &ObjectStoreParams::default())
+        .new_store(url, &lance_io::object_store::ObjectStoreParams::default())
         .await
         .unwrap_or_else(|e| panic!("census bottom listing: store construction failed: {e}"));
     let mut out = Vec::new();
@@ -392,72 +390,25 @@ pub(crate) async fn list_realm_keys(root: &str) -> Vec<String> {
     out
 }
 
-/// Interpose the fault-injecting provider over the engine registry's
-/// `shared-memory` provider. Idempotent; process-permanent.
+/// Install the fault-injecting decorator on the engine's Lance-realm
+/// object-store seam, which covers the `shared-memory` and `file` schemes
+/// (`omnigraph::object_store_seam`). Idempotent; the guard lives in a
+/// process-wide `OnceLock`, so it never drops and the install is permanent.
 pub fn install() {
     INSTALLED.get_or_init(|| {
-        let registry = omnigraph::dst_lance_store_registry();
-        let original = registry
-            .get_provider("shared-memory")
-            .expect("lance registry always has a shared-memory provider");
-        registry.insert(
-            "shared-memory",
-            Arc::new(FaultInjectingProvider { inner: original }),
-        );
+        omnigraph::object_store_seam::OBJECT_STORE.install(Arc::new(LanceFaultDecorator))
     });
 }
 
-static INSTALLED_FILE: OnceLock<()> = OnceLock::new();
+/// The seam behavior: every Lance-realm store becomes a
+/// [`FaultInjectingOsStore`] over the base store the engine's hook built.
+struct LanceFaultDecorator;
 
-/// LANE B whitebox: interpose the same decorator over the `file` scheme
-/// provider — `install()` covers only `shared-memory`, so a local-FS
-/// child's Lance-realm writes would otherwise bypass the kill counter.
-/// Idempotent; process-permanent; only the dst_child binary calls it.
-///
-/// # Panics
-/// When the registry has no `file` provider (it always ships one).
-pub fn install_file() {
-    INSTALLED_FILE.get_or_init(|| {
-        let registry = omnigraph::dst_lance_store_registry();
-        let original = registry
-            .get_provider("file")
-            .expect("lance registry always has a file provider");
-        registry.insert("file", Arc::new(FaultInjectingProvider { inner: original }));
-    });
-}
+impl Behavior for LanceFaultDecorator {}
 
-/// Wraps the original `shared-memory` provider: same store, same path and
-/// prefix semantics, but the constructed store's `inner` is decorated.
-#[derive(Debug)]
-struct FaultInjectingProvider {
-    inner: Arc<dyn ObjectStoreProvider>,
-}
-
-#[async_trait]
-impl ObjectStoreProvider for FaultInjectingProvider {
-    async fn new_store(
-        &self,
-        base_path: Url,
-        params: &ObjectStoreParams,
-    ) -> lance_core::Result<LanceObjectStore> {
-        let mut store = self.inner.new_store(base_path, params).await?;
-        store.inner = Arc::new(FaultInjectingOsStore {
-            inner: Arc::clone(&store.inner),
-        });
-        Ok(store)
-    }
-
-    fn extract_path(&self, url: &Url) -> lance_core::Result<OsPath> {
-        self.inner.extract_path(url)
-    }
-
-    fn calculate_object_store_prefix(
-        &self,
-        url: &Url,
-        storage_options: Option<&std::collections::HashMap<String, String>>,
-    ) -> lance_core::Result<String> {
-        self.inner
-            .calculate_object_store_prefix(url, storage_options)
+impl DecorateObjectStore for LanceFaultDecorator {
+    fn wrap(&self, base: Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(FaultInjectingOsStore { inner: base })
     }
 }
 

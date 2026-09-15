@@ -54,6 +54,7 @@ mod managed;
 mod managed_http_fixture;
 mod output;
 mod planes;
+mod schema_upgrade;
 mod scope;
 mod upgrade;
 use cli::*;
@@ -945,6 +946,9 @@ async fn main() -> Result<()> {
                 } else {
                     print_schema_apply_human(&output);
                 }
+            }
+            SchemaCommand::UpgradeSystemColumns { uri, check, json } => {
+                schema_upgrade::run(&cli.profile, &cli.store, uri, check, json, cli.quiet).await?;
             }
             SchemaCommand::Show { uri, json } => {
                 let client = client::GraphClient::resolve(

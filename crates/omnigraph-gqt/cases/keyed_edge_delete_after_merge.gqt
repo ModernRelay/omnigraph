@@ -1,0 +1,110 @@
+# issue: none
+# notes: keyed twin of unkeyed_edge_dup_delete_after_merge.gqt: with @key(@src, @dst) (RFC 0044) the branch's
+# notes: re-insert upserts, both the merged branch and main stay writable, and a delete by source removes
+# notes: the one row per pair; restart keeps the deletion.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+
+--- seed
+{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"type": "Person", "data": {"name": "Charlie"}}
+{"type": "Person", "data": {"name": "Diana"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob"}
+{"edge": "Knows", "from": "Alice", "to": "Charlie"}
+{"edge": "Knows", "from": "Bob", "to": "Diana"}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query change() { insert Knows { from: "Alice", to: "Bob" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge b0
+
+--- expect ok
+
+--- mutate branch: b0
+query change() { insert Knows { from: "Charlie", to: "Diana" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate branch: main
+query change() { insert Knows { from: "Bob", to: "Charlie" } }
+
+--- expect affected: nodes=0 edges=1
+
+--- query branch: b0
+query edges() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { $p.name, $q.name }
+}
+
+--- expect unordered
+{"p.name": "Alice", "q.name": "Bob"}
+{"p.name": "Alice", "q.name": "Charlie"}
+{"p.name": "Bob", "q.name": "Diana"}
+{"p.name": "Charlie", "q.name": "Diana"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate branch: main
+query change() { delete Knows where from = "Alice" }
+
+--- expect affected: nodes=0 edges=2
+
+--- query branch: main
+query edges() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { $p.name, $q.name }
+}
+
+--- expect unordered
+{"p.name": "Bob", "q.name": "Charlie"}
+{"p.name": "Bob", "q.name": "Diana"}
+
+--- expect shape
+p.name: String
+q.name: String
+
+--- restart
+
+--- query branch: main
+query edge_count() {
+    match {
+        $p: Person
+        $p $e:knows $q
+    }
+    return { count($q.name) as n }
+}
+
+--- expect unordered
+{"n": 2}
+
+--- expect shape
+n: I64

@@ -9,7 +9,7 @@ check the [release notes](../../releases/) before upgrading.
 
 ## Explicit storage migration
 
-`omnigraph upgrade` defaults to storage format v8 in the same location.
+`omnigraph upgrade` defaults to v9: the storage conversions to v8, then the system-column upgrade (below).
 Qualified standalone v6 graphs from the 0.9.x/0.10.x release lines run v6 → v7
 registration conversion followed by metadata-only v7 → v8 conversion. Qualified
 v7 development graphs run only the final step. Both reuse table data and preserve
@@ -26,7 +26,7 @@ their registration-clock interpretation.
 3. Run preflight with the new binary:
 
    ```bash
-   omnigraph upgrade ./graph.omni --check --to-format 8 --json
+   omnigraph upgrade ./graph.omni --check --json
    ```
 
 4. Inspect `outcome`, `findings`, `route` and `work`. A passing check is advisory;
@@ -46,7 +46,7 @@ their registration-clock interpretation.
 5. Execute while the graph remains offline:
 
    ```bash
-   omnigraph upgrade ./graph.omni --to-format 8 --json
+   omnigraph upgrade ./graph.omni --json
    ```
 
 6. Verify reads on every branch and retained snapshot, then start only the new
@@ -54,11 +54,12 @@ their registration-clock interpretation.
    with the old executable; old bytes remaining in the upgraded root do not
    make downgrading safe. Post-upgrade writes are absent from that backup.
 
-`--to-format` defaults to 8. Explicit `--to-format 7` stops at v7 for a
+`--to-format` defaults to 9. Explicit `--to-format 7` stops at v7 for a
 v7-compatible executable; the current binary accepts v8 and v9 for normal open
-and will refuse that intermediate result. Upgraded graphs keep the legacy
-system column spellings at v8; no route targets v9, and the in-place
-system-column conversion is not available. A graph already at v9 reports
+and will refuse that intermediate result. Explicit `--to-format 8` stops at
+v8, keeping the legacy system column spellings. The v8 to v9 step is the
+system-column upgrade (below), which needs a graph with only main: a route
+ending at v9 refuses other branches before any conversion. A graph already at v9 reports
 `already_current` for the default and for an explicit `--to-format 8` alike;
 `--to-format 7` on a v8 or v9 graph is refused as a downgrade below the served
 range. Unsupported sources and targets
@@ -239,13 +240,29 @@ mapping is:
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
 | v7 | the exact unreleased development build that wrote it |
-| v8 | 0.11 development builds before the system-column namespace change, and every `omnigraph upgrade` output; still served by the current binary without export/import |
+| v8 | 0.11 development builds before the system-column namespace change, and conversions completed with `omnigraph upgrade --to-format 8`; still served by the current binary without export/import |
 | v9 | current 0.11.x line; entity export/import normally not required within this generation |
 
 If the graph's generation is newer than the binary, upgrade the binary rather
 than rebuilding with it.
 
-An in-place system-column upgrade is [planned](../../rfcs/0040-system-column-namespace.md#rollout). It is not available in this build; existing v8 graphs retain their spellings.
+## System-column upgrade (v8 to v9)
+
+`omnigraph schema upgrade-system-columns <graph>` respells a v8 graph's system
+columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`) and moves it to v9. Columns are renamed by field id: no rows are
+rewritten, indexes survive, and data, history, and commit ids are unchanged;
+`--check` runs the preflight and writes nothing; `--json` prints the report.
+The preflight refuses a graph with any non-main branch (merge what you need,
+then delete the branches: a merge alone leaves the source live) and a
+property whose name starts with `_` (rename it with `@rename_from` first),
+naming every offender under `system_columns_preflight`. Edge constraints
+such as `@unique(src, dst)` become `@unique(@src, @dst)`. Stop every server
+serving the graph and retain a verified backup first: a write from a server
+still running lands the graph in a refusal only a restore clears, and there
+is no reverse operation. An interrupted run is completed by the next
+read-write open (every CLI command except `--check`; a rerun then reports
+`already_current`), and a read-only handle refuses until then. A v9 graph
+reports `already_current`; cluster-managed graphs are refused.
 
 ## Rebuild
 

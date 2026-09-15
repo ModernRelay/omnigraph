@@ -149,7 +149,7 @@ mod child {
         // file-scheme Lance provider BEFORE the engine first resolves a
         // store for this root.
         let rig = (die_at.is_some() || weather).then(|| {
-            omnigraph_dst::lance_faults::install_file();
+            omnigraph_dst::lance_faults::install();
             let base: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::local());
             let rig = RealKillRig::new(base, die_at, weather.then(|| weather_plan(seed)));
             rig.set_barrier_path(&oplog_path);

@@ -155,7 +155,7 @@ pub(super) async fn init_manifest_graph(
     // acknowledgement was lost before `Dataset::write` returned success to
     // OmniGraph.  It deliberately sits inside the create half, before the
     // caller can classify the returned Dataset as proof of commitment.
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_MANIFEST_CREATE_ACK_LOST)
+    crate::seams::fail(&crate::seams::catalog::INIT_MANIFEST_CREATE_ACK_LOST)
         .map_err(ManifestInitError::ManifestCreateOutcomeUnknown)?;
     Ok(dataset)
 }
@@ -168,7 +168,7 @@ pub(super) async fn open_exact_genesis_manifest(
     attempt: &GenesisManifestAttempt,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<(Dataset, ManifestState, Vec<GraphLineageRow>)> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_MANIFEST_CREATE_PROBE)?;
+    crate::seams::fail(&crate::seams::catalog::INIT_MANIFEST_CREATE_PROBE)?;
     let (dataset, known_state, lineage_rows, _) =
         open_manifest_graph_with_lineage(root_uri, None, control_session).await?;
 
@@ -242,7 +242,7 @@ fn genesis_probe_mismatch(root_uri: &str, detail: impl std::fmt::Display) -> Omn
 pub(super) async fn load_initial_manifest_state(
     dataset: &Dataset,
 ) -> Result<(ManifestState, Vec<GraphLineageRow>)> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_POST_MANIFEST_CREATE)?;
+    crate::seams::fail(&crate::seams::catalog::INIT_POST_MANIFEST_CREATE)?;
     read_manifest_state_and_lineage(dataset).await
 }
 
@@ -432,7 +432,7 @@ async fn create_empty_dataset(
     let dataset = Dataset::write(reader, uri, Some(params))
         .await
         .map_err(OmniError::storage)?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_TABLE_CREATE_ACK_LOST)?;
+    crate::seams::fail(&crate::seams::catalog::INIT_TABLE_CREATE_ACK_LOST)?;
     Ok(dataset)
 }
 

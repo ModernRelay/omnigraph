@@ -58,7 +58,7 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{
     OMNIGRAPH_ROW_COUNT_KEY, object_store_path_from_uri, table_version_metadata_for_state,
 };
-pub(crate) use migrations::stamp_for_system_columns;
+pub(crate) use migrations::{publish_stamp_advance, stamp_for_system_columns};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
@@ -69,14 +69,16 @@ pub(crate) use recovery::{
     HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
     RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
     RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
+    RecoverySidecar, RecoverySidecarHandle, RecoverySystemColumnUpgrade, RecoveryTableUpdateSlot,
+    SidecarKind, SidecarTablePin, SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
     confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
-    confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
-    finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
-    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
-    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_failed_branch_merge_under_gates,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    confirm_schema_apply_sidecar_v9, delete_sidecar, delete_sidecar_after_publish,
+    ensure_read_only_schema_coherent, finalize_effect_free_occ_sidecar,
+    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
+    new_ensure_indices_sidecar_v9, new_occ_sidecar_v9, new_optimize_sidecar_v9,
+    new_schema_apply_sidecar_v9, new_system_column_upgrade_sidecar_v9,
+    recover_failed_branch_merge_under_gates, recover_manifest_drift, schema_apply_serial_queue_key,
+    write_sidecar,
 };
 pub use state::DatasetEntry;
 #[cfg(test)]
@@ -709,33 +711,17 @@ async fn probe_dataset_latest_incarnation(
         })
     }
     .await;
-    let error = match held {
+    match held {
         Ok(incarnation) => return Ok(incarnation),
-        Err(error @ (OmniError::BranchNotFound { .. } | OmniError::Storage(_))) => error,
+        Err(OmniError::BranchNotFound { .. } | OmniError::Storage(_)) => {}
         Err(error) => return Err(error),
-    };
-    // The held native ref or its tree is gone. Under incarnation-suffixed refs
-    // a recreated branch lives at a new native ref, so re-resolve the logical
-    // name through the live registry: the replacement's identity is a
-    // guaranteed mismatch, and a deleted branch is a typed absence. Only a
-    // registry that still names the held ref makes the miss a real failure.
-    let live = crate::branch_control::list_live_manifest_branch_contents(dataset).await?;
-    let Some(native) =
-        crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), branch)?
-    else {
-        return Err(OmniError::BranchNotFound {
-            branch: branch.to_string(),
-        });
-    };
-    if dataset.manifest().branch.as_deref() == Some(native.as_str()) {
-        return Err(error);
     }
+    let native = resolve_native_manifest_branch(dataset, branch).await?;
     let replacement = dataset
         .checkout_branch(&native)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
-    let branch_identifier = replacement
-        .branch_identifier()
+    let branch_identifier = crate::branch_control::dataset_branch_identifier(&replacement)
         .await
         .map_err(|error| branch_ref_error(error, branch))?;
     Ok(ManifestIncarnation {
@@ -1604,9 +1590,7 @@ impl ManifestCoordinator {
         let lineage_rows = match known_state.graph_heads.get(branch_key) {
             Some(head) if projection_has_head(head) => None,
             _ => {
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
-                )?;
+                crate::seams::fail(&crate::seams::catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
                 Some(read_graph_lineage(&dataset).await?.0)
             }
         };

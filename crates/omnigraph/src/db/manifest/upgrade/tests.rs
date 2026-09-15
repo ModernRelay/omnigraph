@@ -5,6 +5,10 @@ use super::*;
 use crate::db::Omnigraph;
 
 async fn synthetic_v6_fixture(root: &str) {
+    synthetic_v6_fixture_with_branch(root, true).await;
+}
+
+async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
     let db =
         Omnigraph::init_with_legacy_system_columns_for_tests(root, "node Person { name: String }")
             .await
@@ -37,10 +41,65 @@ async fn synthetic_v6_fixture(root: &str) {
     lance::dataset::cleanup::cleanup_old_versions(&dataset, policy)
         .await
         .unwrap();
-    let version = dataset.version().version;
-    crate::storage_layer::lance_clone::create_branch(&mut dataset, "feature", version)
+    if create_branch {
+        let version = dataset.version().version;
+        crate::storage_layer::lance_clone::create_branch(&mut dataset, "feature", version)
+            .await
+            .unwrap();
+    }
+}
+
+/// The default route on a branch-free synthetic v6 graph runs all three
+/// steps and lands at v9; `--check` names both deferred preflights first.
+#[tokio::test]
+async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v9() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    synthetic_v6_fixture_with_branch(root, false).await;
+    let before = stored_files(dir.path());
+    let check = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: true,
+            to_format: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
+    assert_eq!(
+        check.route,
+        [HANDLER, RETIREMENT_HANDLER, SYSTEM_COLUMNS_HANDLER]
+    );
+    assert_eq!(check.work.deferred_checks.len(), 2, "{check:?}");
+    assert_eq!(stored_files(dir.path()), before);
+
+    let upgraded = upgrade_storage(root, UpgradeOptions::default())
         .await
         .unwrap();
+    assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
+    assert_eq!(
+        upgraded.completed_handlers,
+        [HANDLER, RETIREMENT_HANDLER, SYSTEM_COLUMNS_HANDLER]
+    );
+    let reopened = Omnigraph::open(root).await.unwrap();
+    assert_eq!(
+        reopened
+            .internal_schema_version_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        9
+    );
+    let snapshot = reopened.snapshot().await;
+    let person = reopened
+        .storage()
+        .open_snapshot_at_table(&snapshot, "node:Person")
+        .await
+        .unwrap();
+    assert!(person.dataset().schema().field("__id").is_some());
+    assert!(person.dataset().schema().field("id").is_none());
 }
 
 fn stored_files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
@@ -67,7 +126,7 @@ fn stored_files(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTim
 #[tokio::test]
 async fn storage_upgrade_check_has_no_local_store_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -122,16 +181,17 @@ async fn storage_upgrade_check_has_no_local_store_effects() {
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility() {
-    use crate::failpoints::{FailScenario, ScopedFailPoint, names};
+    use crate::seams::{FailScenario, catalog};
     let _scenario = FailScenario::setup();
     for source_format in [6, 7] {
-        for boundary in [
-            names::UPGRADE_AFTER_FENCE,
-            names::UPGRADE_AFTER_STAGE,
-            names::UPGRADE_AFTER_BRANCH,
-            names::UPGRADE_BEFORE_ACTIVATION,
-            names::UPGRADE_AFTER_ACTIVATION,
+        for seam in [
+            &catalog::UPGRADE_AFTER_FENCE,
+            &catalog::UPGRADE_AFTER_STAGE,
+            &catalog::UPGRADE_AFTER_BRANCH,
+            &catalog::UPGRADE_BEFORE_ACTIVATION,
+            &catalog::UPGRADE_AFTER_ACTIVATION,
         ] {
+            let boundary = seam.name();
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().to_str().unwrap();
             synthetic_v6_fixture(root).await;
@@ -148,18 +208,26 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
                 assert_eq!(first.outcome, UpgradeOutcome::Completed, "{first:?}");
             }
             let report = {
-                let _fault = ScopedFailPoint::new(boundary, "return");
-                upgrade_storage(root, UpgradeOptions::default())
-                    .await
-                    .unwrap()
+                let _fault = seam.fire_always();
+                upgrade_storage(
+                    root,
+                    UpgradeOptions {
+                        check: false,
+                        to_format: Some(8),
+                    },
+                )
+                .await
+                .unwrap()
             };
             assert_eq!(
                 report.outcome,
                 UpgradeOutcome::RecoveryRequired,
                 "{boundary}: {report:?}"
             );
-            let activated = boundary == names::UPGRADE_AFTER_ACTIVATION && source_format == 7;
-            let intermediate = boundary == names::UPGRADE_AFTER_ACTIVATION && source_format == 6;
+            let activated =
+                boundary == catalog::UPGRADE_AFTER_ACTIVATION.name() && source_format == 7;
+            let intermediate =
+                boundary == catalog::UPGRADE_AFTER_ACTIVATION.name() && source_format == 6;
             assert_eq!(Omnigraph::open(root).await.is_ok(), activated, "{boundary}");
             assert_eq!(
                 Omnigraph::open_read_only(root).await.is_ok(),
@@ -188,9 +256,15 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
                 "{boundary}: {check:?}"
             );
             assert_eq!(stored_files(dir.path()), before_check, "{boundary}");
-            let retried = upgrade_storage(root, UpgradeOptions::default())
-                .await
-                .unwrap();
+            let retried = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check: false,
+                    to_format: Some(8),
+                },
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 retried.outcome,
                 if activated {
@@ -206,9 +280,15 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
                 let dataset = open(root, branch).await.unwrap();
                 assert_eq!(read_stamp(&dataset), Some(8), "{boundary}");
             }
-            let repeated = upgrade_storage(root, UpgradeOptions::default())
-                .await
-                .unwrap();
+            let repeated = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check: false,
+                    to_format: Some(8),
+                },
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 repeated.outcome,
                 UpgradeOutcome::AlreadyCurrent,
@@ -221,16 +301,22 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn storage_upgrade_recovery_refuses_foreign_head_movement() {
-    use crate::failpoints::{FailScenario, ScopedFailPoint, names};
+    use crate::seams::FailScenario;
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
     {
-        let _fault = ScopedFailPoint::new(names::UPGRADE_AFTER_FENCE, "return");
-        let interrupted = upgrade_storage(root, UpgradeOptions::default())
-            .await
-            .unwrap();
+        let _fault = crate::seams::catalog::UPGRADE_AFTER_FENCE.fire_always();
+        let interrupted = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: false,
+                to_format: Some(8),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             interrupted.outcome,
             UpgradeOutcome::RecoveryRequired,
@@ -243,9 +329,15 @@ async fn storage_upgrade_recovery_refuses_foreign_head_movement() {
         .await
         .unwrap();
     let before_retry = stored_files(dir.path());
-    let refused = upgrade_storage(root, UpgradeOptions::default())
-        .await
-        .unwrap();
+    let refused = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         refused.outcome,
         UpgradeOutcome::RecoveryRequired,
@@ -266,7 +358,7 @@ async fn storage_upgrade_recovery_refuses_foreign_head_movement() {
 #[tokio::test]
 async fn storage_upgrade_tracks_metadata_writes_and_no_payload_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -289,7 +381,13 @@ async fn storage_upgrade_tracks_metadata_writes_and_no_payload_effects() {
     };
     let report = crate::instrumentation::with_query_io_probes(
         probes,
-        upgrade_storage(root, UpgradeOptions::default()),
+        upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: false,
+                to_format: Some(8),
+            },
+        ),
     )
     .await
     .unwrap();
@@ -329,7 +427,7 @@ async fn storage_upgrade_tracks_metadata_writes_and_no_payload_effects() {
 #[tokio::test]
 async fn storage_upgrade_policy_denial_precedes_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     struct DenySchemaApply;
     impl omnigraph_policy::PolicyChecker for DenySchemaApply {
         fn check(
@@ -353,7 +451,10 @@ async fn storage_upgrade_policy_denial_precedes_effects() {
     let before = stored_files(dir.path());
     let report = upgrade_storage_as(
         root,
-        UpgradeOptions::default(),
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
         Some("blocked-actor"),
         Some(&DenySchemaApply),
     )
@@ -372,7 +473,7 @@ async fn storage_upgrade_policy_denial_precedes_effects() {
 #[tokio::test]
 async fn storage_upgrade_refuses_unknown_ownership_and_source() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     for (source_format, expected_code) in [("5", "unsupported_source"), ("99", "newer_than_binary")]
     {
         let dir = tempfile::tempdir().unwrap();
@@ -384,18 +485,26 @@ async fn storage_upgrade_refuses_unknown_ownership_and_source() {
             .await
             .unwrap();
         let before = stored_files(dir.path());
-        let report = upgrade_storage(root, UpgradeOptions::default())
+        for to_format in [None, Some(8)] {
+            let report = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check: false,
+                    to_format,
+                },
+            )
             .await
             .unwrap();
-        assert_eq!(report.outcome, UpgradeOutcome::CheckFailed, "{report:?}");
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.code == expected_code),
-            "{report:?}"
-        );
-        assert_eq!(stored_files(dir.path()), before);
+            assert_eq!(report.outcome, UpgradeOutcome::CheckFailed, "{report:?}");
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.code == expected_code),
+                "{report:?}"
+            );
+            assert_eq!(stored_files(dir.path()), before);
+        }
     }
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
@@ -406,9 +515,15 @@ async fn storage_upgrade_refuses_unknown_ownership_and_source() {
         .await
         .unwrap();
     let before = stored_files(dir.path());
-    let report = upgrade_storage(root, UpgradeOptions::default())
-        .await
-        .unwrap();
+    let report = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         report.outcome,
         UpgradeOutcome::RecoveryRequired,
@@ -426,7 +541,7 @@ async fn storage_upgrade_refuses_unknown_ownership_and_source() {
 #[tokio::test]
 async fn storage_upgrade_refuses_preexisting_recovery_without_healing() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -494,7 +609,7 @@ async fn storage_upgrade_refuses_preexisting_recovery_without_healing() {
 #[tokio::test]
 async fn storage_upgrade_current_main_refuses_legacy_branch_without_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -528,7 +643,7 @@ async fn storage_upgrade_current_main_refuses_legacy_branch_without_effects() {
 #[tokio::test]
 async fn storage_upgrade_history_budget_precedes_manifest_reads() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -572,7 +687,7 @@ async fn storage_upgrade_history_budget_precedes_manifest_reads() {
 #[tokio::test]
 async fn storage_upgrade_v7_to_v8_preserves_manifest_fragments_and_history() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
@@ -632,9 +747,15 @@ async fn storage_upgrade_v7_to_v8_preserves_manifest_fragments_and_history() {
         );
         assert_eq!(stored_files(dir.path()), before);
     }
-    let result = upgrade_storage(root, UpgradeOptions::default())
-        .await
-        .unwrap();
+    let result = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(result.outcome, UpgradeOutcome::Completed, "{result:?}");
     assert_eq!(result.route, [RETIREMENT_HANDLER]);
     for (native, source) in sources {
@@ -679,13 +800,13 @@ async fn storage_upgrade_v7_to_v8_preserves_manifest_fragments_and_history() {
 #[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continuing() {
-    use crate::failpoints::{FailScenario, ScopedFailPoint, names};
+    use crate::seams::FailScenario;
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
     {
-        let _fault = ScopedFailPoint::new(names::UPGRADE_AFTER_FENCE, "return");
+        let _fault = crate::seams::catalog::UPGRADE_AFTER_FENCE.fire_always();
         let report = upgrade_storage(
             root,
             UpgradeOptions {
@@ -732,9 +853,15 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
         Some(pending.clone())
     );
     assert_eq!(stored_files(dir.path()), before);
-    let result = upgrade_storage(root, UpgradeOptions::default())
-        .await
-        .unwrap();
+    let result = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(result.outcome, UpgradeOutcome::Completed, "{result:?}");
     assert_eq!(result.completed_handlers, [HANDLER, RETIREMENT_HANDLER]);
     for branch in &pending.branches {
@@ -841,7 +968,7 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
 #[tokio::test]
 async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_name() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let db =
@@ -873,7 +1000,7 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
             root,
             UpgradeOptions {
                 check,
-                to_format: None,
+                to_format: Some(8),
             },
         )
         .await
@@ -902,7 +1029,7 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
         root,
         UpgradeOptions {
             check: true,
-            to_format: None,
+            to_format: Some(8),
         },
     )
     .await
@@ -911,13 +1038,13 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     assert_eq!(stored_files(dir.path()), before);
 }
 
-/// A graph born at the current vintage (v9) sits above the default route
-/// target: the default request is already current and effect-free, and an
-/// explicit lower or unreachable target is refused without effects.
+/// A graph born at the current vintage (v9) already sits at the default route
+/// target: the default and every served explicit target are already current
+/// and effect-free, and a lower target is refused without effects.
 #[tokio::test]
 async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     drop(
@@ -942,22 +1069,24 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
             Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
         );
         assert_eq!(stored_files(dir.path()), before);
-        let explicit_served = upgrade_storage(
-            root,
-            UpgradeOptions {
-                check,
-                to_format: Some(8),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            explicit_served.outcome,
-            UpgradeOutcome::AlreadyCurrent,
-            "{explicit_served:?}"
-        );
-        assert_eq!(stored_files(dir.path()), before);
-        for (to_format, expected_code) in [(7, "target_below_stamp"), (9, "unsupported_target")] {
+        for to_format in [8, 9] {
+            let explicit_served = upgrade_storage(
+                root,
+                UpgradeOptions {
+                    check,
+                    to_format: Some(to_format),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                explicit_served.outcome,
+                UpgradeOutcome::AlreadyCurrent,
+                "{explicit_served:?}"
+            );
+            assert_eq!(stored_files(dir.path()), before);
+        }
+        for (to_format, expected_code) in [(7, "target_below_stamp"), (10, "unsupported_target")] {
             let refused = upgrade_storage(
                 root,
                 UpgradeOptions {
@@ -990,9 +1119,15 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
         .unwrap();
     drop(dataset);
     let before = stored_files(dir.path());
-    let newer = upgrade_storage(root, UpgradeOptions::default())
-        .await
-        .unwrap();
+    let newer = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(newer.outcome, UpgradeOutcome::CheckFailed, "{newer:?}");
     assert!(
         newer
@@ -1007,7 +1142,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
 #[tokio::test]
 async fn storage_upgrade_legacy_source_refuses_reserved_retirement_metadata_without_effects() {
     #[cfg(feature = "failpoints")]
-    let _scenario = crate::failpoints::FailScenario::setup();
+    let _scenario = crate::seams::FailScenario::setup();
     for source in [6, 7] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
@@ -1056,5 +1191,118 @@ async fn storage_upgrade_legacy_source_refuses_reserved_retirement_metadata_with
             );
             assert_eq!(stored_files(dir.path()), before);
         }
+    }
+}
+
+/// The default route ends at v9: a legacy v8 graph with only main runs the
+/// system-column step, `--to-format 8` stays already current before and after,
+/// and a v8 graph with another branch is refused before any effect.
+#[tokio::test]
+async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v9() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    drop(
+        Omnigraph::init_with_legacy_system_columns_for_tests(
+            root,
+            "node Person { name: String }\nedge Knows: Person -> Person { @unique(src, dst) }",
+        )
+        .await
+        .unwrap(),
+    );
+    let before = stored_files(dir.path());
+    let served = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: Some(8),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(served.outcome, UpgradeOutcome::AlreadyCurrent, "{served:?}");
+    let check = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: true,
+            to_format: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
+    assert_eq!(check.target_format, 9);
+    assert!(check.target_defaulted);
+    assert_eq!(check.route, [SYSTEM_COLUMNS_HANDLER]);
+    assert_eq!(stored_files(dir.path()), before, "check writes nothing");
+
+    let upgraded = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: false,
+            to_format: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
+    assert_eq!(upgraded.completed_handlers, [SYSTEM_COLUMNS_HANDLER]);
+    assert_eq!(
+        upgraded.last_durable_completed_boundary.as_deref(),
+        Some(SYSTEM_COLUMNS_HANDLER)
+    );
+    let reopened = Omnigraph::open(root).await.unwrap();
+    assert_eq!(
+        reopened
+            .internal_schema_version_of(crate::db::ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        9
+    );
+    drop(reopened);
+    for to_format in [None, Some(8), Some(9)] {
+        let again = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: false,
+                to_format,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
+    }
+
+    let branched_dir = tempfile::tempdir().unwrap();
+    let branched_root = branched_dir.path().to_str().unwrap();
+    let db = Omnigraph::init_with_legacy_system_columns_for_tests(
+        branched_root,
+        "node Person { name: String }",
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    drop(db);
+    let before = stored_files(branched_dir.path());
+    for check in [true, false] {
+        let refused = upgrade_storage(
+            branched_root,
+            UpgradeOptions {
+                check,
+                to_format: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.outcome, UpgradeOutcome::CheckFailed, "{refused:?}");
+        assert!(
+            refused
+                .findings
+                .iter()
+                .any(|finding| finding.code == crate::db::SYSTEM_COLUMNS_PREFLIGHT),
+            "{refused:?}"
+        );
+        assert_eq!(stored_files(branched_dir.path()), before);
     }
 }

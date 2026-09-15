@@ -26,7 +26,7 @@ environments:
 
 The complete scenario executes against a fresh graph for each environment.
 These two target/storage combinations are implemented. Direct engine execution
-currently refuses faults. Server targets, direct-engine memory storage, cloud
+currently refuses seams. Server targets, direct-engine memory storage, cloud
 storage and other combinations fail admission explicitly; their names do not
 imply implementation or qualification.
 
@@ -44,33 +44,55 @@ in fresh worker processes; completed assertion failures also replay and later
 seeds still run within the file budget. Matching replay of a failing graph
 assertion remains a failure unless it meets the explicit known-failure contract below.
 
-## Fault placement
+## Seam placement
 
-Place a fault directly before its query or mutate operation:
+Place a seam directly before its mutate operation, a GQ mutation or a branch
+statement; no seam is crossed by a query step yet. Several seam blocks may
+precede one operation when they name distinct seams (two lost writes on one
+mutation, `cases/issue_602_stale_sidecar_heals_on_reopen.gqt`); each carries
+its own delivery record, and the same seam twice before one operation is
+refused:
 
 ```yaml
---- fault
+--- seam
 at: branch_merge.post_authority_capture
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 ```
 
-All four fields are required. The occurrence counts crossings inside that
-operation, including production retries; setup and preceding operations cannot
-consume it. The guard is removed before the next operation or restart. Fault directives inside loops are currently refused. GQT does not add retries.
+All four fields are required. `at` names a decision seam in the engine's
+catalog (`omnigraph::seams::catalog`, RFC 0066); `action` is `fail` or
+`skip` and must match the effect the seam declares (`fail` admits the fail
+and contention effects, `skip` the skip effect); `hold` is refused until
+concurrent steps exist. A `fail` action on a seam of effect contention
+injects a retryable error that the publisher retries, so the step succeeds
+and the `seam_delivered` record is its only proof; on a seam of effect fail
+the step states the injected error in its `--- expect error:` row. A `skip`
+action carries the healthy expectation the skipped path produces; a lost
+durable write is then proven healed by a `--- restart` and the query after it
+(`cases/issue_602_stale_sidecar_heals_on_reopen.gqt`), or, while the defect
+stands, pinned by a `--- known_failure` marker on that restart. The occurrence counts crossings inside that
+operation, including production retries; setup and preceding operations
+cannot consume it. The installed decision is removed before the next
+operation or restart. Seam directives inside loops are refused. GQT does not
+add retries.
 
-Supported returned-error hooks are `branch_merge.post_authority_capture`,
-`branch_merge.post_sidecar_pre_fork`, `branch_merge.post_effects_pre_confirm`,
-`branch_merge.post_phase_b_pre_manifest_commit` and
-`mutation.post_sidecar_pre_fork`. Occurrences must be 1–1000000. Delivery must
-appear exactly once in the selected operation's typed `Manifest` error message
-or `RecoveryRequired` reason. Text in data or an unrelated error cannot satisfy
-this check. An unknown hook or an unobserved occurrence fails.
+A seam is admitted when its catalog operation matches the step it precedes:
+`mutation` before a mutate, `branch_merge`/`branch_create`/`branch_delete`
+before the matching branch statement, `any_write` before either; a seam of
+operation `unreachable` is refused. Occurrences must be 1–1000000. Delivery
+is proven by the runner's own decision: it counts crossings, fires on the
+declared occurrence, and the report carries `seam_delivered`; an unfired
+seam fails with `seam_unobserved`. Text in data or an error cannot satisfy
+this check.
 
-Process crashes, additional fault actions, server/CLI sessions and network
-simulation are future extensions. The engine recovery fixes remain separate:
-the three failure-then-write corpus cases continue to expect successful writes.
+`--- fault` is reserved for storage-boundary faults (a separate amendment)
+and is refused today with a pointer to `--- seam`. An old `--- fault` block
+converts by renaming the section and its `return_error` action to
+`action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
+concurrent steps, server/CLI sessions and network simulation are future
+extensions.
 
 ## Known recovery failures
 
@@ -86,21 +108,27 @@ match:
 ```
 
 `step` and `match` are required. The step is a positive operation ordinal.
-The typed matcher currently supports only `error: RecoveryRequired`, with a
-nonempty exact `reason` of at most 2048 bytes. Unknown error names, including
-`Unknown`, and extra fields are refused. The old `--- fixme` syntax is refused.
-Use the existing `# issue` and `# notes` headers for issue identity and context;
-`# issue: none` remains valid when no issue has been assigned. This marker admits only
-engine-DST/in-memory cases without loops, targeting an ordinary mutate with
-its healthy `ok` or `affected` expectation. At least one supported fault must
-precede that step; no fault may occur at or after it.
+The typed matcher supports `error: RecoveryRequired`, with a nonempty exact
+`reason` of at most 2048 bytes, on a mutate step, and `error: Internal`,
+with a nonempty `reason_prefix` of at most 2048 bytes, on a `--- restart`
+step whose reopen is refused by an `Internal` manifest error (the prefix,
+because the refusal embeds a per-run operation id). Unknown error names,
+including `Unknown`, and extra fields are refused. The old `--- fixme`
+syntax is refused. Use the existing `# issue` and `# notes` headers for
+issue identity and context; `# issue: none` remains valid when no issue has
+been assigned. This marker admits only engine-DST/in-memory cases without
+loops, targeting an ordinary mutate with its healthy `ok` or `affected`
+expectation or a restart. At least one seam must precede that step; no seam
+may occur at or after it.
 
-Every preceding assertion must pass, and each declared fault must have exact
-typed delivery evidence at its declared operation. The marked assertion must
-fail because that mutate returned the typed `OmniError::RecoveryRequired`
-variant with exactly the declared reason. An operation ID is retained in raw
-evidence but is not part of the marker. Text in rows, another error variant,
-another step, a changed reason, or missing fault evidence cannot match.
+Every preceding assertion must pass, and each declared seam must have its
+delivery record at its declared operation. The marked assertion must fail
+because that mutate returned the typed `OmniError::RecoveryRequired` variant
+with exactly the declared reason, or that reopen returned an `Internal`
+manifest error opening with the declared prefix. An operation ID is retained
+in raw evidence but is not part of the marker. Text in rows, another error
+variant, another step, a changed reason, or missing seam evidence cannot
+match.
 
 The runner keeps the healthy assertions unchanged and stops at the failing
 step; later steps remain unexecuted. Every selected seed and its mandatory

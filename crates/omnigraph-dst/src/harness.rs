@@ -58,6 +58,7 @@ pub(crate) fn clear_process_slots() {
     crate::lance_faults::set_kill(None);
     crate::lance_faults::set_seam_scheduler(None);
     crate::lance_faults::set_bytes_canary(None);
+    omnigraph::storage::STORAGE.clear();
     FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
 }
 
@@ -1119,6 +1120,16 @@ pub struct UniverseReport {
     /// structural miss, not a trial). Counts through suspension, since
     /// stored damage flows through any read.
     pub persisted_consumed: usize,
+    /// The consumed reads themselves, `<verb> <op> <uri>` with the root
+    /// normalized, so a pin can name WHICH stale object the engine read.
+    pub persisted_consumed_reads: Vec<String>,
+    /// Every recovery audit row at the end of the universe, `<kind>
+    /// <operation_id>`, so a pin can tie a consumed sidecar read to the
+    /// finalization recovery gave that operation. Reading it opens the
+    /// recoveries dataset once after the final audit, harness observation
+    /// rather than engine work; the cost golden names it as `_audit l.list`
+    /// 64 -> 65.
+    pub recovery_audit: Vec<String>,
     /// Sidecar residue at the final audit attributed
     /// to injected lost/misdirected writes — recorded (never silently
     /// excused) and then REQUIRED to heal on one reopen (the
@@ -1135,8 +1146,9 @@ pub struct UniverseReport {
     /// deliberately unasserted (lance-realm compositions are
     /// process-context-sensitive) —
     /// and channel is the observation surface the ruling rested on
-    /// ("query", or "query+bound" when the tie-break consulted the
-    /// bound-edge rows). The per-death RESULT the ledger records for
+    /// ("query", or "query+bound" when the raw Knows rows of the branch
+    /// the op moved were consulted, which can overrule the query
+    /// picture). The per-death RESULT the ledger records for
     /// hits. Deterministic and replay-compared for adapter-realm one-op
     /// rows — an arbitration that flips between same-seed runs is itself
     /// a caught bug; the keep-serving rows carry the lance-realm envelope
@@ -2240,6 +2252,7 @@ struct FailingStorage {
     writes_lost: std::sync::atomic::AtomicUsize,
     writes_misdirected: std::sync::atomic::AtomicUsize,
     persisted_consumed: std::sync::atomic::AtomicUsize,
+    persisted_consumed_reads: Mutex<Vec<String>>,
     /// the staleness clock and memory. `staleness_tick`
     /// advances on every LANDED write-class call (count-landed-only, the
     /// kill enumerator's lesson); `key_history` keeps, per URI, the
@@ -2291,6 +2304,7 @@ impl FailingStorage {
             writes_lost: std::sync::atomic::AtomicUsize::new(0),
             writes_misdirected: std::sync::atomic::AtomicUsize::new(0),
             persisted_consumed: std::sync::atomic::AtomicUsize::new(0),
+            persisted_consumed_reads: Mutex::new(Vec::new()),
             staleness_tick: std::sync::atomic::AtomicU64::new(0),
             key_history: Mutex::new(std::collections::BTreeMap::new()),
             stale_reads_served: std::sync::atomic::AtomicUsize::new(0),
@@ -2376,18 +2390,47 @@ impl FailingStorage {
             .insert(uri.to_string(), verb);
     }
 
+    /// Every consumed read as `<verb> <op> <uri>`, root-normalized so the
+    /// report replay-compares across roots.
+    fn persisted_consumed_reads(&self, root: &str) -> Vec<String> {
+        self.persisted_consumed_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|read| read.replace(root, "<root>"))
+            .collect()
+    }
+
     /// CORRUPTION AXIS (persisted tier) — consumption tracking: a read touching a URI in
     /// the persisted ledger consumed damaged (or injected-absent) state.
     /// Counts regardless of the fault gates — suspension stops CALL-PATH
     /// faults, but stored damage flows through any read. No draws, no
     /// behavior change; zero-knob plans have an empty ledger.
     fn note_persisted_read(&self, op: &str, uri: &str) {
-        let verb = { self.persisted_damage.lock().unwrap().get(uri).copied() };
-        if let Some(verb) = verb {
-            self.persisted_consumed
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            println!("dst s11 damage-consumed: {verb} {op} {uri}");
+        if let Some(verb) = self.consume_persisted(uri) {
+            self.record_consumed_read(verb, op, uri, None);
         }
+    }
+
+    /// The damage verb last injected on `uri`, counted as consumed; `None`
+    /// when the URI carries no persisted damage.
+    fn consume_persisted(&self, uri: &str) -> Option<&'static str> {
+        let verb = { self.persisted_damage.lock().unwrap().get(uri).copied() }?;
+        self.persisted_consumed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(verb)
+    }
+
+    /// One consumed read in the report; `detail` says what the read returned
+    /// when the verb alone cannot (a sidecar's `effect_phase`).
+    fn record_consumed_read(&self, verb: &str, op: &str, uri: &str, detail: Option<&str>) {
+        let mut line = format!("{verb} {op} {uri}");
+        if let Some(detail) = detail {
+            line.push(' ');
+            line.push_str(detail);
+        }
+        println!("dst s11 damage-consumed: {line}");
+        self.persisted_consumed_reads.lock().unwrap().push(line);
     }
 
     // ---------------------------------------- bounded staleness ---------
@@ -2833,6 +2876,17 @@ pub(crate) fn truncate_text(text: &str, pos_roll: u64) -> Option<String> {
     Some(text.chars().take(keep).collect())
 }
 
+/// `phase=<effect_phase>` of a `__recovery/` sidecar body the engine read, the
+/// evidence a pin needs to tell a stale Armed sidecar from a confirmed one.
+fn sidecar_phase(uri: &str, body: Option<&str>) -> Option<String> {
+    if !uri.contains("__recovery/") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body?).ok()?;
+    let phase = value["protocol_v3"]["effect_phase"].as_str()?;
+    Some(format!("phase={phase}"))
+}
+
 #[async_trait::async_trait]
 impl StorageAdapter for FailingStorage {
     async fn read_text(&self, uri: &str) -> OmniResult<String> {
@@ -2854,17 +2908,22 @@ impl StorageAdapter for FailingStorage {
     async fn read_text_if_exists(&self, uri: &str) -> OmniResult<Option<String>> {
         self.read_fault("read_text_if_exists", uri).await?;
         self.latent_fault("read_text_if_exists", uri)?;
-        self.note_persisted_read("read_text_if_exists", uri);
+        let consumed = self.consume_persisted(uri);
         // both polarities are legal lies here — an old value
         // (possibly a zombie) or a stale absence (`None` before the key's
         // creation reached "the replica").
-        if let Some(as_of) = self.roll_stale(self.plan.stale_read_pct)
+        let out = if let Some(as_of) = self.roll_stale(self.plan.stale_read_pct)
             && let Some((state, _)) = self.state_as_of(uri, as_of)
         {
             self.count_stale_read("read_text_if_exists", uri, as_of);
-            return Ok(state.map(|text| self.maybe_corrupt("read_text_if_exists", uri, text)));
+            state
+        } else {
+            self.inner.read_text_if_exists(uri).await?
+        };
+        if let Some(verb) = consumed {
+            let phase = sidecar_phase(uri, out.as_deref());
+            self.record_consumed_read(verb, "read_text_if_exists", uri, phase.as_deref());
         }
-        let out = self.inner.read_text_if_exists(uri).await?;
         Ok(out.map(|text| self.maybe_corrupt("read_text_if_exists", uri, text)))
     }
     async fn read_text_if_exists_bounded(
@@ -3543,15 +3602,21 @@ impl RetryEffect {
         };
         let outcome = judge(after);
         if let Some(before) = before {
-            judge(before);
-            if after.len() < before.len() {
+            let seen = judge(before);
+            let rank = |o: &ReconcileOutcome| match o {
+                ReconcileOutcome::AppliedTwice => 2,
+                ReconcileOutcome::Applied => 1,
+                _ => 0,
+            };
+            let demoted = rank(&outcome) < rank(&seen);
+            if demoted {
                 detectors::violation(
                     DET_CRASH_CONTRACT,
                     at_op,
                     format!(
-                        "{label}: recovery demoted a visible edge insertion: before={before:?}, after={after:?}"
+                        "{label}: recovery changed a visible effect: before={before:?} judged {seen:?}, after={after:?} judged {outcome:?}"
                     ),
-                    "recovery must preserve every visible insertion, including the retry",
+                    "recovery preserves every visible effect, including a landed retry",
                 );
             }
         }
@@ -3627,8 +3692,11 @@ async fn maintenance_obligations(
     // (1) Idempotent convergence.
     let rerun = {
         #[cfg(feature = "failpoints")]
-        let _sensitivity =
-            fail_rerun.then(|| omnigraph::failpoints::ScopedFailPoint::new(rerun_window, "return"));
+        let _sensitivity = fail_rerun.then(|| {
+            omnigraph::seams::catalog::decide(rerun_window)
+                .unwrap_or_else(|| panic!("harness window {rerun_window} names no catalog seam"))
+                .fire_always()
+        });
         #[cfg(not(feature = "failpoints"))]
         let _ = (rerun_window, fail_rerun);
         exec_world_op(db, wop).await
@@ -3695,7 +3763,9 @@ async fn reopen_under_storm(
 ) -> Omnigraph {
     #[cfg(feature = "failpoints")]
     if let Some(rc) = recovery_crash {
-        let _fp = omnigraph::failpoints::ScopedFailPoint::new(rc, "return");
+        let _fp = omnigraph::seams::catalog::decide(rc)
+            .unwrap_or_else(|| panic!("harness window {rc} names no catalog seam"))
+            .fire_always();
         // Best-effort double fault: if the window IS on this crash's recovery
         // path, the first recovery sweep dies here and we prove a SECOND clean reopen
         // still converges (below). If it isn't reached, no double fault
@@ -3781,20 +3851,76 @@ fn insertion_branch<'a>(wop: &'a WorldOp, world: &WorldModel) -> Option<&'a str>
     }
 }
 
+/// Actor the engine signs rollback and legacy-sidecar recovery commits with; an
+/// exact-protocol roll-forward (v3/v4/v7/v8, every sidecar the current writer
+/// emits) publishes the writer's actor, so a writer commit is one NOT signed so.
+const RECOVERY_ACTOR: &str = "omnigraph:recovery";
+
+/// Newest graph commit id on `branch`, `None` when the branch has no readable
+/// history (dead target, damaged store).
+async fn branch_head_commit(db: &Omnigraph, branch: &str) -> Option<String> {
+    db.list_commits(Some(branch))
+        .await
+        .ok()?
+        .first()
+        .map(|commit| commit.graph_commit_id.clone())
+}
+
+async fn branch_heads(
+    db: &Omnigraph,
+    world: &WorldModel,
+    at_op: usize,
+    wop: &WorldOp,
+    failing: Option<&FailingStorage>,
+) -> Vec<(String, String)> {
+    if let Some(f) = failing {
+        f.suspend();
+    }
+    crate::cost::set_label("_heads");
+    let mut heads = Vec::new();
+    for name in world.branch_names() {
+        match branch_head_commit(db, &name).await {
+            Some(head) => heads.push((name, head)),
+            None => detectors::violation(
+                DET_ARBITRATION_PHYSICAL,
+                at_op,
+                format!("live branch '{name}' has no readable commit history before the op"),
+                "every live branch lists at least its fork-point commit",
+            ),
+        }
+    }
+    crate::cost::set_label(&crate::cost::debug_head(wop));
+    if let Some(f) = failing {
+        f.resume();
+    }
+    heads
+}
+
+struct Arbitration<'a> {
+    label: &'a str,
+    at_op: usize,
+    retry: RetryEffect,
+    recovery_crash: Option<&'static str>,
+    heads_before: &'a [(String, String)],
+}
+
 /// Judge the failed op and its optional retry, then reopen and enforce
 /// recovery monotonicity. Unrelated unjudged ops require watch reconciliation.
-#[allow(clippy::too_many_arguments)]
 async fn reconcile_after_failure(
     db: Omnigraph,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
     world: &WorldModel,
-    label: &str,
-    at_op: usize,
-    recovery_crash: Option<&'static str>,
-    retry: RetryEffect,
+    arbitration: Arbitration<'_>,
 ) -> (Omnigraph, ReconcileOutcome, &'static str) {
+    let Arbitration {
+        label,
+        at_op,
+        retry,
+        recovery_crash,
+        heads_before,
+    } = arbitration;
     // Stale-capture rule on [`resolve_keep_serving_watch`]: a ruling can
     // remove the op's target between its sampling and this judgment. A
     // dead-target op has exactly one legal outcome — NotApplied — enforced
@@ -3833,7 +3959,21 @@ async fn reconcile_after_failure(
         );
     }
     let insertion_branch = insertion_branch(wop, world);
-    let visible_edge_rows = if let Some(branch) = insertion_branch {
+    let moved: Vec<String> = world
+        .branch_names()
+        .into_iter()
+        .filter(|name| {
+            with.state_of_opt(name).is_some_and(|with_state| {
+                world.state_of(name).physical_rows() != with_state.physical_rows()
+            })
+        })
+        .collect();
+    let moved = match moved.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => panic!("{label}: one op moves rows on one branch (op={wop:?}, moved={many:?})"),
+    };
+    let visible_edge_rows = if let Some(branch) = &moved {
         Some(Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await)
     } else {
         None
@@ -3885,31 +4025,102 @@ async fn reconcile_after_failure(
     // Which channel the ruling rests on — recorded so the run tables carry
     // observed provenance, never an assumption (canary lesson).
     let mut channel: &'static str = "query";
-    if target_live && (as_model == as_with || insertion_branch.is_some()) {
-        let touched = match wop {
-            WorldOp::Data { branch, .. } => Some(branch),
-            _ => None,
+    if target_live && let Some(branch) = &moved {
+        channel = "query+bound";
+        let expect_world = world.state_of(branch).physical_rows();
+        let expect_with = with.state_of(branch).physical_rows();
+        let knows = Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
+        let expect_twice = if insertion_branch.is_some() && retry != RetryEffect::None {
+            let mut twice = with.clone();
+            apply_world(&mut twice, wop);
+            twice.state_of(branch).physical_rows()
+        } else {
+            expect_with.clone()
         };
-        if let Some(branch) = touched {
-            let expect_world = world.state_of(branch).physical_rows();
-            let expect_with = with.state_of(branch).physical_rows();
-            if expect_world != expect_with {
-                channel = "query+bound";
-                let knows =
-                    Box::pin(knows_rows_bound_target(&db, ReadTarget::branch(branch))).await;
-                let expect_twice = if insertion_branch.is_some() && retry != RetryEffect::None {
-                    let mut twice = with.clone();
-                    apply_world(&mut twice, wop);
-                    twice.state_of(branch).physical_rows()
-                } else {
-                    expect_with.clone()
-                };
-                outcome = retry.reconcile_edges(
-                    visible_edge_rows.as_deref(),
-                    &knows,
-                    [&expect_world, &expect_with, &expect_twice],
-                    label,
+        outcome = retry.reconcile_edges(
+            visible_edge_rows.as_deref(),
+            &knows,
+            [&expect_world, &expect_with, &expect_twice],
+            label,
+            at_op,
+        );
+    }
+    if target_live {
+        for (branch, before) in heads_before {
+            let (Some(world_state), Some(with_state)) =
+                (world.state_of_opt(branch), with.state_of_opt(branch))
+            else {
+                continue;
+            };
+            let predicted = world_state.person_rows() != with_state.person_rows()
+                || world_state.physical_rows() != with_state.physical_rows();
+            let own_target = match wop {
+                WorldOp::Data {
+                    op:
+                        Op::Optimize | Op::Cleanup | Op::EnsureIndices | Op::SchemaAddProperty { .. },
+                    ..
+                } => branch == "main",
+                WorldOp::Data { branch: target, .. } => target == branch,
+                WorldOp::BranchMerge { .. } => branch == "main",
+                _ => false,
+            };
+            if !predicted && own_target {
+                continue;
+            }
+            let commits = match db.list_commits(Some(branch)).await {
+                Ok(commits) => commits,
+                Err(error) => detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
                     at_op,
+                    format!(
+                        "{label}: commit history of '{branch}' unreadable after recovery: {error}"
+                    ),
+                    "a recovered branch lists its commits",
+                ),
+            };
+            let Some(newer) = commits.iter().position(|c| c.graph_commit_id == *before) else {
+                detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
+                    at_op,
+                    format!(
+                        "{label}: recorded head {before} of '{branch}' vanished from its history"
+                    ),
+                    "recovery appends commits, never rewrites history",
+                )
+            };
+            let since: Vec<String> = commits[..newer]
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}@v{} parent={:?} actor={:?}",
+                        c.graph_commit_id, c.graph_manifest_version, c.parent_commit_id, c.actor_id
+                    )
+                })
+                .collect();
+            let writer_commits = commits[..newer]
+                .iter()
+                .filter(|c| c.actor_id.as_deref() != Some(RECOVERY_ACTOR))
+                .count();
+            let retried = retry != RetryEffect::None;
+            let legal = match (predicted, &outcome) {
+                (false, _) | (true, ReconcileOutcome::NotApplied | ReconcileOutcome::ForkOnly) => {
+                    writer_commits == 0
+                }
+                (true, ReconcileOutcome::Applied) => {
+                    writer_commits == 1 || (retried && writer_commits == 2)
+                }
+                (true, ReconcileOutcome::AppliedTwice) => writer_commits == 2,
+            };
+            if !legal {
+                detectors::violation(
+                    DET_ARBITRATION_PHYSICAL,
+                    at_op,
+                    format!(
+                        "{label}: {writer_commits} writer commit(s) on '{branch}' since {before} \
+                         ({since:?}) contradict the arbitration {outcome:?} \
+                         (predicted change={predicted}, retried={retried})"
+                    ),
+                    "an applied attempt lands one writer commit on the branch it changes (two when its retry re-committed idempotently) and none elsewhere",
                 );
             }
         }
@@ -4152,10 +4363,17 @@ async fn crash_op(
     recovery_crash: Option<&'static str>,
     expected_conflict: bool,
     failing: Option<&FailingStorage>,
+    heads_before: &[(String, String)],
 ) -> (Omnigraph, CrashOutcome) {
+    assert!(
+        !heads_before.is_empty(),
+        "a scheduled crash requires pre-op commit heads for arbitration"
+    );
     let mut db = db;
     let result = {
-        let _fp = omnigraph::failpoints::ScopedFailPoint::new(failpoint, "return");
+        let _fp = omnigraph::seams::catalog::decide(failpoint)
+            .unwrap_or_else(|| panic!("harness window {failpoint} names no catalog seam"))
+            .fire_always();
         exec_world_op(&mut db, wop).await
     };
     match result {
@@ -4188,10 +4406,13 @@ async fn crash_op(
         root,
         wop,
         world,
-        &format!("crash window '{failpoint}'"),
-        at_op,
-        recovery_crash,
-        RetryEffect::None,
+        Arbitration {
+            label: &format!("crash window '{failpoint}'"),
+            at_op,
+            retry: RetryEffect::None,
+            recovery_crash,
+            heads_before,
+        },
     ))
     .await;
     if let Some(f) = failing {
@@ -4213,6 +4434,7 @@ async fn crash_op(
     _recovery_crash: Option<&'static str>,
     _expected_conflict: bool,
     _failing: Option<&FailingStorage>,
+    _heads_before: &[(String, String)],
 ) -> (Omnigraph, CrashOutcome) {
     panic!("crash scenarios require --features failpoints");
 }
@@ -4278,7 +4500,9 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
 
         let init_result = {
-            let _fp = omnigraph::failpoints::ScopedFailPoint::new(window, "return");
+            let _fp = omnigraph::seams::catalog::decide(window)
+                .unwrap_or_else(|| panic!("harness window {window} names no catalog seam"))
+                .fire_always();
             Box::pin(Omnigraph::init_with_storage(
                 root,
                 TEST_SCHEMA,
@@ -4420,7 +4644,9 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
         drop(db);
 
         let crashing_open = {
-            let _fp = omnigraph::failpoints::ScopedFailPoint::new(window, "return");
+            let _fp = omnigraph::seams::catalog::decide(window)
+                .unwrap_or_else(|| panic!("harness window {window} names no catalog seam"))
+                .fire_always();
             Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await
         };
         let died = crashing_open.is_err();
@@ -4737,32 +4963,10 @@ async fn reconcile_watch_resolution(
         );
     }
     assert_no_recovery_residue(&storage, root, label, at_op).await;
-    // Ambiguity: several compositions can render identically while their
-    // MODELS differ in ghost content or row count. Resolve through the bound-edge rows
-    // per touched branch; a raw read matching NO tied composition is its
-    // own violation. Runs BEFORE the monotonicity checks so they judge the
-    // narrowed set — quantifying over pre-narrowing ties could let the
-    // tie-break eliminate the only Applied match after a demotion check
-    // already passed, installing a demoted model with no red. Scope:
-    // `touched` covers the `Data` branches of A and E only — a ghost
-    // divergence born inside a `LoadFork`'s fork copy or a `BranchMerge`'s
-    // ghost import falls to preference order. Acceptable while ghosts are
-    // empty by construction (post-#474; the ghost set is a regression
-    // tripwire), and inherited from [`reconcile_after_failure`]'s identical
-    // Data-only tie-break scope. Ties whose models are ghost-identical fall
-    // to preference order — the models being equal, the pick is immaterial.
     let mut channel: &'static str = "query";
     if after_matches.len() > 1 {
-        let mut touched: Vec<&String> = Vec::new();
-        if let WorldOp::Data { branch, .. } = deferred {
-            touched.push(branch);
-        }
-        if let Some(i) = interrupt
-            && let WorldOp::Data { branch, .. } = i.wop
-        {
-            touched.push(branch);
-        }
-        for branch in touched {
+        let touched = hyps[after_matches[0]].world.branch_names();
+        for branch in &touched {
             // The raw expectation per tied composition: rows ∪ ghosts on
             // the touched branch (None = branch absent in that model —
             // uniform across ties, since the shared render lists branches).
@@ -4776,7 +4980,7 @@ async fn reconcile_watch_resolution(
                 })
                 .collect();
             let first = &expectations[0];
-            if first.is_none() || expectations.iter().all(|e| e == first) {
+            if expectations.iter().all(|e| e == first) {
                 continue;
             }
             channel = "query+bound";
@@ -4993,13 +5197,44 @@ struct RustEnvironment {
     die_at_write: Option<usize>,
 }
 
-#[derive(Debug)]
 struct RustResources {
     memory: MemoryStorage,
     storage: Arc<dyn StorageAdapter>,
     failing: Option<Arc<FailingStorage>>,
     lance_faults_state: Option<Arc<crate::lance_faults::LanceFaultState>>,
     kill_state: Option<Arc<KillState>>,
+    /// Holds the storage seam for the universe's lifetime: every handle the
+    /// engine opens (init, reopen, read-only bystander) is decorated with the
+    /// same `FailingStorage` the universe built.
+    _storage_seam: Option<
+        omnigraph::seams::Installed<
+            dyn omnigraph::storage::DecorateStorage,
+            omnigraph::seams::Global<dyn omnigraph::storage::DecorateStorage>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for RustResources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustResources")
+            .field("memory", &self.memory)
+            .field("failing", &self.failing)
+            .field("lance_faults_state", &self.lance_faults_state)
+            .field("kill_state", &self.kill_state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The storage-seam behavior: hands back the universe's one `FailingStorage`,
+/// ignoring the base adapter the engine offers (the instance already wraps it).
+struct FailingStorageDecorator(Arc<FailingStorage>);
+
+impl omnigraph::seams::Behavior for FailingStorageDecorator {}
+
+impl omnigraph::storage::DecorateStorage for FailingStorageDecorator {
+    fn wrap(&self, _base: Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter> {
+        self.0.clone()
+    }
 }
 
 impl UniverseEnvironment for RustEnvironment {
@@ -5050,6 +5285,9 @@ impl UniverseEnvironment for RustEnvironment {
             Some(f) => f.clone(),
             None => base,
         };
+        let _storage_seam = failing.as_ref().map(|f| {
+            omnigraph::storage::STORAGE.install(Arc::new(FailingStorageDecorator(f.clone())))
+        });
 
         Ok(RustResources {
             memory,
@@ -5057,6 +5295,7 @@ impl UniverseEnvironment for RustEnvironment {
             failing,
             lance_faults_state,
             kill_state,
+            _storage_seam,
         })
     }
 
@@ -5223,9 +5462,9 @@ impl UniverseScenario<RustResources> for Scenario {
         #[cfg(feature = "failpoints")]
         let _persistent_probe = sc.probe_window.map(|w| {
             let flag = crossed_flag.clone();
-            omnigraph::failpoints::ScopedFailPoint::with_callback(w, move || {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst)
-            })
+            omnigraph::seams::catalog::decide(w)
+                .unwrap_or_else(|| panic!("harness window {w} names no catalog seam"))
+                .observe(move || flag.store(true, std::sync::atomic::Ordering::SeqCst))
         });
 
         for i in 0..sc.ops {
@@ -5320,6 +5559,11 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                 }
             }
+            let mut heads_before = if failing.is_some() || (crash_now.is_some() && !sc.probe_only) {
+                branch_heads(&db, &world, i, &wop, failing.as_deref()).await
+            } else {
+                Vec::new()
+            };
             if let Some(failpoint) = crash_now.filter(|_| !sc.probe_only) {
                 // A scheduled crash ends any keep-serving experiment first —
                 // deferral contract on [`resolve_keep_serving_watch`]. No
@@ -5341,6 +5585,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     ))
                     .await;
                     db = new_db;
+                    heads_before = branch_heads(&db, &world, i, &wop, failing.as_deref()).await;
                     // Stale-capture rule on [`resolve_keep_serving_watch`]:
                     // re-derive the prediction from the world crash_op will
                     // actually judge against.
@@ -5357,6 +5602,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     sc.recovery_crash,
                     expected_conflict,
                     failing.as_deref(),
+                    &heads_before,
                 ))
                 .await;
                 db = new_db;
@@ -5432,10 +5678,15 @@ impl UniverseScenario<RustResources> for Scenario {
                 let _probe_guard = match crash_now {
                     Some(failpoint) if sc.probe_only => {
                         let flag = crossed_flag.clone();
-                        Some(omnigraph::failpoints::ScopedFailPoint::with_callback(
-                            failpoint,
-                            move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
-                        ))
+                        Some(
+                            omnigraph::seams::catalog::decide(failpoint)
+                                .unwrap_or_else(|| {
+                                    panic!("harness window {failpoint} names no catalog seam")
+                                })
+                                .observe(move || {
+                                    flag.store(true, std::sync::atomic::Ordering::SeqCst)
+                                }),
+                        )
                     }
                     _ => None,
                 };
@@ -5515,10 +5766,13 @@ impl UniverseScenario<RustResources> for Scenario {
                         root,
                         &wop,
                         &world,
-                        "crash-state death",
-                        i,
-                        None,
-                        RetryEffect::None,
+                        Arbitration {
+                            label: "crash-state death",
+                            at_op: i,
+                            retry: RetryEffect::None,
+                            recovery_crash: None,
+                            heads_before: &heads_before,
+                        },
                     ))
                     .await;
                     db = new_db;
@@ -5762,6 +6016,7 @@ impl UniverseScenario<RustResources> for Scenario {
                             db = new_db;
                             interrupt_judged = ruling;
                             watch_resolved = true;
+                            heads_before.clear();
                         }
                         // Stale-capture rule on
                         // [`resolve_keep_serving_watch`]: re-derive the
@@ -5923,10 +6178,13 @@ impl UniverseScenario<RustResources> for Scenario {
                                     root,
                                     &wop,
                                     &world,
-                                    "injected-fault failure",
-                                    i,
-                                    None,
-                                    retry_effect,
+                                    Arbitration {
+                                        label: "injected-fault failure",
+                                        at_op: i,
+                                        retry: retry_effect,
+                                        recovery_crash: None,
+                                        heads_before: &heads_before,
+                                    },
                                 ))
                                 .await;
                                 db = new_db;
@@ -6311,8 +6569,8 @@ impl UniverseScenario<RustResources> for Scenario {
             }
         }
 
-        omnigraph::dst_clock::uninstall_logical_clock();
-        omnigraph::dst_ids::uninstall_seeded_ulids();
+        omnigraph::dst_clock::CLOCK.clear();
+        omnigraph::dst_ids::IDS.clear();
         crate::lance_faults::set_active(None);
         crate::lance_faults::set_kill(None);
         // WRITE CENSUS bottom listings: with weather and kill cleared,
@@ -6350,6 +6608,13 @@ impl UniverseScenario<RustResources> for Scenario {
             .as_ref()
             .map(|f| f.persisted_consumed())
             .unwrap_or(0);
+        let persisted_consumed_reads = failing
+            .as_ref()
+            .map(|f| f.persisted_consumed_reads(root))
+            .unwrap_or_default();
+        let recovery_audit = omnigraph::db::dst_recovery_audit_rows(root)
+            .await
+            .expect("the recovery audit dataset reads back at the end of a universe");
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
         // Persisted tier: drain the foreign-sidecar carve-out rows into the
@@ -6385,6 +6650,8 @@ impl UniverseScenario<RustResources> for Scenario {
             writes_lost,
             writes_misdirected,
             persisted_consumed,
+            persisted_consumed_reads,
+            recovery_audit,
             attributed_residue,
             reconcile_verdicts,
             known_issues,

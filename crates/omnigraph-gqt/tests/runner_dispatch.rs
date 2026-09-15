@@ -5,10 +5,10 @@ use std::process::Command;
 fn refuses_unknown_or_unobserved_faults() {
     let expected = if cfg!(tokio_unstable) {
         [
-            "unsupported DST failpoint",
-            "configured faults were not observed",
-            "configured faults were not observed",
-            "configured faults were not observed",
+            "unknown seam",
+            "was not crossed on occurrence",
+            "was not crossed on occurrence",
+            "was not crossed on occurrence",
         ]
     } else {
         [
@@ -286,6 +286,57 @@ fn replay_uses_frozen_case_and_rejects_changed_evidence() {
 
 #[cfg(tokio_unstable)]
 #[test]
+fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text =
+        std::fs::read_to_string(root.join("cases/issue_602_stale_sidecar_heals_on_reopen.gqt"))
+            .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("issue_602_two_seams.gqt");
+    std::fs::write(&path, &text).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    let delivered = summary["attempts"][0]["outcome"]["Ok"]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "seam_delivered")
+        .map(|event| event["value"]["at"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered,
+        vec![
+            "mutation.sidecar_confirm_put",
+            "mutation.sidecar_post_publish_delete"
+        ],
+        "one delivery record per seam, in declaration order"
+    );
+
+    let confirm_block = "--- seam\nat: mutation.sidecar_confirm_put\noccurrence: 1\naction: skip\nscope: next_step\n";
+    let repeated = text.replace(confirm_block, &format!("{confirm_block}\n{confirm_block}"));
+    assert_ne!(
+        repeated, text,
+        "the confirm seam block must be found verbatim"
+    );
+    std::fs::write(&path, repeated).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is declared twice before one step"));
+}
+
+#[cfg(tokio_unstable)]
+#[test]
 fn occurrence_is_counted_inside_the_selected_operation() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(root.join("cases/dst_fault_on_second_merge.gqt")).unwrap();
@@ -297,7 +348,7 @@ fn occurrence_is_counted_inside_the_selected_operation() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("fault_unobserved"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("seam_unobserved"));
     let (_, summary) = report(&output);
     assert_eq!(
         summary["attempts"].as_array().unwrap().len(),
@@ -447,7 +498,7 @@ fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass
         ),
         (
             selected.replace("occurrence: 1", "occurrence: 2"),
-            "fault_unobserved",
+            "seam_unobserved",
         ),
         (
             selected.replace("step: 4", "step: 5").replace(

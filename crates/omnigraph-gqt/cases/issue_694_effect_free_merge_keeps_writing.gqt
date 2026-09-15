@@ -54,10 +54,10 @@ query add_source_row() {
 
 --- expect affected: nodes=1 edges=0
 
---- fault
+--- seam
 at: branch_merge.post_sidecar_pre_fork
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 
 --- mutate

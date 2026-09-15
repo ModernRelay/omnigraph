@@ -10,7 +10,9 @@ const CASE: &str = include_str!(concat!(
 fn fixture() -> (Case, WorkerReport) {
     let case = crate::parse_case("dst_mutation_failure_keeps_writing", CASE).unwrap();
     let marker = case.known_failure.as_ref().unwrap();
-    let ErrorMatch::RecoveryRequired { reason } = &marker.matcher;
+    let ErrorMatch::RecoveryRequired { reason } = &marker.matcher else {
+        unreachable!("the fixture case names a RecoveryRequired marker")
+    };
     let error = OmniError::RecoveryRequired {
         operation_id: "operation-17".into(),
         reason: reason.clone(),
@@ -19,8 +21,8 @@ fn fixture() -> (Case, WorkerReport) {
     let mut evidence = Vec::new();
     for ordinal in 1..=marker.step {
         let operation = json!({"ordinal": ordinal, "loop_binding": null});
-        if let Some(fault) = case.faults.get(&ordinal) {
-            evidence.push(json!({"kind": "fault_delivered", "operation": operation, "value": {"hook": fault.at}}));
+        for seam in case.seams.get(&ordinal).into_iter().flatten() {
+            evidence.push(json!({"kind": "seam_delivered", "operation": operation, "value": {"at": seam.at, "occurrence": seam.occurrence}}));
         }
         if ordinal == marker.step {
             evidence.push(json!({"kind": "typed_error", "operation": operation, "value": {"error": "RecoveryRequired", "reason": reason, "operation_id": "operation-17", "message": error.to_string()}}));
@@ -63,7 +65,7 @@ fn refuses_different_reasons_steps_faults_and_incomplete_assertions() {
                 .retain(|event| event["kind"] != "typed_error"),
             1 => report
                 .evidence
-                .retain(|event| event["kind"] != "fault_delivered"),
+                .retain(|event| event["kind"] != "seam_delivered"),
             2 => {
                 let error = report
                     .evidence
@@ -92,16 +94,16 @@ fn refuses_different_reasons_steps_faults_and_incomplete_assertions() {
                 let fault = report
                     .evidence
                     .iter_mut()
-                    .find(|e| e["kind"] == "fault_delivered")
+                    .find(|e| e["kind"] == "seam_delivered")
                     .unwrap();
-                fault["value"]["hook"] = "another.hook".into();
+                fault["value"]["at"] = "another.seam".into();
             }
             6 => report.result = Err("step 4 (mutate): affected counts mismatch".into()),
             7 => {
                 let fault = report
                     .evidence
                     .iter()
-                    .find(|e| e["kind"] == "fault_delivered")
+                    .find(|e| e["kind"] == "seam_delivered")
                     .unwrap()
                     .clone();
                 report.evidence.push(fault);
@@ -139,7 +141,7 @@ fn never_waives_harness_errors_or_an_unexpected_pass() {
         "timeout",
         "fault_cleanup_failed",
         "report_failed",
-        "fault_unobserved",
+        "seam_unobserved",
     ] {
         let (case, mut report) = fixture();
         report.code = code.into();
@@ -183,7 +185,7 @@ fn marker_is_closed_and_cannot_replace_healthy_expectations() {
         CASE.replace("error: RecoveryRequired", "error: RecoveryRequired\n  unknown: value"),
         CASE.replace("--- known_failure", "--- known_failure\nnotes: \"\""),
         CASE.replace("--- expect affected: nodes=1 edges=0", "--- expect error: recovery required"),
-        CASE.replace("--- fault\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: return_error\nscope: next_step\n", ""),
+        CASE.replace("--- seam\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: fail\nscope: next_step\n", ""),
         CASE.replace("target: omnigraph-engine-dst", "target: omnigraph-engine"),
     ] {
         assert!(crate::parse_case("dst_mutation_failure_keeps_writing", &text).is_err(), "accepted {text}");

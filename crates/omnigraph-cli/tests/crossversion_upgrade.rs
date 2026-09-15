@@ -1522,11 +1522,16 @@ query vectors($q: Vector(4)) {
         before,
         "--check and refused open must leave every source byte unchanged"
     );
-    let upgraded =
-        support::parse_stdout_json(&output_success(cli().args(["upgrade", uri, "--json"])));
+    let upgraded = support::parse_stdout_json(&output_success(cli().args([
+        "upgrade",
+        uri,
+        "--to-format",
+        "8",
+        "--json",
+    ])));
     assert_eq!(upgraded["outcome"], "completed");
     assert_eq!(upgraded["target_format"], 8);
-    assert_eq!(upgraded["target_defaulted"], true);
+    assert_eq!(upgraded["target_defaulted"], false);
     assert_eq!(upgraded["completed_handlers"].as_array().unwrap().len(), 2);
     assert_eq!(upgraded["work"]["payload_bytes_copied"], 0);
     assert_eq!(upgraded["work"]["payload_bytes_rewritten"], 0);
@@ -1553,13 +1558,34 @@ query vectors($q: Vector(4)) {
     );
     for check_mode in [false, true] {
         let mut command = cli();
-        command.args(["upgrade", uri, "--json"]);
+        command.args(["upgrade", uri, "--to-format", "8", "--json"]);
         if check_mode {
             command.arg("--check");
         }
         let report = support::parse_stdout_json(&output_success(&mut command));
         assert_eq!(report["outcome"], "already_current");
         assert_eq!(graph_files(&graph), after, "rerun must be effect-free");
+        let mut default_route = cli();
+        default_route.args(["upgrade", uri, "--json"]);
+        if check_mode {
+            default_route.arg("--check");
+        }
+        let refused = support::parse_stdout_json(&output_failure(&mut default_route));
+        assert_eq!(refused["target_format"], 9);
+        assert_eq!(refused["target_defaulted"], true);
+        assert!(
+            refused["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["code"] == "system_columns_preflight"),
+            "the default route ends at v9 and refuses a graph with branches: {refused}"
+        );
+        assert_eq!(
+            graph_files(&graph),
+            after,
+            "the refused v9 route must be effect-free"
+        );
         let mut downgrade = cli();
         downgrade.args(["upgrade", uri, "--to-format", "7", "--json"]);
         if check_mode {
@@ -1890,18 +1916,33 @@ fn genuine_v09_storage_upgrade_refuses_ambiguous_branch_names() {
             &run_old(&old, &["branch", "create", name, "--uri", uri]),
         );
         let before = graph_files(&graph);
-        for check in [true, false] {
+        for (check, target) in [
+            (true, None),
+            (false, None),
+            (true, Some("8")),
+            (false, Some("8")),
+        ] {
             let mut command = cli();
             command.args(["upgrade", uri, "--json"]);
             if check {
                 command.arg("--check");
             }
+            if let Some(format) = target {
+                command.args(["--to-format", format]);
+            }
             let report = support::parse_stdout_json(&output_failure(&mut command));
-            assert_eq!(report["outcome"], "check_failed");
-            assert!(
-                report["findings"].to_string().contains("branch identity"),
-                "{report}"
-            );
+            assert_eq!(report["outcome"], "check_failed", "{report}");
+            let findings = report["findings"].to_string();
+            match target {
+                Some(_) => assert!(
+                    findings.contains("branch identity"),
+                    "the v7 -> v8 step refuses the ambiguous lifetime: {report}"
+                ),
+                None => assert!(
+                    findings.contains("system_columns_preflight") && findings.contains("only main"),
+                    "the default route refuses every non-main branch before its first effect: {report}"
+                ),
+            }
             assert_eq!(graph_files(&graph), before);
             assert_ok(
                 "legacy source still opens",

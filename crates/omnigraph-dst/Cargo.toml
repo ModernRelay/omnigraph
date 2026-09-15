@@ -5,17 +5,17 @@
 # --cfg tokio_unstable): cd crates/omnigraph-dst && cargo test.
 [package]
 name = "omnigraph-dst"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 publish = false
 
 [features]
 default = ["failpoints"]
-failpoints = ["omnigraph-engine/failpoints", "dep:fail-parallel"]
+failpoints = ["omnigraph-engine/failpoints"]
 
 [dependencies]
-omnigraph-engine = { path = "../omnigraph", version = "0.10.0", features = ["dst"] }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.10.0" }
+omnigraph-engine = { path = "../omnigraph", version = "0.11.0", features = ["dst"] }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
 arrow-array = { workspace = true }
 lance-core = { workspace = true }
 lance-io = { workspace = true }
@@ -30,7 +30,6 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-fail-parallel = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

@@ -38,7 +38,7 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0066**; lower gaps are historical and must
+The next available number is **0067**; lower gaps are historical and must
 not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0058 by
 PR #662 for retained merged ancestry; 0059 by PR #675; 0060 by PR #677).
@@ -169,7 +169,7 @@ This table is the human index for the canonical RFC corpus.
 | [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | accepted | in-progress |
 | [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
 | [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
-| [0040](0040-system-column-namespace.md) | System column namespace | public | draft | in-progress |
+| [0040](0040-system-column-namespace.md) | System column namespace | public | accepted | in-progress |
 | [0041](0041-inline-stored-queries.md) | Inline and stored queries | maintainer | accepted | partial |
 | [0042](0042-incarnation-suffixed-branch-refs.md) | Incarnation-suffixed native branch refs | maintainer | accepted | complete |
 | [0043](0043-full-text-index-compatibility.md) | Full-text index compatibility and explicit rebuild | maintainer | accepted | complete |
@@ -187,5 +187,6 @@ This table is the human index for the canonical RFC corpus.
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
-| [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | draft | in-progress |
+| [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | accepted | in-progress |
 | [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |
+| [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |

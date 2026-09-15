@@ -348,7 +348,7 @@ async fn plan_intervals(
     // (defense-in-depth; unavailable on an e_tag-less store) and the logical
     // post-open `reprove_named_branch_heads` below (load-bearing on every
     // store). Tests park here to exercise the window.
-    crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_PRE_TABLE_OPEN)?;
+    crate::seams::fail(&crate::seams::catalog::CHANGE_FEED_PRE_TABLE_OPEN)?;
 
     let mut plans = Vec::with_capacity(intervals.len());
     for interval in intervals {
@@ -422,7 +422,7 @@ async fn plan_intervals(
     // UUID-named data and transaction files), so a later live read would see a
     // recreated branch's history under this commit's label. Tests park here
     // and recreate the branch to pin that contract.
-    crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_HEAD_WITNESS)?;
+    crate::seams::fail(&crate::seams::catalog::CHANGE_FEED_POST_HEAD_WITNESS)?;
     // The opaque ids are domain-scoped SHA-256 projections of distinct
     // immutable identities, so this order is total and deterministic.
     plans.sort_by(|left, right| {

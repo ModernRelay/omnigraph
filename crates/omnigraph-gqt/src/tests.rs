@@ -1723,7 +1723,7 @@ fn runner_is_required_and_cannot_be_repeated() {
 
 #[test]
 fn fault_limits_and_loop_scope_are_enforced() {
-    let fault = "--- fault\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: return_error\nscope: next_step\n";
+    let fault = "--- seam\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: fail\nscope: next_step\n";
     let operation = "--- mutate\nquery add() { insert Person { name: \"bob\" } }\n--- expect error: injected failpoint\n";
     let prefix = format!("{HDR}{SCHEMA}{SEED}");
     assert!(

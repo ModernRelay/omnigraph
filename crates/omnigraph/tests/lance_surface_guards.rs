@@ -86,6 +86,109 @@ fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
     }
 }
 
+/// Guard: a rename-only `Operation::Project` (the RFC 0040 system-column
+/// upgrade's per-table effect) keeps every fragment file, field id, the
+/// unenforced primary-key marker, and the index on the renamed field.
+#[tokio::test]
+async fn rename_only_project_keeps_fragments_field_ids_pk_marker_and_indexes() {
+    use lance::dataset::transaction::{Operation, Transaction};
+    use lance::dataset::{CommitBuilder, WriteMode, WriteParams};
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(metadata),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let before_fragments = dataset.get_fragments().len();
+    let before_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .flat_map(|fragment| fragment.metadata().files.iter().map(|f| f.path.clone()))
+        .collect();
+    let id_field = dataset.schema().field("id").unwrap().id;
+
+    let mut renamed = dataset.schema().clone();
+    renamed.mut_field_by_id(id_field).unwrap().name = "__id".to_string();
+    renamed.validate().unwrap();
+    let transaction = Transaction::new(
+        dataset.version().version,
+        Operation::Project {
+            schema: renamed,
+            preserves_nullability: true,
+        },
+        None,
+    );
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .with_max_retries(0)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await
+        .unwrap();
+
+    assert!(dataset.schema().field("id").is_none());
+    assert_eq!(dataset.schema().field("__id").unwrap().id, id_field);
+    assert_eq!(
+        dataset
+            .schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["__id"]
+    );
+    assert_eq!(dataset.get_fragments().len(), before_fragments);
+    let after_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .flat_map(|fragment| fragment.metadata().files.iter().map(|f| f.path.clone()))
+        .collect();
+    assert_eq!(
+        after_files, before_files,
+        "a rename-only Project writes no data file"
+    );
+    let indices = dataset.load_indices().await.unwrap();
+    assert!(
+        indices.iter().any(|index| index.fields.contains(&id_field)),
+        "the scalar index follows the field id across the rename"
+    );
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+}
+
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
 async fn fresh_dataset(uri: &str) -> Dataset {
@@ -4320,5 +4423,78 @@ async fn fts_prefilter_does_not_change_covered_fragment_scores() {
             .any(|id| subset_scores[*id].to_bits() != unfiltered[*id].to_bits()),
         "every eligible doc scored identically against subset-only statistics — \
          the fixture cannot detect filter-dependent scoring and this guard is vacuous"
+    );
+}
+
+/// A branch ref read racing `replace_metadata` on the same ref must succeed:
+/// the ref is never deleted, so any error is a torn read (Lance 11.0.0 read refs
+/// as `head` then `get_range`, and a rewrite between the two calls yields a prefix).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "lance-one-get-ref-read: needs a Lance whose `from_path` reads a ref in one `get` \
+            (the 0179 Lance PR); red on 11.0.0, which reads `head` then `get_range`. Un-ignore \
+            at that bump, where the `branch_control` stale-head tests go red and the retry arm leaves"]
+async fn branch_ref_read_survives_concurrent_metadata_rewrite() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let uri = format!("memory:///guard-ref-rewrite-{unique}.lance");
+    let mut ds = fresh_dataset(&uri).await;
+    let base = ds.version().version;
+    ds.create_branch("feature", base, None).await.unwrap();
+    let ds = Arc::new(ds);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let writer = {
+        let ds = ds.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            for round in 0..20_000usize {
+                let metadata: HashMap<String, String> = [(
+                    "omnigraph.retired_manifest_branch".to_string(),
+                    "x".repeat(round % 97),
+                )]
+                .into_iter()
+                .collect();
+                ds.branches()
+                    .replace_metadata("feature", metadata)
+                    .await
+                    .unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let ds = ds.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut reads = 0usize;
+                let mut failures = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    reads += 1;
+                    if let Err(error) = ds.branches().get("feature").await {
+                        failures.push(error.to_string());
+                    }
+                }
+                (reads, failures)
+            })
+        })
+        .collect();
+    writer.await.unwrap();
+    let mut total_reads = 0usize;
+    let mut failures = Vec::new();
+    for reader in readers {
+        let (reads, mut errors) = reader.await.unwrap();
+        total_reads += reads;
+        failures.append(&mut errors);
+    }
+    assert!(total_reads > 100, "readers barely ran: {total_reads} reads");
+    assert!(
+        failures.is_empty(),
+        "{} of {total_reads} branch ref reads failed under a concurrent metadata rewrite \
+         (the ref is never deleted, so every error is a failure); first: {}",
+        failures.len(),
+        failures[0]
     );
 }

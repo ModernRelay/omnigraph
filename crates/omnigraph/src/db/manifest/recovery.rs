@@ -779,6 +779,14 @@ pub(crate) enum RecoverySchemaApplyEffectKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confirmed_transaction: Option<StagedTransactionIdentity>,
     },
+    /// A rename-only `Operation::Project` on an existing table (RFC 0040
+    /// system-column upgrade). Idempotent per table and never compensated:
+    /// recovery completes it or verifies it is complete.
+    SystemColumnRename {
+        planned_transaction: StagedTransactionIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_transaction: Option<StagedTransactionIdentity>,
+    },
 }
 
 impl RecoverySchemaApplyEffectKind {
@@ -789,6 +797,10 @@ impl RecoverySchemaApplyEffectKind {
                 ..
             }
             | Self::FirstTouchDataset {
+                planned_transaction,
+                ..
+            }
+            | Self::SystemColumnRename {
                 planned_transaction,
                 ..
             } => planned_transaction,
@@ -804,6 +816,10 @@ impl RecoverySchemaApplyEffectKind {
             | Self::FirstTouchDataset {
                 confirmed_transaction,
                 ..
+            }
+            | Self::SystemColumnRename {
+                confirmed_transaction,
+                ..
             } => confirmed_transaction.as_ref(),
         }
     }
@@ -817,6 +833,10 @@ impl RecoverySchemaApplyEffectKind {
             | Self::FirstTouchDataset {
                 confirmed_transaction,
                 ..
+            }
+            | Self::SystemColumnRename {
+                confirmed_transaction,
+                ..
             } => *confirmed_transaction = Some(transaction),
         }
     }
@@ -824,6 +844,22 @@ impl RecoverySchemaApplyEffectKind {
     fn is_first_touch(&self) -> bool {
         matches!(self, Self::FirstTouchDataset { .. })
     }
+
+    fn is_system_column_rename(&self) -> bool {
+        matches!(self, Self::SystemColumnRename { .. })
+    }
+}
+
+/// RFC 0040 system-column upgrade marker on a SchemaApply intent: every
+/// effect is a rename-only table commit and the only recovery outcome is
+/// roll-forward. The stamp advance is re-checked from the live `__manifest`;
+/// the recorded post-stamp version is a floor that manifest must have reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoverySystemColumnUpgrade {
+    pub from_stamp: u32,
+    pub to_stamp: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version_after_stamp: Option<u64>,
 }
 
 /// Schema-v7 exact recovery payload. The accepted/old schema identity lives in
@@ -840,6 +876,8 @@ pub(crate) struct RecoveryProtocolV7 {
     pub effect_phase: RecoveryEffectPhase,
     pub effects: Vec<RecoverySchemaApplyEffect>,
     pub intended_delta: RecoveryManifestDelta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_column_upgrade: Option<RecoverySystemColumnUpgrade>,
 }
 
 /// One exact per-table index reconciliation effect. `source_fork_version` is
@@ -1097,7 +1135,7 @@ pub(crate) async fn write_sidecar(
 ) -> Result<RecoverySidecarHandle> {
     // Failpoint: models a storage put failure (S3 PutObject / fs write)
     // in Phase A — every writer must abort before any HEAD advance.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_WRITE)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_WRITE)?;
     debug_assert!(sidecar.schema_version <= SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
@@ -1141,7 +1179,7 @@ pub(crate) async fn confirm_sidecar_phase_b_v9(
 ) -> Result<()> {
     // Failpoint: models a storage failure on the confirmation write — the
     // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     for pin in &mut sidecar.tables {
         // Every pinned table MUST have an achieved version. A miss means the
         // pin set and the publish `updates` diverged — fail loudly at the
@@ -1165,6 +1203,19 @@ pub(crate) async fn confirm_sidecar_phase_b_v9(
     storage.write_text(&uri, &json).await
 }
 
+/// Stage H: delete the sidecar once the `__manifest` commit is visible. The
+/// `MUTATION_SIDECAR_POST_PUBLISH_DELETE` seam models the delete being lost
+/// (acknowledged, effect absent); a failed delete is the caller's to swallow.
+pub(crate) async fn delete_sidecar_after_publish(
+    handle: &RecoverySidecarHandle,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
+    if crate::seams::skip(&crate::seams::catalog::MUTATION_SIDECAR_POST_PUBLISH_DELETE) {
+        return Ok(());
+    }
+    delete_sidecar(handle, storage).await
+}
+
 /// Delete a sidecar after Phase C succeeded. Idempotent (safe to retry).
 pub(crate) async fn delete_sidecar(
     handle: &RecoverySidecarHandle,
@@ -1173,7 +1224,7 @@ pub(crate) async fn delete_sidecar(
     // Failpoint: models a storage delete failure (S3 DeleteObject) in
     // Phase D — callers swallow it (the write already published) and the
     // stale sidecar is healed by the next write or open.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_DELETE)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_DELETE)?;
     storage.delete(&handle.sidecar_uri).await
 }
 
@@ -1191,7 +1242,7 @@ pub(crate) async fn list_sidecars(
     // Failpoint: models a storage list failure (S3 ListObjectsV2) — every
     // consumer (open-time sweep, write-entry heal) must fail loudly
     // rather than silently skipping recovery.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_LIST)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_LIST)?;
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
     // Sort by URI so the sweep processes sidecars deterministically.
@@ -1210,9 +1261,7 @@ pub(crate) async fn list_sidecars(
             continue;
         }
         if before_first_json_read {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ)?;
             before_first_json_read = false;
         }
         let Some(body) = storage.read_text_if_exists(&uri).await? else {
@@ -1247,9 +1296,7 @@ async fn list_parseable_sidecars_for_read_only(
             continue;
         }
         if before_first_json_read {
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ)?;
             before_first_json_read = false;
         }
         let Some(body) = storage.read_text_if_exists(&uri).await? else {
@@ -2240,6 +2287,37 @@ fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) 
                 .to_string(),
         ));
     }
+    let rename_effects = protocol
+        .effects
+        .iter()
+        .filter(|effect| effect.kind.is_system_column_rename())
+        .count();
+    match protocol.system_column_upgrade.as_ref() {
+        Some(upgrade) => {
+            if rename_effects != protocol.effects.len()
+                || !protocol.intended_delta.registrations.is_empty()
+                || !protocol.intended_delta.renames.is_empty()
+                || !protocol.intended_delta.tombstones.is_empty()
+                || (upgrade.from_stamp, upgrade.to_stamp)
+                    != (
+                        super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+                    )
+            {
+                return Err(malformed(format!(
+                    "a system-column upgrade intent carries rename-only effects, no registration, rename, or tombstone, and the served stamp pair v{} to v{}",
+                    super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                    super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+                )));
+            }
+        }
+        None if rename_effects != 0 => {
+            return Err(malformed(
+                "rename-only effects require a system-column upgrade intent".to_string(),
+            ));
+        }
+        None => {}
+    }
 
     let registration_ids: HashSet<TableIdentity> = protocol
         .intended_delta
@@ -3154,7 +3232,7 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
             unresolved: Vec::new(),
         });
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_LIST_PRE_GATES)?;
     let mut processed_any = false;
     let mut unresolved = Vec::new();
     for sidecar in sidecars {
@@ -3324,9 +3402,7 @@ async fn discard_orphaned_branch_sidecar(
             .await?;
         // Failpoint: the residual window above — commit published, audit
         // not yet durable.
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id: intent.graph_commit_id,
@@ -3393,7 +3469,7 @@ pub(crate) async fn recover_manifest_drift(
     if sidecars.is_empty() {
         return Ok(());
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_LIST_PRE_GATES)?;
 
     // For each sidecar, classify against a FRESH snapshot AT THE
     // SIDECAR'S BRANCH. Two reasons:
@@ -4179,9 +4255,7 @@ async fn process_sidecar(
             // pin) and the publish CAS below, a concurrent live writer can
             // advance the manifest past our expected version. The failpoint
             // lets a test force that interleave deterministically.
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
             // RFC-013 Phase 7: `roll_forward_all` folds the recovery commit into the
             // manifest publish CAS, so it also returns the minted `graph_commit_id`
             // for the audit row below.
@@ -4307,8 +4381,7 @@ async fn observe_branch_merge_target_ref(
         .as_deref()
         .filter(|branch| *branch != "main")
     else {
-        let branch_identifier = dataset
-            .branch_identifier()
+        let branch_identifier = crate::branch_control::dataset_branch_identifier(&dataset)
             .await
             .map_err(OmniError::storage)?;
         let version = dataset.version().version;
@@ -4822,9 +4895,7 @@ async fn roll_back_ensure_indices_v8(
                 state.manifest_pinned,
             )
             .await?;
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH)?;
         }
         push_table_update(
             root_uri,
@@ -4850,9 +4921,7 @@ async fn roll_back_ensure_indices_v8(
         &expected,
     )
     .await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT)?;
     record_audit(
         root_uri,
         &prepared,
@@ -4908,7 +4977,7 @@ async fn roll_forward_ensure_indices_v8(
             to_version: confirmed.table_version,
         });
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
     let graph_commit_id = match publish_recovery_commit(
         root_uri,
         sidecar,
@@ -4955,8 +5024,14 @@ async fn process_schema_apply_sidecar_v7(
         .as_ref()
         .expect("caller checked protocol_v7");
 
+    if protocol.system_column_upgrade.is_some() {
+        return match detect_visible_v7_outcome(root_uri, sidecar).await? {
+            Some(outcome) => finalize_visible_v7_outcome(root_uri, storage, sidecar, outcome).await,
+            None => roll_forward_system_column_upgrade(root_uri, storage, snapshot, sidecar).await,
+        };
+    }
     if let Some(outcome) = detect_visible_v7_outcome(root_uri, sidecar).await? {
-        return finalize_visible_v7_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+        return finalize_visible_v7_outcome(root_uri, storage, sidecar, outcome).await;
     }
 
     let mut states = Vec::with_capacity(sidecar.tables.len());
@@ -5125,19 +5200,13 @@ async fn process_schema_apply_sidecar_v7(
         &protocol.target_schema_ir_hash,
     )
     .await?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
     let (_manifest_version, graph_commit_id) =
         match publish_schema_apply_v7_forward(root_uri, sidecar).await {
             Ok(published) => published,
             Err(error) if error.is_read_set_changed() => {
                 if let Some(outcome) = detect_visible_v7_outcome(root_uri, sidecar).await? {
-                    return finalize_visible_v7_outcome(
-                        root_uri,
-                        storage.as_ref(),
-                        sidecar,
-                        outcome,
-                    )
-                    .await;
+                    return finalize_visible_v7_outcome(root_uri, storage, sidecar, outcome).await;
                 }
                 if matches!(mode, RecoveryMode::RollForwardOnly) {
                     return Ok(false);
@@ -5180,6 +5249,332 @@ async fn process_schema_apply_sidecar_v7(
     .await?;
     delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
     Ok(true)
+}
+
+/// Complete an interrupted RFC 0040 system-column upgrade by roll-forward only
+/// (stamp, remaining renames under their planned identities, staging, publish,
+/// promote); it never restores, so both recovery modes run it.
+async fn roll_forward_system_column_upgrade(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v7
+        .as_ref()
+        .expect("caller checked protocol_v7");
+    let upgrade = protocol
+        .system_column_upgrade
+        .as_ref()
+        .expect("caller checked system_column_upgrade");
+
+    let manifest_version_after_stamp =
+        super::migrations::publish_stamp_advance(root_uri, upgrade.from_stamp, upgrade.to_stamp)
+            .await?;
+    if let Some(recorded) = upgrade.manifest_version_after_stamp
+        && manifest_version_after_stamp < recorded
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column upgrade '{}' recorded __manifest version {} after its stamp advance but the live manifest is at {}; refusing to continue",
+            sidecar.operation_id, recorded, manifest_version_after_stamp
+        )));
+    }
+
+    let mut committed_transactions = HashMap::new();
+    let mut updates = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("validated schema-v7 key sets");
+        let planned = effect.kind.planned_transaction();
+        let manifest_entry = snapshot_entry_for_schema_pin(snapshot, pin, protocol)?.ok_or_else(
+            || {
+                OmniError::manifest_internal(format!(
+                    "system-column upgrade '{}' table '{}' is no longer registered in the manifest; refusing to continue",
+                    sidecar.operation_id, pin.table_key
+                ))
+            },
+        )?;
+        if manifest_entry.published_dataset_version != pin.expected_version {
+            return Err(OmniError::manifest_internal(format!(
+                "system-column upgrade '{}' table '{}' is pinned at version {} but the intent expected {}; refusing to continue",
+                sidecar.operation_id,
+                pin.table_key,
+                manifest_entry.published_dataset_version,
+                pin.expected_version
+            )));
+        }
+        let observation = open_lance_head_if_present(
+            &pin.table_path,
+            pin.table_branch.as_deref(),
+            Some((
+                pin.post_commit_pin,
+                planned,
+                manifest_entry.published_dataset_version,
+            )),
+            false,
+            false,
+        )
+        .await?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "system-column upgrade '{}' table '{}' has no Lance dataset at '{}'",
+                sidecar.operation_id, pin.table_key, pin.table_path
+            ))
+        })?;
+        let committed = match (observation.effect_ownership, observation.version) {
+            (EffectOwnership::None, version) if version == pin.expected_version => {
+                commit_planned_system_column_rename(root_uri, pin, planned).await?
+            }
+            (EffectOwnership::OwnAtHead, version) if version == pin.post_commit_pin => observation
+                .transaction
+                .clone()
+                .expect("own effect at head carries its transaction"),
+            (ownership, version) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "system-column upgrade '{}' table '{}' is at Lance version {} with effect ownership {:?}; neither the pinned pre-rename version nor this intent's rename, refusing to continue",
+                    sidecar.operation_id, pin.table_key, version, ownership
+                )));
+            }
+        };
+        if committed != *planned {
+            return Err(OmniError::manifest_internal(format!(
+                "system-column upgrade '{}' table '{}' landed transaction {:?} instead of the planned {:?}",
+                sidecar.operation_id, pin.table_key, committed, planned
+            )));
+        }
+        updates.push(system_column_rename_update(root_uri, pin).await?);
+        committed_transactions.insert(pin.identity, committed);
+    }
+
+    regenerate_system_column_upgrade_staging(root_uri, storage, protocol).await?;
+
+    let mut confirmed = sidecar.clone();
+    if protocol.effect_phase == RecoveryEffectPhase::Armed {
+        confirmed
+            .protocol_v7
+            .as_mut()
+            .expect("cloned schema-v7 protocol")
+            .system_column_upgrade
+            .as_mut()
+            .expect("cloned system-column upgrade intent")
+            .manifest_version_after_stamp = Some(manifest_version_after_stamp);
+        confirm_schema_apply_sidecar_v9(
+            root_uri,
+            storage.as_ref(),
+            &mut confirmed,
+            &updates,
+            &committed_transactions,
+        )
+        .await?;
+    }
+    let confirmed_protocol = confirmed
+        .protocol_v7
+        .as_ref()
+        .expect("confirmed schema-v7 protocol");
+
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let (_manifest_version, graph_commit_id) =
+        match publish_schema_apply_v7_forward(root_uri, &confirmed).await {
+            Ok(published) => published,
+            Err(error) if error.is_read_set_changed() => {
+                if let Some(outcome) = detect_visible_v7_outcome(root_uri, &confirmed).await? {
+                    return finalize_visible_v7_outcome(root_uri, storage, &confirmed, outcome)
+                        .await;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+    crate::db::schema_state::promote_exact_schema_staging(
+        root_uri,
+        storage.as_ref(),
+        &confirmed_protocol.target_schema_ir_hash,
+    )
+    .await?;
+    let outcomes = confirmed_protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| {
+            let confirmed = slot
+                .confirmed
+                .as_ref()
+                .expect("confirmed system-column upgrade delta");
+            TableOutcome {
+                table_key: slot.table_key.clone(),
+                from_version: slot.expected_version,
+                to_version: confirmed.table_version,
+            }
+        })
+        .collect();
+    record_audit(
+        root_uri,
+        &confirmed,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    reclaim_stale_schema_apply_lock(root_uri, storage).await?;
+    crate::seams::fail(&crate::seams::catalog::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM)?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+/// A crashed writer's `__schema_apply_lock__`: no live writer can own it while
+/// its upgrade intent is still on disk (every writer heals first), and it is
+/// reclaimed before the sidecar goes, the only record that re-enters cleanup.
+async fn reclaim_stale_schema_apply_lock(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+) -> Result<()> {
+    let mut coordinator = GraphCoordinator::open(root_uri, std::sync::Arc::clone(storage)).await?;
+    if coordinator
+        .all_branches()
+        .await?
+        .iter()
+        .any(|branch| crate::db::is_schema_apply_lock_branch(branch))
+    {
+        coordinator
+            .branch_delete(crate::db::SCHEMA_APPLY_LOCK_BRANCH)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Commit one table's rename with the intent's planned transaction identity,
+/// exactly at the pinned read version, through the same sealed `TableStore`
+/// primitives as the writer; the table's own head then proves the effect is ours.
+async fn commit_planned_system_column_rename(
+    root_uri: &str,
+    pin: &SidecarTablePin,
+    planned: &StagedTransactionIdentity,
+) -> Result<StagedTransactionIdentity> {
+    let ds = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let ds = match pin.table_branch.as_deref() {
+        Some(branch) if branch != "main" => ds
+            .checkout_branch(branch)
+            .await
+            .map_err(OmniError::storage)?,
+        _ => ds,
+    };
+    if ds.version().version != planned.read_version {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column rename of '{}' expected Lance version {}, found {}",
+            pin.table_key,
+            planned.read_version,
+            ds.version().version
+        )));
+    }
+    let renames = crate::db::omnigraph::system_column_renames(&pin.table_key);
+    let store =
+        crate::table_store::TableStore::new(root_uri, crate::lance_access::control_session());
+    let mut staged = store.stage_rename_columns(&ds, &renames).await?;
+    staged.bind_transaction_identity(planned)?;
+    let (committed, identity) = store
+        .commit_staged_exact(std::sync::Arc::new(ds), staged)
+        .await?;
+    if committed.version().version != pin.post_commit_pin {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column rename of '{}' landed at Lance version {}, expected {}",
+            pin.table_key,
+            committed.version().version,
+            pin.post_commit_pin
+        )));
+    }
+    Ok(identity)
+}
+
+/// The manifest update slot for one renamed table, read from its post-rename
+/// head: the row count is unchanged by a rename, the version metadata is not.
+async fn system_column_rename_update(
+    root_uri: &str,
+    pin: &SidecarTablePin,
+) -> Result<DatasetUpdate> {
+    let ds = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let ds = match pin.table_branch.as_deref() {
+        Some(branch) if branch != "main" => ds
+            .checkout_branch(branch)
+            .await
+            .map_err(OmniError::storage)?,
+        _ => ds,
+    };
+    if ds.version().version != pin.post_commit_pin {
+        return Err(OmniError::manifest_internal(format!(
+            "system-column upgrade table '{}' is at Lance version {} after its rename, expected {}",
+            pin.table_key,
+            ds.version().version,
+            pin.post_commit_pin
+        )));
+    }
+    let row_count = ds.count_rows(None).await.map_err(OmniError::storage)? as u64;
+    let table_relative_path = super::table_path_for_identity(&pin.table_key, pin.identity)?;
+    let version_metadata =
+        super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
+    Ok(DatasetUpdate {
+        identity: pin.identity,
+        type_key: pin.table_key.clone(),
+        published_dataset_version: pin.post_commit_pin,
+        native_dataset_branch: pin.table_branch.clone(),
+        entity_count: row_count,
+        version_metadata,
+    })
+}
+
+/// Rewrite the three schema staging files from the live legacy contract; the
+/// derivation is deterministic, so any crash point regenerates byte-identical
+/// files, and the intent's target identity must still be what it derives.
+async fn regenerate_system_column_upgrade_staging(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    protocol: &RecoveryProtocolV7,
+) -> Result<()> {
+    let accepted_ir =
+        crate::db::schema_state::read_accepted_schema_ir(root_uri, std::sync::Arc::clone(storage))
+            .await?;
+    let source = storage
+        .read_text(&crate::db::schema_state::schema_source_uri(root_uri))
+        .await?;
+    let target = crate::db::omnigraph::render_system_column_upgrade_target(&accepted_ir, &source)?;
+    let target_hash = omnigraph_compiler::schema_ir_hash(&target.desired_ir)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    if target_hash != protocol.target_schema_ir_hash {
+        return Err(OmniError::manifest_internal(format!(
+            "the live schema contract derives target identity {} but the system-column upgrade intent recorded {}; refusing to regenerate staging",
+            target_hash, protocol.target_schema_ir_hash
+        )));
+    }
+    storage
+        .write_text(&schema_source_staging_uri(root_uri), &target.desired_source)
+        .await?;
+    crate::db::schema_state::write_schema_contract_staging(
+        root_uri,
+        storage.as_ref(),
+        &target.desired_ir,
+    )
+    .await?;
+    crate::db::schema_state::validate_exact_schema_staging_target(
+        root_uri,
+        storage.as_ref(),
+        &protocol.target_schema_ir_hash,
+    )
+    .await
 }
 
 async fn publish_schema_apply_v7_forward(
@@ -5374,9 +5769,7 @@ async fn roll_back_schema_apply_v7(
         }
         if state.effect_ownership != EffectOwnership::OwnCompensatedAtHead {
             restore_table_to_version(&pin.table_path, None, state.manifest_pinned).await?;
-            crate::failpoints::maybe_fail(
-                crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
-            )?;
+            crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH)?;
         }
         let restored_table_key = schema_apply_rollback_table_key(protocol, pin);
         push_table_update(
@@ -5409,9 +5802,7 @@ async fn roll_back_schema_apply_v7(
         &expected,
     )
     .await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT)?;
     record_audit(
         root_uri,
         &prepared,
@@ -5433,7 +5824,7 @@ pub(crate) async fn recover_failed_branch_merge_under_gates(
     failed: &RecoverySidecar,
 ) -> Result<bool> {
     assert_eq!(failed.writer_kind, SidecarKind::BranchMerge);
-    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_MERGE_PRE_ERROR_RECOVERY)?;
+    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_PRE_ERROR_RECOVERY)?;
     let Some(sidecar) = reread_sidecar_under_gates(root_uri, storage.as_ref(), failed).await?
     else {
         return Ok(true);
@@ -5762,7 +6153,7 @@ async fn roll_forward_branch_merge_v4(
         });
     }
 
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
     let graph_commit_id = match publish_recovery_commit(
         root_uri,
         sidecar,
@@ -6263,8 +6654,8 @@ async fn roll_back_sidecar(
                     state.manifest_pinned,
                 )
                 .await?;
-                crate::failpoints::maybe_fail(
-                    crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
+                crate::seams::fail(
+                    &crate::seams::catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
                 )?;
             }
             // Publish the post-restore HEAD (the restore commit we just made),
@@ -6306,9 +6697,7 @@ async fn roll_back_sidecar(
         &expected,
     )
     .await?;
-    crate::failpoints::maybe_fail(
-        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-    )?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT)?;
     let outcomes = sidecar
         .protocol_v3
         .as_ref()
@@ -6463,7 +6852,7 @@ async fn finalize_visible_ensure_indices_rollback(
             && record.recovery_kind == RecoveryKind::RolledBack
     });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id: protocol.rollback_graph_commit_id.clone(),
@@ -6491,6 +6880,12 @@ async fn finalize_visible_ensure_indices_rollback(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisibleExactOutcome {
     Original,
+    /// The original commit is visible with matching lineage while the sidecar
+    /// is still `Armed`: the `EffectsConfirmed` write was lost. The commit is
+    /// the authority; `manifest_version` names the committed snapshot (#602).
+    OriginalUnconfirmed {
+        manifest_version: u64,
+    },
     RolledBack,
 }
 
@@ -6567,13 +6962,24 @@ pub(crate) async fn ensure_read_only_schema_coherent(
             .map_err(|error| {
                 OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
             })?;
+        if protocol.system_column_upgrade.is_some()
+            && !matches!(outcome, Some(VisibleExactOutcome::Original))
+        {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id,
+                "graph carries an unfinished system-column upgrade; open read-write to complete it",
+            ));
+        }
         let live = read_schema_state_identity(root_uri, storage)
             .await
             .map_err(|error| {
                 OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
             })?;
         let expected_hash = match outcome {
-            Some(VisibleExactOutcome::Original) => &protocol.target_schema_ir_hash,
+            Some(VisibleExactOutcome::Original)
+            | Some(VisibleExactOutcome::OriginalUnconfirmed { .. }) => {
+                &protocol.target_schema_ir_hash
+            }
             Some(VisibleExactOutcome::RolledBack) | None => &protocol.authority.schema_ir_hash,
         };
         if &live.schema_ir_hash != expected_hash
@@ -6690,7 +7096,7 @@ async fn detect_visible_v7_outcome(
 
 async fn finalize_visible_v7_outcome(
     root_uri: &str,
-    storage: &dyn StorageAdapter,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
     sidecar: &RecoverySidecar,
     outcome: VisibleExactOutcome,
 ) -> Result<bool> {
@@ -6699,10 +7105,17 @@ async fn finalize_visible_v7_outcome(
         .as_ref()
         .expect("caller checked protocol_v7");
     let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::OriginalUnconfirmed { .. } => {
+            return Err(OmniError::manifest_internal(format!(
+                "SchemaApply recovery sidecar '{}' cannot finalize an unconfirmed original \
+                 outcome; only the mutation/load detector produces one",
+                sidecar.operation_id
+            )));
+        }
         VisibleExactOutcome::Original => {
             crate::db::schema_state::promote_exact_schema_staging(
                 root_uri,
-                storage,
+                storage.as_ref(),
                 &protocol.target_schema_ir_hash,
             )
             .await?;
@@ -6731,7 +7144,7 @@ async fn finalize_visible_v7_outcome(
         VisibleExactOutcome::RolledBack => {
             crate::db::schema_state::discard_exact_schema_staging(
                 root_uri,
-                storage,
+                storage.as_ref(),
                 &protocol.authority.schema_ir_hash,
                 &protocol.target_schema_ir_hash,
             )
@@ -6756,7 +7169,7 @@ async fn finalize_visible_v7_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -6769,7 +7182,11 @@ async fn finalize_visible_v7_outcome(
             })
             .await?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    if protocol.system_column_upgrade.is_some() {
+        reclaim_stale_schema_apply_lock(root_uri, storage).await?;
+        crate::seams::fail(&crate::seams::catalog::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM)?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
     Ok(true)
 }
 
@@ -6863,6 +7280,13 @@ async fn finalize_visible_v8_outcome(
         .as_ref()
         .expect("caller checked protocol_v8");
     let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::OriginalUnconfirmed { .. } => {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices recovery sidecar '{}' cannot finalize an unconfirmed original \
+                 outcome; only the mutation/load detector produces one",
+                sidecar.operation_id
+            )));
+        }
         VisibleExactOutcome::Original => {
             let outcomes = protocol
                 .intended_delta
@@ -6906,7 +7330,7 @@ async fn finalize_visible_v8_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -6939,6 +7363,7 @@ async fn detect_visible_v3_outcome(
     let rollback_visible = commits
         .iter()
         .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let mut stale_manifest_version = None;
     let original_visible = if let Some(commit) = original_commit {
         let expected_branch = protocol
             .lineage
@@ -6960,29 +7385,46 @@ async fn detect_visible_v3_outcome(
                 sidecar.operation_id, protocol.lineage.graph_commit_id
             )));
         }
-        let committed_snapshot = ManifestCoordinator::snapshot_at(
-            root_uri,
-            sidecar.branch.as_deref(),
-            commit.graph_manifest_version,
-        )
-        .await?;
-        let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
-            let Some(confirmed) = slot.confirmed.as_ref() else {
-                return false;
-            };
-            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
-                entry.type_key == slot.table_key
-                    && entry.published_dataset_version == confirmed.table_version
-                    && entry.native_dataset_branch == confirmed.table_branch
-                    && entry.entity_count == confirmed.row_count
-                    && entry.version_metadata == confirmed.version_metadata
-            })
-        });
-        if !delta_matches {
-            return Err(OmniError::manifest_internal(format!(
-                "OCC recovery sidecar '{}' found original commit id '{}' but its manifest delta differs",
-                sidecar.operation_id, protocol.lineage.graph_commit_id
-            )));
+        let slots = &protocol.intended_delta.table_updates;
+        if protocol.effect_phase == RecoveryEffectPhase::Armed {
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                graph_commit_id = protocol.lineage.graph_commit_id.as_str(),
+                "recovery: OCC sidecar is still Armed beside its visible original commit; \
+                 the confirmation write was lost and the sidecar is stale"
+            );
+            stale_manifest_version = Some(commit.graph_manifest_version);
+        } else {
+            let committed_snapshot = ManifestCoordinator::snapshot_at(
+                root_uri,
+                sidecar.branch.as_deref(),
+                commit.graph_manifest_version,
+            )
+            .await?;
+            let delta_matches = slots.iter().all(|slot| {
+                let Some(confirmed) = slot.confirmed.as_ref() else {
+                    return false;
+                };
+                snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(
+                    |entry| {
+                        entry.type_key == slot.table_key
+                            && entry.published_dataset_version == confirmed.table_version
+                            && entry.native_dataset_branch == confirmed.table_branch
+                            && entry.entity_count == confirmed.row_count
+                            && entry.version_metadata == confirmed.version_metadata
+                    },
+                )
+            });
+            if !delta_matches {
+                return Err(OmniError::manifest_internal(format!(
+                    "OCC recovery sidecar '{}' found original commit id '{}' but its manifest \
+                     delta differs; the confirmed sidecar '{}' contradicts the committed \
+                     snapshot, inspect it rather than deleting it by hand",
+                    sidecar.operation_id,
+                    protocol.lineage.graph_commit_id,
+                    sidecar_uri(root_uri, &sidecar.operation_id)
+                )));
+            }
         }
         true
     } else {
@@ -6990,7 +7432,10 @@ async fn detect_visible_v3_outcome(
     };
 
     match (original_visible, rollback_visible) {
-        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (true, false) => Ok(Some(match stale_manifest_version {
+            Some(manifest_version) => VisibleExactOutcome::OriginalUnconfirmed { manifest_version },
+            None => VisibleExactOutcome::Original,
+        })),
         (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
         (false, false) => Ok(None),
         (true, true) => Err(OmniError::manifest_internal(format!(
@@ -7040,6 +7485,71 @@ async fn finalize_visible_v3_outcome(
                 outcomes,
             )
         }
+        VisibleExactOutcome::OriginalUnconfirmed { manifest_version } => {
+            let committed_snapshot = ManifestCoordinator::snapshot_at(
+                root_uri,
+                sidecar.branch.as_deref(),
+                manifest_version,
+            )
+            .await?;
+            let mut outcomes = Vec::with_capacity(sidecar.tables.len());
+            for pin in &sidecar.tables {
+                let planned = snapshot_entry_by_identity(&committed_snapshot, pin.identity)
+                    .is_some_and(|entry| {
+                        entry.type_key == pin.table_key
+                            && entry.published_dataset_version == pin.post_commit_pin
+                            && entry.native_dataset_branch == pin.table_branch
+                    });
+                if !planned {
+                    return Err(OmniError::manifest_internal(format!(
+                        "OCC recovery sidecar '{}' is Armed beside its visible original \
+                         commit '{}' but the committed snapshot does not carry the planned \
+                         version of table '{}'; inspect the sidecar '{}' rather than \
+                         deleting it by hand",
+                        sidecar.operation_id,
+                        protocol.lineage.graph_commit_id,
+                        pin.table_key,
+                        sidecar_uri(root_uri, &sidecar.operation_id)
+                    )));
+                }
+                let planned_transaction = protocol
+                    .effects
+                    .iter()
+                    .find(|effect| effect.identity == pin.identity)
+                    .map(|effect| &effect.planned_transaction);
+                let committed_transaction = committed_transaction_identity(
+                    &pin.table_path,
+                    pin.table_branch.as_deref(),
+                    pin.post_commit_pin,
+                )
+                .await?;
+                if planned_transaction.is_none()
+                    || committed_transaction.as_ref() != planned_transaction
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "OCC recovery sidecar '{}' is Armed beside its visible original \
+                         commit '{}' but version {} of table '{}' was not produced by its \
+                         planned transaction; inspect the sidecar '{}' rather than deleting \
+                         it by hand",
+                        sidecar.operation_id,
+                        protocol.lineage.graph_commit_id,
+                        pin.post_commit_pin,
+                        pin.table_key,
+                        sidecar_uri(root_uri, &sidecar.operation_id)
+                    )));
+                }
+                outcomes.push(TableOutcome {
+                    table_key: pin.table_key.clone(),
+                    from_version: pin.expected_version,
+                    to_version: pin.post_commit_pin,
+                });
+            }
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outcomes,
+            )
+        }
         VisibleExactOutcome::RolledBack => {
             let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -7065,7 +7575,7 @@ async fn finalize_visible_v3_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -7172,6 +7682,13 @@ async fn finalize_visible_v4_outcome(
         .as_ref()
         .expect("caller checked protocol_v4");
     let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::OriginalUnconfirmed { .. } => {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' cannot finalize an unconfirmed original \
+                 outcome; only the mutation/load detector produces one",
+                sidecar.operation_id
+            )));
+        }
         VisibleExactOutcome::Original => {
             let outcomes = protocol
                 .intended_delta
@@ -7216,7 +7733,7 @@ async fn finalize_visible_v4_outcome(
             record.operation_id == sidecar.operation_id && record.recovery_kind == kind
         });
     if !already_recorded {
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,
@@ -7549,7 +8066,7 @@ async fn record_audit(
     // Failpoint: models an audit write failure after the roll-forward /
     // roll-back publish (with its folded-in recovery commit) already landed —
     // the sweep aborts, the sidecar stays, and re-entry records the audit row.
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_RECORD_AUDIT)?;
     let mut audit = RecoveryAudit::open(root_uri).await?;
     audit
         .append(RecoveryAuditRecord {
@@ -7573,6 +8090,34 @@ struct LanceHeadObservation {
     version: u64,
     transaction: Option<StagedTransactionIdentity>,
     effect_ownership: EffectOwnership,
+}
+
+/// The identity of the transaction Lance recorded at `version` of the table on
+/// `branch`, read from that immutable version rather than from HEAD, which a
+/// later writer may own; `None` when the version carries no transaction file.
+async fn committed_transaction_identity(
+    table_path: &str,
+    branch: Option<&str>,
+    version: u64,
+) -> Result<Option<StagedTransactionIdentity>> {
+    let ds = crate::instrumentation::open_dataset(
+        table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let ds = match branch {
+        Some(b) if b != "main" => ds.checkout_branch(b).await.map_err(OmniError::storage)?,
+        _ => ds,
+    };
+    let transaction = if ds.version().version == version {
+        ds.read_transaction().await
+    } else {
+        ds.read_transaction_by_version(version).await
+    }
+    .map_err(OmniError::storage)?;
+    Ok(transaction.as_ref().map(StagedTransactionIdentity::from))
 }
 
 #[cfg(test)]
@@ -7900,7 +8445,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v8.as_ref().ok_or_else(|| {
@@ -8145,7 +8690,9 @@ pub(crate) fn new_occ_sidecar_v9(
 }
 
 /// Bind every physical output slot of an RFC-022 sidecar and durably transition
-/// it from `Armed` to `EffectsConfirmed`.
+/// it from `Armed` to `EffectsConfirmed`. The `MUTATION_SIDECAR_CONFIRM_PUT`
+/// seam models the put being lost: the in-memory sidecar still confirms while
+/// the object keeps its arm-time bytes.
 ///
 /// Validation happens against a clone first. A missing table, a rebased Lance
 /// transaction, or a version/branch mismatch leaves the on-disk sidecar Armed,
@@ -8158,7 +8705,7 @@ pub(crate) async fn confirm_occ_sidecar_v9(
     updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
 
     let protocol = sidecar.protocol_v3.as_ref().ok_or_else(|| {
@@ -8273,7 +8820,9 @@ pub(crate) async fn confirm_occ_sidecar_v9(
             error
         ))
     })?;
-    storage.write_text(&uri, &json).await?;
+    if !crate::seams::skip(&crate::seams::catalog::MUTATION_SIDECAR_CONFIRM_PUT) {
+        storage.write_text(&uri, &json).await?;
+    }
     *sidecar = confirmed;
     Ok(())
 }
@@ -8321,11 +8870,63 @@ pub(crate) fn new_schema_apply_sidecar_v9(
             effect_phase: RecoveryEffectPhase::Armed,
             effects,
             intended_delta,
+            system_column_upgrade: None,
         }),
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Arm the RFC 0040 system-column upgrade: a SchemaApply intent whose effects
+/// are all rename-only table commits and whose only recovery outcome is
+/// roll-forward (see [`RecoverySystemColumnUpgrade`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_system_column_upgrade_sidecar_v9(
+    actor_id: Option<String>,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    effects: Vec<RecoverySchemaApplyEffect>,
+    intended_delta: RecoveryManifestDelta,
+    target_schema_ir_hash: String,
+    upgrade: RecoverySystemColumnUpgrade,
+) -> Result<RecoverySidecar> {
+    let sidecar = RecoverySidecar {
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        operation_id: crate::dst_ids::new_ulid().to_string(),
+        started_at: match crate::dst_clock::system_time_now().duration_since(std::time::UNIX_EPOCH)
+        {
+            Ok(duration) => duration.as_micros().to_string(),
+            Err(_) => "0".to_string(),
+        },
+        branch: None,
+        actor_id,
+        writer_kind: SidecarKind::SchemaApply,
+        tables,
+        merge_source_commit_id: None,
+        additional_registrations: Vec::new(),
+        tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
+        protocol_v3: None,
+        protocol_v4: None,
+        protocol_v7: Some(RecoveryProtocolV7 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: crate::dst_ids::new_ulid().to_string(),
+            rollback_audit_outcomes: None,
+            target_schema_ir_hash,
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects,
+            intended_delta,
+            system_column_upgrade: Some(upgrade),
+        }),
+        protocol_v8: None,
+        ensure_indices_rollback_v6: None,
+    };
+    validate_sidecar_shape("<new-system-column-upgrade-v9-sidecar>", &sidecar)?;
     Ok(sidecar)
 }
 
@@ -8339,7 +8940,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v9(
     updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
     let protocol = sidecar.protocol_v7.as_ref().ok_or_else(|| {
         OmniError::manifest_internal("confirm_schema_apply_sidecar_v9 requires a schema-v9 sidecar")
@@ -8507,7 +9108,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
     updates: &[DatasetUpdate],
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v4.as_ref().ok_or_else(|| {
@@ -8977,6 +9578,98 @@ mod tests {
     }
 
     #[test]
+    fn system_column_upgrade_sidecar_shape_is_pinned_to_rename_effects_and_the_served_stamps() {
+        let planned = transaction(3, "system-columns-company");
+        let identity = test_identity("node:Company");
+        let effect = |kind: RecoverySchemaApplyEffectKind| RecoverySchemaApplyEffect {
+            identity,
+            table_key: "node:Company".to_string(),
+            kind,
+        };
+        let build = |effects: Vec<RecoverySchemaApplyEffect>,
+                     registrations: Vec<SidecarTableRegistration>,
+                     to_stamp: u32| {
+            new_system_column_upgrade_sidecar_v9(
+                Some("act-upgrade".to_string()),
+                vec![make_pin(
+                    "node:Company",
+                    "memory://graph/nodes/company",
+                    3,
+                    4,
+                )],
+                RecoveryAuthorityToken {
+                    branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                    graph_head: Some("01H000000000000000000000U0".to_string()),
+                    schema_identity_domain: "domain-a".to_string(),
+                    schema_ir_hash: "accepted-schema".to_string(),
+                    schema_identity_version: 1,
+                },
+                RecoveryLineageIntent {
+                    graph_commit_id: "01H000000000000000000000U1".to_string(),
+                    branch: None,
+                    actor_id: Some("act-upgrade".to_string()),
+                    merged_parent_commit_id: None,
+                    created_at: 790,
+                },
+                effects,
+                RecoveryManifestDelta {
+                    table_updates: vec![RecoveryTableUpdateSlot {
+                        identity,
+                        table_key: "node:Company".to_string(),
+                        expected_version: 3,
+                        table_branch: None,
+                        confirmed: None,
+                    }],
+                    registrations,
+                    renames: Vec::new(),
+                    tombstones: Vec::new(),
+                },
+                "target-schema".to_string(),
+                RecoverySystemColumnUpgrade {
+                    from_stamp: 8,
+                    to_stamp,
+                    manifest_version_after_stamp: None,
+                },
+            )
+        };
+        let rename = || RecoverySchemaApplyEffectKind::SystemColumnRename {
+            planned_transaction: planned.clone(),
+            confirmed_transaction: None,
+        };
+
+        let sidecar = build(vec![effect(rename())], Vec::new(), 9).unwrap();
+        let json = serde_json::to_string(&sidecar).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/upgrade-v9.json", &json).unwrap();
+        assert_eq!(
+            parsed
+                .protocol_v7
+                .unwrap()
+                .system_column_upgrade
+                .unwrap()
+                .to_stamp,
+            9
+        );
+
+        assert!(build(vec![effect(rename())], Vec::new(), 10).is_err());
+        assert!(
+            build(
+                vec![effect(RecoverySchemaApplyEffectKind::ExistingOverwrite {
+                    planned_transaction: planned.clone(),
+                    confirmed_transaction: None,
+                })],
+                Vec::new(),
+                9,
+            )
+            .is_err()
+        );
+
+        let mut unmarked = sidecar;
+        unmarked.protocol_v7.as_mut().unwrap().system_column_upgrade = None;
+        let json = serde_json::to_string(&unmarked).unwrap();
+        assert!(parse_sidecar("memory://graph/__recovery/unmarked.json", &json).is_err());
+    }
+
+    #[test]
     fn schema_apply_v7_sidecar_round_trips_exact_first_touch_envelope() {
         let planned = transaction(0, "schema-create-company");
         let identity = test_identity("node:Company");
@@ -9396,6 +10089,7 @@ mod tests {
             lineage: protocol_v3.lineage.clone(),
             rollback_graph_commit_id: "01H000000000000000000000BC".to_string(),
             rollback_audit_outcomes: None,
+            system_column_upgrade: None,
             target_schema_ir_hash: "foreign-schema-payload".to_string(),
             effect_phase: RecoveryEffectPhase::Armed,
             effects: Vec::new(),
@@ -10217,7 +10911,7 @@ mod tests {
     async fn exact_preflight_rebase_recovery_preserves_published_winner() {
         // This unarmed recovery must not consume a neighboring test's fault.
         #[cfg(feature = "failpoints")]
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         // Lance may preflight-rebase an Append even when CommitBuilder's retry
         // budget is zero. Reproduce the exact availability hazard:
         //
@@ -10392,7 +11086,7 @@ node Person {
 node Person { age: I32? }
 node Company { age: I32? }
 "#;
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
@@ -10493,10 +11187,8 @@ node Company { age: I32? }
         drop(txn);
         drop(db);
 
-        let failpoint = crate::failpoints::ScopedFailPoint::new(
-            crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-            "return",
-        );
+        let failpoint =
+            crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
         let error = crate::db::Omnigraph::open(root)
             .await
             .err()
@@ -10566,7 +11258,7 @@ node Company { age: I32? }
         const SCHEMA: &str = r#"
 node Person { age: I32? }
 "#;
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
         let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
@@ -10650,10 +11342,8 @@ node Person { age: I32? }
         drop(txn);
         drop(db);
 
-        let failpoint = crate::failpoints::ScopedFailPoint::new(
-            crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
-            "return",
-        );
+        let failpoint =
+            crate::seams::catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
         let error = crate::db::Omnigraph::open(root)
             .await
             .err()

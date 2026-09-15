@@ -1166,7 +1166,7 @@ impl TableStore {
         // failpoint seam simulates the e_tag-less-store configuration so tests
         // can prove the logical witness alone refuses a branch delete/recreate.
         let etag_witness_unavailable =
-            crate::failpoints::is_enabled(crate::failpoints::names::CHANGE_FEED_SKIP_ETAG_WITNESS);
+            crate::seams::skip(&crate::seams::catalog::CHANGE_FEED_SKIP_ETAG_WITNESS);
         if !etag_witness_unavailable
             && let Some(expected) = entry.version_metadata.e_tag()
             && dataset.manifest_location().e_tag.as_deref() != Some(expected)
@@ -1319,7 +1319,7 @@ impl TableStore {
         // The ref is now independently durable. Any error from this point is an
         // ambiguous/post-effect outcome to the caller and must retain an armed
         // recovery intent rather than being treated as a safe pre-effect retry.
-        crate::failpoints::maybe_fail(crate::failpoints::names::FORK_POST_CREATE_PRE_OPEN)?;
+        crate::seams::fail(&crate::seams::catalog::FORK_POST_CREATE_PRE_OPEN)?;
 
         // Re-open through the shared session for normal cache behavior. The
         // returned handle above is used only as proof that the matching branch
@@ -3889,6 +3889,63 @@ impl TableStore {
             }
         };
         Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
+    }
+
+    /// The dataset schema with `renames` applied in place: each source field
+    /// keeps its id, nullability, metadata (the unenforced primary key marker
+    /// included) and indexes; only its name changes. Shared by the staged
+    /// rename primitive and the writer's pre-arm dry run so both build one shape.
+    pub(crate) fn renamed_schema(
+        ds: &Dataset,
+        renames: &[(String, String)],
+    ) -> Result<LanceSchema> {
+        let mut schema = ds.schema().clone();
+        for (from, to) in renames {
+            let field_id = ds
+                .schema()
+                .field(from)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "rename source column '{from}' does not exist in the dataset"
+                    ))
+                })?
+                .id;
+            if ds.schema().field(to).is_some() {
+                return Err(OmniError::manifest_internal(format!(
+                    "rename target column '{to}' already exists in the dataset"
+                )));
+            }
+            let field = schema.mut_field_by_id(field_id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "rename source column '{from}' (field {field_id}) is missing from the cloned schema"
+                ))
+            })?;
+            field.name.clone_from(to);
+        }
+        schema.validate().map_err(OmniError::lance_internal)?;
+        Ok(schema)
+    }
+
+    /// Stage a rename-only column alteration: `Operation::Project` over the
+    /// same field ids, no fragment written or rewritten, nullability asserted
+    /// preserved exactly as Lance's own `alter_columns` does for a rename (the
+    /// RFC 0040 system-column upgrade's per-table effect). HEAD does NOT
+    /// advance until [`Self::commit_staged_exact`].
+    pub async fn stage_rename_columns(
+        &self,
+        ds: &Dataset,
+        renames: &[(String, String)],
+    ) -> Result<StagedWrite> {
+        let schema = Self::renamed_schema(ds, renames)?;
+        let transaction = TransactionBuilder::new(
+            ds.manifest.version,
+            Operation::Project {
+                schema,
+                preserves_nullability: true,
+            },
+        )
+        .build();
+        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).

@@ -31,7 +31,7 @@ mean an active sidecar uses an old outer schema.
 |---|---|
 | Mutation / Load | Exact one-transaction effect identity and confirmation |
 | BranchMerge | Fixed bounded transaction chain, source/target authority, and lineage |
-| SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta |
+| SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta; the RFC 0040 system-column upgrade adds rename-only table effects and a `__manifest` stamp advance, recovered by roll-forward only |
 | EnsureIndices / full-text rebuild | Exact CreateIndex effects and complete pointer delta; rebuild retains the same fixed actor and lineage |
 | Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
 
@@ -121,6 +121,24 @@ derived handles before later operations continue.
 Roll-forward publishes the sidecar's pre-minted lineage and complete manifest
 delta; it does not create a new semantic commit. Compensation restores the
 previous accepted graph view and never acknowledges the failed operation.
+
+A mutation/load sidecar found still `Armed` beside its visible original commit
+is stale, not a plan: the writer confirms before it publishes, so this state is
+reachable only when the confirmation write was lost (acknowledged, effect
+absent) or the object rotted back to arm-time bytes. The commit is the
+authority for the operation. Recovery re-runs the check the lost confirmation
+would have made: the committed snapshot at the original commit must carry each
+owned table at the sidecar's planned post-commit version and branch, and the
+Lance transaction recorded at that version (read from the immutable version,
+never from HEAD, which a later writer may own) must be the sidecar's planned
+transaction. It then
+finishes the outcome like a confirmed original: one `RolledForward` audit row
+against the original commit, and the sidecar is deleted. A sidecar whose
+recorded or planned values contradict the committed snapshot is damage and
+still fails the read-write open; the error names the sidecar object, which
+must be inspected rather than deleted by hand. The same lost-confirmation
+shape on a `BranchMerge`, `SchemaApply`, or `EnsureIndices` sidecar still
+refuses the open; healing those is a follow-up.
 
 ## Initialization ownership
 

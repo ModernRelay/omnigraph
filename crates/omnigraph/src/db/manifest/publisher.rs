@@ -275,9 +275,7 @@ impl GraphNamespacePublisher {
         // Test seam: inject a retryable contention here to exercise the outer
         // retry loop's re-run-on-retryable-load-error path (no-op without the
         // `failpoints` feature). The migration surfaces the same typed error.
-        crate::failpoints::maybe_fail_retryable_contention(
-            crate::failpoints::names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION,
-        )?;
+        crate::seams::contention(&crate::seams::catalog::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION)?;
         let dataset = self.dataset().await?;
         guard_stamp(&dataset)?;
         // ONE `__manifest` scan for everything the publish needs: table

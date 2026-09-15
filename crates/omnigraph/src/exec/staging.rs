@@ -604,9 +604,7 @@ impl MutationStaging {
                     // fragment uploads — a partial staged set with no
                     // breadcrumb (benign by construction; cleanup reclaims).
                     if stage_idx > 0 {
-                        crate::failpoints::maybe_fail(
-                            crate::failpoints::names::LOAD_BETWEEN_TABLE_STAGES,
-                        )?;
+                        crate::seams::fail(&crate::seams::catalog::LOAD_BETWEEN_TABLE_STAGES)?;
                     }
                     stage_pending_table(db, table_key, table, path, expected).await
                 },
@@ -1309,22 +1307,20 @@ impl StagedMutation {
         // the intent is fully prepared in memory, but neither the durable
         // sidecar nor a target fork exists yet. A concurrent winner may publish;
         // this attempt then discards/reprepares on the collision below.
-        crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_CLASSIFY)?;
+        crate::seams::fail(&crate::seams::catalog::FORK_BEFORE_CLASSIFY)?;
         let sidecar_handle =
             Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?);
         let operation_id = sidecar.operation_id.clone();
-        crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_ARM_PRE_EFFECT)
-            .map_err(|error| {
-                OmniError::recovery_required(operation_id.clone(), error.to_string())
-            })?;
+        crate::seams::fail(&crate::seams::catalog::MUTATION_POST_ARM_PRE_EFFECT).map_err(
+            |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
+        )?;
         if staged
             .iter()
             .any(|entry| entry.path.deferred_fork.is_some())
         {
-            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_SIDECAR_PRE_FORK)
-                .map_err(|error| {
-                    OmniError::recovery_required(operation_id.clone(), error.to_string())
-                })?;
+            crate::seams::fail(&crate::seams::catalog::MUTATION_POST_SIDECAR_PRE_FORK).map_err(
+                |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
+            )?;
         }
 
         // The v9 intent (with the retained `protocol_v3` payload shape) is now
@@ -1416,10 +1412,9 @@ impl StagedMutation {
             }
         }
         if created_any_fork {
-            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FORK_PRE_COMMIT)
-                .map_err(|error| {
-                    OmniError::recovery_required(operation_id.clone(), error.to_string())
-                })?;
+            crate::seams::fail(&crate::seams::catalog::MUTATION_POST_FORK_PRE_COMMIT).map_err(
+                |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
+            )?;
         }
 
         let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
@@ -1556,13 +1551,12 @@ impl StagedMutation {
                     .version_metadata
                     .with_table_fork_owner(table_fork_owner),
             });
-            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_TABLE_COMMIT)
-                .map_err(|error| {
-                    OmniError::recovery_required(operation_id.clone(), error.to_string())
-                })?;
+            crate::seams::fail(&crate::seams::catalog::MUTATION_POST_TABLE_COMMIT).map_err(
+                |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
+            )?;
         }
 
-        if let Err(error) = confirm_occ_sidecar_v9(
+        confirm_occ_sidecar_v9(
             db.root_uri(),
             db.storage_adapter(),
             &mut sidecar,
@@ -1570,12 +1564,7 @@ impl StagedMutation {
             &committed_transactions,
         )
         .await
-        {
-            return Err(OmniError::recovery_required(
-                operation_id,
-                error.to_string(),
-            ));
-        }
+        .map_err(|error| OmniError::recovery_required(operation_id, error.to_string()))?;
 
         Ok(CommittedMutation {
             updates,

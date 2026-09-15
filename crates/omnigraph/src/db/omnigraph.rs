@@ -33,6 +33,7 @@ mod export;
 mod optimize;
 mod repair;
 mod schema_apply;
+mod system_column_upgrade;
 mod table_ops;
 
 #[doc(hidden)]
@@ -43,6 +44,13 @@ pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
+pub use system_column_upgrade::{
+    SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
+    SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
+};
+pub(crate) use system_column_upgrade::{
+    render_system_column_upgrade_target, reserved_property_offenders, system_column_renames,
+};
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
@@ -397,6 +405,7 @@ impl Omnigraph {
         options: InitOptions,
         legacy_system_columns: bool,
     ) -> Result<Self> {
+        let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
         let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
@@ -500,9 +509,9 @@ impl Omnigraph {
                     return Err(err);
                 }
             }
-            if let Err(err) = crate::failpoints::maybe_fail(
-                crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN,
-            ) {
+            if let Err(err) =
+                crate::seams::fail(&crate::seams::catalog::INIT_AFTER_SCHEMA_PG_WRITTEN)
+            {
                 best_effort_cleanup_owned_init_artifacts(&root, storage.as_ref(), &init_claim)
                     .await;
                 return Err(err);
@@ -683,6 +692,7 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
+        let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
         let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
@@ -739,6 +749,7 @@ impl Omnigraph {
         // still performs the non-mutating coherence proof below: an exact
         // SchemaApply manifest outcome cannot be served with the old schema
         // contract merely because promotion is pending.
+        let mut recovery_advanced_manifest = false;
         if matches!(mode, OpenMode::ReadWrite) {
             // Schema staging is itself mutable recovery state. Hold the shared
             // schema gate across BOTH its file pre-pass and the complete Full
@@ -755,6 +766,7 @@ impl Omnigraph {
             // heal (`heal_pending_sidecars_roll_forward`); only
             // rollback-eligible sidecars it can neither roll forward nor
             // retire as provably effect-free wait for this open-time sweep.
+            let manifest_version_before_sweep = coordinator.version();
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 Arc::clone(&storage),
@@ -764,6 +776,7 @@ impl Omnigraph {
                 write_queue.as_ref(),
             )
             .await?;
+            recovery_advanced_manifest = coordinator.version() != manifest_version_before_sweep;
         } else {
             // ReadOnly performs no repair, but it must not expose a manifest
             // that already contains a fixed SchemaApply outcome with the old
@@ -772,7 +785,12 @@ impl Omnigraph {
             // read-write open resolves them.
             crate::db::manifest::ensure_read_only_schema_coherent(&root, storage.as_ref()).await?;
         }
-        crate::failpoints::maybe_fail(crate::failpoints::names::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
+        let internal_schema_version = if recovery_advanced_manifest {
+            crate::db::manifest::read_supported_internal_schema_version(&root).await?
+        } else {
+            internal_schema_version
+        };
+        crate::seams::fail(&crate::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
         // The stamp guard and coordinator open above both read `__manifest`,
         // so reaching this point proves that manifest is readable; it does not
@@ -1091,6 +1109,23 @@ impl Omnigraph {
     ) -> Result<SchemaApplyResult> {
         self.apply_schema_as_with_catalog_check(desired_schema_source, options, actor, |_| Ok(()))
             .await
+    }
+
+    /// Respell this graph's system columns in place, v8 to v9; the operation
+    /// and its preflight live in `system_column_upgrade` (RFC 0040 step 3).
+    pub async fn upgrade_system_columns(
+        &self,
+        options: SystemColumnUpgradeOptions,
+    ) -> Result<SystemColumnUpgradeReport> {
+        self.upgrade_system_columns_as(options, None).await
+    }
+
+    pub async fn upgrade_system_columns_as(
+        &self,
+        options: SystemColumnUpgradeOptions,
+        actor: Option<&str>,
+    ) -> Result<SystemColumnUpgradeReport> {
+        system_column_upgrade::upgrade_system_columns(self, options, actor).await
     }
 
     pub async fn apply_schema_as_with_catalog_check<F>(
@@ -2284,9 +2319,7 @@ impl Omnigraph {
             .write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::SCHEMA_RELOAD_BEFORE_CONTRACT_READ)?;
         let schema_path = schema_source_uri(&self.root_uri);
         let schema_source = self.storage.read_text(&schema_path).await?;
         let (accepted_ir, accepted_state) = load_validated_schema_contract_for_source(
@@ -2413,8 +2446,14 @@ impl Omnigraph {
         let mut resolved = self.resolve_target_after_schema_validation(target).await?;
         if validate_live_snapshot {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
-        } else if bind_historical_aliases {
+            return Ok((resolved, catalog));
+        }
+        if bind_historical_aliases {
+            let catalog = self
+                .catalog_for_image_vintage(&resolved.snapshot, catalog)
+                .await?;
             resolved.snapshot.bind_catalog_aliases(&catalog)?;
+            return Ok((resolved, catalog));
         }
         Ok((resolved, catalog))
     }
@@ -2460,8 +2499,53 @@ impl Omnigraph {
             version,
         )
         .await?;
+        let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
         snapshot.bind_catalog_aliases(&catalog)?;
         Ok((snapshot, catalog))
+    }
+
+    /// The catalog a pinned image plans against: the accepted one, or its
+    /// re-rendering at the image's own vintage (RFC 0040 historical reads); one
+    /// upgrade publication renames every table, so any retained table tells it.
+    async fn catalog_for_image_vintage(
+        &self,
+        snapshot: &Snapshot,
+        catalog: Arc<Catalog>,
+    ) -> Result<Arc<Catalog>> {
+        let mut image_vintage = None;
+        for entry in snapshot.datasets() {
+            match snapshot.open_dataset(&entry.type_key).await {
+                Ok(image) => {
+                    image_vintage = Some(crate::db::manifest::system_columns_at_image(
+                        image.schema(),
+                        &entry.type_key,
+                    )?);
+                    break;
+                }
+                Err(OmniError::HistoricalVersionReclaimed { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(image_vintage) = image_vintage else {
+            return Ok(catalog);
+        };
+        if image_vintage == catalog.system_columns {
+            return Ok(catalog);
+        }
+        let accepted_ir = read_accepted_schema_ir(self.uri(), Arc::clone(&self.storage)).await?;
+        let vintage_ir = if image_vintage == omnigraph_compiler::SYSTEM_COLUMNS_LEGACY {
+            omnigraph_compiler::into_legacy_image_vintage(accepted_ir)
+        } else {
+            omnigraph_compiler::into_system_columns_vintage(accepted_ir)
+        };
+        omnigraph_compiler::validate_schema_ir(&vintage_ir).map_err(|error| {
+            OmniError::manifest(format!(
+                "the pinned image spells its system columns at another vintage than the accepted schema, which cannot be rendered there: {error}"
+            ))
+        })?;
+        let mut rendered = build_catalog_from_ir(&vintage_ir)?;
+        fixup_physical_schemas(&mut rendered)?;
+        Ok(Arc::new(rendered))
     }
 
     /// Resolve a read target to its snapshot, without attaching read caches.
@@ -2787,7 +2871,7 @@ impl Omnigraph {
         // happens after this and lock-free. Tests delete/recreate the polled
         // branch here to prove `commit_snapshot`'s incarnation re-prove fails
         // closed instead of emitting a replacement branch's rows.
-        crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_CAPTURE)?;
+        crate::seams::fail(&crate::seams::catalog::CHANGE_FEED_POST_CAPTURE)?;
         let graph_identity = self.schema_view.load().schema_identity_domain.clone();
         crate::changes::feed::poll(
             self.uri(),
@@ -3122,9 +3206,7 @@ impl Omnigraph {
         // schema -> source/target branch gates.
         self.heal_pending_recovery_sidecars_for_write(&relevant)
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3216,9 +3298,7 @@ impl Omnigraph {
         let relevant = [branch.as_deref(), Some(target_branch.as_str())];
         self.heal_pending_recovery_sidecars_for_write(&relevant)
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3286,9 +3366,7 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         self.heal_pending_recovery_sidecars_for_branch_delete(&branch)
             .await?;
-        crate::failpoints::maybe_fail(
-            crate::failpoints::names::BRANCH_CONTROL_POST_RECOVERY_BARRIER,
-        )?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3312,7 +3390,7 @@ impl Omnigraph {
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
         self.ensure_branch_delete_recovery_safe_under_gates(&branch)
             .await?;
-        crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_TABLE_GATES)?;
+        crate::seams::fail(&crate::seams::catalog::BRANCH_DELETE_POST_TABLE_GATES)?;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         self.ensure_schema_state_valid().await?;
         let mut target_control = self
@@ -3878,7 +3956,7 @@ async fn verify_local_create_if_absent(root: &str, storage: &dyn StorageAdapter)
     if storage_kind_for_uri(root)? != StorageKind::Local {
         return Ok(());
     }
-    crate::failpoints::maybe_fail(crate::failpoints::names::LOCAL_CREATE_IF_ABSENT_PROBE)?;
+    crate::seams::fail(&crate::seams::catalog::LOCAL_CREATE_IF_ABSENT_PROBE)?;
     for _ in 0..CREATE_IF_ABSENT_PROBE_CLAIM_ATTEMPTS {
         let probe_name = format!(
             "{CREATE_IF_ABSENT_PROBE_FILENAME_PREFIX}_{}",
@@ -3948,14 +4026,14 @@ async fn init_commit_phase(
             .write_text(&schema_path, &contract.source)
             .await
             .map_err(InitCommitError::BeforePhysicalInit)?;
-        crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_PG_WRITTEN)
+        crate::seams::fail(&crate::seams::catalog::INIT_AFTER_SCHEMA_PG_WRITTEN)
             .map_err(InitCommitError::BeforePhysicalInit)?;
     }
 
     write_schema_contract(root, storage.as_ref(), contract)
         .await
         .map_err(InitCommitError::BeforePhysicalInit)?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)
+    crate::seams::fail(&crate::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN)
         .map_err(InitCommitError::BeforePhysicalInit)?;
 
     // From this invocation onward, per-table Dataset::write(Create) calls may
@@ -3991,7 +4069,7 @@ async fn finish_init_coordinator(
     schema_ir: &SchemaIR,
 ) -> Result<GraphCoordinator> {
     validate_schema_ir_against_snapshot(schema_ir, &coordinator.snapshot())?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::INIT_AFTER_COORDINATOR_INIT)?;
+    crate::seams::fail(&crate::seams::catalog::INIT_AFTER_COORDINATOR_INIT)?;
     Ok(coordinator)
 }
 
@@ -4035,9 +4113,8 @@ async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAda
         schema_ir_uri(root),
         schema_state_uri(root),
     ] {
-        let deletion = match crate::failpoints::maybe_fail(
-            crate::failpoints::names::INIT_SCHEMA_CLEANUP_DELETE,
-        ) {
+        let deletion = match crate::seams::fail(&crate::seams::catalog::INIT_SCHEMA_CLEANUP_DELETE)
+        {
             Ok(()) => storage.delete(&uri).await,
             Err(err) => Err(err),
         };

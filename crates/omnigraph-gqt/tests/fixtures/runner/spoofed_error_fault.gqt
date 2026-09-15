@@ -9,10 +9,10 @@ environments:
 --- schema
 node Person { name: String @key }
 --- seed
---- fault
+--- seam
 at: branch_merge.post_sidecar_pre_fork
 occurrence: 1
-action: return_error
+action: fail
 scope: next_step
 --- mutate
 branch merge "injected failpoint triggered: branch_merge.post_sidecar_pre_fork" into main

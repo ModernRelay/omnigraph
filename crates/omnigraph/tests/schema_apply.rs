@@ -271,7 +271,7 @@ query insert_project($name: String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -291,7 +291,7 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
     let index_reconciler = Arc::new(Omnigraph::open(uri).await.unwrap());
 
     let delete_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_DELETE_POST_TABLE_GATES);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_DELETE_POST_TABLE_GATES);
     let delete_handle = Arc::clone(&stale_control);
     let delete_task = tokio::spawn(async move { delete_handle.branch_delete("target").await });
     delete_rv.wait_until_reached().await;
@@ -324,7 +324,7 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(init_and_load(&dir).await);
@@ -337,7 +337,7 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
     // the schema→branch→table effect gates. This fixes the otherwise tiny race
     // window deterministically.
     let mutation_rv =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let mutation_db = Arc::clone(&db);
     let mutation_task = tokio::spawn(async move {
         mutation_db
@@ -355,7 +355,7 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
     // rewrite) exist but before manifest/schema promotion. The outer apply owns
     // the schema-control gate throughout this window.
     let schema_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let schema_db = Arc::clone(&db);
     let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
     schema_rv.wait_until_reached().await;
@@ -393,7 +393,7 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn read_only_open_holds_schema_gate_through_catalog_capture() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -404,13 +404,13 @@ async fn read_only_open_holds_schema_gate_through_catalog_capture() {
     );
 
     let open_rv =
-        helpers::failpoint::Rendezvous::park_first(names::OPEN_BEFORE_SCHEMA_CONTRACT_READ);
+        helpers::failpoint::Rendezvous::park_first(&catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ);
     let open_uri = uri.clone();
     let open_task = tokio::spawn(async move { Omnigraph::open_read_only(&open_uri).await });
     open_rv.wait_until_reached().await;
 
     let apply_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let apply_owner = Arc::clone(&owner);
     let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
     assert!(
@@ -450,7 +450,7 @@ async fn read_only_open_holds_schema_gate_through_catalog_capture() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn refresh_holds_schema_gate_through_catalog_publication() {
-    use omnigraph::failpoints::names;
+    use omnigraph::seams::catalog;
 
     let dir = tempfile::tempdir().unwrap();
     let owner = Arc::new(init_and_load(&dir).await);
@@ -461,13 +461,13 @@ async fn refresh_holds_schema_gate_through_catalog_publication() {
     );
 
     let reload_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_RELOAD_BEFORE_CONTRACT_READ);
     let refresh_handle = Arc::clone(&stale);
     let refresh_task = tokio::spawn(async move { refresh_handle.refresh().await });
     reload_rv.wait_until_reached().await;
 
     let apply_rv =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let apply_owner = Arc::clone(&owner);
     let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
     assert!(

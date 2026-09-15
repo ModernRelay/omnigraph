@@ -5,6 +5,7 @@
 //! OmniGraph's single-writer-process schema, branch, and table gates.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use lance::Dataset;
 use lance::dataset::refs::{BranchContents, BranchIdentifier, check_valid_branch};
@@ -22,30 +23,144 @@ pub(crate) enum BranchCreateOutcome {
     RefAlreadyExists,
 }
 
-const BRANCH_ENUMERATION_MAX_ATTEMPTS: usize = 3;
+const BRANCH_REF_READ_MAX_ATTEMPTS: usize = 3;
 
-/// List Lance's authoritative named-branch refs through one bounded
-/// read-only retry boundary.
-///
-/// Lance first lists `_refs/branches/` and then reads each listed ref. A legal
-/// concurrent delete can remove one ref between those two reads, yielding a
-/// `NotFound` even though a fresh enumeration is valid. Relisting is safe: it
-/// has no durable effect and does not replay the enclosing graph operation.
-/// Every other failure, and repeated branch churn beyond the fixed bound,
-/// retains the substrate error for the owning operation to classify.
+/// Retry a read-only branch ref read across Lance's two ref races: a ref
+/// deleted between list and read (`NotFound`) and a ref rewritten between
+/// `head` and `get_range` (a torn prefix: `Arrow`, or `CorruptFile` mid-char).
+async fn read_branch_refs<T, F, Fut>(read: F, raced: fn(&lance::Error) -> bool) -> lance::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = lance::Result<T>>,
+{
+    for attempt in 1..BRANCH_REF_READ_MAX_ATTEMPTS {
+        match read().await {
+            Err(error) if raced(&error) => {
+                tracing::debug!(attempt, %error, "branch ref read raced a concurrent ref change; rereading");
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    read().await
+}
+
+fn is_torn_ref_read(error: &lance::Error) -> bool {
+    matches!(
+        error,
+        lance::Error::Arrow { .. } | lance::Error::CorruptFile { .. }
+    )
+}
+
+fn is_raced_ref_read(error: &lance::Error) -> bool {
+    matches!(error, lance::Error::NotFound { .. }) || is_torn_ref_read(error)
+}
+
+/// List Lance's authoritative named-branch refs through the bounded read-only
+/// retry boundary. Relisting is safe: it has no durable effect and does not
+/// replay the enclosing graph operation; churn beyond the bound keeps the error.
 pub(crate) async fn list_branch_contents(
     dataset: &Dataset,
 ) -> Result<HashMap<String, BranchContents>> {
-    for attempt in 1..=BRANCH_ENUMERATION_MAX_ATTEMPTS {
-        match dataset.list_branches().await {
-            Ok(branches) => return Ok(branches),
-            Err(lance::Error::NotFound { .. }) if attempt < BRANCH_ENUMERATION_MAX_ATTEMPTS => {
-                tokio::task::yield_now().await;
+    read_branch_refs(|| dataset.list_branches(), is_raced_ref_read)
+        .await
+        .map_err(OmniError::storage)
+}
+
+/// Read one physical ref through the same bounded retry boundary; the caller
+/// maps `RefNotFound` to its own public miss.
+pub(crate) async fn get_branch_contents(
+    dataset: &Dataset,
+    branch: &str,
+) -> lance::Result<BranchContents> {
+    read_branch_refs(
+        || async move { dataset.branches().get(branch).await },
+        is_raced_ref_read,
+    )
+    .await
+}
+
+/// Read one physical ref's exact lifetime identity; same boundary and
+/// `RefNotFound` contract as `get_branch_contents`.
+pub(crate) async fn get_branch_identifier(
+    dataset: &Dataset,
+    native: &str,
+) -> lance::Result<BranchIdentifier> {
+    read_branch_refs(
+        || async move { dataset.branches().get_identifier(Some(native)).await },
+        is_raced_ref_read,
+    )
+    .await
+}
+
+/// The identity of the ref a dataset handle is checked out on, through the
+/// same boundary; every engine read of `Dataset::branch_identifier` goes here.
+pub(crate) async fn dataset_branch_identifier(
+    dataset: &Dataset,
+) -> lance::Result<BranchIdentifier> {
+    read_branch_refs(|| dataset.branch_identifier(), is_raced_ref_read).await
+}
+
+/// Resolve a logical branch to its single live native ref by reading only that
+/// branch's own incarnations: one listing of `_refs/branches/`, then Lance's own
+/// listing read per candidate; a sibling's rewrite or a reclaimed candidate cannot fail it.
+pub(crate) async fn resolve_live_native_branch(
+    dataset: &Dataset,
+    logical: &str,
+) -> Result<Option<String>> {
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?;
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let mut live = Vec::new();
+    for native in list_branch_ref_names(&store, &root.path).await? {
+        if crate::branch_names::logical_branch_name(&native) != logical {
+            continue;
+        }
+        let path = lance::dataset::refs::branch_contents_path(&root.path, &native);
+        let (path, store, name) = (&path, &store, native.as_str());
+        let read = || async move { BranchContents::from_path(path, store, name).await };
+        match read_branch_refs(read, is_torn_ref_read).await {
+            Ok(contents) => {
+                if manifest_branch_is_live(&native, &contents)? {
+                    live.push(native);
+                }
             }
+            Err(lance::Error::NotFound { .. }) => {}
             Err(error) => return Err(OmniError::storage(error)),
         }
     }
-    unreachable!("the bounded branch-enumeration loop always returns")
+    crate::branch_names::resolve_native_branch(live.iter().map(String::as_str), logical)
+}
+
+/// Every native ref name under `_refs/branches/`, decoded the way Lance's own
+/// listing decodes them; no ref is read.
+async fn list_branch_ref_names(
+    store: &lance::io::ObjectStore,
+    root: &object_store::path::Path,
+) -> Result<Vec<String>> {
+    let directory = lance::dataset::refs::base_branches_contents_path(root);
+    let files = store
+        .read_dir(directory)
+        .await
+        .map_err(OmniError::storage)?;
+    files
+        .iter()
+        .filter_map(|file| file.strip_suffix(".json"))
+        .map(|encoded| {
+            object_store::path::Path::from_url_path(encoded)
+                .map(|path| path.to_string())
+                .map_err(|error| {
+                    OmniError::storage(lance::Error::InvalidRef {
+                        message: format!("branch ref name '{encoded}' does not decode: {error}"),
+                    })
+                })
+        })
+        .collect()
 }
 
 /// Enumerate physical native lifetimes, including retired graph manifests.
@@ -109,7 +224,7 @@ pub(crate) async fn get_live_manifest_branch_contents(
     let not_found = || OmniError::BranchNotFound {
         branch: crate::branch_names::logical_branch_name(branch).to_string(),
     };
-    let contents = match dataset.branches().get(branch).await {
+    let contents = match get_branch_contents(dataset, branch).await {
         Ok(contents) => contents,
         Err(lance::Error::RefNotFound { .. }) => {
             return Err(not_found());
@@ -175,9 +290,7 @@ pub(crate) async fn retire_branch_recoverably(
     let mut metadata = contents.metadata;
     metadata.insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), value);
     let result = match dataset.branches().replace_metadata(branch, metadata).await {
-        Ok(()) => {
-            crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_DELETE_POST_NATIVE)
-        }
+        Ok(()) => crate::seams::fail(&crate::seams::catalog::BRANCH_DELETE_POST_NATIVE),
         Err(error) => Err(OmniError::storage(error)),
     };
     let Err(error) = result else { return Ok(()) };
@@ -349,7 +462,7 @@ pub(crate) async fn create_unique_table_fork(
     let created = crate::storage_layer::lance_clone::create_branch(source, branch, source_version)
         .await
         .map_err(OmniError::storage)?;
-    crate::failpoints::maybe_fail(crate::failpoints::names::BRANCH_CREATE_POST_NATIVE)?;
+    crate::seams::fail(&crate::seams::catalog::BRANCH_CREATE_POST_NATIVE)?;
     Ok(created)
 }
 
@@ -378,8 +491,7 @@ pub(crate) async fn create_branch_recoverably(
     }
 
     let parent_branch = source.manifest().branch.clone();
-    let parent_identifier = source
-        .branch_identifier()
+    let parent_identifier = dataset_branch_identifier(source)
         .await
         .map_err(OmniError::storage)?;
 
@@ -403,12 +515,12 @@ pub(crate) async fn create_branch_recoverably(
                 .await
                 .map_err(OmniError::storage)
             {
-                Ok(_) => match crate::failpoints::maybe_fail(
-                    crate::failpoints::names::BRANCH_CREATE_POST_NATIVE,
-                ) {
-                    Ok(()) => return Ok(BranchCreateOutcome::Created),
-                    Err(error) => error,
-                },
+                Ok(_) => {
+                    match crate::seams::fail(&crate::seams::catalog::BRANCH_CREATE_POST_NATIVE) {
+                        Ok(()) => return Ok(BranchCreateOutcome::Created),
+                        Err(error) => error,
+                    }
+                }
                 Err(error) => error,
             };
 
@@ -496,37 +608,67 @@ mod tests {
                 .is_some_and(|parent| is_branch_ref_directory(&parent))
     }
 
+    /// What one injected read of the target ref observes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InjectedRefRead {
+        /// The ref is deleted first, so the real read answers `NotFound`: the
+        /// delete race.
+        DeleteThenRead,
+        /// A synthetic `NotFound`; the ref itself stays intact.
+        NotFound,
+        /// `head` reports two bytes less than the object holds, so the
+        /// following `get_range` returns a prefix: the rewrite race. The
+        /// injection counts pin Lance 11's `head` per read; they move at the bump.
+        StaleHeadSize,
+        /// `head` reports a size that cuts the object inside its first
+        /// multi-byte character, so the prefix is not UTF-8 at all.
+        StaleHeadSizeMidChar,
+    }
+
+    impl InjectedRefRead {
+        fn injects_on_head_only(self) -> bool {
+            matches!(self, Self::StaleHeadSize | Self::StaleHeadSizeMidChar)
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct VanishingBranchRefFault {
         remaining_failures: Arc<AtomicUsize>,
         injected_failures: Arc<AtomicUsize>,
         branch_lists: Arc<AtomicUsize>,
-        delete_ref: bool,
-        always_not_found: bool,
+        read: InjectedRefRead,
         target_file: Arc<str>,
     }
 
     impl VanishingBranchRefFault {
         fn delete_once(target_file: &str) -> Self {
-            Self::new(target_file, 1, true, false)
+            Self::new(target_file, 1, InjectedRefRead::DeleteThenRead)
         }
 
         fn always_not_found(target_file: &str) -> Self {
-            Self::new(target_file, 0, false, true)
+            Self::new(target_file, usize::MAX, InjectedRefRead::NotFound)
         }
 
-        fn new(
-            target_file: &str,
-            failures: usize,
-            delete_ref: bool,
-            always_not_found: bool,
-        ) -> Self {
+        fn stale_head_size_once(target_file: &str) -> Self {
+            Self::new(target_file, 1, InjectedRefRead::StaleHeadSize)
+        }
+
+        /// `Branches::get` probes the ref with `exists` (one `head`) before
+        /// `from_path`'s own `head`; the second stale answer is the torn read.
+        fn stale_head_size_twice(target_file: &str) -> Self {
+            Self::new(target_file, 2, InjectedRefRead::StaleHeadSize)
+        }
+
+        fn stale_head_size_mid_char_once(target_file: &str) -> Self {
+            Self::new(target_file, 1, InjectedRefRead::StaleHeadSizeMidChar)
+        }
+
+        fn new(target_file: &str, failures: usize, read: InjectedRefRead) -> Self {
             Self {
                 remaining_failures: Arc::new(AtomicUsize::new(failures)),
                 injected_failures: Arc::new(AtomicUsize::new(0)),
                 branch_lists: Arc::new(AtomicUsize::new(0)),
-                delete_ref,
-                always_not_found,
+                read,
                 target_file: Arc::from(target_file),
             }
         }
@@ -585,28 +727,46 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
-            if is_target_branch_ref(location, &self.fault.target_file) {
-                let injected = self.fault.always_not_found
-                    || self
-                        .fault
-                        .remaining_failures
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok();
-                if injected {
-                    self.fault.injected_failures.fetch_add(1, Ordering::SeqCst);
-                    if self.fault.delete_ref {
+            let targets_ref = is_target_branch_ref(location, &self.fault.target_file)
+                && (options.head || !self.fault.read.injects_on_head_only());
+            let injected = targets_ref
+                && self
+                    .fault
+                    .remaining_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok();
+            if injected {
+                self.fault.injected_failures.fetch_add(1, Ordering::SeqCst);
+                match self.fault.read {
+                    InjectedRefRead::DeleteThenRead => {
                         self.target.delete(location).await?;
-                        return self.target.get_opts(location, options).await;
                     }
-                    return Err(object_store::Error::NotFound {
-                        path: location.to_string(),
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "injected branch-ref deletion race",
-                        )),
-                    });
+                    InjectedRefRead::NotFound => {
+                        return Err(object_store::Error::NotFound {
+                            path: location.to_string(),
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "injected branch-ref deletion race",
+                            )),
+                        });
+                    }
+                    InjectedRefRead::StaleHeadSize => {
+                        let mut result = self.target.get_opts(location, options).await?;
+                        result.meta.size -= 2;
+                        return Ok(result);
+                    }
+                    InjectedRefRead::StaleHeadSizeMidChar => {
+                        let mut result = self.target.get_opts(location, options).await?;
+                        let bytes = self.target.get(location).await?.bytes().await?;
+                        let first_multibyte = bytes
+                            .iter()
+                            .position(|byte| *byte >= 0x80)
+                            .expect("the target ref must carry a multi-byte character");
+                        result.meta.size = (first_multibyte + 1) as u64;
+                        return Ok(result);
+                    }
                 }
             }
             self.target.get_opts(location, options).await
@@ -724,11 +884,206 @@ mod tests {
             OmniError::Storage(ref failure)
                 if failure.kind == crate::error::StorageFailureKind::NotFound
         ));
-        assert_eq!(fault.branch_lists(), BRANCH_ENUMERATION_MAX_ATTEMPTS);
+        assert_eq!(fault.branch_lists(), BRANCH_REF_READ_MAX_ATTEMPTS);
         assert!(
-            fault.injected_failures() >= BRANCH_ENUMERATION_MAX_ATTEMPTS,
+            fault.injected_failures() >= BRANCH_REF_READ_MAX_ATTEMPTS,
             "every branch-list attempt must observe the injected missing ref"
         );
+    }
+
+    #[tokio::test]
+    async fn branch_enumeration_relists_after_a_ref_rewrite_between_head_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("retiring", version, None)
+            .await
+            .unwrap();
+        dataset
+            .create_branch("survivor", version, None)
+            .await
+            .unwrap();
+
+        let fault = Arc::new(VanishingBranchRefFault::stale_head_size_once(
+            "retiring.json",
+        ));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&fault) as Arc<dyn WrappingObjectStore>]);
+
+        let branches = list_branch_contents(&wrapped).await.unwrap();
+        assert!(branches.contains_key("retiring"));
+        assert!(branches.contains_key("survivor"));
+        assert_eq!(fault.injected_failures(), 1);
+        assert_eq!(fault.branch_lists(), 2);
+    }
+
+    #[tokio::test]
+    async fn branch_get_rereads_after_a_ref_rewrite_between_head_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("retiring", version, None)
+            .await
+            .unwrap();
+
+        let fault = Arc::new(VanishingBranchRefFault::stale_head_size_twice(
+            "retiring.json",
+        ));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&fault) as Arc<dyn WrappingObjectStore>]);
+
+        let contents = get_live_manifest_branch_contents(&wrapped, "retiring")
+            .await
+            .unwrap();
+        assert_eq!(contents.parent_version, version);
+        assert_eq!(fault.injected_failures(), 2);
+    }
+
+    #[tokio::test]
+    async fn branch_enumeration_relists_after_a_prefix_cut_inside_a_multibyte_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("retiring", version, None)
+            .await
+            .unwrap();
+        dataset
+            .branches()
+            .replace_metadata(
+                "retiring",
+                HashMap::from([("note".to_string(), "équipe".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        let fault = Arc::new(VanishingBranchRefFault::stale_head_size_mid_char_once(
+            "retiring.json",
+        ));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&fault) as Arc<dyn WrappingObjectStore>]);
+
+        let branches = list_branch_contents(&wrapped).await.unwrap();
+        assert_eq!(branches["retiring"].metadata["note"], "équipe");
+        assert_eq!(fault.injected_failures(), 1);
+        assert_eq!(fault.branch_lists(), 2);
+    }
+
+    #[tokio::test]
+    async fn branch_identifier_rereads_after_a_ref_rewrite_between_head_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("retiring", version, None)
+            .await
+            .unwrap();
+        let expected = dataset.branches().get("retiring").await.unwrap().identifier;
+
+        let fault = Arc::new(VanishingBranchRefFault::stale_head_size_twice(
+            "retiring.json",
+        ));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&fault) as Arc<dyn WrappingObjectStore>]);
+
+        let identifier = get_branch_identifier(&wrapped, "retiring").await.unwrap();
+        assert_eq!(identifier, expected);
+        assert_eq!(fault.injected_failures(), 2);
+    }
+
+    /// The nightly's failure shape: resolving one branch read every ref, so
+    /// another actor's retirement rewrite tore the lookup.
+    #[tokio::test]
+    async fn resolving_a_branch_reads_only_its_own_incarnations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        let native = |logical: &str| {
+            crate::branch_names::native_branch_name(
+                logical,
+                &crate::branch_names::mint_incarnation(),
+            )
+        };
+        let (live, retired, sibling, nested, other) = (
+            native("dev"),
+            native("dev"),
+            native("dev-2"),
+            native("team/dev"),
+            native("feature"),
+        );
+        for name in [&live, &retired, &sibling, &nested, &other] {
+            dataset.create_branch(name, version, None).await.unwrap();
+        }
+        let retired_identifier = dataset.branches().get(&retired).await.unwrap().identifier;
+        retire_branch_recoverably(&dataset, &retired, &retired_identifier)
+            .await
+            .unwrap();
+
+        let fault = Arc::new(VanishingBranchRefFault::new(
+            &format!("{other}.json"),
+            usize::MAX,
+            InjectedRefRead::StaleHeadSize,
+        ));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&fault) as Arc<dyn WrappingObjectStore>]);
+
+        list_live_manifest_branch_contents(&wrapped)
+            .await
+            .expect_err("reading every ref meets the other branch's torn ref");
+        assert!(fault.injected_failures() > 0);
+
+        let listings_before = fault.branch_lists();
+        let resolved = resolve_live_native_branch(&wrapped, "dev").await.unwrap();
+        assert_eq!(resolved.as_deref(), Some(live.as_str()));
+        let resolved = resolve_live_native_branch(&wrapped, "dev-2").await.unwrap();
+        assert_eq!(resolved.as_deref(), Some(sibling.as_str()));
+        let resolved = resolve_live_native_branch(&wrapped, "team/dev")
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some(nested.as_str()));
+        assert_eq!(
+            resolve_live_native_branch(&wrapped, "absent")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fault.branch_lists() - listings_before,
+            4,
+            "each resolve lists the ref directory exactly once"
+        );
+        assert_eq!(
+            fault.injected_failures(),
+            BRANCH_REF_READ_MAX_ATTEMPTS,
+            "the four resolves never read the other branch's ref; only the listing above did"
+        );
+
+        let every_live = list_live_manifest_branch_contents(&dataset).await.unwrap();
+        for logical in ["dev", "dev-2", "team/dev", "feature", "absent"] {
+            assert_eq!(
+                resolve_live_native_branch(&dataset, logical).await.unwrap(),
+                crate::branch_names::resolve_native_branch(
+                    every_live.keys().map(String::as_str),
+                    logical
+                )
+                .unwrap(),
+                "resolving '{logical}' by its own refs must agree with the full listing"
+            );
+        }
+
+        let vanish = Arc::new(VanishingBranchRefFault::delete_once(&format!(
+            "{live}.json"
+        )));
+        let wrapped = dataset
+            .with_object_store_wrappers(vec![Arc::clone(&vanish) as Arc<dyn WrappingObjectStore>]);
+        assert_eq!(
+            resolve_live_native_branch(&wrapped, "dev").await.unwrap(),
+            None,
+            "a candidate reclaimed between the listing and its read is skipped, not an error"
+        );
+        assert_eq!(vanish.injected_failures(), 1);
     }
 
     #[test]
@@ -768,7 +1123,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn retire_classifies_durable_metadata_after_lost_ack_and_retries() {
-        let _scenario = crate::failpoints::FailScenario::setup();
+        let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let mut dataset = test_dataset(&dir).await;
         let version = dataset.version().version;
@@ -785,10 +1140,7 @@ mod tests {
             .unwrap();
         let original = dataset.branches().get("feature").await.unwrap();
         {
-            let _lost_ack = crate::failpoints::ScopedFailPoint::new(
-                crate::failpoints::names::BRANCH_DELETE_POST_NATIVE,
-                "return",
-            );
+            let _lost_ack = crate::seams::catalog::BRANCH_DELETE_POST_NATIVE.fire_always();
             retire_branch_recoverably(&dataset, "feature", &original.identifier)
                 .await
                 .unwrap();

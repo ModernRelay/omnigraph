@@ -13,11 +13,10 @@ use lance::Dataset;
 use lance::dataset::{CommitBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
-use omnigraph::failpoints::FailScenario;
-use omnigraph::failpoints::ScopedFailPoint;
-use omnigraph::failpoints::names;
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::seams::FailScenario;
+use omnigraph::seams::catalog;
 use serial_test::serial;
 
 use helpers::recovery::{
@@ -299,7 +298,7 @@ async fn native_branch_controls_reclassify_lost_acknowledgements() {
     let before_commits = db.list_commits(Some("main")).await.unwrap().len();
 
     {
-        let _fp = ScopedFailPoint::new(names::BRANCH_CREATE_POST_NATIVE, "return");
+        let _fp = catalog::BRANCH_CREATE_POST_NATIVE.fire_always();
         db.branch_create("feature")
             .await
             .expect("matching BranchContents must classify a lost create acknowledgement");
@@ -313,7 +312,7 @@ async fn native_branch_controls_reclassify_lost_acknowledgements() {
     );
 
     {
-        let _fp = ScopedFailPoint::new(names::BRANCH_DELETE_POST_NATIVE, "return");
+        let _fp = catalog::BRANCH_DELETE_POST_NATIVE.fire_always();
         db.branch_delete("feature")
             .await
             .expect("absent BranchContents must classify a lost delete acknowledgement");
@@ -370,7 +369,7 @@ async fn branch_delete_cleanup_failure_converges_on_retry() {
         "delete leaves table forks for cleanup"
     );
     {
-        let _fp = ScopedFailPoint::new(names::CLEANUP_RECONCILE_FORK, "return");
+        let _fp = catalog::CLEANUP_RECONCILE_FORK.fire_always();
         main.cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -547,7 +546,7 @@ async fn branch_delete_acknowledges_with_forks_awaiting_cleanup() {
         .unwrap();
     let person_uri = node_table_uri(&main, "Person").await;
     {
-        let _fp = ScopedFailPoint::new(names::CLEANUP_RECONCILE_FORK, "panic");
+        let _fp = catalog::CLEANUP_RECONCILE_FORK.panic_at();
         main.branch_delete("feature").await.unwrap();
         assert_eq!(main.branch_list().await.unwrap(), vec!["main".to_string()]);
     }
@@ -614,7 +613,7 @@ async fn branch_recreate_completes_while_old_forks_await_cleanup() {
     let racer = Omnigraph::open(&uri).await.unwrap();
     main.branch_delete("feature").await.unwrap();
     let mut racer = {
-        let _fp = ScopedFailPoint::new(names::CLEANUP_RECONCILE_FORK, "panic");
+        let _fp = catalog::CLEANUP_RECONCILE_FORK.panic_at();
         let create =
             tokio::spawn(async move { racer.branch_create("feature").await.map(|()| racer) });
         tokio::time::timeout(std::time::Duration::from_secs(30), create)
@@ -721,7 +720,7 @@ async fn fresh_fork_write_ignores_unavailable_cleanup_classifier() {
         .unwrap();
     let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
     {
-        let _fp = ScopedFailPoint::new(names::CLASSIFY_FRESH_READ, "return");
+        let _fp = catalog::CLASSIFY_FRESH_READ.fire_always();
         db.load_as("feature", None, row, LoadMode::Merge, None)
             .await
             .expect("fresh writes do not require cleanup classification");
@@ -800,7 +799,7 @@ async fn cleanup_isolates_single_table_failure() {
     }
 
     // One table's version GC fails once; the sweep must isolate it.
-    let _fp = ScopedFailPoint::new(names::CLEANUP_TABLE_GC, "1*return");
+    let _fp = catalog::CLEANUP_TABLE_GC.fire_once_at(1);
     let stats = db
         .cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
@@ -855,7 +854,7 @@ async fn cleanup_isolates_reconcile_failure() {
     // Inject a one-shot failure into the reconcile force-delete. The sweep must
     // not abort.
     {
-        let _fp = ScopedFailPoint::new(names::CLEANUP_RECONCILE_FORK, "1*return");
+        let _fp = catalog::CLEANUP_RECONCILE_FORK.fire_once_at(1);
         db.cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -932,7 +931,7 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     // With the fresh re-check failing, the fork's status is Indeterminate (the
     // branch is live but unreadable) → cleanup must SKIP it, not delete.
     {
-        let _fp = ScopedFailPoint::new(names::CLASSIFY_FRESH_READ, "return");
+        let _fp = catalog::CLASSIFY_FRESH_READ.fire_always();
         db.cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -990,7 +989,7 @@ async fn fork_collision_with_live_concurrent_fork_reprepares() {
     let main = helpers::init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let rv = helpers::failpoint::Rendezvous::park_first(names::FORK_BEFORE_CLASSIFY);
+    let rv = helpers::failpoint::Rendezvous::park_first(&catalog::FORK_BEFORE_CLASSIFY);
 
     let uri_a = uri.clone();
     let writer_a = tokio::spawn(async move {
@@ -1062,7 +1061,7 @@ async fn cross_handle_reclaim_never_deletes_live_intent_owned_fork() {
     let db_a = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FORK_PRE_COMMIT);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FORK_PRE_COMMIT);
 
     let writer_a_db = std::sync::Arc::clone(&db_a);
     let writer_a = tokio::spawn(async move {
@@ -1175,7 +1174,7 @@ async fn armed_first_touch_recovery_accepts_missing_target_ref() {
     db.branch_create("feature").await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        let _failpoint = catalog::MUTATION_POST_SIDECAR_PRE_FORK.fire_always();
         let err = db
             .mutate(
                 "feature",
@@ -1440,7 +1439,7 @@ async fn armed_first_touch_recovery_leaves_legacy_overlap_for_cleanup() {
     drop(manifest);
 
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        let _failpoint = catalog::MUTATION_POST_SIDECAR_PRE_FORK.fire_always();
         let error = db
             .mutate(
                 "feature",
@@ -1628,7 +1627,7 @@ async fn partial_first_touch_recovery_restores_in_place_with_path_descendants() 
             .unwrap();
     }
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_TABLE_COMMIT, "return");
+        let _failpoint = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
         let error = db
             .mutate(
                 "feature",
@@ -1772,7 +1771,7 @@ async fn load_without_explicit_base_does_not_add_main_to_recovery_scope() {
     // must defer it, giving the load barrier a real unresolved main operation to
     // filter rather than a synthetic test-only record.
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_CONFIRM, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_CONFIRM.fire_always();
         let err = db
             .mutate(
                 "main",
@@ -1844,8 +1843,7 @@ async fn armed_first_touch_recovery_defers_exact_fork_cleanup() {
             db.branch_create("feature").await.unwrap();
 
             {
-                let _failpoint =
-                    ScopedFailPoint::new(names::MUTATION_POST_FORK_PRE_COMMIT, "return");
+                let _failpoint = catalog::MUTATION_POST_FORK_PRE_COMMIT.fire_always();
                 let err = db
                     .mutate(
                         "feature",
@@ -1978,7 +1976,7 @@ async fn cross_handle_refresh_waits_for_live_confirmed_writer() {
     let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
     let writer_db = std::sync::Arc::clone(&db_a);
     let writer = tokio::spawn(async move {
         writer_db
@@ -2038,7 +2036,7 @@ async fn recovery_discovery_skips_sidecar_deleted_after_list() {
     let db_b = Arc::new(Omnigraph::open(&uri).await.unwrap());
 
     let writer_rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
     let writer_db = Arc::clone(&db_a);
     let writer = tokio::spawn(async move {
         writer_db
@@ -2060,7 +2058,7 @@ async fn recovery_discovery_skips_sidecar_deleted_after_list() {
     );
 
     let discovery_rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
+        helpers::failpoint::Rendezvous::park_first(&catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
     let follower_db = Arc::clone(&db_b);
     let follower = tokio::spawn(async move {
         follower_db
@@ -2121,7 +2119,7 @@ async fn read_only_recovery_discovery_skips_sidecar_deleted_after_list() {
     let db = helpers::init_and_load(&dir).await;
 
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_CONFIRM, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_CONFIRM.fire_always();
         let error = db
             .mutate(
                 "main",
@@ -2142,7 +2140,7 @@ async fn read_only_recovery_discovery_skips_sidecar_deleted_after_list() {
     );
 
     let discovery_rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
+        helpers::failpoint::Rendezvous::park_first(&catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
     let reader_uri = uri.clone();
     let reader = tokio::spawn(async move { Omnigraph::open_read_only(&reader_uri).await });
     discovery_rendezvous.wait_until_reached().await;
@@ -2181,7 +2179,7 @@ async fn read_write_open_waits_for_live_armed_prefork_writer() {
     db_a.branch_create("feature").await.unwrap();
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_SIDECAR_PRE_FORK);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_SIDECAR_PRE_FORK);
     let writer_db = std::sync::Arc::clone(&db_a);
     let writer = tokio::spawn(async move {
         writer_db
@@ -2238,7 +2236,7 @@ async fn full_recovery_converges_multiple_no_effect_claims_for_one_fork() {
     db.branch_create("feature").await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_FORK_PRE_COMMIT, "return");
+        let _failpoint = catalog::MUTATION_POST_FORK_PRE_COMMIT.fire_always();
         let err = db
             .mutate(
                 "feature",
@@ -2345,7 +2343,7 @@ async fn full_recovery_discards_no_effect_claim_before_confirmed_competitor() {
     let armed_sidecar_path;
     let armed_sidecar_body;
     {
-        let _failpoint = ScopedFailPoint::new(names::MUTATION_POST_SIDECAR_PRE_FORK, "return");
+        let _failpoint = catalog::MUTATION_POST_SIDECAR_PRE_FORK.fire_always();
         let err = db
             .mutate(
                 "feature",
@@ -2370,8 +2368,7 @@ async fn full_recovery_discards_no_effect_claim_before_confirmed_competitor() {
     // the exact sidecar bytes after B's confirmed effect is durable.
     std::fs::remove_file(&armed_sidecar_path).unwrap();
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = db
             .mutate(
                 "feature",
@@ -2417,7 +2414,7 @@ async fn graph_publish_failpoint_triggers_before_commit_append() {
     let mut db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
         .await
         .unwrap();
-    let _failpoint = ScopedFailPoint::new(names::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND, "return");
+    let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
 
     let err = mutate_main(
         &mut db,
@@ -2458,7 +2455,7 @@ async fn rfc023_effect_free_conflict_is_typed_or_fully_reprepared() {
         let db = Arc::new(Omnigraph::init(&uri, RFC023_KEY_SCHEMA).await.unwrap());
         let probes = MergeWriteProbes::default();
 
-        let rendezvous = helpers::failpoint::Rendezvous::park_first(names::FORK_BEFORE_CLASSIFY);
+        let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::FORK_BEFORE_CLASSIFY);
         let writer_db = Arc::clone(&db);
         let writer_probes = probes.clone();
         let writer = tokio::spawn(async move {
@@ -2558,7 +2555,7 @@ async fn rfc023_disjoint_retryable_strict_conflict_reprepares_without_key_confli
     let person_uri = node_table_uri(&db, "Person").await;
     let probes = MergeWriteProbes::default();
 
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::FORK_BEFORE_CLASSIFY);
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::FORK_BEFORE_CLASSIFY);
     let writer_db = Arc::clone(&db);
     let writer_probes = probes.clone();
     let writer = tokio::spawn(async move {
@@ -2649,7 +2646,8 @@ async fn rfc023_table_n_conflict_after_table_1_keeps_recovery_ownership() {
     ];
 
     let probes = MergeWriteProbes::default();
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_TABLE_COMMIT);
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_TABLE_COMMIT);
     let writer_db = Arc::clone(&db);
     let writer_probes = probes.clone();
     let writer = tokio::spawn(async move {
@@ -2760,7 +2758,7 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
     let db = std::sync::Arc::new(Omnigraph::init(uri, OCC_UNIQUE_SCHEMA).await.unwrap());
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let writer_a_db = std::sync::Arc::clone(&db);
     let writer_a = tokio::spawn(async move {
         writer_a_db
@@ -2841,7 +2839,7 @@ async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
     let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let writer_a_db = std::sync::Arc::clone(&db);
     let writer_a = tokio::spawn(async move {
         writer_a_db
@@ -2933,8 +2931,9 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
             helpers::mixed_params(&[("$name", "Alice")], &[])
         };
 
-        let rendezvous =
-            helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        let rendezvous = helpers::failpoint::Rendezvous::park_first(
+            &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        );
         let writer_a_db = std::sync::Arc::clone(&db);
         let expected_for_writer = expected.clone();
         let writer_a = tokio::spawn(async move {
@@ -3026,7 +3025,7 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
     let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
     let expected = branch_head_commit_id(dir.path(), "main").await.unwrap();
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_NO_EFFECT_PRE_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_NO_EFFECT_PRE_GATE);
     let writer_a_db = std::sync::Arc::clone(&db);
     let expected_for_writer = expected.clone();
     let writer_a = tokio::spawn(async move {
@@ -3126,7 +3125,7 @@ async fn live_read_refresh_failure_keeps_manifest_and_lineage_coherent() {
     writer.branch_create("feature").await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::READ_REFRESH_POST_STATE_PRE_LINEAGE, "return");
+        let _failpoint = catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE.fire_always();
         reader
             .query_with_head(
                 omnigraph::db::ReadTarget::branch("feature"),
@@ -3164,7 +3163,7 @@ async fn append_load_revalidates_unique_after_pre_effect_authority_change() {
     let db = std::sync::Arc::new(Omnigraph::init(uri, OCC_UNIQUE_SCHEMA).await.unwrap());
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let writer_a_db = std::sync::Arc::clone(&db);
     let writer_a = tokio::spawn(async move {
         writer_a_db
@@ -3242,7 +3241,7 @@ async fn overwrite_load_rejects_disjoint_head_change_before_effects() {
     let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let writer_a_db = std::sync::Arc::clone(&db);
     let writer_a = tokio::spawn(async move {
         writer_a_db
@@ -3342,7 +3341,7 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
     // B passes its initial (empty) recovery heal, stages from the old pin, and
     // pauses before acquiring the effect gates.
     let before_effect =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let follower_db = std::sync::Arc::clone(&db_b);
     let follower = tokio::spawn(async move {
         follower_db
@@ -3360,8 +3359,7 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
     // arrival parks), commits its exact Lance transaction, confirms the v3
     // sidecar, then fails before manifest visibility.
     {
-        let _post_effect_failure =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _post_effect_failure = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = db_a
             .mutate(
                 "main",
@@ -3493,9 +3491,9 @@ async fn cross_handle_branch_gate_serializes_post_effect_publish() {
     // table effect and pauses before visibility. Releasing B makes it contend
     // for the shared branch gate, which A still holds through Phase D.
     let before_effect =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
     let after_effect =
-        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
 
     let writer_b_db = std::sync::Arc::clone(&db_b);
     let mut writer_b = tokio::spawn(async move {
@@ -3575,7 +3573,7 @@ async fn schema_apply_pre_commit_crash_rolls_forward_via_sidecar() {
 
     {
         let db = Omnigraph::init(&uri, SCHEMA_V1).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             err.to_string()
@@ -3619,7 +3617,7 @@ async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
 
     {
         let db = Omnigraph::init(&uri, SCHEMA_V1).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             err.to_string()
@@ -3718,7 +3716,7 @@ edge WorksAt: Person -> Company
     let db = std::sync::Arc::new(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
     let stale_reader = Omnigraph::open(&uri).await.unwrap();
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT);
 
     let apply_db = std::sync::Arc::clone(&db);
     let apply_task = tokio::spawn(async move { apply_db.apply_schema(SCHEMA_V2_WITH_EDGE).await });
@@ -3914,8 +3912,7 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     // Setup: trigger the residual.
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
 
         // The mutation's finalize completes (commit_staged advances Lance
         // HEAD on node:Person AND writes a `__recovery/{ulid}.json`
@@ -4022,8 +4019,7 @@ async fn azure_recovery_rolls_forward_after_finalize_publisher_failure() {
             .published_dataset_version;
 
         {
-            let _failpoint =
-                ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+            let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
             let err = mutate_main(
                 &mut db,
                 MUTATION_QUERIES,
@@ -4116,8 +4112,7 @@ async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently()
     // Setup: leave one pending sidecar (node:Person at Lance v+1, manifest v).
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -4139,7 +4134,7 @@ async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently()
     // through. wait_until_reached gates the second open so it is guaranteed
     // to be the one that converges the sidecar.
     let rv =
-        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH);
+        helpers::failpoint::Rendezvous::park_first(&catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH);
 
     let uri_parked = uri.clone();
     let parked_open = tokio::spawn(async move { Omnigraph::open(&uri_parked).await });
@@ -4216,7 +4211,7 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
         // then lands deterministically before the delete resumes, so the
         // delete's manifest CAS is guaranteed stale — no retry loop, no sleep.
         let rv = helpers::failpoint::Rendezvous::park_first(
-            names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE,
+            &catalog::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE,
         );
 
         let del_db = Arc::clone(&db);
@@ -4306,8 +4301,7 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
             .published_dataset_version;
         feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
 
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = db
             .load(
                 "feature",
@@ -4400,8 +4394,7 @@ async fn recovery_rolls_forward_load_overwrite() {
         .unwrap();
         parent_commit_id = branch_head_commit_id(dir.path(), "main").await.unwrap();
 
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = db
             .load(
                 "main",
@@ -4539,10 +4532,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
     let feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(
-            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db.ensure_indices_on("feature").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -4615,10 +4605,7 @@ async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
 
     let same_handle_operation_id;
     {
-        let _failpoint = ScopedFailPoint::new(
-            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db.ensure_indices_on("feature").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -4691,8 +4678,7 @@ async fn ensure_indices_complete_armed_effects_roll_back() {
 
     let operation_id;
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM, "return");
+        let _failpoint = catalog::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM.fire_always();
         let err = db
             .ensure_indices()
             .await
@@ -4778,7 +4764,7 @@ async fn ensure_indices_partial_armed_case(full_text_rebuild: bool) {
 
     let operation_id;
     {
-        let _failpoint = ScopedFailPoint::new(names::ENSURE_INDICES_POST_TABLE_EFFECT, "return");
+        let _failpoint = catalog::ENSURE_INDICES_POST_TABLE_EFFECT.fire_always();
         let err = run_index_maintenance(&db, "main", full_text_rebuild)
             .await
             .expect_err("failpoint must stop after the first of two table effects");
@@ -4825,8 +4811,7 @@ async fn ensure_indices_partial_armed_case(full_text_rebuild: bool) {
     );
 
     let retry_error = {
-        let _failpoint =
-            ScopedFailPoint::new(names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE, "return");
+        let _failpoint = catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE.fire_always();
         run_index_maintenance(&db, "main", full_text_rebuild)
             .await
             .expect_err("rollback-only ownership must refuse before remaining index staging")
@@ -4877,10 +4862,7 @@ async fn full_text_rebuild_confirmed_recovery_preserves_original_actor_and_publi
     let parent = before_commits[0].graph_commit_id.clone();
 
     {
-        let _failpoint = ScopedFailPoint::new(
-            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let error = db
             .rebuild_full_text_indices_on_as("main", Some("index-operator"))
             .await
@@ -4969,7 +4951,7 @@ async fn ensure_indices_post_effect_disjoint_winner_is_preserved() {
     let index_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let mut winner_db = Omnigraph::open(&uri).await.unwrap();
     let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        &catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     );
     let index_handle = std::sync::Arc::clone(&index_db);
     let index_task = tokio::spawn(async move { index_handle.ensure_indices().await });
@@ -5041,7 +5023,7 @@ async fn ensure_indices_post_effect_same_table_winner_fails_closed() {
     let index_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let mut winner_db = Omnigraph::open(&uri).await.unwrap();
     let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        &catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     );
     let index_handle = std::sync::Arc::clone(&index_db);
     let index_task = tokio::spawn(async move { index_handle.ensure_indices().await });
@@ -5171,8 +5153,7 @@ async fn ensure_indices_first_touch_before_ref_case(full_text_rebuild: bool) {
         .unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::ENSURE_INDICES_POST_SIDECAR_PRE_FORK, "return");
+        let _failpoint = catalog::ENSURE_INDICES_POST_SIDECAR_PRE_FORK.fire_always();
         run_index_maintenance(&db, "experiment", full_text_rebuild)
             .await
             .expect_err("failpoint must fire after sidecar and before target ref creation");
@@ -5294,7 +5275,7 @@ async fn ensure_indices_mixed_first_touch_rollback_does_not_delete_moved_ref() {
         .unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::ENSURE_INDICES_POST_TABLE_EFFECT, "return");
+        let _failpoint = catalog::ENSURE_INDICES_POST_TABLE_EFFECT.fire_always();
         db.ensure_indices_on("experiment")
             .await
             .expect_err("failpoint must stop after the first first-touch table effect");
@@ -5303,8 +5284,7 @@ async fn ensure_indices_mixed_first_touch_rollback_does_not_delete_moved_ref() {
     drop(db);
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT, "return");
+        let _failpoint = catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
         let first_recovery = Omnigraph::open(&uri).await;
         assert!(
             first_recovery.is_err(),
@@ -5364,8 +5344,7 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
 
     // Setup: trigger the residual (sidecar persists; manifest unchanged).
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -5439,8 +5418,7 @@ async fn cleanup_refuses_pending_v3_sidecar_before_version_gc() {
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -5516,8 +5494,7 @@ async fn load_after_finalize_publisher_failure_heals_without_reopen() {
     // commit_staged (Lance HEAD advances on three tables), then the
     // publisher is wedged before the manifest commit.
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -5598,7 +5575,7 @@ async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
         .version;
 
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_WRITE, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_WRITE.fire_always();
         let err = load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -5684,8 +5661,7 @@ async fn s3_load_recovers_after_publisher_failure_without_reopen() {
     // Failed load: commit_staged lands on S3, manifest publish does not;
     // the sidecar PUT went through the S3 adapter.
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -5743,8 +5719,7 @@ async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
 
     // Pending sidecar with real drift.
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -5759,7 +5734,7 @@ async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
     // the audit write fails — the write must fail loudly and the sidecar
     // must survive for the retry.
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_RECORD_AUDIT, "return");
+        let _failpoint = catalog::RECOVERY_RECORD_AUDIT.fire_always();
         let err = load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Bob","age":25}}
@@ -5834,8 +5809,7 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
 
     // Pending sidecar via the usual finalize → publisher failure.
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -5853,7 +5827,7 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
         assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 1);
     }
 
-    let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_LIST, "return");
+    let _failpoint = catalog::RECOVERY_SIDECAR_LIST.fire_always();
 
     // Write-entry heal: the list failure surfaces as the write's error —
     // no silent skip that would proceed over the pending sidecar.
@@ -5915,7 +5889,7 @@ async fn sidecar_delete_failure_keeps_write_success_and_next_write_heals() {
     let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_DELETE.fire_always();
         // The load itself must succeed: commit_staged + manifest publish
         // landed; only the Phase D cleanup failed (swallowed + logged).
         load_jsonl(
@@ -6011,7 +5985,7 @@ async fn sidecar_write_failure_aborts_branch_merge_with_no_head_advance() {
         .version;
 
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_WRITE, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_WRITE.fire_always();
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string()
@@ -6063,8 +6037,7 @@ async fn mutation_after_finalize_publisher_failure_heals_without_reopen() {
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -6130,8 +6103,7 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
     let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Alice","age":30}}
@@ -6216,8 +6188,7 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     // Failed load on MAIN: Person drifts ahead of the manifest with a
     // sidecar covering it.
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let err = load_jsonl(
             &db,
             r#"{"type":"Person","data":{"name":"Bob","age":25}}
@@ -6342,7 +6313,7 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     // First write: the discard path writes its audit row, then the
     // sidecar delete fails (injected). The write fails loudly.
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_DELETE.fire_always();
         let err = load_jsonl(
             &db,
             "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
@@ -6508,7 +6479,7 @@ async fn interrupted_write_self_heals_effect_free_armed_intent_issue_554() {
     // First post-compaction write dies after its recovery intent is durable
     // but before any table transaction commits.
     {
-        let _fp = ScopedFailPoint::new(names::MUTATION_POST_ARM_PRE_EFFECT, "return");
+        let _fp = catalog::MUTATION_POST_ARM_PRE_EFFECT.fire_always();
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -6594,7 +6565,7 @@ async fn live_heal_defers_pre_v9_armed_effect_free_sidecar() {
     // `protocol_v3` payload shape, so only the declared generation changes —
     // producing the pre-identity envelope the version gate must exclude.
     {
-        let _fp = ScopedFailPoint::new(names::MUTATION_POST_ARM_PRE_EFFECT, "return");
+        let _fp = catalog::MUTATION_POST_ARM_PRE_EFFECT.fire_always();
         mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -6717,8 +6688,7 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
     // fails (injected). The write fails loudly; the sidecar survives so
     // the discard is retried with the audit still owed.
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND, "return");
+        let _failpoint = catalog::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND.fire_always();
         let err = load_jsonl(
             &db,
             "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
@@ -6811,7 +6781,7 @@ edge Knows: Person -> Person {
 edge WorksAt: Person -> Company
 "#;
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
         let err = db.apply_schema(v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
@@ -6866,7 +6836,7 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
 
     // Park the apply right after its staging files land (its sidecar is
     // already on disk from Phase A; the manifest commit has not run).
-    let rv = helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let rv = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
 
     let apply_db = Arc::clone(&db);
     let desired = format!(
@@ -7123,8 +7093,7 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
         .unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let _ = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -7191,7 +7160,7 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let db = std::sync::Arc::new(db);
 
     let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+        &catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
     );
     let writer_a_db = std::sync::Arc::clone(&db);
     let writer_a = tokio::spawn(async move { writer_a_db.ensure_indices().await });
@@ -7304,7 +7273,7 @@ async fn schema_apply_without_schema_staging_rolls_back_on_next_open() {
 
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         let v2_schema = r#"node Person {
     name: String @key
     age: I32?
@@ -7386,7 +7355,7 @@ async fn metadata_only_schema_apply_before_staging_rolls_back_on_next_open() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
 
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             err.to_string()
@@ -7430,15 +7399,14 @@ async fn metadata_only_schema_apply_rollback_retry_never_flips_forward() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
 
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         db.apply_schema(&indexed_schema).await.unwrap_err();
     }
     let operation_id = single_sidecar_operation_id(dir.path());
     drop(db);
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT, "return");
+        let _failpoint = catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
         let first_recovery = Omnigraph::open(&uri).await;
         assert!(
             first_recovery.is_err(),
@@ -7483,14 +7451,13 @@ async fn pinned_schema_apply_rollback_retry_never_flips_forward() {
     );
 
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         db.apply_schema(&desired).await.unwrap_err();
     }
     drop(db);
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT, "return");
+        let _failpoint = catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
         let first_recovery = Omnigraph::open(&uri).await;
         assert!(first_recovery.is_err());
     }
@@ -7521,7 +7488,7 @@ async fn metadata_only_schema_apply_after_staging_rolls_forward_on_next_open() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
 
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             err.to_string()
@@ -7565,13 +7532,13 @@ async fn metadata_only_schema_apply_recovers_after_promotion_prepass_crash() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
 
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
         db.apply_schema(&indexed_schema).await.unwrap_err();
     }
     drop(db);
 
     {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_POST_LIST_PRE_GATES, "return");
+        let _failpoint = catalog::RECOVERY_POST_LIST_PRE_GATES.fire_always();
         let interrupted = Omnigraph::open(&uri).await;
         assert!(
             interrupted.is_err(),
@@ -7606,7 +7573,7 @@ async fn metadata_only_schema_apply_delete_failure_heals_on_next_write() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
 
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_DELETE.fire_always();
         db.apply_schema(&indexed_schema)
             .await
             .expect("Phase-D delete failure must not fail an already-visible schema apply");
@@ -7654,7 +7621,7 @@ async fn schema_apply_recovery_reclaims_owned_add_type_target_and_retry_succeeds
     let db = Omnigraph::init(&uri, SCHEMA_V1).await.unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         db.apply_schema(SCHEMA_V2_ADDED_TYPE)
             .await
             .expect_err("the pre-staging failpoint must leave the AddType intent pending");
@@ -7710,7 +7677,7 @@ async fn schema_apply_first_touch_foreign_winner_is_preserved_not_adopted() {
     let db = std::sync::Arc::new(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT);
     let apply_db = std::sync::Arc::clone(&db);
     let apply_task = tokio::spawn(async move { apply_db.apply_schema(SCHEMA_V2_ADDED_TYPE).await });
     rendezvous.wait_until_reached().await;
@@ -7842,7 +7809,7 @@ async fn schema_apply_phase_b_failure_recovered_on_next_open() {
     // written, but BEFORE the manifest publish. The recovery sidecar persists.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_AFTER_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
         // v2 schema: add a `city` property to Person AND add a new
         // `Tag` node type. The new property triggers the rewritten_tables
         // path (Phase B sidecar coverage). The new type changes the
@@ -8005,7 +7972,7 @@ edge WorksAt: Human -> Company
 "#;
 
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_POST_TABLE_COMMIT, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
         let error = db
             .apply_schema(desired)
             .await
@@ -8074,7 +8041,7 @@ async fn schema_apply_partial_table_effect_rolls_back_exactly() {
     );
 
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_POST_TABLE_COMMIT, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
         let error = db
             .apply_schema(&desired)
             .await
@@ -8145,7 +8112,7 @@ async fn schema_apply_post_effect_disjoint_winner_is_preserved() {
     let schema_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let mut winner_db = Omnigraph::open(&uri).await.unwrap();
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let desired = schema_with_person_city();
     let apply_handle = std::sync::Arc::clone(&schema_db);
     let apply_task = tokio::spawn(async move { apply_handle.apply_schema(&desired).await });
@@ -8224,7 +8191,7 @@ async fn schema_apply_post_effect_same_table_winner_fails_closed() {
     let schema_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let mut winner_db = Omnigraph::open(&uri).await.unwrap();
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
     let desired = schema_with_person_city();
     let apply_handle = std::sync::Arc::clone(&schema_db);
     let apply_task = tokio::spawn(async move { apply_handle.apply_schema(&desired).await });
@@ -8370,8 +8337,7 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
     // graph-wide manifest publish. Exactly one multi-table sidecar persists.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "return");
+        let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db.optimize().await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -8450,8 +8416,7 @@ async fn optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar() {
     let operation_id;
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new(names::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT, "1*return");
+        let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
         let error = db.optimize().await.unwrap_err();
         assert!(
             matches!(error, OmniError::RecoveryRequired { .. }),
@@ -8550,8 +8515,7 @@ node Embedding {
         .unwrap();
     }
 
-    let _failpoint =
-        ScopedFailPoint::new(names::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT, "1*return");
+    let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_once_at(1);
     let error = db.optimize().await.unwrap_err();
     assert!(matches!(error, OmniError::RecoveryRequired { .. }));
     let operation_id = single_sidecar_operation_id(dir.path());
@@ -8625,7 +8589,7 @@ async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
     // The first table task to hit the seam returns; the other task proceeds.
     // Collection waits for both, leaving one completed physical effect under
     // the one shared sidecar and no graph publish.
-    let _failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "1*return");
+    let _failpoint = catalog::OPTIMIZE_BEFORE_COMPACT.fire_once_at(1);
     let error = db.optimize().await.unwrap_err();
     assert!(
         matches!(error, OmniError::RecoveryRequired { .. }),
@@ -8746,7 +8710,7 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
 
     // Park Optimize with its authority token captured but no gate held.
     let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        names::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+        &catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
     );
     let optimize_task_db = std::sync::Arc::clone(&optimize_db);
     let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
@@ -8848,7 +8812,7 @@ async fn optimize_rechecks_late_schema_apply_sidecar_after_main_gate() {
         .version;
 
     let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
+        &catalog::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
     );
     let optimize_task_db = std::sync::Arc::clone(&optimize_db);
     let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
@@ -8859,7 +8823,7 @@ async fn optimize_rechecks_late_schema_apply_sidecar_after_main_gate() {
     // staging or any physical table effect.
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
     {
-        let _failpoint = ScopedFailPoint::new(names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
+        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         let error = schema_db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             error
@@ -8959,7 +8923,7 @@ async fn optimize_rechecks_late_disjoint_main_sidecar_after_main_gate() {
     let manifest_uri = format!("{uri}/__manifest");
 
     let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        names::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
+        &catalog::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
     );
     let optimize_task_db = std::sync::Arc::clone(&optimize_db);
     let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
@@ -8969,8 +8933,7 @@ async fn optimize_rechecks_late_disjoint_main_sidecar_after_main_gate() {
     // work this test protects is Person compaction. Its v3 sidecar is confirmed
     // and durable; only the main graph-head authority overlaps.
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let error = writer_db
             .mutate(
                 "main",
@@ -9102,7 +9065,7 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
 
     // Pause productive Person optimize after the under-main-gate recovery
     // relist and after its Person sidecar is durable.
-    let failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "pause");
+    let failpoint = catalog::OPTIMIZE_BEFORE_COMPACT.hold().0;
 
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
@@ -9188,7 +9151,7 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
     let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
 
     // Pause optimize BEFORE its compaction commits.
-    let failpoint = ScopedFailPoint::new(names::OPTIMIZE_BEFORE_COMPACT, "pause");
+    let failpoint = catalog::OPTIMIZE_BEFORE_COMPACT.hold().0;
 
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
@@ -9272,7 +9235,7 @@ async fn optimize_retry_does_not_misclassify_own_head_drift() {
     // Inject exactly one retryable reindex conflict: attempt 1 compacts (HEAD+1) then
     // "conflicts" on reindex → retry; attempt 2 reopens with HEAD ahead of the manifest
     // from our own compaction — the misclassification trigger.
-    let _failpoint = ScopedFailPoint::new(names::OPTIMIZE_INJECT_REINDEX_CONFLICT, "1*return");
+    let _failpoint = catalog::OPTIMIZE_INJECT_REINDEX_CONFLICT.fire_once_at(1);
 
     let db = Omnigraph::open(&uri).await.unwrap();
     let stats = db
@@ -9372,10 +9335,7 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     // but before commit_manifest_updates. Sidecar persists.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -9495,10 +9455,7 @@ async fn branch_merge_recovery_replays_pointer_slots_with_fixed_lineage() {
     let target_parent = branch_head_commit_id(dir.path(), "target").await.unwrap();
 
     let error = {
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         db.branch_merge_as("main", "target", Some("merge-author"))
             .await
             .unwrap_err()
@@ -9585,7 +9542,7 @@ async fn branch_merge_sidecar_delete_failure_finalizes_visible_fixed_lineage_onc
     let target_parent = branch_head_commit_id(dir.path(), "target").await.unwrap();
 
     let outcome = {
-        let _failpoint = ScopedFailPoint::new(names::RECOVERY_SIDECAR_DELETE, "return");
+        let _failpoint = catalog::RECOVERY_SIDECAR_DELETE.fire_always();
         db.branch_merge_as("source", "target", Some("phase-d-actor"))
             .await
             .expect("Phase-D sidecar deletion failure must not fail a visible merge")
@@ -9702,7 +9659,7 @@ async fn branch_merge_post_effect_target_advance_requires_recovery_and_preserves
     let source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
 
     let merge_rv = helpers::failpoint::Rendezvous::park_first(
-        names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     );
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task =
@@ -9802,7 +9759,7 @@ async fn branch_merge_post_effect_same_table_advance_fails_closed() {
         .clone()
         .expect("fixture must own the published table ref");
     let merge_rv = helpers::failpoint::Rendezvous::park_first(
-        names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     );
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
@@ -9914,10 +9871,7 @@ async fn branch_merge_rollback_restarts_after_restore_before_publish() {
         .expect("fixture must own the published table ref");
 
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         match db.branch_merge("source", "target").await.unwrap_err() {
             OmniError::RecoveryRequired { operation_id, .. } => operation_id,
             other => panic!("confirmed merge must retain recovery ownership: {other}"),
@@ -9952,8 +9906,7 @@ async fn branch_merge_rollback_restarts_after_restore_before_publish() {
     drop(target_winner);
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH, "return");
+        let _failpoint = catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH.fire_always();
         let error = match Omnigraph::open(&uri).await {
             Ok(_) => panic!("recovery must stop after the injected table restore"),
             Err(error) => error,
@@ -10090,7 +10043,7 @@ async fn branch_merge_pointer_ignores_fork_failpoint_and_keeps_orphan() {
             .native_dataset_branch
     );
     {
-        let _failpoint = ScopedFailPoint::new(names::BRANCH_MERGE_POST_SIDECAR_PRE_FORK, "return");
+        let _failpoint = catalog::BRANCH_MERGE_POST_SIDECAR_PRE_FORK.fire_always();
         assert_eq!(
             db.branch_merge("source", "target").await.unwrap(),
             omnigraph::db::MergeOutcome::FastForward
@@ -10166,10 +10119,7 @@ async fn branch_merge_pointer_failure_retries_without_sidecar() {
     let source_entry = source_before.dataset("node:Person").unwrap();
     let target_before = helpers::snapshot_branch(&db, "target").await.unwrap();
     {
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let error = db.branch_merge("source", "target").await.unwrap_err();
         assert!(
             !matches!(error, OmniError::RecoveryRequired { .. }),
@@ -10298,7 +10248,7 @@ async fn branch_merge_confirmation_rejects_foreign_append_after_data_effects() {
 
     let merge_db = std::sync::Arc::new(db);
     let merge_rv = helpers::failpoint::Rendezvous::park_first(
-        names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
+        &catalog::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
     );
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task =
@@ -10439,10 +10389,7 @@ async fn branch_merge_adopt_with_delta_phase_b_failure_recovered_on_next_open() 
     // Fail after the per-table publish loop, before commit_manifest_updates.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -10552,10 +10499,8 @@ async fn branch_merge_multichunk_insert_armed_prefix_rolls_back() {
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let operation_id = {
-        let _error_recovery_failure =
-            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS, "return");
+        let _error_recovery_failure = catalog::BRANCH_MERGE_PRE_ERROR_RECOVERY.fire_always();
+        let _failpoint = catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS.fire_always();
         match db.branch_merge("feature", "main").await.unwrap_err() {
             OmniError::RecoveryRequired { operation_id, .. } => operation_id,
             other => panic!("between-insert-chunk failure must retain recovery: {other}"),
@@ -10627,14 +10572,13 @@ async fn issue_694_multichunk_insert_prefix_cleans_up_live() {
     let db = Omnigraph::open(&uri).await.unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS, "return");
+        let _failpoint = catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS.fire_always();
         let error = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             !matches!(error, OmniError::RecoveryRequired { .. })
                 && error
                     .to_string()
-                    .contains(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+                    .contains(catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS.name()),
             "live cleanup must return the original merge error: {error}"
         );
     }
@@ -10685,10 +10629,8 @@ async fn issue_694_live_cleanup_interrupted_after_restore_retains_recovery() {
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let operation_id = {
-        let _restore_interrupt =
-            ScopedFailPoint::new(names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH, "return");
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS, "return");
+        let _restore_interrupt = catalog::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH.fire_always();
+        let _failpoint = catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS.fire_always();
         match db.branch_merge("feature", "main").await.unwrap_err() {
             OmniError::RecoveryRequired { operation_id, .. } => operation_id,
             other => panic!("interrupted live cleanup must retain recovery ownership: {other}"),
@@ -10761,10 +10703,7 @@ async fn branch_merge_multichunk_effects_confirmed_rolls_forward() {
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let operation_id = {
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         match db.branch_merge("feature", "main").await.unwrap_err() {
             OmniError::RecoveryRequired { operation_id, .. } => operation_id,
             other => panic!("confirmed multi-chunk failure must retain recovery: {other}"),
@@ -10885,9 +10824,8 @@ async fn branch_merge_multichunk_delete_armed_prefix_rolls_back() {
     let db = Omnigraph::open(&uri).await.unwrap();
 
     let operation_id = {
-        let _error_recovery_failure =
-            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
-        let _failpoint = ScopedFailPoint::new(names::BRANCH_MERGE_BETWEEN_DELETE_CHUNKS, "return");
+        let _error_recovery_failure = catalog::BRANCH_MERGE_PRE_ERROR_RECOVERY.fire_always();
+        let _failpoint = catalog::BRANCH_MERGE_BETWEEN_DELETE_CHUNKS.fire_always();
         match db.branch_merge("feature", "main").await.unwrap_err() {
             OmniError::RecoveryRequired { operation_id, .. } => operation_id,
             other => panic!("between-delete-chunk failure must retain recovery: {other}"),
@@ -10968,13 +10906,13 @@ enum MergePartialFailpoint {
 }
 
 impl MergePartialFailpoint {
-    const fn name(self) -> &'static str {
+    fn seam(self) -> &'static omnigraph::seams::DecideSeam {
         match self {
-            Self::AdoptAfterAppend => names::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
-            Self::AdoptAfterUpsert => names::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE,
-            Self::RewriteAfterInsert => names::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
-            Self::RewriteAfterMerge => names::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE,
-            Self::RewriteAfterDelete => names::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
+            Self::AdoptAfterAppend => &catalog::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
+            Self::AdoptAfterUpsert => &catalog::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE,
+            Self::RewriteAfterInsert => &catalog::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
+            Self::RewriteAfterMerge => &catalog::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE,
+            Self::RewriteAfterDelete => &catalog::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM,
         }
     }
 }
@@ -11033,7 +10971,8 @@ async fn assert_partial_merge_rolls_back(
             .collect::<Vec<_>>()
     };
 
-    let failpoint = failpoint.name();
+    let seam = failpoint.seam();
+    let failpoint = seam.name();
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -11092,9 +11031,8 @@ async fn assert_partial_merge_rolls_back(
     // Crash mid-Phase-B at the injected window.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _error_recovery_failure =
-            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
-        let _fp = ScopedFailPoint::new(failpoint, "return");
+        let _error_recovery_failure = catalog::BRANCH_MERGE_PRE_ERROR_RECOVERY.fire_always();
+        let _fp = seam.fire_always();
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string().contains(failpoint),
@@ -11221,10 +11159,7 @@ async fn pre_upgrade_v1_branch_merge_sidecar_rolls_forward_not_back() {
     // sidecar lands on disk.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _fp = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _fp = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         db.branch_merge("feature", "main").await.unwrap_err();
     }
 
@@ -11427,10 +11362,7 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target_inner() {
         let pointer_switch = target_updates > 0;
         let operation_id = {
             let db = Omnigraph::open(&uri).await.unwrap();
-            let _failpoint = ScopedFailPoint::new(
-                names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-                "return",
-            );
+            let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
             let err = db
                 .branch_merge(source_branch, "target_branch")
                 .await
@@ -11637,10 +11569,7 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
     drop(db);
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let _ = db
             .branch_merge("source_branch", "target_branch")
             .await
@@ -11736,10 +11665,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     // still fires, surfacing the Err.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(
-            names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db.ensure_indices().await.unwrap_err();
         assert!(
             err.to_string().contains(
@@ -11815,7 +11741,7 @@ async fn init_failpoint_after_schema_pg_written_cleans_up_schema_file() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_SCHEMA_PG_WRITTEN, "return");
+    let _failpoint = catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.fire_always();
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -11846,7 +11772,7 @@ async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN, "return");
+    let _failpoint = catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN.fire_always();
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -11882,7 +11808,7 @@ async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_COORDINATOR_INIT, "return");
+    let _failpoint = catalog::INIT_AFTER_COORDINATOR_INIT.fire_always();
 
     let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -11935,7 +11861,7 @@ async fn init_failpoint_post_manifest_create_leaves_completed_graph_intact() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let _failpoint = ScopedFailPoint::new(names::INIT_POST_MANIFEST_CREATE, "return");
+    let _failpoint = catalog::INIT_POST_MANIFEST_CREATE.fire_always();
 
     let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -11982,7 +11908,7 @@ async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let _lost_ack = ScopedFailPoint::new(names::INIT_MANIFEST_CREATE_ACK_LOST, "return");
+    let _lost_ack = catalog::INIT_MANIFEST_CREATE_ACK_LOST.fire_always();
 
     let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA)
         .await
@@ -12023,7 +11949,7 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let _lost_ack = ScopedFailPoint::new(names::INIT_TABLE_CREATE_ACK_LOST, "return");
+    let _lost_ack = catalog::INIT_TABLE_CREATE_ACK_LOST.fire_always();
 
     let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("a table Create acknowledgement failure must not return success"),
@@ -12066,8 +11992,8 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let lost_ack = ScopedFailPoint::new(names::INIT_MANIFEST_CREATE_ACK_LOST, "return");
-    let probe_failure = ScopedFailPoint::new(names::INIT_MANIFEST_CREATE_PROBE, "return");
+    let lost_ack = catalog::INIT_MANIFEST_CREATE_ACK_LOST.fire_always();
+    let probe_failure = catalog::INIT_MANIFEST_CREATE_PROBE.fire_always();
 
     let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("an unavailable exact probe must leave the outcome indeterminate"),
@@ -12177,7 +12103,7 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
 
-    let crash = ScopedFailPoint::new(names::INIT_POST_MANIFEST_CREATE, "panic");
+    let crash = catalog::INIT_POST_MANIFEST_CREATE.panic_at();
     let cloned = uri.clone();
     let died = tokio::spawn(async move {
         Omnigraph::init(&cloned, helpers::TEST_SCHEMA)
@@ -12218,8 +12144,8 @@ async fn init_failpoint_returns_original_error_not_cleanup_error() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new(names::INIT_AFTER_SCHEMA_PG_WRITTEN, "return");
-    let _delete_failure = ScopedFailPoint::new(names::INIT_SCHEMA_CLEANUP_DELETE, "return");
+    let _failpoint = catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.fire_always();
+    let _delete_failure = catalog::INIT_SCHEMA_CLEANUP_DELETE.fire_always();
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
@@ -12250,7 +12176,7 @@ async fn init_create_if_absent_probe_failure_leaves_empty_root() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _failpoint = ScopedFailPoint::new(names::LOCAL_CREATE_IF_ABSENT_PROBE, "return");
+    let _failpoint = catalog::LOCAL_CREATE_IF_ABSENT_PROBE.fire_always();
 
     let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("expected Omnigraph::init to fail at the create-if-absent probe"),
@@ -12278,7 +12204,7 @@ async fn read_write_open_create_if_absent_probe_failure_aborts_open() {
     let uri = dir.path().to_str().unwrap();
     let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
 
-    let _failpoint = ScopedFailPoint::new(names::LOCAL_CREATE_IF_ABSENT_PROBE, "return");
+    let _failpoint = catalog::LOCAL_CREATE_IF_ABSENT_PROBE.fire_always();
     let err = match Omnigraph::open(uri).await {
         Ok(_) => panic!("expected read-write open to fail at the create-if-absent probe"),
         Err(e) => e,
@@ -12300,7 +12226,7 @@ async fn read_only_open_skips_create_if_absent_probe() {
     let uri = dir.path().to_str().unwrap();
     let _ = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
 
-    let _failpoint = ScopedFailPoint::new(names::LOCAL_CREATE_IF_ABSENT_PROBE, "return");
+    let _failpoint = catalog::LOCAL_CREATE_IF_ABSENT_PROBE.fire_always();
     let _db = Omnigraph::open_read_only(uri)
         .await
         .expect("read-only open must not run the create-if-absent probe");
@@ -12323,7 +12249,7 @@ async fn publisher_retries_retryable_load_publish_state_error() {
     // `1*return`: fail only the FIRST `load_publish_state` of the next publish, so the
     // retry's second call is clean. Set after `init_and_load` so its publishes are
     // unaffected.
-    let _fp = ScopedFailPoint::new(names::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION, "1*return");
+    let _fp = catalog::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION.fire_once_at(1);
     let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
     db.load_as("main", None, row, LoadMode::Merge, None)
         .await
@@ -12349,7 +12275,7 @@ async fn first_touch_post_create_open_error_keeps_recovery_ownership() {
     let fork_prefix = format!("fork.{incarnation}.m{base_manifest_version}.");
 
     let error = {
-        let _fp = ScopedFailPoint::new(names::FORK_POST_CREATE_PRE_OPEN, "return");
+        let _fp = catalog::FORK_POST_CREATE_PRE_OPEN.fire_always();
         db.mutate(
             "feature",
             MUTATION_QUERIES,
@@ -12486,13 +12412,13 @@ async fn branch_delete_orphans_sidecar_armed_after_initial_barrier() {
     let writer_db = Omnigraph::open(&uri).await.unwrap();
 
     let branch_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_CONTROL_POST_RECOVERY_BARRIER);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER);
     let delete_handle = std::sync::Arc::clone(&delete_db);
     let delete_task = tokio::spawn(async move { delete_handle.branch_delete("feature").await });
     branch_rv.wait_until_reached().await;
 
     {
-        let _fp = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _fp = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         writer_db
             .mutate(
                 "feature",
@@ -12583,7 +12509,7 @@ node Document {
         .dataset("node:Document")
         .unwrap()
         .clone();
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::BLOB_READ_POST_CAPTURE);
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::BLOB_READ_POST_CAPTURE);
     let cell = node_blob_cell("Document", "aba", "content");
     let read_cell = cell.clone();
     let read_task = tokio::spawn(async move {
@@ -12694,7 +12620,7 @@ node Document {
         .unwrap()
         .clone();
 
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_POST_CAPTURE);
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::CHANGE_FEED_POST_CAPTURE);
     // Poll from the beginning so the feature-authored commit is reopened; its
     // snapshot is what the ABA retargets.
     let request = ChangeFeedRequest {
@@ -12809,7 +12735,8 @@ node Document {
         .unwrap()
         .clone();
 
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_PRE_TABLE_OPEN);
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::CHANGE_FEED_PRE_TABLE_OPEN);
     let request = ChangeFeedRequest {
         branch: Some("feature".to_string()),
         position: ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(base_commit_id)),
@@ -12911,9 +12838,9 @@ node Document {
     // Simulate an e_tag-less store for the whole poll: the per-table e_tag
     // comparison is skipped, exactly as on a store whose persisted version
     // metadata carries no e_tag.
-    let _skip_etag =
-        omnigraph::failpoints::ScopedFailPoint::new(names::CHANGE_FEED_SKIP_ETAG_WITNESS, "return");
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_PRE_TABLE_OPEN);
+    let _skip_etag = catalog::CHANGE_FEED_SKIP_ETAG_WITNESS.fire_always();
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::CHANGE_FEED_PRE_TABLE_OPEN);
     let request = ChangeFeedRequest {
         branch: Some("feature".to_string()),
         position: ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(base_commit_id)),
@@ -13038,7 +12965,7 @@ query remove_victim() {
         .clone();
 
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(names::CHANGE_FEED_POST_HEAD_WITNESS);
+        helpers::failpoint::Rendezvous::park_first(&catalog::CHANGE_FEED_POST_HEAD_WITNESS);
     let request = ChangeFeedRequest {
         branch: Some("feature".to_string()),
         position: ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(insert_commit_id)),
@@ -13160,9 +13087,9 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
     let old_target_identifier = old_target.branch_identifier().await.unwrap();
 
     let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
     let control_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_CONTROL_POST_RECOVERY_BARRIER);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CONTROL_POST_RECOVERY_BARRIER);
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task =
@@ -13262,7 +13189,7 @@ async fn branch_merge_fences_concurrent_sync_on_same_handle() {
     db.branch_create("other").await.unwrap();
     let db = std::sync::Arc::new(db);
     let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
 
     let merge_handle = std::sync::Arc::clone(&db);
     let merge_task =
@@ -13314,7 +13241,7 @@ async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
         .clone()
         .expect("fixture must own the published table ref");
     let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task =
@@ -13404,7 +13331,7 @@ async fn branch_merge_rejects_late_uncovered_target_drift_before_sidecar() {
         .published_dataset_version;
     let db = std::sync::Arc::new(db);
     let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
     let merge_handle = std::sync::Arc::clone(&db);
     let merge_task = tokio::spawn(async move { merge_handle.branch_merge("source", "main").await });
     merge_rv.wait_until_reached().await;
@@ -13473,7 +13400,7 @@ async fn branch_merge_source_advance_keeps_captured_source_parent() {
         .expect("fixture must own the published table ref");
     let captured_source_head = branch_head_commit_id(dir.path(), "source").await.unwrap();
     let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task =
@@ -13558,8 +13485,9 @@ async fn branch_merge_pure_insert_rejects_source_table_ref_aba_before_arm() {
     let old_source_identifier = old_source.branch_identifier().await.unwrap();
     let merge_db = std::sync::Arc::new(db);
     let mut source_writer = Omnigraph::open(&uri).await.unwrap();
-    let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_CANDIDATE_VALIDATION);
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
+    );
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task = tokio::spawn(async move { merge_handle.branch_merge("source", "main").await });
@@ -13716,8 +13644,9 @@ async fn branch_merge_pointer_adoption_preserves_replaced_former_target_ref() {
     let source_native_identifier = source_table.branch_identifier().await.unwrap();
 
     let merge_db = std::sync::Arc::new(db);
-    let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_CANDIDATE_VALIDATION);
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
+    );
     let probes = MergeWriteProbes::default();
     let task_probes = probes.clone();
     let merge_handle = std::sync::Arc::clone(&merge_db);
@@ -13852,7 +13781,7 @@ async fn branch_merge_pointer_adoption_preserves_replaced_former_target_ref() {
 }
 
 async fn assert_branch_merge_first_touch_ref_is_recovered(
-    failpoint: &str,
+    failpoint: &'static omnigraph::seams::DecideSeam,
     ref_exists_before_recovery: bool,
 ) {
     let dir = tempfile::tempdir().unwrap();
@@ -13887,9 +13816,8 @@ async fn assert_branch_merge_first_touch_ref_is_recovered(
     assert!(inherited_entry.native_dataset_branch.is_some());
 
     let error = {
-        let _error_recovery_failure =
-            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
-        let _failpoint = ScopedFailPoint::new(failpoint, "return");
+        let _error_recovery_failure = catalog::BRANCH_MERGE_PRE_ERROR_RECOVERY.fire_always();
+        let _failpoint = failpoint.fire_always();
         db.branch_merge("source", "target").await.unwrap_err()
     };
     let operation_id = match error {
@@ -13980,7 +13908,7 @@ async fn assert_branch_merge_first_touch_ref_is_recovered(
 async fn branch_merge_sidecar_precedes_first_touch_target_ref() {
     let _scenario = FailScenario::setup();
     assert_branch_merge_first_touch_ref_is_recovered(
-        names::BRANCH_MERGE_POST_SIDECAR_PRE_FORK,
+        &catalog::BRANCH_MERGE_POST_SIDECAR_PRE_FORK,
         false,
     )
     .await;
@@ -13990,7 +13918,8 @@ async fn branch_merge_sidecar_precedes_first_touch_target_ref() {
 #[serial(branch_merge_first_touch)]
 async fn branch_merge_recovers_ambiguous_first_touch_ref_creation() {
     let _scenario = FailScenario::setup();
-    assert_branch_merge_first_touch_ref_is_recovered(names::FORK_POST_CREATE_PRE_OPEN, true).await;
+    assert_branch_merge_first_touch_ref_is_recovered(&catalog::FORK_POST_CREATE_PRE_OPEN, true)
+        .await;
 }
 
 /// A legacy writer can arm a relevant sidecar after merge's initial recovery
@@ -14005,7 +13934,7 @@ async fn branch_merge_rechecks_late_sidecar_after_table_gates() {
     let (uri, main_rows) = setup_diverged_merge_branches(&dir).await;
     let merge_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(names::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
     let merge_task =
@@ -14061,7 +13990,7 @@ async fn cleanup_rechecks_sidecars_under_gc_gates() {
     drop(helpers::init_and_load(&dir).await);
 
     let cleanup_rv =
-        helpers::failpoint::Rendezvous::park_first(names::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES);
+        helpers::failpoint::Rendezvous::park_first(&catalog::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES);
     let cleanup_uri = uri.clone();
     let cleanup_task = tokio::spawn(async move {
         let mut db = Omnigraph::open(&cleanup_uri).await.unwrap();
@@ -14075,7 +14004,7 @@ async fn cleanup_rechecks_sidecars_under_gc_gates() {
 
     let writer = Omnigraph::open(&uri).await.unwrap();
     {
-        let _fp = ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _fp = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         writer
             .mutate(
                 "main",
@@ -14146,10 +14075,7 @@ async fn full_recovery_rereads_sidecar_body_after_discovery() {
     drop(db);
 
     {
-        let _publish_failure = ScopedFailPoint::new(
-            names::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-            "return",
-        );
+        let _publish_failure = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         Omnigraph::open(&uri)
             .await
             .unwrap()
@@ -14159,7 +14085,7 @@ async fn full_recovery_rereads_sidecar_body_after_discovery() {
     }
 
     let recovery_rv =
-        helpers::failpoint::Rendezvous::park_first(names::RECOVERY_POST_LIST_PRE_GATES);
+        helpers::failpoint::Rendezvous::park_first(&catalog::RECOVERY_POST_LIST_PRE_GATES);
     let recovery_uri = uri.clone();
     let recovery_task = tokio::spawn(async move { Omnigraph::open(&recovery_uri).await });
     recovery_rv.wait_until_reached().await;
@@ -14218,6 +14144,347 @@ async fn full_recovery_rereads_sidecar_body_after_discovery() {
         helpers::count_rows(&recovered, "node:Person").await,
         5,
         "fresh unconfirmed sidecar must roll the interrupted merge back; stale discovery would expose six rows"
+    );
+}
+
+fn v3_sidecar_path(root: &std::path::Path, operation_id: &str) -> std::path::PathBuf {
+    root.join("__recovery").join(format!("{operation_id}.json"))
+}
+
+fn read_sidecar_json(root: &std::path::Path, operation_id: &str) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(v3_sidecar_path(root, operation_id)).unwrap())
+        .unwrap()
+}
+
+fn write_sidecar_json(root: &std::path::Path, operation_id: &str, sidecar: &serde_json::Value) {
+    std::fs::write(
+        v3_sidecar_path(root, operation_id),
+        serde_json::to_string_pretty(sidecar).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Leave the residual a mutation leaves when the acknowledgement of its
+/// manifest publish is lost: the insert is committed and graph-visible, the v3
+/// sidecar is confirmed and still on the object store. Returns the operation id.
+async fn leave_confirmed_v3_sidecar_beside_visible_commit(
+    uri: &str,
+    root: &std::path::Path,
+) -> String {
+    let db = Omnigraph::open(uri).await.unwrap();
+    let _lost_ack = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
+    let err = db
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Stale")], &[("$age", 41)]),
+        )
+        .await
+        .expect_err("the publish acknowledgement is lost after the manifest commit");
+    assert!(
+        matches!(err, OmniError::RecoveryRequired { .. }),
+        "unexpected mutation failure: {err}"
+    );
+    drop(db);
+    let operation_id = single_sidecar_operation_id(root);
+    let sidecar = read_sidecar_json(root, &operation_id);
+    assert_eq!(
+        sidecar["protocol_v3"]["effect_phase"], "EffectsConfirmed",
+        "fixture must begin with the confirmed residual a lost delete leaves"
+    );
+    operation_id
+}
+
+/// Put the arm-time bytes back: exactly what a lost `EffectsConfirmed` write
+/// leaves on the object store (issue #602).
+fn rewrite_v3_sidecar_to_armed(root: &std::path::Path, operation_id: &str) {
+    let mut sidecar = read_sidecar_json(root, operation_id);
+    for table in sidecar["tables"]
+        .as_array_mut()
+        .expect("mutation sidecar tables must be an array")
+    {
+        table["confirmed_version"] = serde_json::Value::Null;
+    }
+    let protocol = sidecar["protocol_v3"]
+        .as_object_mut()
+        .expect("mutation sidecar must carry protocol_v3");
+    protocol.insert(
+        "effect_phase".to_string(),
+        serde_json::Value::String("Armed".to_string()),
+    );
+    for effect in protocol["effects"]
+        .as_array_mut()
+        .expect("mutation effects must be an array")
+    {
+        effect["confirmed_transaction"] = serde_json::Value::Null;
+    }
+    for slot in protocol["intended_delta"]["table_updates"]
+        .as_array_mut()
+        .expect("mutation delta slots must be an array")
+    {
+        slot["confirmed"] = serde_json::Value::Null;
+    }
+    write_sidecar_json(root, operation_id, &sidecar);
+}
+
+/// An Armed v3 sidecar beside its visible commit (the confirmation write was
+/// lost) failed every read-write open with kind=Internal before #602. The
+/// `.gqt` twin pins the rows; this pins the one audit row and the idempotent reopen.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_beside_visible_commit_heals_on_reopen_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("a stale Armed sidecar beside its visible commit must heal, not fail the open");
+    assert_eq!(
+        count_rows(&recovered, "node:Person").await,
+        5,
+        "the committed insert stays visible; nothing is applied or restored"
+    );
+    drop(recovered);
+    assert_eq!(
+        recovery_audit_kinds(dir.path()).await,
+        vec!["RolledForward"],
+        "exactly one RolledForward audit row for the stale sidecar"
+    );
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForwardOriginalLineage {
+            tables: vec![TableExpectation::main("node:Person")],
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// A CONFIRMED sidecar whose recorded values contradict the committed snapshot
+/// is damage: the open still refuses, leaves the sidecar in place, records
+/// nothing, and the error names the sidecar object.
+#[tokio::test]
+#[serial]
+async fn confirmed_v3_sidecar_contradicting_visible_commit_still_refuses_open_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    let mut sidecar = read_sidecar_json(dir.path(), &operation_id);
+    let confirmed = &mut sidecar["protocol_v3"]["intended_delta"]["table_updates"][0]["confirmed"];
+    let row_count = confirmed["row_count"]
+        .as_u64()
+        .expect("confirmed slot carries a row count");
+    confirmed["row_count"] = serde_json::json!(row_count + 1);
+    write_sidecar_json(dir.path(), &operation_id, &sidecar);
+
+    let err = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("a confirmed sidecar contradicting the committed snapshot must refuse"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("but its manifest delta differs"),
+        "unexpected refusal: {text}"
+    );
+    assert!(
+        text.contains(&format!("__recovery/{operation_id}.json")),
+        "the refusal must name the sidecar object: {text}"
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()),
+        vec![operation_id.clone()],
+        "the refusal leaves the sidecar in place"
+    );
+    assert!(
+        recovery_audit_kinds(dir.path()).await.is_empty(),
+        "the refusal records nothing"
+    );
+}
+
+/// The heal re-runs the check the lost confirmation would have made: an Armed
+/// sidecar whose planned table version the committed snapshot does not carry
+/// is damage, so the open refuses, keeps the sidecar, and records nothing.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_contradicting_visible_commit_refuses_open_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+    let mut sidecar = read_sidecar_json(dir.path(), &operation_id);
+    let post_commit_pin = sidecar["tables"][0]["post_commit_pin"]
+        .as_u64()
+        .expect("table pin carries its planned post-commit version");
+    sidecar["tables"][0]["post_commit_pin"] = serde_json::json!(post_commit_pin + 1);
+    write_sidecar_json(dir.path(), &operation_id, &sidecar);
+
+    let err = match Omnigraph::open(&uri).await {
+        Ok(_) => panic!("an Armed sidecar whose plan the commit does not carry must refuse"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("does not carry the planned version"),
+        "unexpected refusal: {text}"
+    );
+    assert!(
+        text.contains(&format!("__recovery/{operation_id}.json")),
+        "the refusal must name the sidecar object: {text}"
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(dir.path()),
+        vec![operation_id.clone()],
+        "the refusal leaves the sidecar in place"
+    );
+    assert!(
+        recovery_audit_kinds(dir.path()).await.is_empty(),
+        "the refusal records nothing"
+    );
+}
+
+/// The open must refuse an Armed sidecar with `needle` in the error, name the
+/// sidecar object, leave it on the object store, and record no audit row.
+async fn assert_armed_sidecar_refused(
+    uri: &str,
+    root: &std::path::Path,
+    operation_id: &str,
+    needle: &str,
+) {
+    let err = match Omnigraph::open(uri).await {
+        Ok(_) => panic!("an Armed sidecar contradicting its committed effect must refuse"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(text.contains(needle), "unexpected refusal: {text}");
+    assert!(
+        text.contains(&format!("__recovery/{operation_id}.json")),
+        "the refusal must name the sidecar object: {text}"
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(root),
+        vec![operation_id.to_string()],
+        "the refusal leaves the sidecar in place"
+    );
+    assert!(
+        recovery_audit_kinds(root).await.is_empty(),
+        "the refusal records nothing"
+    );
+}
+
+/// The heal re-runs the transaction-identity half of the confirmation too: an
+/// Armed sidecar whose planned transaction is not the one Lance recorded at
+/// the planned version is damage, not a lost acknowledgement.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_with_foreign_planned_transaction_refuses_open_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+    let mut sidecar = read_sidecar_json(dir.path(), &operation_id);
+    sidecar["protocol_v3"]["effects"][0]["planned_transaction"]["uuid"] =
+        serde_json::json!("00000000-0000-4000-8000-000000000099");
+    write_sidecar_json(dir.path(), &operation_id, &sidecar);
+
+    assert_armed_sidecar_refused(
+        &uri,
+        dir.path(),
+        &operation_id,
+        "was not produced by its planned transaction",
+    )
+    .await;
+}
+
+/// A rewritten baseline that stays internally consistent (pin, planned read
+/// version and delta slot all moved) still contradicts the transaction Lance
+/// recorded, so the heal refuses instead of copying it into the audit row.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_with_rewritten_baseline_refuses_open_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+    let mut sidecar = read_sidecar_json(dir.path(), &operation_id);
+    sidecar["tables"][0]["expected_version"] = serde_json::json!(99);
+    sidecar["protocol_v3"]["effects"][0]["planned_transaction"]["read_version"] =
+        serde_json::json!(99);
+    sidecar["protocol_v3"]["intended_delta"]["table_updates"][0]["expected_version"] =
+        serde_json::json!(99);
+    write_sidecar_json(dir.path(), &operation_id, &sidecar);
+
+    assert_armed_sidecar_refused(
+        &uri,
+        dir.path(),
+        &operation_id,
+        "was not produced by its planned transaction",
+    )
+    .await;
+}
+
+/// A later writer advanced the table past the stale sidecar's planned version
+/// before the reopen: the heal checks the committed version, not HEAD, so it
+/// still heals and keeps both inserts.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_heals_after_a_later_writer_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+    let stale = read_sidecar_json(dir.path(), &operation_id);
+    std::fs::remove_file(v3_sidecar_path(dir.path(), &operation_id)).unwrap();
+    let db = Omnigraph::open(&uri).await.unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Later")], &[("$age", 42)]),
+    )
+    .await
+    .unwrap();
+    drop(db);
+    write_sidecar_json(dir.path(), &operation_id, &stale);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("a stale Armed sidecar must heal even after a later writer advanced the table");
+    assert_eq!(
+        count_rows(&recovered, "node:Person").await,
+        6,
+        "both the stale insert and the later insert stay visible"
+    );
+    drop(recovered);
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "the heal deletes the stale sidecar"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path()).await,
+        vec!["RolledForward"],
+        "exactly one RolledForward audit row for the stale sidecar"
     );
 }
 
@@ -14289,14 +14556,12 @@ async fn branch_merge_dropping_a_net_zero_table_confirms_and_recovers() {
     // Crash between the durable effects and the sidecar confirmation.
     {
         let db = Omnigraph::open(&uri).await.unwrap();
-        let _error_recovery_failure =
-            ScopedFailPoint::new(names::BRANCH_MERGE_PRE_ERROR_RECOVERY, "return");
-        let _failpoint =
-            ScopedFailPoint::new(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM, "return");
+        let _error_recovery_failure = catalog::BRANCH_MERGE_PRE_ERROR_RECOVERY.fire_always();
+        let _failpoint = catalog::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM.fire_always();
         let err = db.branch_merge("feature", "main").await.unwrap_err();
         assert!(
             err.to_string()
-                .contains(names::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM),
+                .contains(catalog::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM.name()),
             "unexpected error: {err}"
         );
 
