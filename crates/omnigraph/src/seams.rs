@@ -153,6 +153,13 @@ pub(crate) fn contention(seam: &'static DecideSeam) -> Result<()> {
 /// `skip` is honest only when that code treats `None` as a real outcome.
 #[inline]
 #[track_caller]
+#[cfg_attr(
+    not(feature = "failpoints"),
+    allow(
+        clippy::manual_async_fn,
+        reason = "The failpoints build captures the caller before constructing the future."
+    )
+)]
 pub(crate) fn guarded<T>(
     seam: &'static DecideSeam,
     op: impl std::future::Future<Output = Result<T>>,

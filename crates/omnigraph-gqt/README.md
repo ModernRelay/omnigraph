@@ -62,17 +62,19 @@ scope: next_step
 ```
 
 All four fields are required. `at` names a decision seam in the engine's
-catalog (`omnigraph::seams::catalog`, RFC 0066); `action` is `fail` or
-`skip` and must be among the effects the seam declares (`fail` admits a seam
-declaring the fail or contention effect, `skip` one declaring the skip
-effect); `hold` is refused until concurrent steps exist. A seam declares one
+catalog (`omnigraph::seams::catalog`, RFC 0066); `action` is `fail`,
+`contention`, or `skip`. `fail` selects the fail effect when declared,
+otherwise contention for compatibility with existing cases. `contention`
+selects only contention, so a seam declaring both failure effects lets a
+case choose either. `skip` selects only skip; an undeclared effect is
+refused. `hold` is refused until concurrent steps exist. A seam declares one
 effect when it sits between two steps and several when it wraps one
 operation, so `mutation.sidecar_confirm_put` (effects fail and skip) takes
 either action from a case with no engine change
 (`cases/mutation_sidecar_confirm_put_failure_rolls_back.gqt`,
 `cases/issue_602_stale_sidecar_heals_on_reopen.gqt`). A `fail` action on a
-seam declaring contention injects a retryable error that the publisher
-retries, so the step succeeds and the `seam_delivered` record is its only
+contention-only seam, or an explicit `contention` action, injects a retryable
+error that the publisher retries, so the step succeeds and the `seam_delivered` record is its only
 proof; on a seam declaring fail the step states the injected error in its
 `--- expect error:` row. A `skip` action carries the healthy expectation the
 skipped path produces; a lost durable write is then proven healed by a

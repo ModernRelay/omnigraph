@@ -22,6 +22,7 @@ use super::*;
 #[cfg(feature = "failpoints")]
 use crate::db::Omnigraph;
 use crate::error::{ManifestConflictDetails, ManifestError, StorageFailureKind};
+#[cfg(feature = "failpoints")]
 use crate::seams::catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{

@@ -337,6 +337,59 @@ fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
 
 #[cfg(tokio_unstable)]
 #[test]
+fn contention_action_records_the_retryable_effect_and_keeps_legacy_fail() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("cases/mutation_publish_contention_retries.gqt"))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("contention.gqt");
+    for action in ["contention", "fail"] {
+        std::fs::write(
+            &path,
+            text.replace("action: contention", &format!("action: {action}")),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, summary) = report(&output);
+        for attempt in summary["attempts"].as_array().unwrap() {
+            let deliveries = attempt["outcome"]["Ok"]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "seam_delivered")
+                .collect::<Vec<_>>();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0]["value"]["at"], "publish.load_state");
+            assert_eq!(deliveries[0]["value"]["effect"], "contention");
+            assert!(
+                deliveries[0]["value"]["crossings"].as_u64().unwrap() >= 2,
+                "the publisher must retry after the injected contention"
+            );
+        }
+    }
+    std::fs::write(
+        &path,
+        text.replace("publish.load_state", "mutation.sidecar_confirm_put"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not admit action contention"));
+}
+
+#[cfg(tokio_unstable)]
+#[test]
 fn occurrence_is_counted_inside_the_selected_operation() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(root.join("cases/dst_fault_on_second_merge.gqt")).unwrap();

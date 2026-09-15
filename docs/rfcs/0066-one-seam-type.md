@@ -151,9 +151,13 @@ action: fail
 scope: next_step
 ```
 
-`action` is `fail` or `skip`; `hold` is refused until a case can express two
-concurrent steps. The action must be among the effects the site declares, so
-an action the site has no arm for is refused before the case runs. A bare
+`action` is `fail`, `contention`, or `skip`; `hold` is refused until a case
+can express two concurrent steps. `fail` selects `Fail` when declared,
+otherwise `Contention` for compatibility with existing cases. Explicit
+`contention` selects only `Contention`, and `skip` selects only `Skip`.
+A seam declaring both failure effects therefore lets a case choose either,
+regardless of declaration order. An undeclared effect is refused before the
+case runs. A bare
 `--- seam` without `action` is refused: a seam is a place, not an action.
 `--- fault` keeps its name for storage-boundary faults, specified in a
 separate amendment to RFC 0045.
@@ -519,7 +523,8 @@ once.
 
 **GQT.** The `--- seam` block is admitted when `at` names a `Decide` seam in the
 engine catalog, `action` is among the seam's declared effects (`fail` admits
-a set holding `Fail` or `Contention`, `skip` one holding `Skip`), and the
+a set holding `Fail` or `Contention`, explicit `contention` requires
+`Contention`, and `skip` requires `Skip`), and the
 step after the block is of the kind the seam's `op` maps to. The runner
 installs a `Decide` that counts crossings, fires the admitted effect on the
 declared occurrence and records the hit; that record, reported as
@@ -528,7 +533,7 @@ whose effect returns success is provable without any error text.
 
 Coverage is a listing, not a generated corpus. `scripts/seam_corpus.py` reads
 every declared seam under the engine's sources and every `--- seam` in the
-corpus and prints one row per seam: where it is declared (`file:line`), its
+corpus and prints one row per seam: its macro invocation (`file:line`), its
 operation, its effects, and the cases that arm it; `--check` refuses a case
 naming a seam the catalog lacks or an action none of its effects admits.
 The `seam_delivered` record carries the same two locations, `declared_at`
@@ -543,7 +548,7 @@ a deferred fork, `crates/omnigraph/src/exec/staging.rs:1320-1324`, so a
 case generated from the step kind alone fails `seam_unobserved`). Reachable
 seams without a case and seams whose operation no step starts are the two
 debts the listing reports; at this RFC's implementation the catalog holds 89
-seams, 44 reachable, 7 armed by a case, 45 unreachable (the listing is the
+seams, 44 reachable, 8 armed by a case, 45 unreachable (the listing is the
 current number).
 
 **Known failures at a restart.** A `--- known_failure` marker may name a
@@ -804,3 +809,8 @@ behind the scheme; it re-pins scenarios and is its own decision.
   `cleanup.*`, `classify.fresh_read`, the two probes, `init.schema_cleanup_delete`,
   `mutation.sidecar_confirm_put`) stay: they name the operation they guard,
   and the honest shape for such a site is `guarded` around that operation.
+
+- 2026-09-15: expose `action: contention` to select `Contention` even when a
+  seam also declares `Fail`. Preserve the `fail` fallback on contention-only
+  seams. The corpus and runtime both report the declaration macro's invocation
+  line, including when documentation separates the invocation from the static.

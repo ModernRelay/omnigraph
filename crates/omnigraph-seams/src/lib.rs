@@ -921,6 +921,18 @@ mod tests {
         static SECOND_CLOCK: dyn Clock = ("test.second_clock", Op::Unreachable);
     }
 
+    const MACRO_SITE_LINE: u32 = line!() + 1;
+    decide_seam! {
+        /// Documentation between the invocation and static does not move the site.
+        static MACRO_SITE = ("test.macro_site", Mutation, [Fail, Contention]);
+    }
+
+    #[test]
+    fn a_macro_seam_records_the_invocation_line() {
+        assert_eq!(MACRO_SITE.site().line(), MACRO_SITE_LINE);
+        assert!(MACRO_SITE.site().file().ends_with("lib.rs"));
+    }
+
     #[test]
     fn empty_slot_passes_and_guard_drop_empties() {
         assert_eq!(SITE.crossed(), Decision::Pass);

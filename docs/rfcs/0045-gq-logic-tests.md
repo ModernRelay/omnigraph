@@ -830,10 +830,12 @@ query unrelated_write() {
 ```
 
 All four seam fields are required. `scope` accepts only `next_step`;
-`action` is `fail` or `skip`, and must match the effect the seam declares
-in the engine's catalog (`fail` admits the fail and contention effects,
-`skip` admits the skip effect); `hold` is refused until a case can express
-two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
+`action` is `fail`, `contention`, or `skip`. `fail` selects the declared
+`Fail` effect, falling back to `Contention` for compatibility when `Fail`
+is absent. Explicit `contention` selects only `Contention`, and `skip`
+selects only `Skip`; undeclared effects are refused. Thus a seam declaring
+both `Fail` and `Contention` lets a case choose either. `hold` is refused
+until a case can express two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
 that seam attributable to the selected operation, including its production
 retries. It starts at zero when the operation is armed. The installed
 decision passes the first N-1 crossings, fires on the Nth, and passes every

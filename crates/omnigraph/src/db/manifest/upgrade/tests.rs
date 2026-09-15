@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::db::Omnigraph;
+#[cfg(feature = "failpoints")]
 use crate::seams::catalog;
 
 async fn synthetic_v6_fixture(root: &str) {

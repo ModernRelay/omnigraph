@@ -179,7 +179,8 @@ pub(crate) fn observe_fault(error: &OmniError) {
 
 /// The effect a case's action fires on a seam declaring `effects`, or `None`
 /// when the seam admits no such action: `fail` takes `Fail`, else
-/// `Contention`; `skip` takes `Skip`; `hold` is never admitted. One rule for
+/// `Contention`; `contention` takes only `Contention`; `skip` takes `Skip`.
+/// `hold` is never admitted. One rule for
 /// arming and for judging a report's delivery evidence.
 pub(crate) fn admitted_effect(
     action: SeamAction,
@@ -188,6 +189,7 @@ pub(crate) fn admitted_effect(
     use omnigraph::seams::Effect;
     let candidates: &[Effect] = match action {
         SeamAction::Fail => &[Effect::Fail, Effect::Contention],
+        SeamAction::Contention => &[Effect::Contention],
         SeamAction::Skip => &[Effect::Skip],
         SeamAction::Hold => &[],
     };
@@ -1487,5 +1489,38 @@ fn replay_attempts(
         Ok(())
     } else {
         Err(failures.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::{SeamAction, admitted_effect};
+    use omnigraph::seams::Effect;
+
+    #[test]
+    fn fail_and_contention_are_selectable_regardless_of_declaration_order() {
+        for effects in [
+            [Effect::Fail, Effect::Contention],
+            [Effect::Contention, Effect::Fail],
+        ] {
+            assert_eq!(
+                admitted_effect(SeamAction::Fail, &effects),
+                Some(Effect::Fail)
+            );
+            assert_eq!(
+                admitted_effect(SeamAction::Contention, &effects),
+                Some(Effect::Contention)
+            );
+        }
+        assert_eq!(
+            admitted_effect(SeamAction::Fail, &[Effect::Contention]),
+            Some(Effect::Contention),
+            "existing fail directives on contention-only seams stay compatible"
+        );
+        assert_eq!(
+            admitted_effect(SeamAction::Contention, &[Effect::Fail, Effect::Skip]),
+            None,
+            "explicit contention cannot fall back to another effect"
+        );
     }
 }

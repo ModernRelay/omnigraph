@@ -24,14 +24,16 @@ ENGINE_SRC = ROOT / "crates" / "omnigraph" / "src"
 CASES = ROOT / "crates" / "omnigraph-gqt" / "cases"
 
 STATIC = re.compile(
-    r'pub static \w+ = \(\s*"(?P<name>[^"]+)"\s*,\s*(?P<op>\w+)\s*,\s*\[(?P<effects>[^\]]*)\]',
+    r'(?P<invocation>(?:\b\w+\s*::\s*)*\bdecide_seam)\s*!\s*\{'
+    r'(?:\s|//[^\n]*|/\*.*?\*/)*'
+    r'pub\s+static\s+\w+\s*=\s*\(\s*"(?P<name>[^"]+)"\s*,\s*(?P<op>\w+)\s*,\s*\[(?P<effects>[^\]]*)\]',
     re.S,
 )
 EFFECT = re.compile(r"\w+")
 DIRECTIVE = re.compile(r"^--- seam\s*\n(?P<body>(?:(?!^---).*\n)*)", re.M)
 FIELD = re.compile(r"^\s*(\w+):\s*(.+?)\s*$", re.M)
 
-ADMITS = {"fail": {"Fail", "Contention"}, "skip": {"Skip"}}
+ADMITS = {"fail": {"Fail", "Contention"}, "skip": {"Skip"}, "contention": {"Contention"}}
 
 
 def catalog() -> dict[str, tuple[str, str, tuple[str, ...]]]:
@@ -40,7 +42,7 @@ def catalog() -> dict[str, tuple[str, str, tuple[str, ...]]]:
     for path in sorted(ENGINE_SRC.rglob("*.rs")):
         text = path.read_text()
         for m in STATIC.finditer(text):
-            line = text.count("\n", 0, m.start()) + 1
+            line = text.count("\n", 0, m.start("invocation")) + 1
             where = f"{path.relative_to(ROOT)}:{line}"
             seams[m["name"]] = (where, m["op"], tuple(EFFECT.findall(m["effects"])))
     return seams
