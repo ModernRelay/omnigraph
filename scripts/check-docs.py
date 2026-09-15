@@ -243,7 +243,13 @@ def list_ids(value: str) -> list[str]:
 
 
 RFC_FILENAME = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md")
-LAST_NUMBERED_RFC = 66
+# The numbered namespace closed on 2026-09-15 with these numbers allocated
+# (files on main) or reserved (PRs open at closure: 0047, 0048, 0050, 0056,
+# 0059, 0060). The set is final; every other number was never allocated.
+NUMBERED_RFCS = frozenset(
+    f"{number:04d}"
+    for number in (*range(1, 14), 15, 18, 19, *range(22, 67))
+)
 
 
 def rfc_id_of(path: Path, errors: list[str]) -> tuple[str, str] | None:
@@ -260,10 +266,10 @@ def rfc_id_of(path: Path, errors: list[str]) -> tuple[str, str] | None:
         return None
     prefix = name.group(1)
     if len(prefix) == 4:
-        if int(prefix) > LAST_NUMBERED_RFC:
+        if prefix not in NUMBERED_RFCS:
             errors.append(
-                f"{path.relative_to(ROOT)}: numbered RFC namespace is closed at "
-                f"{LAST_NUMBERED_RFC:04d}; use YYYY-MM-DD-kebab-title.md"
+                f"{path.relative_to(ROOT)}: numbered RFC namespace is closed and "
+                f"{prefix} was never allocated; use YYYY-MM-DD-kebab-title.md"
             )
             return None
         return prefix, prefix
