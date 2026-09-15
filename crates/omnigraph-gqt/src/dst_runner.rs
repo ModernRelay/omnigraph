@@ -1119,11 +1119,17 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     }
 }
 
+/// One capture at a time per process: the lifecycle probe installs two
+/// process-wide seams, and two in-process tests would collide on them.
+static CAPTURE_ONE_AT_A_TIME: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn capture(
     input_digest: String,
     future: impl std::future::Future<Output = Result<(), String>>,
 ) -> Result<WorkerReport, String> {
     use futures::FutureExt;
+    let _one_at_a_time = CAPTURE_ONE_AT_A_TIME.lock().await;
     let mut initial = Observations::default();
     #[cfg(tokio_unstable)]
     let _guards = {
