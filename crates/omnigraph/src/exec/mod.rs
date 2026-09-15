@@ -44,8 +44,8 @@ use crate::graph_index::GraphIndex;
 use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
-mod merge;
-mod mutation;
+pub(crate) mod merge;
+pub(crate) mod mutation;
 mod projection;
 mod query;
 pub(crate) mod staging;

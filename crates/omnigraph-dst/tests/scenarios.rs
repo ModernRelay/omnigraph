@@ -1738,31 +1738,12 @@ fn dst_sidecar_weather_lost_and_misdirected() {
     assert!(a.verified > 0);
 }
 
-/// CORRUPTION AXIS (persisted tier) — FINDING PIN (first contact 2026-08-13, seed 103):
-/// a LOST sidecar-UPDATE write (arm landed, update lost — the file exists
-/// with STALE content) meets recovery's own OCC cross-check — "found
-/// original commit id … but its manifest delta differs" — and recovery
-/// REFUSES THE REOPEN with kind=Internal, permanently: every retry reads
-/// the same stale sidecar, so the whole store is bricked through the
-/// prescribed recovery path (the cleanup-brick class). The DETECTION is
-/// correct (applying a stale delta would corrupt data — the sidecar's
-/// redundancy check working); the finding is the failure MODE: a
-/// full-store brick wearing an internal-error shape, no typed
-/// corrupted-recovery-state diagnosis, no quarantine/skip path. This pin
-/// asserts today's reality EXACTLY (both same-seed runs brick, same
-/// message) so it flips LOUDLY when the engine gains a remedy.
-/// The planned "reopen heals lost disarms" contract was REFUTED by this
-/// first contact — reality: heal holds only for whole-sidecar loss
-/// (absence = rollback), not stale content.
+/// CORRUPTION AXIS (persisted tier) — FINDING PIN, FLIPPED by #602: a lost
+/// sidecar-UPDATE write beside its visible manifest commit bricked the reopen
+/// (seed 103 first contact 2026-08-13; seed 100 since the 2026-09-01 re-pin).
 #[test]
 #[serial]
-fn dst_stale_sidecar_bricks_recovery() {
-    // Seed re-pinned 103 -> 100 (2026-09-01): the graph-index artifact
-    // write (`__graph_index/csr-current.bin`, write_bytes) now consumes a
-    // fault-plan roll, shifting every seed's fault schedule; seed 103 no
-    // longer strands a stale sidecar. Seed 100 reproduces the pinned
-    // intent (both runs brick with the same OCC refusal); found by the
-    // bounded 100..150 search at these exact parameters.
+fn dst_stale_sidecar_heals_on_reopen() {
     let sc = Scenario {
         seed: 100,
         ops: 30,
@@ -1774,24 +1755,46 @@ fn dst_stale_sidecar_bricks_recovery() {
         }),
         ..Default::default()
     };
-    let brick = |root: &'static str| {
-        let err =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_universe(root, &sc)))
-                .expect_err("stale-sidecar universe must brick until the engine gains a remedy");
-        // Detector-aware extraction: the brick surfaces as a
-        // tagged (Store(Query), CrashContract) violation — reopen failing
-        // for a non-injected reason.
-        let msg = omnigraph_dst::harness::panic_message(err.as_ref());
-        assert!(
-            msg.contains("but its manifest delta differs"),
-            "expected the stale-sidecar OCC refusal, got: {msg}"
-        );
-        msg.replace(root, "<root>")
-    };
-    let a = brick("shared-memory://dst-s11b-lost-a");
-    let b = brick("shared-memory://dst-s11b-lost-b");
-    assert_eq!(a, b, "the brick must replay identically");
-    println!("dst sidecar-weather finding pin: stale-sidecar recovery brick reproduced: {a}");
+    let a = run_universe("shared-memory://dst-s11b-lost-a", &sc);
+    let b = run_universe("shared-memory://dst-s11b-lost-b", &sc);
+    println!(
+        "dst stale-sidecar heal: {} lost, {} consumed, {} residue rows, {} verified",
+        a.writes_lost,
+        a.persisted_consumed,
+        a.attributed_residue.len(),
+        a.verified
+    );
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &b,
+        "stale-sidecar universes must replay identically",
+    );
+    assert!(
+        a.writes_lost > 0,
+        "the lost-write verb should actually bite (lost={})",
+        a.writes_lost
+    );
+    let healed_from_armed = a.persisted_consumed_reads.iter().any(|read| {
+        let armed = read.ends_with(" phase=Armed");
+        let operation_id = read
+            .split("__recovery/")
+            .nth(1)
+            .and_then(|rest| rest.split(".json").next());
+        armed
+            && operation_id.is_some_and(|operation_id| {
+                a.recovery_audit
+                    .contains(&format!("RolledForward {operation_id}"))
+            })
+    });
+    assert!(
+        healed_from_armed,
+        "the pin holds only while recovery reads a sidecar still Armed after a lost write AND \
+         finalizes that operation RolledForward (a confirmed residual is the older roll-forward \
+         path; an Armed sidecar without its commit rolls back); re-pin the seed if the fault \
+         schedule drifted (consumed reads: {:?}, audit: {:?})",
+        a.persisted_consumed_reads, a.recovery_audit
+    );
+    assert!(a.verified > 0);
 }
 
 /// Pins consumed persisted corruption and an attributed refusal, with strict replay.

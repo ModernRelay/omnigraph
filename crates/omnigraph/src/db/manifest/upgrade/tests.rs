@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::db::Omnigraph;
+#[cfg(feature = "failpoints")]
+use crate::seams::catalog;
 
 async fn synthetic_v6_fixture(root: &str) {
     synthetic_v6_fixture_with_branch(root, true).await;
@@ -307,7 +309,7 @@ async fn storage_upgrade_recovery_refuses_foreign_head_movement() {
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
     {
-        let _fault = crate::seams::catalog::UPGRADE_AFTER_FENCE.fire_always();
+        let _fault = catalog::UPGRADE_AFTER_FENCE.fire_always();
         let interrupted = upgrade_storage(
             root,
             UpgradeOptions {
@@ -806,7 +808,7 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
     {
-        let _fault = crate::seams::catalog::UPGRADE_AFTER_FENCE.fire_always();
+        let _fault = catalog::UPGRADE_AFTER_FENCE.fire_always();
         let report = upgrade_storage(
             root,
             UpgradeOptions {

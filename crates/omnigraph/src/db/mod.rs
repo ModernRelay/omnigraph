@@ -1,7 +1,7 @@
 pub mod commit_graph;
-mod graph_coordinator;
+pub(crate) mod graph_coordinator;
 pub mod manifest;
-mod omnigraph;
+pub(crate) mod omnigraph;
 mod recovery_audit;
 mod schema_state;
 pub(crate) mod write_queue;
@@ -24,6 +24,8 @@ pub use omnigraph::{
 };
 pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
+#[cfg(feature = "dst")]
+pub use recovery_audit::dst_recovery_audit_rows;
 pub(crate) use schema_state::SchemaContractText;
 
 use crate::error::{OmniError, Result};

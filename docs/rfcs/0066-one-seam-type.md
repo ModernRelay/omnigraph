@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 discussion: null
 supersedes: []
 superseded_by: []
@@ -37,7 +37,10 @@ holds complete, so the docs, the DST harness and the GQ logic test runner
 (GQT) read one list. GQT gains a
 `--- seam` block admitted from that catalog, with delivery proof taken from
 the test's own installed behavior rather than from the text of a returned
-error.
+error. A decision seam declares the set of ***effects*** its site honors,
+one for a site between two steps, several for a site that wraps one
+operation, and a case names which one fires, so a new action at a known
+site is a case, not an engine edit (amendment of 2026-09-15, decision log).
 
 ## Motivation
 
@@ -82,23 +85,55 @@ by `dst`) and `decide` (the decision installers and the catalog clear,
 enabled by `failpoints` only), so a build that arms a seam no helper reads,
 `dst` without `failpoints` included, fails to compile.
 
-For an engine author, declaring a seam is one static and one call:
+For an engine author, declaring a seam is one `decide_seam!` beside the code
+it guards and one call. A site between two steps declares one effect and
+calls the helper of that effect:
 
 ```rust
-pub static MUTATION_POST_SIDECAR_PRE_FORK: DecideSeam = Seam::decide(
-    "mutation.post_sidecar_pre_fork",
-    Op::Mutation,
-    Effect::Fail,
-    Global::new(),
-);
+use crate::seams::{decide_seam, fail};
 
-crate::seams::fail(&MUTATION_POST_SIDECAR_PRE_FORK)?;
+decide_seam! {
+    /// After the sidecar is armed, before the deferred fork.
+    pub static MUTATION_POST_SIDECAR_PRE_FORK = ("mutation.post_sidecar_pre_fork", Mutation, [Fail]);
+}
+
+fail(&MUTATION_POST_SIDECAR_PRE_FORK)?;
 ```
 
-For a test author, installing one is one guard:
+A site that wraps one operation declares every outcome the code after it
+survives and runs the operation under `guarded`, which returns the
+operation's result, `None` when the decider skipped it, or the injected
+error:
+
+```rust
+decide_seam! {
+    pub static MUTATION_SIDECAR_CONFIRM_PUT = ("mutation.sidecar_confirm_put", Mutation, [Fail, Skip]);
+}
+
+guarded(&MUTATION_SIDECAR_CONFIRM_PUT, storage.write_text(&uri, &json)).await?;
+```
+
+The macro expands to a `pub static` of type `DecideSeam` built by
+`Seam::decide`, so the plain static is still the contract; the macro only
+drops the paths, and it is the one declaration grammar: the source walker
+refuses a `Seam::decide` written out by hand. The crate's catalog indexes every seam from one list:
+
+```rust
+omnigraph_seams::catalog! {
+    crate::exec::staging::MUTATION_POST_SIDECAR_PRE_FORK,
+    crate::db::manifest::recovery::MUTATION_SIDECAR_CONFIRM_PUT,
+    // …
+}
+```
+
+which re-exports each under `catalog::IDENT` and lists it in `ALL`.
+
+For a test author, installing one is one guard; a seam with several effects
+is installed with the effect named:
 
 ```rust
 let _site = MUTATION_POST_SIDECAR_PRE_FORK.fire_once_at(1);
+let _put = MUTATION_SIDECAR_CONFIRM_PUT.skip_once_at(1);
 let _clock = CLOCK.install(Arc::new(LogicalClock::default()));
 ```
 
@@ -116,16 +151,24 @@ action: fail
 scope: next_step
 ```
 
-`action` is `fail` or `skip`; `hold` is refused until a case can express two
-concurrent steps. The action must match the effect the site declares, so a
-mismatch is refused before the case runs. A bare `--- seam` without `action`
-is refused: a seam is a place, not an action. `--- fault` keeps its name for
-storage-boundary faults, specified in a separate amendment to RFC 0045.
+`action` is `fail`, `contention`, or `skip`; `hold` is refused until a case
+can express two concurrent steps. `fail` selects `Fail` when declared,
+otherwise `Contention` for compatibility with existing cases. Explicit
+`contention` selects only `Contention`, and `skip` selects only `Skip`.
+A seam declaring both failure effects therefore lets a case choose either,
+regardless of declaration order. An undeclared effect is refused before the
+case runs. A bare
+`--- seam` without `action` is refused: a seam is a place, not an action.
+`--- fault` keeps its name for storage-boundary faults, specified in a
+separate amendment to RFC 0045.
 
-A `--- seam` block inherits the placement rules of `--- fault`: at most one
-per step, directly before the step it arms, never inside a loop body, at most
-16 per case, and refused before a `--- restart`, since no installed behavior
-survives a restart. `occurrence: N` counts crossings of the site, retries
+A `--- seam` block inherits the placement rules of `--- fault`: directly
+before the step it arms, never inside a loop body, at most 16 per case, and
+refused before a `--- restart`, since no installed behavior survives a
+restart. Several blocks may precede one step when they name distinct seams,
+each with its own delivery record; the same seam twice before one step is
+refused (the one-per-step rule of the first draft was lifted by the #602 fix,
+whose case loses two independent writes on one mutation). `occurrence: N` counts crossings of the site, retries
 included: the installed behavior passes the first N-1 crossings, fires on the
 Nth, and passes every later one, with N in `1..=1000000`. The expectation
 shape follows the action and the seam's declared effect: a `fail` action on a
@@ -134,22 +177,22 @@ contention the injected error is retryable, the publisher retries it and the
 step carries its healthy expectation, the delivery record being the proof; a
 `skip` step carries the healthy expectation the skipped path produces (the
 complete mapping is RFC 0045 §Seams at an explicit step). The step report
-carries `seam_delivered` with the seam name and the crossing index that
-fired, which is the proof the seam was reached.
+carries `seam_delivered` with the seam name, the crossing index that fired
+and the effect it fired, which is the proof the seam was reached.
 
 The first case of the skip kind is the one the motivation names,
-`crates/omnigraph-gqt/cases/issue_602_stale_sidecar_bricks_reopen.gqt`; the
+`crates/omnigraph-gqt/cases/issue_602_stale_sidecar_heals_on_reopen.gqt`; the
 excerpt below omits its `--- runner`, `--- schema` and `--- seed` sections:
 
 ```
 # issue: 602
---- known_failure
-step: 2
-match:
-  error: Internal
-  reason_prefix: "OCC recovery sidecar '"
 --- seam
-at: mutation.sidecar_confirm_ack_lost
+at: mutation.sidecar_confirm_put
+occurrence: 1
+action: skip
+scope: next_step
+--- seam
+at: mutation.sidecar_post_publish_delete
 occurrence: 1
 action: skip
 scope: next_step
@@ -164,11 +207,35 @@ query all() { match { $p: Person } return { $p.name } }
 {"p.name":"bob"}
 ```
 
-The skipped confirm leaves a sidecar the mutation never acknowledges, and on
-today's tree the reopen at `--- restart` refuses with `kind: Internal`. The
-refusal embeds the operation id of that run, so the marker matches its stable
-head rather than the whole string, and the case lands carrying that marker
-until the heal ships.
+The skipped confirm and the skipped delete leave a sidecar the mutation never
+acknowledges beside its visible commit. Before the #602 heal the reopen at
+`--- restart` refused with `kind: Internal`, and the case was first drafted
+carrying a `--- known_failure` marker on that step (the refusal embeds the
+operation id of the run, so the marker matched its stable head); the heal
+landed in the same change as the two seams, so the case asserts the reopen
+and the rows instead.
+
+The same site honors `fail`, and the second case at it is written without
+touching the engine (`mutation_sidecar_confirm_put_failure_rolls_back.gqt`):
+the put returns the injected error, the sidecar stays `Armed` beside table
+versions nobody published, and the reopen rolls the intent back, so only
+`alice` survives:
+
+```
+--- seam
+at: mutation.sidecar_confirm_put
+occurrence: 1
+action: fail
+scope: next_step
+--- mutate
+query add() { insert Person { name: "bob" } }
+--- expect error: injected failpoint triggered: mutation.sidecar_confirm_put
+--- restart
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+```
 
 ## Design
 
@@ -178,16 +245,16 @@ until the heal ships.
 pub struct Seam<B: ?Sized + 'static, S: Storage<B> = Global<B>> {
     name: &'static str,
     op: Op,
-    effect: Option<Effect>,
+    effects: &'static [Effect],
     slot: S,
 }
 
 impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
     pub const fn new(name: &'static str, op: Op, slot: S) -> Self;
-    pub const fn decide(name: &'static str, op: Op, effect: Effect, slot: S) -> Self;
+    pub const fn decide(name: &'static str, op: Op, effects: &'static [Effect], slot: S) -> Self;
     pub const fn name(&self) -> &'static str;
     pub const fn op(&self) -> Op;
-    pub const fn effect(&self) -> Option<Effect>;
+    pub const fn effects(&self) -> &'static [Effect];
     pub fn with<R>(&self, f: impl FnOnce(&B) -> R) -> Option<R>;
     // with the `install` feature:
     pub fn install(&'static self, b: Arc<B>) -> Installed<B, S>;
@@ -195,7 +262,8 @@ impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
 
 pub type DecideSeam = Seam<dyn Decide, Global<dyn Decide>>;
 pub enum Op { Mutation, BranchMerge, BranchCreate, BranchDelete, AnyWrite, Unreachable }
-pub enum Effect { Fail, Skip, Contention, Hold, Custom }
+pub enum Effect { Fail, Skip, Contention }
+pub enum Decision { Fire(Effect), Pass }
 
 /// Everything a slot may hold; the one hook every behavior shares.
 pub trait Behavior: 'static {
@@ -211,7 +279,12 @@ only if the slot still holds it, then calls `uninstalling` on the removed
 value. Installing over a filled slot panics, so two guards never hold one
 seam, and a value installed after a `clear()` is never removed by an older
 guard. `with` hands the installed behavior to the caller, or `None`. The type
-knows nothing about what `B` does; the call site does.
+knows nothing about what `B` does; the call site does. `effects` is empty
+for every non-decision seam and non-empty for a decision seam: the
+outcomes its site honors, one per site between two steps, several for a
+site that wraps one operation. A decision fires with one of them, and
+`crossed()` refuses a decider firing an effect outside the set, since the
+site has no arm for it.
 
 **The two slot scopes.** `Storage<B>` has two implementations, chosen per seam:
 `Global` (a `RwLock<Option<Arc<B>>>` in the static, `B: Send + Sync`; the
@@ -240,7 +313,7 @@ thread_local_seam! {
 pub static MUTATION_POST_SIDECAR_PRE_FORK: DecideSeam = Seam::decide(
     "mutation.post_sidecar_pre_fork",
     Op::Mutation,
-    Effect::Fail,
+    &[Effect::Fail],
     Global::new(),
 );
 ```
@@ -254,7 +327,7 @@ Under `ThreadLocal` the installed value need not be `Send` or `Sync`, so
 
 | Trait | Method | Seams using it |
 |---|---|---|
-| `Decide` | `decide(&self, name: &'static str) -> Decision` (`Fire` or `Pass`) | the 87 engine and 8 cluster named sites |
+| `Decide` | `decide(&self, name: &'static str) -> Decision` (`Fire(Effect)` or `Pass`) | the 89 engine and 8 cluster named sites |
 | `Clock` | `now_ms(&self) -> u64` | `CLOCK` |
 | `IdSource` | `next_ulid(&self) -> Ulid` | `IDS` |
 | `GateHook` | the existing `TurnHook` contract from `dst_gate.rs` | `GATE` |
@@ -268,32 +341,55 @@ entry points today, and both of those readers are derived from it;
 `IdSource::next_ulid` takes `&self` because the seeded source advances its own
 state (`dst_ids.rs:67-76`).
 
-The crate ships the decision behaviors tests reach for: `FireAlways`,
-`FireOnceAt(n)` (passes `n - 1` crossings, fires on the `n`th), `Counted`
-(the same, with the count readable: the runner's delivery proof), `PanicAt`,
-`Observe(f)` (runs `f`, returns `Pass`, which is what most of the 7
-`with_callback` uses want: the cluster race rewrite, the harness probe flags,
-the thread-filtered counters) and `Hold` (below). `LogicalClock::default()`
-(the fixed epoch, one millisecond per read) and `SeededUlids::new(seed)` stay
-in the engine's `dst_clock` and `dst_ids` modules beside their traits.
+The crate ships the decision behaviors tests reach for: `FireAlways(effect)`,
+`FireOnceAt(n, effect)` (passes `n - 1` crossings, fires `effect` on the
+`n`th), `Counted` (the same, with the count and the effect readable: the
+runner's delivery proof), `PanicAt`, `Observe(f)` (runs `f`, returns `Pass`,
+which is what most of the 7 `with_callback` uses want: the cluster race
+rewrite, the harness probe flags, the thread-filtered counters) and `Hold`
+(below). The installers on `DecideSeam` come in two spellings:
+`fire_always()`, `fire_once_at(n)` and `count_and_fire_at(n)` fire the one
+effect of a single-effect seam and refuse a seam declaring several;
+`fire_always_with(effect)`, `fire_once_at_with(n, effect)` and
+`count_and_fire_at_with(n, effect)` name the effect and refuse one the seam
+does not declare; `fail_once_at(n)`, `skip_once_at(n)`,
+`contention_once_at(n)` and the three `_always` siblings are the same,
+spelled by effect. `LogicalClock::default()` (the fixed epoch, one millisecond
+per read) and `SeededUlids::new(seed)` stay in the engine's `dst_clock` and
+`dst_ids` modules beside their traits.
 
-**Site helpers.** `fail`, `contention` and `skip` are thin functions in each
-consuming crate over `Seam::with`, not in the seams crate: the injected error is
-the consuming crate's own (`OmniError::manifest` in the engine,
-`crates/omnigraph/src/failpoints.rs:91`; the cluster's `Diagnostic`,
-`crates/omnigraph-cluster/src/failpoints.rs:21-25`), and the text
+**Site helpers.** `fail`, `contention`, `skip` and `guarded` are thin
+functions in each consuming crate over `Seam::with`, not in the seams crate:
+the injected error is the consuming crate's own (`OmniError::manifest` in the
+engine, `crates/omnigraph/src/seams.rs`; the cluster's `Diagnostic`,
+`crates/omnigraph-cluster/src/seams.rs`), and the text
 `injected failpoint triggered: ` has 40 dependents plus RFC 0045:821, so it is
-kept byte for byte. `fail(&SEAM)?` returns the injected error on `Fire`, as
-`maybe_fail` does today; `contention(&SEAM)?` returns the retryable CAS error,
-as `maybe_fail_retryable_contention` does; `skip(&SEAM) -> bool` is
-`is_enabled`. Each helper rejects a seam whose declared effect is not its own:
-`fail` admits `Fail`, `contention` admits `Contention`, `skip` admits `Skip`.
-The check is a `debug_assert` at the crossing, and the source walker reports
-the same pairing statically. A site needing another effect declares
-`Effect::Custom` and calls `with` directly; `Custom` seams are never admitted
-by a logic test.
+kept byte for byte. The first three serve a site between two steps, which
+declares exactly one effect: `fail(&SEAM)?` returns the injected error on a
+fired decision, as `maybe_fail` did; `contention(&SEAM)?` returns the
+retryable CAS error, as `maybe_fail_retryable_contention` did;
+`skip(&SEAM) -> bool` is `is_enabled`. Each rejects a seam whose declared set
+is not exactly its own effect (`assert_eq!` at the crossing, and the source
+walker reports the same pairing statically).
 
-**`Hold`.** `Hold` records that the site was reached, parks the first
+`guarded(&SEAM, op).await -> Result<Option<T>>` serves a site that wraps one
+operation and declares every outcome the code after the call survives. It
+holds the only match over the decision: `Pass` runs `op` and returns
+`Some(op's result)`; `Fire(Skip)` returns `Ok(None)` without running `op`;
+`Fire(Fail)` and `Fire(Contention)` return the injected errors. An action
+thus has one meaning at every site (`skip` = the wrapped operation did not
+run, `fail` = it was replaced by the injected error), the site never
+interprets an action itself, and a second action at a known site is a case,
+not an edit. What stays a Rust edit is a new place: one edit per location.
+The set is held honest by review, not by a type: a site lists `Skip` only
+when the code after the call treats `None` as a real outcome
+(`confirm_occ_sidecar_v9` updates the in-memory sidecar after a lost put;
+the post-commit delete remains independent). The three effects are the whole vocabulary:
+a site needing another outcome adds an `Effect` variant and its arm in
+`guarded`, so every outcome a case can name is one every site can honor.
+
+**`Hold`.** `Hold` is a decider, not an effect: it is installable on any
+decision seam, records that the site was reached, parks the first
 crossing until `release()` is called, the guard drops, or `HOLD_BOUND` (30 s)
 elapses, and returns `Pass` on wake; later crossings pass. A wake by the
 bound is recorded by `Hold::timed_out`, so a helper can fail loudly instead of
@@ -306,20 +402,22 @@ arrival and passes later ones, becomes a `Decide` of this shape. The two
 crossing until the rule changed, `Hold` parks the first, and both tests'
 assertions hold either way.
 
-**The first skip seam.** No reachable skip seam exists in the engine today: the
-only `is_enabled` site is `CHANGE_FEED_SKIP_ETAG_WITNESS`
+**The first skip seam, now the first multi-effect seam.** No reachable skip
+seam existed in the engine before this RFC: the only `is_enabled` site was
+`CHANGE_FEED_ETAG_WITNESS`
 (`crates/omnigraph/src/db/table_store.rs:1168`), whose op no GQ step reaches.
-This PR adds the first one, `mutation.sidecar_confirm_ack_lost` (op `Mutation`,
-effect `Skip`): read once, through `skip` inside `confirm_occ_sidecar_v9`
-(`crates/omnigraph/src/db/manifest/recovery.rs`), to skip the confirm put.
-The function returns whether the put was made; `commit_all` carries a `false`
-as `sidecar_confirm_lost`, and the post-commit `delete_sidecar`
-(`crates/omnigraph/src/exec/mutation.rs`) is skipped on it while the sidecar
-handle stays, so a publish failure after the lost confirm still classifies as
-recovery. One crossing models both lost writes because a lost confirm alone
-is repaired by the delete: the pair leaves the stale sidecar that
-[#602](https://github.com/ModernRelay/omnigraph/issues/602) reports, and
-leaves it from a logic test.
+The first one, `mutation.sidecar_confirm_put` (op `Mutation`, effects
+`[Fail, Skip]`), wraps the confirm put through `guarded` inside
+`confirm_occ_sidecar_v9` (`crates/omnigraph/src/db/manifest/recovery.rs`).
+Failure leaves the sidecar Armed with no visible commit and the reopen
+rolls back; skipping loses the put while the in-memory sidecar still confirms. Its sibling
+`mutation.sidecar_post_publish_delete` skips the post-commit delete inside
+`delete_sidecar_after_publish`, the one helper both `exec/mutation.rs` and
+`loader/mod.rs` call. The two are independent: a lost confirm alone is
+repaired by the delete, a lost delete alone leaves a confirmed residual the
+existing roll-forward finalizes, and the pair leaves the stale sidecar that
+[#602](https://github.com/ModernRelay/omnigraph/issues/602) reports, each
+shape its own logic-test case.
 
 **The two storage seams.** `STORAGE` is consulted at the one point where an
 adapter enters a handle, `open_with_storage_and_mode`
@@ -363,8 +461,24 @@ dependencies.
 `catalog.rs` whose `ALL` array a guard test holds complete: membership both
 ways, unique names, one reference per static. A generator or `inventory`
 would be a second source of truth (and `inventory` is not in `Cargo.lock`;
-only `ctor` is). The erased row is
-`SeamEntry { name, op, effect() }`. The engine's catalog replaces
+only `ctor` is). Since the 2026-09-15 amendment the static itself is
+declared beside the site it guards, above the item that crosses it (the
+file of its most-crossed site when several do), through the `decide_seam!`
+macro, and the catalog is one `catalog!` list of paths that expands to a
+`pub use` per seam plus `ALL`, so `catalog::IDENT` stays the one path every
+test, case and harness string resolves through and a seam is listed exactly
+once. The point of
+the placement is location: `Seam::new` and `Seam::decide` are
+`#[track_caller]` const fns that record `Location::caller()`, so
+`SeamEntry::site()` is the file and line of the declaration as the compiler
+saw it, not a string anyone typed, and the site helpers are `#[track_caller]`
+too, so a fired decision records the helper call whose crossing fired
+(`last_fired()`, one of possibly several for one seam; a passing crossing
+records nothing, so a later pass at another helper cannot displace it).
+Private modules
+on the path from the crate root to a declaring file are widened to
+`pub(crate)` for the re-export; nothing becomes `pub`. The erased row is
+`SeamEntry { name, op, effects(), site(), last_fired() }`. The engine's catalog replaces
 `failpoints::names`; the cluster keeps its own, and the logic test runner reads
 the engine's catalog only, since no cluster seam is reachable from a GQ step.
 `catalog::decide(name: &str) -> Option<&'static Seam<dyn Decide, Global>>` is
@@ -385,12 +499,16 @@ The catalog is held honest by the existing source walker.
 `crates/omnigraph/tests/failpoint_names_guard.rs:19-24`
 (`docs/dev/testing.md:43`) is the catalog guard today and is rewritten for the
 new call prefixes, so that every `fail(&`, `skip(&`, `contention(&`,
-`park_first(` and `catalog::decide(` argument is a catalog static rather than
-a literal, every catalog static has at least one reference, and every helper
-call is paired with the effect its static declares. A literal cannot reach a
-helper otherwise: the helpers take `&'static DecideSeam`, so the one string
-path is `catalog::decide`. The scan matches those prefixes only: a bare `with`
-cannot be told from `LocalKey::with` (`dst_gate.rs:31`) by a source walker.
+`guarded(`, `park_first(` and `catalog::decide(` argument is a catalog
+static rather than a literal, every declared static is re-exported by the
+catalog and listed in `ALL` and has at least one reference beyond its own
+declaration, no `Seam::decide` remains in a catalog or under a test module,
+and every single-effect helper call names a static declaring exactly that
+effect (`guarded` takes any declared set). A literal cannot
+reach a helper otherwise: the helpers take `&'static DecideSeam`, so the one
+string path is `catalog::decide`. The scan matches those prefixes only: a
+bare `with` cannot be told from `LocalKey::with` (`dst_gate.rs:31`) by a
+source walker.
 
 **The test guard.** Four methods on `DecideSeam` replace
 `ScopedFailPoint::new(name, rule)`, one per rule shape present in the tree:
@@ -404,23 +522,33 @@ semantics that the 136 uses depend on when their site is crossed more than
 once.
 
 **GQT.** The `--- seam` block is admitted when `at` names a `Decide` seam in the
-engine catalog, `action` matches the seam's declared effect, and the step after
-the block is of the kind the seam's `op` maps to. The runner installs a `Decide`
-that counts crossings, fires on the declared occurrence and records the hit;
-that record, reported as `seam_delivered`, is the delivery proof, so a seam
+engine catalog, `action` is among the seam's declared effects (`fail` admits
+a set holding `Fail` or `Contention`, explicit `contention` requires
+`Contention`, and `skip` requires `Skip`), and the
+step after the block is of the kind the seam's `op` maps to. The runner
+installs a `Decide` that counts crossings, fires the admitted effect on the
+declared occurrence and records the hit; that record, reported as
+`seam_delivered` with the effect that fired, is the delivery proof, so a seam
 whose effect returns success is provable without any error text.
 
 Coverage is a listing, not a generated corpus. `scripts/seam_corpus.py` reads
-the catalog and every `--- seam` in the corpus and prints one row per seam:
-its operation, its effect, and the cases that arm it; `--check` refuses a
-case naming a seam the catalog lacks or an action its effect does not admit.
+every declared seam under the engine's sources and every `--- seam` in the
+corpus and prints one row per seam: its macro invocation (`file:line`), its
+operation, its effects, and the cases that arm it; `--check` refuses a case
+naming a seam the catalog lacks or an action none of its effects admits.
+The `seam_delivered` record carries the same two locations, `declared_at`
+and `fired_at`, so a report says which crate and file a seam lives in and
+which helper call fired. The known-failure classifier requires the record's
+`effect` to equal the one the case's action admits, by the same rule the
+runner arms with, so a replayed report cannot pass on a name and an
+occurrence alone.
 A proof case is written by hand, one per seam, because a step kind alone is
 not enough to cross a site (`MUTATION_POST_SIDECAR_PRE_FORK` fires only with
 a deferred fork, `crates/omnigraph/src/exec/staging.rs:1320-1324`, so a
 case generated from the step kind alone fails `seam_unobserved`). Reachable
 seams without a case and seams whose operation no step starts are the two
-debts the listing reports; at this RFC's implementation the catalog holds 88
-seams, 43 reachable, 6 armed by a case, 45 unreachable (the listing is the
+debts the listing reports; at this RFC's implementation the catalog holds 89
+seams, 44 reachable, 8 armed by a case, 45 unreachable (the listing is the
 current number).
 
 **Known failures at a restart.** A `--- known_failure` marker may name a
@@ -440,8 +568,9 @@ message and ignores what follows.
   same seed before and after the move: the same generated ids, the same
   stamps, in the same order, so every pinned DST scenario replays
   byte-identically.
-- Every decision seam is in its crate's catalog; every catalog entry has a
-  site. The five non-decision seams (`CLOCK`, `IDS`, `GATE`, `STORAGE`,
+- Every decision seam is declared beside a site and indexed by its crate's
+  catalog; every catalog entry has a site, and the entry's `site()` is the
+  declaration the compiler recorded. The five non-decision seams (`CLOCK`, `IDS`, `GATE`, `STORAGE`,
   `OBJECT_STORE`) are statics the harness names directly.
 
 ## Compatibility and reversibility
@@ -516,7 +645,14 @@ Owners extended (`docs/dev/testing.md:23,43,60`): `crates/omnigraph/tests/failpo
 - Every pinned DST scenario strict-replays unchanged after the move
   (`cargo test -p omnigraph-dst --test scenarios`).
 - The source-walk test: every site names a catalog static, every catalog static
-  has a site, and every helper call matches its seam's declared effect.
+  has a site, and every single-effect helper call names a seam declaring
+  exactly that effect.
+- The seams crate's own tests: a multi-effect seam fires the effect named at
+  install, refuses the plain installer, refuses an undeclared effect at
+  install, and refuses at the crossing a decider firing outside the set.
+- GQT: the second case at `mutation.sidecar_confirm_put`,
+  `mutation_sidecar_confirm_put_failure_rolls_back.gqt`, green with no engine
+  change beyond the seam's set; the 602 case unchanged but for the name.
 - The 150 `ScopedFailPoint::new` uses and 7 `with_callback` uses across 11 test
   files rewritten to the `DecideSeam` methods; the `FailScenario::setup`
   calls kept and counted; the 46 engine integration binaries green, 2 of them
@@ -527,8 +663,9 @@ Owners extended (`docs/dev/testing.md:23,43,60`): `crates/omnigraph/tests/failpo
   reports equivalent up to the renamed delivery record (`fault_delivered
   {hook}` became `seam_delivered {at, occurrence, crossings}`);
   `scripts/seam_corpus.py --check` clean over the corpus;
-  `issue_602_stale_sidecar_bricks_reopen.gqt` landing red and carrying its
-  `known_failure` marker until the heal ships.
+  `issue_602_stale_sidecar_heals_on_reopen.gqt` green with the #602 heal in the
+  same change (first drafted as `…_bricks_reopen.gqt`, red with a
+  `known_failure` marker, before the heal joined this PR).
 
 The `--- seam` admission rule and the source walker are rules applied to
 people, so both tables below are part of the evidence. The walker's own
@@ -537,22 +674,25 @@ pairing; the GQT refusal corpus covers admission.
 
 | Way to satisfy the rule without doing the work | What stops it |
 |---|---|
-| Renamed import (`use crate::seams::fail as f;`) | outside the walker's grammar; the helpers take `&'static DecideSeam`, so a renamed helper still cannot take a literal, and each helper asserts the declared effect at every crossing (`assert_eq!`, release builds included) |
+| Renamed import (`use crate::seams::fail as f;`) | outside the walker's grammar; the helpers take `&'static DecideSeam`, so a renamed helper still cannot take a literal, and each single-effect helper asserts the declared set at every crossing (`assert_eq!`, release builds included) |
+| A decider firing an effect the seam does not declare | `crossed()` panics naming the seam, the effect and the declared set; the `_with` installers refuse it earlier |
+| A site listing an effect its code does not survive (`Skip` where `None` is not handled) | no type catches it; the review rule in §Site helpers is the guard, and the proof case is the evidence |
 | A wrapper function that calls a helper | a wrapper's parameter is typed `&'static DecideSeam`, so it can only carry a catalog static; the walker pairs the call where the static is named (a full path or an imported name), the crossing assert covers the rest |
 | A macro that expands to a helper call | a literal macro body is scanned like any other site; a macro that builds the call from a token argument is outside the grammar and left to the crossing assert |
 | Two statics sharing one `name` string | the catalog test in `failpoint_names_guard.rs` asserts unique names, and `catalog::decide` would otherwise answer the first |
-| Wrong effect/helper pairing (`skip(&A_FAIL_SEAM)`) | the helper rejects a seam whose declared effect is not its own, and the walker reports the pairing |
-| A site that calls `with` directly and declares no effect | the seam must declare `Effect::Custom`, which `--- seam` never admits |
+| Wrong effect/helper pairing (`skip(&A_FAIL_SEAM)`, `fail(&A_FAIL_OR_SKIP_SEAM)`) | the helper rejects a seam whose declared set is not exactly its own effect, and the walker reports the pairing; a multi-effect seam reaches a site only through `guarded` |
+| A site that calls `with` directly on a decision seam | the walker's grammar lists no such helper, so the static has no recognised crossing and the catalog test reports it as dead weight |
 | A catalog entry with no site | the catalog test fails on a static that no source or test file names |
 | A `--- seam` naming a seam the case's step kind cannot cross | admission compares the seam's `op` to the next step's kind and refuses before the case runs |
 
 | Route the user docs give an honest author | Does the rule accept it |
 |---|---|
 | Declare a static, call the matching helper at the site, add it to `ALL`, write its proof case | yes; the listing shows the seam with its case |
+| Declare a static with several effects around one operation, call `guarded` at the site, write one proof case per effect | yes; the listing shows the seam with its cases, and any further case at that site needs no engine edit |
 | Declare a static for a site no step can reach yet | yes; the listing reports it as unreachable, and no case may arm it |
-| Call `Seam::with` directly for an effect the three helpers do not cover | yes, with `Effect::Custom`; the seam is armed from a Rust test, never from a case |
-| Arm an existing seam from a Rust test | yes, through the `DecideSeam` methods |
-| Arm a seam from a logic test with `--- seam` | yes when the action matches the declared effect and the next step's kind matches the `op` |
+| Need an outcome the three effects do not cover | add the `Effect` variant and its `guarded` arm, in the seams crate and the engine, so cases can name it too |
+| Arm an existing seam from a Rust test | yes, through the `DecideSeam` methods; the `_with` spelling for a multi-effect seam |
+| Arm a seam from a logic test with `--- seam` | yes when the action is among the declared effects and the next step's kind matches the `op` |
 
 ## Rollout
 
@@ -564,10 +704,19 @@ One PR, carrying:
 - `fail-parallel` removed from the three manifests and the workspace table;
 - the `--- seam` block in GQT with catalog-driven admission, the runner's
   `Decide`, the corpus rewrite and the coverage listing;
-- the new skip seam `mutation.sidecar_confirm_ack_lost`, the `reason_prefix`
-  matcher and `--- restart` support in `known_failure`, and the case
-  `issue_602_stale_sidecar_bricks_reopen.gqt`, which lands carrying that marker
-  until the heal, a separate PR, flips it.
+- the two skip seams `mutation.sidecar_confirm_put` and
+  `mutation.sidecar_post_publish_delete`, the `reason_prefix` matcher and
+  `--- restart` support in `known_failure`, several `--- seam` blocks before
+  one step, and the case `issue_602_stale_sidecar_heals_on_reopen.gqt`, which
+  lands green because the #602 heal ships in the same change (its first draft
+  carried a `known_failure` marker on the restart).
+
+A second PR (2026-09-15) carries the amendment: the effect set on
+`Seam::decide` and `Decision::Fire(Effect)` in the seams crate, the `_with`
+installers, `guarded` in the engine, the 97 catalog entries represented by
+effect sets, `mutation.sidecar_confirm_put` with the set `[Fail, Skip]`, membership
+admission and the effect in `seam_delivered` in GQT, the walker and
+`seam_corpus.py` reading sets, and the second case at the put.
 
 The harness holds the guards for the run: `InstalledEnvironment`
 (`crates/omnigraph-dst/src/environment.rs:66-76`) holds `CLOCK` and `IDS`, each
@@ -604,7 +753,64 @@ behind the scheme; it re-pins scenarios and is its own decision.
   two concurrent steps.
 - Whether any cluster seam ever becomes reachable from a GQ step, which is the
   only reason the runner would read a second catalog.
+- Whether a seam's kind (decision site, decorator, value source, hook) becomes
+  listed metadata beside `op` and `effects`, so one listing covers the five
+  non-decision seams and the runner refuses a `--- seam` naming a decorator
+  by rule rather than by absence from `ALL`. Today the kind is the behavior
+  type parameter only; the reader that would justify the field is a unified
+  listing, and the `dst`/`failpoints` feature split between the catalog and
+  those five statics is the cost to settle first.
 
 ## Decision log
 
-- No maintainer decision recorded yet.
+- 2026-09-15, effect sets (one seam, several actions): a decision seam
+  declares `&[Effect]` instead of one `Effect`; `Decision::Fire` carries the
+  effect; `guarded` wraps an operation and holds the only match; the runner
+  admits by membership and reports the effect. Replaced sentences: in
+  §User and operational behavior, "The action must match the effect the site
+  declares, so a mismatch is refused before the case runs" and the
+  `seam_delivered` sentence; in §Design, the `Seam` listing (`effect:
+  Option<Effect>`, `decide(.., effect: Effect, ..)`, `effect()`, the `Effect`
+  enum with `Hold`), the `Decide` row of the behavior traits table, the
+  shipped-deciders paragraph, the whole **Site helpers** paragraph, the first
+  sentence of **`Hold`**, the **first skip seam** paragraph, the `SeamEntry`
+  row, the walker sentence "every helper call is paired with the effect its
+  static declares", and the **GQT** and coverage paragraphs; in §Evidence,
+  the walker bullet and the three table rows on pairing, `Custom` and
+  `--- seam` admission. `Effect::Hold` is removed: `Hold` is a decider that
+  passes after the park and was installable on any seam already
+  (`Rendezvous::park_first` installs it on fail seams). Motivation recorded
+  in the doc workspace, task 0196: a `.gqt` author could not write a new
+  action at a known site without an engine edit, and the confirm put already
+  needed `fail` beside `skip`.
+- 2026-09-15, same PR, seam location: a seam static is declared beside the
+  site it guards and the catalog indexes it (`pub use` + `ALL`); the
+  constructors and the site helpers are `#[track_caller]`, so every entry
+  knows its declaration (`site()`) and its last crossing
+  (`last_fired()`), and `seam_delivered` reports both as `declared_at`
+  and `fired_at`. Replaced sentences: in §Design **The catalog**, "keeps a
+  hand-listed `catalog.rs`" now describes the index and the re-exports, and
+  the erased row gains the two locations; the walker sentence on "every
+  catalog static has at least one reference"; the coverage paragraph; in
+  §Invariants, "Every decision seam is in its crate's catalog". Motivation:
+  a name says the area, not the crate or file, and nothing hand-written
+  stays true; the compiler's record does.
+- 2026-09-15, same PR, naming: a seam name is a place (`area.position`, the
+  position spelled `post_`/`pre_`/`before_`/`after_`/`between_` or the
+  operation it wraps); the action is the event, so a name never carries an
+  outcome or an effect word, which under an effect set would read as a lie
+  for the second action. Five names migrated: `init.manifest_create_ack_lost`
+  → `init.manifest_create_post_native`, `init.table_create_ack_lost` →
+  `init.table_create_post_native` (the `branch_create.post_native`
+  precedent), `change_feed.skip_etag_witness` → `change_feed.etag_witness`,
+  `optimize.inject_reindex_conflict` → `optimize.post_compact_pre_reindex`,
+  `publish.load_state_retryable_contention` → `publish.load_state`. The
+  fourteen operation-named seams without a position (`recovery.sidecar_*`,
+  `cleanup.*`, `classify.fresh_read`, the two probes, `init.schema_cleanup_delete`,
+  `mutation.sidecar_confirm_put`) stay: they name the operation they guard,
+  and the honest shape for such a site is `guarded` around that operation.
+
+- 2026-09-15: expose `action: contention` to select `Contention` even when a
+  seam also declares `Fail`. Preserve the `fail` fallback on contention-only
+  seams. The corpus and runtime both report the declaration macro's invocation
+  line, including when documentation separates the invocation from the static.

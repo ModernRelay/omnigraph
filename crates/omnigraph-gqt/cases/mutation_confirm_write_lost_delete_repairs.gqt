@@ -1,0 +1,46 @@
+# issue: none
+# notes: Only the sidecar confirm put is lost; the post-commit delete lands and removes the arm-time object, so no residue survives the mutation.
+# notes: The reopen finds nothing under `__recovery/` and serves both rows; the delivery record proves the confirm put was skipped.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: mutation.sidecar_confirm_put
+occurrence: 1
+action: skip
+scope: next_step
+
+--- mutate
+query add_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query rows_after_reopen() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+
+--- expect shape
+p.name: String

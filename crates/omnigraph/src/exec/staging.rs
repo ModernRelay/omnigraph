@@ -40,6 +40,7 @@ use crate::db::manifest::{
 };
 use crate::db::{DatasetUpdate, MutationOpKind};
 use crate::error::{OmniError, Result};
+use crate::seams::{catalog, decide_seam, fail};
 use crate::table_store::ExternalBlobUriCollector;
 
 /// Logical semantics for one accumulated table write.
@@ -189,6 +190,15 @@ fn parse_stage_write_concurrency(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_STAGE_WRITE_CONCURRENCY)
+}
+
+decide_seam! {
+    /// Between per-table fragment uploads
+    /// inside `stage_all_with_concurrency`. A crash here
+    /// leaves a PARTIAL set of staged files across tables with no breadcrumb
+    /// — benign by construction (unreferenced, reclaimable by cleanup), which
+    /// is exactly what the window lets a universe prove.
+    pub static LOAD_BETWEEN_TABLE_STAGES = ("load.between_table_stages", Unreachable, [Fail]);
 }
 
 impl MutationStaging {
@@ -604,7 +614,7 @@ impl MutationStaging {
                     // fragment uploads — a partial staged set with no
                     // breadcrumb (benign by construction; cleanup reclaims).
                     if stage_idx > 0 {
-                        crate::seams::fail(&crate::seams::catalog::LOAD_BETWEEN_TABLE_STAGES)?;
+                        fail(&LOAD_BETWEEN_TABLE_STAGES)?;
                     }
                     stage_pending_table(db, table_key, table, path, expected).await
                 },
@@ -1065,14 +1075,39 @@ pub(crate) struct CommittedMutation {
     /// Recovery sidecar to delete during Stage H after manifest CAS succeeds
     /// (`None` when nothing staged).
     pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
-    /// The confirm put was skipped by the `MUTATION_SIDECAR_CONFIRM_ACK_LOST`
-    /// seam; Stage H then skips the delete too (the second lost write) while
-    /// the handle stays, so a publish failure still classifies as recovery.
-    pub(crate) sidecar_confirm_lost: bool,
     /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
     /// caller MUST hold the complete set across manifest publish (see
     /// `commit_all`) so no same-process writer interleaves after revalidation.
     pub(crate) guards: Vec<crate::db::write_queue::QueueGuard>,
+}
+
+decide_seam! {
+    /// After each exact staged table transaction advances HEAD, before the next
+    /// table effect or Phase-B confirmation. Used to leave a real partial
+    /// multi-table v3 attempt whose remaining first-touch fork still needs
+    /// recovery cleanup.
+    pub static MUTATION_POST_TABLE_COMMIT = ("mutation.post_table_commit", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// After every deferred first-touch table ref is created under a durable
+    /// v3 sidecar, before any staged data transaction advances target HEAD.
+    pub static MUTATION_POST_FORK_PRE_COMMIT = ("mutation.post_fork_pre_commit", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// After the v3 ownership sidecar is durable but before the first deferred
+    /// named-table ref is created. Recovery must accept the absent target ref.
+    pub static MUTATION_POST_SIDECAR_PRE_FORK = ("mutation.post_sidecar_pre_fork", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// The v9 mutation/load recovery intent is durable (Armed) but no table
+    /// transaction has committed yet — the window where a writer failure or
+    /// cancellation strands an effect-free sidecar (issue #554). Unlike
+    /// `MUTATION_POST_SIDECAR_PRE_FORK`, this fires for every enrolled
+    /// mutation/load, main-branch writes included.
+    pub static MUTATION_POST_ARM_PRE_EFFECT = ("mutation.post_arm_pre_effect", Mutation, [Fail]);
 }
 
 impl StagedMutation {
@@ -1239,7 +1274,6 @@ impl StagedMutation {
                 updates: Vec::new(),
                 expected_versions,
                 sidecar_handle: None,
-                sidecar_confirm_lost: false,
                 guards,
             });
         }
@@ -1312,20 +1346,20 @@ impl StagedMutation {
         // the intent is fully prepared in memory, but neither the durable
         // sidecar nor a target fork exists yet. A concurrent winner may publish;
         // this attempt then discards/reprepares on the collision below.
-        crate::seams::fail(&crate::seams::catalog::FORK_BEFORE_CLASSIFY)?;
+        fail(&catalog::FORK_BEFORE_CLASSIFY)?;
         let sidecar_handle =
             Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?);
         let operation_id = sidecar.operation_id.clone();
-        crate::seams::fail(&crate::seams::catalog::MUTATION_POST_ARM_PRE_EFFECT).map_err(
-            |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
-        )?;
+        fail(&MUTATION_POST_ARM_PRE_EFFECT).map_err(|error| {
+            OmniError::recovery_required(operation_id.clone(), error.to_string())
+        })?;
         if staged
             .iter()
             .any(|entry| entry.path.deferred_fork.is_some())
         {
-            crate::seams::fail(&crate::seams::catalog::MUTATION_POST_SIDECAR_PRE_FORK).map_err(
-                |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
-            )?;
+            fail(&MUTATION_POST_SIDECAR_PRE_FORK).map_err(|error| {
+                OmniError::recovery_required(operation_id.clone(), error.to_string())
+            })?;
         }
 
         // The v9 intent (with the retained `protocol_v3` payload shape) is now
@@ -1417,9 +1451,9 @@ impl StagedMutation {
             }
         }
         if created_any_fork {
-            crate::seams::fail(&crate::seams::catalog::MUTATION_POST_FORK_PRE_COMMIT).map_err(
-                |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
-            )?;
+            fail(&MUTATION_POST_FORK_PRE_COMMIT).map_err(|error| {
+                OmniError::recovery_required(operation_id.clone(), error.to_string())
+            })?;
         }
 
         let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
@@ -1556,12 +1590,12 @@ impl StagedMutation {
                     .version_metadata
                     .with_table_fork_owner(table_fork_owner),
             });
-            crate::seams::fail(&crate::seams::catalog::MUTATION_POST_TABLE_COMMIT).map_err(
-                |error| OmniError::recovery_required(operation_id.clone(), error.to_string()),
-            )?;
+            fail(&MUTATION_POST_TABLE_COMMIT).map_err(|error| {
+                OmniError::recovery_required(operation_id.clone(), error.to_string())
+            })?;
         }
 
-        let sidecar_confirm_lost = match confirm_occ_sidecar_v9(
+        confirm_occ_sidecar_v9(
             db.root_uri(),
             db.storage_adapter(),
             &mut sidecar,
@@ -1569,21 +1603,12 @@ impl StagedMutation {
             &committed_transactions,
         )
         .await
-        {
-            Err(error) => {
-                return Err(OmniError::recovery_required(
-                    operation_id,
-                    error.to_string(),
-                ));
-            }
-            Ok(durable) => !durable,
-        };
+        .map_err(|error| OmniError::recovery_required(operation_id, error.to_string()))?;
 
         Ok(CommittedMutation {
             updates,
             expected_versions,
             sidecar_handle,
-            sidecar_confirm_lost,
             guards,
         })
     }

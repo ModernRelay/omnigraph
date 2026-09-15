@@ -128,6 +128,7 @@ pub(crate) enum ErrorMatch {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SeamAction {
     Fail,
+    Contention,
     Skip,
     Hold,
 }
@@ -137,6 +138,7 @@ impl SeamAction {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             SeamAction::Fail => "fail",
+            SeamAction::Contention => "contention",
             SeamAction::Skip => "skip",
             SeamAction::Hold => "hold",
         }
@@ -297,6 +299,9 @@ mod tests {
         let seam = "at: branch_merge.post_authority_capture\noccurrence: 1\naction: fail\nscope: next_step";
         assert!(parse_seam(seam).is_ok());
         assert!(parse_seam(&seam.replace("action: fail", "action: skip")).is_ok());
+        let contention = parse_seam(&seam.replace("action: fail", "action: contention")).unwrap();
+        assert_eq!(contention.action, SeamAction::Contention);
+        assert_eq!(contention.action.as_str(), "contention");
         for text in [
             seam.replace("scope: next_step", ""),
             seam.replace("next_step", "workload"),

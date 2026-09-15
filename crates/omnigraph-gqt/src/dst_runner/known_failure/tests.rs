@@ -21,8 +21,8 @@ fn fixture() -> (Case, WorkerReport) {
     let mut evidence = Vec::new();
     for ordinal in 1..=marker.step {
         let operation = json!({"ordinal": ordinal, "loop_binding": null});
-        if let Some(seam) = case.seams.get(&ordinal) {
-            evidence.push(json!({"kind": "seam_delivered", "operation": operation, "value": {"at": seam.at, "occurrence": seam.occurrence}}));
+        for seam in case.seams.get(&ordinal).into_iter().flatten() {
+            evidence.push(json!({"kind": "seam_delivered", "operation": operation, "value": {"at": seam.at, "occurrence": seam.occurrence, "effect": "fail"}}));
         }
         if ordinal == marker.step {
             evidence.push(json!({"kind": "typed_error", "operation": operation, "value": {"error": "RecoveryRequired", "reason": reason, "operation_id": "operation-17", "message": error.to_string()}}));
@@ -56,8 +56,45 @@ fn accepts_only_the_exact_typed_recovery_failure_and_keeps_raw_evidence() {
 }
 
 #[test]
+fn checks_each_effect_when_multiple_seams_share_a_step() {
+    let (mut case, mut report) = fixture();
+    let seams = case.seams.values_mut().next().unwrap();
+    let mut second = seams[0].clone();
+    second.at = "mutation.sidecar_confirm_put".into();
+    second.action = crate::runner_config::SeamAction::Skip;
+    seams.push(second.clone());
+    let first = report
+        .evidence
+        .iter()
+        .position(|event| event["kind"] == "seam_delivered")
+        .unwrap();
+    let mut delivery = report.evidence[first].clone();
+    delivery["value"]["at"] = second.at.into();
+    delivery["value"]["effect"] = "skip".into();
+    report.evidence.insert(first + 1, delivery);
+    validate(&case).unwrap();
+    assert_eq!(classify(&case, &report), Ok(true));
+    verify_status(&case, &report, true).unwrap();
+
+    for index in [first, first + 1] {
+        let expected = report.evidence[index]["value"]["effect"].clone();
+        for wrong in [json!("fail"), json!("skip"), serde_json::Value::Null] {
+            if wrong == expected {
+                continue;
+            }
+            report.evidence[index]["value"]["effect"] = wrong;
+            assert!(classify(&case, &report).is_err());
+            assert!(verify_status(&case, &report, true).is_err());
+        }
+        report.evidence[index]["value"]["effect"] = expected;
+    }
+    report.evidence.swap(first, first + 1);
+    assert!(classify(&case, &report).is_err());
+}
+
+#[test]
 fn refuses_different_reasons_steps_faults_and_incomplete_assertions() {
-    for mutation in 0..10 {
+    for mutation in 0..12 {
         let (case, mut report) = fixture();
         match mutation {
             0 => report
@@ -123,6 +160,22 @@ fn refuses_different_reasons_steps_faults_and_incomplete_assertions() {
                     .find(|e| e["kind"] == "typed_error")
                     .unwrap();
                 error["kind"] = "query_result".into();
+            }
+            10 => {
+                let fault = report
+                    .evidence
+                    .iter_mut()
+                    .find(|e| e["kind"] == "seam_delivered")
+                    .unwrap();
+                fault["value"]["effect"] = "skip".into();
+            }
+            11 => {
+                let fault = report
+                    .evidence
+                    .iter_mut()
+                    .find(|e| e["kind"] == "seam_delivered")
+                    .unwrap();
+                fault["value"].as_object_mut().unwrap().remove("effect");
             }
             _ => unreachable!(),
         }

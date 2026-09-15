@@ -1120,6 +1120,16 @@ pub struct UniverseReport {
     /// structural miss, not a trial). Counts through suspension, since
     /// stored damage flows through any read.
     pub persisted_consumed: usize,
+    /// The consumed reads themselves, `<verb> <op> <uri>` with the root
+    /// normalized, so a pin can name WHICH stale object the engine read.
+    pub persisted_consumed_reads: Vec<String>,
+    /// Every recovery audit row at the end of the universe, `<kind>
+    /// <operation_id>`, so a pin can tie a consumed sidecar read to the
+    /// finalization recovery gave that operation. Reading it opens the
+    /// recoveries dataset once after the final audit, harness observation
+    /// rather than engine work; the cost golden names it as `_audit l.list`
+    /// 64 -> 65.
+    pub recovery_audit: Vec<String>,
     /// Sidecar residue at the final audit attributed
     /// to injected lost/misdirected writes — recorded (never silently
     /// excused) and then REQUIRED to heal on one reopen (the
@@ -2242,6 +2252,7 @@ struct FailingStorage {
     writes_lost: std::sync::atomic::AtomicUsize,
     writes_misdirected: std::sync::atomic::AtomicUsize,
     persisted_consumed: std::sync::atomic::AtomicUsize,
+    persisted_consumed_reads: Mutex<Vec<String>>,
     /// the staleness clock and memory. `staleness_tick`
     /// advances on every LANDED write-class call (count-landed-only, the
     /// kill enumerator's lesson); `key_history` keeps, per URI, the
@@ -2293,6 +2304,7 @@ impl FailingStorage {
             writes_lost: std::sync::atomic::AtomicUsize::new(0),
             writes_misdirected: std::sync::atomic::AtomicUsize::new(0),
             persisted_consumed: std::sync::atomic::AtomicUsize::new(0),
+            persisted_consumed_reads: Mutex::new(Vec::new()),
             staleness_tick: std::sync::atomic::AtomicU64::new(0),
             key_history: Mutex::new(std::collections::BTreeMap::new()),
             stale_reads_served: std::sync::atomic::AtomicUsize::new(0),
@@ -2378,18 +2390,47 @@ impl FailingStorage {
             .insert(uri.to_string(), verb);
     }
 
+    /// Every consumed read as `<verb> <op> <uri>`, root-normalized so the
+    /// report replay-compares across roots.
+    fn persisted_consumed_reads(&self, root: &str) -> Vec<String> {
+        self.persisted_consumed_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|read| read.replace(root, "<root>"))
+            .collect()
+    }
+
     /// CORRUPTION AXIS (persisted tier) — consumption tracking: a read touching a URI in
     /// the persisted ledger consumed damaged (or injected-absent) state.
     /// Counts regardless of the fault gates — suspension stops CALL-PATH
     /// faults, but stored damage flows through any read. No draws, no
     /// behavior change; zero-knob plans have an empty ledger.
     fn note_persisted_read(&self, op: &str, uri: &str) {
-        let verb = { self.persisted_damage.lock().unwrap().get(uri).copied() };
-        if let Some(verb) = verb {
-            self.persisted_consumed
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            println!("dst s11 damage-consumed: {verb} {op} {uri}");
+        if let Some(verb) = self.consume_persisted(uri) {
+            self.record_consumed_read(verb, op, uri, None);
         }
+    }
+
+    /// The damage verb last injected on `uri`, counted as consumed; `None`
+    /// when the URI carries no persisted damage.
+    fn consume_persisted(&self, uri: &str) -> Option<&'static str> {
+        let verb = { self.persisted_damage.lock().unwrap().get(uri).copied() }?;
+        self.persisted_consumed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(verb)
+    }
+
+    /// One consumed read in the report; `detail` says what the read returned
+    /// when the verb alone cannot (a sidecar's `effect_phase`).
+    fn record_consumed_read(&self, verb: &str, op: &str, uri: &str, detail: Option<&str>) {
+        let mut line = format!("{verb} {op} {uri}");
+        if let Some(detail) = detail {
+            line.push(' ');
+            line.push_str(detail);
+        }
+        println!("dst s11 damage-consumed: {line}");
+        self.persisted_consumed_reads.lock().unwrap().push(line);
     }
 
     // ---------------------------------------- bounded staleness ---------
@@ -2835,6 +2876,17 @@ pub(crate) fn truncate_text(text: &str, pos_roll: u64) -> Option<String> {
     Some(text.chars().take(keep).collect())
 }
 
+/// `phase=<effect_phase>` of a `__recovery/` sidecar body the engine read, the
+/// evidence a pin needs to tell a stale Armed sidecar from a confirmed one.
+fn sidecar_phase(uri: &str, body: Option<&str>) -> Option<String> {
+    if !uri.contains("__recovery/") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body?).ok()?;
+    let phase = value["protocol_v3"]["effect_phase"].as_str()?;
+    Some(format!("phase={phase}"))
+}
+
 #[async_trait::async_trait]
 impl StorageAdapter for FailingStorage {
     async fn read_text(&self, uri: &str) -> OmniResult<String> {
@@ -2856,17 +2908,22 @@ impl StorageAdapter for FailingStorage {
     async fn read_text_if_exists(&self, uri: &str) -> OmniResult<Option<String>> {
         self.read_fault("read_text_if_exists", uri).await?;
         self.latent_fault("read_text_if_exists", uri)?;
-        self.note_persisted_read("read_text_if_exists", uri);
+        let consumed = self.consume_persisted(uri);
         // both polarities are legal lies here — an old value
         // (possibly a zombie) or a stale absence (`None` before the key's
         // creation reached "the replica").
-        if let Some(as_of) = self.roll_stale(self.plan.stale_read_pct)
+        let out = if let Some(as_of) = self.roll_stale(self.plan.stale_read_pct)
             && let Some((state, _)) = self.state_as_of(uri, as_of)
         {
             self.count_stale_read("read_text_if_exists", uri, as_of);
-            return Ok(state.map(|text| self.maybe_corrupt("read_text_if_exists", uri, text)));
+            state
+        } else {
+            self.inner.read_text_if_exists(uri).await?
+        };
+        if let Some(verb) = consumed {
+            let phase = sidecar_phase(uri, out.as_deref());
+            self.record_consumed_read(verb, "read_text_if_exists", uri, phase.as_deref());
         }
-        let out = self.inner.read_text_if_exists(uri).await?;
         Ok(out.map(|text| self.maybe_corrupt("read_text_if_exists", uri, text)))
     }
     async fn read_text_if_exists_bounded(
@@ -6551,6 +6608,13 @@ impl UniverseScenario<RustResources> for Scenario {
             .as_ref()
             .map(|f| f.persisted_consumed())
             .unwrap_or(0);
+        let persisted_consumed_reads = failing
+            .as_ref()
+            .map(|f| f.persisted_consumed_reads(root))
+            .unwrap_or_default();
+        let recovery_audit = omnigraph::db::dst_recovery_audit_rows(root)
+            .await
+            .expect("the recovery audit dataset reads back at the end of a universe");
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
         // Persisted tier: drain the foreign-sidecar carve-out rows into the
@@ -6586,6 +6650,8 @@ impl UniverseScenario<RustResources> for Scenario {
             writes_lost,
             writes_misdirected,
             persisted_consumed,
+            persisted_consumed_reads,
+            recovery_audit,
             attributed_residue,
             reconcile_verdicts,
             known_issues,

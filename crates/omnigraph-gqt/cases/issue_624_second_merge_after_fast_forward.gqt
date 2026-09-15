@@ -1,0 +1,183 @@
+# issue: 624
+# red_on: 2026-09-15, pre-fix build at 379d8ed1 (the parent of #695's f0dcd2e6): step 7 `branch merge b into tgt` failed with `storage: LanceError(IO): … Not found: …/nodes/<dataset>/tree/a.<ULID>/_indices/<uuid>/page_lookup.lance`; steps 1-6 green, the first merge `fast_forward`; green at f0dcd2e6 (#695) itself.
+# notes: the issue's exact order: a fast-forwards into the untouched tgt, then b
+# notes: merges into tgt with no tgt write in between. The fast-forward switched
+# notes: tgt's Person registration onto a's Lance branch; the merge's first-touch
+# notes: fork of that table stamped the index inherited from main with a's base,
+# notes: so the index file was looked up under a's tree. Every index kind seeded
+# notes: on main (BTREE, full-text, vector, built-in id) is read on tgt afterwards.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    value: I64 @index
+    text: String @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Person","data":{"name":"p000","value":0,"text":"needle","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p001","value":1,"text":"needle","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p002","value":2,"text":"needle","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p003","value":3,"text":"needle","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p004","value":4,"text":"needle","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p005","value":5,"text":"needle","embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p006","value":6,"text":"needle","embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p007","value":7,"text":"needle","embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p008","value":8,"text":"needle","embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p009","value":9,"text":"needle","embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p010","value":10,"text":"needle","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p011","value":11,"text":"needle","embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p012","value":12,"text":"needle","embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p013","value":13,"text":"needle","embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p014","value":14,"text":"needle","embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p015","value":15,"text":"needle","embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p016","value":16,"text":"needle","embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p017","value":17,"text":"needle","embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p018","value":18,"text":"needle","embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p019","value":19,"text":"needle","embedding":[19.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p020","value":20,"text":"needle","embedding":[20.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p021","value":21,"text":"needle","embedding":[21.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p022","value":22,"text":"needle","embedding":[22.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p023","value":23,"text":"needle","embedding":[23.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p024","value":24,"text":"needle","embedding":[24.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p025","value":25,"text":"needle","embedding":[25.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p026","value":26,"text":"needle","embedding":[26.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p027","value":27,"text":"needle","embedding":[27.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p028","value":28,"text":"needle","embedding":[28.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p029","value":29,"text":"needle","embedding":[29.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p030","value":30,"text":"needle","embedding":[30.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"p031","value":31,"text":"needle","embedding":[31.0,0.0,0.0,0.0]}}
+
+--- mutate
+branch create tgt
+
+--- expect ok
+
+--- mutate
+branch create a
+
+--- expect ok
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: a
+query ins($n: String, $v: I64, $e: Vector(4)) {
+    insert Person { name: $n, value: $v, text: "needle", embedding: $e }
+}
+
+--- params
+{"n": "a1", "v": 1000, "e": [1000.0, 0.0, 0.0, 0.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge a into tgt
+
+--- expect outcome: fast_forward
+
+--- mutate branch: b
+query ins($n: String, $v: I64, $e: Vector(4)) {
+    insert Person { name: $n, value: $v, text: "needle", embedding: $e }
+}
+
+--- params
+{"n": "b1", "v": 3000, "e": [3000.0, 0.0, 0.0, 0.0]}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b into tgt
+
+--- expect outcome: merged
+
+--- query branch: tgt
+query scalar_read() {
+    match {
+        $p: Person
+        $p.value = 0
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "p000"}
+
+--- expect shape
+p.name: String
+
+--- query branch: tgt
+query key_read() {
+    match {
+        $p: Person
+        $p.name = "p001"
+    }
+    return { $p.value }
+}
+
+--- expect unordered
+{"p.value": 1}
+
+--- expect shape
+p.value: I64
+
+--- query branch: tgt
+query text_read() {
+    match {
+        $p: Person
+        search($p.text, "needle")
+    }
+    return { count($p) as n }
+}
+
+--- expect unordered
+{"n": 34}
+
+--- expect shape
+n: I64
+
+--- query branch: tgt
+query vector_read_indexed_row($q: Vector(4)) {
+    match { $p: Person }
+    return { $p.name }
+    order { nearest($p.embedding, $q) }
+    limit 1
+}
+
+--- params
+{"q": [3.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"p.name": "p003"}
+
+--- expect shape
+p.name: String
+
+--- query branch: tgt
+query vector_read_new_row($q: Vector(4)) {
+    match { $p: Person }
+    return { $p.name }
+    order { nearest($p.embedding, $q) }
+    limit 1
+}
+
+--- params
+{"q": [3000.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"p.name": "b1"}
+
+--- expect shape
+p.name: String
