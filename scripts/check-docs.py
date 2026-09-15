@@ -239,7 +239,38 @@ def scalar(value: str) -> str:
 
 
 def list_ids(value: str) -> list[str]:
-    return re.findall(r"[\"'](\d{4})[\"']", value)
+    return re.findall(r"[\"']([0-9a-z-]+)[\"']", value)
+
+
+RFC_FILENAME = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md")
+LAST_NUMBERED_RFC = 66
+
+
+def rfc_id_of(path: Path, errors: list[str]) -> tuple[str, str] | None:
+    """Return (id, prefix) for an RFC filename, or None after recording the error.
+
+    Numbered RFCs (0001 to 0066) keep the number as id; dated RFCs use the
+    whole stem, so the date prefix alone never has to be unique.
+    """
+    name = RFC_FILENAME.fullmatch(path.name)
+    if not name:
+        errors.append(
+            f"{path.relative_to(ROOT)}: RFC filename must be YYYY-MM-DD-kebab-title.md"
+        )
+        return None
+    prefix = name.group(1)
+    if len(prefix) == 4:
+        if int(prefix) > LAST_NUMBERED_RFC:
+            errors.append(
+                f"{path.relative_to(ROOT)}: numbered RFC namespace is closed at "
+                f"{LAST_NUMBERED_RFC:04d}; use YYYY-MM-DD-kebab-title.md"
+            )
+            return None
+        return prefix, prefix
+    if not valid_date(prefix):
+        errors.append(f"{path.relative_to(ROOT)}: RFC filename date is not a real date")
+        return None
+    return path.stem, prefix
 
 
 def valid_date(value: str) -> bool:
@@ -260,13 +291,11 @@ def check_rfcs(errors: list[str]) -> None:
     for path in sorted(RFC_DIR.glob("*.md")):
         if path.name in {"README.md", "0000-template.md"}:
             continue
-        name = re.fullmatch(r"(\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md", path.name)
-        if not name:
-            errors.append(
-                f"{path.relative_to(ROOT)}: RFC filename must be NNNN-kebab-title.md"
-            )
+        identity = rfc_id_of(path, errors)
+        if identity is None:
             continue
-        number = name.group(1)
+        number, prefix = identity
+        numbered = number == prefix
         if number in seen:
             errors.append(
                 f"{path.relative_to(ROOT)}: duplicate RFC {number}; also {seen[number].relative_to(ROOT)}"
@@ -280,16 +309,22 @@ def check_rfcs(errors: list[str]) -> None:
             errors.append(
                 f"{path.relative_to(ROOT)}: filename RFC {number} != frontmatter {metadata_number!r}"
             )
+        if not numbered and scalar(values.get("created", "")) != prefix:
+            errors.append(
+                f"{path.relative_to(ROOT)}: filename date {prefix} != frontmatter created"
+            )
         title = scalar(values.get("title", ""))
-        heading = re.search(r"^# RFC (\d{4}): (.+)$", body, re.MULTILINE)
+        heading = re.search(r"^# RFC(?: (\d{4}))?: (.+)$", body, re.MULTILINE)
+        expected_heading = f"# RFC {number}: Title" if numbered else "# RFC: Title"
         if not heading:
             errors.append(
-                f"{path.relative_to(ROOT)}: first H1 must use '# RFC {number}: Title'"
+                f"{path.relative_to(ROOT)}: first H1 must use '{expected_heading}'"
             )
         else:
+            heading_number = number if numbered else None
             heading_title = re.sub(r"[`*_]", "", heading.group(2)).strip()
             metadata_title = re.sub(r"[`*_]", "", title).strip()
-            if heading.group(1) != number or heading_title != metadata_title:
+            if heading.group(1) != heading_number or heading_title != metadata_title:
                 errors.append(
                     f"{path.relative_to(ROOT)}: H1 must match frontmatter id and title"
                 )
@@ -340,29 +375,33 @@ def check_rfcs(errors: list[str]) -> None:
 
     registry_rows: dict[str, tuple[str, str, str, str, str]] = {}
     row_pattern = re.compile(
-        r"^\| \[(\d{4})\]\(([^)]+)\) \| (.*?) \| "
+        r"^\| \[(\d{4}-\d{2}-\d{2}|\d{4})\]\(([^)]+)\) \| (.*?) \| "
         r"(public|maintainer) \| (draft|accepted|rejected|superseded) \| "
         r"([^|]+?) \|$",
         re.MULTILINE,
     )
     for match in row_pattern.finditer(registry):
-        number, filename, title, track, status, implementation = match.groups()
-        registry_rows[number] = (
-            filename,
+        label, filename, title, track, status, implementation = match.groups()
+        if filename in registry_rows:
+            errors.append(f"docs/rfcs/README.md: duplicate registry row for {filename}")
+            continue
+        registry_rows[filename] = (
+            label,
             re.sub(r"[`*_]", "", title).strip(),
             track,
             status,
             implementation.strip(),
         )
     for number, path in seen.items():
-        row = registry_rows.get(number)
+        row = registry_rows.pop(path.name, None)
         if row is None:
             errors.append(f"docs/rfcs/README.md: registry row missing RFC {number}")
             continue
-        filename, title, track, status, implementation = row
+        label, title, track, status, implementation = row
         expected_title, expected_track, expected_status, expected_implementation = records[number]
         expected_title = re.sub(r"[`*_]", "", expected_title).strip()
-        if filename != path.name or (
+        expected_label = number if len(number) == 4 else number[:10]
+        if label != expected_label or (
             title,
             track,
             status,
@@ -376,8 +415,8 @@ def check_rfcs(errors: list[str]) -> None:
             errors.append(
                 f"docs/rfcs/README.md: registry row for RFC {number} disagrees with its file"
             )
-    for number in registry_rows.keys() - seen.keys():
-        errors.append(f"docs/rfcs/README.md: registry references missing RFC {number}")
+    for filename in registry_rows:
+        errors.append(f"docs/rfcs/README.md: registry references missing RFC {filename}")
 
 
 def check_locations(files: list[Path], errors: list[str]) -> None:
