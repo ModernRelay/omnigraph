@@ -22,6 +22,7 @@ use super::*;
 #[cfg(feature = "failpoints")]
 use crate::db::Omnigraph;
 use crate::error::{ManifestConflictDetails, ManifestError, StorageFailureKind};
+use crate::seams::catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
     SchemaIdentityDomain, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
@@ -305,8 +306,8 @@ async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
         let test_thread = std::thread::current().id();
         let _probes = (!legacy).then(|| {
             [
-                &crate::seams::catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
-                &crate::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+                &catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
+                &catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
             ]
             .map(|seam| {
                 let reached_effects = Arc::clone(&reached_effects);
@@ -388,8 +389,8 @@ async fn open_refuses_unknown_schema_features_before_recovery() {
         let reached_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let test_thread = std::thread::current().id();
         let _probes = [
-            &crate::seams::catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
-            &crate::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+            &catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
+            &catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
         ]
         .map(|seam| {
             let reached_effects = Arc::clone(&reached_effects);

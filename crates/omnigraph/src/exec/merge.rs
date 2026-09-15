@@ -1,5 +1,6 @@
 use super::*;
 use crate::changes::row_compare::{RawRow, rows_equal};
+use crate::seams::{decide_seam, fail};
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
@@ -4689,6 +4690,12 @@ async fn commit_exact_merge_stage(
     Ok(outcome.into_snapshot())
 }
 
+decide_seam! {
+    /// After one bounded delete chunk committed while at least one later
+    /// delete chunk from the same Armed BranchMerge chain remains.
+    pub static BRANCH_MERGE_BETWEEN_DELETE_CHUNKS = ("branch_merge.between_delete_chunks", BranchMerge, [Fail]);
+}
+
 async fn commit_staged_delete_chunks(
     target_db: &Omnigraph,
     table_key: &str,
@@ -4718,10 +4725,22 @@ async fn commit_staged_delete_chunks(
         *planned_index += 1;
         current = commit_exact_merge_stage(target_db, current, staged_delete, planned).await?;
         if chunk_index + 1 < deleted_ids.chunks.len() {
-            crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_BETWEEN_DELETE_CHUNKS)?;
+            fail(&BRANCH_MERGE_BETWEEN_DELETE_CHUNKS)?;
         }
     }
     Ok(current)
+}
+
+decide_seam! {
+    pub static BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM = ("branch_merge.rewrite_after_delete_pre_confirm", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    pub static BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE = ("branch_merge.rewrite_after_merge_pre_delete", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    pub static BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE = ("branch_merge.rewrite_after_insert_pre_update", BranchMerge, [Fail]);
 }
 
 async fn publish_rewritten_merge_table(
@@ -4783,9 +4802,7 @@ async fn publish_rewritten_merge_table(
         )
         .await?;
         if semantics == KeyedWriteSemantics::StrictInsert {
-            crate::seams::fail(
-                &crate::seams::catalog::BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE,
-            )?;
+            fail(&BRANCH_MERGE_REWRITE_AFTER_INSERT_PRE_UPDATE)?;
         }
     }
 
@@ -4794,7 +4811,7 @@ async fn publish_rewritten_merge_table(
     // rows are on Lance HEAD but the delete has not committed and the
     // achieved-version intent has not been recorded, so recovery must roll BACK.
     // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_rolls_back.
-    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE)?;
+    fail(&BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via deletion vectors. Each row/byte-bounded
     // filter chunk is staged through `stage_delete` and consumes one exact
@@ -4822,7 +4839,7 @@ async fn publish_rewritten_merge_table(
     // deletes are on Lance HEAD but the achieved-version intent has not been
     // recorded, so recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
-    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM)?;
+    fail(&BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM)?;
 
     // Index coverage is reconciler-owned derived state. As on the adopt path,
     // publish the logical merge without waiting for BTREE / FTS / vector work;
@@ -5009,7 +5026,7 @@ async fn commit_keyed_stream_chunks(
         if chunk_index + 1 < chunk_rows.len()
             && let Some(failpoint) = between_chunk_failpoint
         {
-            crate::seams::fail(failpoint)?;
+            fail(failpoint)?;
         }
     }
 
@@ -5031,6 +5048,12 @@ async fn commit_keyed_stream_chunks(
         )));
     }
     Ok(current)
+}
+
+decide_seam! {
+    /// After one bounded strict-insert chunk committed while at least one later
+    /// chunk from the same Armed BranchMerge transaction chain remains.
+    pub static BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS = ("branch_merge.adopt_between_insert_chunks", BranchMerge, [Fail]);
 }
 
 /// Publish a provenance-proven all-insert source interval as the established
@@ -5078,7 +5101,7 @@ async fn publish_proven_pure_insert_adopt(
         current,
         planned_transactions,
         &mut planned_index,
-        Some(&crate::seams::catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+        Some(&BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
         system_columns,
     )
     .await?;
@@ -5100,6 +5123,14 @@ async fn publish_proven_pure_insert_adopt(
         entity_count: final_state.row_count,
         version_metadata: final_state.version_metadata,
     })
+}
+
+decide_seam! {
+    pub static BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE = ("branch_merge.adopt_after_upsert_pre_delete", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    pub static BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT = ("branch_merge.adopt_after_append_pre_upsert", BranchMerge, [Fail]);
 }
 
 /// Apply an [`AdoptDelta`] onto the target's base lineage (the fast-forward /
@@ -5151,7 +5182,7 @@ async fn publish_adopted_delta(
             current_ds,
             planned_transactions,
             &mut planned_index,
-            Some(&crate::seams::catalog::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
+            Some(&BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
             target_txn.catalog.system_columns,
         )
         .await?;
@@ -5162,7 +5193,7 @@ async fn publish_adopted_delta(
     // have not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK (not publish the inserts-only state). See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_append_rolls_back.
-    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT)?;
+    fail(&BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT)?;
 
     // Phase 1b: update the CHANGED rows. Classification proved these ids present
     // in the target-equals-base image; the sealed update-only adapter forbids
@@ -5191,7 +5222,7 @@ async fn publish_adopted_delta(
     // has not committed and the achieved-version intent has not been recorded, so
     // recovery must roll BACK. See
     // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_rolls_back.
-    crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE)?;
+    fail(&BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via row/byte-bounded deletion-vector
     // transactions (same exact-chain helper as the three-way path; MR-A).
@@ -5296,6 +5327,37 @@ fn ensure_merge_target_authority_unchanged(
         ));
     }
     Ok(())
+}
+
+decide_seam! {
+    pub static BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT = ("branch_merge.post_phase_b_pre_manifest_commit", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    /// Every merge table effect is complete, but the sidecar is still in its
+    /// pre-confirmation shape.
+    pub static BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM = ("branch_merge.post_effects_pre_confirm", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    /// The v4 BranchMerge recovery intent is durable, before any first-touch
+    /// target table ref is created.
+    pub static BRANCH_MERGE_POST_SIDECAR_PRE_FORK = ("branch_merge.post_sidecar_pre_fork", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    /// Candidate classification and validation have completed, before the
+    /// final source/target table-gate envelope and recovery arm. Tests use this
+    /// boundary to prove a raw source-table ref delete/recreate cannot pass as
+    /// the native incarnation whose immutable rows were proven.
+    pub static BRANCH_MERGE_POST_CANDIDATE_VALIDATION = ("branch_merge.post_candidate_validation", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    /// Source/target heads and snapshots have been captured while the schema
+    /// and both branch-incarnation gates are held, before merge planning or
+    /// any durable table effect.
+    pub static BRANCH_MERGE_POST_AUTHORITY_CAPTURE = ("branch_merge.post_authority_capture", BranchMerge, [Fail]);
 }
 
 impl Omnigraph {
@@ -5509,7 +5571,7 @@ impl Omnigraph {
             )
             .await?
         };
-        crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE)?;
+        fail(&BRANCH_MERGE_POST_AUTHORITY_CAPTURE)?;
         // The handle remains bound to its original branch throughout the merge.
         // The captured transaction supplies every physical and publish target.
         let target_was_active = self.active_branch().await == target_branch;
@@ -5893,7 +5955,7 @@ impl Omnigraph {
             validate_merge_candidates(catalog, target_snapshot, &changeset).await?;
             validation_timing.finish();
         }
-        crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_CANDIDATE_VALIDATION)?;
+        fail(&BRANCH_MERGE_POST_CANDIDATE_VALIDATION)?;
 
         // Recovery sidecar: protect the complete physical effect set. Every
         // `RewriteMerged` / `AdoptWithDelta` logical data step receives a
@@ -6300,7 +6362,7 @@ impl Omnigraph {
         // transition storage while polling the substrate publisher.
         let post_arm_result = Box::pin(async {
             if recovery.is_some() && !first_touch_effects.is_empty() {
-                crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_SIDECAR_PRE_FORK)?;
+                fail(&BRANCH_MERGE_POST_SIDECAR_PRE_FORK)?;
             }
 
             let physical_publish_timing = crate::instrumentation::start_merge_timing(
@@ -6438,7 +6500,7 @@ impl Omnigraph {
             // The Armed body remains rollback-only until every physical effect,
             // every first-touch ref identity, and every logical output slot are
             // durably confirmed together.
-            crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM)?;
+            fail(&BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM)?;
             if let Some((sidecar, _)) = recovery.as_mut() {
                 let recovery_confirm_timing = crate::instrumentation::start_merge_timing(
                     crate::instrumentation::MergeTimingPhase::RecoveryConfirm,
@@ -6454,7 +6516,7 @@ impl Omnigraph {
                 recovery_confirm_timing.finish();
             }
 
-            crate::seams::fail(&crate::seams::catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
+            fail(&BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
             // Publish the complete merge delta and its pre-minted lineage under
             // the exact target authority captured before classification.

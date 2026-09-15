@@ -15,6 +15,7 @@ use super::manifest::{
     LineageIntent, LineageRefresh, ManifestChange, ManifestCoordinator, ManifestIncarnation,
     ManifestInitError, PublishPrecondition, Snapshot,
 };
+use crate::seams::{decide_seam, fail};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SnapshotId(String);
@@ -121,6 +122,14 @@ pub(crate) struct GraphCoordinator {
     manifest: ManifestCoordinator,
     commit_graph: CommitGraph,
     bound_branch: Option<String>,
+}
+
+decide_seam! {
+    pub static GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT = ("graph_publish.after_manifest_commit", AnyWrite, [Fail]);
+}
+
+decide_seam! {
+    pub static GRAPH_PUBLISH_BEFORE_COMMIT_APPEND = ("graph_publish.before_commit_append", AnyWrite, [Fail]);
 }
 
 impl GraphCoordinator {
@@ -749,7 +758,7 @@ impl GraphCoordinator {
         intent: LineageIntent,
         precondition: &PublishPrecondition,
     ) -> Result<PublishedSnapshot> {
-        crate::seams::fail(&crate::seams::catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
         let mut outcome = self
             .manifest
             .commit_changes_with_lineage_and_precondition(
@@ -759,7 +768,7 @@ impl GraphCoordinator {
                 precondition,
             )
             .await?;
-        crate::seams::fail(&crate::seams::catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
+        fail(&GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
         let commit = self.apply_lineage_to_cache(intent, &outcome);
         self.manifest.acknowledge_published_lineage(&mut outcome);
         Ok(PublishedSnapshot {

@@ -9235,7 +9235,7 @@ async fn optimize_retry_does_not_misclassify_own_head_drift() {
     // Inject exactly one retryable reindex conflict: attempt 1 compacts (HEAD+1) then
     // "conflicts" on reindex → retry; attempt 2 reopens with HEAD ahead of the manifest
     // from our own compaction — the misclassification trigger.
-    let _failpoint = catalog::OPTIMIZE_INJECT_REINDEX_CONFLICT.fire_once_at(1);
+    let _failpoint = catalog::OPTIMIZE_POST_COMPACT_PRE_REINDEX.fire_once_at(1);
 
     let db = Omnigraph::open(&uri).await.unwrap();
     let stats = db
@@ -11908,7 +11908,7 @@ async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let _lost_ack = catalog::INIT_MANIFEST_CREATE_ACK_LOST.fire_always();
+    let _lost_ack = catalog::INIT_MANIFEST_CREATE_POST_NATIVE.fire_always();
 
     let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA)
         .await
@@ -11949,7 +11949,7 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let _lost_ack = catalog::INIT_TABLE_CREATE_ACK_LOST.fire_always();
+    let _lost_ack = catalog::INIT_TABLE_CREATE_POST_NATIVE.fire_always();
 
     let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
         Ok(_) => panic!("a table Create acknowledgement failure must not return success"),
@@ -11964,7 +11964,7 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
         panic!("a physical table Create outcome must remain indeterminate");
     };
     assert_eq!(error_uri, uri);
-    assert!(source.to_string().contains("init.table_create_ack_lost"));
+    assert!(source.to_string().contains("init.table_create_post_native"));
     for artifact in [
         "_schema.pg",
         "_schema.ir.json",
@@ -11992,7 +11992,7 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let lost_ack = catalog::INIT_MANIFEST_CREATE_ACK_LOST.fire_always();
+    let lost_ack = catalog::INIT_MANIFEST_CREATE_POST_NATIVE.fire_always();
     let probe_failure = catalog::INIT_MANIFEST_CREATE_PROBE.fire_always();
 
     let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
@@ -12008,7 +12008,11 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
         panic!("unknown Create plus failed probe must remain typed");
     };
     assert_eq!(error_uri, uri);
-    assert!(source.to_string().contains("init.manifest_create_ack_lost"));
+    assert!(
+        source
+            .to_string()
+            .contains("init.manifest_create_post_native")
+    );
     assert!(probe.to_string().contains("init.manifest_create_probe"));
     for artifact in [
         "_schema.pg",
@@ -12249,7 +12253,7 @@ async fn publisher_retries_retryable_load_publish_state_error() {
     // `1*return`: fail only the FIRST `load_publish_state` of the next publish, so the
     // retry's second call is clean. Set after `init_and_load` so its publishes are
     // unaffected.
-    let _fp = catalog::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION.fire_once_at(1);
+    let _fp = catalog::PUBLISH_LOAD_STATE.fire_once_at(1);
     let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
     db.load_as("main", None, row, LoadMode::Merge, None)
         .await
@@ -12787,14 +12791,9 @@ node Document {
     );
 }
 
-/// The second ABA window on a store that persists NO table e_tags. The
-/// `CHANGE_FEED_SKIP_ETAG_WITNESS` seam disables `open_at_entry_verified`'s
-/// e_tag comparison (the arm the previous cell exercises), so only the LOGICAL
-/// post-open witness — `reprove_named_branch_heads`'s fresh manifest reopen
-/// comparing `graph_head` at the pinned version — can catch the
-/// delete/recreate. An e_tag is not a sufficient native-branch incarnation
-/// witness (a store may persist none, and content equality is not identity),
-/// so this cell pins that the logical witness alone fails the poll closed.
+/// The second ABA window, on a store that persists no table e_tags: with the
+/// `CHANGE_FEED_ETAG_WITNESS` comparison skipped, only the logical post-open
+/// witness (`reprove_named_branch_heads`) catches the delete/recreate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn change_feed_poll_refuses_table_open_aba_without_etag_witness() {
@@ -12838,7 +12837,7 @@ node Document {
     // Simulate an e_tag-less store for the whole poll: the per-table e_tag
     // comparison is skipped, exactly as on a store whose persisted version
     // metadata carries no e_tag.
-    let _skip_etag = catalog::CHANGE_FEED_SKIP_ETAG_WITNESS.fire_always();
+    let _skip_etag = catalog::CHANGE_FEED_ETAG_WITNESS.fire_always();
     let rendezvous =
         helpers::failpoint::Rendezvous::park_first(&catalog::CHANGE_FEED_PRE_TABLE_OPEN);
     let request = ChangeFeedRequest {

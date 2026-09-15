@@ -1,4 +1,5 @@
 use super::*;
+use crate::seams::{decide_seam, fail};
 use futures::TryStreamExt;
 
 const SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS: usize = 1024;
@@ -140,6 +141,31 @@ async fn plan_schema_for_apply(
     db.ensure_schema_state_valid().await?;
     let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
     plan_schema_for_apply_from_accepted(db, desired_schema_source, options, &accepted_ir).await
+}
+
+decide_seam! {
+    pub static SCHEMA_APPLY_AFTER_MANIFEST_COMMIT = ("schema_apply.after_manifest_commit", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static SCHEMA_APPLY_AFTER_STAGING_WRITE = ("schema_apply.after_staging_write", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static SCHEMA_APPLY_BEFORE_STAGING_WRITE = ("schema_apply.before_staging_write", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After each exact SchemaApply table transaction commits, before the next
+    /// table effect or durable EffectsConfirmed transition.
+    pub static SCHEMA_APPLY_POST_TABLE_COMMIT = ("schema_apply.post_table_commit", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// The schema-v7 ownership sidecar is durable, but no table transaction
+    /// has been staged or committed yet. Tests use this to install a genuinely
+    /// foreign first-touch dataset winner.
+    pub static SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT = ("schema_apply.post_sidecar_pre_effect", Unreachable, [Fail]);
 }
 
 async fn plan_schema_for_apply_from_accepted(
@@ -872,7 +898,7 @@ where
     let recovery_operation_id = recovery_handle.operation_id.clone();
 
     let post_arm_result = async {
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
+        fail(&SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
         let mut committed_transactions = HashMap::new();
 
         for table_key in &added_tables {
@@ -918,7 +944,7 @@ where
                     version_metadata: state.version_metadata,
                 },
             );
-            crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+            fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
         for table_key in &rewritten_tables {
@@ -994,7 +1020,7 @@ where
                     version_metadata: state.version_metadata,
                 },
             );
-            crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+            fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
         // Index-only changes (AddConstraint, i.e. adding an `@index`) are pure
@@ -1097,7 +1123,7 @@ where
         // Atomic schema apply: schema staging is part of the exact Phase-B
         // confirmation. Armed always means rollback; EffectsConfirmed is eligible
         // for the fixed exact-head manifest commit and subsequent promotion.
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
+        fail(&SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
 
         let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
         db.storage
@@ -1129,7 +1155,7 @@ where
         // recoverable roll-forward seam immediately before manifest publication.
         // In v7 the exact physical identities and complete manifest delta must be
         // durably confirmed before that seam is exposed.
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
+        fail(&SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
 
         let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
             crate::db::manifest::GraphHeadExpectation::new(
@@ -1153,7 +1179,7 @@ where
             )
             .await?;
 
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
+        fail(&SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         crate::db::schema_state::promote_exact_schema_staging(
             db.root_uri(),
             db.storage_adapter(),

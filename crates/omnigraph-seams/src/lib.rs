@@ -25,7 +25,8 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::panic::Location;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::LocalKey;
 
@@ -168,13 +169,17 @@ impl<B: ?Sized + 'static> Storage<B> for ThreadLocal<B> {
 }
 
 /// A named site with a slot. `name` is the identity a test and a catalog use;
-/// `op` says which operation crosses it; `effect` is set only for
-/// [`Decide`] seams and says what the site does when the decision is
-/// [`Decision::Fire`].
+/// `op` says which operation crosses it; `effects` is non-empty only for
+/// [`Decide`] seams and lists every outcome the site honors when the
+/// decision is [`Decision::Fire`]; `site` is where the static is declared,
+/// recorded by the compiler, which is why a seam is declared beside the code
+/// it guards and only indexed by the catalog.
 pub struct Seam<B: ?Sized + 'static, S: Storage<B> = Global<B>> {
     name: &'static str,
     op: Op,
-    effect: Option<Effect>,
+    effects: &'static [Effect],
+    site: &'static Location<'static>,
+    last_fired: AtomicPtr<Location<'static>>,
     slot: S,
     _behavior: PhantomData<fn() -> Arc<B>>,
 }
@@ -182,23 +187,38 @@ pub struct Seam<B: ?Sized + 'static, S: Storage<B> = Global<B>> {
 impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
     /// A seam that is not a decision site (a clock, an id source, a
     /// decorator).
+    #[track_caller]
     pub const fn new(name: &'static str, op: Op, slot: S) -> Self {
         Self {
             name,
             op,
-            effect: None,
+            effects: &[],
+            site: Location::caller(),
+            last_fired: AtomicPtr::new(std::ptr::null_mut()),
             slot,
             _behavior: PhantomData,
         }
     }
 
-    /// A decision site: the installed [`Decide`] answers fire or pass and the
-    /// site acts per `effect`.
-    pub const fn decide(name: &'static str, op: Op, effect: Effect, slot: S) -> Self {
+    /// A decision site: the installed [`Decide`] answers pass or fire with
+    /// one of `effects`, and the site acts per that effect.
+    ///
+    /// # Panics
+    ///
+    /// When `effects` is empty: a decision site with nothing to fire is a
+    /// non-decision seam, declared with [`Seam::new`].
+    #[track_caller]
+    pub const fn decide(name: &'static str, op: Op, effects: &'static [Effect], slot: S) -> Self {
+        assert!(
+            !effects.is_empty(),
+            "a decision seam declares at least one effect"
+        );
         Self {
             name,
             op,
-            effect: Some(effect),
+            effects,
+            site: Location::caller(),
+            last_fired: AtomicPtr::new(std::ptr::null_mut()),
             slot,
             _behavior: PhantomData,
         }
@@ -212,8 +232,23 @@ impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
         self.op
     }
 
-    pub const fn effect(&self) -> Option<Effect> {
-        self.effect
+    /// The outcomes this site honors; empty for a non-decision seam.
+    pub const fn effects(&self) -> &'static [Effect] {
+        self.effects
+    }
+
+    /// Where the static is declared: the file and line the compiler saw.
+    pub const fn site(&self) -> &'static Location<'static> {
+        self.site
+    }
+
+    /// Where the decision last fired, once it has: the helper call whose
+    /// crossing fired, one of possibly several for one seam. Passing
+    /// crossings do not move it.
+    pub fn last_fired(&self) -> Option<&'static Location<'static>> {
+        let raw = self.last_fired.load(Ordering::Relaxed);
+        // SAFETY: the pointer is null or was stored from a `&'static Location`.
+        unsafe { raw.as_ref() }
     }
 
     /// Hand the installed behavior to `f`, or `None` when the slot is empty.
@@ -261,7 +296,8 @@ impl<B: ?Sized + 'static, S: Storage<B>> fmt::Debug for Seam<B, S> {
         f.debug_struct("Seam")
             .field("name", &self.name)
             .field("op", &self.op)
-            .field("effect", &self.effect)
+            .field("effects", &self.effects)
+            .field("site", &self.site)
             .finish()
     }
 }
@@ -313,16 +349,14 @@ impl Op {
     }
 }
 
-/// What a decision site does with [`Decision::Fire`]. `Custom` marks a site
-/// that reads the seam directly through [`Seam::with`]; a case format cannot
-/// name its outcome, so such a site is never admitted from a case.
+/// An outcome a decision site honors when a decision fires. Parking a
+/// caller is not an outcome: [`Hold`] is a decider that passes after the
+/// park, installable on any decision seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     Fail,
     Skip,
     Contention,
-    Hold,
-    Custom,
 }
 
 impl Effect {
@@ -331,16 +365,15 @@ impl Effect {
             Effect::Fail => "fail",
             Effect::Skip => "skip",
             Effect::Contention => "contention",
-            Effect::Hold => "hold",
-            Effect::Custom => "custom",
         }
     }
 }
 
-/// The answer a [`Decide`] gives at a crossing.
+/// The answer a [`Decide`] gives at a crossing: pass, or fire with the
+/// outcome the site is to produce, one of the seam's declared effects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-    Fire,
+    Fire(Effect),
     Pass,
 }
 
@@ -355,23 +388,96 @@ pub trait Decide: Behavior + Send + Sync {
 pub type DecideSeam = Seam<dyn Decide, Global<dyn Decide>>;
 
 impl DecideSeam {
-    /// Ask the installed decider; an empty slot is `Pass`.
+    /// Ask the installed decider from the caller's location; an empty slot
+    /// is `Pass`. A helper marked `#[track_caller]` forwards its own caller,
+    /// so the recorded crossing is the site, not the helper.
+    ///
+    /// # Panics
+    ///
+    /// When the decider fires an effect the seam does not declare: the site
+    /// has no arm for it, so the installer, not the site, is wrong.
+    #[track_caller]
     pub fn crossed(&self) -> Decision {
-        self.with(|d| d.decide(self.name)).unwrap_or(Decision::Pass)
+        self.crossed_from(Location::caller())
     }
+
+    /// [`crossed`](Self::crossed) with the crossing location passed in, for
+    /// a helper that captured its caller before an `async` block.
+    pub fn crossed_from(&self, caller: &'static Location<'static>) -> Decision {
+        let decision = self.with(|d| d.decide(self.name)).unwrap_or(Decision::Pass);
+        if let Decision::Fire(effect) = decision {
+            assert!(
+                self.effects.contains(&effect),
+                "seam {} fired {} but declares only {}",
+                self.name,
+                effect.as_str(),
+                effects_list(self.effects)
+            );
+            self.last_fired
+                .store(std::ptr::from_ref(caller).cast_mut(), Ordering::Relaxed);
+        }
+        decision
+    }
+}
+
+/// The spelling of an effect set in a message: `[fail, skip]`.
+pub fn effects_list(effects: &[Effect]) -> String {
+    let names: Vec<&str> = effects.iter().map(|e| e.as_str()).collect();
+    format!("[{}]", names.join(", "))
 }
 
 #[cfg(any(test, feature = "decide"))]
 impl DecideSeam {
-    /// Fire on every crossing until the guard drops.
-    pub fn fire_always(&'static self) -> Installed<dyn Decide, Global<dyn Decide>> {
-        self.install(Arc::new(FireAlways))
+    /// The effect the plain installers fire; panics on a multi-effect seam.
+    fn sole_effect(&self) -> Effect {
+        match self.effects {
+            [effect] => *effect,
+            effects => panic!(
+                "seam {} declares {}; install with fire_always_with, fire_once_at_with or count_and_fire_at_with and name the effect",
+                self.name,
+                effects_list(effects)
+            ),
+        }
     }
 
-    /// Pass on the first `n - 1` crossings, fire on the `n`th, pass after.
-    /// `n` is at least 1.
+    fn declared(&self, effect: Effect) -> Effect {
+        assert!(
+            self.effects.contains(&effect),
+            "seam {} does not declare {}; it declares {}",
+            self.name,
+            effect.as_str(),
+            effects_list(self.effects)
+        );
+        effect
+    }
+
+    /// Fire the seam's one effect on every crossing until the guard drops.
+    pub fn fire_always(&'static self) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.fire_always_with(self.sole_effect())
+    }
+
+    /// Fire `effect`, one of the declared effects, on every crossing.
+    pub fn fire_always_with(
+        &'static self,
+        effect: Effect,
+    ) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.install(Arc::new(FireAlways(self.declared(effect))))
+    }
+
+    /// Pass on the first `n - 1` crossings, fire the seam's one effect on
+    /// the `n`th, pass after. `n` is at least 1.
     pub fn fire_once_at(&'static self, n: u64) -> Installed<dyn Decide, Global<dyn Decide>> {
-        self.install(Arc::new(FireOnceAt::new(n)))
+        self.fire_once_at_with(n, self.sole_effect())
+    }
+
+    /// [`fire_once_at`](Self::fire_once_at) firing `effect`, one of the
+    /// declared effects.
+    pub fn fire_once_at_with(
+        &'static self,
+        n: u64,
+        effect: Effect,
+    ) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.install(Arc::new(FireOnceAt::new(n, self.declared(effect))))
     }
 
     /// Panic at every crossing, a simulated process death; the message text
@@ -396,31 +502,69 @@ impl DecideSeam {
         self.install(Arc::new(Observe(f)))
     }
 
-    /// Count crossings and fire on `n`; the count is readable by the test,
-    /// which is how a runner proves delivery without an error message.
+    /// [`fire_once_at_with`](Self::fire_once_at_with) spelled by effect.
+    pub fn fail_once_at(&'static self, n: u64) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.fire_once_at_with(n, Effect::Fail)
+    }
+
+    pub fn skip_once_at(&'static self, n: u64) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.fire_once_at_with(n, Effect::Skip)
+    }
+
+    pub fn contention_once_at(&'static self, n: u64) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.fire_once_at_with(n, Effect::Contention)
+    }
+
+    /// [`fire_always_with`](Self::fire_always_with) spelled by effect.
+    pub fn fail_always(&'static self) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.fire_always_with(Effect::Fail)
+    }
+
+    pub fn skip_always(&'static self) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.fire_always_with(Effect::Skip)
+    }
+
+    pub fn contention_always(&'static self) -> Installed<dyn Decide, Global<dyn Decide>> {
+        self.fire_always_with(Effect::Contention)
+    }
+
+    /// Count crossings and fire the seam's one effect on `n`; the count is
+    /// readable by the test, which is how a runner proves delivery without
+    /// an error message.
     pub fn count_and_fire_at(
         &'static self,
         n: u64,
     ) -> (Installed<dyn Decide, Global<dyn Decide>>, Arc<Counted>) {
-        let counted = Arc::new(Counted::new(n));
+        self.count_and_fire_at_with(n, self.sole_effect())
+    }
+
+    /// [`count_and_fire_at`](Self::count_and_fire_at) firing `effect`, one
+    /// of the declared effects.
+    pub fn count_and_fire_at_with(
+        &'static self,
+        n: u64,
+        effect: Effect,
+    ) -> (Installed<dyn Decide, Global<dyn Decide>>, Arc<Counted>) {
+        let counted = Arc::new(Counted::new(n, self.declared(effect)));
         (self.install(counted.clone()), counted)
     }
 }
 
-/// Fires on every crossing.
-pub struct FireAlways;
+/// Fires its effect on every crossing.
+pub struct FireAlways(pub Effect);
 
 impl Behavior for FireAlways {}
 
 impl Decide for FireAlways {
     fn decide(&self, _name: &'static str) -> Decision {
-        Decision::Fire
+        Decision::Fire(self.0)
     }
 }
 
-/// Fires exactly once, on the `n`th crossing.
+/// Fires its effect exactly once, on the `n`th crossing.
 pub struct FireOnceAt {
     target: u64,
+    effect: Effect,
     crossings: AtomicU64,
 }
 
@@ -428,10 +572,11 @@ impl FireOnceAt {
     /// # Panics
     ///
     /// When `n` is 0: crossings are counted from 1.
-    pub fn new(n: u64) -> Self {
+    pub fn new(n: u64, effect: Effect) -> Self {
         assert!(n >= 1, "fire_once_at counts crossings from 1, got 0");
         Self {
             target: n,
+            effect,
             crossings: AtomicU64::new(0),
         }
     }
@@ -443,24 +588,24 @@ impl Decide for FireOnceAt {
     fn decide(&self, _name: &'static str) -> Decision {
         let seen = self.crossings.fetch_add(1, Ordering::SeqCst) + 1;
         if seen == self.target {
-            Decision::Fire
+            Decision::Fire(self.effect)
         } else {
             Decision::Pass
         }
     }
 }
 
-/// Counts every crossing and fires on the `n`th; the count is the delivery
-/// record a runner reads after the step.
+/// Counts every crossing and fires its effect on the `n`th; the count is
+/// the delivery record a runner reads after the step.
 pub struct Counted {
     inner: FireOnceAt,
     fired: AtomicBool,
 }
 
 impl Counted {
-    pub fn new(n: u64) -> Self {
+    pub fn new(n: u64, effect: Effect) -> Self {
         Self {
-            inner: FireOnceAt::new(n),
+            inner: FireOnceAt::new(n, effect),
             fired: AtomicBool::new(false),
         }
     }
@@ -472,6 +617,11 @@ impl Counted {
     pub fn fired(&self) -> bool {
         self.fired.load(Ordering::SeqCst)
     }
+
+    /// The effect this decider fires.
+    pub fn effect(&self) -> Effect {
+        self.inner.effect
+    }
 }
 
 impl Behavior for Counted {}
@@ -479,7 +629,7 @@ impl Behavior for Counted {}
 impl Decide for Counted {
     fn decide(&self, name: &'static str) -> Decision {
         let decision = self.inner.decide(name);
-        if decision == Decision::Fire {
+        if decision != Decision::Pass {
             self.fired.store(true, Ordering::SeqCst);
         }
         decision
@@ -622,7 +772,12 @@ impl<F: Fn() + Send + Sync + 'static> Decide for Observe<F> {
 pub trait SeamEntry: Sync {
     fn name(&self) -> &'static str;
     fn op(&self) -> Op;
-    fn effect(&self) -> Option<Effect>;
+    /// The outcomes the site honors; empty for a non-decision seam.
+    fn effects(&self) -> &'static [Effect];
+    /// Where the static is declared.
+    fn site(&self) -> &'static Location<'static>;
+    /// Where the decision last fired, once it has.
+    fn last_fired(&self) -> Option<&'static Location<'static>>;
     /// The seam as a decision seam, when it is one.
     fn as_decide(&'static self) -> Option<&'static DecideSeam>;
     /// Empty the slot (a scenario teardown over a whole catalog).
@@ -639,8 +794,16 @@ impl SeamEntry for DecideSeam {
         self.op
     }
 
-    fn effect(&self) -> Option<Effect> {
-        self.effect
+    fn effects(&self) -> &'static [Effect] {
+        self.effects
+    }
+
+    fn site(&self) -> &'static Location<'static> {
+        self.site
+    }
+
+    fn last_fired(&self) -> Option<&'static Location<'static>> {
+        Seam::last_fired(self)
     }
 
     fn as_decide(&'static self) -> Option<&'static DecideSeam> {
@@ -651,6 +814,33 @@ impl SeamEntry for DecideSeam {
     fn clear(&self) {
         Seam::clear(self)
     }
+}
+
+/// Declare a decision seam beside the site it guards:
+/// `decide_seam! { pub static NAME = ("area.place", Mutation, [Fail, Skip]); }`.
+/// The compiler records the invocation as the seam's site.
+#[macro_export]
+macro_rules! decide_seam {
+    ($(#[$meta:meta])* $vis:vis static $name:ident = ($seam_name:literal, $op:ident, [$($effect:ident),+ $(,)?]);) => {
+        $(#[$meta])*
+        $vis static $name: $crate::DecideSeam = $crate::Seam::decide(
+            $seam_name,
+            $crate::Op::$op,
+            &[$($crate::Effect::$effect),+],
+            $crate::Global::new(),
+        );
+    };
+}
+
+/// Index a crate's decision seams from one list: re-export each under the
+/// catalog module and list them in `ALL`.
+#[macro_export]
+macro_rules! catalog {
+    ($($seam:path),+ $(,)?) => {
+        $(pub use $seam;)+
+        /// Every decision seam in this crate.
+        pub static ALL: &[&'static dyn $crate::SeamEntry] = &[$(&$seam),+];
+    };
 }
 
 /// Declare a thread-local seam, `thread_local_seam! { pub static CLOCK: dyn Clock =
@@ -674,13 +864,43 @@ macro_rules! thread_local_seam {
 mod tests {
     use super::*;
 
-    static SITE: DecideSeam = Seam::decide("test.site", Op::Mutation, Effect::Fail, Global::new());
+    static SITE: DecideSeam =
+        Seam::decide("test.site", Op::Mutation, &[Effect::Fail], Global::new());
     static COUNTED: DecideSeam =
-        Seam::decide("test.counted", Op::Mutation, Effect::Fail, Global::new());
-    static HELD: DecideSeam = Seam::decide("test.held", Op::Mutation, Effect::Hold, Global::new());
-    static HELD_DROP: DecideSeam =
-        Seam::decide("test.held_drop", Op::Mutation, Effect::Hold, Global::new());
-    static ROW: DecideSeam = Seam::decide("test.row", Op::Mutation, Effect::Fail, Global::new());
+        Seam::decide("test.counted", Op::Mutation, &[Effect::Fail], Global::new());
+    static HELD: DecideSeam =
+        Seam::decide("test.held", Op::Mutation, &[Effect::Fail], Global::new());
+    static HELD_DROP: DecideSeam = Seam::decide(
+        "test.held_drop",
+        Op::Mutation,
+        &[Effect::Fail],
+        Global::new(),
+    );
+    static ROW: DecideSeam = Seam::decide("test.row", Op::Mutation, &[Effect::Fail], Global::new());
+    static PUT: DecideSeam = Seam::decide(
+        "test.put",
+        Op::Mutation,
+        &[Effect::Fail, Effect::Skip],
+        Global::new(),
+    );
+    static PUT_PLAIN: DecideSeam = Seam::decide(
+        "test.put_plain",
+        Op::Mutation,
+        &[Effect::Fail, Effect::Skip],
+        Global::new(),
+    );
+    static PUT_UNDECLARED: DecideSeam = Seam::decide(
+        "test.put_undeclared",
+        Op::Mutation,
+        &[Effect::Fail, Effect::Skip],
+        Global::new(),
+    );
+    static PUT_LIAR: DecideSeam = Seam::decide(
+        "test.put_liar",
+        Op::Mutation,
+        &[Effect::Skip],
+        Global::new(),
+    );
 
     trait Clock: Behavior + Send + Sync {
         fn now(&self) -> u64;
@@ -706,8 +926,8 @@ mod tests {
         assert_eq!(SITE.crossed(), Decision::Pass);
         {
             let _guard = SITE.fire_always();
-            assert_eq!(SITE.crossed(), Decision::Fire);
-            assert_eq!(SITE.crossed(), Decision::Fire);
+            assert_eq!(SITE.crossed(), Decision::Fire(Effect::Fail));
+            assert_eq!(SITE.crossed(), Decision::Fire(Effect::Fail));
         }
         assert_eq!(SITE.crossed(), Decision::Pass);
     }
@@ -717,10 +937,47 @@ mod tests {
         let (_guard, counted) = COUNTED.count_and_fire_at(3);
         assert_eq!(COUNTED.crossed(), Decision::Pass);
         assert_eq!(COUNTED.crossed(), Decision::Pass);
-        assert_eq!(COUNTED.crossed(), Decision::Fire);
+        assert_eq!(COUNTED.crossed(), Decision::Fire(Effect::Fail));
         assert_eq!(COUNTED.crossed(), Decision::Pass);
         assert_eq!(counted.crossings(), 4);
         assert!(counted.fired());
+        assert_eq!(counted.effect(), Effect::Fail);
+    }
+
+    #[test]
+    fn a_multi_effect_seam_fires_the_effect_named_at_install() {
+        {
+            let _guard = PUT.skip_once_at(1);
+            assert_eq!(PUT.crossed(), Decision::Fire(Effect::Skip));
+            assert_eq!(PUT.crossed(), Decision::Pass);
+        }
+        {
+            let _guard = PUT.fail_always();
+            assert_eq!(PUT.crossed(), Decision::Fire(Effect::Fail));
+        }
+        let (_guard, counted) = PUT.count_and_fire_at_with(2, Effect::Fail);
+        assert_eq!(PUT.crossed(), Decision::Pass);
+        assert_eq!(PUT.crossed(), Decision::Fire(Effect::Fail));
+        assert_eq!(counted.effect(), Effect::Fail);
+    }
+
+    #[test]
+    #[should_panic(expected = "declares [fail, skip]; install with")]
+    fn a_multi_effect_seam_refuses_the_plain_installer() {
+        let _guard = PUT_PLAIN.fire_once_at(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not declare contention")]
+    fn an_installer_refuses_an_undeclared_effect() {
+        let _guard = PUT_UNDECLARED.fire_always_with(Effect::Contention);
+    }
+
+    #[test]
+    #[should_panic(expected = "fired fail but declares only [skip]")]
+    fn a_crossing_refuses_a_decider_firing_outside_the_set() {
+        let _guard = PUT_LIAR.install(Arc::new(FireAlways(Effect::Fail)));
+        let _ = PUT_LIAR.crossed();
     }
 
     #[test]
@@ -759,31 +1016,52 @@ mod tests {
     #[test]
     fn a_stale_guard_leaves_a_later_installation_alone() {
         static RESET: DecideSeam =
-            Seam::decide("test.reset", Op::Mutation, Effect::Fail, Global::new());
+            Seam::decide("test.reset", Op::Mutation, &[Effect::Fail], Global::new());
         let stale = RESET.fire_always();
         RESET.clear();
         let _live = RESET.fire_once_at(1);
         drop(stale);
-        assert_eq!(RESET.crossed(), Decision::Fire);
+        assert_eq!(RESET.crossed(), Decision::Fire(Effect::Fail));
     }
 
     #[test]
     #[should_panic(expected = "already installed")]
     fn installing_over_a_live_guard_is_refused() {
         static TWICE: DecideSeam =
-            Seam::decide("test.twice", Op::Mutation, Effect::Fail, Global::new());
+            Seam::decide("test.twice", Op::Mutation, &[Effect::Fail], Global::new());
         let _first = TWICE.fire_always();
         let _second = TWICE.fire_once_at(2);
+    }
+
+    #[rustfmt::skip]
+    static LOCATED: DecideSeam = Seam::decide("test.located", Op::Mutation, &[Effect::Fail], Global::new());
+    const LINE_AFTER_LOCATED: u32 = line!();
+
+    #[test]
+    #[rustfmt::skip]
+    fn a_seam_records_its_declaration_and_where_it_last_fired() {
+        assert!(LOCATED.site().file().ends_with("lib.rs"));
+        assert_eq!(LOCATED.site().line(), LINE_AFTER_LOCATED - 1);
+        assert_eq!(LOCATED.crossed(), Decision::Pass);
+        assert!(LOCATED.last_fired().is_none(), "a passing crossing records nothing");
+        let guard = LOCATED.fire_once_at(1);
+        let _ = LOCATED.crossed(); let fired_line = line!();
+        let _ = LOCATED.crossed();
+        drop(guard);
+        let fired = LOCATED.last_fired().unwrap();
+        assert_eq!((fired.file(), fired.line()), (LOCATED.site().file(), fired_line), "a later passing crossing does not move it");
+        let entry: &dyn SeamEntry = &LOCATED;
+        assert_eq!(entry.site().line(), LINE_AFTER_LOCATED - 1);
     }
 
     #[test]
     fn catalog_row_reads_the_seam() {
         let entry: &dyn SeamEntry = &ROW;
         assert_eq!(entry.name(), "test.row");
-        assert_eq!(entry.effect(), Some(Effect::Fail));
+        assert_eq!(entry.effects(), &[Effect::Fail]);
         let seam = entry.as_decide().unwrap();
         let _guard = seam.fire_always();
-        assert_eq!(ROW.crossed(), Decision::Fire);
+        assert_eq!(ROW.crossed(), Decision::Fire(Effect::Fail));
         entry.clear();
         assert_eq!(ROW.crossed(), Decision::Pass);
     }

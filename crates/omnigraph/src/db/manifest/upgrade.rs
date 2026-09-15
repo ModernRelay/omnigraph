@@ -22,6 +22,7 @@ use super::{
     OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_GRAPH_HEAD, OBJECT_TYPE_TABLE,
     OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
 };
+use crate::seams::{decide_seam, fail};
 
 pub(super) const UPGRADE_PENDING_KEY: &str = "omnigraph:storage_upgrade_pending";
 const UPGRADE_RECEIPT_KEY: &str = "omnigraph:storage_upgrade_receipt";
@@ -514,6 +515,22 @@ async fn refuse_system_columns_offenders_before_conversion(
     Ok(())
 }
 
+decide_seam! {
+    pub static UPGRADE_BEFORE_ACTIVATION = ("upgrade.before_activation", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static UPGRADE_AFTER_BRANCH = ("upgrade.after_branch", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static UPGRADE_AFTER_FENCE = ("upgrade.after_fence", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    pub static UPGRADE_AFTER_ACTIVATION = ("upgrade.after_activation", Unreachable, [Fail]);
+}
+
 async fn run_step(
     root: &str,
     options: UpgradeOptions,
@@ -706,7 +723,7 @@ async fn run_step(
         publish_fence(main, json, intent.target_format).await?;
     }
     report.last_durable_completed_boundary = Some("source_fenced".into());
-    crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_FENCE)?;
+    fail(&UPGRADE_AFTER_FENCE)?;
     for branch in &intent.branches {
         let current = open(root, branch.native.as_deref()).await?;
         if crate::branch_control::dataset_branch_identifier(&current)
@@ -729,7 +746,7 @@ async fn run_step(
             "converted:{}",
             branch.native.as_deref().unwrap_or("main")
         ));
-        crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_BRANCH)?;
+        fail(&UPGRADE_AFTER_BRANCH)?;
     }
     for branch in &intent.branches {
         let current = open(root, branch.native.as_deref()).await?;
@@ -747,10 +764,10 @@ async fn run_step(
     if intent_from(&main)?.as_ref() != Some(&intent) {
         return Err(invalid("activation ownership changed"));
     }
-    crate::seams::fail(&crate::seams::catalog::UPGRADE_BEFORE_ACTIVATION)?;
+    fail(&UPGRADE_BEFORE_ACTIVATION)?;
     publish_activation(main).await?;
     report.last_durable_completed_boundary = Some("activated".into());
-    crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_ACTIVATION)?;
+    fail(&UPGRADE_AFTER_ACTIVATION)?;
     report.outcome = UpgradeOutcome::Completed;
     report.completed_handlers.push(handler.into());
     report.recovery = None;
@@ -1366,6 +1383,10 @@ async fn publish_activation(dataset: Dataset) -> Result<Dataset> {
         .map_err(OmniError::storage)
 }
 
+decide_seam! {
+    pub static UPGRADE_AFTER_STAGE = ("upgrade.after_stage", Unreachable, [Fail]);
+}
+
 async fn publish_conversion(
     current: Dataset,
     source: Dataset,
@@ -1443,7 +1464,7 @@ async fn publish_conversion(
             .await
             .map_err(OmniError::storage)?
     };
-    crate::seams::fail(&crate::seams::catalog::UPGRADE_AFTER_STAGE)?;
+    fail(&UPGRADE_AFTER_STAGE)?;
     let target = CommitBuilder::new(destination)
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)

@@ -63,29 +63,37 @@ scope: next_step
 
 All four fields are required. `at` names a decision seam in the engine's
 catalog (`omnigraph::seams::catalog`, RFC 0066); `action` is `fail` or
-`skip` and must match the effect the seam declares (`fail` admits the fail
-and contention effects, `skip` the skip effect); `hold` is refused until
-concurrent steps exist. A `fail` action on a seam of effect contention
-injects a retryable error that the publisher retries, so the step succeeds
-and the `seam_delivered` record is its only proof; on a seam of effect fail
-the step states the injected error in its `--- expect error:` row. A `skip`
-action carries the healthy expectation the skipped path produces; a lost
-durable write is then proven healed by a `--- restart` and the query after it
+`skip` and must be among the effects the seam declares (`fail` admits a seam
+declaring the fail or contention effect, `skip` one declaring the skip
+effect); `hold` is refused until concurrent steps exist. A seam declares one
+effect when it sits between two steps and several when it wraps one
+operation, so `mutation.sidecar_confirm_put` (effects fail and skip) takes
+either action from a case with no engine change
+(`cases/mutation_sidecar_confirm_put_failure_rolls_back.gqt`,
+`cases/issue_602_stale_sidecar_heals_on_reopen.gqt`). A `fail` action on a
+seam declaring contention injects a retryable error that the publisher
+retries, so the step succeeds and the `seam_delivered` record is its only
+proof; on a seam declaring fail the step states the injected error in its
+`--- expect error:` row. A `skip` action carries the healthy expectation the
+skipped path produces; a lost durable write is then proven healed by a
+`--- restart` and the query after it
 (`cases/issue_602_stale_sidecar_heals_on_reopen.gqt`), or, while the defect
-stands, pinned by a `--- known_failure` marker on that restart. The occurrence counts crossings inside that
-operation, including production retries; setup and preceding operations
-cannot consume it. The installed decision is removed before the next
-operation or restart. Seam directives inside loops are refused. GQT does not
-add retries.
+stands, pinned by a `--- known_failure` marker on that restart. The occurrence counts
+crossings inside that operation, including production retries; setup and
+preceding operations cannot consume it. The installed decision is removed
+before the next operation or restart. Seam directives inside loops are
+refused. GQT does not add retries.
 
 A seam is admitted when its catalog operation matches the step it precedes:
 `mutation` before a mutate, `branch_merge`/`branch_create`/`branch_delete`
 before the matching branch statement, `any_write` before either; a seam of
 operation `unreachable` is refused. Occurrences must be 1–1000000. Delivery
-is proven by the runner's own decision: it counts crossings, fires on the
-declared occurrence, and the report carries `seam_delivered`; an unfired
-seam fails with `seam_unobserved`. Text in data or an error cannot satisfy
-this check.
+is proven by the runner's own decision: it counts crossings, fires the
+admitted effect on the declared occurrence, and the report carries
+`seam_delivered` with the seam, the occurrence, the crossings, the effect,
+`declared_at` (the file and line of the seam's static, beside the code it
+guards) and `fired_at` (the helper call whose crossing fired); an unfired seam fails
+with `seam_unobserved`. Text in data or an error cannot satisfy this check.
 
 `--- fault` is reserved for storage-boundary faults (a separate amendment)
 and is refused today with a pointer to `--- seam`. An old `--- fault` block
