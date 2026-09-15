@@ -250,69 +250,75 @@ pub(crate) struct ArmedSeam {
     counted: std::sync::Arc<omnigraph::seams::Counted>,
 }
 
+/// Arm every seam declared before one step, in declaration order; the parser
+/// already refused the same seam twice before one step.
 #[cfg(tokio_unstable)]
-pub(crate) fn arm_seam(
-    seam: Option<&SeamDirective>,
+pub(crate) fn arm_seams(
+    seams: &[SeamDirective],
     step: &crate::Step,
-) -> Result<Option<ArmedSeam>, String> {
-    seam.map(|seam| {
-        let entry = admit_seam(seam, Some(step))?;
-        let (guard, counted) = entry.count_and_fire_at(seam.occurrence as u64);
-        Ok(ArmedSeam {
-            at: seam.at.clone(),
-            occurrence: seam.occurrence,
-            guard: Some(guard),
-            counted,
+) -> Result<Vec<ArmedSeam>, String> {
+    seams
+        .iter()
+        .map(|seam| {
+            let entry = admit_seam(seam, Some(step))?;
+            let (guard, counted) = entry.count_and_fire_at(seam.occurrence as u64);
+            Ok(ArmedSeam {
+                at: seam.at.clone(),
+                occurrence: seam.occurrence,
+                guard: Some(guard),
+                counted,
+            })
         })
-    })
-    .transpose()
+        .collect()
 }
 
 #[cfg(not(tokio_unstable))]
 pub(crate) struct ArmedSeam;
 
 #[cfg(not(tokio_unstable))]
-pub(crate) fn arm_seam(
-    seam: Option<&SeamDirective>,
+pub(crate) fn arm_seams(
+    seams: &[SeamDirective],
     _step: &crate::Step,
-) -> Result<Option<ArmedSeam>, String> {
-    if seam.is_some() {
-        Err("unsupported_environment: DST runner is unavailable".into())
+) -> Result<Vec<ArmedSeam>, String> {
+    if seams.is_empty() {
+        Ok(Vec::new())
     } else {
-        Ok(None)
+        Err("unsupported_environment: DST runner is unavailable".into())
     }
 }
 
-/// Uninstall the decider and check delivery: the site fired exactly on the
-/// declared crossing. The record is the proof a case's report carries.
+/// Uninstall every decider first, then check delivery seam by seam: each site
+/// fired exactly on its declared crossing. The records are the proof a case's
+/// report carries, one per seam in declaration order.
 #[cfg(tokio_unstable)]
-pub(crate) fn finish_seam(armed: Option<ArmedSeam>) -> Result<(), String> {
-    let Some(mut armed) = armed else {
-        return Ok(());
-    };
-    drop(armed.guard.take());
-    let crossings = armed.counted.crossings();
-    if !armed.counted.fired() {
-        return Err(format!(
-            "seam_unobserved: seam {} was not crossed on occurrence {} by the selected operation; crossings observed: {crossings}",
-            armed.at, armed.occurrence
-        ));
+pub(crate) fn finish_seams(mut armed: Vec<ArmedSeam>) -> Result<(), String> {
+    for seam in &mut armed {
+        drop(seam.guard.take());
     }
-    record(
-        "seam_delivered",
-        serde_json::json!({"at": armed.at, "occurrence": armed.occurrence, "crossings": crossings}),
-    );
-    observe(|| {
-        format!(
-            "seam delivered: {} on crossing {}",
-            armed.at, armed.occurrence
-        )
-    });
+    for seam in &armed {
+        let crossings = seam.counted.crossings();
+        if !seam.counted.fired() {
+            return Err(format!(
+                "seam_unobserved: seam {} was not crossed on occurrence {} by the selected operation; crossings observed: {crossings}",
+                seam.at, seam.occurrence
+            ));
+        }
+        record(
+            "seam_delivered",
+            serde_json::json!({"at": seam.at, "occurrence": seam.occurrence, "crossings": crossings}),
+        );
+        observe(|| {
+            format!(
+                "seam delivered: {} on crossing {}",
+                seam.at, seam.occurrence
+            )
+        });
+    }
     Ok(())
 }
 
 #[cfg(not(tokio_unstable))]
-pub(crate) fn finish_seam(_armed: Option<ArmedSeam>) -> Result<(), String> {
+pub(crate) fn finish_seams(_armed: Vec<ArmedSeam>) -> Result<(), String> {
     Ok(())
 }
 
@@ -817,7 +823,7 @@ fn run_invocation(
     for env in &selected_envs {
         env.admit(!case.seams.is_empty())?;
     }
-    for (ordinal, seam) in &case.seams {
+    for (ordinal, seams) in &case.seams {
         let step = case
             .items
             .iter()
@@ -826,7 +832,9 @@ fn run_invocation(
                 crate::Item::Loop { steps, .. } => steps.as_slice(),
             })
             .find(|step| step.ordinal() == *ordinal);
-        admit_seam(seam, step)?;
+        for seam in seams {
+            admit_seam(seam, step)?;
+        }
     }
     if bless && case.known_failure.is_some() {
         return Err("invalid_case: bless is refused for known_failure cases".into());

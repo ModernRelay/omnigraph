@@ -92,6 +92,20 @@ pub(crate) struct RecoveryAuditRecord {
     pub created_at: i64,
 }
 
+/// Every recovery audit row as `<kind> <operation_id>`, oldest first: the DST
+/// harness's evidence that a heal of a given kind finalized a given sidecar.
+#[doc(hidden)]
+#[cfg(feature = "dst")]
+pub async fn dst_recovery_audit_rows(root_uri: &str) -> Result<Vec<String>> {
+    let audit = RecoveryAudit::open(root_uri).await?;
+    Ok(audit
+        .list()
+        .await?
+        .into_iter()
+        .map(|record| format!("{} {}", record.recovery_kind.as_str(), record.operation_id))
+        .collect())
+}
+
 pub(crate) struct RecoveryAudit {
     root_uri: String,
     dataset: Option<Dataset>,

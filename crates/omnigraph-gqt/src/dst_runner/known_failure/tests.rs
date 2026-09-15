@@ -21,7 +21,7 @@ fn fixture() -> (Case, WorkerReport) {
     let mut evidence = Vec::new();
     for ordinal in 1..=marker.step {
         let operation = json!({"ordinal": ordinal, "loop_binding": null});
-        if let Some(seam) = case.seams.get(&ordinal) {
+        for seam in case.seams.get(&ordinal).into_iter().flatten() {
             evidence.push(json!({"kind": "seam_delivered", "operation": operation, "value": {"at": seam.at, "occurrence": seam.occurrence}}));
         }
         if ordinal == marker.step {

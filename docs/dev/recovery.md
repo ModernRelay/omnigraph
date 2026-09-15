@@ -128,7 +128,10 @@ reachable only when the confirmation write was lost (acknowledged, effect
 absent) or the object rotted back to arm-time bytes. The commit is the
 authority for the operation. Recovery re-runs the check the lost confirmation
 would have made: the committed snapshot at the original commit must carry each
-owned table at the sidecar's planned post-commit version and branch. It then
+owned table at the sidecar's planned post-commit version and branch, and the
+Lance transaction recorded at that version (read from the immutable version,
+never from HEAD, which a later writer may own) must be the sidecar's planned
+transaction. It then
 finishes the outcome like a confirmed original: one `RolledForward` audit row
 against the original commit, and the sidecar is deleted. A sidecar whose
 recorded or planned values contradict the committed snapshot is damage and

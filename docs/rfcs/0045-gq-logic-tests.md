@@ -870,12 +870,14 @@ cleanup fails it with `fault_cleanup_failed` and a timeout with `timeout`.
 A decision that leaked into another operation or graph
 fails isolation even if the expected rows match.
 
-One seam directive attaches to one operation; adjacent directives,
-directives before restart/setup, orphan directives, and directives inside
-loops are refused in this phase. Multiple seams in one operation and
-seams during setup remain out of scope. A case may contain up to 16
-seam directives at separate operations. No installed decision survives a
-restart, environment change, seed, or replay.
+A seam directive attaches to the one operation it precedes. Several
+directives may precede one operation when they name distinct seams (two
+independent lost writes on one mutation); each is armed, counted and
+recorded on its own, and the same seam named twice before one operation is
+refused. Directives before restart/setup, orphan directives, and directives
+inside loops are refused in this phase; seams during setup remain out of
+scope. A case may contain up to 16 seam directives. No installed decision
+survives a restart, environment change, seed, or replay.
 
 Initial `omnigraph-engine` admission rejects seams. A future seam-capable
 direct-engine implementation can use process isolation where the decision

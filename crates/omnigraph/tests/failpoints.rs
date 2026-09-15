@@ -14229,8 +14229,8 @@ fn rewrite_v3_sidecar_to_armed(root: &std::path::Path, operation_id: &str) {
 }
 
 /// An Armed v3 sidecar beside its visible commit (the confirmation write was
-/// lost) failed every read-write open with kind=Internal before #602; now the
-/// open heals it from the commit and leaves the data untouched.
+/// lost) failed every read-write open with kind=Internal before #602. The
+/// `.gqt` twin pins the rows; this pins the one audit row and the idempotent reopen.
 #[tokio::test]
 #[serial]
 async fn stale_armed_v3_sidecar_beside_visible_commit_heals_on_reopen_issue_602() {
@@ -14352,6 +14352,139 @@ async fn stale_armed_v3_sidecar_contradicting_visible_commit_refuses_open_issue_
     assert!(
         recovery_audit_kinds(dir.path()).await.is_empty(),
         "the refusal records nothing"
+    );
+}
+
+/// The open must refuse an Armed sidecar with `needle` in the error, name the
+/// sidecar object, leave it on the object store, and record no audit row.
+async fn assert_armed_sidecar_refused(
+    uri: &str,
+    root: &std::path::Path,
+    operation_id: &str,
+    needle: &str,
+) {
+    let err = match Omnigraph::open(uri).await {
+        Ok(_) => panic!("an Armed sidecar contradicting its committed effect must refuse"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(text.contains(needle), "unexpected refusal: {text}");
+    assert!(
+        text.contains(&format!("__recovery/{operation_id}.json")),
+        "the refusal must name the sidecar object: {text}"
+    );
+    assert_eq!(
+        helpers::recovery::sidecar_operation_ids(root),
+        vec![operation_id.to_string()],
+        "the refusal leaves the sidecar in place"
+    );
+    assert!(
+        recovery_audit_kinds(root).await.is_empty(),
+        "the refusal records nothing"
+    );
+}
+
+/// The heal re-runs the transaction-identity half of the confirmation too: an
+/// Armed sidecar whose planned transaction is not the one Lance recorded at
+/// the planned version is damage, not a lost acknowledgement.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_with_foreign_planned_transaction_refuses_open_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+    let mut sidecar = read_sidecar_json(dir.path(), &operation_id);
+    sidecar["protocol_v3"]["effects"][0]["planned_transaction"]["uuid"] =
+        serde_json::json!("00000000-0000-4000-8000-000000000099");
+    write_sidecar_json(dir.path(), &operation_id, &sidecar);
+
+    assert_armed_sidecar_refused(
+        &uri,
+        dir.path(),
+        &operation_id,
+        "was not produced by its planned transaction",
+    )
+    .await;
+}
+
+/// A rewritten baseline that stays internally consistent (pin, planned read
+/// version and delta slot all moved) still contradicts the transaction Lance
+/// recorded, so the heal refuses instead of copying it into the audit row.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_with_rewritten_baseline_refuses_open_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+    let mut sidecar = read_sidecar_json(dir.path(), &operation_id);
+    sidecar["tables"][0]["expected_version"] = serde_json::json!(99);
+    sidecar["protocol_v3"]["effects"][0]["planned_transaction"]["read_version"] =
+        serde_json::json!(99);
+    sidecar["protocol_v3"]["intended_delta"]["table_updates"][0]["expected_version"] =
+        serde_json::json!(99);
+    write_sidecar_json(dir.path(), &operation_id, &sidecar);
+
+    assert_armed_sidecar_refused(
+        &uri,
+        dir.path(),
+        &operation_id,
+        "was not produced by its planned transaction",
+    )
+    .await;
+}
+
+/// A later writer advanced the table past the stale sidecar's planned version
+/// before the reopen: the heal checks the committed version, not HEAD, so it
+/// still heals and keeps both inserts.
+#[tokio::test]
+#[serial]
+async fn stale_armed_v3_sidecar_heals_after_a_later_writer_issue_602() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+
+    let operation_id = leave_confirmed_v3_sidecar_beside_visible_commit(&uri, dir.path()).await;
+    rewrite_v3_sidecar_to_armed(dir.path(), &operation_id);
+    let stale = read_sidecar_json(dir.path(), &operation_id);
+    std::fs::remove_file(v3_sidecar_path(dir.path(), &operation_id)).unwrap();
+    let db = Omnigraph::open(&uri).await.unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Later")], &[("$age", 42)]),
+    )
+    .await
+    .unwrap();
+    drop(db);
+    write_sidecar_json(dir.path(), &operation_id, &stale);
+
+    let recovered = Omnigraph::open(&uri)
+        .await
+        .expect("a stale Armed sidecar must heal even after a later writer advanced the table");
+    assert_eq!(
+        count_rows(&recovered, "node:Person").await,
+        6,
+        "both the stale insert and the later insert stay visible"
+    );
+    drop(recovered);
+    assert!(
+        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
+        "the heal deletes the stale sidecar"
+    );
+    assert_eq!(
+        recovery_audit_kinds(dir.path()).await,
+        vec!["RolledForward"],
+        "exactly one RolledForward audit row for the stale sidecar"
     );
 }
 

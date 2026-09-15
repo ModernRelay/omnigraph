@@ -1203,6 +1203,19 @@ pub(crate) async fn confirm_sidecar_phase_b_v9(
     storage.write_text(&uri, &json).await
 }
 
+/// Stage H: delete the sidecar once the `__manifest` commit is visible. The
+/// `MUTATION_SIDECAR_POST_PUBLISH_DELETE` seam models the delete being lost
+/// (acknowledged, effect absent); a failed delete is the caller's to swallow.
+pub(crate) async fn delete_sidecar_after_publish(
+    handle: &RecoverySidecarHandle,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
+    if crate::seams::skip(&crate::seams::catalog::MUTATION_SIDECAR_POST_PUBLISH_DELETE) {
+        return Ok(());
+    }
+    delete_sidecar(handle, storage).await
+}
+
 /// Delete a sidecar after Phase C succeeded. Idempotent (safe to retry).
 pub(crate) async fn delete_sidecar(
     handle: &RecoverySidecarHandle,
@@ -7479,35 +7492,58 @@ async fn finalize_visible_v3_outcome(
                 manifest_version,
             )
             .await?;
-            let outcomes = sidecar
-                .tables
-                .iter()
-                .map(|pin| {
-                    let planned = snapshot_entry_by_identity(&committed_snapshot, pin.identity)
-                        .is_some_and(|entry| {
-                            entry.type_key == pin.table_key
-                                && entry.published_dataset_version == pin.post_commit_pin
-                                && entry.native_dataset_branch == pin.table_branch
-                        });
-                    if !planned {
-                        return Err(OmniError::manifest_internal(format!(
-                            "OCC recovery sidecar '{}' is Armed beside its visible original \
-                             commit '{}' but the committed snapshot does not carry the planned \
-                             version of table '{}'; inspect the sidecar '{}' rather than \
-                             deleting it by hand",
-                            sidecar.operation_id,
-                            protocol.lineage.graph_commit_id,
-                            pin.table_key,
-                            sidecar_uri(root_uri, &sidecar.operation_id)
-                        )));
-                    }
-                    Ok(TableOutcome {
-                        table_key: pin.table_key.clone(),
-                        from_version: pin.expected_version,
-                        to_version: pin.post_commit_pin,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let mut outcomes = Vec::with_capacity(sidecar.tables.len());
+            for pin in &sidecar.tables {
+                let planned = snapshot_entry_by_identity(&committed_snapshot, pin.identity)
+                    .is_some_and(|entry| {
+                        entry.type_key == pin.table_key
+                            && entry.published_dataset_version == pin.post_commit_pin
+                            && entry.native_dataset_branch == pin.table_branch
+                    });
+                if !planned {
+                    return Err(OmniError::manifest_internal(format!(
+                        "OCC recovery sidecar '{}' is Armed beside its visible original \
+                         commit '{}' but the committed snapshot does not carry the planned \
+                         version of table '{}'; inspect the sidecar '{}' rather than \
+                         deleting it by hand",
+                        sidecar.operation_id,
+                        protocol.lineage.graph_commit_id,
+                        pin.table_key,
+                        sidecar_uri(root_uri, &sidecar.operation_id)
+                    )));
+                }
+                let planned_transaction = protocol
+                    .effects
+                    .iter()
+                    .find(|effect| effect.identity == pin.identity)
+                    .map(|effect| &effect.planned_transaction);
+                let committed_transaction = committed_transaction_identity(
+                    &pin.table_path,
+                    pin.table_branch.as_deref(),
+                    pin.post_commit_pin,
+                )
+                .await?;
+                if planned_transaction.is_none()
+                    || committed_transaction.as_ref() != planned_transaction
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "OCC recovery sidecar '{}' is Armed beside its visible original \
+                         commit '{}' but version {} of table '{}' was not produced by its \
+                         planned transaction; inspect the sidecar '{}' rather than deleting \
+                         it by hand",
+                        sidecar.operation_id,
+                        protocol.lineage.graph_commit_id,
+                        pin.post_commit_pin,
+                        pin.table_key,
+                        sidecar_uri(root_uri, &sidecar.operation_id)
+                    )));
+                }
+                outcomes.push(TableOutcome {
+                    table_key: pin.table_key.clone(),
+                    from_version: pin.expected_version,
+                    to_version: pin.post_commit_pin,
+                });
+            }
             (
                 RecoveryKind::RolledForward,
                 protocol.lineage.graph_commit_id.clone(),
@@ -8054,6 +8090,34 @@ struct LanceHeadObservation {
     version: u64,
     transaction: Option<StagedTransactionIdentity>,
     effect_ownership: EffectOwnership,
+}
+
+/// The identity of the transaction Lance recorded at `version` of the table on
+/// `branch`, read from that immutable version rather than from HEAD, which a
+/// later writer may own; `None` when the version carries no transaction file.
+async fn committed_transaction_identity(
+    table_path: &str,
+    branch: Option<&str>,
+    version: u64,
+) -> Result<Option<StagedTransactionIdentity>> {
+    let ds = crate::instrumentation::open_dataset(
+        table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let ds = match branch {
+        Some(b) if b != "main" => ds.checkout_branch(b).await.map_err(OmniError::storage)?,
+        _ => ds,
+    };
+    let transaction = if ds.version().version == version {
+        ds.read_transaction().await
+    } else {
+        ds.read_transaction_by_version(version).await
+    }
+    .map_err(OmniError::storage)?;
+    Ok(transaction.as_ref().map(StagedTransactionIdentity::from))
 }
 
 #[cfg(test)]
@@ -8626,8 +8690,9 @@ pub(crate) fn new_occ_sidecar_v9(
 }
 
 /// Bind every physical output slot of an RFC-022 sidecar and durably transition
-/// it from `Armed` to `EffectsConfirmed`. Returns whether the confirm put was
-/// made; only the `MUTATION_SIDECAR_CONFIRM_ACK_LOST` seam makes it `false`.
+/// it from `Armed` to `EffectsConfirmed`. The `MUTATION_SIDECAR_CONFIRM_PUT`
+/// seam models the put being lost: the in-memory sidecar still confirms while
+/// the object keeps its arm-time bytes.
 ///
 /// Validation happens against a clone first. A missing table, a rebased Lance
 /// transaction, or a version/branch mismatch leaves the on-disk sidecar Armed,
@@ -8639,7 +8704,7 @@ pub(crate) async fn confirm_occ_sidecar_v9(
     sidecar: &mut RecoverySidecar,
     updates: &[DatasetUpdate],
     committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
-) -> Result<bool> {
+) -> Result<()> {
     crate::seams::fail(&crate::seams::catalog::RECOVERY_SIDECAR_CONFIRM)?;
     validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
 
@@ -8755,12 +8820,11 @@ pub(crate) async fn confirm_occ_sidecar_v9(
             error
         ))
     })?;
-    let durable = !crate::seams::skip(&crate::seams::catalog::MUTATION_SIDECAR_CONFIRM_ACK_LOST);
-    if durable {
+    if !crate::seams::skip(&crate::seams::catalog::MUTATION_SIDECAR_CONFIRM_PUT) {
         storage.write_text(&uri, &json).await?;
     }
     *sidecar = confirmed;
-    Ok(durable)
+    Ok(())
 }
 
 /// Arm an exact schema-v9 SchemaApply intent. `tables`/`effects` name every

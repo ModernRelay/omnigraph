@@ -1775,13 +1775,25 @@ fn dst_stale_sidecar_heals_on_reopen() {
         "the lost-write verb should actually bite (lost={})",
         a.writes_lost
     );
+    let healed_from_armed = a.persisted_consumed_reads.iter().any(|read| {
+        let armed = read.ends_with(" phase=Armed");
+        let operation_id = read
+            .split("__recovery/")
+            .nth(1)
+            .and_then(|rest| rest.split(".json").next());
+        armed
+            && operation_id.is_some_and(|operation_id| {
+                a.recovery_audit
+                    .contains(&format!("RolledForward {operation_id}"))
+            })
+    });
     assert!(
-        a.persisted_consumed_reads
-            .iter()
-            .any(|read| read.starts_with("lost-write ") && read.contains("__recovery/")),
-        "the pin holds only while the engine reads a sidecar whose update write was lost; \
-         re-pin the seed if the fault schedule drifted (consumed reads: {:?})",
-        a.persisted_consumed_reads
+        healed_from_armed,
+        "the pin holds only while recovery reads a sidecar still Armed after a lost write AND \
+         finalizes that operation RolledForward (a confirmed residual is the older roll-forward \
+         path; an Armed sidecar without its commit rolls back); re-pin the seed if the fault \
+         schedule drifted (consumed reads: {:?}, audit: {:?})",
+        a.persisted_consumed_reads, a.recovery_audit
     );
     assert!(a.verified > 0);
 }
