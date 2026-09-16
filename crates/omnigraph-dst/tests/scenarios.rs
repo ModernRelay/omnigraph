@@ -2206,7 +2206,7 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// system-column vintage (RFC 0040 historical reads); the audit's first such
 /// read is a cold open: _audit l.get 1220 -> 1228.
 /// RFC 0067 (detached mutation and load): every mutation-class op loses its
-/// sidecar adapter PUTs and DELETEs and the ref LISTs its sidecar arm paid
+/// sidecar adapter PUT and DELETE calls and the ref LISTs its sidecar arm paid
 /// (AddFriend a.put 8 -> 0, a.delete 4 -> 0, l.list 65 -> 59) and pays one
 /// more Lance manifest PUT per touched table for the detached commit's twin
 /// (AddFriend l.put 30 -> 38); Cleanup now reaps the promoted detached
