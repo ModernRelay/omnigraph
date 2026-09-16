@@ -112,7 +112,7 @@ physical-effect proofs:
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
 | SchemaApply | Exact existing-table rewrites plus owned first-touch table creation and the complete schema/manifest delta | One main-branch graph commit |
 | BranchMerge | Pointer adoption, a proven insertion chain, or a bounded ordered-diff transaction chain | One target-branch graph commit |
-| EnsureIndices / full-text rebuild | One exact `CreateIndex` transaction per productive table; ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
+| EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph commit | | One graph publication when work lands |
 | Optimize | Bounded compaction and index-fold maintenance over the complete planned table set | At most one monotonic main publication |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
@@ -149,6 +149,15 @@ and refuse a blocked one. `omnigraph repair` reports blocked pins as
 `blocked_promotion` and never adopts the foreign commit. First-touch branch
 forks are created without an intent record; an unreferenced fork is garbage
 that cleanup classifies.
+
+The index writer (`ensure_indices` and the explicit full-text rebuild)
+follows the same protocol: it opens each productive table at its pin, stages
+the complete BTREE/FTS/vector batch before the gates (a first-touch fork on a
+branch is created under the gates, with no intent record), commits every
+batch as a detached version of the pin, publishes the pins once and promotes
+them. A failure before publication leaves no residue; one after publication
+leaves a pending pin that reads, including full-text search through the
+batch's certificate, serve from the staged version.
 
 Existing-table constructive transactions stage independently with bounded
 concurrency. `OMNIGRAPH_LOAD_CONCURRENCY` selects that width for both Load and

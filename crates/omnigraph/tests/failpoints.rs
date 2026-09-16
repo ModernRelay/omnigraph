@@ -19,9 +19,8 @@ use omnigraph::seams::catalog;
 use serial_test::serial;
 
 use helpers::recovery::{
-    FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
-    branch_head_commit_id, recovery_audit_kinds, sidecar_operation_ids,
-    single_sidecar_operation_id,
+    RecoveryExpectation, TableExpectation, assert_post_recovery_invariants, branch_head_commit_id,
+    recovery_audit_kinds, sidecar_operation_ids, single_sidecar_operation_id,
 };
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, collect_column_strings, count_rows,
@@ -108,9 +107,9 @@ async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
     )
 }
 
-/// A graph with rows and no key indexes: the index writer has work on every
-/// table. `init_and_load` builds the indexes; this does not.
-async fn graph_with_index_work(dir: &tempfile::TempDir) -> Omnigraph {
+/// A graph with rows and no built indexes: the index writer has work on
+/// every table. `init_and_load` builds the indexes; this does not.
+async fn graph_with_unbuilt_indexes(dir: &tempfile::TempDir) -> Omnigraph {
     use omnigraph::loader::{LoadMode, load_jsonl};
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap();
@@ -120,21 +119,38 @@ async fn graph_with_index_work(dir: &tempfile::TempDir) -> Omnigraph {
     db
 }
 
-/// RFC 0067 left mutation and load with no recovery sidecar, so the tests of
-/// the recovery machinery itself (discovery, the cleanup barrier, the
-/// storage-fault contracts, in-process healing) take their pending,
-/// roll-forward-eligible sidecar from the index writer: on a graph with index
-/// work it stops after its effects are confirmed and before the manifest
-/// commit. Returns the sidecar's operation id.
-async fn leave_confirmed_ensure_indices_sidecar(db: &Omnigraph, root: &std::path::Path) -> String {
-    let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+/// The standard graph plus a branch `pending` whose one Person update is
+/// ready to merge: a row-count-preserving effect on main's Person table.
+async fn graph_with_merge_work(dir: &tempfile::TempDir) -> Omnigraph {
+    let mut db = init_and_load(dir).await;
+    db.branch_create("pending").await.unwrap();
+    mutate_branch(
+        &mut db,
+        "pending",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
+    db
+}
+
+/// RFC 0067 left mutation, load and the index writer with no recovery
+/// sidecar, so the tests of the recovery machinery itself (discovery, the
+/// cleanup barrier, the storage-fault contracts, in-process healing) take
+/// their pending, roll-forward-eligible sidecar from branch merge: on a graph
+/// with merge work it stops after its confirmed effects and before the
+/// manifest commit. Returns the sidecar's operation id.
+async fn leave_confirmed_merge_sidecar(db: &Omnigraph, root: &std::path::Path) -> String {
+    let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
     let err = db
-        .ensure_indices()
+        .branch_merge("pending", "main")
         .await
-        .expect_err("the index build must stop after confirming its effects");
+        .expect_err("the merge must stop after confirming its effects");
     assert!(
         err.to_string().contains(
-            "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
+            "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
         ),
         "unexpected error: {err}"
     );
@@ -1093,20 +1109,20 @@ async fn recovery_discovery_skips_sidecar_deleted_after_list() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let initial = graph_with_index_work(&dir).await;
+    let initial = graph_with_merge_work(&dir).await;
     initial.branch_create("feature").await.unwrap();
     drop(initial);
 
     let db_a = Arc::new(Omnigraph::open(&uri).await.unwrap());
     let db_b = Arc::new(Omnigraph::open(&uri).await.unwrap());
 
-    // Writer A: the index build on main, parked with its confirmed sidecar
+    // Writer A: the merge into main, parked with its confirmed sidecar
     // live, before the manifest commit that publishes it.
     let writer_rendezvous = helpers::failpoint::Rendezvous::park_first(
-        &catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     );
     let writer_db = Arc::clone(&db_a);
-    let writer = tokio::spawn(async move { writer_db.ensure_indices().await });
+    let writer = tokio::spawn(async move { writer_db.branch_merge("pending", "main").await });
     writer_rendezvous.wait_until_reached().await;
 
     let recovery_dir = dir.path().join("__recovery");
@@ -1173,18 +1189,9 @@ async fn read_only_recovery_discovery_skips_sidecar_deleted_after_list() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = graph_with_index_work(&dir).await;
+    let db = graph_with_merge_work(&dir).await;
     let person_rows = helpers::count_rows(&db, "node:Person").await;
-
-    {
-        let _failpoint = catalog::RECOVERY_SIDECAR_CONFIRM.fire_always();
-        let error = db
-            .ensure_indices()
-            .await
-            .expect_err("confirmation failure must leave a valid recovery sidecar");
-        assert!(matches!(error, OmniError::RecoveryRequired { .. }));
-    }
-
+    leave_confirmed_merge_sidecar(&db, dir.path()).await;
     let recovery_dir = dir.path().join("__recovery");
     assert_eq!(
         std::fs::read_dir(&recovery_dir).unwrap().count(),
@@ -2012,7 +2019,7 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    drop(graph_with_index_work(&dir).await);
+    drop(graph_with_merge_work(&dir).await);
     let db_a = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let person_uri = node_table_uri(&db_a, "Person").await;
@@ -2043,7 +2050,7 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
     // A, the index build, commits its exact Lance transactions, confirms the
     // sidecar, then fails before manifest visibility.
     {
-        let operation_id = leave_confirmed_ensure_indices_sidecar(&db_a, dir.path()).await;
+        let operation_id = leave_confirmed_merge_sidecar(&db_a, dir.path()).await;
         let sidecar: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
                 dir.path()
@@ -2054,7 +2061,7 @@ async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() 
         )
         .unwrap();
         assert_eq!(
-            sidecar["writer_kind"], "EnsureIndices",
+            sidecar["writer_kind"], "BranchMerge",
             "A must leave the confirmed index-build intent this race targets"
         );
 
@@ -2561,8 +2568,8 @@ async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently()
 
     // Setup: leave one pending sidecar (every table at Lance v+1, manifest v).
     let person_rows = {
-        let db = graph_with_index_work(&dir).await;
-        leave_confirmed_ensure_indices_sidecar(&db, dir.path()).await;
+        let db = graph_with_merge_work(&dir).await;
+        leave_confirmed_merge_sidecar(&db, dir.path()).await;
         helpers::count_rows(&db, "node:Person").await
     };
     assert_eq!(
@@ -2629,883 +2636,6 @@ async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently()
     );
 }
 
-#[test]
-#[serial]
-fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
-    on_big_stack(recovery_rolls_forward_ensure_indices_on_feature_branch_inner);
-}
-
-async fn recovery_rolls_forward_ensure_indices_on_feature_branch_inner() {
-    use lance::index::DatasetIndexExt;
-    use omnigraph::loader::{LoadMode, load_jsonl};
-
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let operation_id;
-
-    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"alice","age":30}}
-"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-    db.branch_create("feature").await.unwrap();
-    db.mutate(
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "BeforeEnsure")], &[("$age", 42)]),
-    )
-    .await
-    .unwrap();
-
-    // RFC-022 writes no longer build declared indexes inline. Materialize the
-    // feature index once so the setup below can deliberately drop it and test
-    // ensure_indices recovery rather than first materialization.
-    db.ensure_indices_on("feature").await.unwrap();
-
-    let main_person_pin = db
-        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .expect("main must have Person")
-        .published_dataset_version;
-
-    // Make the feature branch's Person table genuinely need index work
-    // while keeping the manifest internally consistent. The test-only
-    // publisher deliberately skips the normal index-rebuild preparation;
-    // the failed writer below is still the real `ensure_indices_on`.
-    let person_uri = node_table_uri(&db, "Person").await;
-    let feature_fork = helpers::snapshot_branch(&db, "feature")
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .native_dataset_branch
-        .clone()
-        .unwrap();
-    let mut ds = helpers::open_dataset_head_exact(&person_uri, Some(&feature_fork)).await;
-    ds.drop_index("__id_idx").await.unwrap();
-    let dropped_index_head = ds.version().version;
-    db.failpoint_publish_table_head_without_index_rebuild_for_test(
-        "feature",
-        "node:Person",
-        Some(&feature_fork),
-    )
-    .await
-    .unwrap();
-    let feature_snapshot = db
-        .snapshot_of(omnigraph::db::ReadTarget::branch("feature"))
-        .await
-        .unwrap();
-    assert_eq!(
-        feature_snapshot
-            .dataset("node:Person")
-            .expect("feature must have Person")
-            .published_dataset_version,
-        dropped_index_head,
-        "test setup must publish the dropped-index table head before ensure_indices runs",
-    );
-    let feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
-
-    {
-        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.ensure_indices_on("feature").await.unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
-            ),
-            "unexpected error: {err}"
-        );
-        operation_id = single_sidecar_operation_id(dir.path());
-    }
-    drop(db);
-
-    let db = Omnigraph::open(&uri).await.unwrap();
-    assert_eq!(
-        helpers::count_rows_branch(&db, "feature", "node:Person").await,
-        2,
-        "feature should see inherited alice plus recovered branch-local row"
-    );
-    assert_eq!(
-        helpers::count_rows(&db, "node:Person").await,
-        1,
-        "ensure_indices branch recovery must not move main"
-    );
-    drop(db);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForwardOriginalLineage {
-            tables: vec![
-                TableExpectation::branch("node:Person", "feature")
-                    .expected_main_manifest_pin(main_person_pin)
-                    .expected_recovery_parent_commit_id(feature_parent_commit_id)
-                    .follow_up_mutation(FollowUpMutation::new(
-                        "feature",
-                        MUTATION_QUERIES,
-                        "insert_person",
-                        mixed_params(&[("$name", "AfterEnsure")], &[("$age", 44)]),
-                    )),
-            ],
-        },
-    )
-    .await
-    .unwrap();
-
-    let mut db = Omnigraph::open(&uri).await.unwrap();
-    assert_eq!(
-        helpers::count_rows_branch(&db, "feature", "node:Person").await,
-        3,
-        "follow-up feature mutation must succeed after ensure_indices recovery"
-    );
-    assert_eq!(
-        helpers::count_rows(&db, "node:Person").await,
-        1,
-        "follow-up feature mutation must not move main"
-    );
-
-    // Repeat the same confirmed residual on the feature branch, but keep this
-    // handle alive. The entry barrier must finish the roll-forward-eligible v8
-    // intent before the retry captures another base or plans another index.
-    let mut ds = helpers::open_dataset_head_exact(&person_uri, Some(&feature_fork)).await;
-    ds.drop_index("__id_idx").await.unwrap();
-    db.failpoint_publish_table_head_without_index_rebuild_for_test(
-        "feature",
-        "node:Person",
-        Some(&feature_fork),
-    )
-    .await
-    .unwrap();
-    let same_handle_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
-
-    let same_handle_operation_id;
-    {
-        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.ensure_indices_on("feature").await.unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
-            ),
-            "unexpected error: {err}"
-        );
-        same_handle_operation_id = single_sidecar_operation_id(dir.path());
-    }
-
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{same_handle_operation_id}.json"));
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(
-        sidecar["protocol_v8"]["effect_phase"], "EffectsConfirmed",
-        "the same-handle retry fixture requires a roll-forward-eligible v8 intent",
-    );
-
-    let pending = db
-        .ensure_indices_on("feature")
-        .await
-        .expect("same-handle retry must heal the confirmed index intent before repreparing");
-    assert!(
-        pending.is_empty(),
-        "the healed feature index should leave no deferred index work"
-    );
-    assert!(
-        helpers::recovery::sidecar_operation_ids(dir.path()).is_empty(),
-        "the entry barrier must finalize the prior confirmed intent before continuing",
-    );
-    drop(db);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &same_handle_operation_id,
-        RecoveryExpectation::RolledForwardOriginalLineage {
-            tables: vec![
-                TableExpectation::branch("node:Person", "feature")
-                    .expected_main_manifest_pin(main_person_pin)
-                    .expected_recovery_parent_commit_id(same_handle_parent_commit_id),
-            ],
-        },
-    )
-    .await
-    .unwrap();
-}
-
-/// Even when every planned CreateIndex transaction landed exactly, a v8
-/// sidecar that is still Armed is rollback-only. Recovery must not infer the
-/// intended manifest delta from complete-looking physical state.
-#[tokio::test]
-#[serial]
-async fn ensure_indices_complete_armed_effects_roll_back() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"alice","age":30}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-    db.apply_schema(&indexed_schema).await.unwrap();
-
-    let operation_id;
-    {
-        let _failpoint = catalog::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM.fire_always();
-        let err = db
-            .ensure_indices()
-            .await
-            .expect_err("failpoint must stop after exact effects but before confirmation");
-        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
-        operation_id = single_sidecar_operation_id(dir.path());
-    }
-
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(
-        sidecar["protocol_v8"]["effect_phase"], "Armed",
-        "the complete-effect rollback fixture requires Armed v8 ownership",
-    );
-    drop(db);
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Armed exact index effects must roll back on Full recovery");
-    drop(recovered);
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledBack {
-            tables: vec![TableExpectation::main("node:Person")],
-        },
-    )
-    .await
-    .unwrap();
-
-    let recovered = Omnigraph::open(&uri).await.unwrap();
-    recovered
-        .ensure_indices()
-        .await
-        .expect("clean retry must rebuild the compensated index batch");
-}
-
-/// A partial Armed v8 intent can leave one planned table still missing its
-/// index. A retry must reject that recovery requirement at entry, before it
-/// stages the remaining table's immutable artifacts.
-#[tokio::test]
-#[serial]
-async fn ensure_indices_entry_barrier_refuses_partial_armed_before_staging() {
-    for full_text_rebuild in [false, true] {
-        ensure_indices_partial_armed_case(full_text_rebuild).await;
-    }
-}
-
-async fn run_index_maintenance(
-    db: &Omnigraph,
-    branch: &str,
-    full_text_rebuild: bool,
-) -> Result<(), OmniError> {
-    if full_text_rebuild {
-        db.rebuild_full_text_indices_on(branch).await.map(|_| ())
-    } else {
-        db.ensure_indices_on(branch).await.map(|_| ())
-    }
-}
-
-async fn ensure_indices_partial_armed_case(full_text_rebuild: bool) {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"alice","age":30}}
-{"type":"Company","data":{"name":"acme"}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-    if full_text_rebuild {
-        // The forced leg replaces existing, fully covered artifacts rather
-        // than relying on the ordinary reconciler's missing-index predicate.
-        db.ensure_indices().await.unwrap();
-    }
-
-    let operation_id;
-    {
-        let _failpoint = catalog::ENSURE_INDICES_POST_TABLE_EFFECT.fire_always();
-        let err = run_index_maintenance(&db, "main", full_text_rebuild)
-            .await
-            .expect_err("failpoint must stop after the first of two table effects");
-        assert!(matches!(err, OmniError::RecoveryRequired { .. }));
-        operation_id = single_sidecar_operation_id(dir.path());
-    }
-
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(
-        sidecar["protocol_v8"]["effect_phase"], "Armed",
-        "a partial table-effect failure must remain rollback-only",
-    );
-    assert_eq!(
-        sidecar["tables"].as_array().map(Vec::len),
-        Some(2),
-        "the fixture must pin two planned table effects so one remains to stage",
-    );
-
-    let snapshot = helpers::snapshot_main(&db).await.unwrap();
-    let mut effected_tables = Vec::new();
-    for (table_key, type_name) in [("node:Person", "Person"), ("node:Company", "Company")] {
-        let manifest_pin = snapshot
-            .dataset(table_key)
-            .unwrap()
-            .published_dataset_version;
-        let table_uri = node_table_uri(&db, type_name).await;
-        let lance_head = helpers::open_dataset_head(&table_uri, None)
-            .await
-            .version()
-            .version;
-        if lance_head > manifest_pin {
-            effected_tables.push(table_key);
-        }
-    }
-    assert_eq!(
-        effected_tables.len(),
-        1,
-        "the first-table failpoint must leave exactly one owned index effect",
-    );
-
-    let retry_error = {
-        let _failpoint = catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE.fire_always();
-        run_index_maintenance(&db, "main", full_text_rebuild)
-            .await
-            .expect_err("rollback-only ownership must refuse before remaining index staging")
-    };
-    match retry_error {
-        OmniError::RecoveryRequired {
-            operation_id: actual,
-            ..
-        } => assert_eq!(actual, operation_id),
-        other => panic!("expected exact pre-staging RecoveryRequired attribution, got {other}"),
-    }
-    assert_eq!(
-        single_sidecar_operation_id(dir.path()),
-        operation_id,
-        "the refused retry must leave only the original Armed intent",
-    );
-    drop(db);
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Full recovery must compensate the exact partial index effect");
-    drop(recovered);
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledBack {
-            tables: vec![TableExpectation::main(effected_tables[0])],
-        },
-    )
-    .await
-    .unwrap();
-
-    let recovered = Omnigraph::open(&uri).await.unwrap();
-    run_index_maintenance(&recovered, "main", full_text_rebuild)
-        .await
-        .expect("clean retry must build both compensated and never-committed indexes");
-}
-
-#[tokio::test]
-#[serial]
-async fn full_text_rebuild_confirmed_recovery_preserves_original_actor_and_publication() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = helpers::init_and_load(&dir).await;
-    let before = helpers::snapshot_main(&db).await.unwrap();
-    let before_commits = db.list_commits(None).await.unwrap();
-    let parent = before_commits[0].graph_commit_id.clone();
-
-    {
-        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let error = db
-            .rebuild_full_text_indices_on_as("main", Some("index-operator"))
-            .await
-            .expect_err("stop after confirmed index effects but before graph publication");
-        assert!(matches!(error, OmniError::RecoveryRequired { .. }));
-    }
-    let operation_id = single_sidecar_operation_id(dir.path());
-    let sidecar: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            dir.path()
-                .join("__recovery")
-                .join(format!("{operation_id}.json")),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(sidecar["protocol_v8"]["effect_phase"], "EffectsConfirmed");
-    assert_eq!(sidecar["actor_id"], "index-operator");
-    assert_eq!(
-        sidecar["protocol_v8"]["lineage"]["actor_id"],
-        "index-operator"
-    );
-    let fixed_commit = sidecar["protocol_v8"]["lineage"]["graph_commit_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        db.list_commits(None).await.unwrap().len(),
-        before_commits.len(),
-        "confirmed table effects must not be graph-visible before publication"
-    );
-    drop(db);
-
-    let recovered = Omnigraph::open(uri).await.unwrap();
-    let commits = recovered.list_commits(None).await.unwrap();
-    assert_eq!(commits.len(), before_commits.len() + 1);
-    assert_eq!(commits[0].graph_commit_id, fixed_commit);
-    assert_eq!(commits[0].actor_id.as_deref(), Some("index-operator"));
-    assert_eq!(
-        commits[0].parent_commit_id.as_deref(),
-        Some(parent.as_str())
-    );
-    let after = helpers::snapshot_main(&recovered).await.unwrap();
-    for table_key in ["node:Company", "node:Person"] {
-        assert_eq!(
-            after.dataset(table_key).unwrap().published_dataset_version,
-            before.dataset(table_key).unwrap().published_dataset_version + 1
-        );
-        let table = after.open_dataset(table_key).await.unwrap();
-        assert!(table.has_fts_index("name").await.unwrap());
-        assert_eq!(
-            table.count_rows(None).await.unwrap(),
-            before.dataset(table_key).unwrap().entity_count as usize
-        );
-    }
-    drop(recovered);
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForwardOriginalLineage {
-            tables: vec![
-                TableExpectation::main("node:Company")
-                    .expected_recovery_parent_commit_id(parent.clone()),
-                TableExpectation::main("node:Person").expected_recovery_parent_commit_id(parent),
-            ],
-        },
-    )
-    .await
-    .unwrap();
-}
-
-/// A foreign process can publish a disjoint table after v8 confirmation but
-/// before the exact graph-head CAS. Full recovery must compensate only the
-/// unpublished index effect and descend from the winning graph commit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn ensure_indices_post_effect_disjoint_winner_is_preserved() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::init_and_load(&dir).await;
-    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-    db.apply_schema(&indexed_schema).await.unwrap();
-    drop(db);
-
-    let index_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
-    let mut winner_db = Omnigraph::open(&uri).await.unwrap();
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        &catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-    );
-    let index_handle = std::sync::Arc::clone(&index_db);
-    let index_task = tokio::spawn(async move { index_handle.ensure_indices().await });
-    rendezvous.wait_until_reached().await;
-
-    let company_uri = node_table_uri(&winner_db, "Company").await;
-    let mut raw_company = lance::Dataset::open(&company_uri).await.unwrap();
-    helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
-    let winner_company_version = raw_company.version().version;
-    winner_db
-        .failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Company", None)
-        .await
-        .unwrap();
-    let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    rendezvous.release();
-
-    let operation_id = match index_task.await.unwrap().unwrap_err() {
-        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
-        other => panic!("post-effect authority loss must require recovery: {other}"),
-    };
-    drop(index_db);
-    drop(winner_db);
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Full recovery must compensate around the disjoint winner");
-    drop(recovered);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledBack {
-            tables: vec![
-                TableExpectation::main("node:Person")
-                    .expected_recovery_parent_commit_id(winner_head),
-            ],
-        },
-    )
-    .await
-    .unwrap();
-    let recovered = Omnigraph::open(&uri).await.unwrap();
-    let main = recovered
-        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-        .await
-        .unwrap();
-    assert_eq!(
-        main.dataset("node:Company")
-            .unwrap()
-            .published_dataset_version,
-        winner_company_version,
-        "index compensation must preserve the disjoint winner"
-    );
-}
-
-/// A same-table foreign commit can bury the exact CreateIndex transaction.
-/// Recovery must retain the sidecar and leave the winning manifest/HEAD alone;
-/// restoring through that winner would be destructive.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn ensure_indices_post_effect_same_table_winner_fails_closed() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::init_and_load(&dir).await;
-    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-    db.apply_schema(&indexed_schema).await.unwrap();
-    drop(db);
-
-    let index_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
-    let mut winner_db = Omnigraph::open(&uri).await.unwrap();
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        &catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-    );
-    let index_handle = std::sync::Arc::clone(&index_db);
-    let index_task = tokio::spawn(async move { index_handle.ensure_indices().await });
-    rendezvous.wait_until_reached().await;
-
-    let person_uri = node_table_uri(&winner_db, "Person").await;
-    let mut raw_person = lance::Dataset::open(&person_uri).await.unwrap();
-    helpers::lance_delete_inline(&mut raw_person, "1 = 2").await;
-    let winner_lance_head = raw_person.version().version;
-    winner_db
-        .failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Person", None)
-        .await
-        .unwrap();
-    let winner_manifest_version = winner_db
-        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    rendezvous.release();
-
-    let operation_id = match index_task.await.unwrap().unwrap_err() {
-        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
-        other => panic!("same-table authority loss must require recovery: {other}"),
-    };
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    drop(index_db);
-
-    let error = match Omnigraph::open(&uri).await {
-        Ok(_) => panic!("Full recovery must refuse to restore through a buried index effect"),
-        Err(error) => error,
-    };
-    assert!(
-        error.to_string().contains("buried")
-            || error.to_string().contains("foreign")
-            || error.to_string().contains("unverifiable"),
-        "unexpected fail-closed error: {error}"
-    );
-    assert!(sidecar_path.exists());
-    assert_eq!(
-        winner_db
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .dataset("node:Person")
-            .unwrap()
-            .published_dataset_version,
-        winner_manifest_version
-    );
-    assert_eq!(
-        lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .version()
-            .version,
-        winner_lance_head
-    );
-}
-
-/// EnsureIndices first-touch ordering is sidecar-before-ref. A crash in that
-/// window is a valid no-effect state: Full recovery must accept the missing
-/// target ref, retire the intent, and leave the child inheriting its parent
-/// until a clean retry performs real index work.
-#[tokio::test]
-#[serial]
-async fn ensure_indices_first_touch_crash_before_ref_recovers_cleanly() {
-    for full_text_rebuild in [false, true] {
-        ensure_indices_first_touch_before_ref_case(full_text_rebuild).await;
-    }
-}
-
-async fn ensure_indices_first_touch_before_ref_case(full_text_rebuild: bool) {
-    use omnigraph::loader::{LoadMode, load_jsonl};
-
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"alice","age":30}}
-"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-    db.branch_create("feature").await.unwrap();
-    db.mutate(
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "feature-row")], &[("$age", 31)]),
-    )
-    .await
-    .unwrap();
-    if full_text_rebuild {
-        db.ensure_indices_on("feature").await.unwrap();
-    }
-    db.branch_create_from(omnigraph::db::ReadTarget::branch("feature"), "experiment")
-        .await
-        .unwrap();
-
-    let person_uri = node_table_uri(&db, "Person").await;
-    let source = helpers::snapshot_branch(&db, "feature").await.unwrap();
-    let entry = source.dataset("node:Person").unwrap();
-    let feature_native = entry.native_dataset_branch.clone().unwrap();
-    let experiment_native = helpers::graph_native_ref(&uri, "experiment").await;
-    let mut person = lance::Dataset::open(&person_uri).await.unwrap();
-    person
-        .create_branch(
-            &experiment_native,
-            (feature_native.as_str(), entry.published_dataset_version),
-            None,
-        )
-        .await
-        .unwrap();
-    let orphan_identifier = person
-        .checkout_branch(&experiment_native)
-        .await
-        .unwrap()
-        .branch_identifier()
-        .await
-        .unwrap();
-
-    {
-        let _failpoint = catalog::ENSURE_INDICES_POST_SIDECAR_PRE_FORK.fire_always();
-        run_index_maintenance(&db, "experiment", full_text_rebuild)
-            .await
-            .expect_err("failpoint must fire after sidecar and before target ref creation");
-    }
-    let operation_id = single_sidecar_operation_id(dir.path());
-    let attempted_fork = saved_sidecar_table_fork(dir.path(), &operation_id, "node:Person");
-    assert_ne!(attempted_fork, experiment_native);
-    assert!(
-        !person
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key(&attempted_fork)
-    );
-    drop(person);
-    drop(db);
-
-    let mut recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Full recovery must accept the missing first-touch target ref");
-    assert!(
-        !dir.path()
-            .join("__recovery")
-            .join(format!("{operation_id}.json"))
-            .exists()
-    );
-    let inherited = recovered
-        .snapshot_of(omnigraph::db::ReadTarget::branch("experiment"))
-        .await
-        .unwrap();
-    assert_eq!(
-        inherited
-            .dataset("node:Person")
-            .unwrap()
-            .native_dataset_branch
-            .as_deref(),
-        Some(feature_native.as_str())
-    );
-
-    run_index_maintenance(&recovered, "experiment", full_text_rebuild)
-        .await
-        .unwrap();
-    let owned = recovered
-        .snapshot_of(omnigraph::db::ReadTarget::branch("experiment"))
-        .await
-        .unwrap();
-    let owned_fork = owned
-        .dataset("node:Person")
-        .unwrap()
-        .native_dataset_branch
-        .clone()
-        .unwrap();
-    assert_ne!(owned_fork, feature_native);
-    assert_ne!(owned_fork, experiment_native);
-    assert_ne!(owned_fork, attempted_fork);
-    let person = lance::Dataset::open(&person_uri).await.unwrap();
-    assert_eq!(
-        person
-            .checkout_branch(&experiment_native)
-            .await
-            .unwrap()
-            .branch_identifier()
-            .await
-            .unwrap(),
-        orphan_identifier
-    );
-    assert!(
-        person
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key(&owned_fork)
-    );
-    assert_eq!(
-        helpers::count_rows_branch(&recovered, "experiment", "node:Person").await,
-        2
-    );
-    recovered
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
-        .await
-        .unwrap();
-    let branches = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .list_branches()
-        .await
-        .unwrap();
-    assert!(!branches.contains_key(&experiment_native));
-    assert!(branches.contains_key(&owned_fork));
-    assert!(branches.contains_key(&feature_native));
-}
-
-/// Mixed first-touch recovery must clean only untouched refs. A table whose
-/// derived index HEAD moved is not a no-effect fork merely because the legacy
-/// EnsureIndices payload lacks transaction identities; Full recovery restores
-/// it through the normal loose-table rollback while accepting a missing sibling
-/// ref.
-#[tokio::test]
-#[serial]
-async fn ensure_indices_mixed_first_touch_rollback_does_not_delete_moved_ref() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-    db.branch_create("feature").await.unwrap();
-    db.load(
-        "feature",
-        "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n\
-         {\"type\":\"Company\",\"data\":{\"name\":\"acme\"}}",
-        LoadMode::Merge,
-    )
-    .await
-    .unwrap();
-    db.branch_create_from(omnigraph::db::ReadTarget::branch("feature"), "experiment")
-        .await
-        .unwrap();
-
-    {
-        let _failpoint = catalog::ENSURE_INDICES_POST_TABLE_EFFECT.fire_always();
-        db.ensure_indices_on("experiment")
-            .await
-            .expect_err("failpoint must stop after the first first-touch table effect");
-    }
-    let operation_id = single_sidecar_operation_id(dir.path());
-    drop(db);
-
-    {
-        let _failpoint = catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
-        let first_recovery = Omnigraph::open(&uri).await;
-        assert!(
-            first_recovery.is_err(),
-            "first recovery must stop after publishing its fixed rollback"
-        );
-    }
-    assert!(
-        dir.path()
-            .join("__recovery")
-            .join(format!("{operation_id}.json"))
-            .exists(),
-        "interrupted rollback must retain its outcome-bearing sidecar"
-    );
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("mixed first-touch rollback retry must finalize its fixed outcome");
-    assert!(
-        !dir.path()
-            .join("__recovery")
-            .join(format!("{operation_id}.json"))
-            .exists()
-    );
-    assert_eq!(
-        helpers::count_rows_branch(&recovered, "experiment", "node:Person").await,
-        1
-    );
-    assert_eq!(
-        helpers::count_rows_branch(&recovered, "experiment", "node:Company").await,
-        1
-    );
-    drop(recovered);
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledBack"],
-        "an interrupted index rollback must never be reclassified as RolledForward"
-    );
-}
-
 /// Refresh-time recovery (Option B): the in-process `Omnigraph::refresh`
 /// runs roll-forward-only recovery, closing the long-running-server
 /// residual without restart.
@@ -3519,9 +2649,9 @@ async fn ensure_indices_mixed_first_touch_rollback_does_not_delete_moved_ref() {
 async fn refresh_runs_roll_forward_recovery_in_process() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = graph_with_index_work(&dir).await;
+    let mut db = graph_with_merge_work(&dir).await;
     let person_rows = helpers::count_rows(&db, "node:Person").await;
-    leave_confirmed_ensure_indices_sidecar(&db, dir.path()).await;
+    leave_confirmed_merge_sidecar(&db, dir.path()).await;
     assert_eq!(
         std::fs::read_dir(dir.path().join("__recovery"))
             .unwrap()
@@ -3573,8 +2703,8 @@ async fn cleanup_refuses_pending_v3_sidecar_before_version_gc() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let mut db = graph_with_index_work(&dir).await;
-    leave_confirmed_ensure_indices_sidecar(&db, dir.path()).await;
+    let mut db = graph_with_merge_work(&dir).await;
+    leave_confirmed_merge_sidecar(&db, dir.path()).await;
 
     let person_uri = node_table_uri(&db, "Person").await;
     let before = lance::Dataset::open(&person_uri).await.unwrap();
@@ -3633,11 +2763,11 @@ async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = graph_with_index_work(&dir).await;
+    let db = graph_with_merge_work(&dir).await;
     let person_rows = helpers::count_rows(&db, "node:Person").await;
 
     // Pending sidecar with real drift.
-    leave_confirmed_ensure_indices_sidecar(&db, dir.path()).await;
+    leave_confirmed_merge_sidecar(&db, dir.path()).await;
 
     // The next write's heal rolls forward (manifest publish lands) but
     // the audit write fails — the write must fail loudly and the sidecar
@@ -3716,9 +2846,9 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = graph_with_index_work(&dir).await;
+    let db = graph_with_merge_work(&dir).await;
     let person_rows = helpers::count_rows(&db, "node:Person").await;
-    leave_confirmed_ensure_indices_sidecar(&db, dir.path()).await;
+    leave_confirmed_merge_sidecar(&db, dir.path()).await;
     assert_eq!(
         std::fs::read_dir(dir.path().join("__recovery"))
             .unwrap()
@@ -3860,18 +2990,27 @@ async fn sidecar_write_failure_aborts_branch_merge_with_no_head_advance() {
 }
 
 /// Same heal contract as the merge variant, for the schema apply entry
-/// point: a pending roll-forward-eligible sidecar (here from a failed index
-/// build) must be healed in-process before the migration runs, so a
-/// long-lived handle can evolve the schema without a restart after a
-/// Phase B → Phase C failure.
+/// point: a pending roll-forward-eligible sidecar (here from a schema apply
+/// that failed after its durable staging write; schema apply needs a
+/// main-only graph, which rules out the merge producer) must be healed
+/// in-process before the migration runs, so a long-lived handle can evolve
+/// the schema without a restart after a Phase B → Phase C failure.
 #[tokio::test]
 #[serial]
 async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let db = graph_with_index_work(&dir).await;
+    let db = init_and_load(&dir).await;
     let person_rows = helpers::count_rows(&db, "node:Person").await;
-    leave_confirmed_ensure_indices_sidecar(&db, dir.path()).await;
+    let desired = format!(
+        "{}\nnode Tag {{ name: String @key }}\n",
+        helpers::TEST_SCHEMA
+    );
+    {
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let err = db.apply_schema(&desired).await.unwrap_err();
+        assert!(matches!(err, OmniError::RecoveryRequired { .. }), "{err}");
+    }
     assert_eq!(
         std::fs::read_dir(dir.path().join("__recovery"))
             .unwrap()
@@ -3879,18 +3018,14 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
         1
     );
 
-    // Additive migration on the SAME handle. Must heal the sidecar first,
-    // then apply normally.
-    let desired = format!(
-        "{}\nnode Tag {{ name: String @key }}\n",
-        helpers::TEST_SCHEMA
-    );
+    // The same migration on the SAME handle. Must heal the sidecar first,
+    // then find the schema already applied.
     db.apply_schema(&desired).await.expect(
         "schema apply on the same handle must heal sidecar-covered \
          drift in-process instead of failing until restart",
     );
 
-    // The index build rolled forward; the migration landed.
+    // The interrupted apply rolled forward; the migration landed.
     assert_eq!(helpers::count_rows(&db, "node:Person").await, person_rows);
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
     let recovery_dir = dir.path().join("__recovery");
@@ -3912,7 +3047,7 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
 async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = graph_with_index_work(&dir).await;
+    let mut db = graph_with_merge_work(&dir).await;
     let main_rows = helpers::count_rows(&db, "node:Person").await;
 
     // A feature branch with its own write, to merge back later.
@@ -3929,7 +3064,7 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
 
     // A failed index build on MAIN: the tables drift ahead of the manifest
     // with a confirmed sidecar covering them.
-    leave_confirmed_ensure_indices_sidecar(&db, dir.path()).await;
+    leave_confirmed_merge_sidecar(&db, dir.path()).await;
     assert_eq!(
         std::fs::read_dir(dir.path().join("__recovery"))
             .unwrap()
@@ -9057,8 +8192,8 @@ async fn branch_merge_sidecar_pins_table_branch_to_active_branch() {
 /// failpoint still fires (it sits after the loops), so the call returns Err —
 /// but no recovery state persists. Reopen is a clean no-op.
 ///
-/// Actual EnsureIndices sidecar persistence and staged-index failure are covered
-/// by `ensure_indices_stage_btree_failure_leaves_existing_tables_writable`; this
+/// Staged-index failure before the gates is covered by
+/// `ensure_indices_stage_btree_failure_leaves_existing_tables_writable`; this
 /// test deliberately reaches the second, no-work reconciliation pass.
 #[tokio::test]
 #[serial]
@@ -11203,7 +10338,7 @@ async fn cleanup_rechecks_sidecars_under_gc_gates() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    drop(graph_with_index_work(&dir).await);
+    drop(graph_with_merge_work(&dir).await);
 
     let cleanup_rv =
         helpers::failpoint::Rendezvous::park_first(&catalog::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES);
@@ -11219,7 +10354,7 @@ async fn cleanup_rechecks_sidecars_under_gc_gates() {
     cleanup_rv.wait_until_reached().await;
 
     let writer = Omnigraph::open(&uri).await.unwrap();
-    leave_confirmed_ensure_indices_sidecar(&writer, dir.path()).await;
+    leave_confirmed_merge_sidecar(&writer, dir.path()).await;
     let person_uri = node_table_uri(&writer, "Person").await;
     let before_versions = lance::Dataset::open(&person_uri)
         .await
@@ -11919,9 +11054,9 @@ async fn blocked_promotion_keeps_writing_detached_and_repair_reports_it() {
         );
     }
 
-    // Writers that commit on the linear HEAD refuse rather than rebase over
-    // the foreign commit.
-    let error = db.ensure_indices().await.unwrap_err();
+    // Writers that commit on the linear HEAD (Optimize here) refuse rather
+    // than rebase over the foreign commit.
+    let error = db.optimize().await.unwrap_err();
     assert!(
         matches!(&error, OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::Conflict),
         "{error}"
@@ -11964,6 +11099,248 @@ async fn blocked_promotion_keeps_writing_detached_and_repair_reports_it() {
     // A fresh handle reads the same rows through the pins.
     let reopened = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     assert_eq!(count_rows(&reopened, "node:Person").await, before + 2);
+}
+
+/// RFC 0067: the index writer commits each index batch detached and publishes
+/// pins. Interrupted after publication, it leaves a pending pin and no
+/// sidecar; reads serve the staged version and the next writer of the table
+/// promotes it, after which a second pass finds no work.
+#[tokio::test]
+#[serial]
+async fn ensure_indices_interrupted_after_publish_leaves_a_pending_pin_the_next_writer_promotes() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = graph_with_unbuilt_indexes(&dir).await;
+    let rows = count_rows(&db, "node:Person").await;
+    {
+        let _failpoint = catalog::ENSURE_INDICES_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        db.ensure_indices().await.unwrap();
+    }
+    assert!(
+        sidecar_operation_ids(dir.path()).is_empty(),
+        "a detached index build arms no recovery sidecar"
+    );
+    let (head, published) = person_head_and_published(&db, "main").await;
+    assert_eq!(head + 1, published, "the index pin is pending");
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
+
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after-index")], &[("$age", 20)]),
+    )
+    .await
+    .unwrap();
+    assert_person_pin_promoted(&db, "main").await;
+    let version = helpers::version_main(&db).await.unwrap();
+    assert!(
+        db.ensure_indices().await.unwrap().is_empty(),
+        "the promoted index batch leaves no work"
+    );
+    assert_eq!(
+        helpers::version_main(&db).await.unwrap(),
+        version,
+        "a second pass publishes nothing"
+    );
+}
+
+/// A failure between the detached index commit and publication leaves the
+/// graph unchanged: no sidecar, no linear movement, no pin; the next pass
+/// rebuilds and promotes.
+#[tokio::test]
+#[serial]
+async fn ensure_indices_failure_before_publish_leaves_no_residue() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph_with_unbuilt_indexes(&dir).await;
+    let before = person_head_and_published(&db, "main").await;
+    let version = helpers::version_main(&db).await.unwrap();
+    {
+        let _failpoint = catalog::ENSURE_INDICES_POST_TABLE_EFFECT.fire_always();
+        let err = db.ensure_indices().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: ensure_indices.post_table_effect"),
+            "unexpected error: {err}"
+        );
+    }
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+    assert_eq!(person_head_and_published(&db, "main").await, before);
+    assert_eq!(helpers::version_main(&db).await.unwrap(), version);
+
+    db.ensure_indices().await.unwrap();
+    assert_person_pin_promoted(&db, "main").await;
+    assert_eq!(
+        person_head_and_published(&db, "main").await.1,
+        before.1 + 1,
+        "the retry publishes one index pin"
+    );
+}
+
+const SEARCH_SCHEMA: &str = include_str!("fixtures/search.pg");
+const SEARCH_DATA: &str = include_str!("fixtures/search.jsonl");
+const SEARCH_QUERIES: &str = include_str!("fixtures/search.gq");
+
+/// HEAD and published version of the Doc table on `branch`.
+async fn doc_head_and_published(db: &Omnigraph, branch: &str) -> (u64, u64) {
+    let snapshot = if branch == "main" {
+        helpers::snapshot_main(db).await.unwrap()
+    } else {
+        helpers::snapshot_branch(db, branch).await.unwrap()
+    };
+    let entry = snapshot.dataset("node:Doc").unwrap();
+    let uri = node_table_uri(db, "Doc").await;
+    let head = helpers::open_dataset_head_exact(&uri, entry.native_dataset_branch.as_deref()).await;
+    (head.version().version, entry.published_dataset_version)
+}
+
+async fn search_titles(db: &mut Omnigraph, branch: &str, term: &str) -> Vec<String> {
+    let result = if branch == "main" {
+        helpers::query_main(db, SEARCH_QUERIES, "text_search", &params(&[("$q", term)]))
+            .await
+            .unwrap()
+    } else {
+        helpers::query_branch(
+            db,
+            branch,
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", term)]),
+        )
+        .await
+        .unwrap()
+    };
+    let mut titles = helpers::first_column_sorted(&result);
+    titles.sort();
+    titles
+}
+
+/// RFC 0067: an explicit full-text rebuild commits its `CreateIndex` batch
+/// detached, with the analyzer certificate written before the commit as
+/// today. Interrupted after publication it leaves a pending pin whose
+/// staged version serves full-text search; the next write on the table
+/// promotes it and search still works.
+#[tokio::test]
+#[serial]
+async fn full_text_rebuild_pending_pin_serves_search_and_promotes() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&db, SEARCH_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    let expected = search_titles(&mut db, "main", "Machine").await;
+    assert!(!expected.is_empty(), "the fixture must match the term");
+
+    {
+        let _failpoint = catalog::ENSURE_INDICES_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        let rebuilt = db.rebuild_full_text_indices_on("main").await.unwrap();
+        assert!(
+            rebuilt
+                .rebuilt_indexes
+                .iter()
+                .any(|index| index.type_key == "node:Doc" && index.property == "title"),
+            "{rebuilt:?}"
+        );
+    }
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+    let (head, published) = doc_head_and_published(&db, "main").await;
+    assert_eq!(head + 1, published, "the rebuilt index pin is pending");
+    assert_eq!(
+        search_titles(&mut db, "main", "Machine").await,
+        expected,
+        "search is served through the staged version and its certificate"
+    );
+    let mut fresh = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(search_titles(&mut fresh, "main", "Machine").await, expected);
+
+    load_jsonl(
+        &db,
+        r#"{"type":"Doc","data":{"slug":"promoter","title":"Machine promoted","body":"x","embedding":[0.1,0.2,0.3,0.4]}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let (head, published) = doc_head_and_published(&db, "main").await;
+    assert_eq!(
+        head, published,
+        "the write promoted the index pin and its own"
+    );
+    let after = search_titles(&mut db, "main", "Machine").await;
+    assert_eq!(after.len(), expected.len() + 1, "{after:?}");
+}
+
+/// A first-touch full-text rebuild on a branch forks the inherited table
+/// with no intent record. A failure between the fork and the detached
+/// commit leaves no sidecar and an unpublished fork that is garbage; the
+/// branch still inherits main's table, main is untouched, and a retry
+/// succeeds on its own fork.
+#[tokio::test]
+#[serial]
+async fn full_text_rebuild_first_touch_fork_failure_leaves_no_residue() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&db, SEARCH_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    db.branch_create("rebuild").await.unwrap();
+    let main_before = doc_head_and_published(&db, "main").await;
+    let branch_version = helpers::version_branch(&db, "rebuild").await.unwrap();
+
+    {
+        let _failpoint = catalog::ENSURE_INDICES_POST_FORK_PRE_COMMIT.fire_always();
+        let err = db
+            .rebuild_full_text_indices_on("rebuild")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: ensure_indices.post_fork_pre_commit"),
+            "unexpected error: {err}"
+        );
+    }
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+    let inherited = helpers::snapshot_branch(&db, "rebuild").await.unwrap();
+    assert!(
+        inherited
+            .dataset("node:Doc")
+            .unwrap()
+            .native_dataset_branch
+            .is_none(),
+        "the branch still inherits main's Doc table"
+    );
+    assert_eq!(
+        helpers::version_branch(&db, "rebuild").await.unwrap(),
+        branch_version
+    );
+    assert_eq!(doc_head_and_published(&db, "main").await, main_before);
+
+    db.rebuild_full_text_indices_on("rebuild").await.unwrap();
+    let forked = helpers::snapshot_branch(&db, "rebuild").await.unwrap();
+    assert!(
+        forked
+            .dataset("node:Doc")
+            .unwrap()
+            .native_dataset_branch
+            .is_some(),
+        "the retry owns its fork"
+    );
+    let (head, published) = doc_head_and_published(&db, "rebuild").await;
+    assert_eq!(head, published, "the fork's pin is promoted");
+    assert_eq!(doc_head_and_published(&db, "main").await, main_before);
+    assert!(
+        !search_titles(&mut db, "rebuild", "Machine")
+            .await
+            .is_empty()
+    );
 }
 
 /// Real-backend coverage of the detached write path (RFC 0067) on an
@@ -12031,7 +11408,7 @@ async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
 }
 
 /// Real-backend coverage of the recovery-sidecar lifecycle the remaining
-/// sidecar writers still use: the index build stops after its confirmed
+/// sidecar writers still use: a branch merge stops after its confirmed
 /// effects, its sidecar PUT went through the S3 adapter, and the next write
 /// on the same handle lists `__recovery/`, rolls the sidecar forward, deletes
 /// it and lands. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set.
@@ -12049,20 +11426,30 @@ async fn s3_recovery_sidecar_lifecycle_heals_on_the_next_write() {
     };
 
     let _scenario = FailScenario::setup();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
     load_jsonl(&db, helpers::TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     let rows = helpers::count_rows(&db, "node:Person").await;
+    db.branch_create("pending").await.unwrap();
+    mutate_branch(
+        &mut db,
+        "pending",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
     {
-        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db
-            .ensure_indices()
+            .branch_merge("pending", "main")
             .await
-            .expect_err("the index build must stop after confirming its effects");
+            .expect_err("the merge must stop after confirming its effects");
         assert!(
             err.to_string().contains(
-                "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
+                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
             ),
             "unexpected error: {err}"
         );
@@ -12081,8 +11468,9 @@ async fn s3_recovery_sidecar_lifecycle_heals_on_the_next_write() {
     drop(db);
     let db = Omnigraph::open(&uri).await.unwrap();
     assert_eq!(helpers::count_rows(&db, "node:Person").await, rows + 1);
+    let ages = collect_i32_column(&read_table(&db, "node:Person").await, "age");
     assert!(
-        db.ensure_indices().await.unwrap().is_empty(),
-        "the rolled-forward index batch leaves no work"
+        ages.contains(&99),
+        "the rolled-forward merge landed: {ages:?}"
     );
 }

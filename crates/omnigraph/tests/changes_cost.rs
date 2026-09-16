@@ -45,10 +45,12 @@ use omnigraph_compiler::ir::ParamMap;
 /// the `id` index absent and stale: neither state may affect the plan. Both
 /// extent sweep points publish the same number of graph commits — the smaller
 /// point pads history with commits on the untouched dataset — so the known
-/// `__manifest` fold term stays comparable.
+/// `__manifest` fold term stays comparable; every point keeps at least one
+/// padding commit, so the stale arm's index build covers the same table set
+/// at both points and its `__manifest` footprint compares like with like.
 #[tokio::test]
 async fn changes_page_opens_and_data_reads_are_bounded_by_delta() {
-    const SEED_COMMITS: u64 = 8;
+    const SEED_COMMITS: u64 = 9;
     const ROWS_PER_COMMIT: u64 = 64;
     cost_harness(async {
         for stale_index in [false, true] {

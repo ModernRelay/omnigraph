@@ -32,7 +32,7 @@ mean an active sidecar uses an old outer schema.
 | Mutation / Load | None since [RFC 0067](../rfcs/0067-detached-table-commits.md): their effects are detached commits published as pins, and a pending pin is promoted by the next writer of the table or by cleanup, never recovered from a sidecar |
 | BranchMerge | Fixed bounded transaction chain, source/target authority, and lineage |
 | SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta; the RFC 0040 system-column upgrade adds rename-only table effects and a `__manifest` stamp advance, recovered by roll-forward only |
-| EnsureIndices / full-text rebuild | Exact CreateIndex effects and complete pointer delta; rebuild retains the same fixed actor and lineage |
+| EnsureIndices / full-text rebuild | None since RFC 0067: index batches are detached commits published as pins; the classifier keeps the kind for sidecars written before the change until it is removed |
 | Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
 
 Pre-v9 identity-less artifacts are never upgraded by guessing from aliases.
@@ -136,8 +136,8 @@ against the original commit, and the sidecar is deleted. A sidecar whose
 recorded or planned values contradict the committed snapshot is damage and
 still fails the read-write open; the error names the sidecar object, which
 must be inspected rather than deleted by hand. The same lost-confirmation
-shape on a `BranchMerge`, `SchemaApply`, or `EnsureIndices` sidecar still
-refuses the open; healing those is a follow-up.
+shape on a `BranchMerge` or `SchemaApply` sidecar still refuses the open;
+healing those is a follow-up.
 
 ## Initialization ownership
 
@@ -194,8 +194,8 @@ The v8 storage fence keeps older binaries from exposing retired branches.
 
 ## Maintenance boundary
 
-Mutation, Load, SchemaApply, BranchMerge, and EnsureIndices carry exact
-transaction identities. Optimize uses Lance maintenance operations that do not
+SchemaApply and BranchMerge carry exact transaction identities; Mutation,
+Load and the index writer publish detached pins instead (RFC 0067). Optimize uses Lance maintenance operations that do not
 yet expose the same caller-owned transaction proof, so its classifier is
 bounded but looser and retains the documented one-mutation-process boundary for
 destructive recovery. Do not widen that claim to distributed takeover without

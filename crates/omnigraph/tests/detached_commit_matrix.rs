@@ -49,6 +49,8 @@ enum Writer {
     Insert,
     MultiTable,
     Cleanup,
+    /// The index writer: one detached `CreateIndex` on Person, no row change.
+    EnsureIndices,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +103,7 @@ impl Writer {
                 InPromotion,
             ],
             Writer::Cleanup => vec![InPromotion, CleanupPreReap],
+            Writer::EnsureIndices => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
         }
     }
 
@@ -109,6 +112,7 @@ impl Writer {
             Writer::Insert => "insert",
             Writer::MultiTable => "insert_and_friend",
             Writer::Cleanup => "cleanup",
+            Writer::EnsureIndices => "ensure_indices",
         }
     }
 
@@ -126,8 +130,19 @@ impl Writer {
 
 impl Window {
     /// The seam and the crossing to park on or return at.
-    fn seam(self) -> (&'static str, u64) {
+    fn seam(self, writer: Writer) -> (&'static str, u64) {
+        let index = writer == Writer::EnsureIndices;
         match self {
+            Window::PostDetached(n) if index => {
+                (catalog::ENSURE_INDICES_POST_TABLE_EFFECT.name(), n as u64)
+            }
+            Window::PrePublish if index => (
+                catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
+                1,
+            ),
+            Window::PostPublish if index => {
+                (catalog::ENSURE_INDICES_POST_PUBLISH_PRE_PROMOTION.name(), 1)
+            }
             Window::PostDetached(n) => (catalog::MUTATION_POST_TABLE_COMMIT.name(), n as u64),
             Window::PrePublish => (catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.name(), 1),
             Window::PostPublish => (catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.name(), 1),
@@ -264,6 +279,7 @@ fn rfc0067_matrix_child_process() {
             let mut db = Omnigraph::open(&uri).await.unwrap();
             let outcome: omnigraph::error::Result<()> = match op.as_str() {
                 "cleanup" => db.cleanup(reclaim_everything()).await.map(|_| ()),
+                "ensure_indices" => db.ensure_indices().await.map(|_| ()),
                 "insert_and_friend" => insert_and_friend(&mut db, &name).await,
                 _ => insert(&mut db, &name).await,
             };
@@ -326,11 +342,18 @@ async fn run_cell(
         let _skip = catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.fire_always();
         insert(&mut db, &format!("m{index}_pending")).await.unwrap();
     }
+    // An index cell needs index work: a declared BTREE the schema apply
+    // records and leaves unbuilt.
+    if writer == Writer::EnsureIndices {
+        db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index"))
+            .await
+            .unwrap();
+    }
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
 
     // The writer under the fault.
-    let (seam, hit) = window.seam();
+    let (seam, hit) = window.seam(writer);
     let mut acknowledged = false;
     let mut note = String::new();
     match fault {
@@ -340,6 +363,7 @@ async fn run_cell(
                 Writer::Insert => insert(&mut db, &write_name).await,
                 Writer::MultiTable => insert_and_friend(&mut db, &write_name).await,
                 Writer::Cleanup => Box::pin(db.cleanup(reclaim_everything())).await.map(|_| ()),
+                Writer::EnsureIndices => db.ensure_indices().await.map(|_| ()),
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
@@ -483,6 +507,25 @@ async fn run_cell(
         sidecar_operation_ids(dir.path()).is_empty(),
         "{cell}: a recovery sidecar was written"
     );
+    if writer == Writer::EnsureIndices && recovery != Recovery::ReadOnly {
+        // Whatever the window left, the next pass converges: it builds what
+        // is missing, and a promoted batch leaves it nothing to publish.
+        let fresh = Omnigraph::open(&root).await.unwrap();
+        fresh
+            .ensure_indices()
+            .await
+            .unwrap_or_else(|error| panic!("{cell}: index pass after recovery failed: {error}"));
+        assert_eq!(
+            linear_head(&person_uri).await,
+            table_pin(&fresh, "node:Person").await,
+            "{cell}: the index pass leaves Person promoted"
+        );
+        fresh
+            .ensure_indices()
+            .await
+            .unwrap_or_else(|error| panic!("{cell}: second index pass failed: {error}"));
+        drop(fresh);
+    }
     format!(
         "{cell}: ack={acknowledged} visible={visible} person pin {person_pin} head {person_head}, knows pin {knows_pin} head {knows_head} {note}"
     )
@@ -521,7 +564,12 @@ async fn run_matrix() {
     } else {
         vec![Recovery::FreshHandle, Recovery::ReadOnly]
     };
-    let writers = [Writer::Insert, Writer::MultiTable, Writer::Cleanup];
+    let writers = [
+        Writer::Insert,
+        Writer::MultiTable,
+        Writer::Cleanup,
+        Writer::EnsureIndices,
+    ];
     let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {
         list.split(',')

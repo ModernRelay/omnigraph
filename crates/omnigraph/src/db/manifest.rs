@@ -72,10 +72,9 @@ pub(crate) use recovery::{
     RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
     RecoverySidecar, RecoverySidecarHandle, RecoverySystemColumnUpgrade, RecoveryTableUpdateSlot,
     SidecarKind, SidecarTablePin, SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
-    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9,
-    confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
-    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
-    new_ensure_indices_sidecar_v9, new_optimize_sidecar_v9, new_schema_apply_sidecar_v9,
+    confirm_branch_merge_sidecar_v9, confirm_schema_apply_sidecar_v9, delete_sidecar,
+    ensure_read_only_schema_coherent, heal_pending_sidecars_roll_forward, list_sidecars,
+    new_branch_merge_sidecar_v9, new_optimize_sidecar_v9, new_schema_apply_sidecar_v9,
     new_system_column_upgrade_sidecar_v9, recover_failed_branch_merge_under_gates,
     recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
 };
