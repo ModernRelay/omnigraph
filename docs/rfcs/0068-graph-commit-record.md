@@ -12,18 +12,18 @@ discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "RFC 0066 accepted: the pin shape this record carries and the promotion reconciler that consumes it."
+  - "RFC 0067 accepted: the pin shape this record carries and the promotion reconciler that consumes it."
   - "Cost instrument: object operations per publication and per current-state read flat at depths 10, 100, 1,000 and 10,000 on file, S3 and Azure, checked in under the existing cost owners."
   - "Concurrency evidence: the probe-14 race and lost-acknowledgement cases on the configured S3 and Azure suites, and DST scenarios for concurrent publishers, stale hints and missing checkpoints."
   - "Conversion: a lossless offline route from the v10 `__manifest` journal to records and checkpoints, and the refusal fence for older binaries."
 ---
 
-# RFC 0067: Graph commit record
+# RFC 0068: Graph commit record
 
 > Number provisional: the registry names 0067 as next available at drafting
 > time; recheck when the PR opens.
 
-**Depends on:** [RFC 0066](0066-detached-table-commits.md) for private
+**Depends on:** [RFC 0067](0067-detached-table-commits.md) for private
 table effects, the three-field pin, and promotion. This RFC changes only
 where the graph commit is stored and how current state is read.
 **Surveyed:** OmniGraph 0.11.0 on `main` at `d1dd8b97`; Lance 11.0.0 and
@@ -38,14 +38,14 @@ written with the storage crate's conditional create at a name that encodes
 the next sequence number on its branch. The conditional create is the
 publication door and the cross-process fence. The record carries the parent
 commit, actor, schema identity, the pins of every table the commit touched
-in RFC 0066's shape, catalog deltas and merge lineage.
+in RFC 0067's shape, catalog deltas and merge lineage.
 
 Current state is read from the newest ***checkpoint***, an object holding
 every table pin at one sequence number, plus the records after it. The read
 cost is bounded by the checkpoint interval, not by history. A best-effort
 ***hint*** object names the latest sequence; readers probe upward from it.
 
-In the throughput path recorded in RFC 0066 this is the fourth and last
+In the throughput path recorded in RFC 0067 this is the fourth and last
 step, the only one that moves the per-branch commit ceiling itself; live
 maintenance, staging outside the gates and group commit come before it and
 do not depend on it.
@@ -58,7 +58,7 @@ inherited index bases for it are retired. Graph branches become
 staging, one detached commit per touched table in parallel, and one
 conditional create.
 
-What does not change: per-type Lance datasets, RFC 0066's detached staging
+What does not change: per-type Lance datasets, RFC 0067's detached staging
 and promotion, the query and merge semantics, policy enforcement, the HTTP
 and CLI contracts, and every public error type.
 
@@ -83,10 +83,10 @@ author proposed there (#7260), is a small immutable record published with
 put-if-not-exists. The maintainer objection to that proposal was that a log
 cannot fence external fast-path writers who never consult it. Inside the
 graph that objection does not apply: the record is the only publication door
-for graph state, and under RFC 0066 promotion is the only writer of a table's
+for graph state, and under RFC 0067 promotion is the only writer of a table's
 linear history.
 
-RFC 0066 removes the recovery liability but leaves this cost in place. This
+RFC 0067 removes the recovery liability but leaves this cost in place. This
 RFC removes the cost and, with it, the last piece of engine-owned Lance
 machinery that exists only to coordinate other Lance datasets.
 
@@ -108,7 +108,7 @@ machinery that exists only to coordinate other Lance datasets.
   are visible to every process at once.
 - `cleanup` prunes records and checkpoints past the retention horizon that
   no retained checkpoint depends on, and protects table versions pinned by
-  any retained record or checkpoint, then runs the RFC 0066 steps. `--keep N`
+  any retained record or checkpoint, then runs the RFC 0067 steps. `--keep N`
   keeps its meaning over graph commits.
 - `repair` reports a hint behind the true latest, a missing checkpoint, and a
   record whose parent is not the previous record, and can rewrite the hint
@@ -183,7 +183,7 @@ invariant 7 and never publication authority.
 1. Capture authority exactly as RFC 0022 §2 describes, from one
    reconstruction of the stream: hint, probe upward, checkpoint, records.
    The captured token is the latest sequence and its commit id.
-2. Prepare, validate and stage detached effects as RFC 0066 describes.
+2. Prepare, validate and stage detached effects as RFC 0067 describes.
 3. Write the record at `seq + 1` with `write_text_if_absent`. Success is
    the graph commit. `Ok(false)` means another writer published `seq + 1`:
    discard the attempt and re-prepare from the new state, exactly as a
@@ -192,7 +192,7 @@ invariant 7 and never publication authority.
    is success; a different one is the conflict; an absent object is a failed
    attempt with no effect.
 5. Write the hint and, on an interval boundary, the checkpoint, best effort.
-6. Promote pins under RFC 0066, best effort.
+6. Promote pins under RFC 0067, best effort.
 
 The read set is arbitrated by the record name: two writers who captured the
 same sequence contend on the same object, and the object store admits one.
@@ -258,7 +258,7 @@ a projection cache that refreshes incrementally. Both derive the delta from
 Lance physical state on every call; the cost is flat in history only because
 of those caps.
 
-What the two RFCs already give. RFC 0066 makes every commit's effect on a
+What the two RFCs already give. RFC 0067 makes every commit's effect on a
 table one recorded transaction with a uuid, an exact unit a change set can
 name, and its promotion by replay reproduces the linear row stamps, so the
 feed's pruned path stays valid on promoted twins; on a pending pin the
@@ -298,7 +298,7 @@ fallback, and a DST instrument should recompute a sample of records from
 physical state and compare before the feed or merge trusts the recorded set
 alone. Record size, the spill threshold, and what a change set means for a
 merge whose classification reads a Blob column also need their own
-evidence. It is the piece that lets step three of RFC 0066's throughput
+evidence. It is the piece that lets step three of RFC 0067's throughput
 path, group commit, keep a per-commit feed, and it belongs in an extension
 of this RFC or a small RFC after it.
 
@@ -329,7 +329,7 @@ on the local filesystem.
 - 4 (publish once): one record per graph commit.
 - 5 (recovery is part of the commit protocol): publication has no
   pre-publication durable effect of its own; a lost acknowledgement is
-  resolved by read-back; promotion is RFC 0066's reconciler.
+  resolved by read-back; promotion is RFC 0067's reconciler.
 - 7 (physical acceleration is derived): checkpoints and hints are derived,
   rebuildable, and never authority.
 - 11 (bounded, observable): a current-state read is bounded by the
@@ -351,7 +351,7 @@ shadow copy, no process-local lock presented as fencing.
 ## Compatibility and reversibility
 
 - Wire: none.
-- Storage: stamp v11, on top of RFC 0066's v10. New graphs write records
+- Storage: stamp v11, on top of RFC 0067's v10. New graphs write records
   only. Conversion of a v10 graph writes one record per `__manifest` version
   on each branch, a checkpoint at each branch head, stream metadata for each
   live native ref, and then deletes the `__manifest` dataset; it runs
@@ -361,7 +361,7 @@ shadow copy, no process-local lock presented as fencing.
   stream into a `__manifest` dataset, feasible because records are complete,
   and is provided by the conversion tool in both directions until this RFC's
   implementation reaches complete.
-- Support boundaries: unchanged from RFC 0066.
+- Support boundaries: unchanged from RFC 0067.
 
 ## Alternatives
 
@@ -379,7 +379,7 @@ shadow copy, no process-local lock presented as fencing.
 - **Wait for upstream multi-table transactions (#7264).** Stalled since
   July; would stage on branches and flip through the catalog, which is the
   cost being removed here.
-- **One dataset per graph.** Recorded in RFC 0066 as the stronger end state;
+- **One dataset per graph.** Recorded in RFC 0067 as the stronger end state;
   it removes this record too, at the cost of a full rewrite. This RFC is the
   optimum that keeps per-type datasets.
 
@@ -431,7 +431,7 @@ conditional-create tests pass on the memory and local backends.
 
 ## Rollout
 
-1. RFC 0066 accepted and its pin shape and promotion reconciler landed.
+1. RFC 0067 accepted and its pin shape and promotion reconciler landed.
 2. Record, checkpoint, hint and stream readers and writers behind stamp v11,
    exercised on new graphs; the cost instrument checked in.
 3. Conversion tool in both directions with its round-trip evidence.
@@ -460,5 +460,5 @@ Each stop leaves `main` shippable; the stamp gates activation.
 
 ## Decision log
 
-- 2026-09-15: drafted as the sequel to RFC 0066 after the write-path
+- 2026-09-15: drafted as the sequel to RFC 0067 after the write-path
   investigation; probe 14 recorded as initial evidence.

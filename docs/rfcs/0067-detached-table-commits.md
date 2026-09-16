@@ -18,7 +18,7 @@ blocked_on:
   - "Compatibility: format stamp v10, the pin shape with target version, staged id and transaction uuid, and the refusal fence for older binaries."
 ---
 
-# RFC 0066: Detached table commits
+# RFC 0067: Detached table commits
 
 > Number provisional: the registry names 0066 as next available at drafting
 > time; recheck when the PR opens.
@@ -512,7 +512,7 @@ manifest reaping uses the public listing.
   probes 8 and 9 and the open questions.
 - **Graph commit record instead of the `__manifest` publication (recommended
   sequel within the multi-dataset model; drafted as
-  [RFC 0067](0067-graph-commit-record.md)).** This RFC leaves the dominant
+  [RFC 0068](0068-graph-commit-record.md)).** This RFC leaves the dominant
   publication cost in place: every graph commit is a merge-insert into a
   Lance dataset whose fold grows with history, the shape upstream measured
   and removed from its own directory catalog (#7176, #7222) and the shape RFC
@@ -690,7 +690,7 @@ on a warm handle performs exactly the sidecar path's five data-table
 requests in the same order (two fragment reads for the keyed scan, then the
 linear commit's hint read and two heads), plus one manifest write for the
 detached commit, so two data-table writes against one; the `__manifest`
-term is untouched at 20 reads in this instrument, which is RFC 0067's
+term is untouched at 20 reads in this instrument, which is RFC 0068's
 subject. On a cold handle the write performs 11 data-table reads against 10,
 the one extra being the head that validates the pinned target manifest,
 which a latest-resolution open serves from the Lance session cache. A first
@@ -743,7 +743,7 @@ two extra writes being the twin manifest and the transaction file Lance
 writes again with the promotion commit; cold handle 11 reads on both; the
 `__manifest` term 50 reads on both. The S3 write-cost owner also shows that
 term growing from 71 reads at depth 10 to 311 at depth 50 on the sidecar
-path, which is RFC 0067's subject and untouched here.
+path, which is RFC 0068's subject and untouched here.
 
 **Chains.** Three writes whose promotions all fail leave three pending pins,
 each staged from the previous staged version, and reads resolve the chain.
@@ -1070,7 +1070,7 @@ per write, which compaction bounds.
    later step may chain the second from the first's detached version, the
    mechanism merge chunks already use, at the cost that bouncing the first
    bounces the second.
-4. **RFC 0067's commit record.** The fold drops from about 15 serial
+4. **RFC 0068's commit record.** The fold drops from about 15 serial
    `__manifest` reads to about 3, the only lever that moves the ceiling
    itself.
 

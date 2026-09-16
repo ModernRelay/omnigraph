@@ -3491,7 +3491,7 @@ impl Omnigraph {
         .await
     }
 
-    /// RFC 0066 prototype: open the pinned base for staging.
+    /// RFC 0067 prototype: open the pinned base for staging.
     pub(crate) async fn reopen_pinned_for_mutation(
         &self,
         table_key: &str,
@@ -3519,7 +3519,7 @@ impl Omnigraph {
         .await
     }
 
-    /// RFC 0066 prototype: promote every pin this writer just published, from
+    /// RFC 0067 prototype: promote every pin this writer just published, from
     /// the handles it already holds, best effort. Failures are logged; the
     /// write already landed and the next writer promotes.
     pub(crate) async fn promote_held_all(&self, held: Vec<HeldPromotion>) {
@@ -3561,7 +3561,7 @@ impl Omnigraph {
         }
     }
 
-    /// RFC 0066 prototype: promote published pins the writer holds no handles
+    /// RFC 0067 prototype: promote published pins the writer holds no handles
     /// for (branch merge), best effort, through the chain walk.
     pub(crate) async fn promote_updates_cold(&self, updates: &[crate::db::DatasetUpdate]) {
         for update in updates {
@@ -3622,7 +3622,7 @@ impl Omnigraph {
         }
     }
 
-    /// RFC 0066 prototype: see `table_ops::proto_chain_pin`.
+    /// RFC 0067 prototype: see `table_ops::proto_chain_pin`.
     pub(crate) async fn proto_chain_pin(
         &self,
         full_path: &str,

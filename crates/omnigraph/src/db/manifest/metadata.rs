@@ -15,7 +15,7 @@ use super::layout::table_id_to_key;
 pub(super) const OMNIGRAPH_ROW_COUNT_KEY: &str = "omnigraph.row_count";
 const OMNIGRAPH_TABLE_BRANCH_KEY: &str = "omnigraph.table_branch";
 const OMNIGRAPH_TABLE_FORK_OWNER_KEY: &str = "omnigraph.table_fork_owner";
-/// RFC 0066 prototype pin fields, carried like the fork owner.
+/// RFC 0067 prototype pin fields, carried like the fork owner.
 const OMNIGRAPH_STAGED_VERSION_KEY: &str = "omnigraph.staged_version";
 const OMNIGRAPH_TRANSACTION_UUID_KEY: &str = "omnigraph.transaction_uuid";
 
@@ -82,11 +82,11 @@ pub(crate) struct TableVersionMetadata {
     naming_scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     table_fork_owner: Option<String>,
-    /// Prototype (RFC 0066): the detached Lance version this pin was staged
+    /// Prototype (RFC 0067): the detached Lance version this pin was staged
     /// as before publication. `None` on pins published by the sidecar path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     staged_version: Option<u64>,
-    /// Prototype (RFC 0066): the uuid of the staged transaction; promotion
+    /// Prototype (RFC 0067): the uuid of the staged transaction; promotion
     /// replays it at the linear target and readers verify it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transaction_uuid: Option<String>,
@@ -121,7 +121,7 @@ impl TableVersionMetadata {
         self.transaction_uuid.as_deref()
     }
 
-    /// RFC 0066 prototype: whether `dataset` is the manifest this pin
+    /// RFC 0067 prototype: whether `dataset` is the manifest this pin
     /// witnesses. The e_tag identifies the exact manifest object; a pin that
     /// carries a transaction uuid also accepts the promoted twin, whose
     /// manifest differs but whose transaction is the same.
@@ -142,7 +142,7 @@ impl TableVersionMetadata {
         }
     }
 
-    /// RFC 0066 prototype: `with_staged` when the pin may be linear.
+    /// RFC 0067 prototype: `with_staged` when the pin may be linear.
     pub(crate) fn with_staged_option(self, staged: Option<(u64, String)>) -> Self {
         match staged {
             Some((staged_version, transaction_uuid)) => {

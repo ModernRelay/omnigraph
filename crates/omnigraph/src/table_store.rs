@@ -3743,12 +3743,12 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
-    /// Prototype (RFC 0066): the store's Lance session.
+    /// Prototype (RFC 0067): the store's Lance session.
     pub(crate) fn lance_session(&self) -> Arc<lance::session::Session> {
         self.session.clone()
     }
 
-    /// Prototype (RFC 0066): commit a staged effect as a Lance detached
+    /// Prototype (RFC 0067): commit a staged effect as a Lance detached
     /// version of its base. No conflict pass runs, nothing at HEAD moves, and
     /// the result is invisible until a manifest pin references it.
     pub async fn commit_staged_detached(

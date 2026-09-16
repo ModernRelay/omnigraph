@@ -413,7 +413,7 @@ impl TableHandleCache {
         Ok(ds)
     }
 
-    /// RFC 0066 prototype: a held handle for this pin, without opening on a miss.
+    /// RFC 0067 prototype: a held handle for this pin, without opening on a miss.
     pub async fn get(
         &self,
         dataset_path: &str,
@@ -431,7 +431,7 @@ impl TableHandleCache {
         inner.entries.get(&key).cloned()
     }
 
-    /// RFC 0066 prototype: hold a handle the writer already opened or committed
+    /// RFC 0067 prototype: hold a handle the writer already opened or committed
     /// for this pin, so the next open of the same pin costs no IO.
     pub async fn insert(
         &self,

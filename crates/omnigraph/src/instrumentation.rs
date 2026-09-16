@@ -1481,25 +1481,25 @@ pub(crate) enum VersionResolution {
 ///    metadata become stale in a session cache.
 static PROTO_PROMOTION_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// RFC 0066 prototype: record one promotion outcome for tests that observe
+/// RFC 0067 prototype: record one promotion outcome for tests that observe
 /// which of two promoters landed a pin.
 pub(crate) fn proto_record_promotion(line: String) {
     PROTO_PROMOTION_LOG.lock().unwrap().push(line);
 }
 
-/// RFC 0066 prototype: every promotion outcome this process recorded.
+/// RFC 0067 prototype: every promotion outcome this process recorded.
 pub fn proto_promotion_log() -> Vec<String> {
     PROTO_PROMOTION_LOG.lock().unwrap().clone()
 }
 
-/// Prototype switch for RFC 0066: mutation and load stage detached commits,
+/// Prototype switch for RFC 0067: mutation and load stage detached commits,
 /// publish pins with a linear target plus staged id, and promote after
 /// publication. Off by default; every other writer keeps the sidecar path.
 pub fn proto_detached_enabled() -> bool {
     std::env::var_os("OMNIGRAPH_PROTO_DETACHED").is_some()
 }
 
-/// Open a pin (RFC 0066 prototype). A pin without a staged id is an ordinary
+/// Open a pin (RFC 0067 prototype). A pin without a staged id is an ordinary
 /// exact-version open. A pin with one opens the linear target when it exists
 /// and carries the recorded transaction uuid, and the staged detached version
 /// otherwise (not yet promoted, or promotion blocked by a foreign commit).

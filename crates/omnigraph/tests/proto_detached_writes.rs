@@ -1,4 +1,4 @@
-//! RFC 0066 prototype validation (not for merge as written). With
+//! RFC 0067 prototype validation (not for merge as written). With
 //! `OMNIGRAPH_PROTO_DETACHED` set, mutation and load stage detached commits,
 //! publish pins with a linear target plus staged id, and promote after
 //! publication. These tests check the assumptions the RFC makes about how

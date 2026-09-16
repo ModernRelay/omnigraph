@@ -4695,7 +4695,7 @@ async fn commit_exact_merge_stage(
     planned: &crate::table_store::StagedTransactionIdentity,
 ) -> Result<SnapshotHandle> {
     if crate::instrumentation::proto_detached_enabled() {
-        // RFC 0066 prototype: every merge chunk commits detached, chained on
+        // RFC 0067 prototype: every merge chunk commits detached, chained on
         // the previous chunk's detached version; the pin publishes the tip.
         // The pre-minted identity keeps its uuid; its read version is the
         // handle actually staged on, which for a chained chunk is detached.
@@ -4882,7 +4882,7 @@ async fn publish_rewritten_merge_table(
         .storage()
         .table_state(&full_path, &current_ds)
         .await?;
-    // RFC 0066 prototype: a detached tip publishes base + chain as its pin.
+    // RFC 0067 prototype: a detached tip publishes base + chain as its pin.
     let (published_dataset_version, staged) = target_db
         .proto_chain_pin(&full_path, table_branch.as_deref(), current_ds.dataset())
         .await?;
@@ -5146,7 +5146,7 @@ async fn publish_proven_pure_insert_adopt(
         .storage()
         .table_state(&full_path, &committed)
         .await?;
-    // RFC 0066 prototype: a detached tip publishes base + chain as its pin.
+    // RFC 0067 prototype: a detached tip publishes base + chain as its pin.
     let (published_dataset_version, staged) = target_db
         .proto_chain_pin(&full_path, table_branch.as_deref(), committed.dataset())
         .await?;
@@ -5287,7 +5287,7 @@ async fn publish_adopted_delta(
         .storage()
         .table_state(&full_path, &current_ds)
         .await?;
-    // RFC 0066 prototype: a detached tip publishes base + chain as its pin.
+    // RFC 0067 prototype: a detached tip publishes base + chain as its pin.
     let (published_dataset_version, staged) = target_db
         .proto_chain_pin(&full_path, table_branch.as_deref(), current_ds.dataset())
         .await?;

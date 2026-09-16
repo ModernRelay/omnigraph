@@ -200,7 +200,7 @@ enum OptimizePreparation {
 struct OptimizeEffectOutcome {
     stat: DatasetOptimizeStats,
     update: Option<crate::db::DatasetUpdate>,
-    /// RFC 0066 prototype: the pin the effects were planned from.
+    /// RFC 0067 prototype: the pin the effects were planned from.
     base_version: u64,
 }
 
@@ -334,7 +334,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             })
             .collect();
         let sidecar = crate::db::manifest::new_optimize_sidecar_v9(pins)?;
-        // RFC 0066 prototype: compaction stages detached and needs no sidecar.
+        // RFC 0067 prototype: compaction stages detached and needs no sidecar.
         let recovery_handle = if crate::instrumentation::proto_detached_enabled() {
             None
         } else {
@@ -702,7 +702,7 @@ async fn apply_optimize_table_effects(
         attempt += 1;
 
         let selected = if proto {
-            // RFC 0066 prototype: compaction plans from the pin, never HEAD.
+            // RFC 0067 prototype: compaction plans from the pin, never HEAD.
             let _ = initial_snapshot.take();
             let pinned = db.fresh_snapshot_for_branch(None).await?;
             let entry = pinned
@@ -824,7 +824,7 @@ async fn apply_optimize_table_effects(
         // scrub is the only commit, `committed` still triggers the Phase-C publish.
         let mut ds = selected.into_dataset();
         let version_before = ds.version().version;
-        // RFC 0066 prototype: the config strip is not staged detached. A
+        // RFC 0067 prototype: the config strip is not staged detached. A
         // delete-only `UpdateConfig` does not conflict with its own twin under
         // Lance's rules, so a replay that lost a race would land a stray
         // linear commit; the strip becomes an explicit migration step.
@@ -870,7 +870,7 @@ async fn apply_optimize_table_effects(
         // uncommitted proof hook. Keep those immutable artifacts (stable-row-ID
         // compaction preserves them), and scan uncovered rows until an explicit
         // full rebuild. Never bless mixed old/new analyzer postings. RFC 0043.
-        // RFC 0066 prototype: index folding cannot commit detached on Lance 11
+        // RFC 0067 prototype: index folding cannot commit detached on Lance 11
         // because `merge_indices` is crate-private and `optimize_indices` only
         // commits linearly; folding is skipped here and is an upstream ask.
         if !proto {
@@ -1318,7 +1318,7 @@ pub async fn cleanup_all_datasets(
     }
     db.revalidate_write_txn(&authority_txn).await?;
 
-    // RFC 0066 prototype: every pending pin is promoted before any version
+    // RFC 0067 prototype: every pending pin is promoted before any version
     // is reclaimed, so stock Lance cleanup only ever sees linear history and
     // a promoted pin's detached manifest becomes surplus.
     if crate::instrumentation::proto_detached_enabled()
@@ -2058,7 +2058,7 @@ mod tests {
     }
 }
 
-/// RFC 0066 prototype: promote every pending pin on every live graph branch,
+/// RFC 0067 prototype: promote every pending pin on every live graph branch,
 /// then delete the detached manifest of each pin that is now linear. Blocked
 /// pins are reported and left alone; their data stays protected by the
 /// unverified-file age gate.
@@ -2135,7 +2135,7 @@ async fn promote_pending_pins_before_cleanup(
     Ok(())
 }
 
-/// RFC 0066 prototype: execute the compaction plan against the pinned base and
+/// RFC 0067 prototype: execute the compaction plan against the pinned base and
 /// commit its outcome as one detached `Rewrite`. No `ReserveFragments`: the
 /// base is a pin nobody appends to, so fragment ids above the base's maximum
 /// are unique by construction, and a `ReserveFragments` twin does not conflict
@@ -2195,7 +2195,7 @@ async fn stage_compaction_detached(
     Ok(metrics)
 }
 
-/// RFC 0066 prototype: publish every compacted pin with the exact base it was
+/// RFC 0067 prototype: publish every compacted pin with the exact base it was
 /// planned from as its expectation. A pin that moved since planning means the
 /// detached compaction is stale: it is discarded and reported, never
 /// published over a concurrent writer's pin.

@@ -1069,7 +1069,7 @@ impl Omnigraph {
                 .await?
         });
         let actual_table_version = dataset.version().version;
-        // RFC 0066 prototype: a pending pin resolves to its staged version.
+        // RFC 0067 prototype: a pending pin resolves to its staged version.
         let pending_staged = entry.version_metadata.staged_version() == Some(actual_table_version);
         if actual_table_version != expected_table_version && !pending_staged {
             return Err(OmniError::blob_integrity(format!(

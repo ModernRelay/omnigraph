@@ -726,11 +726,11 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
 
-    /// Prototype (RFC 0066): the graph-scoped Lance session, so prototype opens
+    /// Prototype (RFC 0067): the graph-scoped Lance session, so prototype opens
     /// share the file-metadata cache like every other data-table open.
     fn lance_session(&self) -> Arc<lance::session::Session>;
 
-    /// Prototype (RFC 0066): commit one staged effect as a detached version.
+    /// Prototype (RFC 0067): commit one staged effect as a detached version.
     async fn commit_staged_detached(
         &self,
         snapshot: SnapshotHandle,

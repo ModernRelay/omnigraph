@@ -119,15 +119,15 @@ pub(crate) struct StagedTablePath {
     /// durable. Preparation reads the inherited `source_entry`; after arming,
     /// commit creates `target_branch` and stages branch-local files there.
     pub(crate) deferred_fork: Option<crate::db::DeferredTableFork>,
-    /// RFC 0066 prototype: the pin's staged detached version and transaction
+    /// RFC 0067 prototype: the pin's staged detached version and transaction
     /// uuid when the pin was published by the prototype path.
     pub(crate) staged_version: Option<u64>,
     pub(crate) transaction_uuid: Option<String>,
-    /// RFC 0066 prototype: the registration path and pin e-tag, the read-handle
+    /// RFC 0067 prototype: the registration path and pin e-tag, the read-handle
     /// cache key of this pin.
     pub(crate) dataset_path: String,
     pub(crate) e_tag: Option<String>,
-    /// RFC 0066 prototype: the graph branch whose manifest journal holds this
+    /// RFC 0067 prototype: the graph branch whose manifest journal holds this
     /// table's earlier pins.
     pub(crate) graph_branch: Option<String>,
 }
@@ -1116,7 +1116,7 @@ pub(crate) struct CommittedMutation {
     /// Recovery sidecar to delete during Stage H after manifest CAS succeeds
     /// (`None` when nothing staged).
     pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
-    /// RFC 0066 prototype: the handles needed to promote each published pin
+    /// RFC 0067 prototype: the handles needed to promote each published pin
     /// without reopening anything; empty on the sidecar path.
     pub(crate) proto_promotions: Vec<crate::db::HeldPromotion>,
     /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
@@ -1655,7 +1655,7 @@ impl StagedMutation {
     }
 }
 
-/// RFC 0066 prototype: commit every staged effect as a detached version of
+/// RFC 0067 prototype: commit every staged effect as a detached version of
 /// its pinned base, with no recovery sidecar, no HEAD movement and no
 /// exactness check (nothing can rebase). The pins published carry the linear
 /// target (`expected + 1`), the staged detached id and the transaction uuid;

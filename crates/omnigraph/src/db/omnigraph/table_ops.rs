@@ -544,7 +544,7 @@ async fn maintain_indices_for_branch(
             planned_transactions.clone(),
             first_touch_source_versions.clone(),
         )?;
-        // RFC 0066 prototype: index builds stage detached and need no sidecar.
+        // RFC 0067 prototype: index builds stage detached and need no sidecar.
         let recovery_handle = if crate::instrumentation::proto_detached_enabled() {
             None
         } else {
@@ -1130,11 +1130,11 @@ pub(crate) struct OpenedForMutation {
     pub(crate) table_branch: Option<String>,
     /// The ref the pin was read on, see `NativeRefPin`.
     pub(crate) pinned_native_ref: Option<String>,
-    /// RFC 0066 prototype: the pin's staged detached version and transaction
+    /// RFC 0067 prototype: the pin's staged detached version and transaction
     /// uuid, when the pin was published by the prototype path.
     pub(crate) staged_version: Option<u64>,
     pub(crate) transaction_uuid: Option<String>,
-    /// RFC 0066 prototype: the registration path and pin e-tag, the read-handle
+    /// RFC 0067 prototype: the registration path and pin e-tag, the read-handle
     /// cache key of this pin.
     pub(crate) dataset_path: String,
     pub(crate) e_tag: Option<String>,
@@ -1380,7 +1380,7 @@ pub(super) async fn open_for_mutation_on_branch(
     }
 }
 
-/// RFC 0066 prototype: open the pinned base for staging. A held handle for
+/// RFC 0067 prototype: open the pinned base for staging. A held handle for
 /// the pin costs no IO and its version says whether the pin is linear yet;
 /// otherwise one open resolves the pin, and a still-staged predecessor is
 /// promoted first so this write stages from a linear base.
@@ -1522,7 +1522,7 @@ fn proto_is_detached(version: u64) -> bool {
     version & lance_table::format::DETACHED_VERSION_MASK != 0
 }
 
-/// RFC 0066 prototype: follow a detached tip's read-version links back to
+/// RFC 0067 prototype: follow a detached tip's read-version links back to
 /// the linear base it was staged from. Every detached commit records the
 /// version it was staged on; a chain of detached commits therefore links
 /// itself, and no manifest history is needed to find a pin's predecessors.
@@ -1570,7 +1570,7 @@ async fn walk_detached_chain(
     }
 }
 
-/// RFC 0066 prototype: whether linear `version` exists on this table.
+/// RFC 0067 prototype: whether linear `version` exists on this table.
 async fn linear_version_exists(
     location: &str,
     version: u64,
@@ -1593,7 +1593,7 @@ async fn linear_version_exists(
     }
 }
 
-/// RFC 0066 prototype: the pin a writer publishes for a table whose tip is a
+/// RFC 0067 prototype: the pin a writer publishes for a table whose tip is a
 /// chain of detached commits: the linear base plus the chain length as the
 /// target, and the tip as the staged version. A linear tip publishes itself.
 pub(super) async fn proto_chain_pin(
@@ -1618,7 +1618,7 @@ pub(super) async fn proto_chain_pin(
     Ok((base + chain.len() as u64, Some((tip_version, tip_uuid))))
 }
 
-/// RFC 0066 prototype: promote the pin at `target_version` and every
+/// RFC 0067 prototype: promote the pin at `target_version` and every
 /// detached commit behind it, oldest first. The chain is found through the
 /// staged versions' read-version links, so it covers both a writer that
 /// staged from a still-staged predecessor and a merge whose chunks chained
@@ -1722,7 +1722,7 @@ pub(super) fn proto_table_location(full_path: &str, table_branch: Option<&str>) 
     }
 }
 
-/// RFC 0066 prototype: outcome of promoting one pin onto its table's linear
+/// RFC 0067 prototype: outcome of promoting one pin onto its table's linear
 /// history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Promotion {
@@ -1731,7 +1731,7 @@ pub enum Promotion {
     Blocked(String),
 }
 
-/// RFC 0066 prototype: replay the staged transaction at `target - 1` so the
+/// RFC 0067 prototype: replay the staged transaction at `target - 1` so the
 /// linear history gains the exact twin of the staged detached version. The
 /// existence check first is mandatory (probe 6c); duplicate replays of
 /// production transaction kinds are refused by Lance (probe 12).
@@ -1838,7 +1838,7 @@ pub(super) async fn promote_table_pin(
     }
 }
 
-/// RFC 0066 prototype: after a refused promotion commit, decide whether the
+/// RFC 0067 prototype: after a refused promotion commit, decide whether the
 /// target now carries our transaction (a racing promoter won) or a foreign one.
 async fn recheck_target(
     session: &std::sync::Arc<lance::session::Session>,
@@ -1861,7 +1861,7 @@ async fn recheck_target(
     })
 }
 
-/// RFC 0066 prototype: what a writer holds after its detached commit, enough
+/// RFC 0067 prototype: what a writer holds after its detached commit, enough
 /// to promote its pin without reopening anything.
 pub(crate) struct HeldPromotion {
     pub(crate) table_key: String,
@@ -1875,7 +1875,7 @@ pub(crate) struct HeldPromotion {
     pub(crate) e_tag: Option<String>,
 }
 
-/// RFC 0066 prototype: promote a pin this writer just published, from the base
+/// RFC 0067 prototype: promote a pin this writer just published, from the base
 /// handle it staged on and the detached handle it committed. The linear
 /// commit's own conflict pass is the existence check: a twin landed by a
 /// racing promoter is refused (probe 12) and rechecked, or recognized as ours
@@ -2228,7 +2228,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     crate::failpoints::maybe_fail(
         crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
     )?;
-    // RFC 0066 prototype: a deferred index build inside Optimize commits
+    // RFC 0067 prototype: a deferred index build inside Optimize commits
     // detached, chained on whatever the handle already holds.
     let new_ds = if crate::instrumentation::proto_detached_enabled() {
         db.storage()
