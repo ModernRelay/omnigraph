@@ -51,6 +51,8 @@ enum Writer {
     Cleanup,
     /// The index writer: one detached `CreateIndex` on Person, no row change.
     EnsureIndices,
+    /// A fast-forward merge of a branch holding one Person insert into main.
+    Merge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +106,7 @@ impl Writer {
             ],
             Writer::Cleanup => vec![InPromotion, CleanupPreReap],
             Writer::EnsureIndices => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
+            Writer::Merge => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
         }
     }
 
@@ -113,6 +116,7 @@ impl Writer {
             Writer::MultiTable => "insert_and_friend",
             Writer::Cleanup => "cleanup",
             Writer::EnsureIndices => "ensure_indices",
+            Writer::Merge => "merge",
         }
     }
 
@@ -132,7 +136,18 @@ impl Window {
     /// The seam and the crossing to park on or return at.
     fn seam(self, writer: Writer) -> (&'static str, u64) {
         let index = writer == Writer::EnsureIndices;
+        let merge = writer == Writer::Merge;
         match self {
+            Window::PostDetached(n) if merge => {
+                (catalog::BRANCH_MERGE_POST_TABLE_EFFECT.name(), n as u64)
+            }
+            Window::PrePublish if merge => (
+                catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
+                1,
+            ),
+            Window::PostPublish if merge => {
+                (catalog::BRANCH_MERGE_POST_PUBLISH_PRE_PROMOTION.name(), 1)
+            }
             Window::PostDetached(n) if index => {
                 (catalog::ENSURE_INDICES_POST_TABLE_EFFECT.name(), n as u64)
             }
@@ -280,6 +295,10 @@ fn rfc0067_matrix_child_process() {
             let outcome: omnigraph::error::Result<()> = match op.as_str() {
                 "cleanup" => db.cleanup(reclaim_everything()).await.map(|_| ()),
                 "ensure_indices" => db.ensure_indices().await.map(|_| ()),
+                "merge" => db
+                    .branch_merge(&format!("src_{name}"), "main")
+                    .await
+                    .map(|_| ()),
                 "insert_and_friend" => insert_and_friend(&mut db, &name).await,
                 _ => insert(&mut db, &name).await,
             };
@@ -349,6 +368,19 @@ async fn run_cell(
             .await
             .unwrap();
     }
+    // A merge cell merges a branch that holds the row under test.
+    if writer == Writer::Merge {
+        let branch = format!("src_{write_name}");
+        db.branch_create(&branch).await.unwrap();
+        db.mutate(
+            &branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", write_name.as_str())], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
 
@@ -364,6 +396,10 @@ async fn run_cell(
                 Writer::MultiTable => insert_and_friend(&mut db, &write_name).await,
                 Writer::Cleanup => Box::pin(db.cleanup(reclaim_everything())).await.map(|_| ()),
                 Writer::EnsureIndices => db.ensure_indices().await.map(|_| ()),
+                Writer::Merge => db
+                    .branch_merge(&format!("src_{write_name}"), "main")
+                    .await
+                    .map(|_| ()),
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
@@ -411,7 +447,7 @@ async fn run_cell(
     }
     let visible = acknowledged || writer.published_at(window);
     match writer {
-        Writer::Insert if visible => {
+        Writer::Insert | Writer::Merge if visible => {
             model.names.insert(write_name.clone());
         }
         Writer::MultiTable if visible => {
@@ -569,6 +605,7 @@ async fn run_matrix() {
         Writer::MultiTable,
         Writer::Cleanup,
         Writer::EnsureIndices,
+        Writer::Merge,
     ];
     let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {

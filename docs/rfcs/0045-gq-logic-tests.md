@@ -811,7 +811,7 @@ setup:
 
 ```text
 --- seam
-at: branch_merge.post_sidecar_pre_fork
+at: branch_merge.post_fork_pre_commit
 occurrence: 1
 action: fail
 scope: next_step
@@ -819,7 +819,7 @@ scope: next_step
 --- mutate
 branch merge source into target
 
---- expect error: injected failpoint triggered: branch_merge.post_sidecar_pre_fork
+--- expect error: injected failpoint triggered: branch_merge.post_fork_pre_commit
 
 --- mutate branch: target
 query unrelated_write() {

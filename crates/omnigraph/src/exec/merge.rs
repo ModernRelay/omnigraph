@@ -107,11 +107,10 @@ async fn prepare_existing_merge_target(
     }
     let native = entry.native_dataset_branch.as_deref();
     let full_path = db.storage().dataset_uri(&entry.dataset_path);
-    let current = db.storage().open_dataset_head(&full_path, native).await?;
-    // The merge commits on the linear HEAD, which must equal the captured
-    // pin: promote a pending pin first (RFC 0067 bridge).
+    // RFC 0067: the chain stages from the pin, promoting a pending
+    // predecessor first; a blocked one is staged behind.
     let current = db
-        .promote_pending_pin(table_key, &full_path, entry, current)
+        .open_pinned_for_write(table_key, &full_path, entry)
         .await?;
     Ok(PreparedExistingMergeTarget {
         current,
@@ -120,23 +119,20 @@ async fn prepare_existing_merge_target(
     })
 }
 
-/// Create the exact first-touch ref persisted by the armed merge intent.
-/// The captured inherited entry fixes its source ref and version.
+/// Create the first-touch ref the merge's captured inherited entry names,
+/// with no intent record: an unreferenced fork is reclaimable garbage that
+/// cleanup classifies (RFC 0067).
 async fn open_first_touch_merge_target(
     db: &Omnigraph,
     txn: &WriteTxn,
     table_key: &str,
-    recovery_operation_id: Option<&str>,
     first_touch_branch: Option<&str>,
 ) -> Result<(SnapshotHandle, String, Option<String>)> {
-    let operation_id = recovery_operation_id.ok_or_else(|| {
-        OmniError::manifest_internal("first-touch merge target has no armed recovery intent")
-    })?;
     let owner = captured_merge_target_ref(txn)?.ok_or_else(|| {
         OmniError::manifest_internal("first-touch merge target must be a named branch")
     })?;
     let native = first_touch_branch.ok_or_else(|| {
-        OmniError::manifest_internal("first-touch merge target lacks its armed native ref")
+        OmniError::manifest_internal("first-touch merge target lacks its planned native ref")
     })?;
     let entry = txn.base.dataset(table_key).ok_or_else(|| {
         OmniError::manifest_internal(format!("captured merge target lacks '{table_key}'"))
@@ -162,9 +158,10 @@ async fn open_first_touch_merge_target(
             entry.native_dataset_branch.as_deref(),
             entry.published_dataset_version,
             native,
-            Some(operation_id),
+            None,
         )
         .await?;
+    fail(&BRANCH_MERGE_POST_FORK_PRE_COMMIT)?;
     Ok((current, full_path, Some(native.to_string())))
 }
 
@@ -4403,15 +4400,6 @@ fn publish_adopted_source_state(
     }
 }
 
-fn pre_minted_merge_transaction(
-    read_version: u64,
-) -> crate::table_store::StagedTransactionIdentity {
-    crate::table_store::StagedTransactionIdentity {
-        read_version,
-        uuid: format!("omnigraph-merge-{}", crate::dst_ids::new_ulid()),
-    }
-}
-
 fn staged_keyed_chunk_count(table_key: &str, table: &StagedTable) -> Result<usize> {
     if table.row_count == 0 || table.chunk_rows.is_empty() {
         return Err(OmniError::manifest_internal(format!(
@@ -4468,11 +4456,9 @@ fn enforce_merge_transaction_ceiling(table_key: &str, transaction_count: usize) 
     Ok(transaction_count)
 }
 
-fn plan_merge_transactions(
-    table_key: &str,
-    candidate: &CandidateTableState,
-    first_read_version: u64,
-) -> Result<Vec<crate::table_store::StagedTransactionIdentity>> {
+/// The number of detached links a HEAD-advancing candidate chains, checked
+/// against the promotion ceiling before any effect.
+fn plan_merge_chain_length(table_key: &str, candidate: &CandidateTableState) -> Result<u64> {
     let transaction_count = match candidate {
         CandidateTableState::RewriteMerged(staged) => {
             staged
@@ -4514,23 +4500,7 @@ fn plan_merge_transactions(
             "HEAD-advancing branch merge candidate '{table_key}' has no logical data transaction"
         )));
     }
-    enforce_merge_transaction_ceiling(table_key, transaction_count)?;
-
-    (0..transaction_count)
-        .map(|offset| {
-            let offset = u64::try_from(offset).map_err(|_| {
-                OmniError::manifest_internal(format!(
-                    "branch merge transaction count for '{table_key}' exceeds u64"
-                ))
-            })?;
-            let read_version = first_read_version.checked_add(offset).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "branch merge transaction version overflow for '{table_key}'"
-                ))
-            })?;
-            Ok(pre_minted_merge_transaction(read_version))
-        })
-        .collect()
+    enforce_merge_transaction_ceiling(table_key, transaction_count)
 }
 
 #[cfg(test)]
@@ -4634,7 +4604,7 @@ mod recovery_chain_limit_tests {
     }
 
     #[test]
-    fn branch_merge_delete_chunks_pre_mint_one_exact_identity_each() {
+    fn branch_merge_delete_chunks_chain_one_link_each() {
         let mut deleted_ids = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
         for row in 0..=KEYED_WRITE_MAX_ROWS {
             deleted_ids.push(format!("id-{row}")).unwrap();
@@ -4644,11 +4614,10 @@ mod recovery_chain_limit_tests {
             updates: None,
             deleted_ids,
         });
-        let planned = plan_merge_transactions("node:Person", &candidate, 41).unwrap();
-        assert_eq!(planned.len(), 2);
-        assert_eq!(planned[0].read_version, 41);
-        assert_eq!(planned[1].read_version, 42);
-        assert_ne!(planned[0].uuid, planned[1].uuid);
+        assert_eq!(
+            plan_merge_chain_length("node:Person", &candidate).unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -4663,13 +4632,13 @@ mod recovery_chain_limit_tests {
             enforce_merge_transaction_ceiling("node:Person", limit).unwrap(),
             limit as u64
         );
-        let planned =
-            plan_merge_transactions("node:Person", &delete_only_candidate(limit), 1).unwrap();
-        assert_eq!(planned.len(), limit);
-        assert_eq!(planned.last().unwrap().read_version, limit as u64);
+        assert_eq!(
+            plan_merge_chain_length("node:Person", &delete_only_candidate(limit)).unwrap(),
+            limit as u64
+        );
 
-        let error = plan_merge_transactions("node:Person", &delete_only_candidate(limit + 1), 1)
-            .unwrap_err();
+        let error =
+            plan_merge_chain_length("node:Person", &delete_only_candidate(limit + 1)).unwrap_err();
         assert!(matches!(
             error,
             OmniError::ResourceLimitExceeded {
@@ -4683,25 +4652,83 @@ mod recovery_chain_limit_tests {
     }
 }
 
-async fn commit_exact_merge_stage(
+/// One table's detached chunk chain, oldest first, with the pinned base it
+/// was staged from (RFC 0067). Promotion replays every link in order.
+struct MergeChain {
+    base: SnapshotHandle,
+    full_path: String,
+    links: Vec<SnapshotHandle>,
+    uuids: Vec<String>,
+}
+
+impl MergeChain {
+    fn new(base: SnapshotHandle, full_path: String) -> Self {
+        Self {
+            base,
+            full_path,
+            links: Vec::new(),
+            uuids: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.links.len() as u64
+    }
+
+    fn tip(&self) -> Result<(&SnapshotHandle, &str)> {
+        match (self.links.last(), self.uuids.last()) {
+            (Some(tip), Some(uuid)) => Ok((tip, uuid)),
+            _ => Err(OmniError::manifest_internal(
+                "branch merge chain has no detached link",
+            )),
+        }
+    }
+
+    /// The pin this chain publishes: its linear base plus its length, with
+    /// the tip as the staged version.
+    fn into_promotion(
+        mut self,
+        table_key: &str,
+        dataset_path: String,
+        table_branch: Option<String>,
+        target: u64,
+        e_tag: Option<String>,
+    ) -> Result<crate::db::HeldPromotion> {
+        let (Some(detached), Some(uuid)) = (self.links.pop(), self.uuids.pop()) else {
+            return Err(OmniError::manifest_internal(
+                "branch merge chain has no detached link",
+            ));
+        };
+        Ok(crate::db::HeldPromotion {
+            table_key: table_key.to_string(),
+            dataset_path,
+            full_path: self.full_path,
+            table_branch,
+            base: self.base,
+            chain: self.links,
+            detached,
+            target,
+            uuid,
+            e_tag,
+        })
+    }
+}
+
+/// Commit one staged chunk as a detached version of `current`, chained
+/// behind the previous chunk; nothing moves the table's linear HEAD.
+async fn commit_detached_merge_stage(
     target_db: &Omnigraph,
     current: SnapshotHandle,
-    mut staged: crate::storage_layer::StagedHandle,
-    planned: &crate::table_store::StagedTransactionIdentity,
+    staged: crate::storage_layer::StagedHandle,
+    chain: &mut MergeChain,
 ) -> Result<SnapshotHandle> {
-    staged.bind_transaction_identity(planned)?;
-    let outcome = target_db
+    let (detached, identity) = target_db
         .storage()
-        .commit_staged_exact(current, staged)
+        .commit_staged_detached(current, staged)
         .await?;
-    if !outcome.is_exact() {
-        return Err(OmniError::manifest_read_set_changed(
-            "branch_merge_lance_transaction",
-            Some(format!("{:?}", outcome.planned_transaction())),
-            Some(format!("{:?}", outcome.committed_transaction())),
-        ));
-    }
-    Ok(outcome.into_snapshot())
+    chain.links.push(detached.clone());
+    chain.uuids.push(identity.uuid);
+    Ok(detached)
 }
 
 decide_seam! {
@@ -4715,8 +4742,7 @@ async fn commit_staged_delete_chunks(
     table_key: &str,
     deleted_ids: &DeleteIdChunks,
     mut current: SnapshotHandle,
-    planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-    planned_index: &mut usize,
+    chain: &mut MergeChain,
 ) -> Result<SnapshotHandle> {
     for (chunk_index, chunk) in deleted_ids.chunks.iter().enumerate() {
         let filter = chunk.filter(deleted_ids.id_col)?;
@@ -4730,14 +4756,7 @@ async fn commit_staged_delete_chunks(
                     chunk_index + 1
                 ))
             })?;
-        let planned = planned_transactions.get(*planned_index).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "branch merge table '{table_key}' has no transaction planned for delete chunk {}",
-                chunk_index + 1
-            ))
-        })?;
-        *planned_index += 1;
-        current = commit_exact_merge_stage(target_db, current, staged_delete, planned).await?;
+        current = commit_detached_merge_stage(target_db, current, staged_delete, chain).await?;
         if chunk_index + 1 < deleted_ids.chunks.len() {
             fail(&BRANCH_MERGE_BETWEEN_DELETE_CHUNKS)?;
         }
@@ -4760,14 +4779,13 @@ decide_seam! {
 async fn publish_rewritten_merge_table(
     target_db: &Omnigraph,
     target_txn: &WriteTxn,
-    recovery_operation_id: Option<&str>,
     first_touch_branch: Option<&str>,
     table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     staged: &StagedMergeResult,
     prepared_target: Option<PreparedExistingMergeTarget>,
-    planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-) -> Result<crate::db::DatasetUpdate> {
+    expected_version: u64,
+) -> Result<(crate::db::DatasetUpdate, MergeChain)> {
     // Branch merge's source-rewrite path is Merge-shaped (upsert from
     // source onto target). The staged delete later in this function
     // (`stage_delete` + an exact commit) operates on rows the rewrite chose
@@ -4778,14 +4796,8 @@ async fn publish_rewritten_merge_table(
     let (mut current_ds, full_path, table_branch) = match prepared_target {
         Some(prepared) => prepared.into_parts(),
         None => {
-            open_first_touch_merge_target(
-                target_db,
-                target_txn,
-                table_key,
-                recovery_operation_id,
-                first_touch_branch,
-            )
-            .await?
+            open_first_touch_merge_target(target_db, target_txn, table_key, first_touch_branch)
+                .await?
         }
     };
 
@@ -4793,11 +4805,10 @@ async fn publish_rewritten_merge_table(
     // strict fenced insertion; existing ids use update-only staging, which
     // can probe an id index without enabling insertion through that route.
     //
-    // Routed through the staged primitive with the transaction identity armed
-    // in the v4 sidecar and transparent Lance conflict retries disabled. A
-    // failure between writing fragments and committing leaves no Lance-HEAD
-    // drift; a failure after the exact commit remains recovery-owned.
-    let mut planned_index = 0_usize;
+    // Every chunk commits detached from the previous one (RFC 0067): a
+    // failure anywhere leaves the chain as reclaimable garbage and the
+    // target's linear HEAD untouched.
+    let mut chain = MergeChain::new(current_ds.clone(), full_path.clone());
     for (payload, semantics) in [
         (&staged.inserts, KeyedWriteSemantics::StrictInsert),
         (&staged.updates, KeyedWriteSemantics::KnownPresentUpdate),
@@ -4809,8 +4820,7 @@ async fn publish_rewritten_merge_table(
             delta,
             semantics,
             current_ds,
-            planned_transactions,
-            &mut planned_index,
+            &mut chain,
             None,
             target_txn.catalog.system_columns,
         )
@@ -4837,16 +4847,9 @@ async fn publish_rewritten_merge_table(
         table_key,
         &staged.deleted_ids,
         current_ds,
-        planned_transactions,
-        &mut planned_index,
+        &mut chain,
     )
     .await?;
-
-    if let Some(unused) = planned_transactions.get(planned_index) {
-        return Err(OmniError::manifest_internal(format!(
-            "branch merge table '{table_key}' did not apply planned transaction {unused:?}"
-        )));
-    }
 
     // Failpoint: crash after the Phase 2 delete commit, before confirmation.
     // Models a partial Phase B on the three-way path — constructive rows +
@@ -4863,17 +4866,19 @@ async fn publish_rewritten_merge_table(
         .storage()
         .table_state(&full_path, &current_ds)
         .await?;
-
-    Ok(crate::db::DatasetUpdate {
+    let (_, tip_uuid) = chain.tip()?;
+    let update = crate::db::DatasetUpdate {
         identity,
         type_key: table_key.to_string(),
-        published_dataset_version: final_state.version,
+        published_dataset_version: expected_version + chain.len(),
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
         version_metadata: final_state
             .version_metadata
-            .with_table_fork_owner(captured_merge_target_ref(target_txn)?),
-    })
+            .with_table_fork_owner(captured_merge_target_ref(target_txn)?)
+            .with_staged(final_state.version, tip_uuid.to_string()),
+    };
+    Ok((update, chain))
 }
 
 /// Reassemble one exact writer-defined chunk from a scanner whose batches are
@@ -4942,8 +4947,7 @@ async fn commit_staged_keyed_chunks(
     table: &StagedTable,
     semantics: KeyedWriteSemantics,
     current: SnapshotHandle,
-    planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-    planned_index: &mut usize,
+    chain: &mut MergeChain,
     between_chunk_failpoint: Option<&'static crate::seams::DecideSeam>,
     system_columns: SystemColumns,
 ) -> Result<SnapshotHandle> {
@@ -4962,8 +4966,7 @@ async fn commit_staged_keyed_chunks(
         table.row_count,
         KeyedChunkStage::General(semantics),
         current,
-        planned_transactions,
-        planned_index,
+        chain,
         between_chunk_failpoint,
         system_columns,
     )
@@ -4989,8 +4992,7 @@ async fn commit_keyed_stream_chunks(
     expected_row_count: u64,
     stage_kind: KeyedChunkStage,
     mut current: SnapshotHandle,
-    planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-    planned_index: &mut usize,
+    chain: &mut MergeChain,
     between_chunk_failpoint: Option<&'static crate::seams::DecideSeam>,
     system_columns: SystemColumns,
 ) -> Result<SnapshotHandle> {
@@ -5025,17 +5027,10 @@ async fn commit_keyed_stream_chunks(
             }
         };
         stage_timing.finish();
-        let planned = planned_transactions.get(*planned_index).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "branch merge table '{table_key}' has no transaction planned for keyed chunk {}",
-                chunk_index + 1
-            ))
-        })?;
-        *planned_index += 1;
         let commit_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::KeyedCommit,
         );
-        current = commit_exact_merge_stage(target_db, current, staged, planned).await?;
+        current = commit_detached_merge_stage(target_db, current, staged, chain).await?;
         commit_timing.finish();
         if chunk_index + 1 < chunk_rows.len()
             && let Some(failpoint) = between_chunk_failpoint
@@ -5086,9 +5081,9 @@ async fn publish_proven_pure_insert_adopt(
     proven: &ProvenPureInsertAdopt,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     prepared_target: PreparedExistingMergeTarget,
-    planned_transactions: &[crate::table_store::StagedTransactionIdentity],
+    expected_version: u64,
     system_columns: SystemColumns,
-) -> Result<crate::db::DatasetUpdate> {
+) -> Result<(crate::db::DatasetUpdate, MergeChain)> {
     let (current, full_path, table_branch) = prepared_target.into_parts();
     let source = SnapshotHandle::new(proven.source.clone());
     let stream = target_db
@@ -5103,7 +5098,7 @@ async fn publish_proven_pure_insert_adopt(
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
-    let mut planned_index = 0_usize;
+    let mut chain = MergeChain::new(current.clone(), full_path.clone());
     let committed = commit_keyed_stream_chunks(
         target_db,
         table_key,
@@ -5113,30 +5108,27 @@ async fn publish_proven_pure_insert_adopt(
         proven.inserted_rows,
         KeyedChunkStage::ProvenStrictInsert,
         current,
-        planned_transactions,
-        &mut planned_index,
+        &mut chain,
         Some(&BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
         system_columns,
     )
     .await?;
-    if let Some(unused) = planned_transactions.get(planned_index) {
-        return Err(OmniError::manifest_internal(format!(
-            "branch merge pure-insert table '{table_key}' did not apply planned transaction {unused:?}"
-        )));
-    }
     let final_state = target_db
         .storage()
         .table_state(&full_path, &committed)
         .await?;
-
-    Ok(crate::db::DatasetUpdate {
+    let (_, tip_uuid) = chain.tip()?;
+    let update = crate::db::DatasetUpdate {
         identity,
         type_key: table_key.to_string(),
-        published_dataset_version: final_state.version,
+        published_dataset_version: expected_version + chain.len(),
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
-        version_metadata: final_state.version_metadata,
-    })
+        version_metadata: final_state
+            .version_metadata
+            .with_staged(final_state.version, tip_uuid.to_string()),
+    };
+    Ok((update, chain))
 }
 
 decide_seam! {
@@ -5157,27 +5149,20 @@ decide_seam! {
 async fn publish_adopted_delta(
     target_db: &Omnigraph,
     target_txn: &WriteTxn,
-    recovery_operation_id: Option<&str>,
     first_touch_branch: Option<&str>,
     table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     delta: &AdoptDelta,
     prepared_target: Option<PreparedExistingMergeTarget>,
-    planned_transactions: &[crate::table_store::StagedTransactionIdentity],
-) -> Result<crate::db::DatasetUpdate> {
+    expected_version: u64,
+) -> Result<(crate::db::DatasetUpdate, MergeChain)> {
     // Existing refs consume the same handle verified before Phase A. Only a
     // first-touch target creates a ref here, under its armed recovery identity.
     let (mut current_ds, full_path, table_branch) = match prepared_target {
         Some(prepared) => prepared.into_parts(),
         None => {
-            open_first_touch_merge_target(
-                target_db,
-                target_txn,
-                table_key,
-                recovery_operation_id,
-                first_touch_branch,
-            )
-            .await?
+            open_first_touch_merge_target(target_db, target_txn, table_key, first_touch_branch)
+                .await?
         }
     };
 
@@ -5186,7 +5171,7 @@ async fn publish_adopted_delta(
     // but `WhenMatched::Fail` is still required: a concurrent same-key writer
     // must conflict rather than letting this optimization bypass the fence.
     // The adapter keeps wide vector/blob rows streaming and batch-bounded.
-    let mut planned_index = 0_usize;
+    let mut chain = MergeChain::new(current_ds.clone(), full_path.clone());
     if let Some(insert_table) = &delta.inserts {
         current_ds = commit_staged_keyed_chunks(
             target_db,
@@ -5194,8 +5179,7 @@ async fn publish_adopted_delta(
             insert_table,
             KeyedWriteSemantics::StrictInsert,
             current_ds,
-            planned_transactions,
-            &mut planned_index,
+            &mut chain,
             Some(&BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
             target_txn.catalog.system_columns,
         )
@@ -5223,8 +5207,7 @@ async fn publish_adopted_delta(
             upsert_table,
             KeyedWriteSemantics::KnownPresentUpdate,
             current_ds,
-            planned_transactions,
-            &mut planned_index,
+            &mut chain,
             None,
             target_txn.catalog.system_columns,
         )
@@ -5245,16 +5228,9 @@ async fn publish_adopted_delta(
         table_key,
         &delta.deleted_ids,
         current_ds,
-        planned_transactions,
-        &mut planned_index,
+        &mut chain,
     )
     .await?;
-
-    if let Some(unused) = planned_transactions.get(planned_index) {
-        return Err(OmniError::manifest_internal(format!(
-            "branch merge table '{table_key}' did not apply planned transaction {unused:?}"
-        )));
-    }
 
     // Phase 4: index coverage is reconciler-owned on the adopt path. Unlike the
     // three-way `RewriteMerged` path, this does NOT build indices inline: the
@@ -5269,17 +5245,19 @@ async fn publish_adopted_delta(
         .storage()
         .table_state(&full_path, &current_ds)
         .await?;
-
-    Ok(crate::db::DatasetUpdate {
+    let (_, tip_uuid) = chain.tip()?;
+    let update = crate::db::DatasetUpdate {
         identity,
         type_key: table_key.to_string(),
-        published_dataset_version: final_state.version,
+        published_dataset_version: expected_version + chain.len(),
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
         version_metadata: final_state
             .version_metadata
-            .with_table_fork_owner(captured_merge_target_ref(target_txn)?),
-    })
+            .with_table_fork_owner(captured_merge_target_ref(target_txn)?)
+            .with_staged(final_state.version, tip_uuid.to_string()),
+    };
+    Ok((update, chain))
 }
 
 fn ensure_merge_target_authority_unchanged(
@@ -5348,15 +5326,20 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// Every merge table effect is complete, but the sidecar is still in its
-    /// pre-confirmation shape.
-    pub static BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM = ("branch_merge.post_effects_pre_confirm", BranchMerge, [Fail]);
+    /// A first-touch fork exists, before its first detached chunk commit. An
+    /// unreferenced fork is reclaimable garbage that cleanup classifies.
+    pub static BRANCH_MERGE_POST_FORK_PRE_COMMIT = ("branch_merge.post_fork_pre_commit", BranchMerge, [Fail]);
 }
 
 decide_seam! {
-    /// The v4 BranchMerge recovery intent is durable, before any first-touch
-    /// target table ref is created.
-    pub static BRANCH_MERGE_POST_SIDECAR_PRE_FORK = ("branch_merge.post_sidecar_pre_fork", BranchMerge, [Fail]);
+    /// One table's complete detached chain exists, before the next table's;
+    /// nothing is visible and no linear HEAD moved.
+    pub static BRANCH_MERGE_POST_TABLE_EFFECT = ("branch_merge.post_table_effect", BranchMerge, [Fail]);
+}
+
+decide_seam! {
+    /// The merge is published, before the writer promotes its chains.
+    pub static BRANCH_MERGE_POST_PUBLISH_PRE_PROMOTION = ("branch_merge.post_publish_pre_promotion", BranchMerge, [Fail]);
 }
 
 decide_seam! {
@@ -6131,15 +6114,11 @@ impl Omnigraph {
             .await?;
         merge_lineage.merged_parent_commit_id = Some(source_head_commit_id.to_string());
 
-        // Build the v9 recovery envelope (`protocol_v4` payload). Physical pins are a subset of the
-        // complete intended manifest delta: pointer-only candidates have no
-        // pre-authority effect, but must still be replayed if a sibling table's
-        // durable effect forces recovery to finish the merge atomically.
-        let mut recovery_pins = Vec::new();
-        let mut recovery_effects = Vec::new();
-        let mut delta_slots = Vec::new();
+        // RFC 0067: every HEAD-advancing candidate chains its chunks detached
+        // from the pin captured before classification, and a first-touch
+        // target forks the inherited source under the gates with no intent
+        // record. Pointer-only candidates have no physical effect.
         let mut first_touch_effects = HashMap::new();
-        let mut planned_transactions_by_table = HashMap::new();
         let mut prepared_existing_targets = HashMap::new();
         for table_key in &ordered_table_keys {
             let Some(candidate) = candidates.get(table_key) else {
@@ -6158,51 +6137,6 @@ impl Omnigraph {
                 Some(source_entry.identity),
                 target_entry.map(|entry| entry.identity),
             )?;
-            let identity = source_entry.identity;
-            let expected_version = target_entry
-                .map(|entry| entry.published_dataset_version)
-                .unwrap_or(0);
-            let planned_output_branch = match candidate {
-                CandidateTableState::RewriteMerged(_)
-                | CandidateTableState::AdoptWithDelta(_)
-                | CandidateTableState::AdoptPureInserts(_) => {
-                    target_active.as_deref().map(|owner| {
-                        match target_entry.filter(|entry| {
-                            entry
-                                .native_dataset_branch
-                                .as_deref()
-                                .is_some_and(|native| {
-                                    entry.version_metadata.is_table_fork_of(native, owner)
-                                })
-                        }) {
-                            Some(entry) => entry
-                                .native_dataset_branch
-                                .clone()
-                                .expect("owned named ref"),
-                            _ => crate::branch_names::table_fork_name(
-                                owner,
-                                target_snapshot.graph_manifest_version(),
-                                &merge_lineage.graph_commit_id,
-                            ),
-                        }
-                    })
-                }
-                CandidateTableState::AdoptSourceState { .. } => {
-                    if target_active.is_some() {
-                        source_entry.native_dataset_branch.clone()
-                    } else {
-                        None
-                    }
-                }
-            };
-            delta_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
-                identity,
-                table_key: table_key.clone(),
-                expected_version,
-                table_branch: planned_output_branch.clone(),
-                confirmed: None,
-            });
-
             match candidate {
                 CandidateTableState::RewriteMerged(_)
                 | CandidateTableState::AdoptWithDelta(_)
@@ -6213,178 +6147,77 @@ impl Omnigraph {
                             table_key
                         ))
                     })?;
-                    let source_fork_version = target_active
-                        .as_deref()
-                        .filter(|owner| {
-                            !entry
-                                .native_dataset_branch
-                                .as_deref()
-                                .is_some_and(|native| {
-                                    entry.version_metadata.is_table_fork_of(native, owner)
-                                })
-                        })
-                        .map(|_| entry.published_dataset_version);
-                    if source_fork_version.is_some()
-                        && matches!(candidate, CandidateTableState::AdoptPureInserts(_))
+                    let first_touch = target_active.as_deref().is_some_and(|owner| {
+                        !entry
+                            .native_dataset_branch
+                            .as_deref()
+                            .is_some_and(|native| {
+                                entry.version_metadata.is_table_fork_of(native, owner)
+                            })
+                    });
+                    if first_touch && matches!(candidate, CandidateTableState::AdoptPureInserts(_))
                     {
                         return Err(OmniError::manifest_internal(format!(
                             "branch merge proven pure-insert candidate '{table_key}' cannot first-touch a lazy target"
                         )));
                     }
-                    if source_fork_version.is_some() {
+                    if first_touch {
+                        let owner = target_active.as_deref().ok_or_else(|| {
+                            OmniError::manifest_internal(
+                                "first-touch merge has no planned native ref",
+                            )
+                        })?;
                         first_touch_effects.insert(
                             table_key.clone(),
-                            planned_output_branch.clone().ok_or_else(|| {
-                                OmniError::manifest_internal(
-                                    "first-touch merge has no planned native ref",
-                                )
-                            })?,
+                            crate::branch_names::table_fork_name(
+                                owner,
+                                target_snapshot.graph_manifest_version(),
+                                &merge_lineage.graph_commit_id,
+                            ),
                         );
                     } else {
-                        // Existing-ref effects must prove that the physical
-                        // baseline still equals the captured manifest pin
-                        // before this merge writes a sidecar that claims the
-                        // next versions. Keep the opened handle for Phase B so
-                        // the post-arm path cannot reopen a different HEAD.
+                        // Existing refs stage from the pin opened here; the
+                        // effect phase consumes this exact handle.
                         prepared_existing_targets.insert(
                             table_key.clone(),
                             prepare_existing_merge_target(self, target_txn, table_key).await?,
                         );
                     }
-                    let planned_transactions =
-                        plan_merge_transactions(table_key, candidate, expected_version)?;
-                    planned_transactions_by_table
-                        .insert(table_key.clone(), planned_transactions.clone());
-                    recovery_pins.push(crate::db::manifest::SidecarTablePin {
-                        identity,
-                        table_key: table_key.clone(),
-                        table_path: self.storage().dataset_uri(&entry.dataset_path),
-                        expected_version,
-                        post_commit_pin: expected_version + 1,
-                        confirmed_version: None,
-                        table_branch: planned_output_branch,
-                        table_fork_owner: target_active.clone(),
-                    });
-                    recovery_effects.push(crate::db::manifest::RecoveryBranchMergeEffect {
-                        identity,
-                        table_key: table_key.clone(),
-                        kind: crate::db::manifest::RecoveryBranchMergeEffectKind::MultiCommitHead {
-                            source_fork_version,
-                            planned_transactions,
-                            confirmed_version: None,
-                            confirmed_branch_identifier: None,
-                        },
-                    });
+                    plan_merge_chain_length(table_key, candidate)?;
                 }
                 CandidateTableState::AdoptSourceState { .. } => {}
             }
         }
 
         // Probe after every existing target handle has been collected, at the
-        // last pre-arm boundary under the complete gate envelope. First-touch
-        // targets are intentionally absent: their native ref does not exist
-        // until the sidecar below is durable.
+        // last pre-effect boundary under the complete gate envelope.
         for table_key in &ordered_table_keys {
-            let candidate = candidates.get(table_key);
-            if let Some(prepared) = prepared_existing_targets.get(table_key) {
-                if let Some(CandidateTableState::AdoptPureInserts(proven)) = candidate {
-                    revalidate_proven_pure_insert_target_incarnation(
-                        self,
-                        table_key,
-                        proven,
-                        &prepared.current,
-                    )
-                    .await?;
-                }
-                let expected_version = target_snapshot
-                    .dataset(table_key)
-                    .ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "prepared branch merge target '{table_key}' has no manifest entry"
-                        ))
-                    })?
-                    .published_dataset_version;
-                self.ensure_existing_effect_baseline(
+            if let Some(prepared) = prepared_existing_targets.get(table_key)
+                && let Some(CandidateTableState::AdoptPureInserts(proven)) =
+                    candidates.get(table_key)
+            {
+                revalidate_proven_pure_insert_target_incarnation(
+                    self,
                     table_key,
-                    prepared.table_branch.as_deref(),
-                    expected_version,
+                    proven,
                     &prepared.current,
                 )
                 .await?;
-                continue;
             }
         }
         final_revalidation_timing.finish();
 
-        // Keep the sidecar alongside its handle: after the whole physical
-        // effect set completes, confirmation binds every output slot and every
-        // first-touch ref identity before the one manifest CAS.
-        let mut recovery: Option<(
-            crate::db::manifest::RecoverySidecar,
-            crate::db::manifest::RecoverySidecarHandle,
-        )> = if recovery_pins.is_empty() {
-            None
-        } else {
-            let authority = crate::db::manifest::RecoveryAuthorityToken {
-                branch_identifier: target_txn.authority.branch_identifier.clone(),
-                graph_head: target_txn.authority.graph_head.clone(),
-                schema_identity_domain: target_txn.authority.schema_identity_domain.clone(),
-                schema_ir_hash: target_txn.authority.schema_ir_hash.clone(),
-                schema_identity_version: target_txn.authority.schema_identity_version,
-            };
-            let recovery_lineage = crate::db::manifest::RecoveryLineageIntent {
-                graph_commit_id: merge_lineage.graph_commit_id.clone(),
-                branch: merge_lineage.branch.clone(),
-                actor_id: merge_lineage.actor_id.clone(),
-                merged_parent_commit_id: merge_lineage.merged_parent_commit_id.clone(),
-                created_at: merge_lineage.created_at,
-            };
-            let sidecar = crate::db::manifest::new_branch_merge_sidecar_v9(
-                active_branch_for_keys.clone(),
-                actor_id.map(str::to_string),
-                recovery_pins,
-                authority,
-                recovery_lineage,
-                recovery_effects,
-                crate::db::manifest::RecoveryManifestDelta {
-                    table_updates: delta_slots,
-                    registrations: Vec::new(),
-                    renames: Vec::new(),
-                    tombstones: Vec::new(),
-                },
-            )?;
-            let recovery_arm_timing = crate::instrumentation::start_merge_timing(
-                crate::instrumentation::MergeTimingPhase::RecoveryArm,
-            );
-            let handle = crate::db::manifest::write_sidecar(
-                self.root_uri(),
-                self.storage_adapter(),
-                &sidecar,
-            )
-            .await?;
-            recovery_arm_timing.finish();
-            Some((sidecar, handle))
-        };
-
-        let recovery_operation_id = recovery
-            .as_ref()
-            .map(|(_, handle)| handle.operation_id.clone());
-        // The armed publisher is a natural state-machine boundary: it owns the
-        // physical effects, confirmation, and the one manifest publication.
-        // Keep that large future out of the already broad planning/revalidation
-        // future so debug builds do not stack both generated state machines'
-        // transition storage while polling the substrate publisher.
-        let post_arm_result = Box::pin(async {
-            if recovery.is_some() && !first_touch_effects.is_empty() {
-                fail(&BRANCH_MERGE_POST_SIDECAR_PRE_FORK)?;
-            }
-
+        // The effect phase is a natural state-machine boundary: it owns the
+        // detached chains, the one manifest publication and the promotions.
+        // Keep that large future out of the already broad planning future so
+        // debug builds do not stack both generated state machines.
+        let (promotions, changed_edge_tables) = Box::pin(async {
             let physical_publish_timing = crate::instrumentation::start_merge_timing(
                 crate::instrumentation::MergeTimingPhase::PhysicalPublish,
             );
             let mut updates = Vec::new();
+            let mut promotions = Vec::new();
             let mut changed_edge_tables = false;
-            let mut confirmed_ref_identifiers = HashMap::new();
             for table_key in &ordered_table_keys {
                 let Some(candidate_state) = candidates.get(table_key) else {
                     continue;
@@ -6397,6 +6230,10 @@ impl Omnigraph {
                         ))
                     })?
                     .identity;
+                let expected_version = target_snapshot
+                    .dataset(table_key)
+                    .map(|entry| entry.published_dataset_version)
+                    .unwrap_or(0);
                 let prepared_target = match candidate_state {
                     CandidateTableState::RewriteMerged(_)
                     | CandidateTableState::AdoptWithDelta(_)
@@ -6413,96 +6250,81 @@ impl Omnigraph {
                     }
                     CandidateTableState::AdoptSourceState { .. } => None,
                 };
-                let update = match candidate_state {
-                    CandidateTableState::AdoptSourceState { .. } => {
+                let (update, chain) = match candidate_state {
+                    CandidateTableState::AdoptSourceState { .. } => (
                         publish_adopted_source_state(
                             source_snapshot,
                             target_snapshot,
                             table_key,
                             target_active.as_deref(),
-                        )?
-                    }
+                        )?,
+                        None,
+                    ),
                     CandidateTableState::AdoptWithDelta(delta) => {
-                        let planned = planned_transactions_by_table.get(table_key).ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "branch merge table '{table_key}' lacks its armed transaction chain"
-                            ))
-                        })?;
-                        publish_adopted_delta(
+                        let (update, chain) = publish_adopted_delta(
                             self,
                             target_txn,
-                            recovery_operation_id.as_deref(),
                             first_touch_effects.get(table_key).map(String::as_str),
                             table_key,
                             identity,
                             delta,
                             prepared_target,
-                            planned,
+                            expected_version,
                         )
-                        .await?
+                        .await?;
+                        (update, Some(chain))
                     }
                     CandidateTableState::AdoptPureInserts(proven) => {
-                        let planned = planned_transactions_by_table.get(table_key).ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "branch merge table '{table_key}' lacks its armed pure-insert transaction"
-                            ))
-                        })?;
                         let prepared_target = prepared_target.ok_or_else(|| {
                             OmniError::manifest_internal(format!(
                                 "branch merge pure-insert table '{table_key}' lacks its verified existing target handle"
                             ))
                         })?;
-                        publish_proven_pure_insert_adopt(
+                        let (update, chain) = publish_proven_pure_insert_adopt(
                             self,
                             table_key,
                             identity,
                             proven,
                             &external_preflight,
                             prepared_target,
-                            planned,
+                            expected_version,
                             catalog.system_columns,
                         )
-                        .await?
+                        .await?;
+                        (update, Some(chain))
                     }
                     CandidateTableState::RewriteMerged(staged) => {
-                        let planned = planned_transactions_by_table.get(table_key).ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "branch merge table '{table_key}' lacks its armed transaction chain"
-                            ))
-                        })?;
-                        publish_rewritten_merge_table(
+                        let (update, chain) = publish_rewritten_merge_table(
                             self,
                             target_txn,
-                            recovery_operation_id.as_deref(),
                             first_touch_effects.get(table_key).map(String::as_str),
                             table_key,
                             identity,
                             staged,
                             prepared_target,
-                            planned,
+                            expected_version,
                         )
-                        .await?
+                        .await?;
+                        (update, Some(chain))
                     }
                 };
-                if let Some(target) = first_touch_effects.get(table_key) {
+                if let Some(chain) = chain {
                     let entry = target_snapshot
                         .dataset(table_key)
                         .or_else(|| source_snapshot.dataset(table_key))
                         .ok_or_else(|| {
                             OmniError::manifest_internal(format!(
-                                "first-touch merge effect '{}' has no table path",
-                                table_key
+                                "branch merge effect '{table_key}' has no table path"
                             ))
                         })?;
-                    let full_path = self.storage().dataset_uri(&entry.dataset_path);
-                    let target_head = self
-                        .storage()
-                        .open_dataset_head(&full_path, Some(target))
-                        .await?;
-                    confirmed_ref_identifiers.insert(
-                        update.identity,
-                        self.storage().branch_identifier(&target_head).await?,
-                    );
+                    promotions.push(chain.into_promotion(
+                        table_key,
+                        entry.dataset_path.clone(),
+                        update.native_dataset_branch.clone(),
+                        update.published_dataset_version,
+                        update.version_metadata.e_tag().map(str::to_string),
+                    )?);
+                    fail(&BRANCH_MERGE_POST_TABLE_EFFECT)?;
                 }
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
@@ -6510,25 +6332,6 @@ impl Omnigraph {
                 updates.push(update);
             }
             physical_publish_timing.finish();
-
-            // The Armed body remains rollback-only until every physical effect,
-            // every first-touch ref identity, and every logical output slot are
-            // durably confirmed together.
-            fail(&BRANCH_MERGE_POST_EFFECTS_PRE_CONFIRM)?;
-            if let Some((sidecar, _)) = recovery.as_mut() {
-                let recovery_confirm_timing = crate::instrumentation::start_merge_timing(
-                    crate::instrumentation::MergeTimingPhase::RecoveryConfirm,
-                );
-                crate::db::manifest::confirm_branch_merge_sidecar_v9(
-                    self.root_uri(),
-                    self.storage_adapter(),
-                    sidecar,
-                    &updates,
-                    &confirmed_ref_identifiers,
-                )
-                .await?;
-                recovery_confirm_timing.finish();
-            }
 
             fail(&BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
 
@@ -6543,8 +6346,8 @@ impl Omnigraph {
             );
             // The manifest publisher reaches Lance MergeInsert and DataFusion's
             // physical planner. Erase that substrate-heavy future at the graph
-            // publication boundary instead of making this recovery envelope's
-            // generated state carry it inline.
+            // publication boundary instead of making this envelope's generated
+            // state carry it inline.
             Box::pin(self.commit_updates_on_branch_with_expected(
                 target_branch,
                 &updates,
@@ -6555,54 +6358,17 @@ impl Omnigraph {
             ))
             .await?;
             manifest_publish_timing.finish();
-
-            Ok::<_, OmniError>((updates, changed_edge_tables))
+            Ok::<_, OmniError>((promotions, changed_edge_tables))
         })
-        .await;
-        let (_updates, changed_edge_tables) = match post_arm_result {
-            Ok(result) => result,
-            Err(error) => {
-                if let Some((sidecar, _)) = &recovery {
-                    let recovered = self.recover_failed_branch_merge_under_gates(sidecar).await;
-                    match recovered {
-                        Ok(true) => return Err(error),
-                        Ok(false) => {}
-                        Err(recovery_error) => {
-                            tracing::warn!(
-                                operation_id = sidecar.operation_id.as_str(),
-                                error = %recovery_error,
-                                "failed merge recovery did not complete"
-                            );
-                        }
-                    }
-                }
-                return match recovery_operation_id {
-                    Some(operation_id) => Err(OmniError::recovery_required(
-                        operation_id,
-                        error.to_string(),
-                    )),
-                    None => Err(error),
-                };
-            }
-        };
+        .await?;
 
-        // Recovery sidecar lifecycle: delete after the manifest publish (Phase C).
-        // Best-effort cleanup; the merge already landed durably so failing the
-        // user here is undesirable.
-        if let Some((_, handle)) = recovery {
-            let recovery_cleanup_timing = crate::instrumentation::start_merge_timing(
-                crate::instrumentation::MergeTimingPhase::RecoveryCleanup,
-            );
-            if let Err(err) =
-                crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
-            {
-                tracing::warn!(
-                    error = %err,
-                    operation_id = handle.operation_id.as_str(),
-                    "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-                );
+        // The merge is durable and visible; promotion is best effort and the
+        // next writer of each table, or cleanup, finishes what it skips.
+        match fail(&BRANCH_MERGE_POST_PUBLISH_PRE_PROMOTION) {
+            Ok(()) => self.promote_held_all(promotions).await,
+            Err(error) => {
+                tracing::warn!(error = %error, "merge promotion interrupted; the next writer promotes")
             }
-            recovery_cleanup_timing.finish();
         }
 
         if changed_edge_tables {

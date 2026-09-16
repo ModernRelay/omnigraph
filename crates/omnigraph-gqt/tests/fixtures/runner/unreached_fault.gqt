@@ -20,7 +20,7 @@ p.name: String
 branch create source
 --- expect ok
 --- seam
-at: branch_merge.post_sidecar_pre_fork
+at: branch_merge.post_fork_pre_commit
 occurrence: 1
 action: fail
 scope: next_step

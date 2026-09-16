@@ -227,9 +227,12 @@ pub(crate) struct HeldPromotion {
     pub(crate) dataset_path: String,
     pub(crate) full_path: String,
     pub(crate) table_branch: Option<String>,
-    /// The linear base the effect was staged on, `target - 1`.
+    /// The linear base the chain was staged on: `target - chain length`.
     pub(crate) base: SnapshotHandle,
-    /// The detached version the pin names.
+    /// The detached links behind the tip, oldest first; empty for a single
+    /// detached commit. A branch merge chains one link per chunk.
+    pub(crate) chain: Vec<SnapshotHandle>,
+    /// The detached version the pin names: the chain's tip.
     pub(crate) detached: SnapshotHandle,
     pub(crate) target: u64,
     pub(crate) uuid: String,
@@ -238,16 +241,44 @@ pub(crate) struct HeldPromotion {
 }
 
 /// Promote a pin this writer just published, from the base handle it staged
-/// on and the detached handle it landed. A twin that a racing promoter
-/// landed first is refused by the replay and recognised on recheck.
+/// on and the detached handles it landed, oldest link first. A twin that a
+/// racing promoter landed first is refused by the replay and recognised on
+/// recheck; a chain then continues from that twin.
 pub(crate) async fn promote_held(db: &Omnigraph, held: HeldPromotion) -> Result<Promotion> {
     let location = table_location(&held.full_path, held.table_branch.as_deref());
-    // A base that is not `target - 1` is a detached predecessor whose
-    // promotion is blocked; the replay refuses it as unsafe and this pin
-    // waits behind it.
+    let first_target = held.target - held.chain.len() as u64;
+    // A base that is not the first link's predecessor is a detached
+    // predecessor whose promotion is blocked; the replay refuses it as
+    // unsafe and this pin waits behind it.
+    let mut base = held.base;
+    for (offset, link) in held.chain.iter().enumerate() {
+        let target = first_target + offset as u64;
+        let uuid = db.storage().transaction_identity(link)?.uuid;
+        base = match db
+            .storage()
+            .promote_detached(base, link, target, &uuid)
+            .await?
+        {
+            PromotionOutcome::Landed(twin) => twin,
+            PromotionOutcome::Refused => match target_state(db, &location, target, &uuid).await? {
+                Some(Promotion::AlreadyPromoted) => open_at(db, &location, target)
+                    .await?
+                    .ok_or_else(|| OmniError::HistoricalVersionReclaimed {
+                        published_dataset_version: target,
+                    })?,
+                Some(Promotion::Blocked(reason)) => return Ok(Promotion::Blocked(reason)),
+                _ => {
+                    return Ok(Promotion::Blocked(
+                        "replay refused and the target is absent".to_string(),
+                    ));
+                }
+            },
+            PromotionOutcome::Unsafe(reason) => return Ok(Promotion::Blocked(reason)),
+        };
+    }
     match db
         .storage()
-        .promote_detached(held.base, &held.detached, held.target, &held.uuid)
+        .promote_detached(base, &held.detached, held.target, &held.uuid)
         .await?
     {
         PromotionOutcome::Landed(twin) => {

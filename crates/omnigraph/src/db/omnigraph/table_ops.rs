@@ -614,6 +614,7 @@ async fn maintain_indices_for_branch(
                 full_path: target.full_path.clone(),
                 table_branch: target.table_branch.clone(),
                 base,
+                chain: Vec::new(),
                 detached,
                 target: published_dataset_version,
                 uuid: identity.uuid,

@@ -147,6 +147,45 @@ async fn ensure_indices_writes_no_control_object() {
     );
 }
 
+/// RFC 0067: a branch merge arms no recovery sidecar either. A fast-forward
+/// merge with one table effect writes and deletes no control object.
+#[tokio::test]
+async fn branch_merge_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+        .await
+        .unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "merged")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached merge chain arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached merge has no sidecar to delete after publication"
+    );
+}
+
 /// Optimize is now one graph-wide writer rather than one writer per productive
 /// table. Its planning and monotonic batch publication must stay bounded by the
 /// current table set, not by graph commit-history depth. Each depth fixture is

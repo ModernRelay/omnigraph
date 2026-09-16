@@ -1173,12 +1173,21 @@ impl StagedMutation {
                 ));
             }
 
-            if entry.path.deferred_fork.is_some() && entry.dataset.version() != current {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("published_dataset_version:{}", entry.table_key),
-                    Some(current.to_string()),
-                    Some(entry.dataset.version().to_string()),
-                ));
+            if entry.path.deferred_fork.is_some() {
+                // The inherited handle is the pin: its linear version, or its
+                // staged version while the pin is pending (RFC 0067); the fork
+                // loop below promotes a pending pin before it forks.
+                let opened = entry.dataset.version();
+                let staged = snapshot
+                    .dataset(&entry.table_key)
+                    .and_then(|e| e.version_metadata.staged_version());
+                if opened != current && staged != Some(opened) {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("published_dataset_version:{}", entry.table_key),
+                        Some(current.to_string()),
+                        Some(opened.to_string()),
+                    ));
+                }
             }
             // RFC 0067: the effect is a detached commit of the pinned base, so
             // the table's linear HEAD is no concern of this writer. Publication
@@ -1303,6 +1312,7 @@ impl StagedMutation {
                 full_path: path.full_path.clone(),
                 table_branch: path.table_branch.clone(),
                 base,
+                chain: Vec::new(),
                 detached,
                 target,
                 uuid: identity.uuid,

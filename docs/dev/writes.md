@@ -111,7 +111,7 @@ physical-effect proofs:
 |---|---|---|
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
 | SchemaApply | Exact existing-table rewrites plus owned first-touch table creation and the complete schema/manifest delta | One main-branch graph commit |
-| BranchMerge | Pointer adoption, a proven insertion chain, or a bounded ordered-diff transaction chain | One target-branch graph commit |
+| BranchMerge | Pointer adoption, or a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (RFC 0067) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph commit | | One graph publication when work lands |
 | Optimize | Bounded compaction and index-fold maintenance over the complete planned table set | At most one monotonic main publication |
 
@@ -143,9 +143,8 @@ the pin stays pending, readable through its staged version, and the next
 writer of that table or `cleanup` promotes it. A pin whose target version a
 foreign linear commit occupies is blocked: a later mutation stages from the
 detached version and its own promotion waits behind the block, while the
-writers that still commit on the linear HEAD (branch merge, index
-maintenance, schema apply, Optimize) promote a pending pin before they plan
-and refuse a blocked one. `omnigraph repair` reports blocked pins as
+writers that still commit on the linear HEAD (schema apply, Optimize)
+promote a pending pin before they plan and refuse a blocked one. `omnigraph repair` reports blocked pins as
 `blocked_promotion` and never adopts the foreign commit. First-touch branch
 forks are created without an intent record; an unreferenced fork is garbage
 that cleanup classifies.
@@ -158,6 +157,18 @@ batch as a detached version of the pin, publishes the pins once and promotes
 them. A failure before publication leaves no residue; one after publication
 leaves a pending pin that reads, including full-text search through the
 batch's certificate, serve from the staged version.
+
+Branch merge follows it too. Each target table opens at its pin; every chunk
+of the proven insertion chain or the bounded ordered diff commits as a
+detached version of the previous chunk (one link per chunk, within the
+merge's transaction ceiling), a pointer adoption copies the source's entry
+including a pending pin, and a first-touch fork on a named target is created
+under the gates with no intent record. The target publishes once, with each
+chained table's pin naming its linear base plus the chain length and the
+tip as the staged version; the writer then promotes every link in order. A
+failure anywhere before publication leaves the target untouched and the
+chain as reclaimable garbage; a target that advanced meanwhile makes the
+merge lose its manifest CAS and return the ordinary conflict.
 
 Existing-table constructive transactions stage independently with bounded
 concurrency. `OMNIGRAPH_LOAD_CONCURRENCY` selects that width for both Load and

@@ -1,5 +1,5 @@
 //! The full crash-window catalog for the hunt
-//! (`dst_hunt_crash_window_sweep`): 70 of the engine's decision seams
+//! (`dst_hunt_crash_window_sweep`): 71 of the engine's decision seams
 //! (`omnigraph::seams::catalog`) at the pinned engine version. A seam added
 //! to the engine enters here as never-reached until its workload exists.
 //!
@@ -7,7 +7,7 @@
 //! be a name the engine catalog declares, so a typo'd or renamed-away window
 //! fails the suite instead of compiling and silently never firing.
 
-pub const CRASH_WINDOWS: [&str; 70] = [
+pub const CRASH_WINDOWS: [&str; 71] = [
     "blob_read.post_capture",
     "branch_control.post_recovery_barrier",
     "branch_create.post_native",
@@ -19,9 +19,9 @@ pub const CRASH_WINDOWS: [&str; 70] = [
     "branch_merge.between_delete_chunks",
     "branch_merge.post_authority_capture",
     "branch_merge.post_candidate_validation",
-    "branch_merge.post_effects_pre_confirm",
+    "branch_merge.post_table_effect",
     "branch_merge.post_phase_b_pre_manifest_commit",
-    "branch_merge.post_sidecar_pre_fork",
+    "branch_merge.post_fork_pre_commit",
     "branch_merge.rewrite_after_delete_pre_confirm",
     "branch_merge.rewrite_after_merge_pre_delete",
     "classify.fresh_read",
@@ -80,6 +80,7 @@ pub const CRASH_WINDOWS: [&str; 70] = [
     // Append new windows so index-derived census seeds for existing windows
     // remain stable.
     "branch_merge.rewrite_after_insert_pre_update",
+    "branch_merge.post_publish_pre_promotion",
 ];
 
 #[cfg(test)]

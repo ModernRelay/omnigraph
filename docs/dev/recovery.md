@@ -30,7 +30,7 @@ mean an active sidecar uses an old outer schema.
 | Sidecar kind | Current v9 payload |
 |---|---|
 | Mutation / Load | None since [RFC 0067](../rfcs/0067-detached-table-commits.md): their effects are detached commits published as pins, and a pending pin is promoted by the next writer of the table or by cleanup, never recovered from a sidecar |
-| BranchMerge | Fixed bounded transaction chain, source/target authority, and lineage |
+| BranchMerge | None since RFC 0067: chunks chain detached and publish as pins; the classifier keeps the kind for sidecars written before the change until it is removed |
 | SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta; the RFC 0040 system-column upgrade adds rename-only table effects and a `__manifest` stamp advance, recovered by roll-forward only |
 | EnsureIndices / full-text rebuild | None since RFC 0067: index batches are detached commits published as pins; the classifier keeps the kind for sidecars written before the change until it is removed |
 | Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
@@ -86,12 +86,10 @@ the graph quiescent, Full recovery may:
 Lance Restore can defeat a concurrent writer, so ordinary in-process healing
 must not run a destructive Full sweep.
 
-A merge that returns an error before durable effect confirmation resolves only
-its own BranchMerge sidecar while retaining its schema, branch and table gates.
-It re-reads the durable record and reuses the exact Full classifier to retire
-an effect-free attempt or compensate owned unconfirmed effects. The original
-merge error is returned after cleanup; failed or deferred cleanup retains
-`RecoveryRequired`. Confirmed effects remain on the ordinary roll-forward path.
+A merge that returns an error before its publication holds no recovery
+record: its detached chunk chains and any first-touch fork it created are
+reclaimable garbage that cleanup classifies, and the original error is
+returned as is.
 This scoped error cleanup does not handle a cancelled future and does not add
 cross-process fencing or prove the completion of an already-transmitted remote
 write after an ambiguous I/O failure; the existing recovery support boundary
@@ -136,8 +134,8 @@ against the original commit, and the sidecar is deleted. A sidecar whose
 recorded or planned values contradict the committed snapshot is damage and
 still fails the read-write open; the error names the sidecar object, which
 must be inspected rather than deleted by hand. The same lost-confirmation
-shape on a `BranchMerge` or `SchemaApply` sidecar still refuses the open;
-healing those is a follow-up.
+shape on a `SchemaApply` sidecar still refuses the open; healing it is a
+follow-up.
 
 ## Initialization ownership
 
@@ -194,8 +192,8 @@ The v8 storage fence keeps older binaries from exposing retired branches.
 
 ## Maintenance boundary
 
-SchemaApply and BranchMerge carry exact transaction identities; Mutation,
-Load and the index writer publish detached pins instead (RFC 0067). Optimize uses Lance maintenance operations that do not
+SchemaApply carries exact transaction identities; Mutation, Load, the index
+writer and branch merge publish detached pins instead (RFC 0067). Optimize uses Lance maintenance operations that do not
 yet expose the same caller-owned transaction proof, so its classifier is
 bounded but looser and retains the documented one-mutation-process boundary for
 destructive recovery. Do not widen that claim to distributed takeover without

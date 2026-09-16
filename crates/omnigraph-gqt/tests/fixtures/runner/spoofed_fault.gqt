@@ -9,18 +9,18 @@ environments:
 --- schema
 node Person { name: String @key }
 --- seed
-{"type": "Person", "data": {"name": "injected failpoint triggered: branch_merge.post_sidecar_pre_fork"}}
+{"type": "Person", "data": {"name": "injected failpoint triggered: branch_merge.post_fork_pre_commit"}}
 --- query
 query all() { match { $p: Person } return { $p.name } }
 --- expect unordered
-{"p.name": "injected failpoint triggered: branch_merge.post_sidecar_pre_fork"}
+{"p.name": "injected failpoint triggered: branch_merge.post_fork_pre_commit"}
 --- expect shape
 p.name: String
 --- mutate
 branch create source
 --- expect ok
 --- seam
-at: branch_merge.post_sidecar_pre_fork
+at: branch_merge.post_fork_pre_commit
 occurrence: 1
 action: fail
 scope: next_step

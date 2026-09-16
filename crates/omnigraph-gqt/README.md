@@ -106,6 +106,11 @@ extensions.
 
 ## Known recovery failures
 
+Since RFC 0067 no corpus writer arms a recovery intent, so no case can
+record a known recovery failure; the marker stays parsed and refused as
+documented here until the recovery classifier retires with the last sidecar
+writer.
+
 An optional `--- known_failure` section directly after `--- runner` and before
 `--- schema` can retain a known recovery defect in the corpus:
 
