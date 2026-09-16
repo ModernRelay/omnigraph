@@ -297,7 +297,9 @@ fn is_declaration(line: &str) -> bool {
 /// whose item is not a `pub static`, or a `decide_seam!` body without one (a
 /// private or crate-visible static is invisible to the listing and teardown).
 fn unindexable_declarations(contents: &str) -> Vec<usize> {
-    let raw = contents.match_indices("Seam::decide(");
+    let raw = contents
+        .match_indices("Seam::decide(")
+        .chain(contents.match_indices("Seam::decide_with_store("));
     let bodies = contents.match_indices("decide_seam!").filter(|(at, _)| {
         let end = block_end(contents, *at).unwrap_or(contents.len());
         !contents[*at..end].contains("pub static ")
@@ -317,6 +319,7 @@ fn catalog_declarations(catalog_text: &str) -> Vec<usize> {
     let mut lines: Vec<usize> = catalog_text
         .match_indices("decide_seam!")
         .chain(catalog_text.match_indices("Seam::decide("))
+        .chain(catalog_text.match_indices("Seam::decide_with_store("))
         .map(|(at, _)| line_of(catalog_text, at))
         .collect();
     lines.sort_unstable();
@@ -749,17 +752,19 @@ fn guard_refuses_duplicates_and_mispaired_helpers() {
              static PRIVATE: DecideSeam = Seam::decide(\"x.p\", Op::Mutation, &[Effect::Fail], Global::new());\n\
              pub(crate) static CRATE: DecideSeam =\n    Seam::decide(\"x.c\", Op::Mutation, &[Effect::Fail], Global::new());\n\
              crate::seams::decide_seam! {\n    pub static D = (\"x.d\", Mutation, [Fail]);\n}\n\
-             crate::seams::decide_seam! {\n    static E = (\"x.e\", Mutation, [Fail]);\n}\n"
+             crate::seams::decide_seam! {\n    static E = (\"x.e\", Mutation, [Fail]);\n}\n\
+             pub static S: DecideSeam = Seam::decide_with_store(\"x.s\", Op::Mutation, &[Effect::Fail], &[StoreEffect::Misdirect], \"o/*\", Global::new());\n"
         ),
-        [1, 2, 4, 8],
-        "every hand-written `Seam::decide` and every macro body without `pub static` is reported by line; the macro `pub static` is not"
+        [1, 2, 4, 8, 11],
+        "every hand-written `Seam::decide` or `Seam::decide_with_store` and every macro body without `pub static` is reported by line; the macro `pub static` is not"
     );
     assert_eq!(
         catalog_declarations(
             "omnigraph_seams::catalog! {\n    crate::x::A,\n}\n\
-             decide_seam! {\n    pub static UNINDEXED = (\"x.u\", Mutation, [Fail]);\n}\n"
+             decide_seam! {\n    pub static UNINDEXED = (\"x.u\", Mutation, [Fail]);\n}\n\
+             pub static WITH_STORE: DecideSeam = Seam::decide_with_store(\"x.w\", Op::Mutation, &[Effect::Fail], &[StoreEffect::Misdirect], \"o/*\", Global::new());\n"
         ),
-        [4],
+        [4, 7],
         "a declaration inside the catalog is reported even when it is a well-formed `pub static`: discovery never reads the catalog"
     );
     assert!(

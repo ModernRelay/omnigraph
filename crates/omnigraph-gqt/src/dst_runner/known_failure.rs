@@ -1,3 +1,5 @@
+use omnigraph_dst::store_places::StoreAction;
+
 use super::WorkerReport;
 use crate::runner_config::{ErrorMatch, Execution, Storage};
 use crate::{Case, Item, MutateExpect, Step};
@@ -132,39 +134,96 @@ pub(super) fn classify(case: &Case, report: &WorkerReport) -> Result<bool, Strin
     {
         return Err(failure.clone());
     }
-    let delivered = report
+    let deliveries = report
         .evidence
         .iter()
         .filter(|event| event["kind"] == "seam_delivered")
+        .collect::<Vec<_>>();
+    let delivered = deliveries
+        .iter()
         .map(|event| {
             (
                 event["operation"]["ordinal"].as_u64(),
                 event["value"]["at"].as_str().map(str::to_string),
                 event["value"]["occurrence"].as_u64(),
                 event["value"]["effect"].as_str().map(str::to_string),
+                event["value"]["subject"].as_str().map(str::to_string),
             )
         })
         .collect::<Vec<_>>();
-    let required = case
+    let seams = case
         .seams
         .iter()
-        .flat_map(|(ordinal, seams)| {
-            seams.iter().map(move |seam| {
-                (
-                    u64::try_from(*ordinal).ok(),
-                    Some(seam.at.clone()),
-                    u64::try_from(seam.occurrence).ok(),
-                    omnigraph::seams::catalog::decide(&seam.at)
-                        .and_then(|entry| super::admitted_effect(seam.action, entry.effects()))
-                        .map(|effect| effect.as_str().to_string()),
-                )
-            })
+        .flat_map(|(ordinal, seams)| seams.iter().map(move |seam| (*ordinal, seam)))
+        .collect::<Vec<_>>();
+    let required = seams
+        .iter()
+        .map(|(ordinal, seam)| {
+            let admitted = super::resolve_seam(seam).ok();
+            (
+                u64::try_from(*ordinal).ok(),
+                Some(seam.at.clone()),
+                u64::try_from(seam.occurrence).ok(),
+                admitted
+                    .as_ref()
+                    .map(|admitted| admitted.effect_name().to_string()),
+                match &admitted {
+                    Some(super::Admitted::CodeStore(entry, _)) => {
+                        entry.store_subject().map(str::to_string)
+                    }
+                    _ => seam.subject.clone(),
+                },
+            )
         })
         .collect::<Vec<_>>();
     if delivered != required {
         return Err(failure.clone());
     }
+    for ((_, seam), event) in seams.iter().zip(&deliveries) {
+        let admitted = super::resolve_seam(seam).map_err(|_| failure.clone())?;
+        if !hit_is_valid(&admitted, &event["value"]["hit"]) {
+            return Err(failure.clone());
+        }
+    }
     Ok(true)
+}
+
+/// A store delivery carries one complete hit: a method of its row, a
+/// requested name the subject selects, and for `misdirect` the stored name
+/// the transform produces. An engine effect carries none.
+fn hit_is_valid(admitted: &super::Admitted, hit: &serde_json::Value) -> bool {
+    let Some(row) = admitted.store_row() else {
+        return hit.is_null();
+    };
+    let (Some(method), Some(requested)) = (hit["method"].as_str(), hit["requested"].as_str())
+    else {
+        return false;
+    };
+    if !row.methods.contains(&method) {
+        return false;
+    }
+    let (action, subject) = match admitted {
+        super::Admitted::Store(_, action, subject) => (*action, Some(subject.clone())),
+        super::Admitted::CodeStore(entry, omnigraph::seams::StoreEffect::Misdirect) => (
+            StoreAction::Misdirect,
+            entry
+                .store_subject()
+                .and_then(|declared| omnigraph_dst::store_places::Subject::parse(declared).ok()),
+        ),
+        super::Admitted::Code(..) => return false,
+    };
+    if subject.is_some_and(|subject| !subject.matches(requested)) {
+        return false;
+    }
+    match action {
+        StoreAction::Misdirect => {
+            hit["stored"].as_str()
+                == Some(omnigraph_dst::store_places::misdirect_uri(requested).as_str())
+        }
+        StoreAction::Lose | StoreAction::Error | StoreAction::Corrupt | StoreAction::Delay => {
+            hit["stored"].is_null()
+        }
+    }
 }
 
 pub(super) fn verify_status(

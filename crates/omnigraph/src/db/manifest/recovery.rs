@@ -1123,7 +1123,10 @@ pub(crate) fn sidecar_uri(root_uri: &str, operation_id: &str) -> String {
 }
 
 decide_seam! {
-    pub static RECOVERY_SIDECAR_WRITE = ("recovery.sidecar_write", AnyWrite, [Fail]);
+    /// Crossed once per sidecar, directly before the one put `write_sidecar`
+    /// makes (`storage.write_text`), which is the call a fired `Misdirect`
+    /// lands under a foreign name.
+    pub static RECOVERY_SIDECAR_WRITE = ("recovery.sidecar_write", AnyWrite, [Fail], store [Misdirect], subject "__recovery/*");
 }
 
 /// Write a sidecar atomically and return a handle for later deletion.

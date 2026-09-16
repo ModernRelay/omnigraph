@@ -81,7 +81,7 @@ pub(crate) fn fail(seam: &'static DecideSeam) -> Result<(), Diagnostic> {
             "{} is not a fail-only seam",
             seam.name()
         );
-        if seam.crossed() != omnigraph_seams::Decision::Pass {
+        if matches!(seam.crossed(), omnigraph_seams::Decision::Fire(_)) {
             return Err(Diagnostic::error(
                 "injected_failpoint",
                 seam.name(),

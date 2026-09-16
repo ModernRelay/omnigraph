@@ -178,6 +178,8 @@ pub struct Seam<B: ?Sized + 'static, S: Storage<B> = Global<B>> {
     name: &'static str,
     op: Op,
     effects: &'static [Effect],
+    store: &'static [StoreEffect],
+    store_subject: Option<&'static str>,
     site: &'static Location<'static>,
     last_fired: AtomicPtr<Location<'static>>,
     slot: S,
@@ -193,6 +195,8 @@ impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
             name,
             op,
             effects: &[],
+            store: &[],
+            store_subject: None,
             site: Location::caller(),
             last_fired: AtomicPtr::new(std::ptr::null_mut()),
             slot,
@@ -209,6 +213,34 @@ impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
     /// non-decision seam, declared with [`Seam::new`].
     #[track_caller]
     pub const fn decide(name: &'static str, op: Op, effects: &'static [Effect], slot: S) -> Self {
+        Self::built(name, op, effects, &[], None, slot)
+    }
+
+    /// [`decide`](Self::decide) for a site that also declares store effects:
+    /// outcomes the site passes through and the storage decoration acts on,
+    /// plus `subject`, the object name of the one store call the site
+    /// precedes.
+    #[track_caller]
+    pub const fn decide_with_store(
+        name: &'static str,
+        op: Op,
+        effects: &'static [Effect],
+        store: &'static [StoreEffect],
+        subject: &'static str,
+        slot: S,
+    ) -> Self {
+        Self::built(name, op, effects, store, Some(subject), slot)
+    }
+
+    #[track_caller]
+    const fn built(
+        name: &'static str,
+        op: Op,
+        effects: &'static [Effect],
+        store: &'static [StoreEffect],
+        store_subject: Option<&'static str>,
+        slot: S,
+    ) -> Self {
         assert!(
             !effects.is_empty(),
             "a decision seam declares at least one effect"
@@ -217,6 +249,8 @@ impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
             name,
             op,
             effects,
+            store,
+            store_subject,
             site: Location::caller(),
             last_fired: AtomicPtr::new(std::ptr::null_mut()),
             slot,
@@ -235,6 +269,17 @@ impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
     /// The outcomes this site honors; empty for a non-decision seam.
     pub const fn effects(&self) -> &'static [Effect] {
         self.effects
+    }
+
+    /// The store effects this site passes through; empty for most seams.
+    pub const fn store_effects(&self) -> &'static [StoreEffect] {
+        self.store
+    }
+
+    /// The object name the site's one store call requests, as a glob;
+    /// `None` for a site that declares no store effects.
+    pub const fn store_subject(&self) -> Option<&'static str> {
+        self.store_subject
     }
 
     /// Where the static is declared: the file and line the compiler saw.
@@ -297,6 +342,7 @@ impl<B: ?Sized + 'static, S: Storage<B>> fmt::Debug for Seam<B, S> {
             .field("name", &self.name)
             .field("op", &self.op)
             .field("effects", &self.effects)
+            .field("store", &self.store)
             .field("site", &self.site)
             .finish()
     }
@@ -369,11 +415,30 @@ impl Effect {
     }
 }
 
-/// The answer a [`Decide`] gives at a crossing: pass, or fire with the
-/// outcome the site is to produce, one of the seam's declared effects.
+/// An outcome the site passes through unchanged and the storage decoration
+/// installed at the storage seam produces on the next matching store call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StoreEffect {
+    /// The next put lands under a different object name and answers success.
+    Misdirect,
+}
+
+impl StoreEffect {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StoreEffect::Misdirect => "misdirect",
+        }
+    }
+}
+
+/// The answer a [`Decide`] gives at a crossing: pass, fire with the outcome
+/// the site is to produce (one of the seam's declared effects), or fire a
+/// store effect (one of the seam's declared store effects), which the site
+/// treats as a pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Fire(Effect),
+    Store(StoreEffect),
     Pass,
 }
 
@@ -405,23 +470,37 @@ impl DecideSeam {
     /// a helper that captured its caller before an `async` block.
     pub fn crossed_from(&self, caller: &'static Location<'static>) -> Decision {
         let decision = self.with(|d| d.decide(self.name)).unwrap_or(Decision::Pass);
-        if let Decision::Fire(effect) = decision {
-            assert!(
+        match decision {
+            Decision::Fire(effect) => assert!(
                 self.effects.contains(&effect),
                 "seam {} fired {} but declares only {}",
                 self.name,
                 effect.as_str(),
                 effects_list(self.effects)
-            );
-            self.last_fired
-                .store(std::ptr::from_ref(caller).cast_mut(), Ordering::Relaxed);
+            ),
+            Decision::Store(effect) => assert!(
+                self.store.contains(&effect),
+                "seam {} fired store effect {} but declares only {}",
+                self.name,
+                effect.as_str(),
+                store_effects_list(self.store)
+            ),
+            Decision::Pass => return decision,
         }
+        self.last_fired
+            .store(std::ptr::from_ref(caller).cast_mut(), Ordering::Relaxed);
         decision
     }
 }
 
 /// The spelling of an effect set in a message: `[fail, skip]`.
 pub fn effects_list(effects: &[Effect]) -> String {
+    let names: Vec<&str> = effects.iter().map(|e| e.as_str()).collect();
+    format!("[{}]", names.join(", "))
+}
+
+/// The spelling of a store effect set in a message: `[misdirect]`.
+pub fn store_effects_list(effects: &[StoreEffect]) -> String {
     let names: Vec<&str> = effects.iter().map(|e| e.as_str()).collect();
     format!("[{}]", names.join(", "))
 }
@@ -774,6 +853,11 @@ pub trait SeamEntry: Sync {
     fn op(&self) -> Op;
     /// The outcomes the site honors; empty for a non-decision seam.
     fn effects(&self) -> &'static [Effect];
+    /// The store effects the site passes through; empty for most seams.
+    fn store_effects(&self) -> &'static [StoreEffect];
+    /// The object name the site's one store call requests, as a glob;
+    /// `None` for a site that declares no store effects.
+    fn store_subject(&self) -> Option<&'static str>;
     /// Where the static is declared.
     fn site(&self) -> &'static Location<'static>;
     /// Where the decision last fired, once it has.
@@ -798,6 +882,14 @@ impl SeamEntry for DecideSeam {
         self.effects
     }
 
+    fn store_effects(&self) -> &'static [StoreEffect] {
+        self.store
+    }
+
+    fn store_subject(&self) -> Option<&'static str> {
+        self.store_subject
+    }
+
     fn site(&self) -> &'static Location<'static> {
         self.site
     }
@@ -816,9 +908,9 @@ impl SeamEntry for DecideSeam {
     }
 }
 
-/// Declare a decision seam beside the site it guards:
-/// `decide_seam! { pub static NAME = ("area.place", Mutation, [Fail, Skip]); }`.
-/// The compiler records the invocation as the seam's site.
+/// Declare a decision seam beside the site it guards, the invocation being its
+/// site: `("area.place", Mutation, [Fail, Skip])`, or with store effects and
+/// the subject of their call, `(.., [Fail], store [Misdirect], subject "a/*")`.
 #[macro_export]
 macro_rules! decide_seam {
     ($(#[$meta:meta])* $vis:vis static $name:ident = ($seam_name:literal, $op:ident, [$($effect:ident),+ $(,)?]);) => {
@@ -827,6 +919,17 @@ macro_rules! decide_seam {
             $seam_name,
             $crate::Op::$op,
             &[$($crate::Effect::$effect),+],
+            $crate::Global::new(),
+        );
+    };
+    ($(#[$meta:meta])* $vis:vis static $name:ident = ($seam_name:literal, $op:ident, [$($effect:ident),+ $(,)?], store [$($store:ident),+ $(,)?], subject $subject:literal);) => {
+        $(#[$meta])*
+        $vis static $name: $crate::DecideSeam = $crate::Seam::decide_with_store(
+            $seam_name,
+            $crate::Op::$op,
+            &[$($crate::Effect::$effect),+],
+            &[$($crate::StoreEffect::$store),+],
+            $subject,
             $crate::Global::new(),
         );
     };
