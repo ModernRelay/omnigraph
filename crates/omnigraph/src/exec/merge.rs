@@ -4118,6 +4118,9 @@ async fn classify_general_adopt(
 /// An empty delta does not imply an empty publish: source and target can hold
 /// the same content at different Lance versions (#473).
 #[must_use = "the adopt plan decides whether this table is a merge candidate"]
+// A registration carries the pin metadata RFC 0067 added; the pointer
+// variant is the common one and boxing it buys nothing.
+#[allow(clippy::large_enum_variant)]
 enum AdoptPublish {
     /// The planned registration is field-for-field the stored entry
     /// (`reregisters_current_entry`).

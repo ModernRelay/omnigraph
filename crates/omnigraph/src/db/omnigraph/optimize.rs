@@ -1301,6 +1301,15 @@ pub async fn cleanup_all_datasets(
                 ))
             })?;
         for entry in branch_snapshot.datasets() {
+            // RFC 0067: a pending pin is promoted before any version is
+            // reclaimed, so stock Lance cleanup only ever sees linear history
+            // and the pin's detached manifest becomes surplus.
+            if let (Some(staged), Some(uuid)) = (
+                entry.version_metadata.staged_version(),
+                entry.version_metadata.transaction_uuid(),
+            ) {
+                promote_pin_before_cleanup(db, entry, staged, uuid).await?;
+            }
             // Validate that the exact protected version is still openable
             // before GC starts. This catches pre-existing damage from an older
             // cleanup implementation and keeps the sweep fail-closed instead
@@ -2005,4 +2014,48 @@ mod tests {
             "unreadable live-branch refs must be left for the next cleanup run"
         );
     }
+}
+
+/// Promote one pending pin, then delete its detached manifest once the
+/// pin is linear (RFC 0067). A blocked pin is reported and left alone: its
+/// files stay protected by the unverified-file age gate, and the
+/// HEAD-equals-pin check refuses cleanup on it.
+async fn promote_pin_before_cleanup(
+    db: &Omnigraph,
+    entry: &crate::db::manifest::DatasetEntry,
+    staged: u64,
+    uuid: &str,
+) -> Result<()> {
+    let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
+    let table_branch = entry.native_dataset_branch.as_deref();
+    let outcome = super::promotion::promote_pin(
+        db,
+        &entry.type_key,
+        &full_path,
+        table_branch,
+        entry.published_dataset_version,
+        staged,
+        uuid,
+    )
+    .await?;
+    match outcome {
+        super::promotion::Promotion::Promoted(_) | super::promotion::Promotion::AlreadyPromoted => {
+            let location = super::promotion::table_location(&full_path, table_branch);
+            let detached = super::promotion::detached_manifest_path(&location, staged);
+            if let Err(error) = db.storage_adapter().delete(&detached).await {
+                tracing::warn!(
+                    error = %error,
+                    detached,
+                    "could not delete a promoted pin's detached manifest; cleanup retries it"
+                );
+            }
+        }
+        super::promotion::Promotion::Blocked(reason) => tracing::warn!(
+            table = entry.type_key.as_str(),
+            target = entry.published_dataset_version,
+            reason,
+            "cleanup found a blocked pin; its files stay protected by the age gate"
+        ),
+    }
+    Ok(())
 }

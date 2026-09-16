@@ -1464,6 +1464,61 @@ pub(crate) enum VersionResolution {
     At(u64),
 }
 
+/// Open a table pin (RFC 0067). A pin without a staged version is an exact
+/// open of its target. A pin with one opens the linear target when it exists
+/// and carries the pin's transaction uuid, and otherwise the staged detached
+/// version: either the pin is pending promotion, or its promotion is blocked
+/// by a foreign commit at the target. An absent target counts as pending only
+/// while the table's linear head has not reached it; once the head is at or
+/// past the target, the twin was promoted and later pruned, and the staged
+/// manifest must not resurrect pruned history.
+pub(crate) async fn open_pinned_dataset(
+    uri: &str,
+    target_version: u64,
+    staged_version: Option<u64>,
+    transaction_uuid: Option<&str>,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let Some(staged) = staged_version else {
+        return open_dataset(uri, VersionResolution::At(target_version), session, wrapper).await;
+    };
+    match open_dataset(
+        uri,
+        VersionResolution::At(target_version),
+        session,
+        wrapper.clone(),
+    )
+    .await
+    {
+        Ok(dataset) => {
+            let ours = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)
+                .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+            if ours {
+                return Ok(dataset);
+            }
+            tracing::warn!(
+                uri,
+                target_version,
+                staged,
+                "pin target carries a foreign or unreadable transaction; resolving the staged version"
+            );
+            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+        }
+        Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
+            let latest = open_dataset(uri, VersionResolution::Latest, session, wrapper.clone())
+                .await?
+                .version()
+                .version;
+            if latest >= target_version {
+                return Err(error);
+            }
+            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// THE dataset-open chokepoint. Every engine `Dataset` open routes through
 /// here so three things hold uniformly, on every path:
 ///

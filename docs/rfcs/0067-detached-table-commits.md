@@ -208,7 +208,13 @@ cannot be read (Lance 12 returns an error for undecodable transaction bytes
 and `None` only when none was recorded), the promotion is blocked; open
 `staged_version` and report the block. A promoter applies the same rule and
 never treats an unreadable transaction as its own. Detached versions are
-immutable and cache like any version.
+immutable and cache like any version. The uuid check costs no request
+beyond the manifest: Lance records the transaction file name,
+`{read_version}-{uuid}.txn`, in every manifest, so the pin resolver, both
+witnesses and the chain walk read a version's transaction identity from the
+opened manifest, and only promotion reads the transaction it replays. A
+manifest that names no transaction file is treated as foreign;
+`lance_surface_guards` pins the name.
 
 Every check that today compares a pin's manifest e-tag with the opened
 dataset's manifest (the Blob facade's integrity check and the change feed's

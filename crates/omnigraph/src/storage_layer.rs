@@ -220,6 +220,15 @@ impl ProvenInsertChunk {
 
 // ─── opaque handles ────────────────────────────────────────────────────────
 
+/// Outcome of replaying a detached transaction at its linear target, in the
+/// storage boundary's own terms (RFC 0067).
+#[derive(Debug)]
+pub enum PromotionOutcome {
+    Landed(SnapshotHandle),
+    Refused,
+    Unsafe(String),
+}
+
 /// Opaque handle to a snapshot of a single sub-table dataset at a
 /// specific version.
 ///
@@ -725,6 +734,32 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
+
+    /// RFC 0067: commit one staged effect as a detached version.
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )>;
+
+    /// RFC 0067: the identity of the transaction a version records.
+    fn transaction_identity(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<crate::table_store::StagedTransactionIdentity>;
+
+    /// RFC 0067: replay the transaction recorded in `staged` on `base` so the
+    /// linear history gains its twin at `target`.
+    async fn promote_detached(
+        &self,
+        base: SnapshotHandle,
+        staged: &SnapshotHandle,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionOutcome>;
 
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
@@ -1235,6 +1270,50 @@ impl TableStorage for TableStore {
         TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
+    }
+
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )> {
+        let ds_arc = snapshot.into_arc();
+        let (dataset, identity) =
+            TableStore::commit_staged_detached(self, ds_arc, staged.into_staged()).await?;
+        Ok((SnapshotHandle::new(dataset), identity))
+    }
+
+    fn transaction_identity(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<crate::table_store::StagedTransactionIdentity> {
+        TableStore::transaction_identity(self, snapshot.dataset())
+    }
+
+    async fn promote_detached(
+        &self,
+        base: SnapshotHandle,
+        staged: &SnapshotHandle,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionOutcome> {
+        let base = base.into_arc();
+        Ok(
+            match TableStore::promote_detached(self, base, staged.dataset(), target, expected_uuid)
+                .await?
+            {
+                crate::table_store::PromotionCommit::Landed(dataset) => {
+                    PromotionOutcome::Landed(SnapshotHandle::new(*dataset))
+                }
+                crate::table_store::PromotionCommit::Refused => PromotionOutcome::Refused,
+                crate::table_store::PromotionCommit::Unsafe(reason) => {
+                    PromotionOutcome::Unsafe(reason)
+                }
+            },
+        )
     }
 
     async fn commit_staged_exact(

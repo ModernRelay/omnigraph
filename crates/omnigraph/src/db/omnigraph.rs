@@ -32,6 +32,7 @@ use crate::table_store::TableStore;
 
 mod export;
 pub(crate) mod optimize;
+pub(crate) mod promotion;
 mod repair;
 pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;

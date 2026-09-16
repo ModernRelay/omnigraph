@@ -4505,11 +4505,13 @@ async fn branch_ref_read_survives_concurrent_metadata_rewrite() {
 // linear commit rebases over a moved HEAD even at zero retries (why the
 // design stages detached); a detached commit from a pinned base ignores the
 // HEAD, never moves it, chains, and needs a retry budget; replaying a
-// recorded transaction linearly produces an identical twin; and a replay
-// over its own twin is refused only for the transaction kinds whose
-// conflict rules see the twin, which decides what may be staged as its own
-// detached commit. A Lance bump that changes any of them is a design
-// review, not a test to weaken.
+// recorded transaction linearly produces an identical twin, and every
+// manifest names its transaction file `{read_version}-{uuid}.txn`, which is
+// how the engine reads a version's transaction identity without a second
+// request; and a replay over its own twin is refused only for the
+// transaction kinds whose conflict rules see the twin, which decides what
+// may be staged as its own detached commit. A Lance bump that changes any
+// of them is a design review, not a test to weaken.
 
 fn rfc0067_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -4758,6 +4760,11 @@ async fn rfc_0067_replaying_a_detached_transaction_promotes_an_identical_twin() 
         recorded.uuid, transaction.uuid,
         "the detached manifest records the transaction"
     );
+    assert_eq!(
+        d1.manifest().transaction_file.as_deref(),
+        Some(format!("1-{}.txn", transaction.uuid).as_str()),
+        "the manifest names its transaction file `{{read_version}}-{{uuid}}.txn`"
+    );
 
     let promoted = rfc0067_linear(base.clone())
         .execute(recorded)
@@ -4767,6 +4774,11 @@ async fn rfc_0067_replaying_a_detached_transaction_promotes_an_identical_twin() 
     assert_eq!(
         promoted.read_transaction().await.unwrap().unwrap().uuid,
         transaction.uuid
+    );
+    assert_eq!(
+        promoted.manifest().transaction_file.as_deref(),
+        Some(format!("1-{}.txn", transaction.uuid).as_str()),
+        "the twin's manifest names the same transaction under the same base"
     );
     assert_eq!(rfc0067_ids(&promoted).await, rfc0067_ids(&d1).await);
     let d1_fragments: Vec<usize> = d1.get_fragments().iter().map(|f| f.id()).collect();
@@ -4797,10 +4809,26 @@ async fn rfc_0067_replaying_a_detached_transaction_promotes_an_identical_twin() 
         .unwrap();
     let mut replay = d2.read_transaction().await.unwrap().unwrap();
     assert_eq!(replay.read_version, d1.version().version);
+    assert_eq!(
+        d2.manifest().transaction_file.as_deref(),
+        Some(format!("{}-{}.txn", d1.version().version, replay.uuid).as_str()),
+        "a chained detached commit names its detached base in the file name"
+    );
     replay.read_version = 2;
     let twin_base = rfc0067_pinned(uri, 2).await;
     let promoted2 = rfc0067_linear(twin_base).execute(replay).await.unwrap();
     assert_eq!(promoted2.version().version, 3);
+    assert_eq!(
+        promoted2.manifest().transaction_file.as_deref(),
+        Some(
+            format!(
+                "2-{}.txn",
+                d2.read_transaction().await.unwrap().unwrap().uuid
+            )
+            .as_str()
+        ),
+        "the chained twin names its linear base"
+    );
     assert_eq!(rfc0067_ids(&promoted2).await, rfc0067_ids(&d2).await);
     let d2_fragments: Vec<usize> = d2.get_fragments().iter().map(|f| f.id()).collect();
     let twin2_fragments: Vec<usize> = promoted2.get_fragments().iter().map(|f| f.id()).collect();

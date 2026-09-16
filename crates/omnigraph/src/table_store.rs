@@ -470,6 +470,11 @@ pub enum IndexCoverage {
 /// started from the same version. Lance may preserve both fields while
 /// rebasing, so enrolled callers must also require the achieved table version
 /// to be exactly `read_version + 1`.
+///
+/// RFC 0067 reads the same pair from the transaction file name the manifest
+/// records (`{read_version}-{uuid}.txn`, pinned in `lance_surface_guards`),
+/// so identifying a pin's promoted twin or following a chain of detached
+/// commits costs no request beyond the manifest itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedTransactionIdentity {
     pub read_version: u64,
@@ -483,6 +488,37 @@ impl From<&Transaction> for StagedTransactionIdentity {
             uuid: transaction.uuid.clone(),
         }
     }
+}
+
+impl StagedTransactionIdentity {
+    /// The identity a manifest records, or `None` when it names no
+    /// transaction file or the name has an unrecognized shape.
+    pub(crate) fn recorded_by(dataset: &Dataset) -> Option<Self> {
+        let name = dataset.manifest().transaction_file.as_deref()?;
+        let (read_version, uuid) = name.strip_suffix(".txn")?.split_once('-')?;
+        Some(Self {
+            read_version: read_version.parse().ok()?,
+            uuid: uuid.to_string(),
+        })
+    }
+
+    /// Whether the transaction was staged on a detached version, which is
+    /// how a chain of detached commits links itself without manifest history.
+    pub(crate) fn base_is_detached(&self) -> bool {
+        TableStore::is_detached_version(self.read_version)
+    }
+}
+
+/// Outcome of replaying a detached transaction at its linear target.
+#[derive(Debug)]
+pub enum PromotionCommit {
+    /// The twin landed at the target with the expected uuid.
+    Landed(Box<Dataset>),
+    /// Lance's conflict pass refused the replay: a racing promoter landed
+    /// first, or a foreign commit occupies the target. The caller rechecks.
+    Refused,
+    /// The replay must not run or did not land where it should.
+    Unsafe(String),
 }
 
 /// A Lance write that has produced fragment files on object storage but is
@@ -963,6 +999,13 @@ decide_seam! {
 }
 
 decide_seam! {
+    /// After a promotion's existence check and before its linear replay
+    /// (RFC 0067). A decision here aligns two promoters on one pin,
+    /// or fails a promotion so the next writer inherits it.
+    pub static PROMOTION_PRE_REPLAY = ("promotion.pre_replay", Unreachable, [Fail]);
+}
+
+decide_seam! {
     /// The e_tag comparison in `open_at_entry_verified`. Skipping it simulates
     /// a store whose persisted table version metadata carries no e_tag. Tests
     /// combine it with `CHANGE_FEED_PRE_TABLE_OPEN` + a branch delete/recreate
@@ -1183,10 +1226,7 @@ impl TableStore {
         // failpoint seam simulates the e_tag-less-store configuration so tests
         // can prove the logical witness alone refuses a branch delete/recreate.
         let etag_witness_unavailable = skip(&CHANGE_FEED_ETAG_WITNESS);
-        if !etag_witness_unavailable
-            && let Some(expected) = entry.version_metadata.e_tag()
-            && dataset.manifest_location().e_tag.as_deref() != Some(expected)
-        {
+        if !etag_witness_unavailable && !entry.version_metadata.witnesses(&dataset) {
             return Err(OmniError::manifest(format!(
                 "change feed table '{}' has no persisted native-branch incarnation \
                  witness at the reopened dataset; the branch was deleted and \
@@ -3760,6 +3800,108 @@ impl TableStore {
             )
         })?;
         Ok((dataset, committed_identity))
+    }
+
+    /// RFC 0067: commit a staged effect as a Lance detached
+    /// version of its base. No conflict pass runs, nothing at HEAD moves, and
+    /// the result is invisible until a manifest pin references it.
+    pub async fn commit_staged_detached(
+        &self,
+        ds: Arc<Dataset>,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        let mut builder = CommitBuilder::new(ds)
+            .with_skip_auto_cleanup(true)
+            .with_detached(true);
+        if let Some(affected_rows) = staged.commit_metadata.affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+        let dataset = builder
+            .execute(staged.transaction)
+            .await
+            .map_err(OmniError::storage)?;
+        let identity = self.transaction_identity(&dataset)?;
+        Ok((dataset, identity))
+    }
+
+    /// Whether a Lance version id names a detached version (RFC 0067).
+    pub(crate) fn is_detached_version(version: u64) -> bool {
+        version & lance_table::format::DETACHED_VERSION_MASK != 0
+    }
+
+    /// The identity of the transaction a version records (RFC 0067), read
+    /// from the manifest alone.
+    pub fn transaction_identity(&self, ds: &Dataset) -> Result<StagedTransactionIdentity> {
+        StagedTransactionIdentity::recorded_by(ds).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "version {} of {} records no transaction file",
+                ds.version().version,
+                ds.uri()
+            ))
+        })
+    }
+
+    /// Replay the transaction recorded in `staged` linearly on `base`, so the
+    /// linear history gains an identical twin at `target` (RFC 0067). The
+    /// replay runs with zero retries; a twin that a racing promoter already
+    /// landed is refused by Lance's conflict pass for every kind the engine
+    /// stages detached (the self-conflict rule pinned in
+    /// `lance_surface_guards`) and reported as `Refused` for the caller to
+    /// recheck. A bare `Append` never replays: it would rebase over its twin
+    /// and duplicate rows.
+    pub async fn promote_detached(
+        &self,
+        base: Arc<Dataset>,
+        staged: &Dataset,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionCommit> {
+        let mut transaction = match staged
+            .read_transaction()
+            .await
+            .map_err(OmniError::storage)?
+        {
+            Some(transaction) if transaction.uuid == expected_uuid => transaction,
+            _ => {
+                return Ok(PromotionCommit::Unsafe(
+                    "staged version carries no matching transaction".to_string(),
+                ));
+            }
+        };
+        if matches!(transaction.operation, Operation::Append { .. }) {
+            return Ok(PromotionCommit::Unsafe(
+                "a bare Append is not replay-safe; the engine never stages one".to_string(),
+            ));
+        }
+        if base.version().version + 1 != target {
+            return Ok(PromotionCommit::Unsafe(format!(
+                "base {} is not the predecessor of target {target}",
+                base.version().version
+            )));
+        }
+        transaction.read_version = target - 1;
+        fail(&PROMOTION_PRE_REPLAY)?;
+        match CommitBuilder::new(base)
+            .with_max_retries(0)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+        {
+            Ok(dataset) => {
+                let landed = dataset.version().version;
+                let uuid_matches = StagedTransactionIdentity::recorded_by(&dataset)
+                    .is_some_and(|identity| identity.uuid == expected_uuid);
+                if landed == target && uuid_matches {
+                    Ok(PromotionCommit::Landed(Box::new(dataset)))
+                } else {
+                    Ok(PromotionCommit::Unsafe(format!(
+                        "replay landed at {landed} for target {target} (uuid match {uuid_matches})"
+                    )))
+                }
+            }
+            Err(lance::Error::RetryableCommitConflict { .. }) => Ok(PromotionCommit::Refused),
+            Err(error) => Err(OmniError::storage(error)),
+        }
     }
 
     /// Commit a staged first-touch dataset creation with no conflict retry.

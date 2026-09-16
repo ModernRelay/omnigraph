@@ -95,6 +95,7 @@ omnigraph_seams::catalog! {
     crate::loader::LOAD_POST_BRANCH_CREATE_PRE_STAGE,
     crate::table_store::CHANGE_FEED_ETAG_WITNESS,
     crate::table_store::FORK_POST_CREATE_PRE_OPEN,
+    crate::table_store::PROMOTION_PRE_REPLAY,
 }
 
 /// The one string-keyed lookup: a case file or the harness names a seam, the catalog answers.

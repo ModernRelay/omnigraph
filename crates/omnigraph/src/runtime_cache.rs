@@ -376,6 +376,8 @@ impl TableHandleCache {
         table_branch: Option<&str>,
         version: u64,
         e_tag: Option<&str>,
+        staged_version: Option<u64>,
+        transaction_uuid: Option<&str>,
         location: &str,
         session: Option<&Arc<Session>>,
     ) -> Result<Dataset> {
@@ -394,9 +396,11 @@ impl TableHandleCache {
         // Miss: open without holding the lock (the open is async IO). A concurrent
         // double-miss opens twice and one wins the insert — correct (the dataset
         // at a version is immutable) and rare.
-        let ds = crate::instrumentation::open_dataset(
+        let ds = crate::instrumentation::open_pinned_dataset(
             location,
-            crate::instrumentation::VersionResolution::At(version),
+            version,
+            staged_version,
+            transaction_uuid,
             session,
             crate::instrumentation::table_wrapper(),
         )

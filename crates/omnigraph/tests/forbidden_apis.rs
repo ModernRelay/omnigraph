@@ -585,6 +585,7 @@ gateway_surfaces! {
         "write_text_if_match", "delete_prefix",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
+        "transaction_identity",
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
         "branch_identifier", "list_native_branches", "reopen_for_mutation",
         "ensure_expected_version", "scan", "scan_with_row_id", "scan_batches",
@@ -617,7 +618,14 @@ gateway_surfaces! {
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("staged exact commit gateway")) => [
         "commit_staged_exact",
     ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
+        "commit_staged_detached",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 promotion replay gateway")) => [
+        "promote_detached",
+    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
+        "is_detached_version", "transaction_identity",
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_at_entry_verified", "open_dataset_head", "list_native_branches",
         "named_fork_is_absent", "ensure_expected_version",
@@ -661,6 +669,12 @@ gateway_surfaces! {
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("staged exact commit gateway")) => [
         "commit_staged_exact",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
+        "commit_staged_detached",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 promotion replay gateway")) => [
+        "promote_detached",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
         "append_or_create_batch", "create_empty_dataset", "write_dataset",
@@ -745,15 +759,20 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
     ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".dataset()", 26, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".promote_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
+    ("db/omnigraph/promotion.rs", ".promote_detached(", 1, WriteProtocol::Exact("RFC 0067 promotion replay")),
+    ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/optimize.rs", ".delete(", 1, WriteProtocol::Composed("RFC 0067 reap of a promoted pin's detached manifest after promotion")),
+    ("storage_layer.rs", ".dataset()", 28, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::new(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
-    ("table_store.rs", "CommitBuilder::new(", 2, WriteProtocol::Composed("staged commit primitive")),
+    ("table_store.rs", "CommitBuilder::new(", 4, WriteProtocol::Composed("staged commit primitive")),
     ("table_store.rs", ".create_index_builder(", 3, WriteProtocol::Composed("staged index primitive")),
     ("table_store.rs", ".execute_uncommitted(", 8, WriteProtocol::Composed("staged physical primitive")),
     ("exec/staging.rs", "write_sidecar(", 1, WriteProtocol::Exact("Mutation/Load v9")),
@@ -899,6 +918,8 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".commit(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",
+    ".commit_staged_detached(",
+    ".promote_detached(",
     ".commit_staged(",
     ".fork_branch_from_state(",
     "commit_updates_on_branch_with_expected(",
