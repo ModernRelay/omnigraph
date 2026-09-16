@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - main
@@ -45,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+          if [[ "$EVENT_NAME" == "merge_group" || "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -184,7 +186,7 @@ jobs:
     # Keep this exact reporting context while it remains required by branch
     # protection, but do not run the substrate-sized audit on pull requests.
     # The full audit still runs after merge, on tags, and by manual dispatch.
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     env:
       # Single switch for the vocabulary audit, disabled by decision on
@@ -419,7 +421,7 @@ jobs:
     needs: classify_changes
     # Own job so a fmt failure cannot mask the clippy result; fmt compiles
     # nothing, so no dep or cache steps.
-    if: github.event_name == 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -443,7 +445,7 @@ jobs:
     # PR gate. Lints stay `warn` in-tree; only this job denies, so a new
     # toolchain's lints cannot break local builds. Main-push runs exist only
     # to seed the cache (see save-if below).
-    if: (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.classify_changes.outputs.run_full_ci == 'true'
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -585,7 +587,7 @@ jobs:
           # tag, and dispatch runs are detection channels: --no-fail-fast,
           # so every independent failure is reported.
           no_fail_fast=()
-          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "merge_group" ]]; then
             no_fail_fast+=(--no-fail-fast)
           fi
           cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
@@ -1038,7 +1040,7 @@ jobs:
     # manual dispatch. Keep it independent of `test` so cold backend graphs
     # start together and a failure reports at its real boundary.
     needs: classify_changes
-    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # Cold failpoint and default-feature Lance graphs compile sequentially on
     # the first cache miss; keep the timeout above the RustFS shard envelope.
