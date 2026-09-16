@@ -42,8 +42,11 @@ directory and always require `--graph`. After `cluster token --config DIR`,
 run data commands from `DIR`; no parent directory is searched. Ordinary data
 requests go directly to the cached endpoint without contacting the control
 API. They keep working during an API outage until the token expires or its
-signing trust is retired. Each request refuses redirects, has a 10-second
-deadline, and accepts at most 8 MiB of response data.
+signing trust is retired. Each request refuses redirects and has a 30-second
+total deadline, including connection establishment and reading the response,
+with at most 10 seconds to connect. Responses are limited to 8 MiB. Requests
+are not automatically retried. If a mutation times out, it may still have
+committed: check the graph's state before deciding whether to submit it again.
 
 Missing, malformed, expired, or insufficient cached authority refuses before
 a request. An explicit `--server`, `--profile`, `--store`, or `--cluster`
