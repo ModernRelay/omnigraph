@@ -103,6 +103,19 @@ fn snapshot_entity_count_at(graph: &std::path::Path, entity_kind: &str, type_nam
         .unwrap()
 }
 
+fn served_policy_state(server: &TestServer) -> (Value, Value) {
+    let read = |arguments: &[&str]| {
+        parse_stdout_json(&output_success(
+            cli()
+                .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
+                .args(["--server", &server.base_url, "--graph", "knowledge"])
+                .args(arguments)
+                .arg("--json"),
+        ))
+    };
+    (read(&["snapshot"]), read(&["branch", "list"]))
+}
+
 fn gemini_base_url() -> String {
     env::var("OMNIGRAPH_GEMINI_BASE_URL")
         .ok()
@@ -1209,6 +1222,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
     let insert = "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+    let before = served_policy_state(&server);
 
     // Case 1: no token → the server refuses before any policy check.
     let no_token = cli()
@@ -1245,11 +1259,13 @@ fn local_cli_change_enforces_engine_layer_policy() {
         .output()
         .unwrap();
     assert!(!denied.status.success(), "bruno/main must be denied");
-    let denied_stderr = String::from_utf8_lossy(&denied.stderr);
+    let refusal = parse_stdout_json(&denied);
+    assert_eq!(refusal["code"], "forbidden");
     assert!(
-        denied_stderr.contains("denied"),
-        "expected 'denied' message for bruno/main, got stderr: {denied_stderr}"
+        refusal["error"].as_str().unwrap().contains("denied"),
+        "expected a policy denial for bruno/main: {refusal}"
     );
+    assert_eq!(served_policy_state(&server), before);
 
     // Case 3: ragnor token against main → permitted by admins-write.
     let allowed = parse_stdout_json(&output_success(
@@ -1346,6 +1362,7 @@ fn local_cli_load_enforces_engine_layer_policy() {
         cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
+    let before = served_policy_state(&server);
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("policy-load.jsonl");
     // The seeded graph (test.jsonl) has Knows/WorksAt edges over its Persons, so a
@@ -1381,11 +1398,13 @@ fn local_cli_load_enforces_engine_layer_policy() {
         .output()
         .unwrap();
     assert!(!denied.status.success(), "bruno/main load must be denied");
-    let stderr = String::from_utf8_lossy(&denied.stderr);
+    let refusal = parse_stdout_json(&denied);
+    assert_eq!(refusal["code"], "forbidden");
     assert!(
-        stderr.contains("denied"),
-        "expected 'denied' for bruno/main load, got: {stderr}"
+        refusal["error"].as_str().unwrap().contains("denied"),
+        "expected a policy denial for bruno/main load: {refusal}"
     );
+    assert_eq!(served_policy_state(&server), before);
 
     // act-ragnor: admins-write rule permits change anywhere.
     let allowed = parse_stdout_json(&output_success(
@@ -1421,6 +1440,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
         cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
+    let before = served_policy_state(&server);
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("policy-ingest.jsonl");
     fs::write(
@@ -1444,11 +1464,13 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
         .output()
         .unwrap();
     assert!(!denied.status.success(), "bruno ingest must be denied");
-    let stderr = String::from_utf8_lossy(&denied.stderr);
+    let refusal = parse_stdout_json(&denied);
+    assert_eq!(refusal["code"], "forbidden");
     assert!(
-        stderr.contains("denied"),
-        "expected 'denied' for bruno ingest, got: {stderr}"
+        refusal["error"].as_str().unwrap().contains("denied"),
+        "expected a policy denial for bruno ingest: {refusal}"
     );
+    assert_eq!(served_policy_state(&server), before);
 
     let allowed = parse_stdout_json(&output_success(
         cli()

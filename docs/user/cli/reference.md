@@ -60,7 +60,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Preview or publish classified storage drift | direct |
 | `cleanup` | Delete old versions under an explicit retention policy | direct |
-| `graphs list` | List graphs on a server | served |
+| `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
@@ -99,10 +99,9 @@ pretty and the `rows` array compact, verbatim.
 
 ### Machine-readable read and write positions
 
-When the read snapshot has an effective graph head, `omnigraph query --json`
-returns its `graph_commit_id` in the complete read envelope. The id and rows
-come from the same pinned snapshot; use that id when a later mutation must be
-conditional on the state that was read.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph
+head. The id and rows share one pinned snapshot; use that id for a later
+conditional mutation.
 
 Successful `mutate --json`, `load --json`, and compatibility
 `ingest --json` responses include `commit`, the exact commit published by
@@ -110,6 +109,10 @@ that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `graph_manifest_version`, optional parent and merged-parent ids, optional
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
 that changes no entities returns `"commit": null`.
+
+`--json` and read commands' `--format json` preserve a graph server's complete
+structured error on stdout (for example, `"code": "forbidden"`) and exit 1.
+Malformed responses remain diagnostics. Conditional mismatches retain exit 4.
 
 ### Conditional mutations
 
@@ -326,9 +329,9 @@ context is present. API failures never trigger direct execution.
 
 ## Managed data access
 
-Use `cluster token` to cache scoped data authority, then `query` or `mutate`
-with `--graph` from the managed folder. See [managed data access](managed-data.md)
-for permissions, offline behavior, expiry, and local credential clearing.
+`cluster token` caches an identity credential; applied Cedar policy supplies
+permissions. See [managed data access](managed-data.md) for graph discovery,
+routing, offline access, expiry, clearing and explicit restricted credentials.
 
 ## Confirmation rules
 
