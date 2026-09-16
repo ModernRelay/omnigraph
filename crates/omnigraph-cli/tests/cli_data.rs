@@ -2287,28 +2287,38 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             4,
         ),
     ] {
-        let server = IntentApiFixture::new(vec![IntentReply::json(status, body.clone())]);
-        let output = cli()
-            .env_remove("OMNIGRAPH_BEARER_TOKEN")
-            .args(["--server", &server.origin, "--graph", "knowledge"])
-            .args(&arguments)
-            .arg("--json")
-            .output()
-            .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(exit),
-            "{arguments:?}: {output:?}"
-        );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
-                panic!("{arguments:?} lost structured HTTP {status}: {error}; {output:?}")
-            }),
-            body,
-            "{arguments:?} must preserve the server's complete error contract"
-        );
-        assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
-        server.assert_complete();
+        let formats: &[&[&str]] = if arguments[0] == "query" {
+            &[&["--json"], &["--format", "json"]]
+        } else {
+            &[&["--json"]]
+        };
+        for format in formats {
+            let server = IntentApiFixture::new(vec![IntentReply::json(status, body.clone())]);
+            let output = cli()
+                .env_remove("OMNIGRAPH_BEARER_TOKEN")
+                .args(["--server", &server.origin, "--graph", "knowledge"])
+                .args(&arguments)
+                .args(*format)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(exit),
+                "{arguments:?} {format:?}: {output:?}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+                    panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
+                }),
+                body,
+                "{arguments:?} {format:?} must preserve the server's complete error contract"
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{arguments:?} {format:?}: {output:?}"
+            );
+            server.assert_complete();
+        }
     }
 }
 

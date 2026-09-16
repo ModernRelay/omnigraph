@@ -2,12 +2,12 @@
 rfc: "0064"
 title: "Identity credentials and applied policy authorization"
 track: maintainer
-status: draft
-implementation: in-progress
+status: accepted
+implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-16
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -28,8 +28,9 @@ permission to read its data or schema.
 Add an identity-authorized cluster planning/apply API that checks the same
 policy engine against the current applied configuration before effects.
 Existing direct storage-holder APIs and version 1 restrictions remain intact.
-This proposal and its implementation are for review; neither is accepted by
-being present in an unmerged pull request.
+Version 2 is the normal credential profile. Version 1 remains an explicit
+compatibility interface for existing restricted clients; its presence does
+not require a new deployment to operate both profiles.
 
 ## Motivation
 
@@ -226,25 +227,35 @@ operations, not Lance semantics. No new substrate behavior is assumed.
 
 ## Rollout
 
-1. Review this contract and qualify dual-profile verification, discovery,
-   shared policy enforcement and client compatibility.
-2. Apply reviewed policy/principal configuration to existing clusters through
-   their existing authorized path; verify management access before activation.
-3. Activate the new execution boundary and compatible server/client versions,
-   then enable version 2 issuance explicitly.
-4. Migrate restricted workloads to dedicated policy-configured identities
-   only through an explicit change. Keep the legacy path during migration.
-5. Retire version 1 only after all issuers stop producing it and at least
-   86,430 seconds pass, with old client migration accounted for.
+Qualify identity verification, discovery, shared policy enforcement and client
+compatibility before activating a supporting server and CLI. A new deployment
+may enable identity-only issuance directly with its declared initial management
+policy. No staged migration or concurrent legacy issuer is required.
+
+An existing deployment first installs reviewed policy/principal configuration
+through its current authorized path and verifies management access. The
+execution boundary then activates with compatible server/client versions.
+Retained graphs, configuration and accepted operations require their existing
+storage and ownership qualification regardless of the authentication cutover.
+
+The published version 1 verifier, data types and explicit restricted CLI
+requests remain compatible. Issuers that continue serving restricted clients
+retain their exact ceilings; unsupported requests refuse without widening them.
+An issuer may stop producing version 1 credentials once it has accounted for
+its clients. Retiring their verification trust also requires waiting at least
+86,430 seconds after the last issuance. This bounds old credential validity;
+it is not a requirement to build a legacy issuance path in new deployments.
 
 ## Unresolved questions
 
-No alternative authority model is left open. Acceptance requires review of
-the additive public APIs and the evidence above; an implementation PR remains
-unmerged until that review is complete.
+No alternative authority model is left open. Live activation and qualification
+of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
 
 - 2026-09-09: Proposed the separate identity profile, authenticated minimal
   discovery, and authorization against applied policy, retaining legacy
   restrictions and direct storage-holder behavior.
+- 2026-09-16: Accepted identity-only credentials and applied-policy authority.
+  Replaced the staged rollout requirement with direct activation for new
+  deployments and explicitly scoped version 1 to published compatibility.

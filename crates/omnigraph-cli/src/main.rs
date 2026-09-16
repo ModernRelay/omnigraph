@@ -158,7 +158,12 @@ async fn main() -> Result<()> {
             .ok()
             .flatten()
             .copied()
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || command_matches
+                .try_get_one::<ReadOutputFormat>("format")
+                .ok()
+                .flatten()
+                == Some(&ReadOutputFormat::Json);
         (Cli::from_arg_matches(&matches)?, json)
     };
     match run(cli).await {
