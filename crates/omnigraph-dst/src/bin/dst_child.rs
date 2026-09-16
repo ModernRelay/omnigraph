@@ -379,7 +379,9 @@ fn main() {
     child::run();
     #[cfg(not(tokio_unstable))]
     {
-        eprintln!("dst_child requires --cfg tokio_unstable (run cargo from the crate dir)");
+        eprintln!(
+            "dst_child requires --cfg tokio_unstable (the workspace .cargo/config.toml sets it; an env RUSTFLAGS without it overrides that)"
+        );
         std::process::exit(2);
     }
 }

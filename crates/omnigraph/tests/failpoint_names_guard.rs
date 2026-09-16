@@ -5,10 +5,12 @@
 //! The catalog statics give compile-time typo protection at every helper
 //! call; the string-keyed `catalog::decide(name)` lookup keeps a literal path
 //! open, so this source-walk closes the gap by construction — the same
-//! defense-in-depth shape as `forbidden_apis.rs`. Add a new seam by adding its
-//! static to the catalog first; this guard then forces every call site to
-//! reference it, and the second test forces it into `ALL`, onto a production
-//! crossing, and onto the helper its declared effect pairs with.
+//! defense-in-depth shape as `forbidden_apis.rs`. A seam is declared beside
+//! the site it guards (so the compiler records its location) and indexed by
+//! the catalog; this guard forces every call site to reference the static,
+//! and the second test forces every declaration into the catalog's `pub use`
+//! list and `ALL`, out of the catalog itself and out of test modules, onto a
+//! production crossing, and onto the helper its declared effect pairs with.
 //!
 //! The walker's grammar is the spelling the tree uses: a helper called by its
 //! own name with `&…::IDENT` as the argument, `IDENT` a catalog static (a
@@ -27,11 +29,13 @@ const LITERAL_ARG_PREFIXES: &[&str] = &[
     "fail(&",
     "skip(&",
     "contention(&",
+    "guarded(",
     "park_first(",
     "catalog::decide(",
 ];
 
-/// Site helper prefixes paired with the effect the seam they take must declare.
+/// Site helper prefixes paired with the one effect the seam they take must
+/// declare; `guarded(` takes any declared set and is not listed.
 const HELPER_EFFECTS: &[(&str, &str)] = &[
     ("fail(", "Fail"),
     ("skip(", "Skip"),
@@ -143,58 +147,103 @@ fn engine_failpoints_test() -> PathBuf {
     manifest_dir().join("tests/failpoints.rs")
 }
 
-/// One declared catalog static.
+/// One declared seam static and the file it lives in.
 struct Declared {
     ident: String,
     name: String,
-    effect: String,
+    effects: Vec<String>,
+    file: PathBuf,
 }
 
-/// One catalog's declared statics plus the identifiers its `ALL` array lists.
+/// One crate's declared statics, the identifiers its catalog re-exports, and
+/// the identifiers its `ALL` array lists.
 struct Catalog {
     label: String,
     declared: Vec<Declared>,
+    reexported: Vec<String>,
     listed: Vec<String>,
 }
 
-/// Parse a catalog source: every `pub static IDENT: … = Seam::decide("name",
-/// Op::…, Effect::…, …);` item, whatever its type is spelled as, plus `ALL`.
-fn parse_catalog_text(contents: &str, label: &str) -> Catalog {
+/// Every decision seam declared in `contents`, one grammar: the
+/// `decide_seam!` body `pub static IDENT = ("name", Op, [Effect, …]);`.
+fn parse_declarations(contents: &str, file: &Path) -> Vec<Declared> {
     let mut declared = Vec::new();
     let mut cursor = 0;
     while let Some(rel) = contents[cursor..].find("pub static ") {
         let at = cursor + rel + "pub static ".len();
-        let Some(colon) = contents[at..].find(':') else {
-            break;
-        };
-        let ident = contents[at..at + colon].trim().to_string();
-        let item_start = at + colon;
+        let ident_len = contents[at..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(0);
+        let ident = contents[at..at + ident_len].to_string();
+        let item_start = at + ident_len;
         let Some(item_len) = contents[item_start..].find(';') else {
             break;
         };
         let item = &contents[item_start..item_start + item_len];
         cursor = item_start + item_len;
-        let Some(decide) = item.find("Seam::decide(") else {
+        let (name, effects) = if item.trim_start().starts_with("= (") {
+            let open = item.find('[').unwrap_or(item.len());
+            let close = item[open..].find(']').map_or(item.len(), |i| open + i);
+            let effects = item[open + 1..close.max(open + 1)]
+                .split(',')
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty())
+                .collect();
+            (quoted(item).unwrap_or_default().to_string(), effects)
+        } else {
             continue;
         };
-        let after = &item[decide + "Seam::decide(".len()..];
-        let name = quoted(after).unwrap_or_default().to_string();
-        let effect = after
-            .find("Effect::")
-            .map(|i| {
-                after[i + "Effect::".len()..]
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
         declared.push(Declared {
             ident,
             name,
-            effect,
+            effects,
+            file: file.to_path_buf(),
         });
     }
+    declared
+}
 
+/// Parse one text holding declarations, `pub use …::IDENT;` re-exports and
+/// `ALL` together (the fixture shape).
+fn parse_catalog_text(contents: &str, label: &str) -> Catalog {
+    let mut catalog = parse_index_text(contents, label);
+    catalog.declared = parse_declarations(contents, Path::new(label));
+    catalog
+}
+
+/// The catalog's index: the paths inside `catalog! { … }`, which are both
+/// the re-exports and `ALL`; or, spelled out, its `pub use …::IDENT;` lines
+/// and its `ALL` array.
+fn parse_index_text(contents: &str, label: &str) -> Catalog {
+    if let Some(open) = contents.find("catalog! {") {
+        let body_start = open + "catalog! {".len();
+        let close = block_end(contents, body_start)
+            .unwrap_or_else(|| panic!("catalog {label}: catalog! block never closes"));
+        let idents: Vec<String> = contents[body_start..close]
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                (!entry.is_empty()).then(|| entry.rsplit("::").next().unwrap_or(entry).to_string())
+            })
+            .collect();
+        return Catalog {
+            label: label.to_string(),
+            declared: Vec::new(),
+            reexported: idents.clone(),
+            listed: idents,
+        };
+    }
+    let reexported = contents
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("pub use ")?
+                .strip_suffix(';')?
+                .rsplit("::")
+                .next()
+                .map(str::to_string)
+        })
+        .collect();
     let all_at = contents
         .find("pub static ALL:")
         .unwrap_or_else(|| panic!("catalog {label} declares no ALL array"));
@@ -210,15 +259,81 @@ fn parse_catalog_text(contents: &str, label: &str) -> Catalog {
 
     Catalog {
         label: label.to_string(),
-        declared,
+        declared: Vec::new(),
+        reexported,
         listed,
     }
 }
 
-fn parse_catalog(path: &Path, label: &str) -> Catalog {
-    let contents = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("catalog {} is unreadable: {e}", path.display()));
-    parse_catalog_text(&contents, label)
+/// A crate's catalog: the index from `catalog_path`, the declarations from
+/// every other source file under `src_root`.
+fn parse_catalog(catalog_path: &Path, src_root: &Path, label: &str) -> Catalog {
+    let contents = std::fs::read_to_string(catalog_path)
+        .unwrap_or_else(|e| panic!("catalog {} is unreadable: {e}", catalog_path.display()));
+    let mut catalog = parse_index_text(&contents, label);
+    let mut files = Vec::new();
+    collect_ext(src_root, "rs", &mut files);
+    files.sort();
+    for file in files {
+        if file.canonicalize().ok() == catalog_path.canonicalize().ok() {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            catalog.declared.extend(parse_declarations(&text, &file));
+        }
+    }
+    catalog
+}
+
+/// Whether a source line declares a seam static, in the `decide_seam!`
+/// body, by the alias or by the raw type; such a line names the ident
+/// without crossing or arming it.
+fn is_declaration(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("pub static ") && line.contains(" = (")
+}
+
+/// 1-based lines of every declaration the index cannot see: a `Seam::decide(`
+/// whose item is not a `pub static`, or a `decide_seam!` body without one (a
+/// private or crate-visible static is invisible to the listing and teardown).
+fn unindexable_declarations(contents: &str) -> Vec<usize> {
+    let raw = contents.match_indices("Seam::decide(");
+    let bodies = contents.match_indices("decide_seam!").filter(|(at, _)| {
+        let end = block_end(contents, *at).unwrap_or(contents.len());
+        !contents[*at..end].contains("pub static ")
+    });
+    let mut lines: Vec<usize> = raw
+        .chain(bodies)
+        .map(|(at, _)| line_of(contents, at))
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// 1-based lines of every declaration in a catalog text: the catalog only
+/// indexes, and discovery skips it, so a seam declared there is checked by
+/// nothing else.
+fn catalog_declarations(catalog_text: &str) -> Vec<usize> {
+    let mut lines: Vec<usize> = catalog_text
+        .match_indices("decide_seam!")
+        .chain(catalog_text.match_indices("Seam::decide("))
+        .map(|(at, _)| line_of(catalog_text, at))
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
+/// Byte offset of the first line after `from` that is only a closing brace,
+/// at any indentation: where a macro block invoked inside a module ends.
+fn block_end(contents: &str, from: usize) -> Option<usize> {
+    let mut at = from;
+    for line in contents[from..].split_inclusive('\n') {
+        if line.trim() == "}" {
+            return Some(at);
+        }
+        at += line.len();
+    }
+    None
 }
 
 /// The first double-quoted string in `text`.
@@ -256,8 +371,10 @@ fn reference_corpus(rust_roots: &[PathBuf], gqt_cases: Option<&Path>, skip: &Pat
             continue;
         }
         if let Ok(text) = std::fs::read_to_string(&file) {
-            corpus.push_str(&text);
-            corpus.push('\n');
+            for line in text.lines().filter(|line| !is_declaration(line)) {
+                corpus.push_str(line);
+                corpus.push('\n');
+            }
         }
     }
     corpus
@@ -296,8 +413,8 @@ fn helper_calls(contents: &str) -> Vec<(&'static str, String)> {
     calls
 }
 
-/// Production source with comment lines removed: a static counts as crossed
-/// only when code under `src/` names it.
+/// Production source with comment and declaration lines removed: a static
+/// counts as crossed only when code under `src/` names it.
 fn production_corpus(src_root: &Path, catalog_path: &Path) -> String {
     let mut files = Vec::new();
     collect_ext(src_root, "rs", &mut files);
@@ -310,7 +427,7 @@ fn production_corpus(src_root: &Path, catalog_path: &Path) -> String {
             continue;
         };
         for line in text.lines() {
-            if !line.trim_start().starts_with("//") {
+            if !line.trim_start().starts_with("//") && !is_declaration(line) {
                 corpus.push_str(line);
                 corpus.push('\n');
             }
@@ -319,23 +436,46 @@ fn production_corpus(src_root: &Path, catalog_path: &Path) -> String {
     corpus
 }
 
-/// A decision seam declared anywhere under `src/` other than the catalog is
-/// invisible to `ALL`, the listing and this guard.
-fn check_no_stray_declarations(src_root: &Path, catalog_path: &Path, violations: &mut Vec<String>) {
+/// A seam is a `pub static` beside its site, only indexed by the catalog:
+/// declared in the catalog it records no site, under a test module it is
+/// gone from non-test builds, not `pub static` it is invisible to the index.
+fn check_declaration_placement(
+    catalog: &Catalog,
+    catalog_path: &Path,
+    src_root: &Path,
+    violations: &mut Vec<String>,
+) {
     let mut files = Vec::new();
     collect_ext(src_root, "rs", &mut files);
+    files.sort();
     for file in files {
-        if file.canonicalize().ok() == catalog_path.canonicalize().ok() {
-            continue;
-        }
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
-        if let Some(at) = text.find("Seam::decide(") {
+        for line in unindexable_declarations(&text) {
             violations.push(format!(
-                "{}:{}: a decision seam declared outside the catalog",
-                file.display(),
-                line_of(&text, at)
+                "{}:{line}: a decision seam outside the `decide_seam! {{ pub static … }}` grammar; the index, the listing and the catalog teardown cannot see it",
+                file.display()
+            ));
+        }
+    }
+    let catalog_text = std::fs::read_to_string(catalog_path).unwrap_or_default();
+    for line in catalog_declarations(&catalog_text) {
+        violations.push(format!(
+            "{}:{line}: a decision seam declared in the catalog, where discovery does not look; declare it beside its site and list its path in `catalog!`",
+            catalog_path.display()
+        ));
+    }
+    for d in &catalog.declared {
+        let under_tests = d
+            .file
+            .components()
+            .any(|c| c.as_os_str() == "tests" || c.as_os_str() == "tests.rs");
+        if under_tests {
+            violations.push(format!(
+                "{}: `{}` is declared under a test module and does not exist in a non-test build",
+                d.file.display(),
+                d.ident
             ));
         }
     }
@@ -378,6 +518,23 @@ fn check_catalog(
             ));
         }
     }
+    let reexported: BTreeSet<&str> = catalog.reexported.iter().map(String::as_str).collect();
+    for ident in &declared_idents {
+        if !reexported.contains(ident) {
+            violations.push(format!(
+                "{}: `{ident}` is declared but not re-exported by the catalog",
+                catalog.label
+            ));
+        }
+    }
+    for ident in &reexported {
+        if !declared_idents.contains(ident) {
+            violations.push(format!(
+                "{}: the catalog re-exports `{ident}`, which is not a declared decision seam",
+                catalog.label
+            ));
+        }
+    }
 
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for d in &catalog.declared {
@@ -409,13 +566,13 @@ fn check_catalog(
     }
 }
 
-/// Every site helper call names a static whose declared effect is the one
-/// the helper implements.
+/// Every single-effect site helper call names a static whose one declared
+/// effect is the one the helper implements.
 fn check_helper_pairing(catalogs: &[&Catalog], files: &[PathBuf], violations: &mut Vec<String>) {
-    let effects: std::collections::BTreeMap<&str, &str> = catalogs
+    let effects: std::collections::BTreeMap<&str, &[String]> = catalogs
         .iter()
         .flat_map(|c| c.declared.iter())
-        .map(|d| (d.ident.as_str(), d.effect.as_str()))
+        .map(|d| (d.ident.as_str(), d.effects.as_slice()))
         .collect();
     for file in files {
         let Ok(contents) = std::fs::read_to_string(file) else {
@@ -423,12 +580,13 @@ fn check_helper_pairing(catalogs: &[&Catalog], files: &[PathBuf], violations: &m
         };
         for (helper_effect, ident) in helper_calls(&contents) {
             if let Some(declared) = effects.get(ident.as_str())
-                && *declared != helper_effect
+                && *declared != [helper_effect.to_string()]
             {
                 violations.push(format!(
-                    "{}: `{ident}` declares Effect::{declared} but is passed to the \
-                     `{}` helper",
+                    "{}: `{ident}` declares [{}] but is passed to the `{}` helper, \
+                     which takes a seam declaring only Effect::{helper_effect}",
                     file.display(),
+                    declared.join(", "),
                     helper_effect.to_lowercase(),
                 ));
             }
@@ -441,8 +599,16 @@ fn catalogs_are_complete_unique_and_used() {
     let engine_catalog_path = manifest_dir().join("src/seams/catalog.rs");
     let cluster_catalog_path = cluster_dir().join("src/seams.rs");
 
-    let engine = parse_catalog(&engine_catalog_path, "omnigraph::seams::catalog");
-    let cluster = parse_catalog(&cluster_catalog_path, "omnigraph_cluster::seams::catalog");
+    let engine = parse_catalog(
+        &engine_catalog_path,
+        &manifest_dir().join("src"),
+        "omnigraph::seams::catalog",
+    );
+    let cluster = parse_catalog(
+        &cluster_catalog_path,
+        &cluster_dir().join("src"),
+        "omnigraph_cluster::seams::catalog",
+    );
 
     let engine_corpus = reference_corpus(
         &[
@@ -465,31 +631,53 @@ fn catalogs_are_complete_unique_and_used() {
     let mut violations = Vec::new();
     check_catalog(&engine, &engine_src, &engine_corpus, &mut violations);
     check_catalog(&cluster, &cluster_src, &cluster_corpus, &mut violations);
-    check_no_stray_declarations(
-        &manifest_dir().join("src"),
+    check_declaration_placement(
+        &engine,
         &engine_catalog_path,
+        &manifest_dir().join("src"),
         &mut violations,
     );
-    check_no_stray_declarations(
-        &cluster_dir().join("src"),
+    check_declaration_placement(
+        &cluster,
         &cluster_catalog_path,
+        &cluster_dir().join("src"),
         &mut violations,
     );
     check_helper_pairing(&[&engine, &cluster], &files_to_scan(), &mut violations);
 
     assert!(
         violations.is_empty(),
-        "the seam catalogs must stay complete (every static in ALL and nothing else), \
-         uniquely named, used, and paired with the helper their effect names:\n{}",
+        "the seam catalogs must stay complete (every static declared beside its site, \
+         re-exported and in ALL, nothing else), uniquely named, used, and paired with \
+         the helper their effect names:\n{}",
         violations.join("\n")
     );
 }
 
 const FIXTURE_CATALOG: &str = r#"
-pub static A: DecideSeam = Seam::decide("x.a", Op::Mutation, Effect::Fail, Global::new());
-pub static B: Seam<dyn Decide, Global<dyn Decide>> =
-    Seam::decide("x.b", Op::Mutation, Effect::Skip, Global::new());
-pub static ALL: &[&'static dyn SeamEntry] = &[&A, &B, &A];
+decide_seam! {
+    pub static A = ("x.a", Mutation, [Fail]);
+}
+decide_seam! {
+    pub static B = ("x.b", Mutation, [Skip]);
+}
+decide_seam! {
+    /// Two effects.
+    pub static C = ("x.c", Mutation, [Fail, Skip]);
+}
+decide_seam! {
+    pub static D = (
+        "x.d",
+        Mutation,
+        [Fail, Skip],
+    );
+}
+omnigraph_seams::catalog! {
+    crate::x::A,
+    crate::x::B,
+    crate::x::D,
+    crate::x::A,
+}
 "#;
 
 #[test]
@@ -499,10 +687,28 @@ fn guard_refuses_duplicates_and_mispaired_helpers() {
         catalog
             .declared
             .iter()
-            .map(|d| d.ident.as_str())
+            .map(|d| (d.ident.as_str(), d.effects.join(",")))
             .collect::<Vec<_>>(),
-        ["A", "B"],
-        "a static spelled without the alias is still parsed"
+        [
+            ("A", "Fail".to_string()),
+            ("B", "Skip".to_string()),
+            ("C", "Fail,Skip".to_string()),
+            ("D", "Fail,Skip".to_string())
+        ],
+        "a set is parsed whole; a body wrapped across lines too"
+    );
+    let mut pairing = Vec::new();
+    let fixture = std::env::temp_dir().join("failpoint_names_guard_pairing.rs");
+    std::fs::write(&fixture, "fail(&catalog::C)?; guarded(&catalog::C, op);").unwrap();
+    check_helper_pairing(&[&catalog], std::slice::from_ref(&fixture), &mut pairing);
+    assert_eq!(
+        pairing,
+        [format!(
+            "{}: `C` declares [Fail, Skip] but is passed to the `fail` helper, which takes \
+             a seam declaring only Effect::Fail",
+            fixture.display()
+        )],
+        "a multi-effect seam reaches a single-effect helper only through `guarded`"
     );
     let mut violations = Vec::new();
     check_catalog(
@@ -515,11 +721,50 @@ fn guard_refuses_duplicates_and_mispaired_helpers() {
         violations,
         [
             "fixture: ALL lists `A` more than once".to_string(),
+            "fixture: `C` is declared but missing from ALL".to_string(),
+            "fixture: `C` is declared but not re-exported by the catalog".to_string(),
             "fixture: `B` (\"x.b\") has no production crossing under src/ — a seam nothing \
              crosses is dead weight"
                 .to_string(),
+            "fixture: `C` (\"x.c\") has no production crossing under src/ — a seam nothing \
+             crosses is dead weight"
+                .to_string(),
+            "fixture: `D` (\"x.d\") has no production crossing under src/ — a seam nothing \
+             crosses is dead weight"
+                .to_string(),
         ],
-        "`AB` must not count as a crossing of `A`; a comment or a case is not a crossing"
+        "`AB` must not count as a crossing of `A`; a comment or a case is not a crossing; \
+         a declared seam the catalog! list omits is reported twice, as unlisted and as unexported"
+    );
+    assert!(
+        !is_declaration("    fail(&catalog::A)?;")
+            && !is_declaration("pub static A: DecideSeam = x;")
+            && is_declaration("    pub static D = (\"x.d\", Mutation, [Fail]);")
+            && is_declaration("    pub static E = ("),
+        "a declaration line is the macro body's `pub static … = (`, wrapped or not; a crossing or a raw static is not one"
+    );
+    assert_eq!(
+        unindexable_declarations(
+            "pub static A: DecideSeam = Seam::decide(\"x.a\", Op::Mutation, &[Effect::Fail], Global::new());\n\
+             static PRIVATE: DecideSeam = Seam::decide(\"x.p\", Op::Mutation, &[Effect::Fail], Global::new());\n\
+             pub(crate) static CRATE: DecideSeam =\n    Seam::decide(\"x.c\", Op::Mutation, &[Effect::Fail], Global::new());\n\
+             crate::seams::decide_seam! {\n    pub static D = (\"x.d\", Mutation, [Fail]);\n}\n\
+             crate::seams::decide_seam! {\n    static E = (\"x.e\", Mutation, [Fail]);\n}\n"
+        ),
+        [1, 2, 4, 8],
+        "every hand-written `Seam::decide` and every macro body without `pub static` is reported by line; the macro `pub static` is not"
+    );
+    assert_eq!(
+        catalog_declarations(
+            "omnigraph_seams::catalog! {\n    crate::x::A,\n}\n\
+             decide_seam! {\n    pub static UNINDEXED = (\"x.u\", Mutation, [Fail]);\n}\n"
+        ),
+        [4],
+        "a declaration inside the catalog is reported even when it is a well-formed `pub static`: discovery never reads the catalog"
+    );
+    assert!(
+        catalog_declarations("omnigraph_seams::catalog! {\n    crate::x::A,\n}\n").is_empty(),
+        "an index-only catalog is clean"
     );
 
     let calls = helper_calls(

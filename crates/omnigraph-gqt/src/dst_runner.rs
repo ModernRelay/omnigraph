@@ -177,34 +177,58 @@ pub(crate) fn observe_fault(error: &OmniError) {
     }
 }
 
+/// The effect a case's action fires on a seam declaring `effects`, or `None`
+/// when the seam admits no such action: `fail` takes `Fail`, else
+/// `Contention`; `contention` takes only `Contention`; `skip` takes `Skip`.
+/// `hold` is never admitted. One rule for
+/// arming and for judging a report's delivery evidence.
+pub(crate) fn admitted_effect(
+    action: SeamAction,
+    effects: &[omnigraph::seams::Effect],
+) -> Option<omnigraph::seams::Effect> {
+    use omnigraph::seams::Effect;
+    let candidates: &[Effect] = match action {
+        SeamAction::Fail => &[Effect::Fail, Effect::Contention],
+        SeamAction::Contention => &[Effect::Contention],
+        SeamAction::Skip => &[Effect::Skip],
+        SeamAction::Hold => &[],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| effects.contains(candidate))
+}
+
 /// Admission of one seam directive against the engine's catalog and the step
-/// it precedes: the seam must exist, the action must match the effect the
-/// site declares, and the step must be of a kind that crosses the seam's
-/// operation.
+/// it precedes: the seam must exist, the action must be among the effects
+/// the site declares, and the step must be of a kind that crosses the seam's
+/// operation. Returns the seam and the effect the action fires.
 pub(crate) fn admit_seam(
     seam: &SeamDirective,
     step: Option<&crate::Step>,
-) -> Result<&'static omnigraph::seams::DecideSeam, String> {
-    use omnigraph::seams::{Effect, Op};
+) -> Result<
+    (
+        &'static omnigraph::seams::DecideSeam,
+        omnigraph::seams::Effect,
+    ),
+    String,
+> {
+    use omnigraph::seams::Op;
     let Some(entry) = omnigraph::seams::catalog::decide(&seam.at) else {
         return Err(format!(
             "unsupported_environment: unknown seam: {}",
             seam.at
         ));
     };
-    let effect_ok = matches!(
-        (seam.action, entry.effect()),
-        (SeamAction::Fail, Some(Effect::Fail | Effect::Contention))
-            | (SeamAction::Skip, Some(Effect::Skip))
-    );
-    if !effect_ok {
+    let Some(effect) = admitted_effect(seam.action, entry.effects()) else {
         return Err(format!(
-            "unsupported_environment: seam {} declares effect {} and does not admit action {}",
+            "unsupported_environment: seam {} (declared at {}) declares effects {} and does not admit action {}",
             seam.at,
-            entry.effect().map_or("none", |effect| effect.as_str()),
+            location(entry.site()),
+            omnigraph::seams::effects_list(entry.effects()),
             seam.action.as_str()
         ));
-    }
+    };
     let compatible = matches!(
         (entry.op(), step),
         (Op::Mutation | Op::AnyWrite, Some(crate::Step::Mutate(_)))
@@ -237,7 +261,7 @@ pub(crate) fn admit_seam(
             entry.op().as_str()
         ));
     }
-    Ok(entry)
+    Ok((entry, effect))
 }
 
 /// One armed seam: the guard that keeps the decider installed for the step,
@@ -245,6 +269,7 @@ pub(crate) fn admit_seam(
 #[cfg(tokio_unstable)]
 pub(crate) struct ArmedSeam {
     at: String,
+    entry: &'static omnigraph::seams::DecideSeam,
     occurrence: usize,
     guard: Option<DecideGuard>,
     counted: std::sync::Arc<omnigraph::seams::Counted>,
@@ -260,10 +285,11 @@ pub(crate) fn arm_seams(
     seams
         .iter()
         .map(|seam| {
-            let entry = admit_seam(seam, Some(step))?;
-            let (guard, counted) = entry.count_and_fire_at(seam.occurrence as u64);
+            let (entry, effect) = admit_seam(seam, Some(step))?;
+            let (guard, counted) = entry.count_and_fire_at_with(seam.occurrence as u64, effect);
             Ok(ArmedSeam {
                 at: seam.at.clone(),
+                entry,
                 occurrence: seam.occurrence,
                 guard: Some(guard),
                 counted,
@@ -303,18 +329,26 @@ pub(crate) fn finish_seams(mut armed: Vec<ArmedSeam>) -> Result<(), String> {
                 seam.at, seam.occurrence
             ));
         }
+        let effect = seam.counted.effect().as_str();
+        let declared_at = location(seam.entry.site());
+        let fired_at = seam.entry.last_fired().map(location);
         record(
             "seam_delivered",
-            serde_json::json!({"at": seam.at, "occurrence": seam.occurrence, "crossings": crossings}),
+            serde_json::json!({"at": seam.at, "occurrence": seam.occurrence, "crossings": crossings, "effect": effect, "declared_at": declared_at, "fired_at": fired_at}),
         );
         observe(|| {
             format!(
-                "seam delivered: {} on crossing {}",
+                "seam delivered: {} on crossing {} with effect {effect}",
                 seam.at, seam.occurrence
             )
         });
     }
     Ok(())
+}
+
+/// `file:line` of a seam's declaration or firing, as a report prints it.
+fn location(at: &std::panic::Location<'_>) -> String {
+    format!("{}:{}", at.file(), at.line())
 }
 
 #[cfg(not(tokio_unstable))]
@@ -1455,5 +1489,38 @@ fn replay_attempts(
         Ok(())
     } else {
         Err(failures.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::{SeamAction, admitted_effect};
+    use omnigraph::seams::Effect;
+
+    #[test]
+    fn fail_and_contention_are_selectable_regardless_of_declaration_order() {
+        for effects in [
+            [Effect::Fail, Effect::Contention],
+            [Effect::Contention, Effect::Fail],
+        ] {
+            assert_eq!(
+                admitted_effect(SeamAction::Fail, &effects),
+                Some(Effect::Fail)
+            );
+            assert_eq!(
+                admitted_effect(SeamAction::Contention, &effects),
+                Some(Effect::Contention)
+            );
+        }
+        assert_eq!(
+            admitted_effect(SeamAction::Fail, &[Effect::Contention]),
+            Some(Effect::Contention),
+            "existing fail directives on contention-only seams stay compatible"
+        );
+        assert_eq!(
+            admitted_effect(SeamAction::Contention, &[Effect::Fail, Effect::Skip]),
+            None,
+            "explicit contention cannot fall back to another effect"
+        );
     }
 }

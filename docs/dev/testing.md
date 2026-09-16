@@ -24,7 +24,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
-| `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the crate-local `.cargo/config.toml` sets it when cargo runs from the crate dir; every test file is `#![cfg(tokio_unstable)]`-gated and the crate compiles empty without it, so the default workspace gate is unaffected). `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
+| `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
 | `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus in-source format self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; format in RFC 0045 |
 
@@ -62,12 +62,22 @@ Recovery tests must cover the protocol layer, the writer, and the user-visible r
 - `tests/failpoints.rs` owns crash windows around durable effects;
 - the writer's normal integration owner proves pre-arm failures leave no residue.
 
-To add a seam: declare its static in `crates/omnigraph/src/seams/catalog.rs`
-with `Seam::decide(name, Op, Effect, Global::new())`, list it in `ALL`, and
-call `crate::seams::fail`, `skip` or `contention` with it at the site.
-`tests/failpoint_names_guard.rs` checks the listing, that the helper matches
-the declared effect, and that some site or case references it;
-`scripts/seam_corpus.py` lists which seams a case covers.
+To add a seam: declare it beside the site it guards, above the item that
+crosses it, with
+`decide_seam! { pub static NAME = ("area.place", Op, [Effect, ..]); }`
+(imported from `crate::seams`; the compiler records the file and line as
+the seam's `site()`, and a hand-written `Seam::decide` is refused); add its
+path to the `catalog!` list in `crates/omnigraph/src/seams/catalog.rs`; call
+`fail`, `skip` or `contention` (imported from `crate::seams`) with it at a
+site between two steps (one declared effect), or `guarded` around the one
+operation it wraps (every outcome that operation can have; a further action
+there is then a case, not an edit). A private module on the path from the
+crate root to the declaring file becomes `pub(crate)` for the re-export.
+`tests/failpoint_names_guard.rs` checks the index, that no static is left
+in the catalog, under a test module or without `pub`, that a single-effect
+helper takes a seam declaring exactly its effect, and that some site or case
+references it; `scripts/seam_corpus.py` lists every seam with where it is
+declared and which cases cover it.
 
 When adding a new writer or sidecar field, update all three layers. See [recovery.md](recovery.md).
 
@@ -135,8 +145,8 @@ cargo test -p omnigraph-cluster --test failpoints --features failpoints
 cargo test -p omnigraph-bench --locked
 ```
 
-Run GQT commands from `crates/omnigraph-gqt` so its Cargo configuration enables
-the DST runtime requested by corpus files:
+GQT commands run from any directory inside the checkout; the workspace Cargo
+configuration enables the DST runtime that corpus files request:
 
 ```bash
 cargo test -p omnigraph-gqt --locked                            # complete corpus and harness tests
@@ -167,12 +177,12 @@ that matches no case is libtest's ordinary green zero-test run; read the
 Canonical workspace graph:
 
 ```bash
-cargo test --workspace --exclude omnigraph-gqt --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```
 
-The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one. The separate `GQ Logic Tests` context owns GQT: the root command above tests unavailable-DST refusal, and the complete corpus command from the GQT crate runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
+The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one. The separate `GQ Logic Tests` context owns GQT: the `runner_dispatch` command above covers dispatch (CI also runs it with `RUSTFLAGS` cleared to prove unavailable-DST refusal), and the complete corpus command runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
 
 AWS server support has a separate feature owner:
 
@@ -187,9 +197,10 @@ S3-backed tests skip unless `OMNIGRAPH_S3_TEST_BUCKET` and the corresponding AWS
 GQT files select their execution target in a `--- runner` YAML section before
 the schema. The file owns its storage, seeds and explicit faults;
 the runner preserves GQT assertions and uses isolated seeded processes.
-Build from `crates/omnigraph-gqt` to enable its Tokio configuration.
-Workspace-root builds without that configuration explicitly refuse DST
-cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
+The workspace Cargo configuration enables the Tokio runtime DST cases need
+from any directory inside the checkout; a build that overrides it (an env
+`RUSTFLAGS` without the cfg, as CI's refusal step does) explicitly refuses
+DST cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
 defines supported targets, hooks, replay observations, and limits. The configured
 CI owner enrolls the complete corpus. A strict `--- known_failure` marker admits only
 the recorded typed recovery failure at its declared step, with verified fault
@@ -223,10 +234,12 @@ receive protocol-owned scratch siblings as `TMPDIR` and cwd; measured workers
 also use their per-repetition scratch as `OMNIGRAPH_MERGE_STAGING_DIR`. The only
 inherited engine setting is the modeled `LANCE_MEM_POOL_SIZE`; Tokio/Rayon
 thread-count overrides are refused before execution. A
-run without `--archive` emits diagnostic output only:
+run without `--archive` emits diagnostic output only. The empty `RUSTFLAGS`
+clears the workspace's development `--cfg tokio_unstable`; the runner refuses
+a build whose build script saw encoded Rust flags:
 
 ```bash
-cargo run --release --locked -p omnigraph-bench -- \
+RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
   suite run benchmarks/suites/local-smoke.suite-v1.yaml
 ```
 

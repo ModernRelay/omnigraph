@@ -1,7 +1,6 @@
 // The crate is `#![cfg(tokio_unstable)]`-gated (tokio's seeded scheduler
 // RNG); without the flag the lib compiles EMPTY, so this file must vanish
-// with it or the workspace gate fails on unresolved imports. CI sets
-// RUSTFLAGS in .github/workflows/dst.yml.
+// with it or the build fails on unresolved imports.
 #![cfg(tokio_unstable)]
 
 //! DST scenario suite — an omnigraph graph living entirely in memory.

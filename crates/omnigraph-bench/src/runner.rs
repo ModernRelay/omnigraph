@@ -938,7 +938,7 @@ pub(crate) fn enforce_release_build() -> RunnerResult<()> {
         return Err(RunnerError::new(
             "release_build_required",
             format!(
-                "wall-clock execution requires Cargo profile=release, Cargo-reported opt-level=2, debug-assertions=false, the checked-in release-profile declaration, no build-script-visible encoded Rust flags, and no unsupported release-profile environment overrides: {}; effective LTO/codegen/strip options remain explicitly unproved until a controlled build receipt is available; run `cargo run --release --locked -p omnigraph-bench -- suite run ...`",
+                "wall-clock execution requires Cargo profile=release, Cargo-reported opt-level=2, debug-assertions=false, the checked-in release-profile declaration, no build-script-visible encoded Rust flags, and no unsupported release-profile environment overrides: {}; effective LTO/codegen/strip options remain explicitly unproved until a controlled build receipt is available; run `RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- suite run ...` (the workspace .cargo/config.toml sets --cfg tokio_unstable for development builds; the empty RUSTFLAGS clears it)",
                 configuration.message
             ),
         ));

@@ -71,6 +71,9 @@ build_from_source() {
   log "Building omnigraph binaries from source"
   (
     cd "$repo_root"
+    # A set RUSTFLAGS, empty included, replaces the workspace `[build]
+    # rustflags` (.cargo/config.toml): the binaries build without the cfg.
+    export RUSTFLAGS=
     cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission
   )
 

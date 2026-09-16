@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::branch_control::list_live_manifest_branch_contents;
 use crate::error::{OmniError, Result, missing_graph_type_at_snapshot};
+use crate::seams::{decide_seam, fail};
 use datafusion::logical_expr::Expr;
 use lance::Dataset;
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
@@ -14,7 +15,7 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3, SystemColumns};
 
 #[path = "manifest/graph.rs"]
-mod graph;
+pub(crate) mod graph;
 #[path = "manifest/layout.rs"]
 mod layout;
 #[path = "manifest/metadata.rs"]
@@ -28,13 +29,13 @@ mod migrations;
 #[path = "manifest/namespace.rs"]
 mod namespace;
 #[path = "manifest/publisher.rs"]
-mod publisher;
+pub(crate) mod publisher;
 #[path = "manifest/recovery.rs"]
-mod recovery;
+pub(crate) mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
 #[path = "manifest/upgrade.rs"]
-mod upgrade;
+pub(crate) mod upgrade;
 pub use upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
     UpgradeWork, upgrade_storage, upgrade_storage_as,
@@ -980,6 +981,14 @@ pub(crate) enum LineageRefresh {
     Append(Vec<GraphLineageRow>),
 }
 
+decide_seam! {
+    /// A stale live read has opened and decoded a replacement manifest whose
+    /// exact branch-head row is absent, but has not yet decoded the inherited
+    /// lineage fallback. Failure here must leave the old coordinator coherent.
+    /// Crossed by reads only, which no case step kind names yet.
+    pub static READ_REFRESH_POST_STATE_PRE_LINEAGE = ("read.refresh_post_state_pre_lineage", Unreachable, [Fail]);
+}
+
 impl ManifestCoordinator {
     /// Take an operation-local copy of this exact immutable view. The caller
     /// still checks its authority after acquiring the operation's gates.
@@ -1590,7 +1599,7 @@ impl ManifestCoordinator {
         let lineage_rows = match known_state.graph_heads.get(branch_key) {
             Some(head) if projection_has_head(head) => None,
             _ => {
-                crate::seams::fail(&crate::seams::catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
+                fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
                 Some(read_graph_lineage(&dataset).await?.0)
             }
         };

@@ -1,19 +1,19 @@
-# Crate-local cargo config: running cargo FROM THIS DIRECTORY builds with
-# the `tokio_unstable` cfg the DST suite needs (tokio's seeded scheduler,
-# `Builder::rng_seed`, sits behind it).
+# Crate-local cargo config, `[env]` ONLY: running cargo FROM THIS DIRECTORY
+# supplies the pool-quiescing trio to every cargo-spawned process. The
+# `--cfg tokio_unstable` the suite needs comes from the workspace
+# `.cargo/config.toml` for every build; no `[build]` table here, so this
+# file never forks the build fingerprints.
 #
 #   cd crates/omnigraph-dst && cargo test
 #
 # Scope: cargo discovers config by walking up from the invocation
-# directory, so this applies only when invoked from inside this crate —
-# workspace-root builds and the default CI jobs stay flag-free (the crate
-# compiles empty there by design). The DST CI workflows set RUSTFLAGS
-# themselves.
-[build]
-rustflags = ["--cfg", "tokio_unstable"]
+# directory, so this applies only when invoked from inside this crate.
+# From the repo root, export the trio yourself (the DST CI workflows do);
+# `require_pool_env` panics with the same instruction otherwise. The trio
+# cannot live in the workspace config: the GQT DST runner refuses it as
+# ambient env.
 
-# The pool-quiescing trio as process-start env. TOML copy of
-# `env_knobs::QUIESCE_ENV` — the why and the rules live there.
+# TOML copy of `env_knobs::QUIESCE_ENV` — the why and the rules live there.
 [env]
 RAYON_NUM_THREADS = "1"
 LANCE_CPU_THREADS = "1"

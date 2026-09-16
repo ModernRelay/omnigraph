@@ -1,6 +1,7 @@
 use super::*;
 
 use super::query::literal_to_sql;
+use crate::seams::{decide_seam, fail};
 use crate::storage_layer::PendingScanBudget;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
@@ -649,6 +650,30 @@ fn enforce_no_mixed_destructive_constructive(
     Ok(())
 }
 
+decide_seam! {
+    pub static MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE = ("mutation.delete_node_pre_primary_delete", Mutation, [Fail]);
+}
+
+decide_seam! {
+    pub static MUTATION_POST_FINALIZE_PRE_PUBLISHER = ("mutation.post_finalize_pre_publisher", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// Deterministic OCC rendezvous after a mutation has validated and staged
+    /// its complete attempt, but before the RFC-022 branch effect gate is
+    /// acquired and the write authority token is revalidated. Tests park the
+    /// first writer here, commit a conflicting second writer, then prove the
+    /// first attempt is discarded and validation is rerun from a fresh token.
+    pub static MUTATION_POST_STAGE_PRE_EFFECT_GATE = ("mutation.post_stage_pre_effect_gate", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// After a conditional mutation has executed to a zero-effect result, but
+    /// before it acquires the branch gate and revalidates the caller's graph
+    /// head. This pins the linearization point for successful no-op CAS calls.
+    pub static MUTATION_POST_NO_EFFECT_PRE_GATE = ("mutation.post_no_effect_pre_gate", Mutation, [Fail]);
+}
+
 impl Omnigraph {
     pub async fn mutate(
         &self,
@@ -962,7 +987,7 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
                 if txn.caller_expected_graph_head.is_some() {
-                    crate::seams::fail(&crate::seams::catalog::MUTATION_POST_NO_EFFECT_PRE_GATE)?;
+                    fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
                     // A no-op has no table transaction, so it never reaches
                     // `commit_all`. It still needs a linearization point for
                     // the caller's CAS promise: under the same schema -> branch
@@ -986,7 +1011,7 @@ impl Omnigraph {
             Ok(total) => {
                 self.validate_staged_mutation(&staging, &txn).await?;
                 let staged = staging.stage_all(self, requested.as_deref()).await?;
-                crate::seams::fail(&crate::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+                fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
                 let lineage_intent = self
                     .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
                     .await?;
@@ -1018,7 +1043,7 @@ impl Omnigraph {
                 // Any failure from here is `RecoveryRequired`; synchronous heal
                 // or a read-write open converges the recorded outcome. See
                 // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
-                crate::seams::fail(&crate::seams::catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+                fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
                 let publish_result = self
                     .commit_updates_on_branch_with_expected(
                         requested.as_deref(),
@@ -1541,7 +1566,7 @@ impl Omnigraph {
         // HEAD only at the unified end-of-query commit — no inline residual.
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
-        crate::seams::fail(&crate::seams::catalog::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
+        fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
         staging.record_deleted_ids(&table_key, &deleted_ids);
         staging.record_delete(&table_key, pred_sql.clone());
 

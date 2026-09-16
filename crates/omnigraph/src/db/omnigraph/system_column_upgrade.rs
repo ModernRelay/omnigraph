@@ -7,6 +7,7 @@
 use super::*;
 use crate::db::manifest::UpgradeMode;
 use crate::db::schema_state::SchemaState;
+use crate::seams::{catalog, decide_seam, fail};
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
 use serde::Serialize;
 
@@ -273,6 +274,13 @@ async fn preflight(
     Ok(())
 }
 
+decide_seam! {
+    /// The RFC 0040 system-column upgrade advanced main's `__manifest` stamp
+    /// but has renamed no table yet: stamp 9 over legacy spellings under an
+    /// Armed intent, the one state no other writer can produce.
+    pub static SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE = ("system_column_upgrade.after_stamp_advance", Unreachable, [Fail]);
+}
+
 /// Returns the published graph version and the armed intent's handle: the
 /// caller retires the sidecar only after it released `__schema_apply_lock__`,
 /// so a crash in between leaves the record that re-enters lock cleanup.
@@ -466,7 +474,7 @@ async fn execute_with_lock(
     let recovery_operation_id = recovery_handle.operation_id.clone();
 
     let post_arm_result = async {
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
+        fail(&catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
         let manifest_version_after_stamp =
             crate::db::manifest::publish_stamp_advance(db.root_uri(), from_stamp, to_stamp)
                 .await?;
@@ -479,9 +487,9 @@ async fn execute_with_lock(
             .expect("new system-column upgrade sidecar carries its intent")
             .manifest_version_after_stamp = Some(manifest_version_after_stamp);
         db.refresh_coordinator_only().await?;
-        crate::seams::fail(&crate::seams::catalog::SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE)?;
+        fail(&SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE)?;
 
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
+        fail(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
         db.storage
             .write_text(&schema_source_staging_uri(&db.root_uri), &desired_source)
             .await?;
@@ -530,7 +538,7 @@ async fn execute_with_lock(
                 entity_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
-            crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+            fail(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
         crate::db::manifest::confirm_schema_apply_sidecar_v9(
@@ -541,7 +549,7 @@ async fn execute_with_lock(
             &committed_transactions,
         )
         .await?;
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
+        fail(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
 
         let mut manifest_changes = Vec::with_capacity(confirmed_updates.len());
         let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
@@ -582,7 +590,7 @@ async fn execute_with_lock(
                 &precondition,
             )
             .await?;
-        crate::seams::fail(&crate::seams::catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
+        fail(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         crate::db::schema_state::promote_exact_schema_staging(
             db.root_uri(),
             db.storage_adapter(),

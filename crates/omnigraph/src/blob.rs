@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::changes::EntityKind;
 use crate::db::{Omnigraph, ReadTarget, ResolvedTarget};
 use crate::error::{OmniError, Result};
+use crate::seams::{decide_seam, fail};
 
 /// Inclusive raw-byte ceiling for one configured or input external Blob URI.
 ///
@@ -969,6 +970,13 @@ struct ResolvedBlobCell {
     stable_property_id: u64,
 }
 
+decide_seam! {
+    /// A Blob read has captured one exact graph snapshot and table authority,
+    /// but has not opened the selected Lance table version yet. Tests replace
+    /// a named branch here to prove a live read fails rather than retargeting.
+    pub static BLOB_READ_POST_CAPTURE = ("blob_read.post_capture", Unreachable, [Fail]);
+}
+
 impl Omnigraph {
     /// Resolve and read one Blob cell against a branch or immutable snapshot.
     ///
@@ -1027,7 +1035,7 @@ impl Omnigraph {
         let stable_table_id = entry.identity.stable_table_id;
         let table_incarnation_id = entry.identity.table_incarnation_id;
 
-        crate::seams::fail(&crate::seams::catalog::BLOB_READ_POST_CAPTURE)?;
+        fail(&BLOB_READ_POST_CAPTURE)?;
 
         let dataset = Arc::new(if entry.native_dataset_branch.is_some() {
             // Local filesystems provide no manifest e-tag, so the ordinary

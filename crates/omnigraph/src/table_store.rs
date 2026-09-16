@@ -65,6 +65,7 @@ use crate::blob::{
 use crate::db::manifest::TableVersionMetadata;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
+use crate::seams::{decide_seam, fail, skip};
 use crate::storage_layer::{
     IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
     PendingScanBudget, ProvenInsertChunk,
@@ -954,6 +955,22 @@ pub struct TableStore {
     external_blob_policy: Arc<ExternalBlobPolicy>,
 }
 
+decide_seam! {
+    /// After Lance durably creates a target table ref, before the caller can
+    /// reopen and verify it. An error here is post-effect and must retain the
+    /// recovery sidecar.
+    pub static FORK_POST_CREATE_PRE_OPEN = ("fork.post_create_pre_open", AnyWrite, [Fail]);
+}
+
+decide_seam! {
+    /// The e_tag comparison in `open_at_entry_verified`. Skipping it simulates
+    /// a store whose persisted table version metadata carries no e_tag. Tests
+    /// combine it with `CHANGE_FEED_PRE_TABLE_OPEN` + a branch delete/recreate
+    /// to prove the LOGICAL post-open head re-prove still refuses the
+    /// replacement — the e_tag is defense-in-depth, not the load-bearing witness.
+    pub static CHANGE_FEED_ETAG_WITNESS = ("change_feed.etag_witness", Unreachable, [Skip]);
+}
+
 impl TableStore {
     pub fn new(root_uri: &str, session: Arc<lance::session::Session>) -> Self {
         Self {
@@ -1165,8 +1182,7 @@ impl TableStore {
         // (`reprove_named_branch_heads`), which is store-independent. The
         // failpoint seam simulates the e_tag-less-store configuration so tests
         // can prove the logical witness alone refuses a branch delete/recreate.
-        let etag_witness_unavailable =
-            crate::seams::skip(&crate::seams::catalog::CHANGE_FEED_SKIP_ETAG_WITNESS);
+        let etag_witness_unavailable = skip(&CHANGE_FEED_ETAG_WITNESS);
         if !etag_witness_unavailable
             && let Some(expected) = entry.version_metadata.e_tag()
             && dataset.manifest_location().e_tag.as_deref() != Some(expected)
@@ -1319,7 +1335,7 @@ impl TableStore {
         // The ref is now independently durable. Any error from this point is an
         // ambiguous/post-effect outcome to the caller and must retain an armed
         // recovery intent rather than being treated as a safe pre-effect retry.
-        crate::seams::fail(&crate::seams::catalog::FORK_POST_CREATE_PRE_OPEN)?;
+        fail(&FORK_POST_CREATE_PRE_OPEN)?;
 
         // Re-open through the shared session for normal cache behavior. The
         // returned handle above is used only as proof that the matching branch

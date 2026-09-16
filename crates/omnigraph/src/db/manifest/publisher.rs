@@ -46,6 +46,7 @@ use super::{
     NativeRefPin, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
     TableIdentity, TableRegistration, TableRename, TableTombstone, WinnerRef,
 };
+use crate::seams::{contention, decide_seam};
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
 /// (`TooMuchWriteContention`). Lance's own `conflict_retries` is set to 0 in
@@ -220,6 +221,12 @@ type FoldedPublishInputs = (
     Vec<(TableIdentity, u64)>,
 );
 
+decide_seam! {
+    /// The publisher's `load_publish_state` read, inside the CAS retry loop.
+    /// Contention here proves the outer retry re-runs the load.
+    pub static PUBLISH_LOAD_STATE = ("publish.load_state", AnyWrite, [Contention]);
+}
+
 impl GraphNamespacePublisher {
     fn checked_base_incarnation(
         &self,
@@ -275,7 +282,7 @@ impl GraphNamespacePublisher {
         // Test seam: inject a retryable contention here to exercise the outer
         // retry loop's re-run-on-retryable-load-error path (no-op without the
         // `failpoints` feature). The migration surfaces the same typed error.
-        crate::seams::contention(&crate::seams::catalog::PUBLISH_LOAD_STATE_RETRYABLE_CONTENTION)?;
+        contention(&PUBLISH_LOAD_STATE)?;
         let dataset = self.dataset().await?;
         guard_stamp(&dataset)?;
         // ONE `__manifest` scan for everything the publish needs: table

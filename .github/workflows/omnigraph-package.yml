@@ -125,6 +125,9 @@ jobs:
                     features_arg="--features ${OMNIGRAPH_FEATURES}"
                   fi
                   echo "Building Omnigraph with features='${OMNIGRAPH_FEATURES:-}' tag_suffix='${tag_suffix}' image_tag='${image_tag}'"
+                  # A set RUSTFLAGS, empty included, replaces the workspace `[build]
+                  # rustflags` (.cargo/config.toml): the package builds without the cfg.
+                  export RUSTFLAGS=
                   cargo build --release --locked \
                     -p omnigraph-cli \
                     -p omnigraph-server \

@@ -1,8 +1,9 @@
 # omnigraph's deterministic-simulation-testing crate —
 # the slatedb-dst pattern. Owns the harness, oracles, catalogs, instruments,
 # and its own fixtures; the engine keeps only the injection seams.
-# Build from this directory (its .cargo/config.toml sets the required
-# --cfg tokio_unstable): cd crates/omnigraph-dst && cargo test.
+# Run from this directory (its [env]-only .cargo/config.toml supplies the
+# pool trio): cd crates/omnigraph-dst && cargo test. The required
+# --cfg tokio_unstable comes from the workspace .cargo/config.toml.
 [package]
 name = "omnigraph-dst"
 version = "0.11.0"

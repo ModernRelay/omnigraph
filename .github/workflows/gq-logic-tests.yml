@@ -148,17 +148,20 @@ jobs:
 
       - name: Test unavailable DST runtime refusal
         if: needs.classify_changes.outputs.run_full_ci == 'true' && matrix.mode == 'ordinary'
+        # The flagless build shape this test exists for: an env RUSTFLAGS,
+        # empty included, replaces the workspace `[build] rustflags`.
+        env:
+          RUSTFLAGS: ""
         run: cargo test -p omnigraph-gqt --locked --timings --lib --test runner_dispatch -- --nocapture
 
+      # The workspace .cargo/config.toml enables the seeded Tokio runtime
+      # from any directory; these steps run from the repo root.
       - name: Run complete GQ logic tests with DST
         if: needs.classify_changes.outputs.run_full_ci == 'true' && matrix.mode == 'dst'
-        working-directory: crates/omnigraph-gqt
         run: cargo test -p omnigraph-gqt --locked --timings -- --nocapture
 
       - name: Clippy GQT with DST
         if: needs.classify_changes.outputs.run_full_ci == 'true' && matrix.mode == 'dst-clippy'
-        # Crate-local Cargo configuration enables the seeded Tokio runtime.
-        working-directory: crates/omnigraph-gqt
         run: cargo clippy -p omnigraph-gqt --all-targets --locked --timings -- -D warnings -W clippy::dbg_macro
 
       - name: Retain GQT invocation reports
