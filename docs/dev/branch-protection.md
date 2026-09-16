@@ -18,6 +18,7 @@ protection.
 - `GQ Logic Tests`
 - `Fix Regression Gate`
 - `Storage Upgrade Compatibility`
+- `Dependency Guard (cargo deny)`
 
 Checks are strict, so a PR must be current with `main`. `Graph Vocabulary
 Guard` remains as an always-reporting context but reports a successful skip on
@@ -31,6 +32,12 @@ both genuine predecessor migration journeys execute on every change, including
 documentation-only pull requests. Its fixture availability and required-context
 contract are checked by `scripts/check-storage-upgrade-ci.py`. The repository
 policy change must still be applied by an administrator to affect GitHub.
+`Dependency Guard (cargo deny)` is required on every change: it builds nothing
+and holds `Cargo.lock` to `deny.toml`. Its RustSec database is fetched at run
+time, so an advisory published overnight reds every open pull request until a
+lockfile bump or a `deny.toml` exemption lands on `main`; with strict checks
+that one pull request unblocks the rest. `dependency-guard-nightly.yml` runs
+the same check on `main` daily, so the red shows there first.
 
 `Test Workspace` runs on pull requests as a reporting context and is
 deliberately not required: with strict checks every merge invalidates every
@@ -55,8 +62,8 @@ The JSON is authoritative for every exact setting.
 ## Code owners
 
 `.github/CODEOWNERS` names the reviewers GitHub requests for each workspace
-member: one anchored line per crate under `crates/` and under `tools/`. Paths
-outside those directories request nobody. GitHub reads the copy on `main`,
+member: one anchored line per crate under `crates/` and under `tools/`, plus
+one for `/deny.toml`, the dependency allowlist. Other paths request nobody. GitHub reads the copy on `main`,
 requests the listed people when a pull request is opened ready for review,
 marked ready, or gains a matching path in a later push, and never requests the
 pull request's own author. Two handles on

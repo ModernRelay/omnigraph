@@ -1,5 +1,7 @@
-# Advisory reviewer requests, one line per workspace member; nothing here blocks a merge.
+# Advisory reviewer requests, one line per workspace member plus the dependency allowlist; nothing here blocks a merge.
 # See docs/dev/branch-protection.md, section Code owners.
+
+/deny.toml                              @azimafroozeh
 
 /crates/omnigraph/                      @azimafroozeh @aaltshuler
 /crates/omnigraph-api-types/            @aaltshuler

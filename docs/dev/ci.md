@@ -25,6 +25,8 @@ Branch protection currently requires these reporting contexts:
 - `Lint (clippy)`
 - `GQ Logic Tests`
 - `Fix Regression Gate`
+- `Storage Upgrade Compatibility`
+- `Dependency Guard (cargo deny)`
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
@@ -129,7 +131,34 @@ Repository metadata gates also check:
 
 - immutable commit SHAs for external Actions and reusable workflows;
 - agreement between container and package binary sets;
-- the dependency direction around `omnigraph-azure-admission`.
+- the dependency direction around `omnigraph-azure-admission`;
+- the dependency graph, in `Dependency Guard (cargo deny)`: `cargo deny
+  --locked check` holds `Cargo.lock` and every manifest, all features enabled,
+  to the allowlists in `deny.toml` (registry and git sources, licenses, RustSec
+  advisories and yanked versions, wildcard version specs; dev-dependencies
+  included; the rules and their reasons live there). It runs on every pull
+  request, documentation-only ones included. A new source, license, or advisory
+  exemption is an edit to `deny.toml` in the same pull request, reviewed as
+  such (a git-form `[patch]` entry is refused like any git source). Three
+  refusals name no remedy: a `path` dependency without `version` in
+  a publishable crate is a wildcard (add `version`); a workspace member without
+  a `license` field is unlicensed (add `license = "MIT"`); a crate whose license
+  text cargo-deny cannot read needs a `[[licenses.clarify]]` entry. A `path` copy of a
+  crate, bare or behind `[patch]`, and a `.cargo/config.toml` source replacement
+  keep no source for cargo-deny to check; `scripts/check-dependency-sources.py`,
+  run in the same job, refuses them: the source-less `Cargo.lock` packages are
+  exactly the workspace members by name and version, no manifest declares a
+  `[patch]` table, and neither `.cargo/config.toml` nor the deprecated
+  `.cargo/config` declares a source replacement or path override.
+  Build scripts are outside both checks. An exemption that no longer matches
+  anything fails the check, so the bump that clears an advisory or drops a
+  license's last holder also removes its `deny.toml` row. The job is a required
+  context (see [branch-protection.md](branch-protection.md)). The RustSec
+  database is fetched at run time; `dependency-guard-nightly.yml` runs the same
+  check on `main` daily, so an advisory published overnight shows there first
+  and then turns every open pull request red at its next push; the fix is a
+  lockfile bump or a `deny.toml` exemption in its own pull request, not a
+  rerun.
 
 Container entrypoint and Azure deployment-validation jobs test argument composition, non-destructive Bicep validation, bootstrap readiness/admission modes, and non-root image ownership.
 
@@ -242,12 +271,14 @@ python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
 python3 scripts/check-azure-admission-boundary.py
+python3 scripts/check-dependency-sources.py
+cargo deny --locked check   # from the repository root, after Cargo.lock is current; allowlist in deny.toml
 typos                       # from the repository root; a subdirectory run scans only that subtree
 actionlint .github/workflows/*.yml
 shellcheck scripts/*.sh
 ```
 
-`typos` (`cargo install typos-cli --locked --version 1.50.1`, the version `ci.yml` pins; the misspelling list grows per release, so a newer local binary can flag words CI accepts), `actionlint` and `shellcheck` are developer tools, not workspace dependencies. Run the applicable subset when a change does not touch their surface.
+`typos` (`cargo install typos-cli --locked --version 1.50.1`, the version `ci.yml` pins; the misspelling list grows per release, so a newer local binary can flag words CI accepts), `cargo-deny` (`cargo install cargo-deny --locked --version 0.20.2`, the version the pinned `cargo-deny-action` bundles; `deny.toml` uses the `unsound` scope field, which needs 0.19 or newer; run it from the repository root once `Cargo.lock` is current, since `--locked` refuses a stale lockfile and a subdirectory run scopes the graph to that package and reports the root's ignores as unmatched; the advisory database grows daily, so a local run can report an advisory CI has not seen yet or the reverse), `actionlint` and `shellcheck` are developer tools, not workspace dependencies. Run the applicable subset when a change does not touch their surface.
 
 ## Release workflows
 
