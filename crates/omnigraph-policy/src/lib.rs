@@ -71,6 +71,10 @@ pub enum PolicyAction {
     /// is double-gated: `invoke_query` to reach the tool, plus `change` for
     /// the write itself.
     InvokeQuery,
+    /// Change the cluster's configuration, including policy membership,
+    /// graph creation, and the initial schema of a newly created graph.
+    /// Existing graph schema changes additionally require `schema_apply`.
+    ConfigManage,
 }
 
 impl PolicyAction {
@@ -86,6 +90,7 @@ impl PolicyAction {
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
             Self::InvokeQuery => "invoke_query",
+            Self::ConfigManage => "config_manage",
         }
     }
 
@@ -108,6 +113,7 @@ impl PolicyAction {
     pub fn resource_kind(self) -> PolicyResourceKind {
         match self {
             Self::GraphList => PolicyResourceKind::Server,
+            Self::ConfigManage => PolicyResourceKind::Cluster,
             Self::Read
             | Self::Export
             | Self::Change
@@ -130,6 +136,8 @@ pub enum PolicyResourceKind {
     Graph,
     /// `Omnigraph::Server::"root"` — management actions.
     Server,
+    /// `Omnigraph::Cluster::"root"` — applied cluster configuration.
+    Cluster,
 }
 
 /// Which kind of policy file the caller is loading. Drives the
@@ -150,6 +158,9 @@ pub enum PolicyEngineKind {
     /// actions whose `resource_kind()` is `PolicyResourceKind::Server`
     /// are allowed.
     Server,
+    /// The cluster-bound bundle: cluster configuration and server inventory
+    /// rules, each still bound to its own resource kind.
+    Cluster,
 }
 
 impl fmt::Display for PolicyAction {
@@ -173,6 +184,7 @@ impl FromStr for PolicyAction {
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
             "invoke_query" => Ok(Self::InvokeQuery),
+            "config_manage" => Ok(Self::ConfigManage),
             other => bail!("unknown policy action '{other}'"),
         }
     }
@@ -375,16 +387,24 @@ impl PolicyConfig {
             // a specific resource kind).
             let mut server_scoped = false;
             let mut graph_scoped = false;
+            let mut cluster_scoped = false;
             for action in &rule.allow.actions {
                 match action.resource_kind() {
                     PolicyResourceKind::Server => server_scoped = true,
                     PolicyResourceKind::Graph => graph_scoped = true,
+                    PolicyResourceKind::Cluster => cluster_scoped = true,
                 }
             }
             if server_scoped && graph_scoped {
                 bail!(
                     "policy rule '{}' mixes the server-scoped action `graph_list` \
                      with per-graph actions; split into separate rules",
+                    rule.id
+                );
+            }
+            if cluster_scoped && (graph_scoped || server_scoped) {
+                bail!(
+                    "policy rule '{}' mixes cluster configuration actions with other resource kinds; split into separate rules",
                     rule.id
                 );
             }
@@ -507,6 +527,18 @@ impl PolicyEngine {
         PolicyCompiler::compile(&config, SERVER_RESOURCE_ID)
     }
 
+    /// Load the bundle bound to `cluster` in cluster configuration.
+    /// Configuration and server-inventory actions use distinct Cedar resources.
+    pub fn load_cluster(path: &Path) -> Result<Self> {
+        Self::load_cluster_from_source(&fs::read_to_string(path)?)
+    }
+
+    pub fn load_cluster_from_source(source: &str) -> Result<Self> {
+        let config = PolicyConfig::from_source(source)?;
+        validate_kind_alignment(&config, PolicyEngineKind::Cluster)?;
+        PolicyCompiler::compile(&config, CLUSTER_RESOURCE_ID)
+    }
+
     /// Evaluate a request. `actor_id` is supplied as a separate
     /// argument (not inside `PolicyRequest`) so the type system enforces
     /// the "server-authoritative actor identity" invariant — clients
@@ -532,6 +564,7 @@ impl PolicyEngine {
         let resource = match request.action.resource_kind() {
             PolicyResourceKind::Server => entity_uid("Server", SERVER_RESOURCE_ID)?,
             PolicyResourceKind::Graph => entity_uid("Graph", &self.graph_id)?,
+            PolicyResourceKind::Cluster => entity_uid("Cluster", CLUSTER_RESOURCE_ID)?,
         };
         let context_value = json!({
             "has_branch": request.branch.is_some(),
@@ -643,16 +676,21 @@ impl PolicyEngine {
 /// a server file fails at load time instead of compiling cleanly
 /// and never matching a request.
 fn validate_kind_alignment(config: &PolicyConfig, kind: PolicyEngineKind) -> Result<()> {
-    let required = match kind {
-        PolicyEngineKind::Graph => PolicyResourceKind::Graph,
-        PolicyEngineKind::Server => PolicyResourceKind::Server,
-    };
     for rule in &config.rules {
         for action in &rule.allow.actions {
-            if action.resource_kind() != required {
+            let allowed = match kind {
+                PolicyEngineKind::Graph => action.resource_kind() == PolicyResourceKind::Graph,
+                PolicyEngineKind::Server => action.resource_kind() == PolicyResourceKind::Server,
+                PolicyEngineKind::Cluster => matches!(
+                    action.resource_kind(),
+                    PolicyResourceKind::Cluster | PolicyResourceKind::Server
+                ),
+            };
+            if !allowed {
                 let (got, expected_file) = match action.resource_kind() {
                     PolicyResourceKind::Server => ("server-scoped", "server policy file"),
                     PolicyResourceKind::Graph => ("per-graph", "per-graph policy file"),
+                    PolicyResourceKind::Cluster => ("cluster-scoped", "cluster policy file"),
                 };
                 bail!(
                     "policy rule '{}' uses {} action '{}' in a {:?} policy file; \
@@ -731,6 +769,17 @@ fn compile_entities(config: &PolicyConfig, graph_id: &str, schema: &Schema) -> R
             HashSet::<EntityUid>::new(),
         )?);
     }
+    if config
+        .rules
+        .iter()
+        .any(|rule| rule.allow.actions.contains(&PolicyAction::ConfigManage))
+    {
+        entities.push(Entity::new(
+            entity_uid("Cluster", CLUSTER_RESOURCE_ID)?,
+            HashMap::new(),
+            HashSet::<EntityUid>::new(),
+        )?);
+    }
 
     Ok(Entities::from_entities(entities, Some(schema))?)
 }
@@ -780,6 +829,9 @@ fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, graph_id: &st
         }
         PolicyResourceKind::Server => {
             format!("Omnigraph::Server::{}", cedar_literal(SERVER_RESOURCE_ID))
+        }
+        PolicyResourceKind::Cluster => {
+            format!("Omnigraph::Cluster::{}", cedar_literal(CLUSTER_RESOURCE_ID))
         }
     };
 
@@ -841,6 +893,7 @@ namespace Omnigraph {
     entity Group;
     entity Graph;
     entity Server;
+    entity Cluster;
 
     action "read" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "export" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
@@ -853,6 +906,7 @@ namespace Omnigraph {
     action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
     action "graph_list" appliesTo { principal: Actor, resource: Server, context: RequestContext };
+    action "config_manage" appliesTo { principal: Actor, resource: Cluster, context: RequestContext };
 }
 "#
 }
@@ -861,6 +915,7 @@ namespace Omnigraph {
 /// (the running server); the id is fixed at `"root"` so Cedar rules can
 /// reference it unambiguously: `resource == Omnigraph::Server::"root"`.
 const SERVER_RESOURCE_ID: &str = "root";
+const CLUSTER_RESOURCE_ID: &str = "root";
 
 fn entity_uid(entity_type: &str, id: &str) -> Result<EntityUid> {
     let typename = EntityTypeName::from_str(&format!("Omnigraph::{entity_type}"))?;
@@ -1096,7 +1151,7 @@ rules:
     }
     use super::{
         PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
-        PolicyTestCase, PolicyTestConfig,
+        PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
     };
 
     #[test]
@@ -1673,5 +1728,82 @@ rules:
             )
             .unwrap();
         assert!(decision.allowed);
+    }
+
+    #[test]
+    fn config_manage_is_explicit_cluster_authority_not_graph_admin() {
+        let source = r#"
+version: 1
+groups:
+  owners: [principal:owner]
+  readers: [principal:reader]
+rules:
+  - id: manage-configuration
+    allow:
+      actors: {group: owners}
+      actions: [config_manage]
+  - id: inspect-registry
+    allow:
+      actors: {group: readers}
+      actions: [graph_list]
+"#;
+        let policy = PolicyEngine::load_cluster_from_source(source).unwrap();
+        let request = |action| PolicyRequest {
+            action,
+            branch: None,
+            target_branch: None,
+        };
+        assert!(
+            policy
+                .authorize("principal:owner", &request(PolicyAction::ConfigManage))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !policy
+                .authorize("principal:reader", &request(PolicyAction::ConfigManage))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !policy
+                .authorize("principal:unknown", &request(PolicyAction::ConfigManage))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            policy
+                .authorize("principal:reader", &request(PolicyAction::GraphList))
+                .unwrap()
+                .allowed
+        );
+        assert!(PolicyEngine::load_server_from_source(source).is_err());
+        assert!(PolicyEngine::load_graph_from_source(source, "graph").is_err());
+        assert_eq!(
+            PolicyAction::ConfigManage.resource_kind(),
+            PolicyResourceKind::Cluster
+        );
+        assert_eq!(
+            PolicyAction::Admin.resource_kind(),
+            PolicyResourceKind::Graph
+        );
+        assert_eq!(
+            "config_manage".parse::<PolicyAction>().unwrap(),
+            PolicyAction::ConfigManage
+        );
+        for scope in ["branch_scope", "target_branch_scope"] {
+            let scoped = source.replace(
+                "actions: [config_manage]",
+                &format!("actions: [config_manage]\n      {scope}: any"),
+            );
+            assert!(PolicyEngine::load_cluster_from_source(&scoped).is_err());
+        }
+        for action in ["read", "graph_list"] {
+            let mixed = source.replace(
+                "actions: [config_manage]",
+                &format!("actions: [config_manage, {action}]"),
+            );
+            assert!(PolicyEngine::load_cluster_from_source(&mixed).is_err());
+        }
     }
 }

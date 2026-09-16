@@ -74,7 +74,7 @@ Clients cannot claim another actor. See [Authorization and actors](policy.md).
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
-on a trusted development network. Tokens without a policy allow only the
+on a trusted development network. Static tokens without a policy allow only the
 `read` action. Stored-query invocation, export, graph listing, writes, and other
 actions remain denied.
 
@@ -96,20 +96,39 @@ service. The provisioning operator owns supplying the correct identity binding.
 The [trust and credential format](../../rfcs/0053-offline-data-token-verification.md#public-trust-and-root-binding)
 defines the machine-written file.
 
-Signed credentials use the actor `principal:<immutable-principal-id>`. Apply a
-Cedar policy permitting that exact actor through the ordinary cluster loop
-before using the credential. Its graph/action grants only narrow that policy:
-no policy, an unknown actor, or an action absent from either permission source
-is denied. A caller cannot change its actor through request headers or JSON.
-Graph listing reveals only graphs with an explicit `graph_list` grant.
+Signed credentials use the actor `principal:<immutable-principal-id>`. A caller
+cannot change its actor through request headers or JSON. The server accepts
+two explicit profiles:
+
+- **Identity credentials (version 2)** bind the principal to the cluster and
+  contain no permissions. Applied Cedar policy decides graph operations;
+  missing policy or an unknown policy actor denies protected access.
+- **Legacy restricted credentials (version 1)** additionally limit access to
+  their exact graph/action grants. Both the grant and applied policy must
+  allow the request. These credentials cannot grant `schema_apply`,
+  `config_manage`, or `admin`.
+
+Every valid identity credential can call `GET /graphs/discovery` for graph IDs
+and display names from the server's applied inventory, including quarantined
+graphs. Display names currently equal graph IDs. This route returns no storage
+locations, availability, schema, query definitions, or graph data, and does not
+require policy membership. It accepts neither static nor restricted
+credentials. `GET /graphs` remains a separate metadata catalog requiring
+`graph_list` policy permission; restricted credentials also filter it to
+graphs with a signed `graph_list` grant. Discovery does not make an unavailable
+server reachable or grant access to a listed graph.
+
+See [managed data access](../cli/managed-data.md) for issuance and CLI discovery.
 
 Tokens live for 60–86,400 seconds from issuance. The server permits an issuance
 clock up to 30 seconds ahead, so at most 86,430 seconds can remain on admission.
 Expiry has no grace period. Logout or a permission change at the issuer does
 not revoke an issued token; already accepted operations can finish after
 expiry. Stored-query calls need `invoke_query` plus `read` or `change` for the
-body. Schema changes still use `cluster apply`; data tokens cannot grant
-`schema_apply` or `admin`.
+body. An applied policy change takes effect on the next request after server
+activation, using the same identity credential. Schema changes still use
+`cluster apply` and its [current-policy authorization](policy.md#actions);
+the identity credential supplies no permission or ownership bypass.
 
 Static credentials can coexist for operator recovery. An exact configured
 static credential keeps its existing authority, including credentials with
@@ -124,7 +143,8 @@ seconds after its final issuance before removing it with another restart.
 |---|---|
 | `GET /healthz` | Process health |
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
-| `GET /graphs` | List served graphs; requires `graph_list` policy |
+| `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
+| `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
 | `/graphs/{id}/query`, `/mutate` | Run inline GQ source |
 | `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |
