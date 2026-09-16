@@ -137,7 +137,8 @@ impl fmt::Display for GraphKey {
 }
 
 /// Authorization shape. Static credentials use Cedar without an additional
-/// grant ceiling; signed data credentials retain their exact grants.
+/// grant ceiling; version 1 signed credentials retain exact grants, while
+/// version 2 credentials authenticate identity for applied policy evaluation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum Scope {
@@ -145,6 +146,8 @@ pub enum Scope {
     Full,
     /// Exact graph/action ceilings are retained in the authenticated claims.
     DataToken,
+    /// Cluster-bound identity; graph permissions come only from applied policy.
+    IdentityToken,
 }
 
 /// How the server authenticated the actor.
@@ -188,7 +191,7 @@ impl ResolvedActor {
     }
 }
 
-/// Verified request identity and its immutable signed grant ceiling.
+/// Verified request identity and its immutable signed credential profile.
 ///
 /// Public identity fields are exposed only through a shared projection. There
 /// is no public constructor or mutable projection: a caller-created
@@ -196,8 +199,14 @@ impl ResolvedActor {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedActor {
     actor: ResolvedActor,
-    data_token: Option<Arc<crate::data_tokens::DataTokenClaims>>,
+    data_token: Option<VerifiedDataToken>,
     selected_graph: Option<GraphId>,
+}
+
+#[derive(Debug, Clone)]
+enum VerifiedDataToken {
+    Restricted(Arc<crate::data_tokens::DataTokenClaims>),
+    Identity(Arc<crate::data_tokens::IdentityTokenClaims>),
 }
 
 impl std::ops::Deref for AuthenticatedActor {
@@ -225,7 +234,20 @@ impl AuthenticatedActor {
                 scopes: vec![Scope::DataToken],
                 source: AuthSource::SignedData,
             },
-            data_token: Some(Arc::new(claims)),
+            data_token: Some(VerifiedDataToken::Restricted(Arc::new(claims))),
+            selected_graph: None,
+        }
+    }
+
+    pub(crate) fn signed_identity(claims: crate::data_tokens::IdentityTokenClaims) -> Self {
+        Self {
+            actor: ResolvedActor {
+                actor_id: Arc::from(format!("principal:{}", claims.sub)),
+                tenant_id: None,
+                scopes: vec![Scope::IdentityToken],
+                source: AuthSource::SignedData,
+            },
+            data_token: Some(VerifiedDataToken::Identity(Arc::new(claims))),
             selected_graph: None,
         }
     }
@@ -237,14 +259,25 @@ impl AuthenticatedActor {
 
     /// Authenticated signed claims, excluding the original bearer plaintext.
     pub fn data_claims(&self) -> Option<&crate::data_tokens::DataTokenClaims> {
-        self.data_token.as_deref()
+        match &self.data_token {
+            Some(VerifiedDataToken::Restricted(claims)) => Some(claims),
+            _ => None,
+        }
+    }
+
+    /// Authenticated version 2 identity metadata, never graph permission grants.
+    pub fn identity_claims(&self) -> Option<&crate::data_tokens::IdentityTokenClaims> {
+        match &self.data_token {
+            Some(VerifiedDataToken::Identity(claims)) => Some(claims),
+            _ => None,
+        }
     }
 
     pub(crate) fn select_graph(&mut self, graph_id: &GraphId) -> bool {
-        if self.source == AuthSource::Static {
+        if self.source == AuthSource::Static || self.identity_claims().is_some() {
             return true;
         }
-        if self.data_token.as_ref().is_some_and(|claims| {
+        if self.data_claims().is_some_and(|claims| {
             claims
                 .grants
                 .iter()
@@ -257,10 +290,10 @@ impl AuthenticatedActor {
     }
 
     pub(crate) fn permits_action(&self, action: omnigraph_policy::PolicyAction) -> bool {
-        if self.source == AuthSource::Static {
+        if self.source == AuthSource::Static || self.identity_claims().is_some() {
             return true;
         }
-        self.data_token.as_ref().is_some_and(|claims| {
+        self.data_claims().is_some_and(|claims| {
             claims.grants.iter().any(|grant| {
                 (self.selected_graph.as_ref() == Some(&grant.graph_id)
                     || (self.selected_graph.is_none()
@@ -272,7 +305,8 @@ impl AuthenticatedActor {
 
     pub(crate) fn permits_graph_listing(&self, graph_id: &str) -> bool {
         self.source == AuthSource::Static
-            || self.data_token.as_ref().is_some_and(|claims| {
+            || self.identity_claims().is_some()
+            || self.data_claims().is_some_and(|claims| {
                 claims.grants.iter().any(|grant| {
                     grant.graph_id.as_str() == graph_id
                         && grant

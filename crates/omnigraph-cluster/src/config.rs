@@ -960,7 +960,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                     omnigraph_policy::PolicyConfig::from_source(&source).and_then(|_| {
                         match (binds_cluster, graph_binding.as_deref()) {
                             (true, None) => {
-                                omnigraph_policy::PolicyEngine::load_server_from_source(&source)
+                                omnigraph_policy::PolicyEngine::load_cluster_from_source(&source)
                                     .map(|_| ())
                             }
                             (false, Some(graph_id)) => {
@@ -1024,6 +1024,8 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         desired: Some(DesiredCluster {
             config_dir: config_dir.clone(),
             config_digest,
+            config_semantics: serde_json::to_string(&raw)
+                .expect("raw cluster config must serialize deterministically"),
             storage_root: settings.storage_root.clone(),
             state_lock: settings.state_lock,
             graphs,
