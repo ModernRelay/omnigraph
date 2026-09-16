@@ -1,5 +1,5 @@
 ---
-rfc: "0069"
+rfc: "2026-09-14-compatibility-surfaces"
 title: "Compatibility surfaces"
 track: maintainer
 status: draft
@@ -14,11 +14,9 @@ superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0069: Compatibility surfaces
+# RFC: Compatibility surfaces
 
 > A term set in ***bold italics*** is being defined at that exact spot; it is plain text everywhere after.
-
-> Number provisional: this number is the first that no open draft held when drafting began; re-check the registry's next-available line when the PR opens.
 
 ## Summary
 
