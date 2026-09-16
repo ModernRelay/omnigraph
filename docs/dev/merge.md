@@ -174,9 +174,10 @@ rules, and the small cache/layout controls in the
 it unset, so timing does not read the clock. Its top-level timing flow is:
 
 `OuterPrepare` -> ((`ProvenInsertHistory` -> `ProvenInsertPlanScan`) | `TableWalk`)
--> `CandidateValidation` -> `FinalRevalidation` -> `RecoveryArm` ->
-`PhysicalPublish` -> `RecoveryConfirm` -> `ManifestPublish` -> `RecoveryCleanup`
--> `OuterRestoreRefresh`.
+-> `CandidateValidation` -> `FinalRevalidation` -> `PhysicalPublish` ->
+`ManifestPublish` -> `OuterRestoreRefresh`. The `RecoveryArm`,
+`RecoveryConfirm` and `RecoveryCleanup` phases retired with the merge
+sidecar (RFC 0067).
 
 The parenthesized classification routes are chosen per table, so a mixed-table
 operation can record both route families. `TableWalk` covers one general

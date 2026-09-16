@@ -838,18 +838,15 @@ pub(crate) enum MergeTimingPhase {
     TableWalk,
     CandidateValidation,
     FinalRevalidation,
-    RecoveryArm,
     PhysicalPublish,
     KeyedStage,
     KeyedCommit,
-    RecoveryConfirm,
     ManifestPublish,
-    RecoveryCleanup,
     OuterRestoreRefresh,
 }
 
 impl MergeTimingPhase {
-    const COUNT: usize = 14;
+    const COUNT: usize = 11;
 
     const fn index(self) -> usize {
         self as usize
@@ -862,13 +859,10 @@ impl MergeTimingPhase {
         Self::TableWalk,
         Self::CandidateValidation,
         Self::FinalRevalidation,
-        Self::RecoveryArm,
         Self::PhysicalPublish,
         Self::KeyedStage,
         Self::KeyedCommit,
-        Self::RecoveryConfirm,
         Self::ManifestPublish,
-        Self::RecoveryCleanup,
         Self::OuterRestoreRefresh,
     ];
 
@@ -880,13 +874,10 @@ impl MergeTimingPhase {
             Self::TableWalk => "TableWalk",
             Self::CandidateValidation => "CandidateValidation",
             Self::FinalRevalidation => "FinalRevalidation",
-            Self::RecoveryArm => "RecoveryArm",
             Self::PhysicalPublish => "PhysicalPublish",
             Self::KeyedStage => "KeyedStage",
             Self::KeyedCommit => "KeyedCommit",
-            Self::RecoveryConfirm => "RecoveryConfirm",
             Self::ManifestPublish => "ManifestPublish",
-            Self::RecoveryCleanup => "RecoveryCleanup",
             Self::OuterRestoreRefresh => "OuterRestoreRefresh",
         }
     }
@@ -1156,9 +1147,6 @@ impl MergeWriteProbes {
     pub fn final_revalidation_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::FinalRevalidation)
     }
-    pub fn recovery_arm_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryArm)
-    }
     pub fn physical_publish_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::PhysicalPublish)
     }
@@ -1174,14 +1162,8 @@ impl MergeWriteProbes {
     pub fn keyed_commit_max_us(&self) -> u64 {
         self.merge_timing_max_us(MergeTimingPhase::KeyedCommit)
     }
-    pub fn recovery_confirm_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryConfirm)
-    }
     pub fn manifest_publish_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::ManifestPublish)
-    }
-    pub fn recovery_cleanup_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryCleanup)
     }
     pub fn outer_restore_refresh_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)

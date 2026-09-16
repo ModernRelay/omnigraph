@@ -431,31 +431,25 @@ impl MergeRouteObservation {
     }
 }
 
-const CURRENT_STABLE_MERGE_PHASES: [&str; 14] = [
+const CURRENT_STABLE_MERGE_PHASES: [&str; 11] = [
     "OuterPrepare",
     "ProvenInsertHistory",
     "ProvenInsertPlanScan",
     "TableWalk",
     "CandidateValidation",
     "FinalRevalidation",
-    "RecoveryArm",
     "PhysicalPublish",
     "KeyedStage",
     "KeyedCommit",
-    "RecoveryConfirm",
     "ManifestPublish",
-    "RecoveryCleanup",
     "OuterRestoreRefresh",
 ];
-const REQUIRED_GENERAL_TOP_LEVEL_PHASES: [&str; 9] = [
+const REQUIRED_GENERAL_TOP_LEVEL_PHASES: [&str; 6] = [
     "OuterPrepare",
     "CandidateValidation",
     "FinalRevalidation",
-    "RecoveryArm",
     "PhysicalPublish",
-    "RecoveryConfirm",
     "ManifestPublish",
-    "RecoveryCleanup",
     "OuterRestoreRefresh",
 ];
 const GENERAL_ROUTE_UNENTERED_PHASES: [&str; 2] = ["ProvenInsertHistory", "ProvenInsertPlanScan"];
@@ -493,13 +487,10 @@ pub(crate) fn test_general_merge_stored_phases(
         phase("TableWalk", 20, 10, table_walk_intervals),
         phase("CandidateValidation", 4, 4, 1),
         phase("FinalRevalidation", 5, 5, 1),
-        phase("RecoveryArm", 2, 2, 1),
         phase("PhysicalPublish", 100, 100, 1),
         phase("KeyedStage", 20, 10, merge_insert_calls),
         phase("KeyedCommit", 30, 15, merge_insert_calls),
-        phase("RecoveryConfirm", 2, 2, 1),
         phase("ManifestPublish", 6, 6, 1),
-        phase("RecoveryCleanup", 1, 1, 1),
         phase("OuterRestoreRefresh", 2, 2, 1),
     ]
 }
