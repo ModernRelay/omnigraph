@@ -544,7 +544,16 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     } else {
         request
     };
-    let mut response = request.send().await?;
+    remote_response_json_bounded(request.send().await?, bearer_token, response_limit).await
+}
+
+/// Decode either JSON requests or raw NDJSON loads through the same bounded,
+/// credential-safe response path. The request owner chooses its deadline.
+pub(crate) async fn remote_response_json_bounded<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    bearer_token: Option<&str>,
+    response_limit: Option<usize>,
+) -> Result<T> {
     let status = response.status();
     let text = if let Some(limit) = response_limit {
         if status.is_redirection() {
