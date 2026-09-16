@@ -5110,4 +5110,42 @@ async fn rfc_0067_replay_over_its_own_twin_is_refused_only_for_self_conflicting_
         first.version().version + 1,
         "the delete-only config twin rebased instead of conflicting"
     );
+
+    // Overwrite: idempotent. An Overwrite replaces every fragment, so Lance
+    // has nothing for it to conflict with, and it recognises the already
+    // committed twin instead of landing a stray: the replay returns the
+    // first commit's version and adds no version. A schema-apply rewrite
+    // pin can therefore be promoted by racing promoters without residue.
+    let head = rfc0067_head(uri).await;
+    let overwrite = InsertBuilder::new(Arc::new(head.clone()))
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![pk_batch(&["o1"], &[1])])
+        .await
+        .unwrap();
+    let first = rfc0067_linear(head.clone())
+        .execute(overwrite.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.version().version, head.version().version + 1);
+    let versions_after_first = rfc0067_head(uri).await.versions().await.unwrap().len();
+    let second = rfc0067_linear(head.clone())
+        .execute(overwrite)
+        .await
+        .expect("an Overwrite twin is accepted, not refused");
+    assert_eq!(
+        second.version().version,
+        first.version().version,
+        "the Overwrite twin resolves to the first commit's version"
+    );
+    let head = rfc0067_head(uri).await;
+    assert_eq!(head.version().version, first.version().version);
+    assert_eq!(
+        head.versions().await.unwrap().len(),
+        versions_after_first,
+        "the Overwrite twin adds no version"
+    );
+    assert_eq!(rfc0067_ids(&head).await, vec!["o1"]);
 }

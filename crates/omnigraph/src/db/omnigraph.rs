@@ -62,12 +62,13 @@ use super::manifest::{
     GenesisManifestAttempt, ManifestChange, Snapshot, TableRegistration, TableTombstone,
 };
 use super::schema_state::{
-    SCHEMA_SOURCE_FILENAME, SchemaContractText, load_validated_schema_contract,
-    load_validated_schema_contract_for_source, read_accepted_schema_ir, read_schema_contract_text,
-    read_schema_contract_text_for_source, read_schema_state_identity, recover_schema_state_files,
-    render_schema_contract, schema_ir_uri, schema_source_staging_uri, schema_source_uri,
-    schema_state_uri, validate_schema_contract, validate_schema_contract_text,
-    validate_schema_ir_against_snapshot, write_schema_contract, write_schema_contract_staging,
+    SCHEMA_SOURCE_FILENAME, SchemaContractText, SchemaStagingPolicy, SchemaStateRecovery,
+    load_validated_schema_contract, load_validated_schema_contract_for_source,
+    read_accepted_schema_ir, read_schema_contract_text, read_schema_contract_text_for_source,
+    read_schema_state_identity, recover_schema_state_files, render_schema_contract, schema_ir_uri,
+    schema_source_staging_uri, schema_source_uri, schema_state_uri, validate_schema_contract,
+    validate_schema_contract_text, validate_schema_ir_against_snapshot, write_schema_contract,
+    write_schema_contract_staging,
 };
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
@@ -213,6 +214,11 @@ pub struct Omnigraph {
     coordinator: Arc<tokio::sync::RwLock<GraphCoordinator>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
+    /// RFC 0067: this handle's schema apply published its manifest commit but
+    /// could not install the schema contract. The next write-entry heal on
+    /// this handle installs it from the staged copy; other handles and
+    /// processes converge at their next read-write open.
+    pending_schema_install: std::sync::atomic::AtomicBool,
     /// Warm change-feed cut for this handle's bound branch. A cut (head,
     /// witness, genesis, lineage projection, forward child index) is a PURE
     /// projection of `__manifest`, so it is exactly valid while the manifest
@@ -495,7 +501,7 @@ impl Omnigraph {
         let schema_identity_domain = schema_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_physical_schemas(&mut catalog)?;
-        let (_, ir_json, state_json) = render_schema_contract(&schema_ir)?;
+        let (_, ir_json, state_json) = render_schema_contract(&schema_ir, None)?;
         let contract = SchemaContractText {
             source: schema_source.to_string(),
             ir_json,
@@ -665,6 +671,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
+            pending_schema_install: std::sync::atomic::AtomicBool::new(false),
             feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
@@ -784,12 +791,29 @@ impl Omnigraph {
         if matches!(mode, OpenMode::ReadWrite) {
             // Schema staging is itself mutable recovery state. Hold the shared
             // schema gate across BOTH its file pre-pass and the complete Full
-            // sidecar sweep, so `schema_state_recovery` cannot go stale in a
+            // sidecar sweep, so the schema staging decision cannot go stale in a
             // release/reacquire gap. The sweep adds branch → sorted table gates
             // per sidecar under this outer guard.
-            let schema_state_recovery =
-                recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
-                    .await?;
+            recover_schema_state_files(
+                &root,
+                Arc::clone(&storage),
+                &coordinator.snapshot(),
+                SchemaStagingPolicy::PromoteOrDiscard,
+            )
+            .await?;
+            // RFC 0067: a crashed schema apply leaves its durable sentinel
+            // behind with no sidecar to retire it. The open-time pass above
+            // settled its staging, so the sentinel is stale under the same
+            // one-mutation-process boundary; reclaim it before the sweep.
+            if coordinator
+                .all_branches()
+                .await?
+                .iter()
+                .any(|branch| is_schema_apply_lock_branch(branch))
+            {
+                tracing::warn!("reclaiming the schema apply sentinel left by a crashed apply");
+                coordinator.branch_delete(SCHEMA_APPLY_LOCK_BRANCH).await?;
+            }
             // Recovery sweep: close the Phase B → Phase C residual on
             // any sidecar left over from a crashed writer. Long-running
             // processes additionally converge in-process: the staged-
@@ -802,7 +826,6 @@ impl Omnigraph {
                 Arc::clone(&storage),
                 &mut coordinator,
                 crate::db::manifest::RecoveryMode::Full,
-                schema_state_recovery,
                 write_queue.as_ref(),
             )
             .await?;
@@ -857,6 +880,7 @@ impl Omnigraph {
             // sessions reuse the process-wide object-store registry.
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
+            pending_schema_install: std::sync::atomic::AtomicBool::new(false),
             feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
@@ -2050,12 +2074,25 @@ impl Omnigraph {
             {
                 let mut coord = self.coordinator.write().await;
                 coord.refresh().await?;
-                recover_schema_state_files(
+                let outcome = recover_schema_state_files(
                     &self.root_uri,
                     Arc::clone(&self.storage),
                     &coord.snapshot(),
+                    SchemaStagingPolicy::PromoteOnly,
                 )
                 .await?;
+                // A promoted staging completes a published apply whose writer
+                // died before releasing its sentinel; release it here so the
+                // caller's write is not refused until the next open.
+                if matches!(outcome, SchemaStateRecovery::Promoted)
+                    && coord
+                        .all_branches()
+                        .await?
+                        .iter()
+                        .any(|branch| is_schema_apply_lock_branch(branch))
+                {
+                    coord.branch_delete(SCHEMA_APPLY_LOCK_BRANCH).await?;
+                }
             }
         } // ← guards released before the heal's queue acquisition
         let _outcome = crate::db::manifest::heal_pending_sidecars_roll_forward(
@@ -2330,12 +2367,38 @@ impl Omnigraph {
             &self.write_queue,
         )
         .await?;
-        if outcome.processed_any {
-            // A rolled-forward SchemaApply sidecar moved disk + manifest
-            // to the new schema (staging promoted, registrations
-            // published); the in-memory catalog must follow or the very
-            // write that triggered the heal validates against the stale
-            // schema. Same post-heal step as `refresh`.
+        // RFC 0067: finish this handle's own published-but-uninstalled schema
+        // apply before the caller's write plans against the manifest. The
+        // flag keeps the common path free of any staging probe.
+        let mut installed = false;
+        if self
+            .pending_schema_install
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let result = {
+                let _serial = self
+                    .write_queue
+                    .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                    .await;
+                let snapshot = self.coordinator.read().await.snapshot();
+                recover_schema_state_files(
+                    &self.root_uri,
+                    Arc::clone(&self.storage),
+                    &snapshot,
+                    SchemaStagingPolicy::PromoteOnly,
+                )
+                .await
+            };
+            match result {
+                Ok(recovery) => installed = matches!(recovery, SchemaStateRecovery::Promoted),
+                Err(error) => {
+                    self.pending_schema_install
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
+        }
+        if outcome.processed_any || installed {
             self.reload_schema_if_source_changed().await?;
             self.invalidate_read_caches().await;
         }

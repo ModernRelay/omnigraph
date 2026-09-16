@@ -53,6 +53,13 @@ enum Writer {
     EnsureIndices,
     /// A fast-forward merge of a branch holding one Person insert into main.
     Merge,
+    /// Schema apply adding a nullable Person property: one detached rewrite
+    /// of Person, no row change, the contract staged and installed.
+    SchemaApply,
+}
+
+fn city_schema() -> String {
+    helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String?")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +114,7 @@ impl Writer {
             Writer::Cleanup => vec![InPromotion, CleanupPreReap],
             Writer::EnsureIndices => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
             Writer::Merge => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
+            Writer::SchemaApply => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
         }
     }
 
@@ -117,6 +125,7 @@ impl Writer {
             Writer::Cleanup => "cleanup",
             Writer::EnsureIndices => "ensure_indices",
             Writer::Merge => "merge",
+            Writer::SchemaApply => "schema_apply",
         }
     }
 
@@ -137,7 +146,15 @@ impl Window {
     fn seam(self, writer: Writer) -> (&'static str, u64) {
         let index = writer == Writer::EnsureIndices;
         let merge = writer == Writer::Merge;
+        let schema = writer == Writer::SchemaApply;
         match self {
+            Window::PostDetached(n) if schema => {
+                (catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.name(), n as u64)
+            }
+            Window::PrePublish if schema => (catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.name(), 1),
+            Window::PostPublish if schema => {
+                (catalog::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION.name(), 1)
+            }
             Window::PostDetached(n) if merge => {
                 (catalog::BRANCH_MERGE_POST_TABLE_EFFECT.name(), n as u64)
             }
@@ -300,6 +317,7 @@ fn rfc0067_matrix_child_process() {
                     .await
                     .map(|_| ()),
                 "insert_and_friend" => insert_and_friend(&mut db, &name).await,
+                "schema_apply" => db.apply_schema(&city_schema()).await.map(|_| ()),
                 _ => insert(&mut db, &name).await,
             };
             if let Err(error) = outcome {
@@ -400,6 +418,7 @@ async fn run_cell(
                     .branch_merge(&format!("src_{write_name}"), "main")
                     .await
                     .map(|_| ()),
+                Writer::SchemaApply => db.apply_schema(&city_schema()).await.map(|_| ()),
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
@@ -429,8 +448,18 @@ async fn run_cell(
             }
             if fault == Fault::Race {
                 let race_name = format!("m{index}_race");
-                insert(&mut db, &race_name).await.unwrap();
-                model.names.insert(race_name);
+                if writer == Writer::SchemaApply {
+                    // The apply's durable sentinel refuses every concurrent
+                    // writer of the graph while it is in flight.
+                    let refused = insert(&mut db, &race_name).await.unwrap_err();
+                    assert!(
+                        refused.to_string().contains("schema apply"),
+                        "{cell}: the sentinel must refuse the racer: {refused}"
+                    );
+                } else {
+                    insert(&mut db, &race_name).await.unwrap();
+                    model.names.insert(race_name);
+                }
                 std::fs::write(barrier.join("go"), b"1").unwrap();
                 let out = child.wait_with_output().unwrap();
                 acknowledged = out.status.success();
@@ -496,6 +525,23 @@ async fn run_cell(
     let (observed, duplicates) = observe_model(&fresh).await;
     assert!(!duplicates, "{cell}: duplicate Person keys");
     assert_eq!(observed, model, "{cell}: row model");
+    if writer == Writer::SchemaApply {
+        assert_eq!(
+            fresh.schema_source().contains("city: String?"),
+            visible,
+            "{cell}: the schema contract follows the publication"
+        );
+        for staging in [
+            "_schema.pg.staging",
+            "_schema.ir.json.staging",
+            "__schema_state.json.staging",
+        ] {
+            assert!(
+                !dir.path().join(staging).exists(),
+                "{cell}: the open retires {staging}"
+            );
+        }
+    }
     let (same_handle, _) = observe_model(&db).await;
     assert_eq!(
         same_handle, model,
@@ -606,6 +652,7 @@ async fn run_matrix() {
         Writer::Cleanup,
         Writer::EnsureIndices,
         Writer::Merge,
+        Writer::SchemaApply,
     ];
     let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {

@@ -150,8 +150,8 @@ detached manifest older than the threshold that no pending chain protects
 (superseded pins, promoted chain links and attempts that never published). A pin whose target version a
 foreign linear commit occupies is blocked: a later mutation stages from the
 detached version and its own promotion waits behind the block, while the
-writers that still commit on the linear HEAD (schema apply, Optimize)
-promote a pending pin before they plan and refuse a blocked one. `omnigraph repair` reports blocked pins as
+graph-global writers (schema apply, Optimize) promote every pending pin
+before they plan and refuse a blocked one. `omnigraph repair` reports blocked pins as
 `blocked_promotion` and never adopts the foreign commit. First-touch branch
 forks are created without an intent record; an unreferenced fork is garbage
 that cleanup classifies.
@@ -164,6 +164,25 @@ batch as a detached version of the pin, publishes the pins once and promotes
 them. A failure before publication leaves no residue; one after publication
 leaves a pending pin that reads, including full-text search through the
 batch's certificate, serve from the staged version.
+
+Schema apply stages each existing-table rewrite as a detached Overwrite of
+the promoted HEAD, publishes it as a pin one past the published version and
+promotes it after the manifest commit. An added type is a linear
+version-one create at its identity path; that path is a deterministic
+function of the accepted identity allocator, so an attempt that died after
+creating the dataset left it exactly where the retry creates it, and the
+retry reclaims the unregistered leftover under the schema sentinel before
+creating. The schema contract is staged before the manifest commit with the
+graph commit it publishes recorded in `__schema_state.json.staging`, and the
+writer installs the live contract from memory after the commit. No sidecar is
+armed: a failure before the commit leaves detached versions, a created
+dataset and a staged contract that the next read-write open discards; a
+failure after it leaves a published manifest whose contract installation the
+same handle's next write, or the next read-write open, completes because the
+recorded commit is in main's lineage. A read-only open refuses that state and serves
+an unpublished staging as if it were absent. The open also reclaims a
+sentinel left by a crashed apply, under the same one-mutation-process
+boundary as every other open-time recovery decision.
 
 Branch merge follows it too. Each target table opens at its pin; every chunk
 of the proven insertion chain or the bounded ordered diff commits as a

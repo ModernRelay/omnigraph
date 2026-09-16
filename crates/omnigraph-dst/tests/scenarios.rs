@@ -2214,6 +2214,11 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// The detached index writer opens each productive table at its pin and
 /// promotes the twin it lands (EnsureIndices l.get 11 -> 15; the closing
 /// pass reads the promoted twins, _close l.get 31 -> 35, _verify 2071 -> 2069).
+/// Detached schema apply: a read-write open lists the branch refs once to
+/// reclaim a stale schema-apply sentinel (_setup/_audit l.list 37/65 ->
+/// 38/66, _audit l.get 1228 -> 1230) and a read-only open probes the staged
+/// schema state once for its coherence proof (_audit a.exists 79 -> 81,
+/// _verify 376 -> 389).
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

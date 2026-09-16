@@ -147,6 +147,48 @@ async fn ensure_indices_writes_no_control_object() {
     );
 }
 
+/// RFC 0067: schema apply arms no recovery sidecar. A property addition
+/// rewrites one table detached; the only control objects written are the
+/// three staged contract files and the three live ones, and the only deletes
+/// retire the staging.
+#[tokio::test]
+async fn schema_apply_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+        .await
+        .unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String?"))
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        6,
+        "a detached schema apply writes the staged and live contract files and no sidecar"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        3,
+        "a detached schema apply deletes only its three staging files"
+    );
+    assert!(
+        !dir.path().join("__recovery").exists()
+            || std::fs::read_dir(dir.path().join("__recovery"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "no recovery sidecar may exist after a schema apply"
+    );
+}
+
 /// RFC 0067: a branch merge arms no recovery sidecar either. A fast-forward
 /// merge with one table effect writes and deletes no control object.
 #[tokio::test]

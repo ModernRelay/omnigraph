@@ -60,6 +60,7 @@ omnigraph_seams::catalog! {
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_AFTER_STAGING_WRITE,
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_BEFORE_STAGING_WRITE,
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT,
+    crate::db::omnigraph::schema_apply::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION,
     crate::db::omnigraph::schema_apply::SCHEMA_APPLY_POST_TABLE_COMMIT,
     crate::db::omnigraph::system_column_upgrade::SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE,
     crate::db::omnigraph::table_ops::ENSURE_INDICES_POST_FORK_PRE_COMMIT,

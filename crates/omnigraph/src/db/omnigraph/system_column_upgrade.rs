@@ -325,8 +325,7 @@ async fn execute_with_lock(
         crate::table_store::StagedTransactionIdentity,
     >::new();
     for entry in snapshot.datasets() {
-        let planned =
-            super::schema_apply::pre_minted_schema_transaction(entry.published_dataset_version);
+        let planned = pre_minted_schema_transaction(entry.published_dataset_version);
         recovery_pins.push(crate::db::manifest::SidecarTablePin {
             table_fork_owner: None,
             identity: entry.identity,
@@ -499,7 +498,7 @@ async fn execute_with_lock(
         db.storage
             .write_text(&schema_source_staging_uri(&db.root_uri), &desired_source)
             .await?;
-        write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir).await?;
+        write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir, None).await?;
         crate::db::schema_state::validate_exact_schema_staging_target(
             db.root_uri(),
             db.storage_adapter(),
@@ -618,5 +617,16 @@ async fn execute_with_lock(
             recovery_operation_id,
             error.to_string(),
         )),
+    }
+}
+
+/// Pre-mint the exact rename transaction identity the v9 sidecar records
+/// before the table effect commits.
+fn pre_minted_schema_transaction(
+    read_version: u64,
+) -> crate::table_store::StagedTransactionIdentity {
+    crate::table_store::StagedTransactionIdentity {
+        read_version,
+        uuid: format!("omnigraph-schema-{}", crate::dst_ids::new_ulid()),
     }
 }

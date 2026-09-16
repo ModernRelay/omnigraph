@@ -19,7 +19,7 @@ use serial_test::serial;
 
 use helpers::recovery::{
     RecoveryExpectation, TableExpectation, assert_post_recovery_invariants, branch_head_commit_id,
-    recovery_audit_kinds, sidecar_operation_ids, single_sidecar_operation_id,
+    sidecar_operation_ids, single_sidecar_operation_id,
 };
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, collect_column_strings, count_rows,
@@ -236,28 +236,29 @@ fn node_table_identity_json(db: &Omnigraph, type_name: &str) -> serde_json::Valu
     })
 }
 
-fn pending_schema_apply_node_table_uri(root: &str, type_name: &str) -> String {
-    let operation_id = single_sidecar_operation_id(std::path::Path::new(root));
-    let sidecar_path = std::path::Path::new(root)
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
-    let table_key = format!("node:{type_name}");
-    let registration = sidecar["protocol_v7"]["intended_delta"]["registrations"]
-        .as_array()
-        .expect("SchemaApply sidecar must carry its intended registrations")
-        .iter()
-        .find(|registration| registration["table_key"] == table_key)
-        .unwrap_or_else(|| panic!("SchemaApply sidecar has no registration for {table_key}"));
-    let table_path = registration["table_path"]
-        .as_str()
-        .expect("SchemaApply registration must carry its identity-derived table path");
-    format!(
-        "{}/{}",
-        root.trim_end_matches('/'),
-        table_path.trim_start_matches('/')
-    )
+/// The one node dataset directory the live manifest does not register: the
+/// leftover of an abandoned add-type create (RFC 0067).
+async fn unregistered_node_table_uri(db: &Omnigraph) -> String {
+    let registered: std::collections::BTreeSet<String> = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .datasets()
+        .map(|entry| entry.dataset_path.trim_start_matches('/').to_string())
+        .collect();
+    let root = db.uri().trim_end_matches('/').to_string();
+    let mut orphans: Vec<String> = std::fs::read_dir(format!("{root}/nodes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| !registered.contains(&format!("nodes/{name}")))
+        .collect();
+    orphans.sort();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "expected exactly one unregistered node dataset, got {orphans:?}"
+    );
+    format!("{root}/nodes/{}", orphans[0])
 }
 
 // Lance can durably complete a native ref mutation while the caller observes
@@ -2198,7 +2199,7 @@ async fn cross_handle_branch_gate_serializes_post_effect_publish() {
 
 #[tokio::test]
 #[serial]
-async fn schema_apply_pre_commit_crash_rolls_forward_via_sidecar() {
+async fn schema_apply_pre_commit_crash_discards_staging_on_reopen() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -2213,31 +2214,44 @@ async fn schema_apply_pre_commit_crash_rolls_forward_via_sidecar() {
             "got: {}",
             err
         );
+        assert!(
+            !matches!(err, OmniError::RecoveryRequired { .. }),
+            "a failure before publication needs no recovery: {err}"
+        );
     }
+    assert!(
+        dir.path().join("__schema_state.json.staging").exists(),
+        "the staged contract outlives the writer"
+    );
+    assert_no_recovery_sidecars(dir.path());
 
-    // Reopen. With the sidecar protocol, a Phase B → Phase C crash
-    // (per-table commit_staged done; manifest publish not yet) is
-    // recoverable: the sidecar's `additional_registrations` carries the
-    // intent to register `node:Company`, schema-state recovery promotes
-    // the staging files, and the manifest-drift sweep publishes the
-    // RegisterTable + Update so the manifest catches up to the schema
-    // the writer already declared. The orphan-dataset-on-disk-with-no-
-    // manifest-entry corruption that pre-this-protocol recoveries left
-    // behind is closed.
+    // RFC 0067: the staged contract names a graph commit that never landed,
+    // so the next read-write open discards it; the created Company dataset
+    // is unregistered garbage at the path the retry creates at.
     let db = Omnigraph::open(&uri).await.unwrap();
-    assert_eq!(
-        db.schema_source().as_str(),
-        SCHEMA_V2_ADDED_TYPE,
-        "live schema must reflect the rolled-forward apply (Company added)"
-    );
+    assert_eq!(db.schema_source().as_str(), SCHEMA_V1);
     assert_no_staging_files(dir.path());
-    // node:Company must be registered in the manifest (queryable);
-    // pre-protocol recoveries left it as an orphan dataset on disk.
-    let company_rows = helpers::count_rows(&db, "node:Company").await;
-    assert_eq!(
-        company_rows, 0,
-        "node:Company must have a manifest entry post-recovery"
+    assert!(
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Company")
+            .is_none(),
+        "nothing registers an unpublished apply's table"
     );
+    let company_uri = unregistered_node_table_uri(&db).await;
+    assert!(
+        std::path::Path::new(&company_uri).exists(),
+        "the abandoned create stays as unregistered garbage until the retry reclaims it"
+    );
+
+    db.apply_schema(SCHEMA_V2_ADDED_TYPE)
+        .await
+        .expect("the retry reclaims the leftover and publishes");
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 0);
+    assert_eq!(node_table_uri(&db, "Company").await, company_uri);
+    assert_no_staging_files(dir.path());
+    assert_no_recovery_sidecars(dir.path());
 }
 
 #[tokio::test]
@@ -2252,56 +2266,35 @@ async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
         let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
+            matches!(err, OmniError::RecoveryRequired { .. }),
+            "a failure after publication reports the pending contract installation: {err}"
+        );
+        assert!(
             err.to_string()
                 .contains("injected failpoint triggered: schema_apply.after_manifest_commit"),
             "got: {}",
             err
         );
     }
+    assert_no_recovery_sidecars(dir.path());
 
     // ReadOnly must remain non-mutating, but it also must not combine the
-    // already-published v7 manifest delta with the old live schema contract.
-    // It fails closed until a read-write open performs promotion/recovery.
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{}.json", single_sidecar_operation_id(dir.path())));
-
-    // Even though read-only open historically ignores corrupt recovery files,
-    // it must fail closed when schema-staging artifacts mean that the corrupt
-    // file could be the only proof of a committed-but-unpromoted SchemaApply.
-    // Keep the valid body so the rest of this test can exercise recovery.
-    let valid_sidecar = std::fs::read_to_string(&sidecar_path).unwrap();
-    std::fs::write(&sidecar_path, "{not json").unwrap();
-    let corrupt_read_only_error = match Omnigraph::open_read_only(&uri).await {
-        Ok(_) => panic!("read-only open must refuse corrupt intent plus schema staging"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        corrupt_read_only_error,
-        OmniError::RecoveryRequired { .. }
-    ));
-    assert!(
-        corrupt_read_only_error
-            .to_string()
-            .contains("schema-staging artifacts alongside unparseable recovery sidecar")
-    );
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
-        SCHEMA_V1,
-        "the corrupt-sidecar guard must remain non-mutating"
-    );
-    std::fs::write(&sidecar_path, valid_sidecar).unwrap();
-
+    // already-published manifest delta with the old live schema contract.
+    // It fails closed until a read-write open performs the promotion.
     let read_only_error = match Omnigraph::open_read_only(&uri).await {
         Ok(_) => panic!("read-only open must refuse a committed-but-unpromoted SchemaApply"),
         Err(error) => error,
     };
-    assert!(matches!(
-        read_only_error,
-        OmniError::RecoveryRequired { .. }
-    ));
-    assert!(sidecar_path.exists());
+    assert!(
+        matches!(read_only_error, OmniError::RecoveryRequired { .. }),
+        "{read_only_error}"
+    );
+    assert!(
+        read_only_error
+            .to_string()
+            .contains("schema contract promotion is pending"),
+        "{read_only_error}"
+    );
     assert!(dir.path().join("_schema.pg.staging").exists());
     assert!(dir.path().join("_schema.ir.json.staging").exists());
     assert!(dir.path().join("__schema_state.json.staging").exists());
@@ -2312,9 +2305,8 @@ async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
     );
 
     // Simulate a crash partway through promotion: source reached its final
-    // name, while the exact IR/state contract remains staged. Recovery must
-    // validate the mixed state as one target identity and finish it, rather
-    // than rejecting the already-visible fixed manifest outcome.
+    // name, while the IR/state contract remains staged. Recovery must
+    // validate the mixed state as one target identity and finish it.
     std::fs::rename(
         dir.path().join("_schema.pg.staging"),
         dir.path().join("_schema.pg"),
@@ -2324,11 +2316,15 @@ async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
     assert!(dir.path().join("_schema.ir.json.staging").exists());
     assert!(dir.path().join("__schema_state.json.staging").exists());
 
-    // Reopen — the fixed manifest outcome is visible, so recovery completes
-    // the remaining promotion and the live schema matches v2.
+    // Reopen: the publishing commit is in lineage, so recovery completes the
+    // remaining promotion and the live schema matches v2.
     let db = Omnigraph::open(&uri).await.unwrap();
     assert_eq!(db.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
     assert_no_staging_files(dir.path());
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 0);
+    db.apply_schema(SCHEMA_V2_ADDED_TYPE)
+        .await
+        .expect("the reclaimed sentinel admits the next apply, a no-op here");
 }
 
 /// The applying handle's coordinator observes the fixed manifest commit before
@@ -2858,15 +2854,9 @@ async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, person_rows);
 }
 
-/// Same heal contract as the merge variant, for the schema apply entry
-/// point: a pending roll-forward-eligible sidecar (here from a schema apply
-/// that failed after its durable staging write; schema apply needs a
-/// main-only graph, which rules out the merge producer) must be healed
-/// in-process before the migration runs, so a long-lived handle can evolve
-/// the schema without a restart after a Phase B → Phase C failure.
 #[tokio::test]
 #[serial]
-async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
+async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
@@ -2878,33 +2868,22 @@ async fn schema_apply_after_finalize_publisher_failure_heals_without_reopen() {
     {
         let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
         let err = db.apply_schema(&desired).await.unwrap_err();
-        assert!(matches!(err, OmniError::RecoveryRequired { .. }), "{err}");
-    }
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .count(),
-        1
-    );
-
-    // The same migration on the SAME handle. Must heal the sidecar first,
-    // then find the schema already applied.
-    db.apply_schema(&desired).await.expect(
-        "schema apply on the same handle must heal sidecar-covered \
-         drift in-process instead of failing until restart",
-    );
-
-    // The interrupted apply rolled forward; the migration landed.
-    assert_eq!(helpers::count_rows(&db, "node:Person").await, person_rows);
-    assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        assert_eq!(
-            std::fs::read_dir(&recovery_dir).unwrap().count(),
-            0,
-            "no sidecar may remain after heal + successful schema apply"
+        assert!(
+            !matches!(err, OmniError::RecoveryRequired { .. }),
+            "a failure before publication is a plain error: {err}"
         );
     }
+    assert_no_recovery_sidecars(dir.path());
+    assert!(dir.path().join("__schema_state.json.staging").exists());
+
+    db.apply_schema(&desired)
+        .await
+        .expect("the retry restages over its own unpublished staging in-process");
+
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, person_rows);
+    assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
+    assert_no_staging_files(dir.path());
+    assert_no_recovery_sidecars(dir.path());
 }
 
 /// Same heal contract for the branch-merge entry point: a pending
@@ -3297,15 +3276,9 @@ async fn orphaned_branch_discard_converges_across_audit_append_failure() {
     );
 }
 
-/// After the write-entry heal rolls a SchemaApply sidecar forward (a
-/// crashed apply on the SAME handle: staging promoted, registrations
-/// published), the handle's in-memory catalog must be reloaded — disk
-/// and manifest are on the new schema, and validating subsequent
-/// writes against the stale catalog rejects rows of types the graph
-/// already has.
 #[tokio::test]
 #[serial]
-async fn load_after_schema_apply_phase_b_failure_uses_recovered_catalog() {
+async fn load_after_schema_apply_pre_publish_failure_keeps_the_accepted_catalog() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
@@ -3321,59 +3294,44 @@ async fn load_after_schema_apply_phase_b_failure_uses_recovered_catalog() {
     .await
     .unwrap();
 
-    // v2: a Person property (rewritten_tables work) + a new Tag type
-    // (table-set change, keeps the staging disambiguator decisive).
-    let v2_schema = r#"node Person {
-    name: String @key
-    age: I32?
-    city: String?
-}
-
-node Company {
-    name: String @key
-}
-
-node Tag {
-    label: String @key
-}
-
-edge Knows: Person -> Person {
-    since: Date?
-}
-
-edge WorksAt: Person -> Company
-"#;
+    let v2_schema = format!(
+        "{}\nnode Tag {{ label: String @key }}\n",
+        schema_with_person_city()
+    );
     {
         let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
-        let err = db.apply_schema(v2_schema).await.unwrap_err();
+        let err = db.apply_schema(&v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("injected failpoint triggered: schema_apply.after_staging_write"),
             "unexpected error: {err}"
         );
-        let recovery_dir = dir.path().join("__recovery");
-        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 1);
     }
+    assert_no_recovery_sidecars(dir.path());
 
-    // Same handle: a load of the NEW type. The entry heal rolls the
-    // apply forward (staging promoted, manifest registers node:Tag) —
-    // and the loader must then validate against the RECOVERED catalog,
-    // not the stale in-memory one.
+    // Same handle: the entry heal leaves an unpublished staging alone and the
+    // accepted catalog stays authoritative, so the new type is unknown.
     load_jsonl(
         &db,
         "{\"type\":\"Tag\",\"data\":{\"label\":\"t1\"}}\n",
         LoadMode::Merge,
     )
     .await
-    .expect(
-        "after the heal rolls the schema apply forward, the same handle \
-         must accept rows of the recovered schema's types",
-    );
-    assert_eq!(helpers::count_rows(&db, "node:Tag").await, 1);
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
-    }
+    .expect_err("an unpublished apply's type must not be loadable");
+    load_jsonl(
+        &db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"bob\",\"age\":31}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("the accepted schema keeps accepting rows");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+    drop(db);
+
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_no_staging_files(dir.path());
+    assert!(!reopened.schema_source().contains("node Tag"));
+    assert_eq!(helpers::count_rows(&reopened, "node:Person").await, 2);
 }
 
 /// A concurrent write's entry heal must NOT promote a LIVE schema
@@ -3771,6 +3729,14 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     assert_eq!(person_head_after, person_head_before);
 }
 
+fn assert_no_recovery_sidecars(root: &std::path::Path) {
+    let recovery_dir = root.join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(&recovery_dir).unwrap().next().is_none(),
+        "no recovery sidecar may exist"
+    );
+}
+
 fn assert_no_staging_files(graph: &std::path::Path) {
     for name in [
         "_schema.pg.staging",
@@ -3794,28 +3760,20 @@ fn schema_with_person_city() -> String {
 // Per-writer Phase B → Phase C recovery integration
 // =====================================================================
 //
-// Each of the four migrated writers writes a sidecar BEFORE its
-// per-table commit_staged loop and deletes it AFTER the manifest
-// publish. The `recovery_rolls_forward_after_finalize_publisher_failure`
-// test above covers MutationStaging::finalize. The three tests below
-// cover the other three writers: schema_apply, branch_merge,
-// ensure_indices.
-//
-// Each follows the same shape: trigger the writer with a failpoint
-// active in the Phase B → Phase C window, drop the engine, reopen,
-// assert recovery rolled forward (manifest pin advanced, audit row
-// recorded, sidecar deleted) and a follow-up operation succeeds without
-// PublishedDatasetVersionMismatch.
+// RFC 0067: every writer stages detached effects and publishes once. A
+// failure before publication leaves no residue for the next open or the
+// same handle to retire; a failure after publication leaves pending pins,
+// and for schema apply a staged contract, that the next writer or open
+// completes.
 
 #[tokio::test]
 #[serial]
-async fn schema_apply_without_schema_staging_rolls_back_on_next_open() {
+async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let operation_id;
 
     {
         let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
@@ -3833,91 +3791,67 @@ async fn schema_apply_without_schema_staging_rolls_back_on_next_open() {
         let db = Omnigraph::open(&uri).await.unwrap();
         version_main(&db).await.unwrap()
     };
-
+    let v2_schema = format!(
+        "{}\nnode Tag {{ label: String @key }}\n",
+        schema_with_person_city()
+    );
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
-        let v2_schema = r#"node Person {
-    name: String @key
-    age: I32?
-    city: String?
-}
-
-node Company {
-    name: String @key
-}
-
-node Tag {
-    label: String @key
-}
-
-edge Knows: Person -> Person {
-    since: Date?
-}
-
-edge WorksAt: Person -> Company
-"#;
-        let err = db.apply_schema(v2_schema).await.unwrap_err();
+        let err = db.apply_schema(&v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("injected failpoint triggered: schema_apply.before_staging_write"),
             "unexpected error: {err}"
         );
-        operation_id = single_sidecar_operation_id(dir.path());
     }
+    assert_no_recovery_sidecars(dir.path());
+    assert_no_staging_files(dir.path());
 
+    // The Person rewrite is a detached version and the Tag create is an
+    // unregistered dataset: nothing moved the manifest or any linear HEAD,
+    // so reopening has nothing to roll back.
     let db = Omnigraph::open(&uri).await.unwrap();
-    // Roll-back now publishes the restored version, so the manifest version
-    // advances — but to the OLD-schema content: the migration never applied
-    // (asserted by count_rows + the `_schema.pg` checks below), and the sweep
-    // converges (`manifest == Lance HEAD`, asserted by
-    // assert_post_recovery_invariants's RolledBack arm).
-    assert!(
-        version_main(&db).await.unwrap() > pre_failure_version,
-        "roll-back publishes the restored (old-schema) version, advancing the manifest; \
-         pre={pre_failure_version}",
-    );
     assert_eq!(
-        helpers::count_rows(&db, "node:Person").await,
-        1,
-        "old-schema data must remain readable after rollback"
+        version_main(&db).await.unwrap(),
+        pre_failure_version,
+        "an unpublished apply publishes nothing, not even a rollback"
     );
-    drop(db);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledBack {
-            tables: vec![TableExpectation::main("node:Person")],
-        },
-    )
-    .await
-    .unwrap();
-
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+    let snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let person_entry = snapshot.dataset("node:Person").unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let person_head = lance::Dataset::open(&person_uri).await.unwrap();
+    assert_eq!(
+        person_head.version().version,
+        person_entry.published_dataset_version,
+        "a detached rewrite never moves the linear HEAD"
+    );
+    assert!(snapshot.dataset("node:Tag").is_none());
     let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(
-        !live_schema.contains("city: String?"),
-        "_schema.pg must keep the OLD schema when staging files never existed; got:\n{live_schema}",
-    );
-    assert!(
-        !live_schema.contains("node Tag"),
-        "_schema.pg must keep the OLD schema when staging files never existed; got:\n{live_schema}",
-    );
+    assert!(!live_schema.contains("city: String?"), "{live_schema}");
+    assert!(!live_schema.contains("node Tag"), "{live_schema}");
+
+    db.apply_schema(&v2_schema)
+        .await
+        .expect("the retry rewrites from the pin and reclaims the Tag leftover");
+    assert!(db.schema_source().contains("city: String?"));
+    assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
 }
 
-/// A metadata-only SchemaApply still changes the accepted schema contract, so
-/// it needs a durable intent even though it has no table pins. A crash before
-/// schema staging must roll that empty-table intent back unambiguously.
 #[tokio::test]
 #[serial]
-async fn metadata_only_schema_apply_before_staging_rolls_back_on_next_open() {
+async fn metadata_only_schema_apply_before_staging_leaves_no_residue() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-
-    let operation_id = {
+    {
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
@@ -3925,132 +3859,31 @@ async fn metadata_only_schema_apply_before_staging_rolls_back_on_next_open() {
                 .contains("injected failpoint triggered: schema_apply.before_staging_write"),
             "unexpected error: {err}"
         );
-        single_sidecar_operation_id(dir.path())
-    };
-    drop(db);
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("empty-table SchemaApply intent should roll back cleanly");
-    drop(recovered);
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledBack { tables: vec![] },
-    )
-    .await
-    .unwrap();
+    }
+    assert_no_recovery_sidecars(dir.path());
     assert_no_staging_files(dir.path());
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(
-        !live_schema.contains("age: I32? @index"),
-        "a pre-staging crash must retain the old accepted schema"
-    );
-}
-
-/// A recovery-owned rollback commit also advances the manifest. The durable
-/// SchemaApply Phase-C marker—not numeric version movement—must therefore keep
-/// a pre-staging crash classified as RolledBack when recovery itself is retried
-/// after publishing rollback but before recording its audit.
-#[tokio::test]
-#[serial]
-async fn metadata_only_schema_apply_rollback_retry_never_flips_forward() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
-        db.apply_schema(&indexed_schema).await.unwrap_err();
-    }
-    let operation_id = single_sidecar_operation_id(dir.path());
-    drop(db);
-
-    {
-        let _failpoint = catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
-        let first_recovery = Omnigraph::open(&uri).await;
-        assert!(
-            first_recovery.is_err(),
-            "first recovery must stop after its rollback publish"
-        );
-    }
-    assert!(
-        dir.path()
-            .join("__recovery")
-            .join(format!("{operation_id}.json"))
-            .exists(),
-        "failed audit phase must retain the original sidecar"
-    );
 
     let recovered = Omnigraph::open(&uri)
         .await
-        .expect("the next Full recovery must finish the rollback");
-    drop(recovered);
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledBack"],
-        "rollback retry must never be reclassified or additionally audited as RolledForward"
-    );
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(!live_schema.contains("age: I32? @index"));
-}
-
-/// The same retry discriminator is required when SchemaApply moved a table
-/// before staging. After recovery restores and publishes the table, numeric
-/// pins look like a stale roll-forward; the old live schema hash proves the
-/// outcome is still RolledBack.
-#[tokio::test]
-#[serial]
-async fn pinned_schema_apply_rollback_retry_never_flips_forward() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::init_and_load(&dir).await;
-    let desired = helpers::TEST_SCHEMA.replace(
-        "    age: I32?\n}",
-        "    age: I32?\n    nickname: String?\n}",
-    );
-
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
-        db.apply_schema(&desired).await.unwrap_err();
-    }
-    drop(db);
-
-    {
-        let _failpoint = catalog::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT.fire_always();
-        let first_recovery = Omnigraph::open(&uri).await;
-        assert!(first_recovery.is_err());
-    }
-
-    let recovered = Omnigraph::open(&uri)
+        .expect("an index-only apply that failed before staging left nothing");
+    assert!(!recovered.schema_source().contains("age: I32? @index"));
+    recovered
+        .apply_schema(&indexed_schema)
         .await
-        .expect("pinned SchemaApply rollback retry must converge");
-    assert_eq!(helpers::count_rows(&recovered, "node:Person").await, 4);
-    drop(recovered);
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledBack"],
-        "restored table pins must not be mistaken for stale roll-forward"
-    );
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(!live_schema.contains("nickname: String?"));
+        .expect("the retry applies the index-only change");
+    assert!(recovered.schema_source().contains("age: I32? @index"));
+    assert_no_staging_files(dir.path());
 }
 
-/// The other half of the zero-table protocol: once schema staging exists, the
-/// same metadata-only intent must roll forward and accept the new contract.
 #[tokio::test]
 #[serial]
-async fn metadata_only_schema_apply_after_staging_rolls_forward_on_next_open() {
+async fn metadata_only_schema_apply_after_staging_discards_on_next_open() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-
-    let operation_id = {
+    {
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
@@ -4058,126 +3891,68 @@ async fn metadata_only_schema_apply_after_staging_rolls_forward_on_next_open() {
                 .contains("injected failpoint triggered: schema_apply.after_staging_write"),
             "unexpected error: {err}"
         );
-        single_sidecar_operation_id(dir.path())
-    };
-    drop(db);
+    }
+    assert_no_recovery_sidecars(dir.path());
+    assert!(dir.path().join("__schema_state.json.staging").exists());
 
+    // Metadata-only applies have no table effect: the staged contract is
+    // their only durable state, and its recorded commit never landed.
     let recovered = Omnigraph::open(&uri)
         .await
-        .expect("empty-table SchemaApply intent should roll forward cleanly");
-    drop(recovered);
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForwardOriginalLineage { tables: vec![] },
-    )
-    .await
-    .unwrap();
+        .expect("an unpublished index-only staging is discarded");
     assert_no_staging_files(dir.path());
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(
-        live_schema.contains("age: I32? @index"),
-        "an after-staging crash must promote the new accepted schema"
-    );
+    assert!(!recovered.schema_source().contains("age: I32? @index"));
+    recovered
+        .apply_schema(&indexed_schema)
+        .await
+        .expect("the retry applies the index-only change");
+    assert!(recovered.schema_source().contains("age: I32? @index"));
 }
 
-/// Schema-file recovery runs before sidecar processing. If it promotes staging
-/// and the sweep then crashes, the next pass sees marker=false and no staging;
-/// the live target hash must carry the decision forward into the normal
-/// manifest roll-forward path.
 #[tokio::test]
 #[serial]
-async fn metadata_only_schema_apply_recovers_after_promotion_prepass_crash() {
+async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-
+    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
     {
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
-        db.apply_schema(&indexed_schema).await.unwrap_err();
-    }
-    drop(db);
-
-    {
-        let _failpoint = catalog::RECOVERY_POST_LIST_PRE_GATES.fire_always();
-        let interrupted = Omnigraph::open(&uri).await;
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
+        let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
-            interrupted.is_err(),
-            "first recovery must stop after schema promotion and before sidecar processing"
+            matches!(err, OmniError::RecoveryRequired { .. }),
+            "a failure after publication reports the pending contract installation: {err}"
         );
     }
+    assert!(dir.path().join("__schema_state.json.staging").exists());
+    assert_no_recovery_sidecars(dir.path());
 
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("live target identity must let the next pass finish roll-forward");
-    drop(recovered);
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"]
-    );
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(live_schema.contains("age: I32? @index"));
-}
-
-/// Phase D is outside SchemaApply's logical commit boundary too. With no table
-/// pins, recovery must use the durable Phase-C marker plus target schema hash to
-/// recognize that the metadata-only commit and promotion are already visible;
-/// it must not mislabel the completed apply as RolledBack or wedge the next
-/// write waiting for a full reopen.
-#[tokio::test]
-#[serial]
-async fn metadata_only_schema_apply_delete_failure_heals_on_next_write() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-
-    let operation_id = {
-        let _failpoint = catalog::RECOVERY_SIDECAR_DELETE.fire_always();
-        db.apply_schema(&indexed_schema)
-            .await
-            .expect("Phase-D delete failure must not fail an already-visible schema apply");
-        single_sidecar_operation_id(dir.path())
-    };
-
-    db.mutate(
-        "main",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "after-schema-heal")], &[("$age", 36)]),
+    // The next write's entry heal finds the recorded commit in lineage,
+    // installs the contract and releases the dead apply's sentinel.
+    load_jsonl(
+        &db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
+        LoadMode::Append,
     )
     .await
-    .expect("the next write must heal an already-visible metadata-only apply in process");
-
+    .expect("the next write heals an already-published apply in process");
+    assert_no_staging_files(dir.path());
     assert!(
-        !dir.path()
-            .join("__recovery")
-            .join(format!("{operation_id}.json"))
-            .exists(),
-        "the next write's entry heal must retire the stale SchemaApply sidecar"
-    );
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"],
-        "the completed SchemaApply must have exactly one forward audit and no rollback audit"
-    );
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(
-        live_schema.contains("age: I32? @index"),
-        "healing a stale Phase-D sidecar must retain the accepted schema"
+        db.schema_source().contains("age: I32? @index"),
+        "the healed handle serves the published schema"
     );
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+    db.apply_schema(&indexed_schema)
+        .await
+        .expect("the released sentinel admits the next apply, a no-op here");
 }
 
-/// A v9 AddType target is a first-touch effect with an exact version-one
-/// transaction identity. Pre-staging rollback owns that dataset, reclaims it,
-/// and leaves the target path reusable by a clean retry.
 #[tokio::test]
 #[serial]
-async fn schema_apply_recovery_reclaims_owned_add_type_target_and_retry_succeeds() {
+async fn schema_apply_retry_reclaims_an_abandoned_add_type_dataset() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -4187,13 +3962,17 @@ async fn schema_apply_recovery_reclaims_owned_add_type_target_and_retry_succeeds
         let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
         db.apply_schema(SCHEMA_V2_ADDED_TYPE)
             .await
-            .expect_err("the pre-staging failpoint must leave the AddType intent pending");
+            .expect_err("the pre-staging failpoint must stop the apply after the create");
     }
-    let company_uri = pending_schema_apply_node_table_uri(&uri, "Company");
+    let company_uri = unregistered_node_table_uri(&db).await;
+    assert!(
+        std::path::Path::new(&company_uri).exists(),
+        "the version-one create is durable before the failure"
+    );
     drop(db);
     let recovered = Omnigraph::open(&uri)
         .await
-        .expect("Full recovery should roll back the pre-staging AddType intent");
+        .expect("an unregistered dataset is not recovery state");
     assert!(
         recovered
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -4201,317 +3980,35 @@ async fn schema_apply_recovery_reclaims_owned_add_type_target_and_retry_succeeds
             .unwrap()
             .dataset("node:Company")
             .is_none(),
-        "rollback must not register the orphan target"
+        "nothing registers the orphan target"
     );
     assert!(
-        !std::path::Path::new(&company_uri).exists(),
-        "exact v9 rollback must reclaim the first-touch dataset it owns"
+        std::path::Path::new(&company_uri).exists(),
+        "the open leaves the unregistered leftover for the retry"
     );
-    assert!(
-        !dir.path().join("__recovery").exists()
-            || std::fs::read_dir(dir.path().join("__recovery"))
-                .unwrap()
-                .next()
-                .is_none(),
-        "recovery must consume the failed attempt before retry"
-    );
+    assert_no_recovery_sidecars(dir.path());
 
     recovered
         .apply_schema(SCHEMA_V2_ADDED_TYPE)
         .await
-        .expect("retry must recreate the reclaimed AddType target and publish normally");
+        .expect("the retry reclaims the leftover under the sentinel and publishes");
     assert_eq!(
         helpers::count_rows(&recovered, "node:Company").await,
         0,
         "the retried AddType must be registered and queryable"
     );
-}
-
-/// A strict first-touch SchemaApply create can lose to an independent creator
-/// after its v9 sidecar is durable. The foreign dataset is not graph-visible
-/// and is not ours to adopt or delete: Full recovery records the fixed rollback
-/// outcome, retires only this intent, and preserves the winner byte-for-byte.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn schema_apply_first_touch_foreign_winner_is_preserved_not_adopted() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = std::sync::Arc::new(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-
-    let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT);
-    let apply_db = std::sync::Arc::clone(&db);
-    let apply_task = tokio::spawn(async move { apply_db.apply_schema(SCHEMA_V2_ADDED_TYPE).await });
-    rendezvous.wait_until_reached().await;
-
-    let company_uri = pending_schema_apply_node_table_uri(&uri, "Company");
-    let foreign_schema =
-        std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "foreign_owner",
-            arrow_schema::DataType::Utf8,
-            false,
-        )]));
-    let foreign_batch = arrow_array::RecordBatch::try_new(
-        foreign_schema,
-        vec![std::sync::Arc::new(arrow_array::StringArray::from(vec![
-            "winner",
-        ]))],
-    )
-    .unwrap();
-    let reader = arrow_array::RecordBatchIterator::new(
-        vec![Ok(foreign_batch.clone())],
-        foreign_batch.schema(),
-    );
-    let foreign = lance::Dataset::write(
-        reader,
-        &company_uri,
-        Some(lance::dataset::WriteParams {
-            mode: lance::dataset::WriteMode::Create,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-            allow_external_blob_outside_bases: true,
-            auto_cleanup: None,
-            skip_auto_cleanup: true,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    let foreign_identity = foreign
-        .read_transaction()
-        .await
-        .unwrap()
-        .expect("version-one foreign create must retain its transaction")
-        .uuid
-        .clone();
-    assert_eq!(foreign.version().version, 1);
-    assert_eq!(foreign.count_rows(None).await.unwrap(), 1);
-    drop(foreign);
-    rendezvous.release();
-
-    let operation_id = match apply_task.await.unwrap().unwrap_err() {
-        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
-        other => panic!("post-arm first-touch loss must require recovery: {other}"),
-    };
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    assert!(sidecar_path.exists());
-    drop(db);
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Full recovery must preserve a foreign first-touch winner");
-    assert_eq!(recovered.schema_source().as_str(), SCHEMA_V1);
-    assert!(
-        recovered
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .dataset("node:Company")
-            .is_none(),
-        "recovery must never adopt the foreign dataset into the graph manifest"
-    );
-    assert!(!sidecar_path.exists());
-    assert_eq!(recovery_audit_kinds(dir.path()).await, vec!["RolledBack"]);
-
-    let preserved = lance::Dataset::open(&company_uri).await.unwrap();
-    assert_eq!(preserved.version().version, 1);
-    assert_eq!(preserved.count_rows(None).await.unwrap(), 1);
+    assert_eq!(node_table_uri(&recovered, "Company").await, company_uri);
+    let company = lance::Dataset::open(&company_uri).await.unwrap();
     assert_eq!(
-        preserved
-            .read_transaction()
-            .await
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .uuid,
-        foreign_identity,
-        "recovery must leave the foreign transaction identity untouched"
+        company.version().version,
+        1,
+        "the reclaimed path holds the retry's own version-one create"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn schema_apply_phase_b_failure_recovered_on_next_open() {
-    use omnigraph::loader::{LoadMode, load_jsonl};
-
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let operation_id;
-    let fixed_commit_id;
-    const ACTOR: &str = "schema-v9-recovery-actor";
-
-    // Seed: a Person table with one row so the schema-apply rewritten_tables
-    // loop has actual work to do.
-    {
-        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        load_jsonl(
-            &db,
-            r#"{"type":"Person","data":{"name":"alice","age":30}}
-"#,
-            LoadMode::Append,
-        )
-        .await
-        .unwrap();
-    }
-
-    // Capture pre-failure manifest version so we can assert the recovery
-    // sweep advances it.
-    let pre_failure_version = {
-        let db = Omnigraph::open(&uri).await.unwrap();
-        version_main(&db).await.unwrap()
-    };
-
-    // Setup: trigger the residual via `schema_apply.after_staging_write`.
-    // This failpoint fires AFTER the rewritten_tables/indexed_tables loops
-    // (Lance HEAD advanced) AND AFTER the schema-state staging files are
-    // written, but BEFORE the manifest publish. The recovery sidecar persists.
-    {
-        let db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
-        // v2 schema: add a `city` property to Person AND add a new
-        // `Tag` node type. The new property triggers the rewritten_tables
-        // path (Phase B sidecar coverage). The new type changes the
-        // overall table set — required to keep `recover_schema_state_files`
-        // (which runs BEFORE recover_manifest_drift) happy: it can't
-        // disambiguate property-only migrations and would reject the
-        // open before the recovery sweep ever ran.
-        let v2_schema = r#"node Person {
-    name: String @key
-    age: I32?
-    city: String?
-}
-
-node Company {
-    name: String @key
-}
-
-node Tag {
-    label: String @key
-}
-
-edge Knows: Person -> Person {
-    since: Date?
-}
-
-edge WorksAt: Person -> Company
-"#;
-        let err = db
-            .apply_schema_as(
-                v2_schema,
-                omnigraph::db::SchemaApplyOptions::default(),
-                Some(ACTOR),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
-            "unexpected error: {err}"
-        );
-
-        // Sidecar must still exist.
-        let recovery_dir = dir.path().join("__recovery");
-        let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(
-            sidecars.len(),
-            1,
-            "exactly one sidecar must persist after schema_apply failure"
-        );
-        operation_id = single_sidecar_operation_id(dir.path());
-        let sidecar_path = recovery_dir.join(format!("{operation_id}.json"));
-        let sidecar: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
-        assert_eq!(sidecar["schema_version"], 9);
-        assert_eq!(sidecar["actor_id"], ACTOR);
-        assert_eq!(
-            sidecar["protocol_v7"]["effect_phase"], "EffectsConfirmed",
-            "post-staging failure must leave an exact roll-forward intent"
-        );
-        fixed_commit_id = sidecar["protocol_v7"]["lineage"]["graph_commit_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-    }
-
-    // Recovery: reopen proves the exact confirmed Person overwrite and Tag
-    // first-touch transaction, then publishes the sidecar's fixed lineage and
-    // complete manifest delta.
-    let db = Omnigraph::open(&uri).await.unwrap();
-
-    // Recovery sweep must have advanced the manifest pin on the rewritten
-    // table: roll-forward published the post-failure Lance HEAD.
-    let post_recovery_version = version_main(&db).await.unwrap();
-    assert!(
-        post_recovery_version > pre_failure_version,
-        "manifest version must advance post-recovery; pre={pre_failure_version}, \
-        post={post_recovery_version}",
-    );
-    assert_eq!(
-        branch_head_commit_id(dir.path(), "main").await.unwrap(),
-        fixed_commit_id,
-        "recovery must publish the pre-minted SchemaApply commit"
-    );
-    let recovered_commit = db.get_commit(&fixed_commit_id).await.unwrap();
-    assert_eq!(recovered_commit.actor_id.as_deref(), Some(ACTOR));
-    drop(db);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForwardOriginalLineage {
-            tables: vec![TableExpectation::main("node:Person")],
-        },
-    )
-    .await
-    .unwrap();
-
-    // Schema-apply atomicity: the live `_schema.pg` must reflect the
-    // NEW schema (city column on Person, Tag node type) — not the old.
-    // Without the schema-staging coordination, the schema-state
-    // recovery would have deleted the staging files (because manifest
-    // hadn't advanced when it ran), leaving a corrupt graph with new-
-    // schema data on disk but old-schema catalog.
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
-    assert!(
-        live_schema.contains("city: String?"),
-        "_schema.pg must reflect the NEW schema (city column added); got:\n{live_schema}",
-    );
-    assert!(
-        live_schema.contains("node Tag"),
-        "_schema.pg must reflect the NEW schema (Tag type added); got:\n{live_schema}",
-    );
-
-    // Catalog ↔ manifest agreement: the new `node:Tag` type the schema
-    // declares must have a manifest entry the engine can read against.
-    // Without registrations / tombstones in the sidecar, recovery's
-    // `roll_forward_all` only publishes Updates for rewritten tables;
-    // added tables (Tag) end up as orphan datasets on disk with no
-    // manifest entry, and the live schema declares a type the manifest
-    // doesn't know about.
-    let db = Omnigraph::open(&uri).await.unwrap();
-    let tag_rows = helpers::count_rows(&db, "node:Tag").await;
-    assert_eq!(
-        tag_rows, 0,
-        "node:Tag must have a manifest entry (with 0 rows) post-recovery; \
-         a panic here means recovery failed to register the added table"
-    );
-}
-
-/// A rename+rewrite pin uses the desired alias (`node:Human`) for its forward
-/// output, but an Armed crash must compensate back into the accepted manifest
-/// binding (`node:Person`). Publishing the restore under the target alias would
-/// fail OCC after the physical Restore and wedge every subsequent open.
-#[tokio::test]
-#[serial]
-async fn schema_apply_rename_rewrite_partial_effect_restores_source_alias() {
+async fn schema_apply_rename_rewrite_partial_effect_leaves_no_residue() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -4534,34 +4031,24 @@ edge Knows: Human -> Human {
 edge WorksAt: Human -> Company
 "#;
 
-    let operation_id = {
+    {
         let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
         let error = db
             .apply_schema(desired)
             .await
-            .expect_err("rename+rewrite must stop after its exact table effect");
+            .expect_err("rename+rewrite must stop after its detached table effect");
         assert!(
             error.to_string().contains("schema_apply.post_table_commit"),
             "unexpected partial rename error: {error}"
         );
-        single_sidecar_operation_id(dir.path())
-    };
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(sidecar["schema_version"], 9);
-    assert_eq!(sidecar["protocol_v7"]["effect_phase"], "Armed");
-    let rename = &sidecar["protocol_v7"]["intended_delta"]["renames"][0];
-    assert_eq!(rename["expected_table_key"], "node:Person");
-    assert_eq!(rename["table_key"], "node:Human");
+    }
+    assert_no_recovery_sidecars(dir.path());
+    assert_no_staging_files(dir.path());
     drop(db);
 
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Full recovery must publish the restored source alias");
+    // The rewrite is a detached version behind the source alias's pin; the
+    // rename was never published. Reopening finds the graph untouched.
+    let recovered = Omnigraph::open(&uri).await.unwrap();
     let snapshot = recovered
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
@@ -4573,25 +4060,21 @@ edge WorksAt: Human -> Company
         people_before
     );
     assert!(!recovered.schema_source().contains("node Human"));
-    drop(recovered);
 
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledBack {
-            tables: vec![TableExpectation::main("node:Person")],
-        },
-    )
-    .await
-    .unwrap();
+    recovered
+        .apply_schema(desired)
+        .await
+        .expect("the retry publishes the rename and rewrite");
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Human").await,
+        people_before
+    );
+    assert!(recovered.schema_source().contains("node Human"));
 }
 
-/// A multi-table apply can crash after only its first exact transaction. The
-/// Armed sidecar must prove and compensate that proper subset without touching
-/// a planned table whose HEAD never moved.
 #[tokio::test]
 #[serial]
-async fn schema_apply_partial_table_effect_rolls_back_exactly() {
+async fn schema_apply_partial_table_effect_leaves_no_residue() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -4603,35 +4086,37 @@ async fn schema_apply_partial_table_effect_rolls_back_exactly() {
         "    name: String @key\n    domain: String?\n}\n\nedge Knows",
     );
 
-    let operation_id = {
+    {
         let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
         let error = db
             .apply_schema(&desired)
             .await
-            .expect_err("the first exact table commit must be interrupted");
+            .expect_err("the first detached table commit must be interrupted");
         assert!(
             error.to_string().contains("schema_apply.post_table_commit"),
             "unexpected partial-effect error: {error}"
         );
-        single_sidecar_operation_id(dir.path())
-    };
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(sidecar["schema_version"], 9);
-    assert_eq!(sidecar["protocol_v7"]["effect_phase"], "Armed");
-    assert_eq!(
-        sidecar["protocol_v7"]["effects"].as_array().unwrap().len(),
-        2
-    );
+    }
+    assert_no_recovery_sidecars(dir.path());
+    assert_no_staging_files(dir.path());
     drop(db);
 
-    let recovered = Omnigraph::open(&uri)
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    let snapshot = recovered
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
-        .expect("Full recovery must compensate the exact partial table set");
+        .unwrap();
+    for type_name in ["Person", "Company"] {
+        let entry = snapshot.dataset(&format!("node:{type_name}")).unwrap();
+        let head = lance::Dataset::open(&node_table_uri(&recovered, type_name).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            head.version().version,
+            entry.published_dataset_version,
+            "{type_name}: a detached rewrite never moves the linear HEAD"
+        );
+    }
     assert_eq!(
         helpers::count_rows(&recovered, "node:Person").await,
         people_before
@@ -4642,113 +4127,31 @@ async fn schema_apply_partial_table_effect_rolls_back_exactly() {
     );
     assert!(!recovered.schema_source().contains("city: String?"));
     assert!(!recovered.schema_source().contains("domain: String?"));
-    assert!(!sidecar_path.exists());
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledBack"],
-        "partial compensation must have one durable rollback outcome"
-    );
 
     recovered
         .apply_schema(&desired)
         .await
-        .expect("the complete migration must succeed after exact compensation");
+        .expect("the complete migration must succeed after an abandoned attempt");
     assert!(recovered.schema_source().contains("city: String?"));
     assert!(recovered.schema_source().contains("domain: String?"));
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Person").await,
+        people_before
+    );
 }
 
-/// SchemaApply is prepared against one exact main graph head. A foreign
-/// process may publish a disjoint table after the schema table effect but
-/// before the exact manifest CAS. The apply must retain recovery ownership;
-/// Full recovery compensates only its unpublished overwrite and descends from
-/// the winning graph commit.
+/// A concurrent publication on main between the staged effects and the
+/// manifest commit: the apply loses its graph-head CAS, which is a plain
+/// refusal before publication. Its detached rewrite and staged contract are
+/// garbage, the winner is untouched, and the retry plans from the winner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn schema_apply_post_effect_disjoint_winner_is_preserved() {
+async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without_residue() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     let db = helpers::init_and_load(&dir).await;
     let people_before = helpers::count_rows(&db, "node:Person").await;
-    drop(db);
-
-    let schema_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
-    let mut winner_db = Omnigraph::open(&uri).await.unwrap();
-    let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
-    let desired = schema_with_person_city();
-    let apply_handle = std::sync::Arc::clone(&schema_db);
-    let apply_task = tokio::spawn(async move { apply_handle.apply_schema(&desired).await });
-    rendezvous.wait_until_reached().await;
-
-    // Model a writer in another process: advance Company below the normal
-    // process-local gates, then publish that exact physical HEAD to main.
-    let company_uri = node_table_uri(&winner_db, "Company").await;
-    let mut raw_company = lance::Dataset::open(&company_uri).await.unwrap();
-    helpers::lance_delete_inline(&mut raw_company, "1 = 2").await;
-    let winner_company_version = raw_company.version().version;
-    winner_db
-        .failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Company", None)
-        .await
-        .unwrap();
-    let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    rendezvous.release();
-
-    let operation_id = match apply_task.await.unwrap().unwrap_err() {
-        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
-        other => panic!("post-effect authority loss must require recovery: {other}"),
-    };
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    assert!(sidecar_path.exists());
-    drop(schema_db);
-    drop(winner_db);
-
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("Full recovery must compensate around a disjoint winner");
-    assert!(!sidecar_path.exists());
-    assert_eq!(
-        helpers::count_rows(&recovered, "node:Person").await,
-        people_before,
-        "rollback must restore the pre-apply Person image"
-    );
-    assert!(
-        !recovered.schema_source().contains("city: String?"),
-        "the stale schema contract must not be promoted"
-    );
-    let main = recovered
-        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-        .await
-        .unwrap();
-    assert_eq!(
-        main.dataset("node:Company")
-            .unwrap()
-            .published_dataset_version,
-        winner_company_version,
-        "compensation must preserve the disjoint winner's table pin"
-    );
-    let rollback_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    let rollback_commit = recovered.get_commit(&rollback_head).await.unwrap();
-    assert_eq!(
-        rollback_commit.parent_commit_id.as_deref(),
-        Some(winner_head.as_str()),
-        "rollback lineage must descend from the winning main commit"
-    );
-}
-
-/// If a foreign main commit buries SchemaApply's exact Person overwrite, a
-/// destructive Restore could erase the winner. Recovery must leave both the
-/// winning manifest/HEAD and the durable sidecar untouched for operator review.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn schema_apply_post_effect_same_table_winner_fails_closed() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::init_and_load(&dir).await;
     drop(db);
 
     let schema_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
@@ -4768,50 +4171,45 @@ async fn schema_apply_post_effect_same_table_winner_fails_closed() {
         .failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Person", None)
         .await
         .unwrap();
-    let winner_manifest_version = winner_db
+    let winner_pin = winner_db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap()
         .dataset("node:Person")
         .unwrap()
         .published_dataset_version;
+    let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
     rendezvous.release();
 
-    let operation_id = match apply_task.await.unwrap().unwrap_err() {
-        OmniError::RecoveryRequired { operation_id, .. } => operation_id,
-        other => panic!("same-table authority loss must require recovery: {other}"),
-    };
-    let sidecar_path = dir
-        .path()
-        .join("__recovery")
-        .join(format!("{operation_id}.json"));
-    assert!(sidecar_path.exists());
-    drop(schema_db);
-
-    let error = match Omnigraph::open(&uri).await {
-        Ok(_) => panic!("Full recovery must refuse to restore through a same-table winner"),
-        Err(error) => error,
-    };
+    let error = apply_task.await.unwrap().unwrap_err();
     assert!(
-        error.to_string().contains("foreign")
-            || error.to_string().contains("unverifiable")
-            || error.to_string().contains("interleaved"),
-        "unexpected fail-closed error: {error}"
+        !matches!(error, OmniError::RecoveryRequired { .. }),
+        "losing the CAS before publication needs no recovery: {error}"
     );
+    assert_no_recovery_sidecars(dir.path());
+    drop(schema_db);
+    drop(winner_db);
+
+    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert_no_staging_files(dir.path());
     assert!(
-        sidecar_path.exists(),
-        "fail-closed intent must remain durable"
+        !recovered.schema_source().contains("city: String?"),
+        "the unpublished staging must not be promoted"
     );
     assert_eq!(
-        winner_db
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .dataset("node:Person")
+        helpers::count_rows(&recovered, "node:Person").await,
+        people_before
+    );
+    let main = recovered
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        main.dataset("node:Person")
             .unwrap()
             .published_dataset_version,
-        winner_manifest_version,
-        "failed recovery must not move the winning manifest pin"
+        winner_pin,
+        "the winner's pin is preserved"
     );
     assert_eq!(
         lance::Dataset::open(&person_uri)
@@ -4820,7 +4218,22 @@ async fn schema_apply_post_effect_same_table_winner_fails_closed() {
             .version()
             .version,
         winner_lance_head,
-        "failed recovery must not Restore through the winning Lance HEAD"
+        "the abandoned detached rewrite never moved the linear HEAD"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        winner_head,
+        "nothing publishes on behalf of the lost apply"
+    );
+
+    recovered
+        .apply_schema(&schema_with_person_city())
+        .await
+        .expect("the retry plans from the winner's authority");
+    assert!(recovered.schema_source().contains("city: String?"));
+    assert_eq!(
+        helpers::count_rows(&recovered, "node:Person").await,
+        people_before
     );
 }
 
@@ -5239,13 +4652,6 @@ async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
     .unwrap();
 }
 
-async fn seed_optimize_late_sidecar_race(dir: &tempfile::TempDir) {
-    let mut seed = helpers::init_and_load(dir).await;
-    // Leave real compaction work behind so a missing barrier advances Person
-    // instead of accidentally passing because Optimize was a no-op.
-    helpers::commit_many(&mut seed, 4).await;
-}
-
 /// Optimize captures a complete authority token before entering any writer
 /// gate, then revalidates it after schema -> main -> table (`optimize.rs`, the
 /// comment above `open_write_txn`). That revalidation is the only thing that
@@ -5256,6 +4662,13 @@ async fn seed_optimize_late_sidecar_race(dir: &tempfile::TempDir) {
 /// of the recovery sidecar's `RecoveryAuthorityToken`. Removing it would
 /// silently downgrade optimize/cleanup/repair from
 /// reject-on-authority-drift to read-whatever-is-fresh.
+async fn seed_optimize_race_graph(dir: &tempfile::TempDir) {
+    let mut seed = helpers::init_and_load(dir).await;
+    // Leave real compaction work behind so a missing barrier advances Person
+    // instead of accidentally passing because Optimize was a no-op.
+    helpers::commit_many(&mut seed, 4).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 #[serial(optimize)]
@@ -5264,7 +4677,7 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
 
-    seed_optimize_late_sidecar_race(&dir).await;
+    seed_optimize_race_graph(&dir).await;
 
     let optimize_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
     let mut writer_db = Omnigraph::open(&uri).await.unwrap();
@@ -5337,133 +4750,6 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
         sidecars.is_empty(),
         "a pre-effect authority refusal must leave no Optimize sidecar: {sidecars:?}",
     );
-}
-
-/// Optimize's entry recovery probe is only a fast path. A graph-global
-/// SchemaApply can arm its durable sidecar after that probe while Optimize is
-/// waiting for the main-branch gate, then fail before staging any schema/table
-/// effect. Once Optimize owns that gate it must relist recovery state and return
-/// the older operation's exact RecoveryRequired id before opening HEAD, writing
-/// an Optimize sidecar, or moving either the table or manifest.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-#[serial(optimize)]
-async fn optimize_rechecks_late_schema_apply_sidecar_after_main_gate() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-
-    seed_optimize_late_sidecar_race(&dir).await;
-
-    // Both handles must exist before the late sidecar: a new read-write open
-    // would recover it instead of exercising the long-lived-handle race.
-    let optimize_db = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
-    let schema_db = Omnigraph::open(&uri).await.unwrap();
-    let person_uri = node_table_uri(optimize_db.as_ref(), "Person").await;
-    let manifest_uri = format!("{uri}/__manifest");
-    let manifest_before = version_main(optimize_db.as_ref()).await.unwrap();
-    let physical_manifest_before = lance::Dataset::open(&manifest_uri)
-        .await
-        .unwrap()
-        .version()
-        .version;
-    let graph_head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    let person_head_before = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .version()
-        .version;
-
-    let rendezvous = helpers::failpoint::Rendezvous::park_first(
-        &catalog::OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE,
-    );
-    let optimize_task_db = std::sync::Arc::clone(&optimize_db);
-    let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
-    rendezvous.wait_until_reached().await;
-
-    // Adding @index changes only accepted schema metadata. The failpoint fires
-    // after SchemaApply's zero-table v5 sidecar is durable, but before schema
-    // staging or any physical table effect.
-    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
-        let error = schema_db.apply_schema(&indexed_schema).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("injected failpoint triggered: schema_apply.before_staging_write"),
-            "unexpected SchemaApply failure: {error}",
-        );
-    }
-    let schema_operation_id = single_sidecar_operation_id(dir.path());
-
-    rendezvous.release();
-    let optimize_error = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
-        .await
-        .expect("Optimize task hung after releasing the recovery-check rendezvous")
-        .unwrap()
-        .expect_err("Optimize must refuse the late graph-global recovery intent");
-    match optimize_error {
-        OmniError::RecoveryRequired { operation_id, .. } => {
-            assert_eq!(operation_id, schema_operation_id)
-        }
-        other => panic!("expected exact RecoveryRequired attribution, got {other}"),
-    }
-    drop(rendezvous);
-
-    assert_eq!(
-        single_sidecar_operation_id(dir.path()),
-        schema_operation_id,
-        "Optimize must not add its own sidecar beside the older SchemaApply intent",
-    );
-    assert_eq!(
-        version_main(optimize_db.as_ref()).await.unwrap(),
-        manifest_before,
-        "late-barrier refusal must happen before any data or internal manifest effect",
-    );
-    assert_eq!(
-        lance::Dataset::open(&manifest_uri)
-            .await
-            .unwrap()
-            .version()
-            .version,
-        physical_manifest_before,
-        "late-barrier refusal must not compact the physical __manifest afterward",
-    );
-    assert_eq!(
-        branch_head_commit_id(dir.path(), "main").await.unwrap(),
-        graph_head_before,
-        "late-barrier refusal must not manufacture graph lineage",
-    );
-    assert_eq!(
-        lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .version()
-            .version,
-        person_head_before,
-        "Optimize must not move the target table HEAD around the older sidecar",
-    );
-
-    drop(optimize_db);
-    drop(schema_db);
-
-    // Full recovery owns the abandoned SchemaApply intent. Once it rolls the
-    // metadata-only attempt back, the same Optimize work is safe and succeeds.
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("read-write open must recover the abandoned SchemaApply intent");
-    assert_post_recovery_invariants(
-        dir.path(),
-        &schema_operation_id,
-        RecoveryExpectation::RolledBack { tables: vec![] },
-    )
-    .await
-    .unwrap();
-    recovered
-        .optimize()
-        .await
-        .expect("Optimize must succeed after the older recovery intent is resolved");
 }
 
 /// Optimize retains main's branch gate after its final recovery relist and

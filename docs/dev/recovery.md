@@ -31,7 +31,7 @@ mean an active sidecar uses an old outer schema.
 |---|---|
 | Mutation / Load | None since [RFC 0067](../rfcs/0067-detached-table-commits.md): their effects are detached commits published as pins, and a pending pin is promoted by the next writer of the table or by cleanup, never recovered from a sidecar |
 | BranchMerge | None since RFC 0067: chunks chain detached and publish as pins; the classifier keeps the kind for sidecars written before the change until it is removed |
-| SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta; the RFC 0040 system-column upgrade adds rename-only table effects and a `__manifest` stamp advance, recovered by roll-forward only |
+| SchemaApply | None for schema apply itself since RFC 0067: rewrites are detached pins, an added type is a linear create at its identity path, and the staged contract records its publishing commit, so the next read-write open promotes it when that commit is in lineage and discards it otherwise. The RFC 0040 system-column upgrade still writes the v9 exact protocol (rename-only table effects, unmarked schema staging and a `__manifest` stamp advance), recovered by roll-forward only |
 | EnsureIndices / full-text rebuild | None since RFC 0067: index batches are detached commits published as pins; the classifier keeps the kind for sidecars written before the change until it is removed |
 | Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
 
@@ -80,7 +80,8 @@ the graph quiescent, Full recovery may:
 - restore/compensate an owned partial set to the pinned graph state;
 - retire recovery ownership of a proven unpublished private first-touch fork,
   leaving its storage for explicit cleanup;
-- promote or discard owned schema staging;
+- promote schema staging whose recorded publication is in lineage, and at a
+  read-write open discard staging whose publication never landed;
 - refuse an invariant violation or ambiguous effect.
 
 Lance Restore can defeat a concurrent writer, so ordinary in-process healing

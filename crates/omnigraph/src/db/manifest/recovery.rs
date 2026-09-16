@@ -43,8 +43,8 @@ use crate::branch_control::list_branch_contents;
 use crate::db::graph_coordinator::GraphCoordinator;
 use crate::db::recovery_audit::{RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome};
 use crate::db::schema_state::{
-    SchemaStateRecovery, read_schema_state_identity, schema_ir_staging_uri,
-    schema_source_staging_uri, schema_state_staging_uri,
+    read_schema_state_identity, schema_ir_staging_uri, schema_source_staging_uri,
+    schema_state_staging_uri,
 };
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
@@ -3265,7 +3265,6 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
             .iter()
             .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
             .collect();
-        let is_schema_apply = matches!(sidecar.writer_kind, SidecarKind::SchemaApply);
         let _table_guards = write_queue.acquire_many(&queue_keys).await;
         // Re-read after the wait: the writer we blocked on may have completed
         // Phase C and deleted the sidecar, or may have durably confirmed Phase B
@@ -3283,21 +3282,6 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         // It also re-runs per sidecar, so a multi-sidecar pass never
         // classifies against a reconcile result an earlier roll-forward
         // staled. Non-SchemaApply sidecars never consult the value.
-        let schema_state_recovery = if is_schema_apply {
-            let snapshot = {
-                let mut coord = coordinator.write().await;
-                coord.refresh().await?;
-                coord.snapshot()
-            };
-            crate::db::schema_state::recover_schema_state_files(
-                root_uri,
-                std::sync::Arc::clone(&storage),
-                &snapshot,
-            )
-            .await?
-        } else {
-            SchemaStateRecovery::Noop
-        };
         // Fresh per-branch snapshot — same rationale as
         // `recover_manifest_drift`: classify against the branch the
         // sidecar's writer targeted, refreshed after any prior
@@ -3336,7 +3320,6 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
             &branch_snapshot,
             &sidecar,
             RecoveryMode::RollForwardOnly,
-            schema_state_recovery,
         )
         .await?
         {
@@ -3484,7 +3467,6 @@ pub(crate) async fn recover_manifest_drift(
     storage: std::sync::Arc<dyn StorageAdapter>,
     coordinator: &mut GraphCoordinator,
     mode: RecoveryMode,
-    schema_state_recovery: SchemaStateRecovery,
     write_queue: &crate::db::write_queue::WriteQueueManager,
 ) -> Result<()> {
     let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
@@ -3554,15 +3536,7 @@ pub(crate) async fn recover_manifest_drift(
                 coordinator.snapshot()
             }
         };
-        process_sidecar(
-            root_uri,
-            &storage,
-            &branch_snapshot,
-            &sidecar,
-            mode,
-            schema_state_recovery,
-        )
-        .await?;
+        process_sidecar(root_uri, &storage, &branch_snapshot, &sidecar, mode).await?;
     }
     // Final refresh so the caller sees the post-sweep state.
     coordinator.refresh().await?;
@@ -3783,7 +3757,6 @@ async fn process_sidecar(
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     mode: RecoveryMode,
-    schema_state_recovery: SchemaStateRecovery,
 ) -> Result<bool> {
     // Returns whether durable state changed (roll-forward, roll-back,
     // effect-free retirement, or stale-sidecar audit recovery). `false` =
@@ -4188,9 +4161,7 @@ async fn process_sidecar(
                 .map(|()| true)
         }
         SidecarDecision::RollForward => {
-            if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
-                && !schema_state_recovery.completed_schema_apply_sidecar_rename()
-            {
+            if matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
                 if sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION {
                     let target_is_live =
                         schema_apply_target_identity_is_live(root_uri, storage.as_ref(), sidecar)
@@ -5613,6 +5584,7 @@ async fn regenerate_system_column_upgrade_staging(
         root_uri,
         storage.as_ref(),
         &target.desired_ir,
+        None,
     )
     .await?;
     crate::db::schema_state::validate_exact_schema_staging_target(
@@ -6937,6 +6909,28 @@ pub(crate) async fn ensure_read_only_schema_coherent(
                 ),
             ));
         }
+    }
+
+    // RFC 0067: schema apply arms no sidecar. Its staged contract names the
+    // publishing graph commit; once that commit is in lineage the manifest
+    // already carries the new registrations, and only a read-write open may
+    // install the contract files. An unpublished staging is inert garbage.
+    if let crate::db::schema_state::StagedContract::Marked {
+        state,
+        published: true,
+    } = crate::db::schema_state::inspect_staged_contract(root_uri, storage, false).await?
+    {
+        let graph_commit_id = state
+            .publication
+            .map(|publication| publication.graph_commit_id)
+            .unwrap_or_default();
+        return Err(OmniError::recovery_required(
+            graph_commit_id.clone(),
+            format!(
+                "read-only open found SchemaApply manifest outcome for graph commit '{}' but the schema contract promotion is pending; run a read-write open to finish it",
+                graph_commit_id
+            ),
+        ));
     }
 
     for sidecar in sidecars {
@@ -8687,6 +8681,7 @@ pub(crate) async fn confirm_occ_sidecar_v9(
 /// independently durable table operation; metadata/tombstone-only applies may
 /// deliberately carry an empty set because schema staging is confirmed by the
 /// same protocol before publication.
+#[cfg(test)]
 pub(crate) fn new_schema_apply_sidecar_v9(
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,
