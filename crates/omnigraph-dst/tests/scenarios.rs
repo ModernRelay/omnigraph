@@ -1082,15 +1082,15 @@ fn dst_v11_fault_injection_atomicity_and_replay() {
 #[test]
 #[serial]
 fn dst_staleness_bite_and_replay() {
-    // Seed 257 since RFC 0067 moved the storage-action schedule (seed 251
+    // Seed 277 since RFC 0067 moved the storage-action schedule (seed 251
     // then met a stale absence of a schema contract file, which the engine
-    // refuses as manual coordination; `dst_staleness_seed_search` lists
-    // the green seeds).
+    // refuses as manual coordination, and the detached index writer moved
+    // it again; `dst_staleness_seed_search` lists the green seeds).
     let sc = Scenario {
-        seed: 257,
+        seed: 277,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 25_700,
+            seed: 27_700,
             stale_read_pct: 15,
             stale_list_pct: 15,
             max_lag_ticks: 4,
@@ -2211,6 +2211,9 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// more Lance manifest PUT per touched table for the detached commit's twin
 /// (AddFriend l.put 30 -> 38); Cleanup now reaps the promoted detached
 /// manifests (a.delete 0 -> 8, l.get 345 -> 353).
+/// The detached index writer opens each productive table at its pin and
+/// promotes the twin it lands (EnsureIndices l.get 11 -> 15; the closing
+/// pass reads the promoted twins, _close l.get 31 -> 35, _verify 2071 -> 2069).
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
