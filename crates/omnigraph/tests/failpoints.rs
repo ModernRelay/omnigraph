@@ -11965,3 +11965,124 @@ async fn blocked_promotion_keeps_writing_detached_and_repair_reports_it() {
     let reopened = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     assert_eq!(count_rows(&reopened, "node:Person").await, before + 2);
 }
+
+/// Real-backend coverage of the detached write path (RFC 0067) on an
+/// S3-compatible store: a load interrupted after its publication leaves a
+/// pending pin whose staged version serves reads; the next load on the same
+/// handle promotes it, and a reopen agrees. No `__recovery` object is written.
+/// Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set (same gate as
+/// `s3_storage.rs`); CI runs it against RustFS.
+#[tokio::test]
+#[serial]
+async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let Some(uri) = helpers::s3_test_graph_uri("failpoints") else {
+        eprintln!(
+            "skipping s3_write_pending_pin_is_promoted_by_the_next_write: \
+             OMNIGRAPH_S3_TEST_BUCKET is not set"
+        );
+        return;
+    };
+
+    let _scenario = FailScenario::setup();
+    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    {
+        let _failpoint = catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        load_jsonl(
+            &db,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Company","data":{"name":"Acme"}}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("the load is published before its promotion is interrupted");
+    }
+    let snapshot = helpers::snapshot_main(&db).await.unwrap();
+    let person = snapshot.dataset("node:Person").unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let head = helpers::open_dataset_head_exact(&person_uri, None).await;
+    assert_eq!(
+        head.version().version + 1,
+        person.published_dataset_version,
+        "the Person pin is pending on S3"
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("the next write promotes the pending pin and lands");
+    let snapshot = helpers::snapshot_main(&db).await.unwrap();
+    let person = snapshot.dataset("node:Person").unwrap();
+    let head = helpers::open_dataset_head_exact(&person_uri, None).await;
+    assert_eq!(head.version().version, person.published_dataset_version);
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 1);
+
+    drop(db);
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+}
+
+/// Real-backend coverage of the recovery-sidecar lifecycle the remaining
+/// sidecar writers still use: the index build stops after its confirmed
+/// effects, its sidecar PUT went through the S3 adapter, and the next write
+/// on the same handle LISTs `__recovery/`, rolls the sidecar forward, DELETEs
+/// it and lands. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set.
+#[tokio::test]
+#[serial]
+async fn s3_recovery_sidecar_lifecycle_heals_on_the_next_write() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let Some(uri) = helpers::s3_test_graph_uri("failpoints") else {
+        eprintln!(
+            "skipping s3_recovery_sidecar_lifecycle_heals_on_the_next_write: \
+             OMNIGRAPH_S3_TEST_BUCKET is not set"
+        );
+        return;
+    };
+
+    let _scenario = FailScenario::setup();
+    let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, helpers::TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let rows = helpers::count_rows(&db, "node:Person").await;
+    {
+        let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let err = db
+            .ensure_indices()
+            .await
+            .expect_err("the index build must stop after confirming its effects");
+        assert!(
+            err.to_string().contains(
+                "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    load_jsonl(
+        &db,
+        r#"{"type":"Person","data":{"name":"Healed","age":25}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("the same-handle heal must converge on an S3-backed graph");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, rows + 1);
+
+    drop(db);
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, rows + 1);
+    assert!(
+        db.ensure_indices().await.unwrap().is_empty(),
+        "the rolled-forward index batch leaves no work"
+    );
+}
