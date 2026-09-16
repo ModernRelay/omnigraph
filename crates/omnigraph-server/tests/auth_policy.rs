@@ -171,8 +171,8 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         "branch list cannot probe a graph outside the signed grant",
     );
 
-    // Managed CLI load reuses this existing route. Failed fork+load admission
-    // must leave the branch registry and graph head alone.
+    // Version-1 signed-grant compatibility on the existing load route. Failed
+    // fork+load admission must leave the branch registry and graph head alone.
     let (_, before_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
     let (_, before_load_commits) =
         json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;

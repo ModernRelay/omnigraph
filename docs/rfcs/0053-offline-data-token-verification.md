@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-08
+updated: 2026-09-16
 discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
@@ -284,13 +284,15 @@ Command activation must use the shared selected-connection path proposed in
 folder-context dispatcher. Its CC-06 and CC-14 exclude load and commit commands
 from context routing and the query/mutate migration guard. CC-05, CC-07,
 CC-10 and CC-17 require separately tested capability selection, exact selected
-API/cluster/endpoint equality before credential transmission, graph/action
-checks, and destination/effect evidence. Load requires `change` and, when
-`--from` is present, `branch_create` for the same graph; commit reads require
-`read`. Current server-side signed-grant and Cedar enforcement remains
-mandatory. Transport and authorization fixtures do not prove that future
-resolver or CLI action mapping. They neither implement the draft RFC nor
-activate its separately scoped served catalog extension.
+API/cluster/endpoint equality before credential transmission and
+destination/effect evidence. This RFC's version-1 signed-grant credential
+remains supported: load requires `change` and, when `--from` is present,
+`branch_create` for the same graph; commit reads require `read`. The legacy
+credential's grant ceiling and current applied Cedar policy both apply. These
+grant fixtures qualify that credential format, not a requirement that another
+identity credential carry permissions. Transport and authorization fixtures do
+not prove the future resolver or CLI action mapping. They neither implement
+the draft RFC nor activate its separately scoped served catalog extension.
 
 ## Invariants
 

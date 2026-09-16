@@ -530,9 +530,9 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
 }
 
 #[tokio::test]
-async fn managed_commit_transport_uses_cached_read_authority() {
-    // Transport preparation only: this fixture supplies `read` manually and
-    // uses the cached endpoint. It does not qualify CLI action mapping or
+async fn managed_commit_transport_uses_legacy_grant_read_authority() {
+    // Version-1 signed-grant compatibility: this fixture supplies `read`
+    // manually and uses the cached endpoint. It does not qualify CLI action mapping or
     // equality against an independently selected endpoint.
     let context = context();
     let store = MemoryStore::default();
@@ -593,9 +593,10 @@ async fn managed_commit_transport_uses_cached_read_authority() {
 }
 
 #[test]
-fn managed_load_credential_helper_checks_explicit_graph_and_actions() {
-    // The caller supplies required actions; this does not qualify CLI action
-    // mapping or equality against an independently selected endpoint.
+fn managed_load_legacy_grant_cache_checks_explicit_graph_and_actions() {
+    // Version-1 signed-grant compatibility. The caller supplies required actions;
+    // this does not qualify CLI action mapping or equality against an
+    // independently selected endpoint.
     let context = context();
     let store = MemoryStore::default();
     assert_eq!(
@@ -782,7 +783,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
 
 #[tokio::test]
 async fn managed_load_transport_sends_exact_ndjson_and_preserves_the_server_receipt() {
-    // Transport preparation with manually supplied actions and a cached
+    // Transport preparation with a version-1 signed-grant credential and a cached
     // endpoint; no managed CLI routing or selected-endpoint equality is implied.
     let dir = tempfile::tempdir().unwrap();
     let context = context();
