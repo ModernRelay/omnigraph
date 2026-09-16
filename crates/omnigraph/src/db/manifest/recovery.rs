@@ -999,6 +999,12 @@ pub(crate) struct RecoverySidecar {
     /// physical index effects exact; it only makes compensation retry-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensure_indices_rollback_v6: Option<RecoveryEnsureIndicesRollbackV6>,
+    /// The `__recovery/` object this sidecar was listed from (`None` when
+    /// built in memory). A heal re-reads, rewrites, and deletes it there, so
+    /// a file not named `<operation_id>.json` is healed as its operation and
+    /// deleted under its own name (#601).
+    #[serde(skip)]
+    pub listed_uri: Option<String>,
 }
 
 /// Opaque handle returned by [`write_sidecar`] so the caller can delete
@@ -1120,6 +1126,15 @@ pub(crate) fn recovery_dir_uri(root_uri: &str) -> String {
 pub(crate) fn sidecar_uri(root_uri: &str, operation_id: &str) -> String {
     let dir = recovery_dir_uri(root_uri);
     format!("{}/{}.json", dir, operation_id)
+}
+
+/// The listed uri, else the canonical `sidecar_uri` for a sidecar built in
+/// memory.
+pub(crate) fn healed_sidecar_uri(root_uri: &str, sidecar: &RecoverySidecar) -> String {
+    sidecar
+        .listed_uri
+        .clone()
+        .unwrap_or_else(|| sidecar_uri(root_uri, &sidecar.operation_id))
 }
 
 decide_seam! {
@@ -1262,8 +1277,9 @@ decide_seam! {
     pub static RECOVERY_POST_SIDECAR_LIST_PRE_READ = ("recovery.post_sidecar_list_pre_read", AnyWrite, [Fail]);
 }
 
-/// Read every sidecar under `__recovery/`. Returns an empty vec if the
-/// directory does not exist or is empty (the steady-state path).
+/// Read every sidecar under `__recovery/`, in uri order (canonical ULID names
+/// sort chronologically). Returns an empty vec if the directory does not
+/// exist or is empty (the steady-state path).
 ///
 /// Sidecars whose `schema_version` is unsupported by this binary are NOT
 /// silently skipped — the function returns an error so an operator can
@@ -1279,12 +1295,6 @@ pub(crate) async fn list_sidecars(
     fail(&RECOVERY_SIDECAR_LIST)?;
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
-    // Sort by URI so the sweep processes sidecars deterministically.
-    // Sidecar filenames are ULIDs, which are lexicographically sortable
-    // === chronologically sortable; the older sidecar is processed
-    // before the newer one. Without this sort, `list_dir` returns
-    // filesystem-order results which are nondeterministic and can mask
-    // ordering-sensitive bugs.
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
     let mut before_first_json_read = true;
@@ -1303,6 +1313,14 @@ pub(crate) async fn list_sidecars(
         };
         let sidecar = parse_sidecar(&uri, &body)?;
         validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
+        if uri != sidecar_uri(root_uri, &sidecar.operation_id) {
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                listed_uri = uri.as_str(),
+                "recovery sidecar file is not named after its operation id; \
+                 it is healed as that operation and deleted by its listed uri"
+            );
+        }
         out.push(sidecar);
     }
     Ok(out)
@@ -1368,7 +1386,7 @@ async fn reread_sidecar_under_gates(
     storage: &dyn StorageAdapter,
     listed: &RecoverySidecar,
 ) -> Result<Option<RecoverySidecar>> {
-    let uri = sidecar_uri(root_uri, &listed.operation_id);
+    let uri = healed_sidecar_uri(root_uri, listed);
     let Some(body) = storage.read_text_if_exists(&uri).await? else {
         return Ok(None);
     };
@@ -1444,12 +1462,13 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
         }
         .into());
     }
-    let sidecar: RecoverySidecar = serde_json::from_str(body).map_err(|err| {
+    let mut sidecar: RecoverySidecar = serde_json::from_str(body).map_err(|err| {
         OmniError::manifest_internal(format!(
             "recovery sidecar at '{}' failed to deserialize: {}",
             sidecar_uri, err
         ))
     })?;
+    sidecar.listed_uri = Some(sidecar_uri.to_string());
     validate_sidecar_shape(sidecar_uri, &sidecar)?;
     Ok(sidecar)
 }
@@ -3459,11 +3478,8 @@ async fn discard_orphaned_branch_sidecar(
             })
             .await?;
     }
-    let handle = RecoverySidecarHandle {
-        operation_id: sidecar.operation_id.clone(),
-        sidecar_uri: sidecar_uri(root_uri, &sidecar.operation_id),
-    };
-    delete_sidecar(&handle, storage).await
+    fail(&RECOVERY_SIDECAR_DELETE)?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await
 }
 
 /// The write-queue key serializing schema-apply's sidecar lifecycle
@@ -3791,7 +3807,7 @@ pub(crate) async fn finalize_effect_free_occ_sidecar(
         return Ok(false);
     }
 
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(true)
 }
 
@@ -3993,8 +4009,7 @@ async fn process_sidecar(
                 operation_id = sidecar.operation_id.as_str(),
                 authority_changed, "recovery: abandoning v3 sidecar with no owned physical effects"
             );
-            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
-                .await?;
+            delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
             return Ok(true);
         }
 
@@ -4068,7 +4083,7 @@ async fn process_sidecar(
                     "recovery sidecar '{}' has invariant violation; refusing to act \
                      — operator review required (sidecar at '{}', classifications: {:?})",
                     sidecar.operation_id,
-                    sidecar_uri(root_uri, &sidecar.operation_id),
+                    healed_sidecar_uri(root_uri, sidecar),
                     classifications,
                 )))
             }
@@ -4113,8 +4128,7 @@ async fn process_sidecar(
                 if matches!(mode, RecoveryMode::RollForwardOnly) {
                     return Ok(false);
                 }
-                delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
-                    .await?;
+                delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
                 return Ok(true);
             }
             if all_no_movement && any_pin_advanced {
@@ -4378,8 +4392,7 @@ async fn process_sidecar(
                 outcomes,
             )
             .await?;
-            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
-                .await?;
+            delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
             Ok(true)
         }
     }
@@ -4877,7 +4890,7 @@ async fn process_ensure_indices_sidecar_v8(
         if matches!(mode, RecoveryMode::RollForwardOnly) {
             return Ok(false);
         }
-        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
         return Ok(true);
     }
 
@@ -4991,7 +5004,7 @@ async fn roll_back_ensure_indices_v8(
         rollback_outcomes,
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage, &prepared.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(())
 }
 
@@ -5069,7 +5082,7 @@ async fn roll_forward_ensure_indices_v8(
         outcomes,
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
     Ok(true)
 }
 
@@ -5308,7 +5321,7 @@ async fn process_schema_apply_sidecar_v7(
         outcomes,
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
     Ok(true)
 }
 
@@ -5489,7 +5502,7 @@ async fn roll_forward_system_column_upgrade(
     .await?;
     reclaim_stale_schema_apply_lock(root_uri, storage).await?;
     fail(&SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM)?;
-    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
     Ok(true)
 }
 
@@ -5879,7 +5892,7 @@ async fn roll_back_schema_apply_v7(
         protocol.rollback_audit_outcomes.clone().unwrap_or_default(),
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage, &prepared.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(())
 }
 
@@ -6166,7 +6179,7 @@ async fn process_branch_merge_sidecar_v4(
             );
             return Ok(false);
         }
-        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
         return Ok(true);
     }
 
@@ -6256,7 +6269,7 @@ async fn roll_forward_branch_merge_v4(
         outcomes,
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
     Ok(true)
 }
 
@@ -6405,7 +6418,7 @@ async fn converge_or_defer_roll_forward(
     // crashed between audit and delete); if it is already gone, the winner
     // completed it — return success WITHOUT a duplicate audit, keeping the
     // audit append-idempotent per operation_id across concurrent sweeps.
-    let sidecar_path = sidecar_uri(root_uri, &sidecar.operation_id);
+    let sidecar_path = healed_sidecar_uri(root_uri, sidecar);
     if !storage.exists(&sidecar_path).await? {
         warn!(
             operation_id = sidecar.operation_id.as_str(),
@@ -6477,7 +6490,7 @@ async fn converge_or_defer_roll_forward(
         outcomes,
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
     Ok(true)
 }
 
@@ -6660,7 +6673,7 @@ async fn prepare_fixed_rollback_audit_plan(
             "prepare_fixed_rollback_audit_plan called without a fixed rollback identity",
         ));
     }
-    let uri = sidecar_uri(root_uri, &prepared.operation_id);
+    let uri = healed_sidecar_uri(root_uri, &prepared);
     validate_sidecar_shape(&uri, &prepared)?;
     let json = serde_json::to_string_pretty(&prepared).map_err(|error| {
         OmniError::manifest_internal(format!(
@@ -6793,7 +6806,7 @@ async fn roll_back_sidecar(
         outcomes,
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(())
 }
 
@@ -6857,7 +6870,7 @@ async fn record_audit_recovery_rollforward(
         outcomes,
     )
     .await?;
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(())
 }
 
@@ -6939,7 +6952,7 @@ async fn finalize_visible_ensure_indices_rollback(
             })
             .await?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(true)
 }
 
@@ -7260,7 +7273,7 @@ async fn finalize_visible_v7_outcome(
         reclaim_stale_schema_apply_lock(root_uri, storage).await?;
         fail(&SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM)?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage.as_ref(), sidecar).await?;
     Ok(true)
 }
 
@@ -7417,7 +7430,7 @@ async fn finalize_visible_v8_outcome(
             })
             .await?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(true)
 }
 
@@ -7496,7 +7509,7 @@ async fn detect_visible_v3_outcome(
                      snapshot, inspect it rather than deleting it by hand",
                     sidecar.operation_id,
                     protocol.lineage.graph_commit_id,
-                    sidecar_uri(root_uri, &sidecar.operation_id)
+                    healed_sidecar_uri(root_uri, sidecar)
                 )));
             }
         }
@@ -7583,7 +7596,7 @@ async fn finalize_visible_v3_outcome(
                         sidecar.operation_id,
                         protocol.lineage.graph_commit_id,
                         pin.table_key,
-                        sidecar_uri(root_uri, &sidecar.operation_id)
+                        healed_sidecar_uri(root_uri, sidecar)
                     )));
                 }
                 let planned_transaction = protocol
@@ -7609,7 +7622,7 @@ async fn finalize_visible_v3_outcome(
                         protocol.lineage.graph_commit_id,
                         pin.post_commit_pin,
                         pin.table_key,
-                        sidecar_uri(root_uri, &sidecar.operation_id)
+                        healed_sidecar_uri(root_uri, sidecar)
                     )));
                 }
                 outcomes.push(TableOutcome {
@@ -7662,7 +7675,7 @@ async fn finalize_visible_v3_outcome(
             })
             .await?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(true)
 }
 
@@ -7820,7 +7833,7 @@ async fn finalize_visible_v4_outcome(
             })
             .await?;
     }
-    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    delete_healed_sidecar(root_uri, storage, sidecar).await?;
     Ok(true)
 }
 
@@ -8335,12 +8348,12 @@ async fn open_lance_head_if_present(
     }))
 }
 
-async fn delete_sidecar_by_operation_id(
+async fn delete_healed_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    operation_id: &str,
+    sidecar: &RecoverySidecar,
 ) -> Result<()> {
-    storage.delete(&sidecar_uri(root_uri, operation_id)).await
+    storage.delete(&healed_sidecar_uri(root_uri, sidecar)).await
 }
 
 /// Arm the identity-aware Optimize protocol. Optimize has no writer-specific
@@ -8388,6 +8401,7 @@ fn new_unvalidated_sidecar(
         protocol_v7: None,
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
+        listed_uri: None,
     }
 }
 
@@ -8503,6 +8517,7 @@ pub(crate) fn new_ensure_indices_sidecar_v9(
             intended_delta,
         }),
         ensure_indices_rollback_v6: None,
+        listed_uri: None,
     };
     validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -8520,7 +8535,7 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
     fail(&RECOVERY_SIDECAR_CONFIRM)?;
-    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    let uri = healed_sidecar_uri(root_uri, sidecar);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v8.as_ref().ok_or_else(|| {
         OmniError::manifest_internal(
@@ -8758,6 +8773,7 @@ pub(crate) fn new_occ_sidecar_v9(
         protocol_v7: None,
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
+        listed_uri: None,
     };
     validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -8893,7 +8909,7 @@ pub(crate) async fn confirm_occ_sidecar_v9(
     }
     confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
 
-    let uri = sidecar_uri(root_uri, &confirmed.operation_id);
+    let uri = healed_sidecar_uri(root_uri, &confirmed);
     validate_sidecar_shape(&uri, &confirmed)?;
     let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
         OmniError::manifest_internal(format!(
@@ -8957,6 +8973,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
         }),
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
+        listed_uri: None,
     };
     validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -9008,6 +9025,7 @@ pub(crate) fn new_system_column_upgrade_sidecar_v9(
         }),
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
+        listed_uri: None,
     };
     validate_sidecar_shape("<new-system-column-upgrade-v9-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -9114,7 +9132,7 @@ pub(crate) async fn confirm_schema_apply_sidecar_v9(
     }
     confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
 
-    let uri = sidecar_uri(root_uri, &confirmed.operation_id);
+    let uri = healed_sidecar_uri(root_uri, &confirmed);
     validate_sidecar_shape(&uri, &confirmed)?;
     let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
         OmniError::manifest_internal(format!(
@@ -9174,6 +9192,7 @@ pub(crate) fn new_branch_merge_sidecar_v9(
         protocol_v7: None,
         protocol_v8: None,
         ensure_indices_rollback_v6: None,
+        listed_uri: None,
     };
     validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
     Ok(sidecar)
@@ -9192,7 +9211,7 @@ pub(crate) async fn confirm_branch_merge_sidecar_v9(
     confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
 ) -> Result<()> {
     fail(&RECOVERY_SIDECAR_CONFIRM)?;
-    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    let uri = healed_sidecar_uri(root_uri, sidecar);
     validate_sidecar_shape(&uri, sidecar)?;
     let protocol = sidecar.protocol_v4.as_ref().ok_or_else(|| {
         OmniError::manifest_internal(
