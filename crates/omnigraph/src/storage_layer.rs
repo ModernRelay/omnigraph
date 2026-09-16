@@ -726,6 +726,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
 
+    /// Prototype (RFC 0066): the graph-scoped Lance session, so prototype opens
+    /// share the file-metadata cache like every other data-table open.
+    fn lance_session(&self) -> Arc<lance::session::Session>;
+
+    /// Prototype (RFC 0066): commit one staged effect as a detached version.
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )>;
+
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
         &self,
@@ -1235,6 +1249,24 @@ impl TableStorage for TableStore {
         TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
+    }
+
+    fn lance_session(&self) -> Arc<lance::session::Session> {
+        TableStore::lance_session(self)
+    }
+
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )> {
+        let ds_arc = snapshot.into_arc();
+        let (dataset, identity) =
+            TableStore::commit_staged_detached(self, ds_arc, staged.into_staged()).await?;
+        Ok((SnapshotHandle::new(dataset), identity))
     }
 
     async fn commit_staged_exact(

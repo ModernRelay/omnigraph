@@ -22,7 +22,7 @@ pub use omnigraph::{
     SkipReason, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
     SystemColumnUpgradeReport,
 };
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{DeferredTableFork, HeldPromotion, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 pub(crate) use schema_state::SchemaContractText;
 

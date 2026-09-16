@@ -1069,7 +1069,9 @@ impl Omnigraph {
                 .await?
         });
         let actual_table_version = dataset.version().version;
-        if actual_table_version != expected_table_version {
+        // RFC 0066 prototype: a pending pin resolves to its staged version.
+        let pending_staged = entry.version_metadata.staged_version() == Some(actual_table_version);
+        if actual_table_version != expected_table_version && !pending_staged {
             return Err(OmniError::blob_integrity(format!(
                 "selected dataset for {} type '{}' opened at Lance version {}, expected published dataset version {}",
                 entity_label(cell.entity),
@@ -1116,9 +1118,7 @@ impl Omnigraph {
                 )));
             }
         }
-        if let Some(expected_e_tag) = entry.version_metadata.e_tag()
-            && dataset.manifest_location().e_tag.as_deref() != Some(expected_e_tag)
-        {
+        if !entry.version_metadata.witnesses(&dataset).await {
             return Err(OmniError::blob_integrity(format!(
                 "selected dataset for {} type '{}' opened a different Lance manifest incarnation at published dataset version {}",
                 entity_label(cell.entity),

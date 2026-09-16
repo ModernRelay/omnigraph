@@ -51,7 +51,7 @@ pub use system_column_upgrade::{
 pub(crate) use system_column_upgrade::{
     render_system_column_upgrade_target, reserved_property_offenders, system_column_renames,
 };
-pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
+pub(crate) use table_ops::{DeferredTableFork, HeldPromotion, OpenedForMutation};
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
 use super::commit_graph::GraphCommit;
@@ -3489,6 +3489,147 @@ impl Omnigraph {
             None,
         )
         .await
+    }
+
+    /// RFC 0066 prototype: open the pinned base for staging.
+    pub(crate) async fn reopen_pinned_for_mutation(
+        &self,
+        table_key: &str,
+        graph_branch: Option<&str>,
+        dataset_path: &str,
+        full_path: &str,
+        table_branch: Option<&str>,
+        target_version: u64,
+        e_tag: Option<&str>,
+        staged_version: Option<u64>,
+        transaction_uuid: Option<&str>,
+    ) -> Result<SnapshotHandle> {
+        table_ops::reopen_pinned_for_mutation(
+            self,
+            table_key,
+            graph_branch,
+            dataset_path,
+            full_path,
+            table_branch,
+            target_version,
+            e_tag,
+            staged_version,
+            transaction_uuid,
+        )
+        .await
+    }
+
+    /// RFC 0066 prototype: promote every pin this writer just published, from
+    /// the handles it already holds, best effort. Failures are logged; the
+    /// write already landed and the next writer promotes.
+    pub(crate) async fn promote_held_all(&self, held: Vec<HeldPromotion>) {
+        for promotion in held {
+            if let Err(error) =
+                crate::failpoints::maybe_fail(crate::failpoints::names::PROTO_POST_PROMOTION)
+            {
+                tracing::warn!(error = %error, "proto: promotion interrupted; the next writer promotes");
+                break;
+            }
+            let table_key = promotion.table_key.clone();
+            let target = promotion.target_version;
+            let full_path = promotion.full_path.clone();
+            let outcome = table_ops::promote_held(self, promotion).await;
+            crate::instrumentation::proto_record_promotion(format!(
+                "{full_path} target={target} via=held {}",
+                match &outcome {
+                    Ok(table_ops::Promotion::Promoted(v)) => format!("Promoted({v})"),
+                    Ok(table_ops::Promotion::AlreadyPromoted) => "AlreadyPromoted".to_string(),
+                    Ok(table_ops::Promotion::Blocked(reason)) => format!("Blocked({reason})"),
+                    Err(error) => format!("Error({error})"),
+                }
+            ));
+            match outcome {
+                Ok(table_ops::Promotion::Promoted(_))
+                | Ok(table_ops::Promotion::AlreadyPromoted) => {}
+                Ok(table_ops::Promotion::Blocked(reason)) => tracing::warn!(
+                    table = table_key.as_str(),
+                    target,
+                    reason,
+                    "proto: promotion blocked"
+                ),
+                Err(error) => tracing::warn!(
+                    table = table_key.as_str(),
+                    error = %error,
+                    "proto: promotion failed"
+                ),
+            }
+        }
+    }
+
+    /// RFC 0066 prototype: promote published pins the writer holds no handles
+    /// for (branch merge), best effort, through the chain walk.
+    pub(crate) async fn promote_updates_cold(&self, updates: &[crate::db::DatasetUpdate]) {
+        for update in updates {
+            if let Err(error) =
+                crate::failpoints::maybe_fail(crate::failpoints::names::PROTO_POST_PROMOTION)
+            {
+                tracing::warn!(error = %error, "proto: promotion interrupted; the next writer promotes");
+                break;
+            }
+            let (Some(staged), Some(uuid)) = (
+                update.version_metadata.staged_version(),
+                update.version_metadata.transaction_uuid(),
+            ) else {
+                continue;
+            };
+            let table_path = match crate::db::manifest::table_path_for_identity(
+                &update.type_key,
+                update.identity,
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::warn!(error = %error, "proto: promotion skipped, no table path");
+                    continue;
+                }
+            };
+            let full_path = self.storage().dataset_uri(&table_path);
+            let outcome = table_ops::promote_pending_chain(
+                self,
+                &update.type_key,
+                None,
+                &full_path,
+                update.native_dataset_branch.as_deref(),
+                update.published_dataset_version,
+                staged,
+                uuid,
+            )
+            .await;
+            crate::instrumentation::proto_record_promotion(format!(
+                "{full_path} target={} via=cold {}",
+                update.published_dataset_version,
+                match &outcome {
+                    Ok(table_ops::Promotion::Promoted(v)) => format!("Promoted({v})"),
+                    Ok(table_ops::Promotion::AlreadyPromoted) => "AlreadyPromoted".to_string(),
+                    Ok(table_ops::Promotion::Blocked(reason)) => format!("Blocked({reason})"),
+                    Err(error) => format!("Error({error})"),
+                }
+            ));
+            if let Ok(table_ops::Promotion::Blocked(reason)) | Err(reason) =
+                outcome.map_err(|error| error.to_string())
+            {
+                tracing::warn!(
+                    table = update.type_key.as_str(),
+                    target = update.published_dataset_version,
+                    reason,
+                    "proto: merge promotion did not land"
+                );
+            }
+        }
+    }
+
+    /// RFC 0066 prototype: see `table_ops::proto_chain_pin`.
+    pub(crate) async fn proto_chain_pin(
+        &self,
+        full_path: &str,
+        table_branch: Option<&str>,
+        tip: &Dataset,
+    ) -> Result<(u64, Option<(u64, String)>)> {
+        table_ops::proto_chain_pin(self, full_path, table_branch, tip).await
     }
 
     pub(crate) async fn fork_dataset_from_entry_state_under_intent(

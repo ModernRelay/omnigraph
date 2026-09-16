@@ -306,6 +306,24 @@ pub mod names {
     /// `MUTATION_POST_SIDECAR_PRE_FORK`, this fires for every enrolled
     /// mutation/load, main-branch writes included.
     pub const MUTATION_POST_ARM_PRE_EFFECT: &str = "mutation.post_arm_pre_effect";
+    /// RFC 0066 prototype: every detached table commit landed, the manifest
+    /// publication has not run. Failing here must leave the graph unchanged.
+    pub const PROTO_POST_DETACHED_PRE_PUBLISH: &str = "proto.post_detached_pre_publish";
+    /// RFC 0066 prototype: the manifest publication landed, promotion has not
+    /// run. Failing here leaves pins resolving to their staged versions.
+    pub const PROTO_POST_PUBLISH_PRE_PROMOTE: &str = "proto.post_publish_pre_promote";
+    /// RFC 0066 prototype: after a promotion's existence check and before its
+    /// linear commit. A callback here aligns two promoters on one pin.
+    pub const PROTO_PRE_PROMOTION_COMMIT: &str = "proto.pre_promotion_commit";
+    /// RFC 0066 prototype: after each detached commit of a write, chunk chain
+    /// or compaction; the hit count selects which one.
+    pub const PROTO_POST_DETACHED_COMMIT: &str = "proto.post_detached_commit";
+    /// RFC 0066 prototype: before each pin's post-publication promotion; the
+    /// hit count selects how many pins were promoted before the fault.
+    pub const PROTO_POST_PROMOTION: &str = "proto.post_promotion";
+    /// RFC 0066 prototype: in cleanup, after a pin was promoted and before its
+    /// detached manifest is reaped.
+    pub const PROTO_CLEANUP_PRE_REAP: &str = "proto.cleanup_pre_reap";
     /// Deterministic OCC rendezvous after a mutation has validated and staged
     /// its complete attempt, but before the RFC-022 branch effect gate is
     /// acquired and the write authority token is revalidated. Tests park the

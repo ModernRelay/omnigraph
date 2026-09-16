@@ -1167,10 +1167,7 @@ impl TableStore {
         // can prove the logical witness alone refuses a branch delete/recreate.
         let etag_witness_unavailable =
             crate::failpoints::is_enabled(crate::failpoints::names::CHANGE_FEED_SKIP_ETAG_WITNESS);
-        if !etag_witness_unavailable
-            && let Some(expected) = entry.version_metadata.e_tag()
-            && dataset.manifest_location().e_tag.as_deref() != Some(expected)
-        {
+        if !etag_witness_unavailable && !entry.version_metadata.witnesses(&dataset).await {
             return Err(OmniError::manifest(format!(
                 "change feed table '{}' has no persisted native-branch incarnation \
                  witness at the reopened dataset; the branch was deleted and \
@@ -3744,6 +3741,43 @@ impl TableStore {
             )
         })?;
         Ok((dataset, committed_identity))
+    }
+
+    /// Prototype (RFC 0066): the store's Lance session.
+    pub(crate) fn lance_session(&self) -> Arc<lance::session::Session> {
+        self.session.clone()
+    }
+
+    /// Prototype (RFC 0066): commit a staged effect as a Lance detached
+    /// version of its base. No conflict pass runs, nothing at HEAD moves, and
+    /// the result is invisible until a manifest pin references it.
+    pub async fn commit_staged_detached(
+        &self,
+        ds: Arc<Dataset>,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        let mut builder = CommitBuilder::new(ds)
+            .with_skip_auto_cleanup(true)
+            .with_detached(true);
+        if let Some(affected_rows) = staged.commit_metadata.affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+        let dataset = builder
+            .execute(staged.transaction)
+            .await
+            .map_err(OmniError::storage)?;
+        let identity = dataset
+            .read_transaction()
+            .await
+            .map_err(OmniError::storage)?
+            .as_ref()
+            .map(StagedTransactionIdentity::from)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "Lance committed a detached effect without a readable transaction identity",
+                )
+            })?;
+        Ok((dataset, identity))
     }
 
     /// Commit a staged first-touch dataset creation with no conflict retry.

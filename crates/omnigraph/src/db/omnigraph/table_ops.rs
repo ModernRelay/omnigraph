@@ -544,10 +544,19 @@ async fn maintain_indices_for_branch(
             planned_transactions.clone(),
             first_touch_source_versions.clone(),
         )?;
-        let recovery_handle =
-            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
-                .await?;
-        let recovery_operation_id = recovery_handle.operation_id.clone();
+        // RFC 0066 prototype: index builds stage detached and need no sidecar.
+        let recovery_handle = if crate::instrumentation::proto_detached_enabled() {
+            None
+        } else {
+            Some(
+                crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
+                    .await?,
+            )
+        };
+        let recovery_operation_id = recovery_handle
+            .as_ref()
+            .map(|handle| handle.operation_id.clone())
+            .unwrap_or_default();
 
         let post_arm_result = async {
             if !first_touch_sources.is_empty() {
@@ -588,7 +597,9 @@ async fn maintain_indices_for_branch(
                         entry.native_dataset_branch.as_deref(),
                         entry.published_dataset_version,
                         target,
-                        Some(&recovery_operation_id),
+                        recovery_handle
+                            .as_ref()
+                            .map(|_| recovery_operation_id.as_str()),
                     )
                     .await?
                 };
@@ -623,32 +634,51 @@ async fn maintain_indices_for_branch(
                         table_key
                     ))
                 })?;
-                staged.bind_transaction_identity(planned)?;
-                let outcome = db.storage().commit_staged_exact(ds, staged).await?;
-                if !outcome.is_exact() {
-                    return Err(OmniError::manifest_read_set_changed(
-                        format!("ensure_indices_lance_transaction:{table_key}"),
-                        Some(format!("{:?}", outcome.planned_transaction())),
-                        Some(format!("{:?}", outcome.committed_transaction())),
-                    ));
-                }
-                committed_transactions
-                    .insert(pin.identity, outcome.committed_transaction().clone());
-                let ds = outcome.into_snapshot();
+                let ds = if crate::instrumentation::proto_detached_enabled() {
+                    let planned = crate::table_store::StagedTransactionIdentity {
+                        read_version: ds.version(),
+                        uuid: planned.uuid.clone(),
+                    };
+                    staged.bind_transaction_identity(&planned)?;
+                    let (detached, identity) =
+                        db.storage().commit_staged_detached(ds, staged).await?;
+                    crate::failpoints::maybe_fail(
+                        crate::failpoints::names::PROTO_POST_DETACHED_COMMIT,
+                    )?;
+                    committed_transactions.insert(pin.identity, identity);
+                    detached
+                } else {
+                    staged.bind_transaction_identity(planned)?;
+                    let outcome = db.storage().commit_staged_exact(ds, staged).await?;
+                    if !outcome.is_exact() {
+                        return Err(OmniError::manifest_read_set_changed(
+                            format!("ensure_indices_lance_transaction:{table_key}"),
+                            Some(format!("{:?}", outcome.planned_transaction())),
+                            Some(format!("{:?}", outcome.committed_transaction())),
+                        ));
+                    }
+                    committed_transactions
+                        .insert(pin.identity, outcome.committed_transaction().clone());
+                    outcome.into_snapshot()
+                };
                 if first_touch {
                     confirmed_ref_identifiers
                         .insert(pin.identity, db.storage().branch_identifier(&ds).await?);
                 }
                 let state = db.storage().table_state(&full_path, &ds).await?;
+                let (published_dataset_version, staged_pin) = db
+                    .proto_chain_pin(&full_path, pin.table_branch.as_deref(), ds.dataset())
+                    .await?;
                 updates.push(crate::db::DatasetUpdate {
                     identity: pin.identity,
                     type_key: table_key,
-                    published_dataset_version: state.version,
+                    published_dataset_version,
                     native_dataset_branch: pin.table_branch.clone(),
                     entity_count: state.row_count,
                     version_metadata: state
                         .version_metadata
-                        .with_table_fork_owner(pin.table_fork_owner.as_deref()),
+                        .with_table_fork_owner(pin.table_fork_owner.as_deref())
+                        .with_staged_option(staged_pin),
                 });
                 crate::failpoints::maybe_fail(
                     crate::failpoints::names::ENSURE_INDICES_POST_TABLE_EFFECT,
@@ -658,15 +688,17 @@ async fn maintain_indices_for_branch(
             crate::failpoints::maybe_fail(
                 crate::failpoints::names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM,
             )?;
-            crate::db::manifest::confirm_ensure_indices_sidecar_v9(
-                db.root_uri(),
-                db.storage_adapter(),
-                &mut sidecar,
-                &updates,
-                &committed_transactions,
-                &confirmed_ref_identifiers,
-            )
-            .await?;
+            if recovery_handle.is_some() {
+                crate::db::manifest::confirm_ensure_indices_sidecar_v9(
+                    db.root_uri(),
+                    db.storage_adapter(),
+                    &mut sidecar,
+                    &updates,
+                    &committed_transactions,
+                    &confirmed_ref_identifiers,
+                )
+                .await?;
+            }
             crate::failpoints::maybe_fail(
                 crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
             )?;
@@ -680,22 +712,38 @@ async fn maintain_indices_for_branch(
                 lineage,
             )
             .await?;
+            if crate::instrumentation::proto_detached_enabled() {
+                match crate::failpoints::maybe_fail(
+                    crate::failpoints::names::PROTO_POST_PUBLISH_PRE_PROMOTE,
+                ) {
+                    Ok(()) => db.promote_updates_cold(&updates).await,
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "proto: index promotion skipped; the next writer promotes"
+                    ),
+                }
+            }
             Ok::<String, OmniError>(published.graph_commit_id)
         }
         .await;
 
-        let published = post_arm_result.map_err(|error| {
-            OmniError::recovery_required(recovery_operation_id, error.to_string())
-        })?;
+        let published = match &recovery_handle {
+            Some(_) => post_arm_result.map_err(|error| {
+                OmniError::recovery_required(recovery_operation_id.clone(), error.to_string())
+            })?,
+            None => post_arm_result?,
+        };
 
-        if let Err(err) =
-            crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
-        {
-            tracing::warn!(
-                error = %err,
-                operation_id = recovery_handle.operation_id.as_str(),
-                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-            );
+        if let Some(recovery_handle) = &recovery_handle {
+            if let Err(err) =
+                crate::db::manifest::delete_sidecar(recovery_handle, db.storage_adapter()).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    operation_id = recovery_handle.operation_id.as_str(),
+                    "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                );
+            }
         }
         Some(published)
     };
@@ -1082,6 +1130,14 @@ pub(crate) struct OpenedForMutation {
     pub(crate) table_branch: Option<String>,
     /// The ref the pin was read on, see `NativeRefPin`.
     pub(crate) pinned_native_ref: Option<String>,
+    /// RFC 0066 prototype: the pin's staged detached version and transaction
+    /// uuid, when the pin was published by the prototype path.
+    pub(crate) staged_version: Option<u64>,
+    pub(crate) transaction_uuid: Option<String>,
+    /// RFC 0066 prototype: the registration path and pin e-tag, the read-handle
+    /// cache key of this pin.
+    pub(crate) dataset_path: String,
+    pub(crate) e_tag: Option<String>,
     /// RFC-022 first-touch named-branch writes stage against the inherited
     /// source snapshot and defer the durable Lance ref creation until after
     /// their v9 recovery intent (`protocol_v3` payload) is armed in
@@ -1179,6 +1235,13 @@ pub(super) async fn open_for_mutation_on_branch(
                     full_path,
                     table_branch: entry.native_dataset_branch.clone(),
                     pinned_native_ref: entry.native_dataset_branch.clone(),
+                    staged_version: entry.version_metadata.staged_version(),
+                    transaction_uuid: entry
+                        .version_metadata
+                        .transaction_uuid()
+                        .map(str::to_string),
+                    dataset_path: entry.dataset_path.clone(),
+                    e_tag: entry.version_metadata.e_tag().map(str::to_string),
                     deferred_fork: None,
                 });
             }
@@ -1191,6 +1254,13 @@ pub(super) async fn open_for_mutation_on_branch(
                     full_path,
                     table_branch: None,
                     pinned_native_ref: entry.native_dataset_branch.clone(),
+                    staged_version: entry.version_metadata.staged_version(),
+                    transaction_uuid: entry
+                        .version_metadata
+                        .transaction_uuid()
+                        .map(str::to_string),
+                    dataset_path: entry.dataset_path.clone(),
+                    e_tag: entry.version_metadata.e_tag().map(str::to_string),
                     deferred_fork: None,
                 });
             }
@@ -1227,6 +1297,13 @@ pub(super) async fn open_for_mutation_on_branch(
                 full_path,
                 table_branch: None,
                 pinned_native_ref: entry.native_dataset_branch.clone(),
+                staged_version: entry.version_metadata.staged_version(),
+                transaction_uuid: entry
+                    .version_metadata
+                    .transaction_uuid()
+                    .map(str::to_string),
+                dataset_path: entry.dataset_path.clone(),
+                e_tag: entry.version_metadata.e_tag().map(str::to_string),
                 deferred_fork: None,
             })
         }
@@ -1254,6 +1331,13 @@ pub(super) async fn open_for_mutation_on_branch(
                     full_path,
                     table_branch: Some(native_active.to_string()),
                     pinned_native_ref: entry.native_dataset_branch.clone(),
+                    staged_version: entry.version_metadata.staged_version(),
+                    transaction_uuid: entry
+                        .version_metadata
+                        .transaction_uuid()
+                        .map(str::to_string),
+                    dataset_path: entry.dataset_path.clone(),
+                    e_tag: entry.version_metadata.e_tag().map(str::to_string),
                     deferred_fork: Some(DeferredTableFork {
                         source_entry: entry.clone(),
                         target_branch: native_active.to_string(),
@@ -1283,9 +1367,595 @@ pub(super) async fn open_for_mutation_on_branch(
                 full_path,
                 table_branch,
                 pinned_native_ref: entry.native_dataset_branch.clone(),
+                staged_version: entry.version_metadata.staged_version(),
+                transaction_uuid: entry
+                    .version_metadata
+                    .transaction_uuid()
+                    .map(str::to_string),
+                dataset_path: entry.dataset_path.clone(),
+                e_tag: entry.version_metadata.e_tag().map(str::to_string),
                 deferred_fork: None,
             })
         }
+    }
+}
+
+/// RFC 0066 prototype: open the pinned base for staging. A held handle for
+/// the pin costs no IO and its version says whether the pin is linear yet;
+/// otherwise one open resolves the pin, and a still-staged predecessor is
+/// promoted first so this write stages from a linear base.
+pub(super) async fn reopen_pinned_for_mutation(
+    db: &Omnigraph,
+    table_key: &str,
+    graph_branch: Option<&str>,
+    dataset_path: &str,
+    full_path: &str,
+    table_branch: Option<&str>,
+    target_version: u64,
+    e_tag: Option<&str>,
+    staged_version: Option<u64>,
+    transaction_uuid: Option<&str>,
+) -> Result<SnapshotHandle> {
+    db.ensure_schema_apply_not_locked("write").await?;
+    let caches = db.read_caches();
+    let session = caches.session.clone();
+    let held = caches
+        .handles
+        .get(dataset_path, table_branch, target_version, e_tag)
+        .await;
+    if let Some(ds) = held
+        .as_ref()
+        .filter(|ds| ds.version().version == target_version)
+    {
+        return Ok(SnapshotHandle::new(ds.clone()));
+    }
+    let location = proto_table_location(full_path, table_branch);
+    let wrapper = crate::instrumentation::table_wrapper();
+    // A held handle at the staged version may predate a promotion by another
+    // handle or process, so a fresh resolution decides before any promotion.
+    let dataset = match held {
+        Some(ds) if staged_version.is_none() => ds,
+        _ => {
+            crate::instrumentation::open_pinned_dataset(
+                &location,
+                target_version,
+                staged_version,
+                transaction_uuid,
+                Some(&session),
+                wrapper.clone(),
+            )
+            .await?
+        }
+    };
+    let (Some(staged), Some(uuid)) = (staged_version, transaction_uuid) else {
+        // A linear pin (no staged fields) resolves to the target directly.
+        caches
+            .handles
+            .insert(
+                dataset_path,
+                table_branch,
+                target_version,
+                e_tag,
+                dataset.clone(),
+            )
+            .await;
+        return Ok(SnapshotHandle::new(dataset));
+    };
+    if dataset.version().version == target_version {
+        caches
+            .handles
+            .insert(
+                dataset_path,
+                table_branch,
+                target_version,
+                e_tag,
+                dataset.clone(),
+            )
+            .await;
+        return Ok(SnapshotHandle::new(dataset));
+    }
+    // The pin is still staged: promote the predecessor first so this write
+    // stages from a linear base and its own promotion has a base to land on.
+    // A blocked promotion is tolerated: the write then stages from the staged
+    // version and its own promotion reports the block.
+    let outcome = promote_pending_chain(
+        db,
+        table_key,
+        graph_branch,
+        full_path,
+        table_branch,
+        target_version,
+        staged,
+        uuid,
+    )
+    .await;
+    crate::instrumentation::proto_record_promotion(format!(
+        "{full_path} target={target_version} via=predecessor {}",
+        promotion_label(&outcome)
+    ));
+    // A promotion that fails or is blocked never fails the write: it stages
+    // from the staged version and its own promotion waits behind the block.
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(
+                target_version,
+                error = %error,
+                "proto: predecessor promotion failed before staging"
+            );
+            return Ok(SnapshotHandle::new(dataset));
+        }
+    };
+    match outcome {
+        Promotion::Promoted(_) | Promotion::AlreadyPromoted => {
+            let promoted = crate::instrumentation::open_dataset(
+                &location,
+                crate::instrumentation::VersionResolution::At(target_version),
+                Some(&session),
+                wrapper,
+            )
+            .await?;
+            caches
+                .handles
+                .insert(
+                    dataset_path,
+                    table_branch,
+                    target_version,
+                    e_tag,
+                    promoted.clone(),
+                )
+                .await;
+            Ok(SnapshotHandle::new(promoted))
+        }
+        Promotion::Blocked(reason) => {
+            tracing::warn!(
+                target_version,
+                reason,
+                "proto: predecessor promotion blocked before staging"
+            );
+            Ok(SnapshotHandle::new(dataset))
+        }
+    }
+}
+
+fn proto_is_detached(version: u64) -> bool {
+    version & lance_table::format::DETACHED_VERSION_MASK != 0
+}
+
+/// RFC 0066 prototype: follow a detached tip's read-version links back to
+/// the linear base it was staged from. Every detached commit records the
+/// version it was staged on; a chain of detached commits therefore links
+/// itself, and no manifest history is needed to find a pin's predecessors.
+/// Returns the linear base and the chain, tip first, as `(version, uuid)`.
+async fn walk_detached_chain(
+    location: &str,
+    session: &std::sync::Arc<lance::session::Session>,
+    tip_version: u64,
+) -> Result<(Option<u64>, Vec<(u64, String)>)> {
+    let mut chain = Vec::new();
+    let mut version = tip_version;
+    loop {
+        let ds = match crate::instrumentation::open_dataset(
+            location,
+            crate::instrumentation::VersionResolution::At(version),
+            Some(session),
+            crate::instrumentation::table_wrapper(),
+        )
+        .await
+        {
+            Ok(ds) => ds,
+            // A predecessor that was promoted and whose detached manifest
+            // cleanup already reaped: the chain ends here and its linear base
+            // is `target - chain length`, which the caller verifies exists.
+            Err(OmniError::HistoricalVersionReclaimed { .. }) if !chain.is_empty() => {
+                return Ok((None, chain));
+            }
+            Err(error) => return Err(error),
+        };
+        let transaction = ds
+            .read_transaction()
+            .await
+            .map_err(OmniError::storage)?
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "detached version {version} carries no transaction"
+                ))
+            })?;
+        let read_version = transaction.read_version;
+        chain.push((version, transaction.uuid));
+        if !proto_is_detached(read_version) {
+            return Ok((Some(read_version), chain));
+        }
+        version = read_version;
+    }
+}
+
+/// RFC 0066 prototype: whether linear `version` exists on this table.
+async fn linear_version_exists(
+    location: &str,
+    version: u64,
+    session: &std::sync::Arc<lance::session::Session>,
+) -> Result<bool> {
+    if version == 0 {
+        return Ok(false);
+    }
+    match crate::instrumentation::open_dataset(
+        location,
+        crate::instrumentation::VersionResolution::At(version),
+        Some(session),
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(OmniError::HistoricalVersionReclaimed { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// RFC 0066 prototype: the pin a writer publishes for a table whose tip is a
+/// chain of detached commits: the linear base plus the chain length as the
+/// target, and the tip as the staged version. A linear tip publishes itself.
+pub(super) async fn proto_chain_pin(
+    db: &Omnigraph,
+    full_path: &str,
+    table_branch: Option<&str>,
+    tip: &Dataset,
+) -> Result<(u64, Option<(u64, String)>)> {
+    let tip_version = tip.version().version;
+    if !proto_is_detached(tip_version) {
+        return Ok((tip_version, None));
+    }
+    let session = db.read_caches().session.clone();
+    let location = proto_table_location(full_path, table_branch);
+    let (base, chain) = walk_detached_chain(&location, &session, tip_version).await?;
+    let base = base.ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "detached chain on {full_path} lost a predecessor manifest before publication"
+        ))
+    })?;
+    let (_, tip_uuid) = chain[0].clone();
+    Ok((base + chain.len() as u64, Some((tip_version, tip_uuid))))
+}
+
+/// RFC 0066 prototype: promote the pin at `target_version` and every
+/// detached commit behind it, oldest first. The chain is found through the
+/// staged versions' read-version links, so it covers both a writer that
+/// staged from a still-staged predecessor and a merge whose chunks chained
+/// detached; the walk is bounded by the chain length.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn promote_pending_chain(
+    db: &Omnigraph,
+    table_key: &str,
+    _graph_branch: Option<&str>,
+    full_path: &str,
+    table_branch: Option<&str>,
+    target_version: u64,
+    staged_version: u64,
+    transaction_uuid: &str,
+) -> Result<Promotion> {
+    let session = db.read_caches().session.clone();
+    let location = proto_table_location(full_path, table_branch);
+    // A promoter that did not stage the pin checks the target first: the same
+    // pin is registered on every branch that inherits it, and once promoted
+    // its detached manifest may already be reaped.
+    match crate::instrumentation::open_dataset(
+        &location,
+        crate::instrumentation::VersionResolution::At(target_version),
+        Some(&session),
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+    {
+        Ok(existing) => {
+            return Ok(match existing.read_transaction().await {
+                Ok(Some(transaction)) if transaction.uuid == transaction_uuid => {
+                    Promotion::AlreadyPromoted
+                }
+                _ => Promotion::Blocked(format!(
+                    "linear version {target_version} exists with a foreign or unreadable transaction"
+                )),
+            });
+        }
+        Err(OmniError::HistoricalVersionReclaimed { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    let (base, chain) = walk_detached_chain(&location, &session, staged_version).await?;
+    if chain[0].1 != transaction_uuid {
+        return Ok(Promotion::Blocked(
+            "staged version carries no matching transaction".to_string(),
+        ));
+    }
+    let base = match base {
+        Some(base) if base + chain.len() as u64 == target_version => base,
+        Some(base) => {
+            return Ok(Promotion::Blocked(format!(
+                "{table_key}: a chain of {} detached commits on linear base {base} does not reach target {target_version}",
+                chain.len()
+            )));
+        }
+        None => {
+            let base = target_version.saturating_sub(chain.len() as u64);
+            if !linear_version_exists(&location, base, &session).await? {
+                return Ok(Promotion::Blocked(format!(
+                    "{table_key}: chain predecessors were reclaimed and linear base {base} is absent"
+                )));
+            }
+            base
+        }
+    };
+    if chain.len() > 1 {
+        crate::instrumentation::proto_record_promotion(format!(
+            "{full_path} chain={} base={base}",
+            chain.len()
+        ));
+    }
+    for (index, (staged, uuid)) in chain.iter().rev().enumerate() {
+        let target = base + 1 + index as u64;
+        match promote_table_pin(&session, full_path, table_branch, target, *staged, uuid).await? {
+            Promotion::Promoted(_) | Promotion::AlreadyPromoted => {}
+            blocked => return Ok(blocked),
+        }
+    }
+    Ok(Promotion::Promoted(target_version))
+}
+
+fn promotion_label(outcome: &Result<Promotion>) -> String {
+    match outcome {
+        Ok(Promotion::Promoted(v)) => format!("Promoted({v})"),
+        Ok(Promotion::AlreadyPromoted) => "AlreadyPromoted".to_string(),
+        Ok(Promotion::Blocked(reason)) => format!("Blocked({reason})"),
+        Err(error) => format!("Error({error})"),
+    }
+}
+
+pub(super) fn proto_table_location(full_path: &str, table_branch: Option<&str>) -> String {
+    match table_branch.filter(|branch| *branch != "main") {
+        Some(branch) => {
+            let mut location = crate::storage::join_uri(full_path, "tree");
+            for segment in branch.split('/') {
+                location = crate::storage::join_uri(&location, segment);
+            }
+            location
+        }
+        None => full_path.to_string(),
+    }
+}
+
+/// RFC 0066 prototype: outcome of promoting one pin onto its table's linear
+/// history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Promotion {
+    Promoted(u64),
+    AlreadyPromoted,
+    Blocked(String),
+}
+
+/// RFC 0066 prototype: replay the staged transaction at `target - 1` so the
+/// linear history gains the exact twin of the staged detached version. The
+/// existence check first is mandatory (probe 6c); duplicate replays of
+/// production transaction kinds are refused by Lance (probe 12).
+pub(super) async fn promote_table_pin(
+    session: &std::sync::Arc<lance::session::Session>,
+    full_path: &str,
+    table_branch: Option<&str>,
+    target_version: u64,
+    staged_version: u64,
+    transaction_uuid: &str,
+) -> Result<Promotion> {
+    use lance::dataset::CommitBuilder;
+    let location = proto_table_location(full_path, table_branch);
+    let wrapper = crate::instrumentation::table_wrapper();
+    let at = |version: u64| {
+        crate::instrumentation::open_dataset(
+            &location,
+            crate::instrumentation::VersionResolution::At(version),
+            Some(session),
+            wrapper.clone(),
+        )
+    };
+    match at(target_version).await {
+        Ok(existing) => {
+            return Ok(match existing.read_transaction().await {
+                Ok(Some(transaction)) if transaction.uuid == transaction_uuid => {
+                    Promotion::AlreadyPromoted
+                }
+                _ => Promotion::Blocked(format!(
+                    "linear version {target_version} exists with a foreign or unreadable transaction"
+                )),
+            });
+        }
+        Err(OmniError::HistoricalVersionReclaimed { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    if target_version == 0 {
+        return Ok(Promotion::Blocked("target version 0".to_string()));
+    }
+    let base = match at(target_version - 1).await {
+        Ok(base) => base,
+        Err(OmniError::HistoricalVersionReclaimed { .. }) => {
+            return Ok(Promotion::Blocked(format!(
+                "linear base {} is absent (predecessor not promoted)",
+                target_version - 1
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let staged = at(staged_version).await?;
+    let mut transaction = match staged
+        .read_transaction()
+        .await
+        .map_err(OmniError::storage)?
+    {
+        Some(transaction) if transaction.uuid == transaction_uuid => transaction,
+        _ => {
+            return Ok(Promotion::Blocked(
+                "staged version carries no matching transaction".to_string(),
+            ));
+        }
+    };
+    if matches!(
+        transaction.operation,
+        lance::dataset::transaction::Operation::Append { .. }
+    ) {
+        return Ok(Promotion::Blocked(
+            "bare Append is not replay-safe; production never stages one".to_string(),
+        ));
+    }
+    transaction.read_version = target_version - 1;
+    crate::failpoints::maybe_fail(crate::failpoints::names::PROTO_PRE_PROMOTION_COMMIT)?;
+    let committed = CommitBuilder::new(std::sync::Arc::new(base))
+        .with_max_retries(0)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await;
+    match committed {
+        Ok(dataset) => {
+            let landed = dataset.version().version;
+            let uuid_ok = matches!(
+                dataset.read_transaction().await,
+                Ok(Some(transaction)) if transaction.uuid == transaction_uuid
+            );
+            if landed == target_version && uuid_ok {
+                Ok(Promotion::Promoted(landed))
+            } else {
+                Ok(Promotion::Blocked(format!(
+                    "replay landed at {landed} (target {target_version}), uuid match {uuid_ok}"
+                )))
+            }
+        }
+        Err(lance::Error::RetryableCommitConflict { .. }) => {
+            recheck_target(
+                session,
+                full_path,
+                table_branch,
+                target_version,
+                transaction_uuid,
+            )
+            .await
+        }
+        Err(error) => Err(OmniError::storage(error)),
+    }
+}
+
+/// RFC 0066 prototype: after a refused promotion commit, decide whether the
+/// target now carries our transaction (a racing promoter won) or a foreign one.
+async fn recheck_target(
+    session: &std::sync::Arc<lance::session::Session>,
+    full_path: &str,
+    table_branch: Option<&str>,
+    target_version: u64,
+    transaction_uuid: &str,
+) -> Result<Promotion> {
+    let location = proto_table_location(full_path, table_branch);
+    let existing = crate::instrumentation::open_dataset(
+        &location,
+        crate::instrumentation::VersionResolution::At(target_version),
+        Some(session),
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    Ok(match existing.read_transaction().await {
+        Ok(Some(transaction)) if transaction.uuid == transaction_uuid => Promotion::AlreadyPromoted,
+        _ => Promotion::Blocked("raced by a foreign commit at the target version".to_string()),
+    })
+}
+
+/// RFC 0066 prototype: what a writer holds after its detached commit, enough
+/// to promote its pin without reopening anything.
+pub(crate) struct HeldPromotion {
+    pub(crate) table_key: String,
+    pub(crate) dataset_path: String,
+    pub(crate) full_path: String,
+    pub(crate) table_branch: Option<String>,
+    pub(crate) base: SnapshotHandle,
+    pub(crate) detached: SnapshotHandle,
+    pub(crate) target_version: u64,
+    pub(crate) transaction_uuid: String,
+    pub(crate) e_tag: Option<String>,
+}
+
+/// RFC 0066 prototype: promote a pin this writer just published, from the base
+/// handle it staged on and the detached handle it committed. The linear
+/// commit's own conflict pass is the existence check: a twin landed by a
+/// racing promoter is refused (probe 12) and rechecked, or recognized as ours
+/// by Lance's `verify_commit_outcome` when only the manifest write raced.
+pub(super) async fn promote_held(db: &Omnigraph, held: HeldPromotion) -> Result<Promotion> {
+    use lance::dataset::CommitBuilder;
+    let mut transaction = match held
+        .detached
+        .dataset()
+        .read_transaction()
+        .await
+        .map_err(OmniError::storage)?
+    {
+        Some(transaction) if transaction.uuid == held.transaction_uuid => transaction,
+        _ => {
+            return Ok(Promotion::Blocked(
+                "staged version carries no matching transaction".to_string(),
+            ));
+        }
+    };
+    if matches!(
+        transaction.operation,
+        lance::dataset::transaction::Operation::Append { .. }
+    ) {
+        return Ok(Promotion::Blocked(
+            "bare Append is not replay-safe; production never stages one".to_string(),
+        ));
+    }
+    if held.base.version() + 1 != held.target_version {
+        return Ok(Promotion::Blocked(format!(
+            "held base {} is not the predecessor of target {}",
+            held.base.version(),
+            held.target_version
+        )));
+    }
+    transaction.read_version = held.target_version - 1;
+    crate::failpoints::maybe_fail(crate::failpoints::names::PROTO_PRE_PROMOTION_COMMIT)?;
+    let session = db.read_caches().session.clone();
+    let committed = CommitBuilder::new(held.base.into_arc())
+        .with_max_retries(0)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await;
+    match committed {
+        Ok(dataset) => {
+            let landed = dataset.version().version;
+            let uuid_ok = matches!(
+                dataset.read_transaction().await,
+                Ok(Some(transaction)) if transaction.uuid == held.transaction_uuid
+            );
+            if landed == held.target_version && uuid_ok {
+                db.read_caches()
+                    .handles
+                    .insert(
+                        &held.dataset_path,
+                        held.table_branch.as_deref(),
+                        held.target_version,
+                        held.e_tag.as_deref(),
+                        dataset,
+                    )
+                    .await;
+                Ok(Promotion::Promoted(landed))
+            } else {
+                Ok(Promotion::Blocked(format!(
+                    "replay landed at {landed} (target {}), uuid match {uuid_ok}",
+                    held.target_version
+                )))
+            }
+        }
+        Err(lance::Error::RetryableCommitConflict { .. }) => {
+            recheck_target(
+                &session,
+                &held.full_path,
+                held.table_branch.as_deref(),
+                held.target_version,
+                &held.transaction_uuid,
+            )
+            .await
+        }
+        Err(error) => Err(OmniError::storage(error)),
     }
 }
 
@@ -1558,16 +2228,22 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     crate::failpoints::maybe_fail(
         crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
     )?;
-    let new_ds = db
-        .storage()
-        .commit_staged(ds.clone(), staged)
-        .await
-        .map_err(|error| {
-            error.with_context(format!(
-                "commit index batch on {table_key} ({:?})",
-                work.specs
-            ))
-        })?;
+    // RFC 0066 prototype: a deferred index build inside Optimize commits
+    // detached, chained on whatever the handle already holds.
+    let new_ds = if crate::instrumentation::proto_detached_enabled() {
+        db.storage()
+            .commit_staged_detached(ds.clone(), staged)
+            .await
+            .map(|(detached, _)| detached)
+    } else {
+        db.storage().commit_staged(ds.clone(), staged).await
+    }
+    .map_err(|error| {
+        error.with_context(format!(
+            "commit index batch on {table_key} ({:?})",
+            work.specs
+        ))
+    })?;
     *ds = new_ds;
     Ok(work.pending)
 }

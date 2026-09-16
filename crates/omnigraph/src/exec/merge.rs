@@ -106,7 +106,22 @@ async fn prepare_existing_merge_target(
     }
     let native = entry.native_dataset_branch.as_deref();
     let full_path = db.storage().dataset_uri(&entry.dataset_path);
-    let current = db.storage().open_dataset_head(&full_path, native).await?;
+    let current = if crate::instrumentation::proto_detached_enabled() {
+        db.reopen_pinned_for_mutation(
+            table_key,
+            txn.branch.as_deref(),
+            &entry.dataset_path,
+            &full_path,
+            native,
+            entry.published_dataset_version,
+            entry.version_metadata.e_tag(),
+            entry.version_metadata.staged_version(),
+            entry.version_metadata.transaction_uuid(),
+        )
+        .await?
+    } else {
+        db.storage().open_dataset_head(&full_path, native).await?
+    };
     Ok(PreparedExistingMergeTarget {
         current,
         full_path,
@@ -123,9 +138,13 @@ async fn open_first_touch_merge_target(
     recovery_operation_id: Option<&str>,
     first_touch_branch: Option<&str>,
 ) -> Result<(SnapshotHandle, String, Option<String>)> {
-    let operation_id = recovery_operation_id.ok_or_else(|| {
-        OmniError::manifest_internal("first-touch merge target has no armed recovery intent")
-    })?;
+    let operation_id = if crate::instrumentation::proto_detached_enabled() {
+        recovery_operation_id
+    } else {
+        Some(recovery_operation_id.ok_or_else(|| {
+            OmniError::manifest_internal("first-touch merge target has no armed recovery intent")
+        })?)
+    };
     let owner = captured_merge_target_ref(txn)?.ok_or_else(|| {
         OmniError::manifest_internal("first-touch merge target must be a named branch")
     })?;
@@ -153,7 +172,7 @@ async fn open_first_touch_merge_target(
             entry.native_dataset_branch.as_deref(),
             entry.published_dataset_version,
             native,
-            Some(operation_id),
+            operation_id,
         )
         .await?;
     Ok((current, full_path, Some(native.to_string())))
@@ -4117,6 +4136,7 @@ async fn classify_general_adopt(
 /// An empty delta does not imply an empty publish: source and target can hold
 /// the same content at different Lance versions (#473).
 #[must_use = "the adopt plan decides whether this table is a merge candidate"]
+#[allow(clippy::large_enum_variant)]
 enum AdoptPublish {
     /// The planned registration is field-for-field the stored entry
     /// (`reregisters_current_entry`).
@@ -4674,6 +4694,30 @@ async fn commit_exact_merge_stage(
     mut staged: crate::storage_layer::StagedHandle,
     planned: &crate::table_store::StagedTransactionIdentity,
 ) -> Result<SnapshotHandle> {
+    if crate::instrumentation::proto_detached_enabled() {
+        // RFC 0066 prototype: every merge chunk commits detached, chained on
+        // the previous chunk's detached version; the pin publishes the tip.
+        // The pre-minted identity keeps its uuid; its read version is the
+        // handle actually staged on, which for a chained chunk is detached.
+        let planned = crate::table_store::StagedTransactionIdentity {
+            read_version: current.version(),
+            uuid: planned.uuid.clone(),
+        };
+        staged.bind_transaction_identity(&planned)?;
+        let (detached, identity) = target_db
+            .storage()
+            .commit_staged_detached(current, staged)
+            .await?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::PROTO_POST_DETACHED_COMMIT)?;
+        if identity.uuid != planned.uuid {
+            return Err(OmniError::manifest_read_set_changed(
+                "branch_merge_lance_transaction",
+                Some(planned.uuid.clone()),
+                Some(identity.uuid),
+            ));
+        }
+        return Ok(detached);
+    }
     staged.bind_transaction_identity(planned)?;
     let outcome = target_db
         .storage()
@@ -4838,16 +4882,21 @@ async fn publish_rewritten_merge_table(
         .storage()
         .table_state(&full_path, &current_ds)
         .await?;
+    // RFC 0066 prototype: a detached tip publishes base + chain as its pin.
+    let (published_dataset_version, staged) = target_db
+        .proto_chain_pin(&full_path, table_branch.as_deref(), current_ds.dataset())
+        .await?;
 
     Ok(crate::db::DatasetUpdate {
         identity,
         type_key: table_key.to_string(),
-        published_dataset_version: final_state.version,
+        published_dataset_version,
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
         version_metadata: final_state
             .version_metadata
-            .with_table_fork_owner(captured_merge_target_ref(target_txn)?),
+            .with_table_fork_owner(captured_merge_target_ref(target_txn)?)
+            .with_staged_option(staged),
     })
 }
 
@@ -5097,14 +5146,18 @@ async fn publish_proven_pure_insert_adopt(
         .storage()
         .table_state(&full_path, &committed)
         .await?;
+    // RFC 0066 prototype: a detached tip publishes base + chain as its pin.
+    let (published_dataset_version, staged) = target_db
+        .proto_chain_pin(&full_path, table_branch.as_deref(), committed.dataset())
+        .await?;
 
     Ok(crate::db::DatasetUpdate {
         identity,
         type_key: table_key.to_string(),
-        published_dataset_version: final_state.version,
+        published_dataset_version,
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
-        version_metadata: final_state.version_metadata,
+        version_metadata: final_state.version_metadata.with_staged_option(staged),
     })
 }
 
@@ -5234,16 +5287,21 @@ async fn publish_adopted_delta(
         .storage()
         .table_state(&full_path, &current_ds)
         .await?;
+    // RFC 0066 prototype: a detached tip publishes base + chain as its pin.
+    let (published_dataset_version, staged) = target_db
+        .proto_chain_pin(&full_path, table_branch.as_deref(), current_ds.dataset())
+        .await?;
 
     Ok(crate::db::DatasetUpdate {
         identity,
         type_key: table_key.to_string(),
-        published_dataset_version: final_state.version,
+        published_dataset_version,
         native_dataset_branch: table_branch,
         entity_count: final_state.row_count,
         version_metadata: final_state
             .version_metadata
-            .with_table_fork_owner(captured_merge_target_ref(target_txn)?),
+            .with_table_fork_owner(captured_merge_target_ref(target_txn)?)
+            .with_staged_option(staged),
     })
 }
 
@@ -6242,13 +6300,15 @@ impl Omnigraph {
                         ))
                     })?
                     .published_dataset_version;
-                self.ensure_existing_effect_baseline(
-                    table_key,
-                    prepared.table_branch.as_deref(),
-                    expected_version,
-                    &prepared.current,
-                )
-                .await?;
+                if !crate::instrumentation::proto_detached_enabled() {
+                    self.ensure_existing_effect_baseline(
+                        table_key,
+                        prepared.table_branch.as_deref(),
+                        expected_version,
+                        &prepared.current,
+                    )
+                    .await?;
+                }
                 continue;
             }
         }
@@ -6260,7 +6320,7 @@ impl Omnigraph {
         let mut recovery: Option<(
             crate::db::manifest::RecoverySidecar,
             crate::db::manifest::RecoverySidecarHandle,
-        )> = if recovery_pins.is_empty() {
+        )> = if recovery_pins.is_empty() || crate::instrumentation::proto_detached_enabled() {
             None
         } else {
             let authority = crate::db::manifest::RecoveryAuthorityToken {
@@ -6503,7 +6563,7 @@ impl Omnigraph {
             Ok::<_, OmniError>((updates, changed_edge_tables))
         })
         .await;
-        let (_updates, changed_edge_tables) = match post_arm_result {
+        let (updates, changed_edge_tables) = match post_arm_result {
             Ok(result) => result,
             Err(error) => {
                 if let Some((sidecar, _)) = &recovery {
@@ -6547,6 +6607,18 @@ impl Omnigraph {
                 );
             }
             recovery_cleanup_timing.finish();
+        }
+
+        if crate::instrumentation::proto_detached_enabled() {
+            match crate::failpoints::maybe_fail(
+                crate::failpoints::names::PROTO_POST_PUBLISH_PRE_PROMOTE,
+            ) {
+                Ok(()) => self.promote_updates_cold(&updates).await,
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "proto: merge promotion skipped; the next writer promotes"
+                ),
+            }
         }
 
         if changed_edge_tables {

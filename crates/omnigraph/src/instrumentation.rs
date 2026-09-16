@@ -1479,6 +1479,100 @@ pub(crate) enum VersionResolution {
 ///    control session is attached instead. Every open therefore reuses the
 ///    shared object-store registry/client pool without letting mutable control
 ///    metadata become stale in a session cache.
+static PROTO_PROMOTION_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// RFC 0066 prototype: record one promotion outcome for tests that observe
+/// which of two promoters landed a pin.
+pub(crate) fn proto_record_promotion(line: String) {
+    PROTO_PROMOTION_LOG.lock().unwrap().push(line);
+}
+
+/// RFC 0066 prototype: every promotion outcome this process recorded.
+pub fn proto_promotion_log() -> Vec<String> {
+    PROTO_PROMOTION_LOG.lock().unwrap().clone()
+}
+
+/// Prototype switch for RFC 0066: mutation and load stage detached commits,
+/// publish pins with a linear target plus staged id, and promote after
+/// publication. Off by default; every other writer keeps the sidecar path.
+pub fn proto_detached_enabled() -> bool {
+    std::env::var_os("OMNIGRAPH_PROTO_DETACHED").is_some()
+}
+
+/// Open a pin (RFC 0066 prototype). A pin without a staged id is an ordinary
+/// exact-version open. A pin with one opens the linear target when it exists
+/// and carries the recorded transaction uuid, and the staged detached version
+/// otherwise (not yet promoted, or promotion blocked by a foreign commit).
+pub(crate) async fn open_pinned_dataset(
+    uri: &str,
+    target_version: u64,
+    staged_version: Option<u64>,
+    transaction_uuid: Option<&str>,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let Some(staged) = staged_version else {
+        return open_dataset(uri, VersionResolution::At(target_version), session, wrapper).await;
+    };
+    match open_dataset(
+        uri,
+        VersionResolution::At(target_version),
+        session,
+        wrapper.clone(),
+    )
+    .await
+    {
+        Ok(dataset) => {
+            let ours = match dataset.read_transaction().await {
+                Ok(Some(transaction)) => Some(transaction.uuid.as_str()) == transaction_uuid,
+                _ => false,
+            };
+            if ours {
+                return Ok(dataset);
+            }
+            tracing::warn!(
+                uri,
+                target_version,
+                staged,
+                "proto: linear target carries a foreign or unreadable transaction; resolving the staged version"
+            );
+            if std::env::var_os("OMNIGRAPH_PROTO_TRACE").is_some() {
+                eprintln!(
+                    "PROTO TRACE open_pinned_dataset: target {target_version} at {uri} carries {:?}, expected {transaction_uuid:?}; falling back to staged {staged}",
+                    dataset
+                        .read_transaction()
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|t| t.uuid)
+                );
+            }
+            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+        }
+        Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
+            // An absent target is pending only while the linear history has
+            // not reached it. Once the head is at or past the target, the twin
+            // was promoted and later pruned, and the staged manifest must not
+            // resurrect pruned history: this is reclaimed history, not a
+            // pending pin.
+            let latest = open_dataset(uri, VersionResolution::Latest, session, wrapper.clone())
+                .await?
+                .version()
+                .version;
+            if latest >= target_version {
+                return Err(error);
+            }
+            if std::env::var_os("OMNIGRAPH_PROTO_TRACE").is_some() {
+                eprintln!(
+                    "PROTO TRACE open_pinned_dataset: target {target_version} absent at {uri} (head {latest}); opening staged {staged}"
+                );
+            }
+            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn open_dataset(
     uri: &str,
     version: VersionResolution,
@@ -1526,6 +1620,18 @@ pub(crate) async fn open_dataset(
         lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
             if matches!(version, VersionResolution::At(_)) =>
         {
+            if std::env::var_os("OMNIGRAPH_PROTO_TRACE").is_some() {
+                let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+                let frames: Vec<&str> = backtrace
+                    .lines()
+                    .filter(|line| line.contains("omnigraph") && !line.contains("instrumentation"))
+                    .take(12)
+                    .collect();
+                eprintln!(
+                    "PROTO TRACE reclaimed {version:?} at {uri}:\n{}",
+                    frames.join("\n")
+                );
+            }
             OmniError::HistoricalVersionReclaimed {
                 published_dataset_version: match version {
                     VersionResolution::At(version) => version,

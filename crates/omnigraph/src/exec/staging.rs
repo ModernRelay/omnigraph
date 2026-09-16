@@ -119,6 +119,17 @@ pub(crate) struct StagedTablePath {
     /// durable. Preparation reads the inherited `source_entry`; after arming,
     /// commit creates `target_branch` and stages branch-local files there.
     pub(crate) deferred_fork: Option<crate::db::DeferredTableFork>,
+    /// RFC 0066 prototype: the pin's staged detached version and transaction
+    /// uuid when the pin was published by the prototype path.
+    pub(crate) staged_version: Option<u64>,
+    pub(crate) transaction_uuid: Option<String>,
+    /// RFC 0066 prototype: the registration path and pin e-tag, the read-handle
+    /// cache key of this pin.
+    pub(crate) dataset_path: String,
+    pub(crate) e_tag: Option<String>,
+    /// RFC 0066 prototype: the graph branch whose manifest journal holds this
+    /// table's earlier pins.
+    pub(crate) graph_branch: Option<String>,
 }
 
 /// Per-query staging state.
@@ -207,6 +218,11 @@ impl MutationStaging {
         deferred_fork: Option<crate::db::DeferredTableFork>,
         expected_version: u64,
         op_kind: MutationOpKind,
+        staged_version: Option<u64>,
+        transaction_uuid: Option<String>,
+        dataset_path: String,
+        e_tag: Option<String>,
+        graph_branch: Option<String>,
     ) -> Result<()> {
         if let Some(existing) = self.paths.get(table_key) {
             if existing.identity != identity {
@@ -225,6 +241,11 @@ impl MutationStaging {
                 table_branch,
                 pinned_native_ref: crate::db::manifest::NativeRefPin::Exact(pinned_native_ref),
                 deferred_fork,
+                staged_version,
+                transaction_uuid,
+                dataset_path,
+                e_tag,
+                graph_branch,
             });
         self.expected_versions
             .entry(table_key.to_string())
@@ -780,6 +801,20 @@ async fn stage_pending_table(
                 .open_snapshot_at_entry(&fork.source_entry)
                 .await?
         }
+        None if crate::instrumentation::proto_detached_enabled() => {
+            db.reopen_pinned_for_mutation(
+                &table_key,
+                path.graph_branch.as_deref(),
+                &path.dataset_path,
+                &path.full_path,
+                path.table_branch.as_deref(),
+                expected,
+                path.e_tag.as_deref(),
+                path.staged_version,
+                path.transaction_uuid.as_deref(),
+            )
+            .await?
+        }
         None => {
             db.reopen_for_mutation(
                 &table_key,
@@ -880,6 +915,20 @@ async fn stage_delete_table(
             db.storage()
                 .open_snapshot_at_entry(&fork.source_entry)
                 .await?
+        }
+        None if crate::instrumentation::proto_detached_enabled() => {
+            db.reopen_pinned_for_mutation(
+                &table_key,
+                path.graph_branch.as_deref(),
+                &path.dataset_path,
+                &path.full_path,
+                path.table_branch.as_deref(),
+                expected,
+                path.e_tag.as_deref(),
+                path.staged_version,
+                path.transaction_uuid.as_deref(),
+            )
+            .await?
         }
         None => {
             db.reopen_for_mutation(
@@ -1067,6 +1116,9 @@ pub(crate) struct CommittedMutation {
     /// Recovery sidecar to delete during Stage H after manifest CAS succeeds
     /// (`None` when nothing staged).
     pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
+    /// RFC 0066 prototype: the handles needed to promote each published pin
+    /// without reopening anything; empty on the sidecar path.
+    pub(crate) proto_promotions: Vec<crate::db::HeldPromotion>,
     /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
     /// caller MUST hold the complete set across manifest publish (see
     /// `commit_all`) so no same-process writer interleaves after revalidation.
@@ -1221,19 +1273,22 @@ impl StagedMutation {
             // the rule here and in control/maintenance adapters behind one
             // helper prevents a future writer from weakening ownership by
             // emitting its sidecar before checking the physical baseline.
-            db.ensure_existing_effect_baseline(
-                &entry.table_key,
-                entry.path.table_branch.as_deref(),
-                current,
-                &entry.dataset,
-            )
-            .await?;
+            if !crate::instrumentation::proto_detached_enabled() {
+                db.ensure_existing_effect_baseline(
+                    &entry.table_key,
+                    entry.path.table_branch.as_deref(),
+                    current,
+                    &entry.dataset,
+                )
+                .await?;
+            }
         }
         // An empty load/mutation has no independently durable table effect.
         // It may still publish its fixed lineage intent, but arming recovery
         // would manufacture an effect plan where none exists.
         if staged.is_empty() {
             return Ok(CommittedMutation {
+                proto_promotions: Vec::new(),
                 updates: Vec::new(),
                 expected_versions,
                 sidecar_handle: None,
@@ -1258,6 +1313,19 @@ impl StagedMutation {
                 );
                 entry.path.table_branch = Some(fork.target_branch.clone());
             }
+        }
+
+        if crate::instrumentation::proto_detached_enabled() {
+            return commit_all_detached(
+                db,
+                staged,
+                expected_versions,
+                guards,
+                txn,
+                lineage_intent,
+                table_fork_owner,
+            )
+            .await;
         }
 
         // Sidecar protocol: build the per-table pin list and write the
@@ -1578,12 +1646,126 @@ impl StagedMutation {
         }
 
         Ok(CommittedMutation {
+            proto_promotions: Vec::new(),
             updates,
             expected_versions,
             sidecar_handle,
             guards,
         })
     }
+}
+
+/// RFC 0066 prototype: commit every staged effect as a detached version of
+/// its pinned base, with no recovery sidecar, no HEAD movement and no
+/// exactness check (nothing can rebase). The pins published carry the linear
+/// target (`expected + 1`), the staged detached id and the transaction uuid;
+/// promotion replays them after publication.
+async fn commit_all_detached(
+    db: &crate::db::Omnigraph,
+    staged: Vec<StagedTableEntry>,
+    expected_versions: crate::db::manifest::ExpectedTableVersions,
+    guards: Vec<crate::db::write_queue::QueueGuard>,
+    txn: &crate::db::WriteTxn,
+    _lineage_intent: &crate::db::manifest::LineageIntent,
+    table_fork_owner: Option<&str>,
+) -> Result<CommittedMutation> {
+    let mut staged = staged;
+    // First-touch forks: create the native ref now (no intent record to arm),
+    // then stage the retained logical plan on the fresh target handle.
+    for entry in &mut staged {
+        let Some(fork) = entry.path.deferred_fork.clone() else {
+            continue;
+        };
+        let target = db
+            .fork_dataset_from_entry_state_under_intent(
+                &entry.table_key,
+                fork.source_entry.identity,
+                &entry.path.full_path,
+                fork.source_entry.native_dataset_branch.as_deref(),
+                fork.source_entry.published_dataset_version,
+                &fork.target_branch,
+                None,
+            )
+            .await?;
+        entry.dataset = target;
+        let plan = entry.deferred_stage.take().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "deferred fork for '{}' has no deferred stage plan",
+                entry.table_key
+            ))
+        })?;
+        let staged_write = stage_deferred_plan(
+            db,
+            &entry.table_key,
+            entry.dataset.clone(),
+            plan,
+            &entry.planned_transaction,
+        )
+        .await?;
+        entry.staged_write = Some(staged_write);
+    }
+    let _ = txn;
+
+    let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
+    let mut proto_promotions = Vec::with_capacity(staged.len());
+    for entry in staged {
+        let StagedTableEntry {
+            table_key,
+            path,
+            expected_version,
+            dataset,
+            pending_mode: _,
+            staged_write,
+            deferred_stage: _,
+            planned_transaction: _,
+        } = entry;
+        let staged_write = staged_write.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "table '{}' reached commit without a staged transaction",
+                table_key
+            ))
+        })?;
+        let base = dataset.clone();
+        let (detached, identity) = db
+            .storage()
+            .commit_staged_detached(dataset, staged_write)
+            .await?;
+        crate::failpoints::maybe_fail(crate::failpoints::names::PROTO_POST_DETACHED_COMMIT)?;
+        let state = db.storage().table_state(&path.full_path, &detached).await?;
+        let version_metadata = state
+            .version_metadata
+            .with_table_fork_owner(table_fork_owner)
+            .with_staged(state.version, identity.uuid.clone());
+        proto_promotions.push(crate::db::HeldPromotion {
+            table_key: table_key.clone(),
+            dataset_path: path.dataset_path.clone(),
+            full_path: path.full_path.clone(),
+            table_branch: path.table_branch.clone(),
+            base,
+            detached,
+            target_version: expected_version + 1,
+            transaction_uuid: identity.uuid,
+            e_tag: version_metadata.e_tag().map(str::to_string),
+        });
+        updates.push(DatasetUpdate {
+            identity: path.identity,
+            type_key: table_key.clone(),
+            published_dataset_version: expected_version + 1,
+            native_dataset_branch: path.table_branch.clone(),
+            entity_count: state.row_count,
+            version_metadata,
+        });
+    }
+    // Every detached effect is durable and invisible; a failure here leaves
+    // the graph unchanged and the caller simply retries.
+    crate::failpoints::maybe_fail(crate::failpoints::names::PROTO_POST_DETACHED_PRE_PUBLISH)?;
+    Ok(CommittedMutation {
+        updates,
+        expected_versions,
+        sidecar_handle: None,
+        proto_promotions,
+        guards,
+    })
 }
 
 /// Walk `batches` in reverse, tracking seen `id` values; for each row

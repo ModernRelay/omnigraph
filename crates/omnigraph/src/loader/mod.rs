@@ -736,6 +736,11 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
+            opened.staged_version,
+            opened.transaction_uuid,
+            opened.dataset_path,
+            opened.e_tag,
+            branch.map(str::to_string),
         )?;
         for batch in batches {
             let schema = batch.schema();
@@ -789,6 +794,11 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
+            opened.staged_version,
+            opened.transaction_uuid,
+            opened.dataset_path,
+            opened.e_tag,
+            branch.map(str::to_string),
         )?;
         for batch in batches {
             let schema = batch.schema();
@@ -849,6 +859,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
         updates,
         expected_versions,
         sidecar_handle,
+        proto_promotions,
         guards: _queue_guards,
     } = staged
         .commit_all(
@@ -904,6 +915,17 @@ async fn load_jsonl_reader_once<R: BufRead>(
         }
     }
 
+    if crate::instrumentation::proto_detached_enabled() {
+        match crate::failpoints::maybe_fail(
+            crate::failpoints::names::PROTO_POST_PUBLISH_PRE_PROMOTE,
+        ) {
+            Ok(()) => db.promote_held_all(proto_promotions).await,
+            Err(error) => tracing::warn!(
+                error = %error,
+                "proto: promotion skipped; the next writer promotes"
+            ),
+        }
+    }
     Ok(LoadReceipt { result, commit })
 }
 

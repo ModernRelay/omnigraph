@@ -561,6 +561,11 @@ async fn open_table_for_mutation(
         opened.deferred_fork.clone(),
         opened.expected_version,
         op_kind,
+        opened.staged_version,
+        opened.transaction_uuid.clone(),
+        opened.dataset_path.clone(),
+        opened.e_tag.clone(),
+        branch.map(str::to_string),
     )?;
     Ok((opened.handle, opened.full_path, opened.table_branch))
 }
@@ -1004,6 +1009,7 @@ impl Omnigraph {
                     updates,
                     expected_versions,
                     sidecar_handle,
+                    proto_promotions,
                     guards: _queue_guards,
                 } = staged
                     .commit_all(
@@ -1067,6 +1073,17 @@ impl Omnigraph {
                             operation_id = handle.operation_id.as_str(),
                             "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
                         );
+                    }
+                }
+                if crate::instrumentation::proto_detached_enabled() {
+                    match crate::failpoints::maybe_fail(
+                        crate::failpoints::names::PROTO_POST_PUBLISH_PRE_PROMOTE,
+                    ) {
+                        Ok(()) => self.promote_held_all(proto_promotions).await,
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "proto: promotion skipped; the next writer promotes"
+                        ),
                     }
                 }
                 Ok(crate::MutationReceipt {

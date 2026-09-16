@@ -576,6 +576,8 @@ impl Snapshot {
                         entry.native_dataset_branch.as_deref(),
                         entry.published_dataset_version,
                         entry.version_metadata.e_tag(),
+                        entry.version_metadata.staged_version(),
+                        entry.version_metadata.transaction_uuid(),
                         &location,
                         Some(&caches.session),
                     )
@@ -885,9 +887,11 @@ impl DatasetEntry {
         // cached path (`Snapshot::open_lance_dataset` → handle cache) calls the same opener on
         // a miss with the shared session, so both paths count on the per-query
         // `table_wrapper`.
-        crate::instrumentation::open_dataset(
+        crate::instrumentation::open_pinned_dataset(
             &location,
-            crate::instrumentation::VersionResolution::At(self.published_dataset_version),
+            self.published_dataset_version,
+            self.version_metadata.staged_version(),
+            self.version_metadata.transaction_uuid(),
             session,
             crate::instrumentation::table_wrapper(),
         )
