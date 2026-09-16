@@ -41,7 +41,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 /// Unauthenticated, and therefore minimal: it reports whether this replica
 /// is serving or draining, the applied `config_digest` it booted from, the
 /// ledger revision and CAS it read, and how many graphs it serves and does
-/// not serve. Graph ids are topology and stay behind `GET /graphs`. Answers
+/// not serve. Graph ids stay behind authenticated catalog endpoints. Answers
 /// 503 once shutdown has begun; `/healthz` stays 200 while the process is
 /// alive.
 #[utoipa::path(
@@ -147,6 +147,49 @@ pub(crate) async fn server_graphs_list(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/graphs/discovery",
+    tag = "management",
+    operation_id = "discoverGraphs",
+    responses(
+        (status = 200, description = "Authenticated minimal graph inventory", body = GraphDiscoveryResponse),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Identity credential required", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+pub(crate) async fn server_graphs_discovery(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+) -> std::result::Result<Json<GraphDiscoveryResponse>, ApiError> {
+    let actor = actor.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    if !actor.is_identity() {
+        return Err(ApiError::forbidden(
+            "graph discovery requires an admitted identity credential",
+        ));
+    }
+    // Both sets come from the accepted boot inventory. Never scan storage or
+    // include per-graph status, roots, diagnostics, schema, or policy contents.
+    let ids: std::collections::BTreeSet<String> = state
+        .routing()
+        .registry
+        .list()
+        .into_iter()
+        .map(|handle| handle.key.graph_id.as_str().to_owned())
+        .chain(state.quarantined_graphs())
+        .collect();
+    Ok(Json(GraphDiscoveryResponse {
+        graphs: ids
+            .into_iter()
+            .map(|graph_id| GraphDiscoveryEntry {
+                display_name: graph_id.clone(),
+                graph_id,
+            })
+            .collect(),
+    }))
+}
+
 pub(crate) async fn server_openapi(
     State(state): State<AppState>,
 ) -> Json<utoipa::openapi::OpenApi> {
@@ -177,7 +220,13 @@ const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
 /// always-flat endpoints. `/graphs` is the management enumeration —
 /// it lives at the root in both single mode (405) and multi mode, and
 /// must never be rewritten to `/graphs/{graph_id}/graphs`.
-const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/readyz", "/graphs"];
+const ALWAYS_FLAT_PATHS: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/graphs",
+    "/graphs/discovery",
+    "/.well-known/oauth-protected-resource",
+];
 
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the
@@ -285,6 +334,10 @@ pub(crate) async fn require_bearer_auth(
     request.extensions_mut().remove::<AuthenticatedActor>();
     if !state.requires_bearer_auth() {
         return Ok(next.run(request).await);
+    }
+
+    if request.headers().get_all(AUTHORIZATION).iter().count() != 1 {
+        return Err(ApiError::unauthorized("one bearer credential is required"));
     }
 
     let Some(header) = request
@@ -1437,7 +1490,7 @@ pub(crate) async fn server_mutate_if_graph_commit(
 /// Path parameter for `POST /queries/{name}`.
 #[derive(Deserialize)]
 pub(crate) struct QueryNamePath {
-    name: String,
+    pub(crate) name: String,
 }
 
 pub(crate) fn parse_optional_invoke_body(

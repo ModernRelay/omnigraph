@@ -23,6 +23,112 @@ mod support;
 use support::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let identity = tokens.identity_token();
+    let restricted = tokens.token(json!([{"graph_id":"default","actions":["read","graph_list"]}]));
+    let state = AppState::open_with_bearer_tokens(
+        graph.to_string_lossy().to_string(),
+        vec![("breakglass".into(), "static-token".into())],
+    )
+    .await
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone())
+    .with_boot_witness(
+        omnigraph_server::BootWitness {
+            applied_graphs: vec!["default".into(), "unavailable".into()],
+            ..Default::default()
+        },
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::time::Duration::from_secs(30),
+    );
+    let app = build_app(state);
+    let (status, catalog) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        catalog,
+        json!({"graphs":[
+            {"graph_id":"default","display_name":"default"},
+            {"graph_id":"unavailable","display_name":"unavailable"}
+        ]})
+    );
+    for token in [&restricted, "static-token"] {
+        let (status, _) = json_response(&app, get_request("/graphs/discovery", token)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "legacy credentials cannot escape their catalog contract"
+        );
+    }
+    for path in [
+        "/graphs",
+        "/graphs/default/schema",
+        "/graphs/default/snapshot",
+    ] {
+        let (status, _) = json_response(&app, get_request(path, &identity)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "existence is not permission: {path}"
+        );
+    }
+    let (status, _) = json_response(
+        &app,
+        get_request("/graphs/discovery", "invalid.jwt.signature"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let policy_path = temp.path().join("policy.yaml");
+    for actors in [vec!["someone-else"], vec![tokens.actor.as_str()]] {
+        fs::write(&policy_path, permit_all_policy_yaml(&actors)).unwrap();
+        let state = AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            Vec::new(),
+            Some(&policy_path),
+        )
+        .await
+        .unwrap()
+        .with_data_token_trust(tokens.trust.clone());
+        let app = build_app(state);
+        let expected = if actors[0] == tokens.actor {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        let (status, _) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "policy enrollment cannot hide existence"
+        );
+        let (status, _) =
+            json_response(&app, get_request("/graphs/default/schema", &identity)).await;
+        assert_eq!(status, expected, "the same token follows activated policy");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(g("/schema/apply"))
+            .header("authorization", format!("Bearer {identity}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&SchemaApplyRequest {
+                    schema_source: fs::read_to_string(fixture("test.pg")).unwrap(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let (status, _) = json_response(&app, request).await;
+        assert_eq!(
+            status, expected,
+            "identity credentials neither grant nor ban schema apply"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
@@ -170,6 +276,66 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         body,
         "branch list cannot probe a graph outside the signed grant",
     );
+
+    // Version-1 signed-grant compatibility on the existing load route. Failed
+    // fork+load admission must leave the branch registry and graph head alone.
+    let (_, before_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    let (_, before_load_commits) =
+        json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    let split_load_grant = tokens.token(json!([
+        {"graph_id":"default","actions":["change"]},
+        {"graph_id":"reports","actions":["branch_create"]}
+    ]));
+    for token in [&read, &write, &create, &split_load_grant] {
+        let (status, body) = json_response(&app, signed_load_request(token, true)).await;
+        assert_forbidden(
+            status,
+            body,
+            "load requires change and fork authority on the same graph",
+        );
+    }
+    let (_, after_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
+    let (_, after_load_commits) =
+        json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    assert_eq!(before_load_branches, after_load_branches);
+    assert_eq!(before_load_commits, after_load_commits);
+    let load_token =
+        tokens.token(json!([{"graph_id":"default","actions":["read","change","branch_create"]}]));
+    let (status, loaded) = json_response(&app, signed_load_request(&load_token, true)).await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["branch_created"], true);
+    assert_eq!(loaded["actor_id"], tokens.actor);
+    assert_eq!(loaded["commit"]["actor_id"], tokens.actor);
+    let (_, branch_commits) =
+        json_response(&app, get_request(&g("/commits?branch=load_review"), &read)).await;
+    assert_eq!(loaded["commit"], branch_commits["commits"][0]);
+    let (_, unchanged_main) =
+        json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
+    assert_eq!(unchanged_main, before_load_commits);
+    let (status, loaded_again) = json_response(&app, signed_load_request(&write, false)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "existing branch only needs change: {loaded_again}"
+    );
+    assert_eq!(loaded_again["branch_created"], false);
+}
+
+fn signed_load_request(token: &str, fork: bool) -> Request<Body> {
+    let path = if fork {
+        "/load/ndjson?branch=load_review&from=main&mode=merge"
+    } else {
+        "/load/ndjson?branch=load_review&mode=merge"
+    };
+    Request::builder()
+        .uri(g(path))
+        .method(Method::POST)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"SignedLoad\",\"age\":29}}\n",
+        ))
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -219,6 +385,23 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         status,
         StatusCode::FORBIDDEN,
         "a valid token must not enroll its actor in Cedar"
+    );
+    let load_token =
+        tokens.token(json!([{"graph_id":"default","actions":["change","branch_create"]}]));
+    let (_, before_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
+    for denied_app in [&app, &unknown_actor_app] {
+        let (status, body) =
+            json_response(denied_app, signed_load_request(&load_token, true)).await;
+        assert_forbidden(
+            status,
+            body,
+            "signed load cannot bypass missing Cedar permission",
+        );
+    }
+    let (_, after_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
+    assert_eq!(
+        before_load, after_load,
+        "Cedar denial cannot create the load branch"
     );
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await

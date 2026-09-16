@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-16
 discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
@@ -15,6 +15,11 @@ blocked_on: []
 ---
 
 # RFC 0053: Offline data-token verification
+
+> The [identity and applied-policy extension](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+> adds identity-only credentials, automatic acquisition and an offline OAuth
+> resource profile. This RFC retains the public version-1 restricted
+> credential contract; normal managed access uses identity-only credentials.
 
 ## Summary
 
@@ -232,15 +237,16 @@ until expiry or trust retirement, and local clearing is not server revocation.
 Automation may use the explicit origin-bound control credential to mint into
 the same keychain; unattended raw-token consumers use the issuance API.
 
-Only implicitly addressed `query` and `mutate` consult managed context in the
-exact current directory. An explicit `--server`, `--profile`, `--store`, or
-`--cluster` retains ordinary addressing and command-applicability validation,
-without reading that context. Every other graph, storage, alias, or local
-command likewise retains its existing handler. This does not add managed
-transport support to those commands. Global `--direct` bypasses context as
-before, including for cluster commands.
+Only implicitly addressed `query`, `mutate`, `load`, `commit list`, and
+`commit show` consult managed context in the exact current directory. An
+explicit `--server`, `--profile`, `--store`, or `--cluster` retains ordinary
+addressing and command-applicability validation, without reading that context;
+a positional load/commit-list URI or `commit show --uri` does the same. Every other
+graph, storage, alias, or local command retains its existing handler. This does
+not add managed transport support to those commands. Global `--direct` bypasses
+context as before, including for cluster commands.
 
-For implicit `query`/`mutate`, absent context leaves ordinary resolution
+For these implicit data commands, absent context leaves ordinary resolution
 unchanged; malformed context refuses. Valid context plus a nonempty
 `OMNIGRAPH_PROFILE` or an operator `defaults.server`/`defaults.store` target
 refuses with `managed_target_ambiguous` before keychain access or requests.
@@ -254,10 +260,26 @@ An unambiguous managed request requires explicit `--graph`, rejects explicit
 `--as`, and uses the separately cached data endpoint/credential. Missing,
 malformed, expired, or under-scoped credentials never fall through to static
 credentials, a profile, or direct storage. Legacy token settings never supply
-managed authority. Managed requests refuse redirects and have a 10-second
-deadline and 8 MiB response bound. Cluster control dispatch and token issuance
-retain their existing scope requirements. New named managed connections are
-a separate change.
+managed authority. Managed reads refuse redirects and have a 30-second
+deadline and 8 MiB response bound. Managed `mutate`, including ad-hoc
+mutations, stored mutation invocations and branch-write statements, uses
+the same 30-second request deadline with a 10-second connection bound
+and the same 8 MiB response bound. Managed `commit list` and `commit show`
+use the separately cached `read` grant and the existing native commit
+protocol, with the read deadline and response bound. They permit exact graph
+lineage inspection after an uncertain write without exposing a data
+credential or opening storage directly. Managed `load` uses the existing
+authenticated NDJSON endpoint with `change` authority, additionally requiring
+`branch_create` when `--from` is present; the server still intersects signed grants
+with Cedar and owns branch creation and graph publication. One managed load accepts at most
+32 MiB of UTF-8 input, retains the 8 MiB response bound, and uses a 300-second
+request deadline with a 10-second connection bound. The existing engine's keyed
+table row and parsed-byte limits remain unchanged. No load request is retried by
+the CLI: a timeout, interrupted response, or unverified receipt requires
+reconciliation of the target branch before a caller decides whether to retry.
+Ordinary direct and profile-based loading keep their existing transport.
+Cluster control dispatch and token issuance retain their existing scope
+requirements. New named managed connections are a separate change.
 
 ## Invariants
 
@@ -321,33 +343,16 @@ graph, trust without static credentials, invalid trust, and overlapping keys.
 The CLI passed 99 unit and 133 process tests; strict lint and documentation
 checks passed for the implemented server and client surfaces.
 
-The 2026-09-05 managed pilot used the server implementation at `463290a9` and
-native CLI binary with SHA-256
-`cb464cb72bb0d48ec885896e2361bee46b860b995c457cee9d33f9ca17eace0a`.
-Generated evidence records real WorkOS session issuance through the API and a
-per-cluster AWS KMS key, with a request for an ungranted export action refused.
-The actual operator retained kubelet's final container exit on a Ready node,
-completed its ordinary drain and apply, and verified that serving reported the
-finalized receipt's ledger after trust and Cedar policy were installed.
-
-Seven real-KMS verifier cases produced the expected results: a valid read
-returned 200; expired, wrong-cluster, and wrong-incarnation credentials returned
-401; missing read authority, another graph's grant, and an absent Cedar actor
-returned 403. With the Intent API at zero Pods, the actual CLI inserted one
-node and read it back at the same graph commit with the immutable principal
-actor. Its 60-second credential then produced `data_credential_expired`, and
-the API was restored. This separately exercises server expiry and client cache
-expiry; no credential was included in the generated CLI output.
-
-This qualification covers one existing cluster and one enrolled human
-principal. It does not complete the companion control-plane G4 identity, auth,
-and credential-transport gate or G5 managed-product gate, provide cell
-infrastructure, or qualify backup/restore, distributed writer fencing, or the
-full tenant adversarial matrix. Those boundaries remain outside this RFC.
+Historical provider/KMS interoperability checks covered valid reads, expired
+and mismatched credentials, grant ceilings, missing policy membership, and
+CLI reads and writes while the issuer was unavailable. They covered one
+cluster and one human principal, not a general deployment qualification.
+Backup/restore, distributed writer fencing and tenant-isolation qualification
+remain outside this RFC.
 
 ## Rollout
 
-Record this contract and the companion control-plane decision before code.
+Record this public contract before code.
 Implement and qualify the offline verifier, then deploy prepared trust and
 policy to an existing cluster. Only then enable issuance and client access.
 Keep a deliberate static break-glass path during the controlled transition.
@@ -361,6 +366,22 @@ None for the bounded wire and authorization contract. Implementation and
 qualification remain separate from acceptance.
 
 ## Decision log
+
+2026-09-08: Managed queries and mutations use a bounded 30-second request
+deadline. Loads retain their separate 300-second deadline. The 10-second
+connection deadline, response limit, redirect refusal and disabled automatic
+retries remain unchanged.
+Managed commit list/show reads use cached `read` authority so callers can
+inspect native lineage when a write response is lost. This adds no new
+protocol, token export or automatic write reconciliation.
+
+2026-09-07: Extended managed CLI routing to implicit `load`, preserving explicit
+ordinary targets and the compatibility repair's ambiguity rules. The existing
+authenticated NDJSON protocol, graph publication, and server policy owners are
+unchanged. This adds a 32 MiB input bound and a separate 300-second load deadline
+while retaining the 8 MiB response bound and requiring branch creation authority
+for `--from`. Transport and authorization tests cover the CLI-to-server
+contract; engine publication and recovery semantics remain unchanged.
 
 2026-09-06: The compatibility repair restores the three public struct shapes
 and isolates canonical-root validation in opt-in managed boot. This replaces
@@ -379,7 +400,7 @@ only implicit query/mutate; competing ambient targets refuse before credential
 access rather than silently selecting either destination. Existing unambiguous
 managed access, offline verification, action grants and no-fallback guarantees
 remain. Implementation and regression evidence for this correction must be
-reported separately from the earlier pilot qualification.
+reported separately from the earlier interoperability qualification.
 
 2026-09-05: Recorded the bounded offline verifier before implementation,
 following the existing server policy/action audit. Managed root identity is
@@ -388,8 +409,8 @@ the actual resolved serving root and does not import private marker formats.
 
 2026-09-05: Accepted by the maintainer for implementation with the explicit
 wire bounds, static-first exact credential matching, required Cedar permit,
-and same-snapshot canonical root accessor. Companion control-plane DEC-08-23
-owns issuance, permissions, KMS custody, and operator preparation. Qualification
+and same-snapshot canonical root accessor. Issuer implementations own issuance,
+admission, signing-key custody and preparation of public trust. Qualification
 remains required before claiming the implementation complete.
 
 2026-09-05: Retained the existing server graph-id grammar and reserved names.
@@ -398,8 +419,7 @@ remains 64. Managed issuance uses the intersection with Core configuration
 identifiers rather than changing the independent server routing contract.
 
 2026-09-05: Completed the bounded server and CLI implementation after the
-focused regressions and real WorkOS/KMS qualification above. The live pilot
-used the ordinary managed drain, receipt, and readiness path, preserving
-existing engine and storage behavior. The
+focused regressions and provider/KMS interoperability checks above. Existing
+engine and storage behavior was preserved. The
 later CLI diagnostic-redaction fix is covered by its focused regression and
 does not change the successfully qualified data path.

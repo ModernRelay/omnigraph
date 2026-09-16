@@ -78,8 +78,8 @@ pub(crate) use recovery::{
     heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
     new_ensure_indices_sidecar_v9, new_occ_sidecar_v9, new_optimize_sidecar_v9,
     new_schema_apply_sidecar_v9, new_system_column_upgrade_sidecar_v9,
-    recover_failed_branch_merge_under_gates, recover_manifest_drift, schema_apply_serial_queue_key,
-    write_sidecar,
+    recover_failed_branch_merge_under_gates, recover_manifest_drift, refuse_pending_recovery,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::DatasetEntry;
 #[cfg(test)]

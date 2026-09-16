@@ -455,6 +455,21 @@ impl std::fmt::Display for PreconditionFailedCli {
 
 impl std::error::Error for PreconditionFailedCli {}
 
+/// Preserve a typed server refusal through the command dispatch so JSON
+/// callers retain its code and detail fields instead of parsing a message.
+#[derive(Debug)]
+pub(crate) struct RemoteErrorCli {
+    pub(crate) output: ErrorOutput,
+}
+
+impl std::fmt::Display for RemoteErrorCli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.output.error)
+    }
+}
+
+impl std::error::Error for RemoteErrorCli {}
+
 /// Build the typed CAS-lost error for the embedded transport, mirroring the
 /// structured body a server would have returned so `--json` output is
 /// transport-uniform. `message` is the engine error's own `Display` text, so
@@ -544,7 +559,16 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     } else {
         request
     };
-    let mut response = request.send().await?;
+    remote_response_json_bounded(request.send().await?, bearer_token, response_limit).await
+}
+
+/// Decode either JSON requests or raw NDJSON loads through the same bounded,
+/// credential-safe response path. The request owner chooses its deadline.
+pub(crate) async fn remote_response_json_bounded<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    bearer_token: Option<&str>,
+    response_limit: Option<usize>,
+) -> Result<T> {
     let status = response.status();
     let text = if let Some(limit) = response_limit {
         if status.is_redirection() {
@@ -575,7 +599,7 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
             if error.precondition_failure.is_some() {
                 return Err(PreconditionFailedCli { output: error }.into());
             }
-            bail!(error.error);
+            return Err(RemoteErrorCli { output: error }.into());
         }
         bail!("server returned {}: {}", status, text);
     }

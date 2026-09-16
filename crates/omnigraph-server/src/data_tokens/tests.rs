@@ -75,6 +75,58 @@ fn issuer_golden_signature_and_per_graph_ceiling() {
 }
 
 #[test]
+fn identity_profile_preserves_bindings_and_rejects_permissions() {
+    let fixture = golden();
+    let now = fixture["verification_time"].as_u64().unwrap();
+    let trust = trust();
+    let mut claims = fixture["claims"].clone();
+    claims["version"] = json!(2);
+    claims.as_object_mut().unwrap().remove("grants");
+    let mut actor = trust.verify_authenticated_at(&sign(&claims), now).unwrap();
+    assert!(actor.data_claims().is_none());
+    assert_eq!(
+        serde_json::to_value(actor.identity_claims().unwrap()).unwrap(),
+        claims
+    );
+    assert!(actor.select_graph(&GraphId::try_from("other").unwrap()));
+    assert!(actor.permits_action(PolicyAction::SchemaApply));
+    for (field, value) in [
+        ("grants", fixture["claims"]["grants"].clone()),
+        ("grants", json!([])),
+        ("roles", json!(["admin"])),
+        ("actions", json!(["read"])),
+        ("groups", json!(["admins"])),
+        ("version", json!(1)),
+        ("version", json!(3)),
+        ("iss", json!("https://other.example")),
+        ("aud", json!("urn:omnigraph:data:other")),
+        ("account_id", json!("other")),
+        ("cluster_id", json!("other")),
+        ("cluster_incarnation", json!("other")),
+        ("sub", json!("email@example.com")),
+        ("jti", json!("")),
+        ("principal_kind", json!("development")),
+        ("assurance", json!("verified_workload")),
+        ("iat", json!(now + 31)),
+        ("exp", json!(now)),
+        ("exp", json!(claims["iat"].as_u64().unwrap() + 86401)),
+    ] {
+        let mut bad = claims.clone();
+        bad[field] = value;
+        assert!(
+            trust.verify_authenticated_at(&sign(&bad), now).is_none(),
+            "accepted {field}"
+        );
+    }
+    let duplicate = claims.to_string().replacen('{', "{\"version\":2,", 1);
+    assert!(
+        trust
+            .verify_at(&sign_raw(&fixture["header"].to_string(), &duplicate), now)
+            .is_none()
+    );
+}
+
+#[test]
 fn signed_profile_rejects_invalid_authority_and_unsupported_claims() {
     let fixture = golden();
     let now = fixture["verification_time"].as_u64().unwrap();
@@ -104,6 +156,10 @@ fn signed_profile_rejects_invalid_authority_and_unsupported_claims() {
         (
             "grants",
             json!([{"graph_id":"graph-a","actions":["schema_apply"]}]),
+        ),
+        (
+            "grants",
+            json!([{"graph_id":"graph-a","actions":["config_manage"]}]),
         ),
         (
             "grants",

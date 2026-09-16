@@ -55,7 +55,7 @@ under a crate, a rustdoc-only change) satisfy it only through the
 differs by shape: a corpus match ran green in the required `GQ Logic
 Tests` job; a Rust match is a test-attributed definition or an edit inside
 one, not a run. A pull request runs every workspace test target in `Test
-Workspace`, a reporting context the gate does not consult, and workspace
+Workspace`, a required context the gate does not consult, and workspace
 clippy refuses an unreferenced private function but not an `#[ignore]`d or
 cfg-gated one, so whether that test runs in the suite and asserts the right
 thing stays with review.

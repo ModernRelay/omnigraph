@@ -138,7 +138,7 @@ fn installed_file_is_current(installed: &fs::File, path: &std::path::Path) -> Re
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    let cli = {
+    let (cli, json) = {
         let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
@@ -149,8 +149,37 @@ async fn main() -> Result<()> {
                     .help("Print version"),
             )
             .get_matches_from(raw_args);
-        Cli::from_arg_matches(&matches)?
+        let mut command_matches = &matches;
+        while let Some((_, child)) = command_matches.subcommand() {
+            command_matches = child;
+        }
+        let json = command_matches
+            .try_get_one::<bool>("json")
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false)
+            || command_matches
+                .try_get_one::<ReadOutputFormat>("format")
+                .ok()
+                .flatten()
+                == Some(&ReadOutputFormat::Json);
+        (Cli::from_arg_matches(&matches)?, json)
     };
+    match run(cli).await {
+        Err(error) if json => {
+            if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
+                print_json(&remote.output)?;
+                std::io::stdout().flush()?;
+                std::process::exit(1);
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     if let Some(result) = managed::dispatch(&cli).await {
         let code = result.emit()?;
         if code != 0 {
@@ -158,7 +187,7 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let managed_data = match managed::data::client(&cli) {
+    let managed_data = match managed::data::client(&cli).await {
         Ok(client) => client,
         Err(output) => {
             let code = output.emit()?;
@@ -372,16 +401,20 @@ async fn main() -> Result<()> {
             mode,
             json,
         } => {
-            let client = client::GraphClient::resolve_with_policy(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                cli.as_actor.as_deref(),
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
+            let client = if let Some(client) = managed_data {
+                client
+            } else {
+                client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?
+            };
             let branch = resolve_branch(branch, None, "main");
             if matches!(mode, CliLoadMode::Overwrite) {
                 confirm_destructive("load --mode overwrite", client.uri(), cli.yes, json)?;
@@ -556,15 +589,20 @@ async fn main() -> Result<()> {
         },
         Command::Commit { command } => match command {
             CommitCommand::List { uri, branch, json } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
+                let client = match managed_data {
+                    Some(client) => client,
+                    None => {
+                        client::GraphClient::resolve(
+                            capability,
+                            cli.server.as_deref(),
+                            cli.graph.as_deref(),
+                            uri,
+                            cli.profile.as_deref(),
+                            cli.store.as_deref(),
+                        )
+                        .await?
+                    }
+                };
                 let payload = client.list_commits(branch.as_deref()).await?;
                 if json {
                     print_json(&payload)?;
@@ -577,15 +615,20 @@ async fn main() -> Result<()> {
                 commit_id,
                 json,
             } => {
-                let client = client::GraphClient::resolve(
-                    capability,
-                    cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
-                    cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
+                let client = match managed_data {
+                    Some(client) => client,
+                    None => {
+                        client::GraphClient::resolve(
+                            capability,
+                            cli.server.as_deref(),
+                            cli.graph.as_deref(),
+                            uri,
+                            cli.profile.as_deref(),
+                            cli.store.as_deref(),
+                        )
+                        .await?
+                    }
+                };
                 let commit = client.get_commit(&commit_id).await?;
                 if json {
                     print_json(&commit)?;
@@ -1744,14 +1787,36 @@ async fn main() -> Result<()> {
             }
         },
         Command::Graphs { command } => match command {
-            GraphsCommand::List { json } => {
-                // Registry scope (RFC-011): the bare server base URL, resolved
-                // synchronously — the async D7 require-graph probe cannot run
-                // here, and no `/graphs/<id>` is ever appended.
-                let client = client::GraphClient::resolve_registry(
-                    cli.server.as_deref(),
-                    cli.profile.as_deref(),
-                )?;
+            GraphsCommand::List { json, discovery } => {
+                let (client, discovery) = if let Some(client) = managed_data {
+                    (client, true)
+                } else {
+                    // Explicit operator addressing retains the legacy catalog
+                    // unless discovery is explicitly requested. Token bytes do
+                    // not choose configuration or change static-token behavior.
+                    (
+                        client::GraphClient::resolve_registry(
+                            cli.server.as_deref(),
+                            cli.profile.as_deref(),
+                        )?,
+                        discovery,
+                    )
+                };
+                if discovery {
+                    let payload = client.discover_graphs().await?;
+                    if json {
+                        print_json(&payload)?;
+                    } else {
+                        for entry in payload.graphs {
+                            if entry.display_name == entry.graph_id {
+                                println!("{}", entry.graph_id);
+                            } else {
+                                println!("{}\t{}", entry.graph_id, entry.display_name);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
                 let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;
