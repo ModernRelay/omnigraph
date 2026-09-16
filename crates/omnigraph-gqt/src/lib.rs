@@ -1247,7 +1247,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             }
             "fault" => {
                 return Err(format!(
-                    "line {}: `--- fault` no longer names a code seam; write `--- seam` with the same `at`, `occurrence` and `scope`, and `action: fail` (was `return_error`) or `action: skip`",
+                    "line {}: there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
                     section.header_line + 1
                 ));
             }

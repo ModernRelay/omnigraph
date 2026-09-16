@@ -42,6 +42,18 @@ one for a site between two steps, several for a site that wraps one
 operation, and a case names which one fires, so a new action at a known
 site is a case, not an engine edit (amendment of 2026-09-15, decision log).
 
+A seam whose behavior is the store's, not the engine's, is written the same
+way: a ***store effect*** is an outcome a seam declares in a second set
+beside its effects, which the site passes through unchanged and the storage
+decoration acts on at the next matching store call, and a ***store place***
+is a seam whose site is a store call itself, listed in a table beside the
+decoration rather than in the engine catalog. A case selects one call of a
+store place through the `subject` field (defined below), a pattern over the object's name
+relative to the graph root; which blocks require it and which refuse it is
+RFC 0045 §Seams at an explicit step. The first store effect is `misdirect`,
+the first case the foreign-named sidecar of issue 601 (amendment of
+2026-09-15, decision log).
+
 ## Motivation
 
 Three different things share the word failpoint today (file and line
@@ -151,20 +163,39 @@ action: fail
 scope: next_step
 ```
 
-`action` is `fail`, `contention`, or `skip`; `hold` is refused until a case
-can express two concurrent steps. `fail` selects `Fail` when declared,
+`action` is `fail`, `contention`, `skip`, or a store action, the first being
+`misdirect`; `hold` is refused until a case can express two concurrent
+steps. `fail` selects `Fail` when declared,
 otherwise `Contention` for compatibility with existing cases. Explicit
 `contention` selects only `Contention`, and `skip` selects only `Skip`.
 A seam declaring both failure effects therefore lets a case choose either,
 regardless of declaration order. An undeclared effect is refused before the
-case runs. A bare
-`--- seam` without `action` is refused: a seam is a place, not an action.
-`--- fault` keeps its name for storage-boundary faults, specified in a
-separate amendment to RFC 0045.
+case runs. A bare `--- seam` without `action` is refused: a seam is a
+place, not an action. A store fault is a seam like any other and has no
+block of its own: `--- fault` names nothing and is refused with a pointer
+to `--- seam`. Two shapes reach the store. A decision seam in engine code
+may declare a store effect, the first being `misdirect`: the site passes,
+the write it guards proceeds, and the storage decoration installed at
+`STORAGE` lands that one call under a different object name, the same
+directory with the filename prefixed `dstm-`, and answers success, so the
+engine holds a handle naming an object the store does not have. A store
+place, `storage.put`, `storage.delete`, `storage.rename`, `storage.cas`,
+`storage.get` or `storage.list`, is the store call itself as a seam;
+because one place serves every object, a case names the object with
+`subject`, a glob whose grammar is §Design **Subjects**, and `occurrence`
+counts the calls of that place whose requested name matches. Which blocks
+require `subject` and which refuse it is RFC 0045 §Seams at an explicit
+step. A store action on a decision seam that does not declare it is
+refused before the case runs, and so is an engine action (`fail`,
+`contention`, `skip`, `hold`) on a store place: the store's spelling of an
+injected error is `error`. `error`, `lose`, `corrupt` and `delay` parse as
+store actions and are refused at admission naming the table row until a row
+admits them; `misdirect` is the one admitted spelling.
 
-A `--- seam` block inherits the placement rules of `--- fault`: directly
-before the step it arms, never inside a loop body, at most 16 per case, and
-refused before a `--- restart`, since no installed behavior survives a
+A `--- seam` block keeps the placement rules of the retired `--- fault`
+block: directly before the step it arms, never inside a loop body, at most
+16 per case, and refused before a `--- restart`, since no installed behavior
+survives a
 restart. Several blocks may precede one step when they name distinct seams,
 each with its own delivery record; the same seam twice before one step is
 refused (the one-per-step rule of the first draft was lifted by the #602 fix,
@@ -237,6 +268,41 @@ query all() { match { $p: Person } return { $p.name } }
 {"p.name":"alice"}
 ```
 
+The first store-effect case is
+`issue_601_foreign_named_sidecar_blocks_branch.gqt`, carried as a known
+failure until the [#601](https://github.com/ModernRelay/omnigraph/issues/601)
+fix deletes its marker; the excerpt omits `--- runner`, `--- known_failure`,
+`--- schema` and `--- seed`:
+
+```
+# issue: 601
+--- seam
+at: recovery.sidecar_write
+occurrence: 1
+action: misdirect
+scope: next_step
+--- mutate
+query add_row() { insert Person { name: "bob" } }
+--- expect affected: nodes=1 edges=0
+--- restart
+--- mutate
+query add_row_after_reopen() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+```
+
+The arm put behind `recovery.sidecar_write` is the one store call between
+the seam and the handle (`crates/omnigraph/src/db/manifest/recovery.rs:1146`
+and `:1154`), so the misdirected object is `__recovery/dstm-<opid>.json`
+with a valid Armed body; the confirm put and the post-publish delete
+address the canonical name. The reopen at `--- restart` lists the
+directory, reads the foreign file, classifies the intent as the healer
+decides and deletes the canonical name, which does not exist, so the file
+stays; the write at the third step is refused with `RecoveryRequired`, and
+the marker's reason is copied from the red report. The same object placed
+by the store place form reads `at: storage.put`, `subject: __recovery/*`,
+`occurrence: 1`, `action: misdirect`; both forms produce one bucket state
+and one delivery record.
+
 ## Design
 
 **The type.** In `crates/omnigraph-seams`:
@@ -246,15 +312,19 @@ pub struct Seam<B: ?Sized + 'static, S: Storage<B> = Global<B>> {
     name: &'static str,
     op: Op,
     effects: &'static [Effect],
+    store: &'static [StoreEffect],
     slot: S,
 }
 
 impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
     pub const fn new(name: &'static str, op: Op, slot: S) -> Self;
     pub const fn decide(name: &'static str, op: Op, effects: &'static [Effect], slot: S) -> Self;
+    pub const fn decide_with_store(name: &'static str, op: Op, effects: &'static [Effect], store: &'static [StoreEffect], subject: &'static str, slot: S) -> Self;
     pub const fn name(&self) -> &'static str;
     pub const fn op(&self) -> Op;
     pub const fn effects(&self) -> &'static [Effect];
+    pub const fn store_effects(&self) -> &'static [StoreEffect];
+    pub const fn store_subject(&self) -> Option<&'static str>;
     pub fn with<R>(&self, f: impl FnOnce(&B) -> R) -> Option<R>;
     // with the `install` feature:
     pub fn install(&'static self, b: Arc<B>) -> Installed<B, S>;
@@ -263,7 +333,8 @@ impl<B: ?Sized + 'static, S: Storage<B>> Seam<B, S> {
 pub type DecideSeam = Seam<dyn Decide, Global<dyn Decide>>;
 pub enum Op { Mutation, BranchMerge, BranchCreate, BranchDelete, AnyWrite, Unreachable }
 pub enum Effect { Fail, Skip, Contention }
-pub enum Decision { Fire(Effect), Pass }
+pub enum StoreEffect { Misdirect }
+pub enum Decision { Fire(Effect), Store(StoreEffect), Pass }
 
 /// Everything a slot may hold; the one hook every behavior shares.
 pub trait Behavior: 'static {
@@ -285,6 +356,36 @@ outcomes its site honors, one per site between two steps, several for a
 site that wraps one operation. A decision fires with one of them, and
 `crossed()` refuses a decider firing an effect outside the set, since the
 site has no arm for it.
+
+**Store effects.** A catalog entry may declare a second set beside its
+effects, its ***store effects***: `decide_seam!` gains
+`store [Misdirect], subject "__recovery/*"`,
+`Seam::decide_with_store` holds the set and `store_effects()` answers it,
+`effects()` still answers `[Fail]` for `recovery.sidecar_write`, and
+`crossed()` accepts a decider firing an outcome from either set, checking
+membership per set. A decider fires a store effect as
+`Decision::Store(Misdirect)`, never as `Fire`: `Fire` carries an `Effect`,
+and the two enums do not convert. A site has no arm for a store effect:
+each site helper (`fail`, `skip`, `contention`, `guarded`) gains one arm
+that treats `Store(_)` as `Pass`, and the decider that fired it hands the
+storage decoration a one-shot instruction for the next `write_text`,
+`write_bytes` or `write_text_if_absent`, consumed by the next such call the
+decoration sees (the GQT target runs one operation at a time, and the rule
+list is empty under the nightly). Nothing else moves: the engine-site
+calls, the exact-set checks over `effects()` in the helpers and the source
+walker, the plain installers `fire_always` and `fire_once_at`, and the DST
+nightly's arming of `recovery.sidecar_write` are untouched. A site declares
+a store effect only when exactly one store call of the matching kind
+follows it before the next seam, so "the next call" is unambiguous; the
+source walk (§Evidence) does not check this. The proof case's report does:
+the test in `crates/omnigraph-gqt/tests/runner_dispatch.rs` that runs the
+case asserts its delivery record's `hit` (§GQT) names `write_text`, a
+`requested` name under `__recovery/`, and a `stored` name equal to
+`requested` with `dstm-` prefixed on the file name in the same directory.
+The doc comment of the declaring site names that call. The declaration also
+names the call's subject, and the decoration consumes the one-shot only on a
+put that matches it, so a put of another object between the site and its call
+is passed through, not misdirected.
 
 **The two slot scopes.** `Storage<B>` has two implementations, chosen per seam:
 `Global` (a `RwLock<Option<Arc<B>>>` in the static, `B: Send + Sync`; the
@@ -327,7 +428,7 @@ Under `ThreadLocal` the installed value need not be `Send` or `Sync`, so
 
 | Trait | Method | Seams using it |
 |---|---|---|
-| `Decide` | `decide(&self, name: &'static str) -> Decision` (`Fire(Effect)` or `Pass`) | the 89 engine and 8 cluster named sites |
+| `Decide` | `decide(&self, name: &'static str) -> Decision` (`Fire(Effect)`, `Store(StoreEffect)` or `Pass`) | the 89 engine and 8 cluster named sites |
 | `Clock` | `now_ms(&self) -> u64` | `CLOCK` |
 | `IdSource` | `next_ulid(&self) -> Ulid` | `IDS` |
 | `GateHook` | the existing `TurnHook` contract from `dst_gate.rs` | `GATE` |
@@ -375,7 +476,9 @@ walker reports the same pairing statically).
 `guarded(&SEAM, op).await -> Result<Option<T>>` serves a site that wraps one
 operation and declares every outcome the code after the call survives. It
 holds the only match over the decision: `Pass` runs `op` and returns
-`Some(op's result)`; `Fire(Skip)` returns `Ok(None)` without running `op`;
+`Some(op's result)`, and so does `Store(_)`, whose effect the storage
+decoration applies, not the site; `Fire(Skip)` returns `Ok(None)` without
+running `op`;
 `Fire(Fail)` and `Fire(Contention)` return the injected errors. An action
 thus has one meaning at every site (`skip` = the wrapped operation did not
 run, `fail` = it was replaced by the injected error), the site never
@@ -384,9 +487,9 @@ not an edit. What stays a Rust edit is a new place: one edit per location.
 The set is held honest by review, not by a type: a site lists `Skip` only
 when the code after the call treats `None` as a real outcome
 (`confirm_occ_sidecar_v9` updates the in-memory sidecar after a lost put;
-the post-commit delete remains independent). The three effects are the whole vocabulary:
-a site needing another outcome adds an `Effect` variant and its arm in
-`guarded`, so every outcome a case can name is one every site can honor.
+the post-commit delete remains independent). The three engine effects are
+the site vocabulary; a store effect is passed through at the site and acted
+on by the decoration (**Store effects**, **Store places**).
 
 **`Hold`.** `Hold` is a decider, not an effect: it is installable on any
 decision seam, records that the site was reached, parks the first
@@ -436,6 +539,95 @@ engine's `StorageAdapter` (`crates/omnigraph/src/storage.rs:18`, which returns
 back a clone of that `Arc` for every handle, which is how `suspend` and
 `resume` (`harness.rs:5235`) and `damage_events` (`:5424`) keep reaching the
 wrapped object.
+
+**Store places.** The decoration installed at `STORAGE` is the DST harness's
+`FailingStorage` (`crates/omnigraph-dst/src/harness.rs:2217`), which already
+routes every `StorageAdapter` method through a hook: `read_fault` on the
+reads and listings and `latent_fault` on the content reads, `write_fault` on
+the writes, rename, delete and compare-and-swap, `maybe_misdirect` on the
+three puts; `exists` is unhooked and is no place. A store place is one of
+those method families given a seam name, listed once in that crate as
+`STORE_PLACES` beside the implementation, as the engine catalog sits beside
+the engine's sites. The store places cover the control objects the engine
+writes through `StorageAdapter` itself: the sidecars under `__recovery/`,
+the queues and the markers. Every Lance dataset is outside them, the graph
+tables and `__manifest` alike: a publication into a branch's `__manifest`
+is a Lance `MergeInsertBuilder` write
+(`crates/omnigraph/src/db/manifest/publisher.rs:942-967`) that crosses
+`OBJECT_STORE`, which no store place reaches, so no `storage.put` subject
+selects a dataset object.
+
+| place | adapter methods | actions the hook implements | admitted by this amendment |
+|---|---|---|---|
+| `storage.put` | `write_text`, `write_bytes`, `write_text_if_absent` | `misdirect`, `lose`, `error`, `delay`, `corrupt` | `misdirect` |
+| `storage.delete` | `delete`, `delete_prefix` | `lose`, `error`, `delay` | none |
+| `storage.rename` | `rename_text` | `lose`, `error`, `delay` | none |
+| `storage.cas` | `write_text_if_match` | `error`, `delay`, `corrupt` | none |
+| `storage.get` | `read_text`, `read_text_if_exists`, `read_text_if_exists_bounded`, `read_bytes_if_exists_bounded`, `read_text_versioned` | `error`, `delay`, `corrupt` | none |
+| `storage.list` | `list_dir`, `list_dir_bounded` | `error`, `delay` | none |
+
+A cell is admitted when the rule list has an arm for it and every adapter
+method of its row honors it; the random plan's own verbs do not count as an
+arm, and an action a hook implements for part of a row names its method
+subset: today the write corruption hook is text-only (`write_text`,
+`write_text_if_absent`) and the read one skips `read_bytes_if_exists_bounded`;
+`StorePlaceEntry.honors` is per row, and a method subset gets a field when an
+admitted action needs one. This amendment admits `misdirect` on `storage.put` and the store
+effect on `recovery.sidecar_write`; every other cell is a later change that
+touches the hook and the table.
+
+A store place is not a `DecideSeam`: `STORAGE` is a wrap seam declared
+`Op::Unreachable` (`crates/omnigraph/src/storage.rs:324-331`), so a store
+place lives in `STORE_PLACES`, not in the engine catalog. The `storage.`
+prefix selects nothing: `storage.local_create_if_absent_probe` is a
+decision seam of the engine catalog
+(`crates/omnigraph/src/db/omnigraph.rs:3989`, `Op::AnyWrite`), so the GQT
+runner resolves `at` by exact name, the engine catalog first and
+`STORE_PLACES` second, and refuses a name both answer, naming both rows; a
+`store_places` unit test asserts the two registries share no name. A store
+place is admitted before any mutate or branch step as `AnyWrite` admits; a
+store place before a `--- restart` or before a query step stays refused in
+this amendment (§Unresolved questions). Which steps put is a property of the
+engine path, not the grammar: a mutation and a merge write their sidecar
+through `StorageAdapter`; a branch create writes nothing through it, so a
+store place before one fails `seam_unobserved` with no matching call. A step admits at most one store
+action, as a store place or as a store effect on a decision seam; a second
+is refused at admission with `unsupported_environment: one store action
+per step`, naming both directives. This is the one exception to distinct
+seams coexisting before one operation (RFC 0045 §Seams at an explicit
+step): a catalog entry declares the subject of its call but no call
+ordinal, so
+admission cannot tell whether two store actions reach one store call, and
+the conservative rule needs no such map. A case's directive becomes one rule on the
+decoration, `(place, subject glob, occurrence, action)`, consulted before
+the decoration's own enable gate, so the decoration stays inactive under
+GQT and draws nothing from its generator; the count advances once per
+adapter call, at the top of the method before the decoration's own gates,
+and the action is applied once the gates have let the call proceed; today
+the three put methods consult the rule, and a method of another place
+consults nothing until an action of its row is admitted. A hit reuses the random-plan verbs (`misdirect_uri`,
+`crates/omnigraph-dst/src/store_places.rs`; the persisted-damage ledger,
+`harness.rs:2568-2578`) and records
+`(method, requested, stored)` for the runner. The rule and any one-shot are
+installed and removed with the step's decisions, before the next operation
+or restart. A pair the table lists but the hook does not yet implement is
+refused at admission as not implemented, naming the row, so the grammar
+never admits what the decoration cannot do.
+
+**The decoration under GQT.** Before this amendment the GQT DST target
+handed the engine the environment's bare adapter, so `STORAGE` was crossed
+with nothing installed. Under it the memory environment
+(`omnigraph-dst`) builds the `FailingStorage` with `FaultPlan::none()`,
+installs it at `STORAGE` inside the scenario run after setup and holds the
+guard to the end of the case, the decorator returning that one `Arc` for
+every handle as the harness's own `FailingStorageDecorator` does
+(`harness.rs:5310-5320`), so init, open and every `--- restart` reopen share
+the decoration. `omnigraph-dst` exports the rule-list handle and the hit
+record; the runner installs its own decider, counting as `Counted` does,
+which on a store effect arms the one-shot through that handle. The
+decoration is a property of the target, never of a case: a case without
+store seams runs through it unchanged, and a seeded replay stays
+byte-identical because the inactive decoration draws no random numbers.
 
 `OBJECT_STORE` is a per-call hook, not a decoration applied at construction.
 Lance's registry caches stores under weak references
@@ -510,6 +702,26 @@ string path is `catalog::decide`. The scan matches those prefixes only: a
 bare `with` cannot be told from `LocalKey::with` (`dst_gate.rs:31`) by a
 source walker.
 
+**Subjects.** A catalog entry or a `STORE_PLACES` row may declare a
+***subject***, the value a crossing carries that tells two crossings of one
+place apart: for a store place the object's root-relative name; for a
+decision seam that declares store effects, the subject of the one store call
+the site precedes, declared beside the store set
+(`store [Misdirect], subject "__recovery/*"`) and never restated by a case. A
+subject is matched whole and
+case-sensitively against the object's name with the environment root and its
+`/` removed (`__recovery/<opid>.json`), with `globset` semantics fixed the
+same on every host: `literal_separator(true)` (`*` within one segment, `**`
+across), `case_insensitive(false)` and `backslash_escape(true)`, so an
+escaped pattern selects the same objects on a Unix host and on one where
+the backslash is a path separator; it is 1 to 2048 bytes, and an empty or
+unparsable glob is refused at parse. `subject` in a case is admitted only against an
+entry or row that declares one, and `occurrence` counts the crossings whose
+subject matches. A decision seam that is crossed once per table or once per
+intent may declare a subject in a later amendment without a change to the
+case grammar, and a place that ever needs two-part selection takes a small
+map under the same name.
+
 **The test guard.** Four methods on `DecideSeam` replace
 `ScopedFailPoint::new(name, rule)`, one per rule shape present in the tree:
 `SEAM.fire_always()` (today's `return`, 136 uses, firing on every crossing),
@@ -521,27 +733,45 @@ the rewrite is one call per use, and `fire_always` keeps the unbounded
 semantics that the 136 uses depend on when their site is crossed more than
 once.
 
-**GQT.** The `--- seam` block is admitted when `at` names a `Decide` seam in the
-engine catalog, `action` is among the seam's declared effects (`fail` admits
+**GQT.** The `--- seam` block is admitted when `at` names a `Decide` seam in
+the engine catalog or a store place in `STORE_PLACES`, `action` is among the
+seam's declared effects or its store effects (`fail` admits
 a set holding `Fail` or `Contention`, explicit `contention` requires
 `Contention`, and `skip` requires `Skip`), and the
 step after the block is of the kind the seam's `op` maps to. The runner
 installs a `Decide` that counts crossings, fires the admitted effect on the
 declared occurrence and records the hit; that record, reported as
 `seam_delivered` with the effect that fired, is the delivery proof, so a seam
-whose effect returns success is provable without any error text.
+whose effect returns success is provable without any error text. For a store
+place or a fired store effect that record carries `subject` (the glob as
+written for a store place; the site's declared subject for a store effect)
+and `hit`, an object with
+`method`, `requested` (the name the engine asked for) and, for `misdirect`
+only, `stored` (the name the store used); `requested` and `stored` are
+root-relative, the domain `subject` is matched in.
 
 Coverage is a listing, not a generated corpus. `scripts/seam_corpus.py` reads
-every declared seam under the engine's sources and every `--- seam` in the
-corpus and prints one row per seam: its macro invocation (`file:line`), its
-operation, its effects, and the cases that arm it; `--check` refuses a case
-naming a seam the catalog lacks or an action none of its effects admits.
+every declared seam under the engine's sources, every store place in
+`STORE_PLACES` under `omnigraph-dst`, and every `--- seam` in the corpus, and
+prints one row per seam and per store place: its macro invocation or table
+row (`file:line`), its operation, its effects and store effects, and the
+cases that arm it; `--check` refuses a case naming a seam neither the catalog
+nor `STORE_PLACES` holds, or an action none of its sets admits. Coverage
+stays one listing.
 The `seam_delivered` record carries the same two locations, `declared_at`
 and `fired_at`, so a report says which crate and file a seam lives in and
 which helper call fired. The known-failure classifier requires the record's
 `effect` to equal the one the case's action admits, by the same rule the
-runner arms with, so a replayed report cannot pass on a name and an
-occurrence alone.
+runner arms with; it resolves the name by exact membership, the engine
+catalog first and `STORE_PLACES` second, compares the subject when one is
+declared, and validates each store delivery's `hit`: present and complete,
+`method` among the row's methods, `requested` matched by the subject, and
+for `misdirect` `stored` equal to `requested` with `dstm-` prefixed on the
+file name in the same directory. A report failing any of these is not a
+known failure, so a replayed report cannot pass on a name and an occurrence
+alone, nor on a tuple with a missing or foreign hit; the malformed-hit
+reports are cases of the classifier's tests
+(`crates/omnigraph-gqt/src/dst_runner/known_failure/tests.rs`).
 A proof case is written by hand, one per seam, because a step kind alone is
 not enough to cross a site (`MUTATION_POST_SIDECAR_PRE_FORK` fires only with
 a deferred fork, `crates/omnigraph/src/exec/staging.rs:1320-1324`, so a
@@ -666,6 +896,17 @@ Owners extended (`docs/dev/testing.md:23,43,60`): `crates/omnigraph/tests/failpo
   `issue_602_stale_sidecar_heals_on_reopen.gqt` green with the #602 heal in the
   same change (first drafted as `…_bricks_reopen.gqt`, red with a
   `known_failure` marker, before the heal joined this PR).
+- GQT: `issue_601_foreign_named_sidecar_blocks_branch.gqt` red on the
+  unfixed engine with its `known_failure` marker on the third step, the
+  marker's reason copied from the red report; the same bucket state reached
+  through `storage.put` with `subject: __recovery/*` in the sibling case
+  `issue_601_foreign_named_sidecar_via_store_place.gqt`, carrying the same
+  marker.
+- `omnigraph-dst`: the decoration's rule list fires on the declared
+  occurrence of the matching subject and on no other call.
+- DST: the pinned scenarios strict-replay unchanged, the empty rule list
+  consulted at the top of every put.
+- GQT: the corpus green with the decoration installed under every DST run.
 
 The `--- seam` admission rule and the source walker are rules applied to
 people, so both tables below are part of the evidence. The walker's own
@@ -684,15 +925,22 @@ pairing; the GQT refusal corpus covers admission.
 | A site that calls `with` directly on a decision seam | the walker's grammar lists no such helper, so the static has no recognised crossing and the catalog test reports it as dead weight |
 | A catalog entry with no site | the catalog test fails on a static that no source or test file names |
 | A `--- seam` naming a seam the case's step kind cannot cross | admission compares the seam's `op` to the next step's kind and refuses before the case runs |
+| `subject` on a seam or row that declares none | admission refuses it naming the entry; on a seam that declares its own, admission refuses the restatement naming the declared subject |
+| A store action on a decision seam whose set lacks it, or an engine action on a store place | admission refuses it by membership, as for any undeclared effect |
+| A store place and action the table lists but the hook does not implement | admission refuses it as not implemented, naming the row |
+| A store effect declared at a site that is followed by two store calls of the kind | no type catches it; the review rule in §Design **Store effects** is the guard, and the `runner_dispatch.rs` test over the proof case, which asserts the hit's method and both names, is the evidence |
+| Two store actions before one step (a store place beside a store effect, or two store places) | admission refuses the second with `one store action per step`, naming both directives |
 
 | Route the user docs give an honest author | Does the rule accept it |
 |---|---|
 | Declare a static, call the matching helper at the site, add it to `ALL`, write its proof case | yes; the listing shows the seam with its case |
 | Declare a static with several effects around one operation, call `guarded` at the site, write one proof case per effect | yes; the listing shows the seam with its cases, and any further case at that site needs no engine edit |
 | Declare a static for a site no step can reach yet | yes; the listing reports it as unreachable, and no case may arm it |
-| Need an outcome the three effects do not cover | add the `Effect` variant and its `guarded` arm, in the seams crate and the engine, so cases can name it too |
+| Need an outcome the three effects do not cover | add the `Effect` variant and its `guarded` arm, in the seams crate and the engine, so cases can name it too, or a store effect, see **Store effects** |
 | Arm an existing seam from a Rust test | yes, through the `DecideSeam` methods; the `_with` spelling for a multi-effect seam |
 | Arm a seam from a logic test with `--- seam` | yes when the action is among the declared effects and the next step's kind matches the `op` |
+| Arm a store fault from a logic test at an engine seam that declares a store effect | yes; the delivery record carries the effect and the store's own hit |
+| Arm a store fault from a logic test at a store place with a `subject` | yes when the pair is in `STORE_PLACES` and implemented |
 
 ## Rollout
 
@@ -717,6 +965,19 @@ installers, `guarded` in the engine, the 97 catalog entries represented by
 effect sets, `mutation.sidecar_confirm_put` with the set `[Fail, Skip]`, membership
 admission and the effect in `seam_delivered` in GQT, the walker and
 `seam_corpus.py` reading sets, and the second case at the put.
+
+A third PR (2026-09-15) carries the store half: the decoration installed
+under the GQT DST target, the store-effect set with its pass-through at the
+site helpers and the one-shot handoff in the decoration,
+`recovery.sidecar_write` declaring `store: [Misdirect]` beside its unchanged
+`[Fail]`, the `STORE_PLACES` table with the rule list and the `misdirect`
+cell of `storage.put`, `SeamAction` and `admitted_effect` in the GQT runner
+reading store actions, `seam_corpus.py` reading `STORE_PLACES` and admitting
+them, the `subject` field with admission by entry or row, `seam_delivered`
+carrying the subject and the hit, the
+[#601](https://github.com/ModernRelay/omnigraph/issues/601) case as a known
+failure, the GQT README's four-fields and reserved `--- fault` paragraphs
+(`:64`, `:100-105`), and this amendment to RFC 0066 and RFC 0045.
 
 The harness holds the guards for the run: `InstalledEnvironment`
 (`crates/omnigraph-dst/src/environment.rs:66-76`) holds `CLOCK` and `IDS`, each
@@ -760,6 +1021,19 @@ behind the scheme; it re-pins scenarios and is its own decision.
   type parameter only; the reader that would justify the field is a unified
   listing, and the `dst`/`failpoints` feature split between the catalog and
   those five statics is the cost to settle first.
+- Store effects are a second set on the catalog entry, not variants of
+  `Effect`; whether they join `Effect` once more than one exists is left
+  open, and `crossed()` accepts either shape.
+- Whether a store place may precede a `--- restart` or a query step: until it
+  may, the reopen's own listing and reads are unreachable from a case, and
+  widening the placement rule is its own change.
+- Which decision seams declare a subject first: the candidates are those
+  crossed once per table in a merge and once per intent in a heal.
+- Which other sites followed by exactly one store call declare a store effect
+  next (`recovery.sidecar_confirm`, `mutation.sidecar_confirm_put`,
+  `recovery.orphan_discard_audit_append`, `recovery.record_audit`,
+  `storage.local_create_if_absent_probe`): each is its own review under the
+  §Store effects rule.
 
 ## Decision log
 
@@ -814,3 +1088,28 @@ behind the scheme; it re-pins scenarios and is its own decision.
   seam also declares `Fail`. Preserve the `fail` fallback on contention-only
   seams. The corpus and runtime both report the declaration macro's invocation
   line, including when documentation separates the invocation from the static.
+- 2026-09-15, store faults as seam places: a seam reached at the store is a
+  `--- seam`, never a `--- fault`; a catalog entry may declare a second set
+  of store effects beside its effects, the first being `Misdirect`, passed
+  through at the site as `Decision::Store` and acted on by the storage
+  decoration, with `effects()` unchanged and each site helper gaining one
+  pass-through arm; store places are admitted from `STORE_PLACES` in
+  `omnigraph-dst` by exact name, never by the `storage.` prefix, selected by
+  `subject`, at most one store action per step; the GQT DST target installs
+  the decoration on every run. Replaced sentences: in §Design, "`pub enum
+  Decision { Fire(Effect), Pass }`", the `Decide` row of the trait table
+  ("`Fire(Effect)` or `Pass`") and, in the `guarded` match, "`Pass` runs
+  `op` and returns `Some(op's result)`" (now `Store(_)` runs `op` too); in
+  §User and operational behavior, "`action` is `fail`, `contention`, or
+  `skip`", "`--- fault` keeps its name for storage-boundary faults, specified
+  in a separate amendment to RFC 0045" and "A `--- seam` block inherits the
+  placement rules of `--- fault`"; in §Design, "The three effects are the
+  whole vocabulary: a site needing another outcome adds an `Effect` variant
+  and its arm in `guarded`", "The `--- seam` block is admitted when `at`
+  names a `Decide` seam in the engine catalog", the `seam_corpus.py` coverage
+  paragraph and the known-failure classifier sentence; in §Evidence and
+  tests, the honest-routes row "Need an outcome the three effects do not
+  cover". Motivation: the foreign-named sidecar of issue 601 is a valid body
+  under a wrong object name, which no engine line produces and no `fail` or
+  `skip` can plant, and the DST target ran without the decoration the nightly
+  runs with, so a store fault the nightly can inject had no case form.

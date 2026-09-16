@@ -26,6 +26,7 @@ rand = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+globset = { workspace = true }
 # test-util (Builder::start_paused, virtual clock) is DST-only; keeping
 # it off the workspace-wide tokio dep keeps it out of the shipping crates.
 tokio = { workspace = true, features = ["test-util"] }

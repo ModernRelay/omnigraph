@@ -1,0 +1,49 @@
+# issue: 601
+# red_on: 185dfea3 (2026-09-16): step 3 refuses with RecoveryRequired "pending Mutation recovery operation blocks writes on branch 'main'" (the staging barrier, `staging.rs`), after the step-2 reopen succeeded; the delivery record shows the arm put stored as `__recovery/dstm-<opid>.json`
+# notes: One misdirected store write, named as a store place: `storage.put` under `__recovery/*` misdirects the arm put (`recovery.rs:1154`), the same object the store-effect form of this case misdirects, so it lands as `__recovery/dstm-<opid>.json` instead of `__recovery/<opid>.json`, with a valid Armed body. The confirm put and the post-publish delete address the canonical name, so the foreign file survives the mutation.
+# notes: `list_sidecars` trusts the parsed body and never checks the filename against `operation_id`; the healer deletes the canonical path rebuilt from the id. The file is consumed by every scan and deleted by none.
+# notes: The reopen at step 2 succeeds and re-heals; the file stays. Step 3 pins the barrier refusal AFTER the reopen, because the claim of #601 is that the prescribed remedy (reopen) does not clear it. The known-failure marker flips when the fix deletes the LISTED uri.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- known_failure
+step: 3
+match:
+  error: RecoveryRequired
+  reason: "pending Mutation recovery operation blocks writes on branch 'main'"
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: storage.put
+subject: "__recovery/*"
+occurrence: 1
+action: misdirect
+scope: next_step
+
+--- mutate
+query add_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- mutate
+query add_row_after_reopen() {
+    insert Person { name: "carol" }
+}
+
+--- expect affected: nodes=1 edges=0

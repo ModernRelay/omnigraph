@@ -268,7 +268,7 @@ impl Default for FaultPlan {
 impl FaultPlan {
     /// All-zero plan: used when the crash-state enumeration needs the
     /// storage wrapper installed but no fault weather was requested.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             seed: 0,
             error_pct: 0,
@@ -2214,10 +2214,13 @@ fn is_recovery_barrier_rejection(wop: &WorldOp, err: &OmniError) -> bool {
 /// and VIRTUAL-time latency on both read- and write-class calls, plus the
 /// corruption (read + persisted tiers) and bounded-staleness axes.
 #[derive(Debug)]
-struct FailingStorage {
+pub struct FailingStorage {
     inner: Arc<dyn StorageAdapter>,
     rng: Mutex<SplitMix64>,
     plan: FaultPlan,
+    /// The per-step targeting a logic test installs (store places and the
+    /// one-shot a store effect arms); consulted before every gate below.
+    targets: crate::store_places::Targets,
     /// Faults apply only once enabled — init and fixture load stay clean so
     /// every universe starts from the same healthy world.
     enabled: std::sync::atomic::AtomicBool,
@@ -2280,6 +2283,20 @@ enum WriteFate {
 }
 
 impl FailingStorage {
+    /// A zero plan, never enabled, so nothing is drawn from the generator:
+    /// only a targeted rule or an armed one-shot acts; `root` is what a
+    /// rule's subject is relative to.
+    pub fn quiet(inner: Arc<dyn StorageAdapter>, root: String) -> Arc<Self> {
+        let mut storage = Self::new(inner, FaultPlan::none(), None, None);
+        storage.targets = crate::store_places::Targets::new(Some(root));
+        Arc::new(storage)
+    }
+
+    /// The targeting state a runner installs rules on and drains hits from.
+    pub fn targets(&self) -> &crate::store_places::Targets {
+        &self.targets
+    }
+
     fn new(
         inner: Arc<dyn StorageAdapter>,
         plan: FaultPlan,
@@ -2290,6 +2307,7 @@ impl FailingStorage {
             inner,
             rng: Mutex::new(SplitMix64(plan.seed)),
             plan,
+            targets: crate::store_places::Targets::new(None),
             enabled: std::sync::atomic::AtomicBool::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
             lance,
@@ -2557,7 +2575,7 @@ impl FailingStorage {
     /// target URI to write to (`misdirect_uri`). Ledger records BOTH halves of the damage: the
     /// intended object is absent (misdirect-source), the foreign object
     /// exists (misdirect-target).
-    fn maybe_misdirect(&self, op: &str, uri: &str) -> Option<String> {
+    fn maybe_misdirect(&self, op: crate::store_places::PutMethod, uri: &str) -> Option<String> {
         if self.plan.misdirect_write_pct == 0 || !self.active() {
             return None;
         }
@@ -2565,6 +2583,46 @@ impl FailingStorage {
         if roll >= self.plan.misdirect_write_pct {
             return None;
         }
+        Some(self.misdirect_to(op, uri))
+    }
+
+    /// The rule or one-shot decision for this put, consulted before every
+    /// gate so an inactive decoration still honors it; `settle_put` records
+    /// the hit once the store has answered.
+    #[track_caller]
+    fn targeted_put(&self, uri: &str) -> Option<crate::store_places::Targeted> {
+        self.targets
+            .on_call(crate::store_places::StorePlace::Put, uri)
+    }
+
+    /// The store actions the three put hooks have an arm for; `admitted` on
+    /// the put row must stay within it.
+    pub const PUT_HOOK_ACTIONS: &[crate::store_places::StoreAction] =
+        &[crate::store_places::StoreAction::Misdirect];
+
+    fn settle_put(
+        &self,
+        targeted: Option<crate::store_places::Targeted>,
+        op: crate::store_places::PutMethod,
+        uri: &str,
+        stored: Option<&str>,
+        landed: bool,
+    ) {
+        if let Some(targeted) = targeted {
+            self.targets.record(
+                targeted,
+                crate::store_places::StorePlace::Put,
+                op.as_str(),
+                uri,
+                stored,
+                landed,
+            );
+        }
+    }
+
+    /// Runs only for a put `write_fault` let proceed.
+    fn misdirect_to(&self, op: crate::store_places::PutMethod, uri: &str) -> String {
+        let op = op.as_str();
         let target = misdirect_uri(uri);
         self.writes_misdirected
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2576,7 +2634,7 @@ impl FailingStorage {
         // injected damage as a bypass write.
         crate::write_census::record("adapter", op, &target, self.active());
         println!("dst s11 damage: misdirect {op} {uri} -> {target}");
-        Some(target)
+        target
     }
 
     /// latent sector check, called AFTER the per-call fault
@@ -2818,15 +2876,7 @@ impl FailingStorage {
     }
 }
 
-/// CORRUPTION AXIS (persisted tier) — pure misdirection transform: same directory,
-/// `dstm-` filename prefix (extension preserved) — the write lands at a
-/// wrong key inside the same keyspace, so listings still see it.
-pub(crate) fn misdirect_uri(uri: &str) -> String {
-    match uri.rsplit_once('/') {
-        Some((dir, file)) => format!("{dir}/dstm-{file}"),
-        None => format!("dstm-{uri}"),
-    }
-}
+pub use crate::store_places::misdirect_uri;
 
 /// pure, seeded read-time bit rot: substitute exactly one char
 /// (index = `pos_roll`, already reduced modulo the char count by the caller's
@@ -2964,21 +3014,57 @@ impl StorageAdapter for FailingStorage {
             .await
     }
     async fn write_text(&self, uri: &str, contents: &str) -> OmniResult<()> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_text", uri, true).await? {
+        let fate = match self.write_fault("write_text", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteText,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteText,
+                uri,
+                None,
+                false,
+            );
             return Ok(());
         }
-        let (target, stored);
-        match self.maybe_misdirect("write_text", uri) {
-            Some(t) => target = t,
-            None => target = uri.to_string(),
-        }
-        match self.maybe_corrupt_write("write_text", &target, contents) {
-            Some(s) => stored = s,
-            None => stored = contents.to_string(),
-        }
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteText, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteText, uri)
+                .unwrap_or_else(|| uri.to_string()),
+        };
+        let stored = self
+            .maybe_corrupt_write("write_text", &target, contents)
+            .unwrap_or_else(|| contents.to_string());
         self.staleness_base(&target).await;
         let out = self.inner.write_text(&target, &stored).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteText,
+            uri,
+            Some(&target),
+            out.is_ok(),
+        );
         if out.is_ok() {
             self.count_completion("write_text", uri);
             self.staleness_record(&target, Some(stored.clone()), None);
@@ -2986,40 +3072,114 @@ impl StorageAdapter for FailingStorage {
         self.lose_ack("write_text", uri, out).await
     }
     async fn write_bytes(&self, uri: &str, contents: &[u8]) -> OmniResult<()> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_bytes", uri, true).await? {
+        let fate = match self.write_fault("write_bytes", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteBytes,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteBytes,
+                uri,
+                None,
+                false,
+            );
             return Ok(());
         }
-        let target = match self.maybe_misdirect("write_bytes", uri) {
-            Some(t) => t,
-            None => uri.to_string(),
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteBytes, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteBytes, uri)
+                .unwrap_or_else(|| uri.to_string()),
         };
         // Write corruption and the staleness history stay text-only (see
         // `read_bytes_if_exists_bounded`): both are `String`-typed. Kill,
         // write faults, misdirection, completion counting and ack loss apply.
         let out = self.inner.write_bytes(&target, contents).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteBytes,
+            uri,
+            Some(&target),
+            out.is_ok(),
+        );
         if out.is_ok() {
             self.count_completion("write_bytes", uri);
         }
         self.lose_ack("write_bytes", uri, out).await
     }
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> OmniResult<bool> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_text_if_absent", uri, true).await? {
+        let fate = match self.write_fault("write_text_if_absent", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteTextIfAbsent,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
             // The engine believes the if-absent insert landed.
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteTextIfAbsent,
+                uri,
+                None,
+                false,
+            );
             return Ok(true);
         }
-        let (target, stored);
-        match self.maybe_misdirect("write_text_if_absent", uri) {
-            Some(t) => target = t,
-            None => target = uri.to_string(),
-        }
-        match self.maybe_corrupt_write("write_text_if_absent", &target, contents) {
-            Some(s) => stored = s,
-            None => stored = contents.to_string(),
-        }
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteTextIfAbsent, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteTextIfAbsent, uri)
+                .unwrap_or_else(|| uri.to_string()),
+        };
+        let stored = self
+            .maybe_corrupt_write("write_text_if_absent", &target, contents)
+            .unwrap_or_else(|| contents.to_string());
         self.staleness_base(&target).await;
         let out = self.inner.write_text_if_absent(&target, &stored).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteTextIfAbsent,
+            uri,
+            Some(&target),
+            matches!(out, Ok(true)),
+        );
         if matches!(out, Ok(true)) {
             self.count_completion("write_text_if_absent", uri);
             self.staleness_record(&target, Some(stored.clone()), None);
@@ -5227,7 +5387,7 @@ impl std::fmt::Debug for RustResources {
 
 /// The storage-seam behavior: hands back the universe's one `FailingStorage`,
 /// ignoring the base adapter the engine offers (the instance already wraps it).
-struct FailingStorageDecorator(Arc<FailingStorage>);
+pub struct FailingStorageDecorator(pub Arc<FailingStorage>);
 
 impl omnigraph::seams::Behavior for FailingStorageDecorator {}
 
@@ -6701,6 +6861,92 @@ mod corruption_verb_tests {
     fn mutations_are_deterministic() {
         assert_eq!(bit_rot_text("abcdef", 3), bit_rot_text("abcdef", 3));
         assert_eq!(truncate_text("abcdef", 3), truncate_text("abcdef", 3));
+    }
+
+    #[test]
+    fn put_row_admits_only_hook_actions() {
+        let row = crate::store_places::store_place("storage.put").expect("put row");
+        for action in row.admitted {
+            assert!(
+                super::FailingStorage::PUT_HOOK_ACTIONS.contains(action),
+                "{}",
+                action.as_str()
+            );
+        }
+    }
+
+    /// Every `(place, admitted action)` pair the table offers a case is driven
+    /// through the real hooks, so a pair the row admits and no hook applies is
+    /// a red test rather than a case that silently never delivers.
+    #[tokio::test]
+    async fn every_admitted_action_lands_through_its_hooks() {
+        use std::sync::Arc;
+
+        use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
+
+        use crate::store_places::{STORE_PLACES, StoreAction, Subject, TargetedRule};
+
+        let root = "shared-memory://dst-admitted-actions/graph";
+        for row in STORE_PLACES {
+            for action in row.admitted {
+                let base = Arc::new(ObjectStorageAdapter::in_memory());
+                let inner: Arc<dyn StorageAdapter> = base.clone();
+                let storage = super::FailingStorage::quiet(inner, root.to_string());
+                for method in row.methods {
+                    storage.targets().install_rule(TargetedRule::new(
+                        row.place,
+                        Subject::parse("**").expect("glob"),
+                        1,
+                        *action,
+                    ));
+                    let uri = format!("{root}/__recovery/{method}.json");
+                    let text = format!("text-{method}");
+                    let absent = format!("absent-{method}");
+                    match *method {
+                        "write_text" => storage.write_text(&uri, &text).await.expect("write_text"),
+                        "write_bytes" => storage
+                            .write_bytes(&uri, b"bytes")
+                            .await
+                            .expect("write_bytes"),
+                        "write_text_if_absent" => assert!(
+                            storage
+                                .write_text_if_absent(&uri, &absent)
+                                .await
+                                .expect("write_text_if_absent")
+                        ),
+                        other => unreachable!(
+                            "{} admits {} but {other} has no call here",
+                            row.name,
+                            action.as_str()
+                        ),
+                    }
+                    let hits = storage.targets().clear().hits;
+                    let label = format!("{} {} {method}", row.name, action.as_str());
+                    assert_eq!(hits.len(), 1, "{label}");
+                    assert!(hits[0].landed, "{label}");
+                    assert_eq!(hits[0].action, *action, "{label}");
+                    assert_eq!(hits[0].method, *method, "{label}");
+                    if *action == StoreAction::Misdirect {
+                        let stored = super::misdirect_uri(&uri);
+                        assert!(!base.exists(&uri).await.expect("exists"), "{label}");
+                        assert!(base.exists(&stored).await.expect("exists"), "{label}");
+                        match *method {
+                            "write_text" => assert_eq!(
+                                base.read_text(&stored).await.expect("read_text"),
+                                text,
+                                "{label}"
+                            ),
+                            "write_text_if_absent" => assert_eq!(
+                                base.read_text(&stored).await.expect("read_text"),
+                                absent,
+                                "{label}"
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -9,11 +9,18 @@ use omnigraph_compiler::QueryResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::runner_config::{Environment, Execution, SeamAction, SeamDirective};
+use crate::runner_config::{Environment, Execution};
 use crate::{CaseOutcome, parse_case, stem_of};
 
 mod known_failure;
+mod seams;
 mod settings;
+
+pub(crate) use seams::{
+    Admitted, admit_seam, arm_seams, finish_seams, refuse_two_store_actors, resolve_seam,
+};
+#[cfg(tokio_unstable)]
+use seams::{DECORATION, DecideGuard};
 
 pub(crate) fn validate_known_failure(case: &crate::Case) -> Result<(), String> {
     known_failure::validate(case)
@@ -67,13 +74,6 @@ pub(crate) fn lifetime_counts() -> Option<[u64; 2]> {
         .ok()
         .flatten()
 }
-
-/// The guard a decision seam's installer returns.
-#[cfg(tokio_unstable)]
-type DecideGuard = omnigraph::seams::Installed<
-    dyn omnigraph::seams::Decide,
-    omnigraph::seams::Global<dyn omnigraph::seams::Decide>,
->;
 
 #[cfg(tokio_unstable)]
 fn lifecycle_probe() -> (
@@ -177,183 +177,9 @@ pub(crate) fn observe_fault(error: &OmniError) {
     }
 }
 
-/// The effect a case's action fires on a seam declaring `effects`, or `None`
-/// when the seam admits no such action: `fail` takes `Fail`, else
-/// `Contention`; `contention` takes only `Contention`; `skip` takes `Skip`.
-/// `hold` is never admitted. One rule for
-/// arming and for judging a report's delivery evidence.
-pub(crate) fn admitted_effect(
-    action: SeamAction,
-    effects: &[omnigraph::seams::Effect],
-) -> Option<omnigraph::seams::Effect> {
-    use omnigraph::seams::Effect;
-    let candidates: &[Effect] = match action {
-        SeamAction::Fail => &[Effect::Fail, Effect::Contention],
-        SeamAction::Contention => &[Effect::Contention],
-        SeamAction::Skip => &[Effect::Skip],
-        SeamAction::Hold => &[],
-    };
-    candidates
-        .iter()
-        .copied()
-        .find(|candidate| effects.contains(candidate))
-}
-
-/// Admission of one seam directive against the engine's catalog and the step
-/// it precedes: the seam must exist, the action must be among the effects
-/// the site declares, and the step must be of a kind that crosses the seam's
-/// operation. Returns the seam and the effect the action fires.
-pub(crate) fn admit_seam(
-    seam: &SeamDirective,
-    step: Option<&crate::Step>,
-) -> Result<
-    (
-        &'static omnigraph::seams::DecideSeam,
-        omnigraph::seams::Effect,
-    ),
-    String,
-> {
-    use omnigraph::seams::Op;
-    let Some(entry) = omnigraph::seams::catalog::decide(&seam.at) else {
-        return Err(format!(
-            "unsupported_environment: unknown seam: {}",
-            seam.at
-        ));
-    };
-    let Some(effect) = admitted_effect(seam.action, entry.effects()) else {
-        return Err(format!(
-            "unsupported_environment: seam {} (declared at {}) declares effects {} and does not admit action {}",
-            seam.at,
-            location(entry.site()),
-            omnigraph::seams::effects_list(entry.effects()),
-            seam.action.as_str()
-        ));
-    };
-    let compatible = matches!(
-        (entry.op(), step),
-        (Op::Mutation | Op::AnyWrite, Some(crate::Step::Mutate(_)))
-            | (
-                Op::BranchMerge | Op::AnyWrite,
-                Some(crate::Step::Control(crate::ControlStep {
-                    write: crate::ControlWrite::Merge { .. },
-                    ..
-                })),
-            )
-            | (
-                Op::BranchCreate | Op::AnyWrite,
-                Some(crate::Step::Control(crate::ControlStep {
-                    write: crate::ControlWrite::Create { .. },
-                    ..
-                })),
-            )
-            | (
-                Op::BranchDelete | Op::AnyWrite,
-                Some(crate::Step::Control(crate::ControlStep {
-                    write: crate::ControlWrite::Delete { .. },
-                    ..
-                })),
-            )
-    );
-    if !compatible {
-        return Err(format!(
-            "unsupported_environment: seam {} (operation {}) is not crossed by the step it precedes",
-            seam.at,
-            entry.op().as_str()
-        ));
-    }
-    Ok((entry, effect))
-}
-
-/// One armed seam: the guard that keeps the decider installed for the step,
-/// and the counter that proves the site was crossed and fired.
-#[cfg(tokio_unstable)]
-pub(crate) struct ArmedSeam {
-    at: String,
-    entry: &'static omnigraph::seams::DecideSeam,
-    occurrence: usize,
-    guard: Option<DecideGuard>,
-    counted: std::sync::Arc<omnigraph::seams::Counted>,
-}
-
-/// Arm every seam declared before one step, in declaration order; the parser
-/// already refused the same seam twice before one step.
-#[cfg(tokio_unstable)]
-pub(crate) fn arm_seams(
-    seams: &[SeamDirective],
-    step: &crate::Step,
-) -> Result<Vec<ArmedSeam>, String> {
-    seams
-        .iter()
-        .map(|seam| {
-            let (entry, effect) = admit_seam(seam, Some(step))?;
-            let (guard, counted) = entry.count_and_fire_at_with(seam.occurrence as u64, effect);
-            Ok(ArmedSeam {
-                at: seam.at.clone(),
-                entry,
-                occurrence: seam.occurrence,
-                guard: Some(guard),
-                counted,
-            })
-        })
-        .collect()
-}
-
-#[cfg(not(tokio_unstable))]
-pub(crate) struct ArmedSeam;
-
-#[cfg(not(tokio_unstable))]
-pub(crate) fn arm_seams(
-    seams: &[SeamDirective],
-    _step: &crate::Step,
-) -> Result<Vec<ArmedSeam>, String> {
-    if seams.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Err("unsupported_environment: DST runner is unavailable".into())
-    }
-}
-
-/// Uninstall every decider first, then check delivery seam by seam: each site
-/// fired exactly on its declared crossing. The records are the proof a case's
-/// report carries, one per seam in declaration order.
-#[cfg(tokio_unstable)]
-pub(crate) fn finish_seams(mut armed: Vec<ArmedSeam>) -> Result<(), String> {
-    for seam in &mut armed {
-        drop(seam.guard.take());
-    }
-    for seam in &armed {
-        let crossings = seam.counted.crossings();
-        if !seam.counted.fired() {
-            return Err(format!(
-                "seam_unobserved: seam {} was not crossed on occurrence {} by the selected operation; crossings observed: {crossings}",
-                seam.at, seam.occurrence
-            ));
-        }
-        let effect = seam.counted.effect().as_str();
-        let declared_at = location(seam.entry.site());
-        let fired_at = seam.entry.last_fired().map(location);
-        record(
-            "seam_delivered",
-            serde_json::json!({"at": seam.at, "occurrence": seam.occurrence, "crossings": crossings, "effect": effect, "declared_at": declared_at, "fired_at": fired_at}),
-        );
-        observe(|| {
-            format!(
-                "seam delivered: {} on crossing {} with effect {effect}",
-                seam.at, seam.occurrence
-            )
-        });
-    }
-    Ok(())
-}
-
 /// `file:line` of a seam's declaration or firing, as a report prints it.
 fn location(at: &std::panic::Location<'_>) -> String {
-    format!("{}:{}", at.file(), at.line())
-}
-
-#[cfg(not(tokio_unstable))]
-pub(crate) fn finish_seams(_armed: Vec<ArmedSeam>) -> Result<(), String> {
-    Ok(())
+    omnigraph_dst::store_places::file_line(at.file(), at.line())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -866,9 +692,11 @@ fn run_invocation(
                 crate::Item::Loop { steps, .. } => steps.as_slice(),
             })
             .find(|step| step.ordinal() == *ordinal);
-        for seam in seams {
-            admit_seam(seam, step)?;
-        }
+        let admitted = seams
+            .iter()
+            .map(|seam| admit_seam(seam, step))
+            .collect::<Result<Vec<_>, _>>()?;
+        refuse_two_store_actors(seams, &admitted)?;
     }
     if bless && case.known_failure.is_some() {
         return Err("invalid_case: bless is refused for known_failure cases".into());
@@ -1223,21 +1051,37 @@ struct GqtScenario<'a> {
 impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for GqtScenario<'_> {
     type Output = Result<WorkerReport, String>;
 
+    /// The engine talks to the store through the `STORAGE` seam on every run,
+    /// faulted or not: the decoration is a property of the target, and a
+    /// store action only hands it one rule for one step.
     async fn run(
         &self,
         resources: &mut omnigraph_dst::memory::MemoryStorage,
         _workload_seed: u64,
     ) -> Self::Output {
-        capture(
-            self.input_digest.clone(),
-            crate::execute_case_with_storage(
-                self.case,
-                &self.input.case_path,
-                &resources.root,
-                resources.adapter.clone(),
-            ),
-        )
-        .await
+        use omnigraph::storage::StorageAdapter;
+        let base: std::sync::Arc<dyn StorageAdapter> = resources.adapter.clone();
+        let decoration =
+            omnigraph_dst::harness::FailingStorage::quiet(base, resources.root.clone());
+        omnigraph::storage::STORAGE.clear();
+        let _installed = omnigraph::storage::STORAGE.install(std::sync::Arc::new(
+            omnigraph_dst::harness::FailingStorageDecorator(decoration.clone()),
+        ));
+        let storage: std::sync::Arc<dyn StorageAdapter> = decoration.clone();
+        DECORATION
+            .scope(
+                decoration,
+                capture(
+                    self.input_digest.clone(),
+                    crate::execute_case_with_storage(
+                        self.case,
+                        &self.input.case_path,
+                        &resources.root,
+                        storage,
+                    ),
+                ),
+            )
+            .await
     }
 }
 
@@ -1494,8 +1338,10 @@ fn replay_attempts(
 
 #[cfg(test)]
 mod action_tests {
-    use super::{SeamAction, admitted_effect};
     use omnigraph::seams::Effect;
+
+    use super::seams::admitted_effect;
+    use crate::runner_config::SeamAction;
 
     #[test]
     fn fail_and_contention_are_selectable_regardless_of_declaration_order() {

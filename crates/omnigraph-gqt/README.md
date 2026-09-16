@@ -51,7 +51,10 @@ statement; no seam is crossed by a query step yet. Several seam blocks may
 precede one operation when they name distinct seams (two lost writes on one
 mutation, `cases/issue_602_stale_sidecar_heals_on_reopen.gqt`); each carries
 its own delivery record, and the same seam twice before one operation is
-refused:
+refused. The one exception is the store: at most one directive per step may
+act on the store, as a store place or as a store action on a decision seam; a
+second is refused at admission with `unsupported_environment: one store
+action per step`:
 
 ```yaml
 --- seam
@@ -61,9 +64,22 @@ action: fail
 scope: next_step
 ```
 
-All four fields are required. `at` names a decision seam in the engine's
-catalog (`omnigraph::seams::catalog`, RFC 0066); `action` is `fail`,
-`contention`, or `skip`. `fail` selects the fail effect when declared,
+The four fields `at`, `occurrence`, `action` and `scope` are required, and
+`subject` is optional. `at` names a decision seam in the engine's catalog
+(`omnigraph::seams::catalog`, RFC 0066) or a store place in `STORE_PLACES`
+(`omnigraph-dst`); a store place requires `subject`, a glob over the object's
+root-relative name (RFC 0066 §Design Subjects), and a block whose catalog
+entry or row declares no subject refuses it; a decision seam that declares a
+store effect carries its own subject, which a case does not restate. Quote a
+subject that begins with
+`*`: the case reader refuses an unquoted leading `*` as a YAML alias; a
+quoted subject is read as one scalar, so globset's `{a,b}` and `[!x]` forms
+are fine inside the quotes. A store
+place is admitted before a mutate or branch step (a branch create writes
+nothing through the adapter, so a store place before it is `seam_unobserved`). `action` is `fail`,
+`contention`, `skip`, or a store action, the first being `misdirect`, with
+`lose`, `error`, `corrupt` and `delay` spellable and refused at admission
+naming the table row until admitted. `fail` selects the fail effect when declared,
 otherwise contention for compatibility with existing cases. `contention`
 selects only contention, so a seam declaring both failure effects lets a
 case choose either. `skip` selects only skip; an undeclared effect is
@@ -97,8 +113,12 @@ admitted effect on the declared occurrence, and the report carries
 guards) and `fired_at` (the helper call whose crossing fired); an unfired seam fails
 with `seam_unobserved`. Text in data or an error cannot satisfy this check.
 
-`--- fault` is reserved for storage-boundary faults (a separate amendment)
-and is refused today with a pointer to `--- seam`. An old `--- fault` block
+There is no `--- fault` section: a fault injected at the object store is a
+`--- seam` naming a store place or a decision seam that declares a store
+effect, and a `--- fault` section is refused with a pointer to `--- seam`.
+The store places, their methods and the actions each honors are RFC 0066's
+table; a place-and-action pair outside it, or listed but not implemented, is
+refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
 `action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
 concurrent steps, server/CLI sessions and network simulation are future

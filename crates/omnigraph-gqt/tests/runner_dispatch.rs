@@ -590,3 +590,166 @@ fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass
     assert!(String::from_utf8_lossy(&output.stderr).contains("bless is refused for known_failure"));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), selected);
 }
+
+/// Both forms of the issue 601 case misdirect the same arm put: one hit
+/// each with `write_text`, the canonical name requested, the `dstm-` name
+/// stored beside it, and the same known failure at step 3.
+#[cfg(tokio_unstable)]
+#[test]
+fn store_effect_and_store_place_misdirect_the_same_put() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(
+        root.join("cases/issue_601_foreign_named_sidecar_blocks_branch.gqt"),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("issue_601_two_forms.gqt");
+    let code_seam = "--- seam\nat: recovery.sidecar_write\noccurrence: 1\naction: misdirect\nscope: next_step\n";
+    let store_seam = "--- seam\nat: storage.put\nsubject: \"__recovery/*\"\noccurrence: 1\naction: misdirect\nscope: next_step\n";
+    assert!(
+        text.contains(code_seam),
+        "the seam block must be found verbatim"
+    );
+    let mut requested_seen: Vec<String> = Vec::new();
+    for (form, seam, subject) in [
+        ("store effect", code_seam, serde_json::json!("__recovery/*")),
+        ("store place", store_seam, serde_json::json!("__recovery/*")),
+    ] {
+        std::fs::write(&path, text.replace(code_seam, seam)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{form}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (_, summary) = report(&output);
+        for attempt in summary["attempts"].as_array().unwrap() {
+            assert_eq!(attempt["known_failure"], true, "{form}");
+            let deliveries = attempt["outcome"]["Ok"]["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "seam_delivered")
+                .collect::<Vec<_>>();
+            assert_eq!(deliveries.len(), 1, "{form}");
+            let value = &deliveries[0]["value"];
+            assert_eq!(value["effect"], "misdirect", "{form}");
+            assert_eq!(value["subject"], subject, "{form}");
+            assert_eq!(value["hit"]["method"], "write_text", "{form}");
+            let requested = value["hit"]["requested"].as_str().unwrap();
+            let file = requested.strip_prefix("__recovery/").unwrap();
+            assert!(
+                file.ends_with(".json") && !file.contains('/') && !file.starts_with("dstm-"),
+                "{form}: {requested}"
+            );
+            assert_eq!(
+                value["hit"]["stored"].as_str().unwrap(),
+                format!("__recovery/dstm-{file}"),
+                "{form}"
+            );
+            requested_seen.push(requested.to_string());
+        }
+    }
+    assert!(
+        requested_seen.windows(2).all(|pair| pair[0] == pair[1]),
+        "both forms misdirect the same object: {requested_seen:?}"
+    );
+
+    for (variant, expected) in [
+        (
+            text.replace(
+                code_seam,
+                &code_seam.replace(
+                    "scope: next_step\n",
+                    "scope: next_step\nsubject: \"__recovery/*\"\n",
+                ),
+            ),
+            "declares its own subject",
+        ),
+        (
+            text.replace(
+                code_seam,
+                &store_seam.replace("subject: \"__recovery/*\"\n", ""),
+            ),
+            "requires subject",
+        ),
+        (
+            text.replace(
+                code_seam,
+                &store_seam.replace("action: misdirect", "action: fail"),
+            ),
+            "does not admit engine action fail",
+        ),
+        (
+            text.replace(code_seam, &format!("{code_seam}\n{store_seam}")),
+            "one store action per step",
+        ),
+        (
+            text.replace(
+                code_seam,
+                &code_seam.replace("recovery.sidecar_write", "mutation.post_sidecar_pre_fork"),
+            ),
+            "does not admit action misdirect",
+        ),
+        (
+            text.replace(code_seam, &store_seam.replace("__recovery/*", "[")),
+            "subject is not a glob",
+        ),
+        (
+            text.replace(
+                code_seam,
+                &store_seam.replace("action: misdirect", "action: lose"),
+            ),
+            "lists action lose but it is not admitted",
+        ),
+        (
+            text.replace(
+                code_seam,
+                &code_seam.replace("action: misdirect", "action: lose"),
+            ),
+            "does not admit action lose",
+        ),
+    ] {
+        std::fs::write(&path, &variant).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "accepted a case that should say {expected:?}"
+        );
+        assert!(stderr.contains(expected), "{expected:?} not in: {stderr}");
+    }
+
+    let braces = "__recovery/{*.json,*.bin}";
+    std::fs::write(
+        &path,
+        text.replace(code_seam, &store_seam.replace("__recovery/*", braces)),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "brace alternation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    for attempt in summary["attempts"].as_array().unwrap() {
+        let deliveries = attempt["outcome"]["Ok"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "seam_delivered")
+            .collect::<Vec<_>>();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0]["value"]["subject"], serde_json::json!(braces));
+    }
+}

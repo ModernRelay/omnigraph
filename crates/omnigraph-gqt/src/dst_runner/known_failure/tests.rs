@@ -187,6 +187,125 @@ fn refuses_different_reasons_steps_faults_and_incomplete_assertions() {
     }
 }
 
+const STORE_CASE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/cases/issue_601_foreign_named_sidecar_blocks_branch.gqt"
+));
+
+/// The issue 601 case as written (a store effect on a decision seam) or
+/// rewritten onto the store place `storage.put` under `__recovery/*`, with
+/// the report a healthy run produces: one delivery carrying the hit.
+fn store_fixture(store_place: bool) -> (Case, WorkerReport) {
+    let text = if store_place {
+        STORE_CASE.replace(
+            "at: recovery.sidecar_write\n",
+            "at: storage.put\nsubject: \"__recovery/*\"\n",
+        )
+    } else {
+        STORE_CASE.to_string()
+    };
+    let case = crate::parse_case("issue_601_foreign_named_sidecar_blocks_branch", &text).unwrap();
+    let marker = case.known_failure.as_ref().unwrap();
+    let ErrorMatch::RecoveryRequired { reason } = &marker.matcher else {
+        unreachable!("the fixture case names a RecoveryRequired marker")
+    };
+    let error = OmniError::RecoveryRequired {
+        operation_id: "op-1".into(),
+        reason: reason.clone(),
+    };
+    let message = format!("mutation failed: {error}");
+    let mut evidence = Vec::new();
+    for ordinal in 1..=marker.step {
+        let operation = json!({"ordinal": ordinal, "loop_binding": null});
+        for seam in case.seams.get(&ordinal).into_iter().flatten() {
+            let mut value = json!({"at": seam.at, "occurrence": seam.occurrence, "effect": "misdirect", "hit": {"method": "write_text", "requested": "__recovery/op-1.json", "stored": "__recovery/dstm-op-1.json"}});
+            value["subject"] = json!(seam.subject.as_deref().unwrap_or("__recovery/*"));
+            evidence
+                .push(json!({"kind": "seam_delivered", "operation": operation, "value": value}));
+        }
+        if ordinal == marker.step {
+            evidence.push(json!({"kind": "typed_error", "operation": operation, "value": {"error": "RecoveryRequired", "reason": reason, "operation_id": "op-1", "message": error.to_string()}}));
+        }
+        let value = if ordinal == marker.step {
+            json!({"status": "failed", "code": "assertion_failed", "message": message})
+        } else {
+            json!({"status": "passed"})
+        };
+        evidence.push(json!({"kind": "assertion", "operation": operation, "value": value}));
+    }
+    let report = WorkerReport {
+        code: "assertion_failed".into(),
+        phase: "execution".into(),
+        input_digest: "frozen-input".into(),
+        result: Err(format!("step {} (mutate): {message}", marker.step)),
+        observations: vec![],
+        evidence,
+    };
+    (case, report)
+}
+
+#[test]
+fn store_deliveries_need_one_complete_hit() {
+    type Mutation = fn(&mut serde_json::Value);
+    let mutations: [(&str, Mutation); 7] = [
+        ("missing hit", |v| {
+            v.as_object_mut().unwrap().remove("hit");
+        }),
+        ("hit without method", |v| {
+            v["hit"].as_object_mut().unwrap().remove("method");
+        }),
+        ("method outside the row", |v| {
+            v["hit"]["method"] = "delete".into();
+        }),
+        ("requested outside the subject", |v| {
+            v["hit"]["requested"] = "data/x.lance".into();
+            v["hit"]["stored"] = "data/dstm-x.lance".into();
+        }),
+        ("stored not the transform", |v| {
+            v["hit"]["stored"] = "__recovery/op-1.json".into();
+        }),
+        ("stored in another directory", |v| {
+            v["hit"]["stored"] = "other/dstm-op-1.json".into();
+        }),
+        ("subject dropped from the record", |v| {
+            v.as_object_mut().unwrap().remove("subject");
+        }),
+    ];
+    for store_place in [false, true] {
+        let (case, report) = store_fixture(store_place);
+        assert_eq!(
+            classify(&case, &report),
+            Ok(true),
+            "store_place={store_place}"
+        );
+        verify_status(&case, &report, true).unwrap();
+        let index = report
+            .evidence
+            .iter()
+            .position(|event| event["kind"] == "seam_delivered")
+            .unwrap();
+        for (label, mutate) in mutations {
+            let mut report = store_fixture(store_place).1;
+            mutate(&mut report.evidence[index]["value"]);
+            assert!(
+                classify(&case, &report).is_err(),
+                "{label}, store_place={store_place}"
+            );
+        }
+    }
+    let (case, mut report) = fixture();
+    let index = report
+        .evidence
+        .iter()
+        .position(|event| event["kind"] == "seam_delivered")
+        .unwrap();
+    report.evidence[index]["value"]["hit"] = json!({"method": "write_text", "requested": "__recovery/op-1.json", "stored": "__recovery/dstm-op-1.json"});
+    assert!(
+        classify(&case, &report).is_err(),
+        "an engine effect carries no hit"
+    );
+}
+
 #[test]
 fn never_waives_harness_errors_or_an_unexpected_pass() {
     for code in [

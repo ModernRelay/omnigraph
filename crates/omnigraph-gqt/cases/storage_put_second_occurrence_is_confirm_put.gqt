@@ -1,0 +1,44 @@
+# issue: none
+# notes: On `storage.put` under `__recovery/*`, occurrence 2 is the confirm put of the mutation: occurrence 1 is the arm put, and the second call of the step rewrites the same sidecar as Confirmed.
+# notes: The mutation stays healthy because the confirm put is followed by the delete of the canonical name, so the misdirected copy is the only object left behind and no read path needs it; the reopen at step 2 and the read at step 3 see both rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: storage.put
+subject: "__recovery/*"
+occurrence: 2
+action: misdirect
+scope: next_step
+
+--- mutate
+query add_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query all() { match { $p: Person } return { $p.name } }
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+
+--- expect shape
+p.name: String

@@ -26,6 +26,14 @@ fn parses_a_minimal_case() {
 }
 
 #[test]
+fn a_fault_section_is_refused() {
+    let fault =
+        "--- fault\nat: recovery.sidecar_write\noccurrence: 1\naction: fail\nscope: next_step\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{fault}{QUERY}{EXPECT}");
+    assert!(refusal("x", &text).contains("there is no `--- fault` section"));
+}
+
+#[test]
 fn header_notes_repeat_and_continuation_lines_are_refused() {
     let text = format!(
         "# issue: 7\n# red_on: 2026-01-01, the run\n# notes: returned 8,\n# notes: not 20.\n{SCHEMA}{SEED}{QUERY}{EXPECT}"

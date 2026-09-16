@@ -18,7 +18,8 @@ use crate::error::Result;
 pub use omnigraph_seams::Installed;
 pub use omnigraph_seams::{
     Behavior, Counted, Decide, DecideSeam, Decision, Effect, FireAlways, FireOnceAt, Global, Hold,
-    Observe, Op, PanicAt, Seam, SeamEntry, ThreadLocal, decide_seam, effects_list,
+    Observe, Op, PanicAt, Seam, SeamEntry, StoreEffect, ThreadLocal, decide_seam, effects_list,
+    store_effects_list,
 };
 
 pub mod catalog;
@@ -80,7 +81,8 @@ fn injected_contention(seam: &'static DecideSeam) -> crate::error::OmniError {
 }
 
 /// Site helper for a seam declaring only `Effect::Fail`: a fired decision
-/// becomes the injected `Manifest` error.
+/// becomes the injected `Manifest` error. A fired store effect passes: the
+/// storage decoration acts on the call that follows.
 #[inline]
 #[track_caller]
 pub(crate) fn fail(seam: &'static DecideSeam) -> Result<()> {
@@ -92,7 +94,7 @@ pub(crate) fn fail(seam: &'static DecideSeam) -> Result<()> {
             "{} is not a fail-only seam",
             seam.name()
         );
-        if seam.crossed() != Decision::Pass {
+        if matches!(seam.crossed(), Decision::Fire(_)) {
             return Err(injected(seam));
         }
     }
@@ -115,7 +117,7 @@ pub(crate) fn skip(seam: &'static DecideSeam) -> bool {
             "{} is not a skip-only seam",
             seam.name()
         );
-        seam.crossed() != Decision::Pass
+        matches!(seam.crossed(), Decision::Fire(_))
     }
     #[cfg(not(feature = "failpoints"))]
     {
@@ -137,7 +139,7 @@ pub(crate) fn contention(seam: &'static DecideSeam) -> Result<()> {
             "{} is not a contention-only seam",
             seam.name()
         );
-        if seam.crossed() != Decision::Pass {
+        if matches!(seam.crossed(), Decision::Fire(_)) {
             return Err(injected_contention(seam));
         }
     }
@@ -169,7 +171,7 @@ pub(crate) fn guarded<T>(
     async move {
         #[cfg(feature = "failpoints")]
         match seam.crossed_from(caller) {
-            Decision::Pass => {}
+            Decision::Pass | Decision::Store(_) => {}
             Decision::Fire(Effect::Skip) => return Ok(None),
             Decision::Fire(Effect::Fail) => return Err(injected(seam)),
             Decision::Fire(Effect::Contention) => return Err(injected_contention(seam)),
