@@ -1,0 +1,119 @@
+# issue: none
+# notes: pins the refusal issue 722 asked for, which PR 569 (v0.10.0) already
+# notes: ships: a declared non-nullable parameter the caller never supplies (no
+# notes: params at all, or an empty object) is refused before execution, the same
+# notes: way an explicit null is; a v0.9.0 server instead drops the unbound `$id`
+# notes: filter and returns every row. An omitted nullable parameter fills with
+# notes: null and matches no row. Green on fe9eb339 at first run, 2026-09-16.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Thing {
+    id: String @key
+    name: String?
+}
+
+--- seed
+{"type":"Thing","data":{"id":"abc","name":"first"}}
+{"type":"Thing","data":{"id":"def","name":"second"}}
+{"type":"Thing","data":{"id":"ghi"}}
+
+--- query
+query thing_by_id($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id, $t.name }
+}
+
+--- params
+{"id": "abc"}
+
+--- expect unordered
+{"t.id": "abc", "t.name": "first"}
+
+--- expect shape
+t.id: String
+t.name: String?
+
+--- query
+query thing_by_id_without_params($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id }
+}
+
+--- expect error: parameter 'id' not provided
+
+--- query
+query thing_by_id_with_empty_params($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id }
+}
+
+--- params
+{}
+
+--- expect error: parameter 'id' not provided
+
+--- query
+query thing_by_id_with_null($id: String) {
+    match { $t: Thing { id: $id } }
+    return { $t.id }
+}
+
+--- params
+{"id": null}
+
+--- expect error: param 'id': null is not accepted for non-nullable parameter
+
+--- mutate
+query delete_thing_by_id_without_params($id: String) {
+    delete Thing where id = $id
+}
+
+--- expect error: parameter 'id' not provided
+
+--- mutate
+query rename_thing_by_id_with_empty_params($id: String, $name: String) {
+    update Thing set { name: $name } where id = $id
+}
+
+--- params
+{}
+
+--- expect error: parameter 'id' not provided
+
+--- mutate
+query insert_thing_without_params($id: String) {
+    insert Thing { id: $id }
+}
+
+--- expect error: parameter 'id' not provided
+
+--- query
+query all_things_untouched() {
+    match { $t: Thing }
+    return { $t.id }
+}
+
+--- expect unordered
+{"t.id": "abc"}
+{"t.id": "def"}
+{"t.id": "ghi"}
+
+--- expect shape
+t.id: String
+
+--- query
+query things_by_name_omitted_nullable($name: String?) {
+    match { $t: Thing { name: $name } }
+    return { $t.id }
+}
+
+--- expect unordered
+
+--- expect shape
+t.id: String
