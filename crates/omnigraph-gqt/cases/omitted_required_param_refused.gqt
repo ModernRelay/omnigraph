@@ -96,16 +96,17 @@ query insert_thing_without_params($id: String) {
 --- query
 query all_things_untouched() {
     match { $t: Thing }
-    return { $t.id }
+    return { $t.id, $t.name }
 }
 
 --- expect unordered
-{"t.id": "abc"}
-{"t.id": "def"}
+{"t.id": "abc", "t.name": "first"}
+{"t.id": "def", "t.name": "second"}
 {"t.id": "ghi"}
 
 --- expect shape
 t.id: String
+t.name: String?
 
 --- query
 query things_by_name_omitted_nullable($name: String?) {
