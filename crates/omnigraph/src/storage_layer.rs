@@ -327,13 +327,6 @@ impl StagedHandle {
         self.inner.transaction_identity()
     }
 
-    /// Remove the exact strict-insert ids before the staged transaction is
-    /// consumed by commit. They are retained only for the fresh-authority
-    /// conflict re-probe; Lance's commit packet does not consume them.
-    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
-        self.inner.take_strict_source_ids()
-    }
-
     /// Replace Lance's random transaction UUID with the identity durably armed
     /// before a deferred first-touch fork. The read version must still match.
     pub(crate) fn bind_transaction_identity(
@@ -368,10 +361,6 @@ impl ExactCommitOutcome {
 
     pub fn committed_transaction(&self) -> &StagedTransactionIdentity {
         &self.committed_transaction
-    }
-
-    pub fn committed_version(&self) -> u64 {
-        self.snapshot.version()
     }
 
     pub fn into_snapshot(self) -> SnapshotHandle {
@@ -454,14 +443,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// branch set to find orphaned per-table forks. `main`/default is not a
     /// named branch and never appears here.
     async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>>;
-
-    async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        table_key: &str,
-        expected_version: u64,
-    ) -> Result<SnapshotHandle>;
 
     fn ensure_expected_version(
         &self,
@@ -905,18 +886,6 @@ impl TableStorage for TableStore {
 
     async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
         TableStore::list_native_branches(self, dataset_uri).await
-    }
-
-    async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        table_key: &str,
-        expected_version: u64,
-    ) -> Result<SnapshotHandle> {
-        TableStore::reopen_for_mutation(self, dataset_uri, branch, table_key, expected_version)
-            .await
-            .map(SnapshotHandle::new)
     }
 
     fn ensure_expected_version(

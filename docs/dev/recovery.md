@@ -29,7 +29,7 @@ mean an active sidecar uses an old outer schema.
 
 | Sidecar kind | Current v9 payload |
 |---|---|
-| Mutation / Load | Exact one-transaction effect identity and confirmation |
+| Mutation / Load | None since [RFC 0067](../rfcs/0067-detached-table-commits.md): their effects are detached commits published as pins, and a pending pin is promoted by the next writer of the table or by cleanup, never recovered from a sidecar |
 | BranchMerge | Fixed bounded transaction chain, source/target authority, and lineage |
 | SchemaApply | Exact existing/first-touch effects, durable schema staging, and complete catalog delta; the RFC 0040 system-column upgrade adds rename-only table effects and a `__manifest` stamp advance, recovered by roll-forward only |
 | EnsureIndices / full-text rebuild | Exact CreateIndex effects and complete pointer delta; rebuild retains the same fixed actor and lineage |
@@ -102,12 +102,11 @@ still applies.
 Long-lived handles and write-entry barriers use the concurrency-safe
 roll-forward-only sweep. It takes the same ordered gates, re-reads the artifact
 under those gates, and may publish a complete confirmed outcome with the
-manifest CAS. It may also retire a provably effect-free Armed mutation/load
-intent whose exact transaction-identity classification proves no owned effect,
-under the same one-mutation-process boundary destructive full-recovery
-decisions assume (see invariants.md, current support boundaries). Anything
-requiring Restore, destructive compensation, or an unproven decision remains on
-disk for the next Full open and blocks only the authority it affects.
+manifest CAS. Anything requiring Restore, destructive compensation, or an
+unproven decision remains on disk for the next Full open and blocks only the
+authority it affects. The effect-free retirement of an Armed mutation or load
+intent (issue #554) no longer has a producer: since RFC 0067 those writers arm
+no intent, and a write that fails before publication leaves nothing behind.
 
 This split lets the common “all table commits landed; final manifest publish
 failed” case heal without a restart while preserving concurrent writers.

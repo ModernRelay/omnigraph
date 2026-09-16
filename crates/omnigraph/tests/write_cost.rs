@@ -262,10 +262,14 @@ async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
         curve.push((d, io));
     }
 
-    assert!(
-        curve[0].1.data_opener_reads > 0,
-        "opener reads must be > 0 — the classifier missed version-resolution reads, \
-         so a flat opener assertion would be vacuous"
+    // RFC 0067: a write on a warm handle opens nothing. The writer stages on
+    // the handle the previous write landed in the read-handle cache, so the
+    // opener term is zero at every depth; the flat assertion below therefore
+    // pins zero, and a non-zero opener read here means a write-side open
+    // stopped going through the held handle.
+    assert_eq!(
+        curve[0].1.data_opener_reads, 0,
+        "a write on a warm handle stages on the held pin and opens nothing"
     );
     assert_flat(
         &curve,
@@ -457,7 +461,7 @@ async fn keyed_insert_routes_through_fenced_adapter_only() {
 /// and one full validation under the pre-effect gates (7 `read_text` + 4 `exists`
 /// total). Per-table resolves must not add more validation. The gate read is
 /// correctness work: it arbitrates schema identity after preparation and before
-/// the recovery sidecar or any Lance HEAD movement. The shape is
+/// any detached table effect; no recovery sidecar is written (RFC 0067). The shape is
 /// the write twin of `warm_read_cost.rs::warm_query_validates_schema_contract_once`,
 /// built with ZERO production change via the counting storage adapter.
 #[tokio::test]
@@ -502,12 +506,12 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
         "a write must probe contract-file existence at capture + pre-effect revalidation (4 probes)",
     );
     assert_eq!(
-        write_text_delta, 2,
-        "an enrolled write must write its recovery sidecar exactly twice (arm + exact confirmation)",
+        write_text_delta, 0,
+        "a detached write arms no recovery sidecar (RFC 0067): no control-object write",
     );
     assert_eq!(
-        delete_delta, 1,
-        "a successful enrolled write must delete its confirmed sidecar once",
+        delete_delta, 0,
+        "a detached write has no sidecar to delete after publication",
     );
 }
 

@@ -559,6 +559,7 @@ async fn open_table_for_mutation(
         opened.full_path.clone(),
         opened.table_branch.clone(),
         opened.pinned_native_ref.clone(),
+        opened.entry.clone(),
         opened.deferred_fork.clone(),
         opened.expected_version,
         op_kind,
@@ -656,6 +657,14 @@ decide_seam! {
 
 decide_seam! {
     pub static MUTATION_POST_FINALIZE_PRE_PUBLISHER = ("mutation.post_finalize_pre_publisher", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// After the manifest published every pin and before the writer promotes
+    /// them from its held handles (RFC 0067). The write is durable and
+    /// visible; a failure here leaves the pins pending for the next writer
+    /// of each table or for cleanup.
+    pub static MUTATION_POST_PUBLISH_PRE_PROMOTION = ("mutation.post_publish_pre_promotion", Mutation, [Fail]);
 }
 
 decide_seam! {
@@ -1024,17 +1033,10 @@ impl Omnigraph {
                 let super::staging::CommittedMutation {
                     updates,
                     expected_versions,
-                    sidecar_handle,
+                    promotions,
                     guards: _queue_guards,
                 } = staged
-                    .commit_all(
-                        self,
-                        requested.as_deref(),
-                        crate::db::manifest::SidecarKind::Mutation,
-                        actor_id,
-                        &txn,
-                        &lineage_intent,
-                    )
+                    .commit_all(self, requested.as_deref(), &txn, &lineage_intent)
                     .await?;
                 // Failpoint for the confirmed-effects → publisher boundary:
                 // table HEADs have advanced but graph visibility has not. The
@@ -1054,42 +1056,19 @@ impl Omnigraph {
                         lineage_intent,
                     )
                     .await;
-                let commit = match publish_result {
-                    Ok(commit) => commit,
-                    Err(err) => {
-                        // A sidecar exists iff at least one table effect was
-                        // committed. Lineage-only / zero-row mutations have no
-                        // physical residual to recover, so preserve their original
-                        // publish error (notably ReadSetChanged) and let the normal
-                        // retry/409 path handle it.
-                        return match sidecar_handle.as_ref() {
-                            Some(handle) => Err(OmniError::recovery_required(
-                                handle.operation_id.clone(),
-                                err.to_string(),
-                            )),
-                            None => Err(err),
-                        };
-                    }
-                };
-                if let Some(handle) = sidecar_handle {
-                    // Best-effort cleanup: the manifest publish already
-                    // succeeded, so the user's mutation is durable. A failed
-                    // delete leaves a fixed, idempotent v3 outcome for the next
-                    // synchronous heal or read-write open to audit and remove.
-                    // Failing the user here would report an error for a write
-                    // that already landed.
-                    if let Err(err) = crate::db::manifest::delete_sidecar_after_publish(
-                        &handle,
-                        self.storage_adapter(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            operation_id = handle.operation_id.as_str(),
-                            "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-                        );
-                    }
+                // RFC 0067: every effect is a detached commit of its pinned base,
+                // so a publish failure leaves the graph unchanged; the error
+                // is returned as is (a moved head is `ReadSetChanged`).
+                let commit = publish_result?;
+                // Promotion lands each pin's linear twin from the handles this
+                // writer holds. The write is already durable and visible, so
+                // a failure here is logged and left for the next writer.
+                match fail(&MUTATION_POST_PUBLISH_PRE_PROMOTION) {
+                    Ok(()) => self.promote_held_all(promotions).await,
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "promotion skipped after publication; the next writer promotes"
+                    ),
                 }
                 Ok(crate::MutationReceipt {
                     result: total,

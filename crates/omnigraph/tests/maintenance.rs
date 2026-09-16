@@ -1024,8 +1024,9 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
     .await
     .expect_err("strict delete must reject uncovered drift before staging the delete");
     assert!(
-        err.to_string().contains("expected"),
-        "delete should fail as a strict stale-version write; got: {err}"
+        err.to_string()
+            .contains("run `omnigraph repair` before writing"),
+        "delete should fail on the uncovered-drift guard at its pinned open; got: {err}"
     );
 
     let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;

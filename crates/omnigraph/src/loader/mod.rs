@@ -740,6 +740,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.full_path,
             opened.table_branch,
             opened.pinned_native_ref,
+            opened.entry,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
@@ -793,6 +794,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.full_path,
             opened.table_branch,
             opened.pinned_native_ref,
+            opened.entry,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
@@ -855,18 +857,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
-        sidecar_handle,
+        promotions,
         guards: _queue_guards,
-    } = staged
-        .commit_all(
-            db,
-            branch,
-            crate::db::manifest::SidecarKind::Load,
-            actor_id,
-            &txn,
-            &lineage_intent,
-        )
-        .await?;
+    } = staged.commit_all(db, branch, &txn, &lineage_intent).await?;
     // Same confirmed-effects → publisher boundary as mutations: table HEADs
     // have advanced and the v3 sidecar contains their exact transaction
     // identities, but the graph manifest has not published the result. Reuse
@@ -882,35 +875,18 @@ async fn load_jsonl_reader_once<R: BufRead>(
             lineage_intent,
         )
         .await;
-    let commit = match publish_result {
-        Ok(commit) => commit,
-        Err(err) => {
-            // Empty loads can still publish lineage but have no table effect and
-            // therefore no recovery sidecar. Preserve that publish error instead
-            // of manufacturing an "unknown" recovery operation.
-            return match sidecar_handle.as_ref() {
-                Some(handle) => Err(OmniError::recovery_required(
-                    handle.operation_id.clone(),
-                    err.to_string(),
-                )),
-                None => Err(err),
-            };
-        }
-    };
-    // The v3 recovery sidecar protects every independently durable table effect
-    // through the one manifest visibility point. Phase C succeeded — clean up
-    // best-effort: failing the user here would error out a write that already
-    // landed durably; a leftover fixed outcome is idempotently finalized later.
-    if let Some(handle) = sidecar_handle {
-        if let Err(err) =
-            crate::db::manifest::delete_sidecar_after_publish(&handle, db.storage_adapter()).await
-        {
-            tracing::warn!(
-                error = %err,
-                operation_id = handle.operation_id.as_str(),
-                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-            );
-        }
+    // RFC 0067: every effect is a detached commit of its pinned base, so a
+    // publish failure leaves the graph unchanged and the error is returned as
+    // is. Promotion then lands each pin's linear twin from the held handles;
+    // the load is durable already, so a failure there is logged and left for
+    // the next writer.
+    let commit = publish_result?;
+    match fail(&catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION) {
+        Ok(()) => db.promote_held_all(promotions).await,
+        Err(error) => tracing::warn!(
+            error = %error,
+            "promotion skipped after publication; the next writer promotes"
+        ),
     }
 
     Ok(LoadReceipt { result, commit })

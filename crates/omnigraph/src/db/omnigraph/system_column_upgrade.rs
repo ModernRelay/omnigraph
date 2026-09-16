@@ -420,6 +420,9 @@ async fn execute_with_lock(
             .storage()
             .open_dataset_head(&dataset_uri, entry.native_dataset_branch.as_deref())
             .await?;
+        let head = db
+            .promote_pending_pin(&entry.type_key, &dataset_uri, entry, head)
+            .await?;
         db.ensure_existing_effect_baseline(
             &entry.type_key,
             entry.native_dataset_branch.as_deref(),

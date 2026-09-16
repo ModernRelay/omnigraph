@@ -294,14 +294,21 @@ async fn maintain_indices_for_branch(
                 .as_deref()
                 .is_some_and(|fork| entry.version_metadata.is_table_fork_of(fork, owner))
         });
+        // Index work commits on the linear HEAD, and a first touch forks a
+        // linear source version: promote a pending pin first (RFC 0067).
         let ds = if first_touch {
             // The inherited owner's HEAD may advance independently after this
             // graph branch was cut. Plan from the exact inherited snapshot, not
             // from that owner's current HEAD.
+            db.promote_inherited_pin(&table_key, &full_path, entry)
+                .await?;
             db.storage().open_snapshot_at_entry(entry).await?
         } else {
-            db.storage()
+            let head = db
+                .storage()
                 .open_dataset_head(&full_path, entry.native_dataset_branch.as_deref())
+                .await?;
+            db.promote_pending_pin(&table_key, &full_path, entry, head)
                 .await?
         };
         let work = match mode {
@@ -362,10 +369,15 @@ async fn maintain_indices_for_branch(
                 .is_some_and(|fork| entry.version_metadata.is_table_fork_of(fork, owner))
         });
         let ds = if first_touch {
+            db.promote_inherited_pin(&table_key, &full_path, entry)
+                .await?;
             db.storage().open_snapshot_at_entry(entry).await?
         } else {
-            db.storage()
+            let head = db
+                .storage()
                 .open_dataset_head(&full_path, entry.native_dataset_branch.as_deref())
+                .await?;
+            db.promote_pending_pin(&table_key, &full_path, entry, head)
                 .await?
         };
         let work = match mode {
@@ -1092,6 +1104,9 @@ pub(crate) struct OpenedForMutation {
     pub(crate) table_branch: Option<String>,
     /// The ref the pin was read on, see `NativeRefPin`.
     pub(crate) pinned_native_ref: Option<String>,
+    /// The manifest registration the pin was read from (RFC 0067): the
+    /// staging reopen resolves it, promoting a pending predecessor first.
+    pub(crate) entry: crate::db::DatasetEntry,
     /// RFC-022 first-touch named-branch writes stage against the inherited
     /// source snapshot and defer the durable Lance ref creation until after
     /// their v9 recovery intent (`protocol_v3` payload) is armed in
@@ -1188,6 +1203,7 @@ pub(super) async fn open_for_mutation_on_branch(
             {
                 return Ok(OpenedForMutation {
                     identity: entry.identity,
+                    entry: entry.clone(),
                     handle: None,
                     expected_version: entry.published_dataset_version,
                     full_path,
@@ -1200,6 +1216,7 @@ pub(super) async fn open_for_mutation_on_branch(
             None => {
                 return Ok(OpenedForMutation {
                     identity: entry.identity,
+                    entry: entry.clone(),
                     handle: None,
                     expected_version: entry.published_dataset_version,
                     full_path,
@@ -1216,28 +1233,16 @@ pub(super) async fn open_for_mutation_on_branch(
 
     match resolved_branch.as_deref() {
         None => {
-            let ds = db.storage().open_dataset_head(&full_path, None).await?;
-            if op_kind.strict_pre_stage_version_check() {
-                if txn.is_some() && ds.version() != entry.published_dataset_version {
-                    return Err(OmniError::manifest_read_set_changed(
-                        format!("published_dataset_version:{table_key}"),
-                        Some(entry.published_dataset_version.to_string()),
-                        Some(ds.version().to_string()),
-                    ));
-                }
-                if txn.is_none() {
-                    db.storage().ensure_expected_version(
-                        &ds,
-                        table_key,
-                        entry.published_dataset_version,
-                    )?;
-                }
-            }
-            let version = ds.version();
+            // RFC 0067: the pinned image, never HEAD. The manifest CAS at
+            // publication is the read-set fence for every op kind.
+            let ds = db
+                .open_pinned_for_write(table_key, &full_path, entry)
+                .await?;
             Ok(OpenedForMutation {
                 identity: entry.identity,
+                entry: entry.clone(),
                 handle: Some(ds),
-                expected_version: version,
+                expected_version: entry.published_dataset_version,
                 full_path,
                 table_branch: None,
                 pinned_native_ref: entry.native_dataset_branch.clone(),
@@ -1263,6 +1268,7 @@ pub(super) async fn open_for_mutation_on_branch(
                 let ds = db.storage().open_snapshot_at_entry(entry).await?;
                 return Ok(OpenedForMutation {
                     identity: entry.identity,
+                    entry: entry.clone(),
                     handle: Some(ds),
                     expected_version: entry.published_dataset_version,
                     full_path,
@@ -1277,23 +1283,19 @@ pub(super) async fn open_for_mutation_on_branch(
             let (ds, table_branch) = open_owned_dataset_for_branch_write(
                 db,
                 table_key,
-                entry.identity,
+                entry,
                 &full_path,
-                entry.native_dataset_branch.as_deref(),
-                entry.published_dataset_version,
-                &entry.version_metadata,
                 active_branch,
                 native_active,
                 op_kind,
-                txn.is_some(),
                 snapshot.graph_manifest_version(),
             )
             .await?;
-            let version = ds.version();
             Ok(OpenedForMutation {
                 identity: entry.identity,
+                entry: entry.clone(),
                 handle: Some(ds),
-                expected_version: version,
+                expected_version: entry.published_dataset_version,
                 full_path,
                 table_branch,
                 pinned_native_ref: entry.native_dataset_branch.clone(),
@@ -1306,38 +1308,27 @@ pub(super) async fn open_for_mutation_on_branch(
 pub(super) async fn open_owned_dataset_for_branch_write(
     db: &Omnigraph,
     table_key: &str,
-    identity: crate::db::manifest::TableIdentity,
+    entry: &crate::db::DatasetEntry,
     full_path: &str,
-    entry_branch: Option<&str>,
-    entry_version: u64,
-    entry_version_metadata: &crate::db::manifest::TableVersionMetadata,
     active_branch: &str,
     native_active: &str,
     op_kind: crate::db::MutationOpKind,
-    occ_enrolled: bool,
     base_manifest_version: u64,
 ) -> Result<(SnapshotHandle, Option<String>)> {
+    let identity = entry.identity;
+    let entry_version = entry.published_dataset_version;
     // `active_branch` is the logical branch (manifest reads, gates, sidecars);
     // `native_active` is its native ref (Lance opens, forks, entry names).
-    match entry_branch {
-        Some(branch) if entry_version_metadata.is_table_fork_of(branch, native_active) => {
+    match entry.native_dataset_branch.as_deref() {
+        Some(branch)
+            if entry
+                .version_metadata
+                .is_table_fork_of(branch, native_active) =>
+        {
+            // RFC 0067: the pinned image on the branch's own ref.
             let ds = db
-                .storage()
-                .open_dataset_head(full_path, Some(branch))
+                .open_pinned_for_write(table_key, full_path, entry)
                 .await?;
-            if op_kind.strict_pre_stage_version_check() {
-                if occ_enrolled && ds.version() != entry_version {
-                    return Err(OmniError::manifest_read_set_changed(
-                        format!("published_dataset_version:{table_key}"),
-                        Some(entry_version.to_string()),
-                        Some(ds.version().to_string()),
-                    ));
-                }
-                if !occ_enrolled {
-                    db.storage()
-                        .ensure_expected_version(&ds, table_key, entry_version)?;
-                }
-            }
             Ok((ds, Some(branch.to_string())))
         }
         source_branch => {
@@ -1371,6 +1362,10 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                 base_manifest_version,
                 &crate::dst_ids::new_ulid().to_string(),
             );
+            // A pending pin on the inherited source is promoted first so the
+            // fork has a linear version to start from (RFC 0067).
+            db.promote_inherited_pin(table_key, full_path, entry)
+                .await?;
             let ds = db
                 .fork_dataset_from_entry_state(
                     table_key,
@@ -1485,35 +1480,6 @@ pub(crate) async fn classify_fork_ref_with_references(
     }
 }
 
-pub(super) async fn reopen_for_mutation(
-    db: &Omnigraph,
-    table_key: &str,
-    full_path: &str,
-    table_branch: Option<&str>,
-    expected_version: u64,
-    op_kind: crate::db::MutationOpKind,
-) -> Result<SnapshotHandle> {
-    db.ensure_schema_apply_not_locked("write").await?;
-    if op_kind.strict_pre_stage_version_check() {
-        db.storage()
-            .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
-            .await
-    } else {
-        // Insert / Merge: skip the strict version check. Open at HEAD —
-        // Lance's natural conflict resolver at commit_staged time
-        // (rebase append, dedupe merge_insert) handles concurrent
-        // writers correctly; the publisher CAS in
-        // `MutationStaging::commit_all` (refreshed under the
-        // per-(table, branch) queue via `snapshot_for_branch`) catches
-        // genuine cross-process drift as 409. See
-        // [`crate::db::MutationOpKind`] for the policy rationale.
-        let _ = expected_version;
-        db.storage()
-            .open_dataset_head(full_path, table_branch)
-            .await
-    }
-}
-
 /// Index work deferred on this pass. A vector property without trainable
 /// vectors can be retried once populated; an existing full-text index with
 /// incomplete coverage requires explicit rebuilding. `reason` names the remedy.
@@ -1622,21 +1588,18 @@ async fn prepare_updates_for_commit(
         let mut prepared_update = update.clone();
         if prepared_update.entity_count > 0 {
             let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
-            // Strict version check is correct here: this runs INSIDE
-            // the publisher commit path, after `commit_staged` already
-            // advanced Lance HEAD to `prepared_update.published_dataset_version`.
-            // The check is a defense-in-depth assertion that the
-            // dataset state matches what we just committed; not the
-            // pre-stage race the op-kind policy targets.
-            let mut ds = reopen_for_mutation(
-                db,
+            // A legacy caller committed linearly on HEAD, so HEAD is the
+            // version its update names; the strict check is a defense-in-depth
+            // assertion that the dataset state matches what it just committed.
+            let mut ds = db
+                .storage()
+                .open_dataset_head(&full_path, prepared_update.native_dataset_branch.as_deref())
+                .await?;
+            db.storage().ensure_expected_version(
+                &ds,
                 &prepared_update.type_key,
-                &full_path,
-                prepared_update.native_dataset_branch.as_deref(),
                 prepared_update.published_dataset_version,
-                crate::db::MutationOpKind::SchemaRewrite,
-            )
-            .await?;
+            )?;
             // Any column not yet buildable (e.g. a vector column whose rows
             // have null embeddings) is deferred and logged inside
             // build_indices; a later ensure_indices/optimize materializes it.

@@ -81,7 +81,7 @@ fn exact_effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal()
         timeout.storage_failure().map(|failure| failure.kind),
         Some(StorageFailureKind::Transient)
     );
-    assert!(!timeout.is_retryable_commit_conflict());
+    assert!(!matches!(timeout, OmniError::RetryableCommitConflict(_)));
 }
 
 fn person_schema() -> Arc<Schema> {
@@ -603,10 +603,6 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
     assert!(
         super::has_insert_absence_certificate(&staged.transaction),
         "an all-new upsert's completed merge proves every inserted id absent from its parent"
-    );
-    assert!(
-        staged.strict_source_ids.is_none(),
-        "certification must not change upsert conflict-normalization semantics"
     );
     assert_eq!(
         staged

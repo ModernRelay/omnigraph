@@ -594,10 +594,6 @@ impl OmniError {
         }
     }
 
-    pub(crate) fn is_retryable_commit_conflict(&self) -> bool {
-        matches!(self, Self::RetryableCommitConflict(_))
-    }
-
     pub(crate) fn is_read_set_changed(&self) -> bool {
         matches!(
             self,

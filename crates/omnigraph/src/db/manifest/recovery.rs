@@ -59,7 +59,7 @@ use super::{
     DatasetUpdate, ExpectedTableVersions, ManifestChange, ManifestCoordinator, NativeRefPin,
     TableIdentity, TableRegistration, TableRename, TableTombstone, TableVersionExpectation,
 };
-use crate::seams::{decide_seam, fail, guarded, skip};
+use crate::seams::{decide_seam, fail};
 
 /// System actor identifier for recovery-owned lineage: legacy recovery,
 /// exact-protocol rollback, schema-v6 EnsureIndices rollback, and orphan
@@ -1210,25 +1210,6 @@ pub(crate) async fn confirm_sidecar_phase_b_v9(
         OmniError::manifest_internal(format!("failed to serialize recovery sidecar: {}", err))
     })?;
     storage.write_text(&uri, &json).await
-}
-
-decide_seam! {
-    /// The sidecar delete after its manifest commit is visible. Skipping it
-    /// leaves the current sidecar bytes for the next read-write open to recover.
-    pub static MUTATION_SIDECAR_POST_PUBLISH_DELETE = ("mutation.sidecar_post_publish_delete", Mutation, [Skip]);
-}
-
-/// Stage H: delete the sidecar once the `__manifest` commit is visible. The
-/// `MUTATION_SIDECAR_POST_PUBLISH_DELETE` seam models the delete being lost
-/// (acknowledged, effect absent); a failed delete is the caller's to swallow.
-pub(crate) async fn delete_sidecar_after_publish(
-    handle: &RecoverySidecarHandle,
-    storage: &dyn StorageAdapter,
-) -> Result<()> {
-    if skip(&MUTATION_SIDECAR_POST_PUBLISH_DELETE) {
-        return Ok(());
-    }
-    delete_sidecar(handle, storage).await
 }
 
 decide_seam! {
@@ -8663,11 +8644,9 @@ pub(crate) async fn confirm_ensure_indices_sidecar_v9(
 
 /// Arm an RFC-022 mutation/load recovery sidecar.
 ///
-/// The returned v3 sidecar is still purely an intent (`Armed`): every staged
-/// transaction identity and manifest output slot is durable, but no achieved
-/// version is recorded. The caller must persist it with [`write_sidecar`]
-/// before the first table HEAD advance and later call
-/// [`confirm_occ_sidecar_v9`] after every exact effect completes.
+/// RFC 0067: no writer arms a Mutation or Load sidecar since v10; the
+/// classifier tests still build them until the classifier goes.
+#[cfg(test)]
 pub(crate) fn new_occ_sidecar_v9(
     writer_kind: SidecarKind,
     branch: Option<String>,
@@ -8760,22 +8739,17 @@ pub(crate) fn new_occ_sidecar_v9(
     Ok(sidecar)
 }
 
-decide_seam! {
-    /// The confirm put after validation, before the manifest commit. Failure
-    /// leaves an Armed sidecar for rollback; skipping loses only the put. The
-    /// independent post-publish delete must also be skipped to leave a residue.
-    pub static MUTATION_SIDECAR_CONFIRM_PUT = ("mutation.sidecar_confirm_put", Mutation, [Fail, Skip]);
-}
-
 /// Bind every physical output slot of an RFC-022 sidecar and durably transition
-/// it from `Armed` to `EffectsConfirmed`. The `MUTATION_SIDECAR_CONFIRM_PUT`
-/// seam models the put being lost: the in-memory sidecar still confirms while
-/// the object keeps its arm-time bytes.
+/// it from `Armed` to `EffectsConfirmed`.
+///
+/// RFC 0067: no writer arms a Mutation or Load sidecar since v10; the
+/// classifier tests still build and confirm them until the classifier goes.
 ///
 /// Validation happens against a clone first. A missing table, a rebased Lance
 /// transaction, or a version/branch mismatch leaves the on-disk sidecar Armed,
 /// which recovery interprets as partial Phase B and rolls back. Only the exact
 /// planned transaction set can become eligible for roll-forward.
+#[cfg(test)]
 pub(crate) async fn confirm_occ_sidecar_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -8898,11 +8872,7 @@ pub(crate) async fn confirm_occ_sidecar_v9(
             error
         ))
     })?;
-    guarded(
-        &MUTATION_SIDECAR_CONFIRM_PUT,
-        storage.write_text(&uri, &json),
-    )
-    .await?;
+    storage.write_text(&uri, &json).await?;
     *sidecar = confirmed;
     Ok(())
 }

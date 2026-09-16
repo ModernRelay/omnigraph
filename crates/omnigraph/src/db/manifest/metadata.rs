@@ -121,6 +121,14 @@ impl TableVersionMetadata {
         self.transaction_uuid.as_deref()
     }
 
+    /// RFC 0067: mark this pin as staged at a detached version whose linear
+    /// twin promotion replays under `uuid`.
+    pub(crate) fn with_staged(mut self, staged_version: u64, transaction_uuid: String) -> Self {
+        self.staged_version = Some(staged_version);
+        self.transaction_uuid = Some(transaction_uuid);
+        self
+    }
+
     /// RFC 0067: whether `dataset` is the manifest this pin
     /// witnesses. The e_tag identifies the exact manifest object; a pin that
     /// carries a transaction uuid also accepts the promoted twin, whose

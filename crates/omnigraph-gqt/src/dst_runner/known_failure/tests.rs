@@ -2,13 +2,13 @@ use super::*;
 use omnigraph::error::OmniError;
 use serde_json::json;
 
-const CASE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/cases/dst_mutation_failure_keeps_writing.gqt"
-));
+/// A fixture, not a corpus case: the corpus carries no known failure since
+/// RFC 0067 made a failed mutation effect-free, so the classifier tests keep
+/// their marker here.
+const CASE: &str = include_str!("fixture.gqt");
 
 fn fixture() -> (Case, WorkerReport) {
-    let case = crate::parse_case("dst_mutation_failure_keeps_writing", CASE).unwrap();
+    let case = crate::parse_case("known_failure_fixture", CASE).unwrap();
     let marker = case.known_failure.as_ref().unwrap();
     let ErrorMatch::RecoveryRequired { reason } = &marker.matcher else {
         unreachable!("the fixture case names a RecoveryRequired marker")
@@ -60,8 +60,8 @@ fn checks_each_effect_when_multiple_seams_share_a_step() {
     let (mut case, mut report) = fixture();
     let seams = case.seams.values_mut().next().unwrap();
     let mut second = seams[0].clone();
-    second.at = "mutation.sidecar_confirm_put".into();
-    second.action = crate::runner_config::SeamAction::Skip;
+    second.at = "publish.load_state".into();
+    second.action = crate::runner_config::SeamAction::Contention;
     seams.push(second.clone());
     let first = report
         .evidence
@@ -70,7 +70,7 @@ fn checks_each_effect_when_multiple_seams_share_a_step() {
         .unwrap();
     let mut delivery = report.evidence[first].clone();
     delivery["value"]["at"] = second.at.into();
-    delivery["value"]["effect"] = "skip".into();
+    delivery["value"]["effect"] = "contention".into();
     report.evidence.insert(first + 1, delivery);
     validate(&case).unwrap();
     assert_eq!(classify(&case, &report), Ok(true));
@@ -238,7 +238,7 @@ fn marker_is_closed_and_cannot_replace_healthy_expectations() {
         CASE.replace("error: RecoveryRequired", "error: RecoveryRequired\n  unknown: value"),
         CASE.replace("--- known_failure", "--- known_failure\nnotes: \"\""),
         CASE.replace("--- expect affected: nodes=1 edges=0", "--- expect error: recovery required"),
-        CASE.replace("--- seam\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: fail\nscope: next_step\n", ""),
+        CASE.replace("--- seam\nat: mutation.post_table_commit\noccurrence: 1\naction: fail\nscope: next_step\n", ""),
         CASE.replace("target: omnigraph-engine-dst", "target: omnigraph-engine"),
     ] {
         assert!(crate::parse_case("dst_mutation_failure_keeps_writing", &text).is_err(), "accepted {text}");

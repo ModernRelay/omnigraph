@@ -183,6 +183,7 @@ struct OptimizeTableTask {
     table_key: String,
     full_path: String,
     expected_version: u64,
+    entry: crate::db::manifest::DatasetEntry,
 }
 
 struct PreparedOptimizeTable {
@@ -301,6 +302,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
                 table_key,
                 full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
                 expected_version: entry.published_dataset_version,
+                entry: entry.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -551,6 +553,11 @@ async fn prepare_optimize_table(
     let snapshot = db
         .storage()
         .open_dataset_head(&task.full_path, None)
+        .await?;
+    // Compaction still commits on the linear HEAD, which must equal the
+    // published version: promote a pending pin first (RFC 0067 bridge).
+    let snapshot = db
+        .promote_pending_pin(&task.table_key, &task.full_path, &task.entry, snapshot)
         .await?;
     let lance_head_version = snapshot.version();
     if lance_head_version < task.expected_version {
@@ -2048,6 +2055,13 @@ mod tests {
     }
 }
 
+decide_seam! {
+    /// In cleanup, after a pending pin was promoted and before its detached
+    /// manifest is deleted (RFC 0067). A failure here leaves a promoted pin
+    /// whose detached manifest the next cleanup reaps.
+    pub static CLEANUP_PRE_REAP = ("cleanup.pre_reap", Unreachable, [Fail]);
+}
+
 /// Promote one pending pin, then delete its detached manifest once the
 /// pin is linear (RFC 0067). Returns the detached versions of a blocked
 /// pin's chain, which cleanup must neither GC around nor reap.
@@ -2073,6 +2087,7 @@ async fn settle_pin_before_cleanup(
     match outcome {
         super::promotion::Promotion::Promoted(_) | super::promotion::Promotion::AlreadyPromoted => {
             let detached = super::promotion::detached_manifest_path(&location, staged);
+            fail(&CLEANUP_PRE_REAP)?;
             if let Err(error) = db.storage_adapter().delete(&detached).await {
                 tracing::warn!(
                     error = %error,

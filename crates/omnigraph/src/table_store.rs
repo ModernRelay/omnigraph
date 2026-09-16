@@ -552,7 +552,6 @@ pub struct StagedWrite {
     /// Exact ids carried by a production strict-insert batch. Kept only until
     /// commit so an effect-free substrate conflict can be re-probed against
     /// fresh manifest authority before it is normalized to `KeyConflict`.
-    strict_source_ids: Option<Vec<String>>,
     /// Fragments to surface alongside the committed manifest in
     /// `Scanner::with_fragments(committed - removed + new)`. For
     /// `Operation::Append` these are the freshly-appended fragments. For
@@ -598,7 +597,6 @@ impl StagedWrite {
         Self {
             transaction,
             commit_metadata: StagedCommitMetadata::default(),
-            strict_source_ids: None,
             new_fragments,
             removed_fragment_ids,
         }
@@ -613,7 +611,6 @@ impl StagedWrite {
         Self {
             transaction,
             commit_metadata,
-            strict_source_ids: None,
             new_fragments,
             removed_fragment_ids,
         }
@@ -630,14 +627,6 @@ impl StagedWrite {
     /// Identity Lance assigned when this effect was staged.
     pub fn transaction_identity(&self) -> StagedTransactionIdentity {
         StagedTransactionIdentity::from(&self.transaction)
-    }
-
-    fn set_strict_source_ids(&mut self, source_ids: Vec<String>) {
-        self.strict_source_ids = Some(source_ids);
-    }
-
-    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
-        self.strict_source_ids.take()
     }
 
     /// Bind a pre-minted recovery identity to a transaction staged after a
@@ -1335,18 +1324,6 @@ impl TableStore {
             ));
         }
         Ok(())
-    }
-
-    pub async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        type_key: &str,
-        expected_version: u64,
-    ) -> Result<Dataset> {
-        let ds = self.open_dataset_head(dataset_uri, branch).await?;
-        self.ensure_expected_version(&ds, type_key, expected_version)?;
-        Ok(ds)
     }
 
     pub async fn fork_branch_from_state(
@@ -3071,14 +3048,12 @@ impl TableStore {
         }
 
         crate::instrumentation::record_stage_fenced_insert(source_ids.len() as u64);
-        let mut staged = StagedWrite::with_commit_metadata(
+        Ok(StagedWrite::with_commit_metadata(
             transaction,
             StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
             visible_fragments,
             Vec::new(),
-        );
-        staged.set_strict_source_ids(source_ids);
-        Ok(staged)
+        ))
     }
 
     /// Resolve any URI-bearing logical blobs into a bounded in-memory keyed

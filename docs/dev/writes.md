@@ -36,6 +36,23 @@ An error before the sidecar/effects leaves graph storage unchanged. Once any
 participant effect is possible, an error that cannot prove a complete terminal
 outcome returns `RecoveryRequired`; it never replans around the partial state.
 
+Mutation and load no longer take the sidecar branch of this protocol. Since
+[RFC 0067](../rfcs/0067-detached-table-commits.md) their participant effects
+are detached Lance commits of the pinned base, so nothing is graph-visible
+before the manifest CAS and nothing needs recovery after it:
+
+```text
+stage exact Lance transactions (no HEAD movement)
+        ↓
+acquire schema → branch → sorted-table gates, recheck the complete authority
+        ↓
+commit each participant as a detached version of its pin
+        ↓
+publish every pin (target, staged version, transaction uuid) + lineage in one manifest CAS
+        ↓
+promote each pin from the held handles (best effort; a pending pin is promoted later)
+```
+
 ## Captured authority
 
 A write attempt captures one immutable `WriteTxn` containing the accepted
@@ -110,9 +127,28 @@ the predecessor's forks are reclaimed by `cleanup` rather than healed in place.
 
 `MutationStaging` accumulates read-your-writes batches and delete predicates
 in memory. It performs all type, value, uniqueness, endpoint, cardinality, and
-resource validation before staging. `stage_all` produces one exact transaction
-per touched table without moving HEAD; `commit_all` enters the gate and
-recovery sequence above.
+resource validation before staging. `stage_all` opens each touched table at
+its pin through the read-handle cache, promoting a pending predecessor pin
+first, and produces one exact transaction per table without moving HEAD.
+`commit_all` enters the gates, revalidates the complete authority, and commits
+every participant as a detached version of its pinned base: no recovery
+sidecar is armed, a table's linear HEAD never moves, and nothing can rebase.
+The manifest then publishes every pin as `(base + 1, staged version,
+transaction uuid)` in one CAS; a publish that loses the CAS returns the plain
+`ReadSetChanged` and the detached manifests are reclaimable garbage. After
+publication the writer promotes each pin from the handles it already holds,
+replaying the recorded transaction at `base` so the linear history gains an
+identical twin. A promotion that fails or is blocked never fails the write:
+the pin stays pending, readable through its staged version, and the next
+writer of that table or `cleanup` promotes it. A pin whose target version a
+foreign linear commit occupies is blocked: a later mutation stages from the
+detached version and its own promotion waits behind the block, while the
+writers that still commit on the linear HEAD (branch merge, index
+maintenance, schema apply, Optimize) promote a pending pin before they plan
+and refuse a blocked one. `omnigraph repair` reports blocked pins as
+`blocked_promotion` and never adopts the foreign commit. First-touch branch
+forks are created without an intent record; an unreferenced fork is garbage
+that cleanup classifies.
 
 Existing-table constructive transactions stage independently with bounded
 concurrency. `OMNIGRAPH_LOAD_CONCURRENCY` selects that width for both Load and
@@ -213,7 +249,9 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Every owned table effect achieved, manifest not yet published | Recovery rolls the fixed outcome forward |
+| Mutation or load fails before publication, after any detached effect | Typed error; no graph movement; the detached manifests are reclaimable garbage |
+| Mutation or load fails after publication, before promotion | Acknowledged; the pin stays pending, readable through its staged version, and the next writer of the table or cleanup promotes it |
+| Every owned table effect of a sidecar writer achieved, manifest not yet published | Recovery rolls the fixed outcome forward |
 | A proven subset achieved | Full recovery compensates or completes according to the writer's fixed plan |
 | Foreign or ambiguous effect | Fail closed; never claim or publish it |
 

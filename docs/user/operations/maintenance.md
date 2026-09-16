@@ -109,6 +109,13 @@ but should be used only when an operator has independently established that the
 the new state of the backing dataset is correct. Repair publishes an existing state; it
 does not rewrite lost or corrupt data.
 
+A `blocked_promotion` classification names a table whose published write
+cannot land on the linear history because a foreign commit took its version.
+Reads and mutations keep working through the pin; branch merge,
+index maintenance, schema apply and optimize refuse that table until the
+block is resolved. Repair reports it and never adopts the foreign commit,
+with or without `--force`.
+
 If you cannot verify suspicious drift, restore or rebuild from a trusted export
 or backup.
 

@@ -41,7 +41,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
-| Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `failpoint_names_guard.rs`, in-source manifest/recovery tests |
+| Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `detached_commit_matrix.rs` (the RFC 0067 writer × window × fault × recovery-actor matrix; `OMNIGRAPH_MATRIX=full` adds the same-handle, other-process and cleanup actors), `failpoint_names_guard.rs`, in-source manifest/recovery tests |
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
@@ -59,7 +59,7 @@ Recovery tests must cover the protocol layer, the writer, and the user-visible r
 
 - in-source tests own sidecar encoding, validation, classification, and exact publication rules;
 - `tests/recovery.rs` owns deterministic completed, partial, ambiguous, and foreign-effect outcomes;
-- `tests/failpoints.rs` owns crash windows around durable effects;
+- `tests/failpoints.rs` owns crash windows around durable effects, including the RFC 0067 windows of a mutation or load (after a detached effect, before and after publication, between promotions) where the graph is unchanged or a pin stays pending;
 - the writer's normal integration owner proves pre-arm failures leave no residue.
 
 To add a seam: declare it beside the site it guards, above the item that

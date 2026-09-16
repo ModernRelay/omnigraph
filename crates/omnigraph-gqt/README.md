@@ -48,8 +48,9 @@ assertion remains a failure unless it meets the explicit known-failure contract 
 
 Place a seam directly before its mutate operation, a GQ mutation or a branch
 statement; no seam is crossed by a query step yet. Several seam blocks may
-precede one operation when they name distinct seams (two lost writes on one
-mutation, `cases/issue_602_stale_sidecar_heals_on_reopen.gqt`); each carries
+precede one operation when they name distinct seams (contention at
+publication and a failure before promotion on one mutation,
+`cases/mutation_pending_pin_survives_reopen.gqt`); each carries
 its own delivery record, and the same seam twice before one operation is
 refused:
 
@@ -69,18 +70,17 @@ selects only contention, so a seam declaring both failure effects lets a
 case choose either. `skip` selects only skip; an undeclared effect is
 refused. `hold` is refused until concurrent steps exist. A seam declares one
 effect when it sits between two steps and several when it wraps one
-operation, so `mutation.sidecar_confirm_put` (effects fail and skip) takes
-either action from a case with no engine change
-(`cases/mutation_sidecar_confirm_put_failure_rolls_back.gqt`,
-`cases/issue_602_stale_sidecar_heals_on_reopen.gqt`). A `fail` action on a
+operation and can declare both fail and skip. A `fail` action on a
 contention-only seam, or an explicit `contention` action, injects a retryable
 error that the publisher retries, so the step succeeds and the `seam_delivered` record is its only
 proof; on a seam declaring fail the step states the injected error in its
-`--- expect error:` row. A `skip` action carries the healthy expectation the
-skipped path produces; a lost durable write is then proven healed by a
-`--- restart` and the query after it
-(`cases/issue_602_stale_sidecar_heals_on_reopen.gqt`), or, while the defect
-stands, pinned by a `--- known_failure` marker on that restart. The occurrence counts
+`--- expect error:` row, unless the site swallows the failure by design (the
+promotion after a mutation's publication, `mutation.post_publish_pre_promotion`,
+where the step succeeds and the delivery record is the proof,
+`cases/mutation_pending_pin_survives_reopen.gqt`). A `skip` action carries
+the healthy expectation the skipped path produces; a lost durable write is
+then proven healed by a `--- restart` and the query after it, or, while the
+defect stands, pinned by a `--- known_failure` marker on that restart. The occurrence counts
 crossings inside that operation, including production retries; setup and
 preceding operations cannot consume it. The installed decision is removed
 before the next operation or restart. Seam directives inside loops are

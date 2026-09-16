@@ -108,6 +108,11 @@ async fn prepare_existing_merge_target(
     let native = entry.native_dataset_branch.as_deref();
     let full_path = db.storage().dataset_uri(&entry.dataset_path);
     let current = db.storage().open_dataset_head(&full_path, native).await?;
+    // The merge commits on the linear HEAD, which must equal the captured
+    // pin: promote a pending pin first (RFC 0067 bridge).
+    let current = db
+        .promote_pending_pin(table_key, &full_path, entry, current)
+        .await?;
     Ok(PreparedExistingMergeTarget {
         current,
         full_path,
@@ -146,6 +151,9 @@ async fn open_first_touch_merge_target(
         )));
     }
     let full_path = db.storage().dataset_uri(&entry.dataset_path);
+    // A fork needs a linear source version: promote the inherited pin first.
+    db.promote_inherited_pin(table_key, &full_path, entry)
+        .await?;
     let current = db
         .fork_dataset_from_entry_state_under_intent(
             table_key,
@@ -1888,6 +1896,9 @@ async fn revalidate_proven_pure_insert_source(
     let head = db
         .storage()
         .open_dataset_head(&full_path, live_entry.native_dataset_branch.as_deref())
+        .await?;
+    let head = db
+        .promote_pending_pin(table_key, &full_path, live_entry, head)
         .await?;
     let live_identifier = db.storage().branch_identifier(&head).await?;
     if live_identifier != proven.source_branch_identifier

@@ -42,6 +42,7 @@ pub(crate) mod table_ops;
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{export_blob_values, logical_row_image};
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+pub(crate) use promotion::HeldPromotion;
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
@@ -3546,23 +3547,40 @@ impl Omnigraph {
         .await
     }
 
-    pub(crate) async fn reopen_for_mutation(
+    /// RFC 0067: the pinned base a writer stages on; see
+    /// `promotion::open_pinned_for_write`.
+    pub(crate) async fn open_pinned_for_write(
         &self,
         table_key: &str,
         full_path: &str,
-        table_branch: Option<&str>,
-        expected_version: u64,
-        op_kind: crate::db::MutationOpKind,
+        entry: &crate::db::DatasetEntry,
     ) -> Result<SnapshotHandle> {
-        table_ops::reopen_for_mutation(
-            self,
-            table_key,
-            full_path,
-            table_branch,
-            expected_version,
-            op_kind,
-        )
-        .await
+        promotion::open_pinned_for_write(self, table_key, full_path, entry).await
+    }
+
+    /// RFC 0067: promote every pin this writer just published, best effort.
+    pub(crate) async fn promote_held_all(&self, held: Vec<HeldPromotion>) {
+        promotion::promote_held_all(self, held).await
+    }
+
+    /// RFC 0067: promote a pending pin before a linear writer plans on it.
+    pub(crate) async fn promote_pending_pin(
+        &self,
+        table_key: &str,
+        full_path: &str,
+        entry: &crate::db::DatasetEntry,
+        head: SnapshotHandle,
+    ) -> Result<SnapshotHandle> {
+        promotion::promote_pending_pin(self, table_key, full_path, entry, head).await
+    }
+
+    pub(crate) async fn promote_inherited_pin(
+        &self,
+        table_key: &str,
+        full_path: &str,
+        entry: &crate::db::DatasetEntry,
+    ) -> Result<()> {
+        promotion::promote_inherited_pin(self, table_key, full_path, entry).await
     }
 
     // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now

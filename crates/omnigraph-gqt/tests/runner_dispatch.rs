@@ -288,11 +288,10 @@ fn replay_uses_frozen_case_and_rejects_changed_evidence() {
 #[test]
 fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text =
-        std::fs::read_to_string(root.join("cases/issue_602_stale_sidecar_heals_on_reopen.gqt"))
-            .unwrap();
+    let text = std::fs::read_to_string(root.join("cases/mutation_pending_pin_survives_reopen.gqt"))
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("issue_602_two_seams.gqt");
+    let path = dir.path().join("two_seams.gqt");
     std::fs::write(&path, &text).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
         .arg(&path)
@@ -313,14 +312,12 @@ fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
         .collect::<Vec<_>>();
     assert_eq!(
         delivered,
-        vec![
-            "mutation.sidecar_confirm_put",
-            "mutation.sidecar_post_publish_delete"
-        ],
+        vec!["publish.load_state", "mutation.post_publish_pre_promotion"],
         "one delivery record per seam, in declaration order"
     );
 
-    let confirm_block = "--- seam\nat: mutation.sidecar_confirm_put\noccurrence: 1\naction: skip\nscope: next_step\n";
+    let confirm_block =
+        "--- seam\nat: publish.load_state\noccurrence: 1\naction: contention\nscope: next_step\n";
     let repeated = text.replace(confirm_block, &format!("{confirm_block}\n{confirm_block}"));
     assert_ne!(
         repeated, text,
@@ -377,7 +374,7 @@ fn contention_action_records_the_retryable_effect_and_keeps_legacy_fail() {
     }
     std::fs::write(
         &path,
-        text.replace("publish.load_state", "mutation.sidecar_confirm_put"),
+        text.replace("publish.load_state", "mutation.post_table_commit"),
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
@@ -472,7 +469,7 @@ fn selecting_engine_does_not_allow_blessing_a_shared_case() {
 #[test]
 fn known_recovery_failure_is_explicit_and_replay_status_is_verified() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = root.join("cases/dst_mutation_failure_keeps_writing.gqt");
+    let path = root.join("cases/merge_armed_intent_blocks_main_until_reopen.gqt");
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
         .arg(&path)
         .output()
@@ -540,13 +537,17 @@ fn known_recovery_failure_is_explicit_and_replay_status_is_verified() {
 fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let text =
-        std::fs::read_to_string(root.join("cases/dst_mutation_failure_keeps_writing.gqt")).unwrap();
+        std::fs::read_to_string(root.join("cases/merge_armed_intent_blocks_main_until_reopen.gqt"))
+            .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("known_failure_refusals.gqt");
     let selected = text.replace("seeds: [0, 42]", "seeds: [42]");
     for (text, expected) in [
         (
-            selected.replace("pending Mutation recovery", "different Mutation recovery"),
+            selected.replace(
+                "pending BranchMerge recovery",
+                "different BranchMerge recovery",
+            ),
             "recovery required",
         ),
         (
@@ -555,8 +556,8 @@ fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass
         ),
         (
             selected.replace("step: 4", "step: 5").replace(
-                "--- mutate branch: work\nquery retry",
-                "--- restart\n\n--- mutate branch: work\nquery retry",
+                "--- mutate\nquery retry",
+                "--- restart\n\n--- mutate\nquery retry",
             ),
             "unexpected_pass",
         ),

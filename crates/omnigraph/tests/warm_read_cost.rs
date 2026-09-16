@@ -1168,6 +1168,9 @@ async fn repeat_warm_read_reuses_table_handles() {
         let mut db = init_and_load(&dir).await;
         // Deep history: the win must hold regardless of commit count.
         commit_many(&mut db, 10).await;
+        // A writer holds the version it landed (RFC 0067), so the cold read
+        // is measured on a fresh handle.
+        let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
 
         // Cold first read: opens the touched table.
         let (cold_out, cold) = measure(db.query(
@@ -1238,7 +1241,10 @@ async fn write_invalidates_table_cache_for_changed_table() {
     .await
     .unwrap();
 
-    // The next read re-opens Person at the new version (cache miss).
+    // The next read serves Person at the new version from the handle the
+    // write landed in the cache (RFC 0067: the writer holds the twin it
+    // promoted), so no open happens and the new row is still observed: the
+    // version-keyed cache never serves a stale handle.
     let (out, io) = measure(db.query(
         ReadTarget::branch("main"),
         TEST_QUERIES,
@@ -1247,9 +1253,9 @@ async fn write_invalidates_table_cache_for_changed_table() {
     ))
     .await;
     out.unwrap();
-    assert!(
-        io.data_reads > 0,
-        "a read after a write to the table must re-open it (version-keyed miss)"
+    assert_eq!(
+        io.data_reads, 0,
+        "a read after a write on the same handle is served from the landed version's handle"
     );
 
     let after = count_rows(&db, "node:Person").await;
