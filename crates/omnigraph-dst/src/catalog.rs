@@ -48,7 +48,7 @@ pub const CRASH_WINDOWS: [&str; 70] = [
     "mutation.post_finalize_pre_publisher",
     "mutation.post_fork_pre_commit",
     "mutation.post_no_effect_pre_gate",
-    "mutation.post_sidecar_pre_fork",
+    "mutation.post_publish_pre_promotion",
     "mutation.post_stage_pre_effect_gate",
     "mutation.post_table_commit",
     "open.before_schema_contract_read",

@@ -792,9 +792,7 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
             return vec![MutateMain, DeleteFixtureOnMain];
         }
         // First-touch fork route: fresh branch, then its first data op.
-        "mutation.post_sidecar_pre_fork"
-        | "mutation.post_fork_pre_commit"
-        | "fork.post_create_pre_open" => {
+        "mutation.post_fork_pre_commit" | "fork.post_create_pre_open" => {
             return vec![EnsureBranch, DataOnBranch];
         }
         "classify.fresh_read" | "cleanup.reconcile_fork" => {
@@ -1905,7 +1903,7 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
         // Only the implicit fork-if-missing path crosses this one.
         return matches!(wop, WorldOp::LoadFork { .. });
     }
-    if window == "mutation.post_sidecar_pre_fork" || window == "mutation.post_fork_pre_commit" {
+    if window == "mutation.post_fork_pre_commit" {
         // Deferred-fork route: only a data op OFF main can be a first touch
         // (main's tables are native, never forked). Scheduling these on main
         // ops is a guaranteed miss.

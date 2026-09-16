@@ -2124,7 +2124,7 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
 /// - recovery.* internals: each executes only during a recovery pass of the
 ///   matching SHAPE — primary picked from the ledger's commit-point map
 ///   (post_phase_b merge = roll-forward; post_table_commit mutation =
-///   rollback+restore; post_sidecar_pre_fork = zero-effect orphan discard;
+///   rollback+restore; post_fork_pre_commit = zero-effect orphan discard;
 ///   post_finalize = any recovery pass for the list/audit steps).
 fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
     match window {
