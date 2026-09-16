@@ -100,7 +100,7 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage, stable row IDs, vector ordering fences, and Blob reads through compaction. If an upstream limitation disappears, remove the workaround and its guard together.
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and its guard together.
 
 ## Server and CLI ownership
 
