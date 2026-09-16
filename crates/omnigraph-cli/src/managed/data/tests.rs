@@ -6,6 +6,151 @@ use omnigraph::db::ReadTarget;
 
 const DATA_TOKEN: &str = "header.payload.signature";
 
+#[tokio::test]
+async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before_submission() {
+    for expired in [false, true] {
+        let mut context = context();
+        let cp = IntentApiFixture::with_origin(|origin| {
+            context.api = origin.to_owned();
+            let credential = identity_credential(&context, "https://data.example");
+            let mut response = credential.metadata();
+            response["token"] = json!(credential.token);
+            vec![IntentReply::json(
+                200,
+                json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
+            )]
+        });
+        let store = MemoryStore::default();
+        if expired {
+            let mut saved = identity_credential(&context, "https://data.example");
+            saved.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
+                .format(&Rfc3339)
+                .unwrap();
+            save(&store, &context, &saved);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        super::super::save_context(dir.path(), &context).unwrap();
+        let cli =
+            Cli::try_parse_from(["omnigraph", "mutate", "m", "--graph", "knowledge"]).unwrap();
+        let client = resolve_with_acquisition(
+            &cli,
+            dir.path(),
+            &store,
+            || Ok(false),
+            async |_| Ok(Some("alice".into())),
+            async |context| Api::new(context.api.clone(), Some("provider-access".into())),
+        )
+        .await
+        .unwrap();
+        assert!(client.is_some());
+        assert_eq!(cp.requests().len(), 1);
+        assert_eq!(cp.requests()[0].path, "/v1/clusters/cluster-a/tokens");
+        assert_eq!(
+            cp.requests()[0].body,
+            json!({"version":2,"ttl_seconds":3600})
+        );
+        assert!(
+            resolve_with_acquisition(
+                &cli,
+                dir.path(),
+                &store,
+                || Ok(false),
+                async |_| Ok(Some("alice".into())),
+                async |_| { panic!("valid graph credential must not call the API") }
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        cp.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn acquisition_preserves_explicit_target_priority_and_never_widens_restricted_credentials() {
+    let context = context();
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let store = MemoryStore::default();
+    let explicit = Cli::try_parse_from([
+        "omnigraph",
+        "query",
+        "q",
+        "--server",
+        "https://explicit.example",
+        "--graph",
+        "knowledge",
+    ])
+    .unwrap();
+    assert!(
+        resolve_with_acquisition(
+            &explicit,
+            dir.path(),
+            &store,
+            || panic!("explicit target reads ambient state"),
+            async |_| panic!("explicit target reads managed identity"),
+            async |_| panic!("explicit target calls issuer")
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let mut restricted = credential(&context, "https://data.example");
+    restricted.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
+        .format(&Rfc3339)
+        .unwrap();
+    save(&store, &context, &restricted);
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    let failure = resolve_with_acquisition(
+        &cli,
+        dir.path(),
+        &store,
+        || Ok(false),
+        async |_| Ok(None),
+        async |_| panic!("restricted credential widened"),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(failure.body["type"], "data_credential_expired");
+}
+
+#[tokio::test]
+async fn acquisition_never_reuses_another_principal_or_accepts_a_wrong_issued_identity() {
+    let mut context = context();
+    let cp = IntentApiFixture::with_origin(|origin| {
+        context.api = origin.into();
+        let credential = identity_credential(&context, "https://data.example");
+        let mut response = credential.metadata();
+        response["token"] = json!(credential.token);
+        vec![IntentReply::json(
+            200,
+            json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
+        )]
+    });
+    let store = MemoryStore::default();
+    let old = identity_credential(&context, "https://data.example");
+    save(&store, &context, &old);
+    let before = store.get(&key(&context)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    super::super::save_context(dir.path(), &context).unwrap();
+    let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
+    assert!(
+        resolve_with_acquisition(
+            &cli,
+            dir.path(),
+            &store,
+            || Ok(false),
+            async |_| Ok(Some("bob".into())),
+            async |context| Api::new(context.api.clone(), Some("bob-provider-token".into()))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(store.get(&key(&context)).unwrap(), before);
+    cp.assert_complete();
+}
+
 fn context() -> Context {
     Context {
         version: 1,
@@ -263,7 +408,17 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
 #[tokio::test]
 async fn identity_issuance_caches_no_permissions_and_discovers_without_control_calls() {
     let discovery = json!({"graphs":[{"graph_id":"hidden","display_name":"hidden"}]});
-    let data = IntentApiFixture::new(vec![IntentReply::json(200, discovery.clone())]);
+    let commit = json!({"graph_commit_id":"head-a","graph_branch":"main","graph_manifest_version":7,
+        "parent_commit_id":null,"merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
+    let data = IntentApiFixture::new(vec![
+        IntentReply::json(200, discovery.clone()),
+        IntentReply::json(
+            403,
+            json!({"error":"current policy denies change","code":"forbidden"}),
+        ),
+        IntentReply::json(200, json!({"commits":[commit.clone()]})),
+        IntentReply::json(200, commit.clone()),
+    ]);
     let mut context = context();
     let cp = IntentApiFixture::with_origin(|origin| {
         context.api = origin.to_owned();
@@ -304,6 +459,87 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     let result = client.discover_graphs().await.unwrap();
     assert_eq!(serde_json::to_value(result).unwrap(), discovery);
     assert_eq!(data.requests()[0].path, "/graphs/discovery");
+    // Identity credentials deliberately have no local action ceiling. Load
+    // and lineage commands reach the exact cached endpoint, where current
+    // policy decides permission, even after the control API is gone.
+    let batch = dir.path().join("batch.jsonl");
+    std::fs::write(&batch, "{}\n").unwrap();
+    for (command, path) in [
+        (
+            vec![
+                "load",
+                "--data",
+                batch.to_str().unwrap(),
+                "--mode",
+                "append",
+                "--from",
+                "main",
+                "--branch",
+                "review",
+            ],
+            "/graphs/knowledge/load/ndjson?branch=review&mode=append&from=main",
+        ),
+        (
+            vec!["commit", "list", "--branch", "main"],
+            "/graphs/knowledge/commits?branch=main",
+        ),
+        (
+            vec!["commit", "show", "head-a"],
+            "/graphs/knowledge/commits/head-a",
+        ),
+    ] {
+        let selected = Cli::try_parse_from(
+            ["omnigraph", "--graph", "knowledge"]
+                .into_iter()
+                .chain(command.clone()),
+        )
+        .unwrap();
+        let client = resolve(&selected, dir.path(), &store, || Ok(false))
+            .unwrap()
+            .unwrap();
+        match command.as_slice() {
+            ["load", ..] => {
+                let error = client
+                    .load(
+                        "review",
+                        Some("main"),
+                        batch.to_str().unwrap(),
+                        crate::cli::CliLoadMode::Append,
+                    )
+                    .await
+                    .unwrap_err();
+                let refusal = error
+                    .downcast_ref::<crate::helpers::RemoteErrorCli>()
+                    .expect("preserve the server policy refusal");
+                assert_eq!(
+                    serde_json::to_value(&refusal.output).unwrap()["code"],
+                    "forbidden"
+                );
+                assert_eq!(refusal.output.error, "current policy denies change");
+            }
+            ["commit", "list", ..] => {
+                let output = client.list_commits(Some("main")).await.unwrap();
+                assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
+            }
+            _ => assert_eq!(
+                serde_json::to_value(client.get_commit("head-a").await.unwrap()).unwrap(),
+                commit
+            ),
+        }
+        let requests = data.requests();
+        let request = requests.last().unwrap();
+        assert_eq!(request.path, path);
+        assert_eq!(
+            request.headers["authorization"],
+            format!("Bearer {}", saved["token"].as_str().unwrap())
+        );
+        assert!(!request.headers.contains_key("x-actor-id"));
+    }
+    assert_eq!(data.requests().len(), 4, "one attempt per operation");
+    assert_eq!(
+        serde_json::from_str::<Value>(&store.get(&key(&context)).unwrap().unwrap()).unwrap(),
+        saved
+    );
     data.assert_complete();
     save(&store, &context, &credential(&context, &data.origin));
     let failure = resolve(&cli, dir.path(), &store, || Ok(false))
@@ -583,7 +819,6 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
             vec!["change", "m", "--cluster", "local"],
             vec!["query", "q", "--direct"],
             vec!["init", "--schema", "schema.pg", "file:///scratch"],
-            vec!["load", "--data", "data.jsonl", "--mode", "append"],
             vec![
                 "load",
                 "--data",
@@ -629,8 +864,6 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
             ],
             vec!["schema", "plan", "--schema", "schema.pg"],
             vec!["commit", "list", "file:///scratch"],
-            vec!["commit", "list"],
-            vec!["commit", "show", "commit-a"],
             vec!["commit", "list", "--direct"],
             vec!["commit", "list", "--server", "legacy"],
             vec!["commit", "list", "--profile", "legacy"],
@@ -662,11 +895,10 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
 }
 
 #[tokio::test]
-async fn managed_commit_transport_uses_legacy_grant_read_authority() {
-    // Version-1 signed-grant compatibility: this fixture supplies `read`
-    // manually and uses the cached endpoint. It does not qualify CLI action mapping or
-    // equality against an independently selected endpoint.
+async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fallback() {
+    let dir = tempfile::tempdir().unwrap();
     let context = context();
+    super::super::save_context(dir.path(), &context).unwrap();
     let store = MemoryStore::default();
     let commit = json!({
         "graph_commit_id":"commit-a", "graph_branch":null,
@@ -678,9 +910,22 @@ async fn managed_commit_transport_uses_legacy_grant_read_authority() {
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
         IntentReply::json(200, commit.clone()),
     ]);
-    for operation in ["list", "show"] {
+    for command in [vec!["commit", "list"], vec!["commit", "show", "commit-a"]] {
+        let cli = Cli::try_parse_from(
+            ["omnigraph", "--graph", "knowledge"]
+                .into_iter()
+                .chain(command.clone()),
+        )
+        .unwrap();
         assert_eq!(
-            load(&store, &context, "knowledge", &["read"])
+            resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
+                .err()
+                .unwrap()
+                .body["type"],
+            "managed_target_ambiguous"
+        );
+        assert_eq!(
+            resolve(&cli, dir.path(), &store, || Ok(false))
                 .err()
                 .unwrap()
                 .body["type"],
@@ -690,7 +935,7 @@ async fn managed_commit_transport_uses_legacy_grant_read_authority() {
         cached.grants[0].actions = vec!["change".into()];
         save(&store, &context, &cached);
         assert_eq!(
-            load(&store, &context, "knowledge", &["read"])
+            resolve(&cli, dir.path(), &store, || Ok(false))
                 .err()
                 .unwrap()
                 .body["type"],
@@ -698,8 +943,10 @@ async fn managed_commit_transport_uses_legacy_grant_read_authority() {
         );
         cached.grants[0].actions = vec!["read".into()];
         save(&store, &context, &cached);
-        let client = load(&store, &context, "knowledge", &["read"]).unwrap();
-        if operation == "list" {
+        let client = resolve(&cli, dir.path(), &store, || Ok(false))
+            .unwrap()
+            .unwrap();
+        if command[1] == "list" {
             let output = client.list_commits(Some("main")).await.unwrap();
             assert_eq!(serde_json::to_value(&output.commits[0]).unwrap(), commit);
         } else {
@@ -707,6 +954,14 @@ async fn managed_commit_transport_uses_legacy_grant_read_authority() {
             assert_eq!(serde_json::to_value(output).unwrap(), commit);
         }
         clear(&store, &context).unwrap();
+        let no_graph = Cli::try_parse_from(std::iter::once("omnigraph").chain(command)).unwrap();
+        assert_eq!(
+            resolve(&no_graph, dir.path(), &NoCredentialAccess, || Ok(false))
+                .err()
+                .unwrap()
+                .body["type"],
+            "graph_required"
+        );
     }
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
@@ -725,18 +980,35 @@ async fn managed_commit_transport_uses_legacy_grant_read_authority() {
 }
 
 #[test]
-fn managed_load_legacy_grant_cache_checks_explicit_graph_and_actions() {
-    // Version-1 signed-grant compatibility. The caller supplies required actions;
-    // this does not qualify CLI action mapping or equality against an
-    // independently selected endpoint.
+fn managed_load_requires_exact_graph_change_and_explicit_fork_authority() {
+    let dir = tempfile::tempdir().unwrap();
     let context = context();
+    super::super::save_context(dir.path(), &context).unwrap();
     let store = MemoryStore::default();
+    let args = [
+        "omnigraph",
+        "load",
+        "--data",
+        "batch.jsonl",
+        "--mode",
+        "append",
+        "--graph",
+        "knowledge",
+    ];
+    let cli = Cli::try_parse_from(args).unwrap();
     assert_eq!(
-        load(&store, &context, "knowledge", &["change"])
+        resolve(&cli, dir.path(), &store, || Ok(false))
             .err()
             .unwrap()
             .body["type"],
         "data_credential_required"
+    );
+    assert_eq!(
+        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
+            .err()
+            .unwrap()
+            .body["type"],
+        "managed_target_ambiguous"
     );
     for (actions, graph, from, allowed) in [
         (vec!["read"], "knowledge", false, false),
@@ -750,18 +1022,46 @@ fn managed_load_legacy_grant_cache_checks_explicit_graph_and_actions() {
         cached.grants[0].graph_id = graph.into();
         cached.grants[0].actions = actions.into_iter().map(str::to_string).collect();
         save(&store, &context, &cached);
-        let required = if from {
-            vec!["change", "branch_create"]
+        let extra = if from {
+            vec!["--branch", "review", "--from", "main"]
         } else {
-            vec!["change"]
+            vec![]
         };
-        let result = load(&store, &context, "knowledge", &required);
+        let cli = Cli::try_parse_from(args.into_iter().chain(extra)).unwrap();
+        let result = resolve(&cli, dir.path(), &store, || Ok(false));
         if allowed {
-            assert!(result.is_ok());
+            assert!(result.unwrap().is_some());
         } else {
             assert_eq!(result.err().unwrap().body["type"], "data_scope_missing");
         }
     }
+    let cli = Cli::try_parse_from(args.into_iter().chain(["--as", "fake"])).unwrap();
+    assert_eq!(
+        resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(false))
+            .err()
+            .unwrap()
+            .body["type"],
+        "managed_scope_conflict"
+    );
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    assert!(
+        resolve(&cli, &child, &NoCredentialAccess, || panic!(
+            "parent context was read"
+        ))
+        .unwrap()
+        .is_none()
+    );
+    std::fs::write(dir.path().join(".omnigraph/context"), "invalid").unwrap();
+    assert_eq!(
+        resolve(&cli, dir.path(), &NoCredentialAccess, || panic!(
+            "invalid context consulted defaults"
+        ))
+        .err()
+        .unwrap()
+        .body["type"],
+        "context_invalid"
+    );
 }
 
 #[test]
@@ -916,27 +1216,43 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
 }
 
 #[tokio::test]
-async fn managed_load_transport_sends_exact_ndjson_and_preserves_the_server_receipt() {
-    // Transport preparation with a version-1 signed-grant credential and a cached
-    // endpoint; no managed CLI routing or selected-endpoint equality is implied.
+async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let context = context();
+    super::super::save_context(dir.path(), &context).unwrap();
     let batch = dir.path().join("batch.jsonl");
     let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
     std::fs::write(&batch, ndjson).unwrap();
     let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
     let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"actor_id":"principal:alice","commit":commit});
-    // A delayed response validates the prepared load transport's receipt.
+    // This is a real response past the ordinary managed 30-second deadline.
     // The request-construction owner separately pins load's 300-second ceiling.
     let server = IntentApiFixture::with_response_delay(
         vec![IntentReply::json(200, reply)],
-        std::time::Duration::from_millis(10_250),
+        std::time::Duration::from_millis(30_750),
     );
     let store = MemoryStore::default();
     let mut cached = credential(&context, &server.origin);
     cached.grants[0].actions = vec!["change".into(), "branch_create".into()];
     save(&store, &context, &cached);
-    let client = load(&store, &context, "knowledge", &["change", "branch_create"]).unwrap();
+    let cli = Cli::try_parse_from([
+        "omnigraph",
+        "load",
+        "--data",
+        batch.to_str().unwrap(),
+        "--graph",
+        "knowledge",
+        "--mode",
+        "append",
+        "--branch",
+        "review",
+        "--from",
+        "main",
+    ])
+    .unwrap();
+    let client = resolve(&cli, dir.path(), &store, || Ok(false))
+        .unwrap()
+        .unwrap();
     let result = client
         .load(
             "review",

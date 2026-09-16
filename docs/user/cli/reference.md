@@ -1,7 +1,6 @@
 # CLI reference
 
-This page is a map of the `omnigraph` command surface. The installed binary is
-the exact reference:
+This page maps the CLI; the installed binary is the exact reference:
 
 ```bash
 omnigraph --help
@@ -71,8 +70,6 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `alias` | Invoke a personal stored-query alias | served |
 | `version` | Print build and storage-format information | local |
 
-The [CLI guide](index.md) gives end-to-end examples. Maintenance safety is
-covered in [Maintenance](../operations/maintenance.md).
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
 `--as` for actor attribution. Direct maintenance does not load server policy;
 see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
@@ -163,6 +160,13 @@ are refused. See [storage migration](../operations/upgrade.md#explicit-storage-m
 missing branch from an explicit base. Overwrite is destructive and may require
 `--yes` for non-local storage.
 
+In a selected managed folder, implicit `load --graph <ID>` uses the separate
+cached data credential. It requires `change`, plus `branch_create` when
+`--from` is present. Managed loads bound input to 32 MiB, responses to 8 MiB,
+and one request to 300 seconds; uncertain writes are never automatically
+retried. See [managed bulk loading](managed-data.md#bulk-loading) for limits,
+permissions, ordinary addressing, and reconciliation.
+
 Change-feed commands, cursor checkpointing, and baseline recovery are described
 in [Changes and Change Feeds](../branching/changes.md).
 
@@ -200,14 +204,9 @@ clusters:
     root: s3://company-data/omnigraph
 
 profiles:
-  prod-knowledge:
-    server: prod
-    default_graph: knowledge
-  company-admin:
-    cluster: company
-    default_graph: knowledge
-  local-dev:
-    store: file:///tmp/dev.omni
+  prod-knowledge: {server: prod, default_graph: knowledge}
+  company-admin: {cluster: company, default_graph: knowledge}
+  local-dev: {store: file:///tmp/dev.omni}
 
 aliases:
   experts:
@@ -230,21 +229,19 @@ invocation.
 
 ## Managed cluster commands
 
-`omnigraph login --api ORIGIN` prints a verification URL and user code to
-stderr. Complete the browser login while the CLI polls. The resulting opaque
-service session is stored in the OS keychain under the canonical API origin:
-macOS Keychain, Windows Credential Manager, or encrypted Secret Service on
-Linux and BSD. There is no plaintext fallback. Sessions expire within 15
-minutes, and the CLI stores no refresh token; run login again after expiry.
-An unavailable keychain refuses the operation. Login JSON includes identity
-and expiry, never a token or device secret.
+`omnigraph login --api ORIGIN` reuses valid cached access or prints a WorkOS
+AuthKit verification URL and user code. The OS keychain holds provider-bound
+access and rotating refresh credentials; old opaque sessions are not reused.
+Access lasts at most 15 minutes; silent renewal ends eight hours after sign-in.
+Normal commands never open browser login. Login JSON reports identity and
+expiry metadata, never credentials. Temporary errors preserve cached access;
+an uncertain refresh is never replayed and may require explicit login.
+See the [authentication contract](../../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+for binding, coordination and refresh bounds.
 
-`omnigraph logout --api ORIGIN` revokes that session and removes only that
-origin's local entry. If revocation fails, the local entry is still removed
-and the error reports `revocation_confirmed: false`; the remote session
-remains subject to its expiry. Accepted runs continue after logout.
-The existing `login SERVER --token` and `logout SERVER` commands retain their
-named-server credential behavior.
+`omnigraph logout --api ORIGIN` requests provider-session revocation and clears
+local credentials. Its `provider_revocation_confirmed` result reports whether
+revocation succeeded. Accepted runs continue. Named-server login is unchanged.
 
 `omnigraph use CLUSTER_ID --api ORIGIN [--config DIR] [--json]` verifies access
 to the cluster, then atomically writes `DIR/.omnigraph/context`:
@@ -329,9 +326,12 @@ context is present. API failures never trigger direct execution.
 
 ## Managed data access
 
-`cluster token` caches an identity credential; applied Cedar policy supplies
-permissions. See [managed data access](managed-data.md) for graph discovery,
-routing, offline access, expiry, clearing and explicit restricted credentials.
+After login and cluster selection, use `graphs list` to discover graphs, then
+`query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
+Missing or expired identity credentials are acquired before the operation;
+applied Cedar policy decides permissions. See [managed data access](managed-data.md)
+for offline behavior, identity binding, explicit restricted credentials,
+discovery and credential clearing.
 
 ## Confirmation rules
 
