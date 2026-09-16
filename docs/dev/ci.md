@@ -6,6 +6,14 @@ Workflow YAML under `.github/workflows/` is the source of truth. This page expla
 
 `ci.yml` always classifies the diff. Only recognized documentation files may take the documentation-only path; a text fixture under a crate is source code.
 
+Merge queues trigger `ci.yml`, `gq-logic-tests.yml`, and `dst.yml` through
+`merge_group: checks_requested`. These runs check out the combined queue
+commit and always run full qualification, including formatting, Clippy,
+workspace tests, GQT, and DST. Workspace tests fail fast as they do on pull
+requests. The PR metadata gate stays on `pull_request_target`; vocabulary
+audits and Azurite retain their post-merge schedule. Queue runs never publish
+releases or save the main branch's caches.
+
 Branch protection currently requires these reporting contexts:
 
 - `Classify Changes`

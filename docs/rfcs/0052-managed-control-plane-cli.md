@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-06
+updated: 2026-09-16
 discussion: https://github.com/ModernRelay/omnigraph/pull/629
 supersedes: []
 superseded_by: []
@@ -15,6 +15,11 @@ blocked_on: []
 ---
 
 # RFC 0052: Managed control-plane CLI
+
+> The [identity and applied-policy extension](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+> replaces this RFC's original authentication contract with provider-native
+> login and automatic identity acquisition. The routing and exact-plan
+> execution contracts below remain applicable.
 
 ## Summary
 
@@ -32,8 +37,7 @@ external repository, but users currently need raw HTTP requests. The CLI has
 direct cluster commands and per-server token login, neither of which can
 substitute for managed identity, durable runs, leases, and signed offers.
 Routing and credential ownership are public contracts, so this is an RFC
-rather than a local command refactor. The companion control-plane decision
-is DEC-08-22 in `ModernRelay/og-control-plane/specs/02-DEC-Decisions.md`.
+rather than a local command refactor.
 
 ## User and operational behavior
 
@@ -96,16 +100,15 @@ origins, without userinfo, path, query, or fragment. HTTPS is mandatory except
 exact loopback hosts for local integration. Redirects are refused; each
 request has a 10-second deadline and 8 MiB body limit.
 
-`login --api` calls the Intent API's device authorization and polling routes.
-The service brokers WorkOS's native device flow and reuses its browser login
-JWT, membership, enrollment, and grant checks. The CLI prints the verification
-URL/user code, never the device secret. It respects expiry and polling
-interval, including slowdown, and saves only the returned opaque session in
-the OS keychain under the canonical API origin. Sessions live at most 15
-minutes and no longer than the provider token. No provider access/refresh
-token is stored by the CLI. An unavailable keychain refuses without a
-plaintext fallback. Logout revokes the service session and removes the local
-entry; session expiry requires a new login. Accepted runs continue normally.
+The original authentication contract used service-brokered device login and
+an opaque session, stored only in the OS keychain for at most 15 minutes.
+That protocol is superseded by the
+[provider-native authentication contract](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients).
+The current CLI uses the provider SDK directly and does not retain the
+broker's device, refresh or opaque-session cache paths. Upgrade the API and
+CLI together and sign in again; no broker migration period is required.
+Named-server credentials and the public restricted data-token verifier are
+separate compatibility contracts, not fallbacks for managed login.
 
 Scoped automation may supply `OMNIGRAPH_CONTROL_TOKEN` only together with
 `OMNIGRAPH_CONTROL_API` matching the selected canonical origin. Data-plane
@@ -136,7 +139,7 @@ Unsupported managed commands refuse before direct execution.
 No stored graph or server API format changes. Removing the context or using
 `--direct` restores the existing direct path intentionally. Older CLI builds
 do not understand this context contract and must not be presented as safe
-managed clients; deploying the new CLI and API together is the pilot boundary.
+managed clients; deploy a compatible CLI and API together.
 The server SDK and Python SDK gain no new authority or dependencies.
 
 ## Alternatives
@@ -147,8 +150,9 @@ The server SDK and Python SDK gain no new authority or dependencies.
   the existing cluster command model and duplicates discoverability/docs.
 - Inferring managed mode from storage roots or existing server aliases risks
   forwarding the wrong credential; explicit context and origin binding win.
-- Refresh-token persistence adds rotation/revocation/storage behavior beyond
-  the bounded pilot. Re-login after expiry keeps the browser contract.
+- Requiring browser sign-in after every short access lifetime interrupts
+  long-running commands. The provider-native extension owns bounded renewal
+  and keeps provider credentials in the OS keychain.
 - Plaintext fallback helps headless setup but silently weakens human secret
   storage. Explicit scoped automation credentials cover unattended execution.
 
@@ -162,25 +166,20 @@ process tests do not touch user keychains or operator configuration. The
 focused baseline passed 91 unit tests and 45 cluster process tests, including
 the existing direct behavior.
 
-The control-plane repository owns transactional permission/revocation,
-device replay, and abandon/apply race tests plus a kind proof driven by this
-actual CLI binary. The passing proof compares CLI/API plan and bundle digests,
-terminal outcome, receipts and readiness witness, and tests cancellation,
-idempotency and denied access. A separate live WorkOS pilot passed native
-device login, real OS keychain storage, exact-plan apply through readiness,
-permission removal and restoration for the same session, and logout. This
-live evidence covers one identity and a nondestructive plan; it does not
-replace deterministic provider fixtures or claim a full browser/two-user
-qualification matrix.
+API implementations separately own transactional permission/revocation,
+device replay, and abandon/apply races. Integration qualification must compare
+CLI/API plan and bundle digests, terminal outcomes, and readiness witnesses,
+and exercise cancellation, idempotency and denied access. Provider fixtures
+do not establish live browser or multi-user interoperability.
 
 ## Rollout
 
 Land the public contract and implementation together with CLI user docs and
-release notes. The companion API adds device sessions and plan abandonment
+release notes. A compatible API supplies authentication and plan abandonment
 without changing executor or engine gates. Existing CLI/direct and managed
 HTTP tests must pass before recommending the managed client. Data-plane
-tokens, managed-store editing, provisioning, console, SSE, and persistent
-refresh tokens remain out of scope for this increment. Managed-store editing
+tokens, managed-store editing, provisioning, console and SSE were outside the
+initial increment. Managed-store editing
 and service provisioning are extended by
 [RFC 0061](0061-managed-cluster-lifecycle.md).
 
@@ -196,7 +195,7 @@ rather than introducing a root-URI override the Core does not currently expose.
 
 2026-09-05: Accepted after maintainer-authorized review of the implementation,
 compatibility, bounded HTTP and credential handling, focused regression
-suites, the full native CLI kind proof, and the separate live WorkOS pilot.
+suites and native CLI integration qualification.
 No engine or storage contract changes are required. Data access remains a
 separate increment; this decision authorizes control-plane operations only.
 

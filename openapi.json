@@ -10,6 +10,27 @@
     "version": "0.11.0"
   },
   "paths": {
+    "/.well-known/oauth-protected-resource": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "operationId": "oauthProtectedResourceMetadata",
+        "responses": {
+          "200": {
+            "description": "Public OAuth protected resource metadata",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "OAuth resource identity is not configured"
+          }
+        }
+      }
+    },
     "/graphs": {
       "get": {
         "tags": [

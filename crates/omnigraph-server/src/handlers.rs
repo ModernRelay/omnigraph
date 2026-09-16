@@ -164,9 +164,9 @@ pub(crate) async fn server_graphs_discovery(
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphDiscoveryResponse>, ApiError> {
     let actor = actor.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
-    if actor.identity_claims().is_none() {
+    if !actor.is_identity() {
         return Err(ApiError::forbidden(
-            "graph discovery requires a version 2 identity credential",
+            "graph discovery requires an admitted identity credential",
         ));
     }
     // Both sets come from the accepted boot inventory. Never scan storage or
@@ -220,7 +220,13 @@ const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
 /// always-flat endpoints. `/graphs` is the management enumeration —
 /// it lives at the root in both single mode (405) and multi mode, and
 /// must never be rewritten to `/graphs/{graph_id}/graphs`.
-const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/readyz", "/graphs", "/graphs/discovery"];
+const ALWAYS_FLAT_PATHS: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/graphs",
+    "/graphs/discovery",
+    "/.well-known/oauth-protected-resource",
+];
 
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the
@@ -328,6 +334,10 @@ pub(crate) async fn require_bearer_auth(
     request.extensions_mut().remove::<AuthenticatedActor>();
     if !state.requires_bearer_auth() {
         return Ok(next.run(request).await);
+    }
+
+    if request.headers().get_all(AUTHORIZATION).iter().count() != 1 {
+        return Err(ApiError::unauthorized("one bearer credential is required"));
     }
 
     let Some(header) = request
@@ -1480,7 +1490,7 @@ pub(crate) async fn server_mutate_if_graph_commit(
 /// Path parameter for `POST /queries/{name}`.
 #[derive(Deserialize)]
 pub(crate) struct QueryNamePath {
-    name: String,
+    pub(crate) name: String,
 }
 
 pub(crate) fn parse_optional_invoke_body(

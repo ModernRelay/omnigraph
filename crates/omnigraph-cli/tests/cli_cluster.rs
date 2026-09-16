@@ -920,7 +920,7 @@ fn managed_data_issue_633_ambient_targets_refuse_without_selecting_either() {
         let home = temp.path().join("operator");
         fs::create_dir(&home).unwrap();
         fs::write(home.join("config.yaml"), config).unwrap();
-        for verb in ["query", "mutate"] {
+        for verb in ["query", "mutate", "load"] {
             let mut command = cli();
             command
                 .current_dir(temp.path())
@@ -929,7 +929,11 @@ fn managed_data_issue_633_ambient_targets_refuse_without_selecting_either() {
                 .env("OMNIGRAPH_BEARER_TOKEN", "must-not-be-used")
                 .args([verb, "--json"])
                 .timeout(std::time::Duration::from_secs(15));
-            command.arg("q");
+            if verb == "load" {
+                command.args(["--data", "missing.jsonl", "--mode", "append"]);
+            } else {
+                command.arg("q");
+            }
             if let Some(profile) = profile {
                 command.env("OMNIGRAPH_PROFILE", profile);
             }
@@ -948,7 +952,7 @@ fn managed_data_issue_633_ambient_targets_refuse_without_selecting_either() {
 }
 
 #[test]
-fn managed_data_issue_633_ordinary_load_and_commit_preserve_ambient_targets() {
+fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
     for malformed in [false, true] {
         for use_profile in [false, true] {
             for operation in ["load", "commit-list", "commit-show"] {
@@ -1007,7 +1011,7 @@ fn managed_data_issue_633_ordinary_load_and_commit_preserve_ambient_targets() {
                         command.args(["commit", "show", "commit-a"]);
                     }
                 }
-                command.arg("--json");
+                command.args(["--direct", "--json"]);
                 let output = output_success(&mut command);
                 let payload = parse_stdout_json(&output);
                 match operation {
@@ -1075,6 +1079,8 @@ fn managed_data_issue_633_folder_context_does_not_gate_local_graph_work() {
         command()
             .args(["load", "--mode", "append", "--data"])
             .arg(fixture("test.jsonl"))
+            .arg("--store")
+            .arg(&graph)
             .arg("--json"),
     );
     output_success(
@@ -1102,7 +1108,12 @@ fn managed_data_issue_633_folder_context_does_not_gate_local_graph_work() {
             .arg(&graph)
             .arg("--json"),
     );
-    output_success(command().args(["commit", "list", "--json"]));
+    output_success(
+        command()
+            .args(["commit", "list", "--store"])
+            .arg(&graph)
+            .arg("--json"),
+    );
     assert!(api.requests().is_empty());
     assert_no_core_effects(temp.path());
 }

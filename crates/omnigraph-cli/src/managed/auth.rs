@@ -5,7 +5,13 @@ use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
 
+mod coordination;
+mod provider;
+mod renewal;
+
 const MAX_SECRET: usize = 16 * 1024;
+// Metadata from another clock may be slightly ahead. Actual expiry never has grace.
+const MAX_METADATA_CLOCK_SKEW: time::Duration = time::Duration::seconds(30);
 
 pub(super) trait Store {
     fn get(&self, origin: &str) -> Result<Option<String>>;
@@ -17,8 +23,8 @@ pub(super) struct OsStore {
     service: &'static str,
 }
 
-pub(super) const CONTROL_STORE: OsStore = OsStore {
-    service: "omnigraph.control-plane.session.v1",
+const AUTHKIT_STORE: OsStore = OsStore {
+    service: "omnigraph.workos-authkit.session.v1",
 };
 pub(super) const DATA_STORE: OsStore = OsStore {
     service: "omnigraph.data-plane.credential.v1",
@@ -85,93 +91,46 @@ impl Store for OsStore {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Session {
-    version: u8,
-    access_token: String,
-    expires_at: String,
-}
-
 fn validate_token(token: &str) -> Result<()> {
     if token.is_empty() || token.len() > MAX_SECRET || !token.bytes().all(|b| b.is_ascii_graphic())
     {
         return Err(Failure::refused(
             "credential_invalid",
-            "the managed credential is invalid",
+            "the credential is invalid",
         ));
     }
     Ok(())
 }
 
-fn session(value: &str) -> Result<Session> {
-    if value.len() > MAX_SECRET {
-        return Err(Failure::refused(
-            "credential_invalid",
-            "the saved managed session is invalid",
-        ));
-    }
-    let session: Session = serde_json::from_str(value).map_err(|_| {
-        Failure::refused("credential_invalid", "the saved managed session is invalid")
-    })?;
-    validate_token(&session.access_token)?;
-    let expires = OffsetDateTime::parse(&session.expires_at, &Rfc3339).map_err(|_| {
-        Failure::refused(
-            "credential_invalid",
-            "the saved managed session expiry is invalid",
-        )
-    })?;
-    let now = OffsetDateTime::now_utc();
-    if session.version != 1 || expires > now + time::Duration::minutes(15) {
-        return Err(Failure::refused(
-            "credential_invalid",
-            "the saved managed session exceeds its 15-minute lifetime",
-        ));
-    }
-    if expires <= now {
-        return Err(Failure::refused(
-            "login_required",
-            "the managed session has expired; run login --api again",
-        ));
-    }
-    Ok(session)
+fn login_required() -> Failure {
+    Failure::refused(
+        "login_required",
+        "sign in with login --api before continuing",
+    )
 }
 
 fn env(name: &str) -> Result<Option<String>> {
-    std::env::var(name).map(Some).or_else(|err| match err {
+    std::env::var(name).map(Some).or_else(|error| match error {
         std::env::VarError::NotPresent => Ok(None),
-        std::env::VarError::NotUnicode(_) => Err(Failure::refused(
+        _ => Err(Failure::refused(
             "credential_invalid",
-            "managed credential environment variables must be valid UTF-8",
+            "credential environment variables must be valid UTF-8",
         )),
     })
 }
 
-fn credential_from(
-    store: &impl Store,
-    origin: &str,
-    token: Option<String>,
-    api: Option<String>,
-) -> Result<String> {
+fn automation(origin: &str, token: Option<String>, api: Option<String>) -> Result<Option<String>> {
     match (token, api) {
+        (None, None) => Ok(None),
         (Some(token), Some(api)) => {
             if canonical_origin(&api)? != origin {
                 return Err(Failure::refused(
                     "credential_origin_mismatch",
-                    "OMNIGRAPH_CONTROL_API does not match the selected API origin",
+                    "OMNIGRAPH_CONTROL_API does not match the selected API",
                 ));
             }
             validate_token(&token)?;
-            Ok(token)
-        }
-        (None, None) => {
-            let value = store.get(origin)?.ok_or_else(|| {
-                Failure::refused(
-                    "login_required",
-                    "no managed session is stored for this API; run login --api",
-                )
-            })?;
-            Ok(session(&value)?.access_token)
+            Ok(Some(token))
         }
         _ => Err(Failure::refused(
             "credential_origin_required",
@@ -180,13 +139,47 @@ fn credential_from(
     }
 }
 
-pub(super) fn credential(store: &OsStore, origin: &str) -> Result<String> {
-    credential_from(
-        store,
+pub(super) async fn credential(origin: &str) -> Result<String> {
+    if let Some(token) = automation(
+        origin,
+        env("OMNIGRAPH_CONTROL_TOKEN")?,
+        env("OMNIGRAPH_CONTROL_API")?,
+    )? {
+        return Ok(token);
+    }
+    let _lock = coordination::lock(origin).await?;
+    renewal::credential(&AUTHKIT_STORE, origin).await
+}
+
+pub(super) async fn cache_lock(key: &str) -> Result<std::fs::File> {
+    coordination::lock(key).await
+}
+
+async fn selected_principal_with(
+    store: &dyn Store,
+    origin: &str,
+    token: Option<String>,
+    api: Option<String>,
+) -> Result<Option<String>> {
+    if let Some(token) = automation(origin, token, api)? {
+        let body = Api::new(origin.into(), Some(token.clone()))?
+            .request(Method::GET, "/v1/auth/session", None, None)
+            .await
+            .map_err(|failure| scrub(failure, &token))?;
+        return bounded_string(&body["data"], "principal_id", 1024)
+            .map(|principal| Some(principal.into()));
+    }
+    Ok(renewal::load(store, origin)?.map(|saved| saved.identity.principal_id))
+}
+
+pub(super) async fn selected_principal(origin: &str) -> Result<Option<String>> {
+    selected_principal_with(
+        &AUTHKIT_STORE,
         origin,
         env("OMNIGRAPH_CONTROL_TOKEN")?,
         env("OMNIGRAPH_CONTROL_API")?,
     )
+    .await
 }
 
 fn bounded_string<'a>(value: &'a Value, name: &str, max: usize) -> Result<&'a str> {
@@ -199,22 +192,16 @@ fn bounded_string<'a>(value: &'a Value, name: &str, max: usize) -> Result<&'a st
 
 fn verification_uri(uri: &str) -> Result<()> {
     let url = url::Url::parse(uri).map_err(|_| Failure::protocol())?;
-    if url.scheme() != "https"
+    if uri.len() > 4096
+        || url.scheme() != "https"
+        || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
     {
         return Err(Failure::protocol());
     }
-    canonical_origin(&url.origin().ascii_serialization()).map_err(|_| Failure::protocol())?;
     Ok(())
-}
-
-fn interval(body: &Value) -> Result<u64> {
-    body.get("interval")
-        .and_then(Value::as_u64)
-        .filter(|n| (5..=600).contains(n))
-        .ok_or_else(Failure::protocol)
 }
 
 fn scrub(mut failure: Failure, secret: &str) -> Failure {
@@ -237,188 +224,153 @@ pub(super) fn scrub_value(value: &mut Value, secret: &str) {
                 "device_code",
                 "id_token",
                 "client_secret",
+                "csrf_token",
             ] {
                 items.remove(field);
             }
-            for item in items.values_mut() {
-                scrub_value(item, secret);
+            let original = std::mem::take(items);
+            for (key, mut item) in original {
+                scrub_value(&mut item, secret);
+                items.insert(key.replace(secret, "[redacted]"), item);
             }
         }
         _ => {}
     }
 }
 
-async fn login_with(store: &impl Store, origin: String) -> Result<Value> {
-    // Detect unsupported/unavailable keychains before asking the user to log in.
-    let _ = store.get(&origin)?;
-    let api = Api::new(origin.clone(), None)?;
-    let started = Instant::now();
-    let initial = api
-        .request(Method::POST, "/v1/auth/device", Some(&json!({})), None)
-        .await?;
-    let data = &initial["data"];
-    let code = bounded_string(data, "device_code", MAX_SECRET)?.to_string();
-    let user_code = bounded_string(data, "user_code", 128)?;
-    let uri = bounded_string(data, "verification_uri", 4096)?;
-    verification_uri(uri)?;
-    let complete = match data.get("verification_uri_complete") {
-        None | Some(Value::Null) => uri,
-        Some(Value::String(value)) if !value.is_empty() && value.len() <= 4096 => {
-            verification_uri(value)?;
-            value
-        }
-        _ => return Err(Failure::protocol()),
-    };
-    let expires = data
-        .get("expires_in")
-        .and_then(Value::as_u64)
-        .filter(|n| (1..=600).contains(n))
-        .ok_or_else(Failure::protocol)?;
-    let deadline = started + Duration::from_secs(expires);
-    let mut poll_interval = interval(data)?;
-    if user_code.contains(&code) || complete.contains(&code) {
+fn seconds(value: f64, minimum: u64, maximum: u64) -> Result<u64> {
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value < minimum as f64
+        || value > maximum as f64
+    {
         return Err(Failure::protocol());
     }
-    eprintln!("Open {complete}\nEnter code: {user_code}");
-    let result = async {
-        loop {
-            let next = Instant::now() + Duration::from_secs(poll_interval);
-            if next >= deadline {
-                tokio::time::sleep_until(deadline).await;
-                return Err(Failure::refused(
-                    "device_expired",
-                    "device authorization expired; start login again",
-                ));
+    Ok(value as u64)
+}
+
+async fn login_with(
+    store: &dyn Store,
+    origin: &str,
+    config: provider::Config,
+    provider: &provider::Provider,
+) -> Result<Value> {
+    let _ = store.get(origin)?;
+    if let Some(saved) = renewal::load(store, origin)?
+        && saved.config == config
+        && saved.state == renewal::RefreshState::Ready
+        && renewal::timestamp(&saved.refresh_expires_at)? > OffsetDateTime::now_utc()
+    {
+        match renewal::credential_with(store, origin, provider).await {
+            Ok(token) => {
+                let verified = renewal::verify(origin, &config, &token, None).await;
+                match verified {
+                    Ok((identity, expiry, mut body)) => {
+                        if identity != saved.identity {
+                            return Err(Failure::refused(
+                                "session_identity_mismatch",
+                                "the stored sign-in identity changed",
+                            ));
+                        }
+                        body["data"]["expires_at"] = json!(if renewal::timestamp(&expiry)?
+                            > renewal::timestamp(&saved.refresh_expires_at)?
+                        {
+                            &saved.refresh_expires_at
+                        } else {
+                            &expiry
+                        });
+                        body["data"]["refresh_expires_at"] = json!(saved.refresh_expires_at);
+                        return Ok(body);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.body["type"].as_str(),
+                            Some("login_required" | "unauthenticated")
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
             }
-            tokio::time::sleep_until(next).await;
-            let response = tokio::time::timeout_at(
-                deadline,
-                api.raw(
-                    Method::POST,
-                    "/v1/auth/device/token",
-                    Some(&json!({"device_code":code})),
-                    None,
-                ),
-            )
+            Err(error)
+                if matches!(
+                    error.body["type"].as_str(),
+                    Some("login_required" | "refresh_outcome_unknown")
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let started = Instant::now();
+    let device = provider
+        .device(&config)
+        .await
+        .map_err(|error| provider::failure(&error))?;
+    validate_token(&device.device_code)?;
+    if device.user_code.is_empty()
+        || device.user_code.len() > 128
+        || device.user_code.chars().any(char::is_control)
+    {
+        return Err(Failure::protocol());
+    }
+    verification_uri(&device.verification_uri)?;
+    let uri = device
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(&device.verification_uri);
+    verification_uri(uri)?;
+    if uri.contains(&device.device_code) || device.user_code.contains(&device.device_code) {
+        return Err(Failure::protocol());
+    }
+    let lifetime = seconds(device.expires_in, 1, 600)?;
+    let mut interval = seconds(device.interval.unwrap_or(5.0), 5, 600)?;
+    let deadline = started + Duration::from_secs(lifetime);
+    eprintln!("Open {uri}\nEnter code: {}", device.user_code);
+    loop {
+        let next = Instant::now() + Duration::from_secs(interval);
+        if next >= deadline {
+            return Err(Failure::refused(
+                "device_expired",
+                "device sign-in expired; run login --api again",
+            ));
+        }
+        tokio::time::sleep_until(next).await;
+        let reply = tokio::time::timeout_at(deadline, provider.poll(&device.device_code))
             .await
             .map_err(|_| {
                 Failure::refused(
                     "device_expired",
-                    "device authorization expired; start login again",
+                    "device sign-in expired; run login --api again",
                 )
-            })??;
-            if response.status.is_success() {
-                let mut body = response.body;
-                let data = body
-                    .get_mut("data")
-                    .and_then(Value::as_object_mut)
-                    .ok_or_else(Failure::protocol)?;
-                let token = data
-                    .remove("access_token")
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .ok_or_else(Failure::protocol)?;
-                validate_token(&token)?;
-                if data.get("token_type").and_then(Value::as_str) != Some("Bearer") {
-                    return Err(Failure::protocol());
+            })?;
+        match reply {
+            Ok(tokens) => {
+                let (saved, body) = renewal::accept(origin, config, tokens, None).await?;
+                if let Err(error) = renewal::save(store, &saved) {
+                    // We cannot retain the new renewable session. Revoke it
+                    // when possible without obscuring the custody failure.
+                    saved.revoke().await;
+                    return Err(error);
                 }
-                let expiry = data
-                    .get("expires_at")
-                    .and_then(Value::as_str)
-                    .ok_or_else(Failure::protocol)?
-                    .to_string();
-                for field in ["principal_id", "subject", "account_id"] {
-                    if !data
-                        .get(field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| !s.is_empty() && s.len() <= 1024)
-                    {
-                        return Err(Failure::protocol());
-                    }
-                }
-                if !data.get("scopes").is_some_and(Value::is_object) {
-                    return Err(Failure::protocol());
-                }
-                // Only the bounded, opaque service credential enters the keychain.
-                let saved = serde_json::to_string(&Session {
-                    version: 1,
-                    access_token: token.clone(),
-                    expires_at: expiry,
-                })
-                .map_err(|_| Failure::protocol())?;
-                session(&saved)?;
-                if let Err(failure) = store.put(&origin, &saved) {
-                    let revoke = Api::new(origin.clone(), Some(token))?;
-                    let _ = revoke
-                        .request(Method::POST, "/v1/auth/logout", None, None)
-                        .await;
-                    return Err(failure);
-                }
-                // Provider/device credentials are not part of the public login result.
-                scrub_value(&mut body, &token);
-                scrub_value(&mut body, &code);
                 return Ok(body);
             }
-            match (response.status.as_u16(), response.body["type"].as_str()) {
-                (428, Some("authorization_pending")) => {
-                    poll_interval = poll_interval.max(interval(&response.body)?)
-                }
-                (429, Some("slow_down")) => {
-                    poll_interval = (poll_interval + 5).min(600).max(interval(&response.body)?)
-                }
-                (409, Some("device_poll_in_progress")) => {
-                    return Err(Failure::refused(
-                        "device_poll_in_progress",
-                        "device authorization may have been consumed; start login again",
-                    ));
-                }
-                _ => {
-                    return Err(Failure {
-                        body: response.body,
-                        exit: if response.status.is_client_error() {
-                            2
-                        } else {
-                            1
-                        },
-                    });
-                }
+            Err(error) if error.code() == Some("authorization_pending") => {}
+            Err(error) if error.code() == Some("slow_down") => {
+                interval = interval.saturating_add(5).min(600);
             }
+            Err(error) => return Err(provider::failure(&error)),
         }
     }
-    .await;
-    result.map_err(|failure| scrub(failure, &code))
 }
 
-pub(super) async fn login(store: &OsStore, origin: String) -> Result<Value> {
-    login_with(store, origin).await
+pub(super) async fn login(origin: String) -> Result<Value> {
+    let _lock = coordination::lock(&origin).await?;
+    let _ = AUTHKIT_STORE.get(&origin)?;
+    let config = provider::Config::discover(&origin).await?;
+    let provider = provider::Provider::new(&config)?;
+    login_with(&AUTHKIT_STORE, &origin, config, &provider).await
 }
 
-async fn logout_with(store: &impl Store, origin: String) -> Result<Value> {
-    let value = store.get(&origin)?.ok_or_else(|| {
-        Failure::refused(
-            "login_required",
-            "no managed session is stored for this API",
-        )
-    })?;
-    let parsed = session(&value);
-    let result = match parsed {
-        Ok(session) => {
-            let api = Api::new(origin.clone(), Some(session.access_token.clone()))?;
-            api.request(Method::POST, "/v1/auth/logout", None, None)
-                .await
-                .map_err(|e| scrub(e, &session.access_token))
-        }
-        Err(err) => Err(err),
-    };
-    store.remove(&origin)?;
-    result.map_err(|mut err| {
-        err.body["local_credential_removed"] = json!(true);
-        err.body["revocation_confirmed"] = json!(false);
-        err
-    })
-}
-
-pub(super) async fn logout(store: &OsStore, origin: String) -> Result<Value> {
-    logout_with(store, origin).await
+pub(super) async fn logout(origin: String) -> Result<Value> {
+    let _lock = coordination::lock(&origin).await?;
+    renewal::logout(&AUTHKIT_STORE, &origin).await
 }
 
 #[cfg(test)]
