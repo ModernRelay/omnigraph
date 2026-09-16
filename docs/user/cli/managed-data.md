@@ -161,9 +161,11 @@ they must be upgraded or use explicit restricted issuance.
 `cluster token --clear [--config DIR]` forgets that cluster's local data
 entry, independently of the control-plane session. Do not combine `--clear`
 with `--graph`, `--actions`, or `--ttl`. Clearing is not server revocation:
-copies remain usable until expiry or signing-key retirement. Likewise,
-`logout --api` revokes only the control-plane login and does not invalidate
-already issued data credentials.
+copies remain usable until expiry or signing-key retirement. `logout --api`
+clears local login credentials and requests provider-session revocation;
+`provider_revocation_confirmed` reports whether that request succeeded.
+Already issued data credentials remain valid independently until expiry or
+signing-key retirement.
 
 ## Bulk loading
 
