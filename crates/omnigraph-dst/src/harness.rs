@@ -820,7 +820,7 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         // ensure_indices deferred-fork route: put data on the branch first
         // (forks ONE table and places it) so the branch ensure_indices has
         // work to do and the remaining tables are first-touch.
-        "ensure_indices.post_sidecar_pre_fork" | "ensure_indices.post_table_effect" => {
+        "ensure_indices.post_fork_pre_commit" | "ensure_indices.post_table_effect" => {
             return vec![EnsureBranch, DataOnBranch, EnsureIndicesBranch];
         }
         // cleanup with state to work on: a live branch fork.
@@ -1912,7 +1912,7 @@ fn window_matches(window: &str, wop: &WorldOp) -> bool {
             WorldOp::Data { branch, op, .. } if branch != "main" && is_mutation_op(op)
         );
     }
-    if window == "ensure_indices.post_sidecar_pre_fork" {
+    if window == "ensure_indices.post_fork_pre_commit" {
         // Same deferred-fork gate, ensure_indices flavor.
         return matches!(
             wop,

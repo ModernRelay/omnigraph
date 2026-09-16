@@ -1972,7 +1972,7 @@ fn dst_maintenance_obligations_bite_and_replay() {
     let cells: [(&str, u64, usize); 3] = [
         ("optimize.before_compact", 7, 24),
         ("cleanup.post_recovery_check_pre_gates", 7, 24),
-        ("ensure_indices.post_effects_pre_confirm", 9, 24),
+        ("ensure_indices.post_table_effect", 9, 24),
     ];
     for (window, seed, ops) in cells {
         let sc = Scenario {
