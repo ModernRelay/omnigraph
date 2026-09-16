@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use omnigraph::db::Omnigraph;
-use omnigraph::failpoints::{FailScenario, ScopedFailPoint, names};
+use omnigraph::seams::{FailScenario, catalog};
 use omnigraph_cluster::{
     ApplyOptions, IdentityAuthorization, PlanOptions, apply_config_dir,
     apply_config_dir_authorized, authorize_apply_plan, import_config_dir,
@@ -82,8 +82,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     let uri = graph.to_str().unwrap();
     let writer = Box::pin(Omnigraph::open(uri)).await.unwrap();
     {
-        let _failpoint =
-            ScopedFailPoint::new(names::MUTATION_POST_FINALIZE_PRE_PUBLISHER, "return");
+        let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let error = Box::pin(writer.mutate_as(
             "main",
             "query add() { insert Person { name: \"interrupted\" } }",

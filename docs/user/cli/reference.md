@@ -99,10 +99,9 @@ pretty and the `rows` array compact, verbatim.
 
 ### Machine-readable read and write positions
 
-When the read snapshot has an effective graph head, `omnigraph query --json`
-returns its `graph_commit_id` in the complete read envelope. The id and rows
-come from the same pinned snapshot; use that id when a later mutation must be
-conditional on the state that was read.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph
+head. The id and rows share one pinned snapshot; use that id for a later
+conditional mutation.
 
 Successful `mutate --json`, `load --json`, and compatibility
 `ingest --json` responses include `commit`, the exact commit published by
@@ -111,12 +110,9 @@ that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
 that changes no entities returns `"commit": null`.
 
-When a graph server returns a structured error, `--json` preserves its `error`,
-optional `code`, and typed detail fields on stdout and exits with code 1.
-For example, a policy refusal retains `"code": "forbidden"`; scripts need not
-parse its human-readable message. Invalid or incomplete server responses remain
-diagnostics and do not produce a fabricated structured refusal. Conditional
-mutation mismatches retain exit code 4 as described below.
+`--json` and read commands' `--format json` preserve a graph server's complete
+structured error on stdout (for example, `"code": "forbidden"`) and exit 1.
+Malformed responses remain diagnostics. Conditional mismatches retain exit 4.
 
 ### Conditional mutations
 
@@ -333,13 +329,9 @@ context is present. API failures never trigger direct execution.
 
 ## Managed data access
 
-Use `cluster token` to cache an identity credential, `graphs list` to discover
-graphs, then `query` or `mutate` with `--graph` from the managed folder.
-Applied Cedar policy decides permissions. An explicitly addressed server uses
-`graphs list --discovery` for the minimal identity catalog; without the flag,
-its existing metadata listing requires `graph_list` permission. See
-[managed data access](managed-data.md) for legacy restricted credentials,
-offline behavior, expiry, and local credential clearing.
+`cluster token` caches an identity credential; applied Cedar policy supplies
+permissions. See [managed data access](managed-data.md) for graph discovery,
+routing, offline access, expiry, clearing and explicit restricted credentials.
 
 ## Confirmation rules
 

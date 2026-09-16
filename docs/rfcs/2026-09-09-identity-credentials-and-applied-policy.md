@@ -1,5 +1,5 @@
 ---
-rfc: "0064"
+rfc: "2026-09-09-identity-credentials-and-applied-policy"
 title: "Identity credentials and applied policy authorization"
 track: maintainer
 status: accepted
@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0064: Identity credentials and applied policy authorization
+# RFC: Identity credentials and applied policy authorization
 
 ## Summary
 
@@ -259,3 +259,5 @@ of a particular deployment remain separate from the accepted library contract.
 - 2026-09-16: Accepted identity-only credentials and applied-policy authority.
   Replaced the staged rollout requirement with direct activation for new
   deployments and explicitly scoped version 1 to published compatibility.
+  Adopted the date-based filename because the provisional number was allocated
+  to the separate explicit-storage-upgrades RFC before this proposal landed.

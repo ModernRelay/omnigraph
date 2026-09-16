@@ -1315,7 +1315,7 @@ pub(crate) async fn refuse_pending_recovery(
     root_uri: &str,
     storage: &dyn StorageAdapter,
 ) -> Result<()> {
-    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_LIST)?;
+    fail(&RECOVERY_SIDECAR_LIST)?;
     let pending = storage
         .list_dir_bounded(
             &recovery_dir_uri(root_uri),

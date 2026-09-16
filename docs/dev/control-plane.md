@@ -89,7 +89,7 @@ Cedar must explicitly permit either signed profile even when no static
 credentials exist. Static credential authority remains unchanged. Issuer
 reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
-[RFC 0064](../rfcs/0064-identity-credentials-and-applied-policy.md).
+[Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
 `GET /graphs/discovery` accepts only the verified identity profile and returns
 IDs and display names for the opened and quarantined graph inventory captured
