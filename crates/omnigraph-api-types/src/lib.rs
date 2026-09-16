@@ -1175,8 +1175,8 @@ pub struct CommitListQuery {
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
-    /// The newest internal-schema (storage-format) version this binary serves;
-    /// it also reads and writes the preceding legacy-vintage version.
+    /// The internal-schema (storage-format) version this binary serves; a
+    /// graph at any other stamp is refused until an explicit upgrade.
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,

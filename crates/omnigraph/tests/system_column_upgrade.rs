@@ -146,7 +146,7 @@ async fn assert_upgraded(db: &mut Omnigraph, dir: &tempfile::TempDir, expected_e
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        9
+        10
     );
     let ir = schema_ir(dir);
     assert_eq!(ir["ir_version"].as_u64(), Some(5));
@@ -265,7 +265,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         .unwrap();
     assert_eq!(check.outcome, SystemColumnUpgradeOutcome::CheckPassed);
     assert!(check.success());
-    assert_eq!((check.stamp_before, check.stamp_after), (8, 8));
+    assert_eq!((check.stamp_before, check.stamp_after), (10, 10));
     assert_eq!(
         check.tables,
         ["edge:WorksAt", "node:Company", "node:Person"]
@@ -276,7 +276,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        8,
+        10,
         "check mode writes nothing"
     );
     assert_eq!(schema_ir(&dir)["ir_version"].as_u64(), Some(2));
@@ -286,7 +286,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         .await
         .unwrap();
     assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
-    assert_eq!((report.stamp_before, report.stamp_after), (8, 9));
+    assert_eq!((report.stamp_before, report.stamp_after), (10, 10));
     assert!(report.findings.is_empty());
     assert!(report.graph_manifest_version.is_some());
     assert_upgraded(&mut db, &dir, &export_before).await;
@@ -306,7 +306,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         .await
         .unwrap();
     assert_eq!(again.outcome, SystemColumnUpgradeOutcome::AlreadyCurrent);
-    assert_eq!((again.stamp_before, again.stamp_after), (9, 9));
+    assert_eq!((again.stamp_before, again.stamp_after), (10, 10));
     drop(db);
 
     let mut reopened = Omnigraph::open(uri).await.unwrap();
@@ -326,7 +326,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
             .internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        9
+        10
     );
 }
 
@@ -498,7 +498,7 @@ async fn system_column_upgrade_refuses_before_any_effect() {
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        8
+        10
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
     assert_eq!(schema_ir(&dir)["ir_version"].as_u64(), Some(2));
@@ -560,11 +560,11 @@ async fn crash_then_roll_forward(seam: &'static DecideSeam) {
     assert_eq!(sidecar["writer_kind"], "SchemaApply");
     assert_eq!(
         sidecar["protocol_v7"]["system_column_upgrade"]["from_stamp"],
-        8
+        10
     );
     assert_eq!(
         sidecar["protocol_v7"]["system_column_upgrade"]["to_stamp"],
-        9
+        10
     );
     assert!(
         sidecar["protocol_v7"]["effects"]

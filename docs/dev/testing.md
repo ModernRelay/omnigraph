@@ -44,8 +44,8 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `failpoint_names_guard.rs`, in-source manifest/recovery tests |
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
-| Legacy-vintage graphs (`id`/`src`/`dst` spellings, stamp 8) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
-| System-column upgrade (RFC 0040 step 3: v8 → v9 in place) | `system_column_upgrade.rs` — check and execute, preflight refusals, every crash point rolled forward on reopen; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
+| Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
+| System-column upgrade (RFC 0040 step 3: respelling in place on a served graph, no stamp change since v10) | `system_column_upgrade.rs` — check and execute, preflight refusals, every crash point rolled forward on reopen; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
 | Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and `benchmark_scenario_contract.rs` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.
@@ -108,26 +108,28 @@ Server suites are organized by public route: `auth_policy`, `data_routes`, `sche
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
-The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V9 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
+The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
 
 ```bash
-OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9 -- --exact --nocapture
+OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
 ```
 
-The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v9 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, and RFC 0040's system columns stamp new graphs v9. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request with the releases it installs.
+The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v10 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, RFC 0040's system columns stamped new graphs v9, and RFC 0067's detached table commits stamp every graph v10. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires genuine v0.9 and
-v0.10 local standalone journeys through the v6 → v7 → v8 route, pinned with
-`--to-format 8` because their fixtures carry a branch; the default route now
-ends at v9 (RFC 0040) and refuses a branched source before any effect, which
-the same journey asserts. It fails
+v0.10 local standalone journeys: the v6 → v7 → v8 route with `--to-format 8`
+first, then the default route to v10 on the same branched fixture, which the
+journey asserts keeps every branch and every table byte. It fails
 missing predecessor binaries, missing cases and skipped required cases. Engine
 storage-upgrade tests own direct v7 → v8 conversion, exact pending v6 → v7
 recovery before composition, explicit target 7, deferred check reporting,
-v8 no-op admission with retained retired refs, and the synthetic v6/v7 → v9
-composition (`storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v9`
-and its siblings; no genuine predecessor binary executes that step yet). Keep the normal-open
-format fences: explicit conversion does not grant serving support for v6/v7.
+v8 no-op admission with retained retired refs, the v8 and v9 → v10 stamp
+step (`storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10`,
+`storage_upgrade_default_route_takes_a_v9_graph_to_v10`) and the synthetic
+v6/v7 → v10 composition (`storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10`;
+no genuine predecessor binary executes that step yet). Keep the normal-open
+format fences: explicit conversion does not grant serving support for
+v6/v7/v8/v9.
 See the [support matrix](versioning.md#storage-upgrade-support-matrix).
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.

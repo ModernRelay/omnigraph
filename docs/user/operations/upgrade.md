@@ -1,15 +1,16 @@
 # Upgrading OmniGraph
 
-Normal open accepts storage formats v8 and v9: v8 graphs spell their system
-columns `id`/`src`/`dst`, v9 graphs spell them `__id`/`__src`/`__dst`, and
-neither is migrated on open. Use explicit storage migration for a registered
-route, or export/import with a source-compatible binary when no route exists.
+Normal open accepts storage format v10 only; nothing is migrated on open. A
+v8 or v9 graph from the 0.11.x line takes one explicit `omnigraph upgrade`
+(below), a metadata-only step that keeps its branches and spellings; use
+export/import with a source-compatible binary when no route exists.
 Storage formats, release versions and full-text index formats are separate;
 check the [release notes](../../releases/) before upgrading.
 
 ## Explicit storage migration
 
-`omnigraph upgrade` defaults to v9: the storage conversions to v8, then the system-column upgrade (below).
+`omnigraph upgrade` defaults to v10: the conversions to v8 where the source
+needs them, then the v10 stamp step, which restamps main and every live branch.
 Qualified standalone v6 graphs from the 0.9.x/0.10.x release lines run v6 → v7
 registration conversion followed by metadata-only v7 → v8 conversion. Qualified
 v7 development graphs run only the final step. Both reuse table data and preserve
@@ -54,18 +55,15 @@ their registration-clock interpretation.
    with the old executable; old bytes remaining in the upgraded root do not
    make downgrading safe. Post-upgrade writes are absent from that backup.
 
-`--to-format` defaults to 9. Explicit `--to-format 7` stops at v7 for a
-v7-compatible executable; the current binary accepts v8 and v9 for normal open
-and will refuse that intermediate result. Explicit `--to-format 8` stops at
-v8, keeping the legacy system column spellings. The v8 to v9 step is the
-system-column upgrade (below), which needs a graph with only main: a route
-ending at v9 refuses other branches before any conversion. A graph already at v9 reports
-`already_current` for the default and for an explicit `--to-format 8` alike;
-`--to-format 7` on a v8 or v9 graph is refused as a downgrade below the served
-range. Unsupported sources and targets
-refuse; there is no automatic data-moving fallback. Both check and execution
-return zero only for success (`check_passed`, `completed` or `already_current`).
-Repeated successful execution is a no-write no-op after admission checks.
+`--to-format` defaults to 10. Explicit `--to-format 7` or `8` stops there for
+a compatible older executable; the current binary refuses either result. v9
+is not a target: the respelling it marked is a separate operation on a served
+graph (below). A v10 graph reports `already_current` for the default and for
+`--to-format 10`; a lower target on it is refused as a downgrade. Unsupported
+sources and targets refuse; there is no automatic data-moving fallback. Check
+and execution return zero only for success (`check_passed`, `completed` or
+`already_current`); a repeated success is a no-write no-op. A source with a
+pending recovery sidecar refuses until the executable that wrote it resolves it.
 
 After each handler's early fence, ordinary opens refuse until every branch is
 converted and validated and main activates that handler's target. If interrupted,
@@ -240,17 +238,18 @@ mapping is:
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
 | v7 | the exact unreleased development build that wrote it |
-| v8 | 0.11 development builds before the system-column namespace change, and conversions completed with `omnigraph upgrade --to-format 8`; still served by the current binary without export/import |
-| v9 | current 0.11.x line; entity export/import normally not required within this generation |
+| v8 | 0.11 development builds before the system-column namespace change, and conversions completed with `omnigraph upgrade --to-format 8`; `omnigraph upgrade` takes it to v10 without export/import |
+| v9 | the 0.11.x line; `omnigraph upgrade` takes it to v10 without export/import |
+| v10 | current line; entity export/import normally not required within this generation |
 
-If the graph's generation is newer than the binary, upgrade the binary rather
-than rebuilding with it.
+If the graph's generation is newer than the binary, upgrade the binary instead.
 
-## System-column upgrade (v8 to v9)
+## System-column upgrade (legacy spellings)
 
-`omnigraph schema upgrade-system-columns <graph>` respells a v8 graph's system
-columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`) and moves it to v9. Columns are renamed by field id: no rows are
-rewritten, indexes survive, and data, history, and commit ids are unchanged;
+`omnigraph schema upgrade-system-columns <graph>` respells a served graph's
+legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`);
+the stamp stays v10. Columns are renamed by field id: no rows are rewritten,
+indexes survive, and data, history, and commit ids are unchanged;
 `--check` runs the preflight and writes nothing; `--json` prints the report.
 The preflight refuses a graph with any non-main branch (merge what you need,
 then delete the branches: a merge alone leaves the source live) and a
@@ -261,8 +260,9 @@ serving the graph and retain a verified backup first: a write from a server
 still running lands the graph in a refusal only a restore clears, and there
 is no reverse operation. An interrupted run is completed by the next
 read-write open (every CLI command except `--check`; a rerun then reports
-`already_current`), and a read-only handle refuses until then. A v9 graph
-reports `already_current`; cluster-managed graphs are refused.
+`already_current`), and a read-only handle refuses until then. A graph that
+already spells `__id`/`__src`/`__dst` reports `already_current`;
+cluster-managed graphs are refused.
 
 ## Rebuild
 

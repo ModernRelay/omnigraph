@@ -51,7 +51,7 @@ pub use system_column_upgrade::{
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
 };
 pub(crate) use system_column_upgrade::{
-    render_system_column_upgrade_target, reserved_property_offenders, system_column_renames,
+    render_system_column_upgrade_target, system_column_renames,
 };
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
@@ -740,20 +740,15 @@ impl Omnigraph {
         // storage format this binary does not read — rebuild via export/import).
         // Both open modes refuse: there is no in-place migration, and the check is
         // a stamp read with no object-store writes, so it is safe under ReadOnly.
-        let internal_schema_version =
-            crate::db::manifest::read_supported_internal_schema_version(&root).await?;
+        crate::db::manifest::read_supported_internal_schema_version(&root).await?;
         // Hold the same schema gate through format preflight and contract
         // capture. A v3 live or staged IR must refuse before the local write
         // probe, coordinator open, or either recovery sweep can change files.
         let schema_contract_guard = write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
-        crate::db::schema_state::refuse_unsupported_schema_versions(
-            &root,
-            storage.as_ref(),
-            internal_schema_version,
-        )
-        .await?;
+        crate::db::schema_state::refuse_unsupported_schema_versions(&root, storage.as_ref())
+            .await?;
         // Read-write opens write before the first user mutation (recovery
         // sweeps, schema-stamp migration), and every write needs atomic
         // create-if-absent; read-only opens perform no writes.
@@ -785,7 +780,6 @@ impl Omnigraph {
         // still performs the non-mutating coherence proof below: an exact
         // SchemaApply manifest outcome cannot be served with the old schema
         // contract merely because promotion is pending.
-        let mut recovery_advanced_manifest = false;
         if matches!(mode, OpenMode::ReadWrite) {
             // Schema staging is itself mutable recovery state. Hold the shared
             // schema gate across BOTH its file pre-pass and the complete Full
@@ -802,7 +796,6 @@ impl Omnigraph {
             // heal (`heal_pending_sidecars_roll_forward`); only
             // rollback-eligible sidecars it can neither roll forward nor
             // retire as provably effect-free wait for this open-time sweep.
-            let manifest_version_before_sweep = coordinator.version();
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 Arc::clone(&storage),
@@ -812,7 +805,6 @@ impl Omnigraph {
                 write_queue.as_ref(),
             )
             .await?;
-            recovery_advanced_manifest = coordinator.version() != manifest_version_before_sweep;
         } else {
             // ReadOnly performs no repair, but it must not expose a manifest
             // that already contains a fixed SchemaApply outcome with the old
@@ -821,11 +813,6 @@ impl Omnigraph {
             // read-write open resolves them.
             crate::db::manifest::ensure_read_only_schema_coherent(&root, storage.as_ref()).await?;
         }
-        let internal_schema_version = if recovery_advanced_manifest {
-            crate::db::manifest::read_supported_internal_schema_version(&root).await?
-        } else {
-            internal_schema_version
-        };
         fail(&OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
         // Read _schema.pg (post-recovery — may have just been renamed in).
         // The stamp guard and coordinator open above both read `__manifest`,
@@ -844,14 +831,6 @@ impl Omnigraph {
         validate_schema_ir_against_snapshot(&accepted_ir, &coordinator.snapshot())?;
         let schema_identity_domain = accepted_ir.schema_identity_domain.as_str().to_string();
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
-        if let Some(required_stamp) = crate::db::schema_state::stamp_covers_system_columns(
-            internal_schema_version,
-            &accepted_ir.features,
-        )? {
-            return Err(OmniError::manifest(format!(
-                "graph internal schema v{internal_schema_version} cannot serve the accepted system columns; expected at least v{required_stamp}"
-            )));
-        }
         fixup_physical_schemas(&mut catalog)?;
 
         let session = lance_access.data_session();

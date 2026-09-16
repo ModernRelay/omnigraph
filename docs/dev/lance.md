@@ -199,9 +199,10 @@ successive mixed-base clones, cold full-text/vector queries, and local and
 inherited external fragment-reuse origins.
 
 Schema v8 defines native-ref retirement metadata; schema v9 adds the
-system-column namespace (RFC 0040). Normal open serves v8 and v9; qualified
-v6/v7 graphs have explicit offline routes to v8, and the default route
-continues to v9. The v7 → v8 handler
+system-column namespace (RFC 0040); schema v10 lets a registration name a
+detached table commit (RFC 0067). Normal open serves v10 only; qualified
+v6/v7/v8/v9 graphs have explicit offline routes to v10, and the
+system-column respelling is a separate step on a served graph. The v7 → v8 handler
 changes only manifest configuration metadata and does not infer fork ownership
 or retire branches. Source v6/v7 graphs with reserved retirement metadata refuse;
 v8 no-op admission validates markers and counts only live logical refs

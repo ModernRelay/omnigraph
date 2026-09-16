@@ -1,8 +1,10 @@
 //! RFC 0040 Rollout step 3: the explicit system-column upgrade of one
 //! legacy-vintage graph. Renames `id`/`src`/`dst` to `__id`/`__src`/`__dst`
-//! in every node and edge table, advances main's `__manifest` stamp from 8 to
-//! 9, and promotes the current-vintage schema contract, as one exact
-//! `SchemaApply` intent whose only recovery outcome is roll-forward.
+//! in every node and edge table and promotes the current-vintage schema
+//! contract, as one exact `SchemaApply` intent whose only recovery outcome is
+//! roll-forward. Before RFC 0067 the step also advanced main's `__manifest`
+//! stamp from 8 to 9; since v10 both vintages share one stamp and the
+//! advance is a no-op, kept in the intent so the protocol shape is unchanged.
 
 use super::*;
 use crate::db::manifest::UpgradeMode;
@@ -27,7 +29,7 @@ pub enum SystemColumnUpgradeOutcome {
     AlreadyCurrent,
     /// Every preflight passed; nothing was written.
     CheckPassed,
-    /// The stamp reads 9 and the current-vintage contract is live.
+    /// The current-vintage contract is live.
     Completed,
     /// A preflight failed; nothing was written. See `findings`.
     Refused,
@@ -275,9 +277,10 @@ async fn preflight(
 }
 
 decide_seam! {
-    /// The RFC 0040 system-column upgrade advanced main's `__manifest` stamp
-    /// but has renamed no table yet: stamp 9 over legacy spellings under an
-    /// Armed intent, the one state no other writer can produce.
+    /// The RFC 0040 system-column upgrade has armed its intent (its stamp
+    /// advance is a no-op since v10) but has renamed no table yet: legacy
+    /// spellings under an Armed intent, the one state no other writer can
+    /// produce.
     pub static SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE = ("system_column_upgrade.after_stamp_advance", Unreachable, [Fail]);
 }
 

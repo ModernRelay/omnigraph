@@ -275,8 +275,12 @@ async fn exact_genesis_probe_rejects_another_initialization_attempt() {
             Ok(_) => panic!("a manifest stamped for another vintage must not authenticate"),
             Err(error) => error,
         };
+        // Since v10 both vintages share one stamp, so the attempt's own
+        // lineage, not the stamp, is what separates a foreign initializer.
         assert!(
-            error.to_string().contains("internal-schema stamp is v"),
+            error
+                .to_string()
+                .contains("genesis lineage does not match this initialization attempt"),
             "unexpected probe error: {error:?}"
         );
     }
@@ -284,7 +288,7 @@ async fn exact_genesis_probe_rejects_another_initialization_attempt() {
 
 #[cfg(feature = "failpoints")]
 #[tokio::test]
-async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
+async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
     let _scenario = crate::seams::FailScenario::setup();
     for legacy in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -298,25 +302,25 @@ async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
             Omnigraph::init(uri, schema).await.unwrap()
         };
         drop(db);
+        // Both vintages are born at v10; a v9 stamp is the 0.11.x graph an
+        // operator has not upgraded yet.
         let mut manifest = open_manifest_dataset(uri, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut manifest, if legacy { 9 } else { 8 })
+        super::migrations::set_stamp_for_test(&mut manifest, 9)
             .await
             .unwrap();
         let before_version = manifest.version().version;
         let reached_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let test_thread = std::thread::current().id();
-        let _probes = (!legacy).then(|| {
-            [
-                &catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
-                &catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
-            ]
-            .map(|seam| {
-                let reached_effects = Arc::clone(&reached_effects);
-                seam.observe(move || {
-                    if std::thread::current().id() == test_thread {
-                        reached_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                })
+        let _probes = [
+            &catalog::LOCAL_CREATE_IF_ABSENT_PROBE,
+            &catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
+        ]
+        .map(|seam| {
+            let reached_effects = Arc::clone(&reached_effects);
+            seam.observe(move || {
+                if std::thread::current().id() == test_thread {
+                    reached_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             })
         });
         for mode in [
@@ -327,21 +331,16 @@ async fn open_requires_a_stamp_that_covers_the_accepted_system_columns() {
                 crate::db::OpenMode::ReadOnly => Omnigraph::open_read_only(uri).await,
                 crate::db::OpenMode::ReadWrite => Omnigraph::open(uri).await,
             };
-            if legacy {
-                result.expect("stamp-first upgrade window must preserve legacy reads");
-            } else {
-                let error = result
-                    .err()
-                    .expect("current system columns require stamp 9");
-                assert!(
-                    error.to_string().contains("expected at least v9"),
-                    "{error}"
-                );
-            }
+            let error = result.err().expect("a v9 stamp is below the served floor");
+            assert!(
+                error.to_string().contains("reads only v10 to v10"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("omnigraph upgrade"), "{error}");
             assert_eq!(
                 reached_effects.load(std::sync::atomic::Ordering::SeqCst),
                 0,
-                "unsupported system columns must refuse before the local write probe or recovery"
+                "a refused stamp must refuse before the local write probe or recovery"
             );
             assert_eq!(
                 open_manifest_dataset(uri, None)

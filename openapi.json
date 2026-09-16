@@ -4738,7 +4738,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The newest internal-schema (storage-format) version this binary serves;\nit also reads and writes the preceding legacy-vintage version.",
+            "description": "The internal-schema (storage-format) version this binary serves; a\ngraph at any other stamp is refused until an explicit upgrade.",
             "minimum": 0
           },
           "source_version": {

@@ -9706,7 +9706,7 @@ mod tests {
                 },
                 "target-schema".to_string(),
                 RecoverySystemColumnUpgrade {
-                    from_stamp: 8,
+                    from_stamp: 10,
                     to_stamp,
                     manifest_version_after_stamp: None,
                 },
@@ -9717,9 +9717,12 @@ mod tests {
             confirmed_transaction: None,
         };
 
-        let sidecar = build(vec![effect(rename())], Vec::new(), 9).unwrap();
+        // Since v10 both vintages share one stamp: the intent records the
+        // served pair (10, 10), and any other pair or a non-rename effect is
+        // refused as malformed.
+        let sidecar = build(vec![effect(rename())], Vec::new(), 10).unwrap();
         let json = serde_json::to_string(&sidecar).unwrap();
-        let parsed = parse_sidecar("memory://graph/__recovery/upgrade-v9.json", &json).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/upgrade-v10.json", &json).unwrap();
         assert_eq!(
             parsed
                 .protocol_v7
@@ -9727,10 +9730,11 @@ mod tests {
                 .system_column_upgrade
                 .unwrap()
                 .to_stamp,
-            9
+            10
         );
 
-        assert!(build(vec![effect(rename())], Vec::new(), 10).is_err());
+        assert!(build(vec![effect(rename())], Vec::new(), 9).is_err());
+        assert!(build(vec![effect(rename())], Vec::new(), 11).is_err());
         assert!(
             build(
                 vec![effect(RecoverySchemaApplyEffectKind::ExistingOverwrite {
@@ -9738,7 +9742,7 @@ mod tests {
                     confirmed_transaction: None,
                 })],
                 Vec::new(),
-                9,
+                10,
             )
             .is_err()
         );

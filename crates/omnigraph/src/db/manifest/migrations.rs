@@ -15,13 +15,15 @@
 //!
 //! ## Served stamps and explicit conversion
 //!
-//! Normal open accepts `MIN_SUPPORTED..=CURRENT`, the two system column
-//! vintages of RFC 0040 (v8 spells `id`/`src`/`dst`, v9 spells
-//! `__id`/`__src`/`__dst`; `stamp_for_system_columns` maps each vintage to its
-//! birth stamp), and refuses an active storage-upgrade intent. The explicit
-//! offline upgrade entry point converts supported v6/v7 graphs to v8 before
-//! serving. Retained v6 snapshots use the legacy decoder after root admission;
-//! normal open never runs conversion or lowers MIN_SUPPORTED.
+//! Normal open accepts `MIN_SUPPORTED..=CURRENT`, which since v10 is one
+//! stamp: every served graph may carry RFC 0067 table pins whose linear
+//! target is still pending, which an older binary would misread. Both RFC
+//! 0040 system column vintages (`id`/`src`/`dst` and `__id`/`__src`/`__dst`)
+//! live under that stamp; the vintage is read from the schema IR, never from
+//! the stamp. Normal open refuses an active storage-upgrade intent. The
+//! explicit offline upgrade entry point converts supported v6/v7/v8/v9 graphs
+//! to v10 before serving. Retained v6 snapshots use the legacy decoder after
+//! root admission; normal open never runs conversion or lowers MIN_SUPPORTED.
 //! Fresh graphs receive their stamp atomically in the manifest Create commit.
 //!
 //! ## Forward-version protection
@@ -74,24 +76,30 @@ use super::layout::open_manifest_dataset_native_with_session;
 ///   `id`, `src`, `dst` for user properties. Stamped on every graph created
 ///   with the new spellings; a v8 graph keeps the legacy spellings and its
 ///   stamp. RFC 0040 Rollout step 3 defines the v8 → v9 upgrade.
+/// - v10 — RFC 0067 lets a table registration name a detached Lance version
+///   (`omnigraph.staged_version`, `omnigraph.transaction_uuid`) whose linear
+///   target is published before it exists. An older binary would open the
+///   absent target and misdiagnose a pending pin as reclaimed history, so
+///   the stamp refuses it before any open. Both system column vintages are
+///   stamped v10; the stamp no longer encodes the vintage.
 ///
-/// v1–v7 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// v1–v9 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
 /// is kept for provenance and to document what each stamp value meant.
-pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 9;
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 10;
 
-/// The oldest main-manifest stamp accepted by normal open: v8, the legacy
-/// system column vintage and the target of every registered upgrade route.
-/// Explicit conversion and retained-snapshot decoding do not lower this gate.
-pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 8;
+/// The oldest main-manifest stamp accepted by normal open: v10, the target of
+/// every registered upgrade route. Explicit conversion and retained-snapshot
+/// decoding do not lower this gate.
+pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 10;
 
 /// The stamp a fresh graph of the given system column vintage is born with:
-/// v8 for the legacy spellings, v9 (CURRENT) for `__id`/`__src`/`__dst`. The
-/// vintage itself is read from the schema IR's feature set, never from the
-/// stamp; the stamp is the storage-format fence old binaries refuse on.
+/// CURRENT for both `id`/`src`/`dst` and `__id`/`__src`/`__dst` since v10.
+/// The vintage itself is read from the schema IR's feature set, never from
+/// the stamp; the stamp is the storage-format fence old binaries refuse on.
+/// An unknown vintage is still refused here so a new spelling cannot be born
+/// without a decision about its stamp.
 pub(crate) fn stamp_for_system_columns(system_columns: SystemColumns) -> Result<u32> {
-    if system_columns == SYSTEM_COLUMNS_LEGACY {
-        Ok(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION)
-    } else if system_columns == SYSTEM_COLUMNS_V3 {
+    if system_columns == SYSTEM_COLUMNS_LEGACY || system_columns == SYSTEM_COLUMNS_V3 {
         Ok(INTERNAL_MANIFEST_SCHEMA_VERSION)
     } else {
         Err(OmniError::manifest_internal(format!(
@@ -109,8 +117,9 @@ pub(crate) fn stamp_for_system_columns(system_columns: SystemColumns) -> Result<
 /// the release tags that stamped each version (verify with
 /// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
 /// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x, v5 was
-/// unreleased (final source commit pinned below), v6 is 0.9.x–0.10.x, and
-/// v7 an unreleased development build. The fallback keeps this map total.
+/// unreleased (final source commit pinned below), v6 is 0.9.x–0.10.x,
+/// v7 an unreleased development build, and v8 and v9 are the two 0.11.x
+/// system column vintages. The fallback keeps this map total.
 pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
     match stamp {
         1 => "0.3.1 or earlier",
@@ -122,6 +131,8 @@ pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         }
         6 => "0.9.x or 0.10.x",
         7 => "an unreleased v7 development build",
+        8 => "0.11.x (legacy system column spellings)",
+        9 => "0.11.x",
         _ => "an unrecognized older release",
     }
 }
@@ -153,12 +164,13 @@ pub(crate) fn read_stamp(dataset: &Dataset) -> Option<u32> {
 /// schema-metadata commit carrying nothing else: the first effect of the RFC
 /// 0040 system-column upgrade, published under its `SchemaApply` intent.
 /// Returns the `__manifest` version after the stamp. Idempotent on a manifest
-/// already at `to` (the roll-forward re-runs it); every other stamp, and a
-/// pending storage-upgrade intent, is refused.
+/// already at `to` (the roll-forward re-runs it, and since v10 both vintages
+/// share one stamp, so `from == to` reads the version and writes nothing);
+/// every other stamp, and a pending storage-upgrade intent, is refused.
 pub(crate) async fn publish_stamp_advance(root_uri: &str, from: u32, to: u32) -> Result<u64> {
     if from < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
         || to > INTERNAL_MANIFEST_SCHEMA_VERSION
-        || from >= to
+        || from > to
     {
         return Err(OmniError::manifest_internal(format!(
             "stamp advance v{from} to v{to} lies outside the served range v{MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION} to v{INTERNAL_MANIFEST_SCHEMA_VERSION}"
@@ -286,8 +298,7 @@ fn manifest_layout_is_modern(dataset: &Dataset) -> bool {
 /// - `stamp > CURRENT`: the graph was written by a newer binary — upgrade omnigraph.
 /// - `stamp < MIN_SUPPORTED`: the graph was made by an older omnigraph whose
 ///   storage format this binary does not read — rebuild it via export/import.
-/// - `MIN_SUPPORTED..=CURRENT` is served as-is; the two values are the two
-///   system column vintages of RFC 0040, and neither is migrated on open.
+/// - `MIN_SUPPORTED..=CURRENT` is served as-is and never migrated on open.
 pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
@@ -297,8 +308,8 @@ pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
         )));
     }
     if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
-        let explicit_upgrade = if matches!(stamp, 6 | 7) {
-            " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check` before execution (add `--to-format 8` to stop at v8 and keep the legacy system column spellings)."
+        let explicit_upgrade = if matches!(stamp, 6..=9) {
+            " A registered in-place route is also available: stop all writers and maintenance, retain a verified backup, and run `omnigraph upgrade <graph> --check` before execution; the route keeps the graph's branches and system column spellings."
         } else {
             ""
         };
@@ -371,20 +382,20 @@ pub(crate) async fn remove_stamp_for_test(dataset: &mut Dataset) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The guard accepts exactly the served range `[8, 9]`, the two system
-    /// column vintages, and refuses anything below the floor or above the
-    /// ceiling.
+    /// The guard accepts exactly the served range, one stamp since v10 that
+    /// both system column vintages are born with, and refuses anything below
+    /// the floor or above the ceiling.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 8);
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 9);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 10);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 10);
         assert!(stamp_for_system_columns(omnigraph_compiler::SYSTEM_COLUMNS_META).is_err());
         assert_eq!(
             (
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
                 INTERNAL_MANIFEST_SCHEMA_VERSION
             ),
-            (8, 9)
+            (10, 10)
         );
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
@@ -395,18 +406,23 @@ mod tests {
         let below = refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1)
             .expect_err("a sub-floor stamp must be refused")
             .to_string();
-        assert!(below.contains("reads only v8 to v9"), "got: {below}");
+        assert!(below.contains("reads only v10 to v10"), "got: {below}");
+        assert!(below.contains("0.11.x"), "got: {below}");
+        assert!(below.contains("omnigraph upgrade"), "got: {below}");
+        let legacy = refuse_if_stamp_unsupported(7)
+            .expect_err("a v7 stamp must be refused")
+            .to_string();
         assert!(
-            below.contains("an unreleased v7 development build"),
-            "got: {below}"
+            legacy.contains("an unreleased v7 development build"),
+            "got: {legacy}"
         );
-        assert!(below.contains("--to-format 8"), "got: {below}");
+        assert!(legacy.contains("omnigraph upgrade"), "got: {legacy}");
         let future_stamp = INTERNAL_MANIFEST_SCHEMA_VERSION + 1;
         let future = refuse_if_stamp_unsupported(future_stamp)
             .expect_err("the first unsupported future stamp must be refused")
             .to_string();
-        assert!(future.contains("internal schema v10"), "got: {future}");
-        assert!(future.contains("reads only v8 to v9"), "got: {future}");
+        assert!(future.contains("internal schema v11"), "got: {future}");
+        assert!(future.contains("reads only v10 to v10"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 
