@@ -1,5 +1,5 @@
 ---
-rfc: "NNNN"
+rfc: "YYYY-MM-DD-kebab-title"
 title: "Short descriptive title"
 track: maintainer
 status: draft
@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on: []
 ---
 
-# RFC NNNN: Short descriptive title
+# RFC: Short descriptive title
 
 Delete every instruction paragraph when it has been answered. Keep the RFC
 focused on the decision and evidence; implementation walkthroughs belong in
