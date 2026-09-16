@@ -6,13 +6,17 @@ Workflow YAML under `.github/workflows/` is the source of truth. This page expla
 
 `ci.yml` always classifies the diff. Only recognized documentation files may take the documentation-only path; a text fixture under a crate is source code.
 
-Merge queues trigger `ci.yml`, `gq-logic-tests.yml`, and `dst.yml` through
-`merge_group: checks_requested`. These runs check out the combined queue
-commit and always run full qualification, including formatting, Clippy,
-workspace tests, GQT, and DST. Workspace tests fail fast as they do on pull
-requests. The PR metadata gate stays on `pull_request_target`; vocabulary
-audits and Azurite retain their post-merge schedule. Queue runs never publish
-releases or save the main branch's caches.
+Merge queue entries trigger `ci.yml`, `gq-logic-tests.yml`, and `dst.yml`
+through `merge_group` (`checks_requested`). These runs check out the combined
+queue commit; the classifier diffs the group's base and head, so a
+documentation-only entry skips the same work it skips on a pull request.
+Workspace tests fail fast as they do on pull requests. The PR metadata gate
+stays on `pull_request_target` and reports a pass on the queue; the
+vocabulary audit, Azurite, the format fence, the RustFS shards and the
+deployment jobs keep their pull-request or post-merge schedule and never run
+on the queue; the DST pinned suite runs there as a reporting context. Queue
+runs never publish releases or save the main branch's caches. Details:
+[branch-protection.md](branch-protection.md), Merge queue.
 
 Branch protection currently requires these reporting contexts:
 
@@ -23,6 +27,7 @@ Branch protection currently requires these reporting contexts:
 - `Test omnigraph-server --features aws`
 - `Format (rustfmt)`
 - `Lint (clippy)`
+- `Test Workspace`
 - `GQ Logic Tests`
 - `Fix Regression Gate`
 - `Storage Upgrade Compatibility`
@@ -70,14 +75,17 @@ as a log line and as a GitHub error annotation. It is a policy check, so it runs
 workflow and the script come from `main`, and the pull request head is fetched
 only as data for the diff range, never checked out or executed. It runs on
 body edits and label changes as well as pushes, builds nothing, and takes no
-documentation-only skip.
+documentation-only skip. On the merge queue's branch it reports a pass
+without a check ([branch-protection.md](branch-protection.md), Merge queue).
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC
 location and metadata, registry agreement, and the absence of committed
 merge-conflict markers in Markdown. Before the documentation checks run,
 the same context also rejects any pull request whose own diff adds a
-conflict-marker line in any file type, annotating each offending file and
+conflict-marker line in any file type (a pull-request-only step; the
+merge-group run skips it, the pull request run having covered the diff),
+annotating each offending file and
 line; markers already on the base branch never fail an unrelated pull
 request. There is no exemption; a document that must quote a conflict block
 indents the markers one space. After the documentation checks, the same
@@ -164,16 +172,16 @@ Container entrypoint and Azure deployment-validation jobs test argument composit
 
 ## Full correctness graphs
 
-The workspace suite (`Test Workspace`) runs on every non-documentation pull request, on every push to `main`, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request drops `--no-fail-fast`):
+The workspace suite (`Test Workspace`) runs on every non-documentation pull request, on the merge queue's branch, on every push to `main`, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request and a merge-queue entry drop `--no-fail-fast`):
 
 ```bash
 cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --no-fail-fast \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
-On a pull request it is a reporting context, not a required one
-([branch-protection.md](branch-protection.md)), and it fails fast: wait for
-it to report, and read a red result, before merging. On `main`, tags, and
+On a pull request and on the merge queue's branch it is a required context
+([branch-protection.md](branch-protection.md)) and it fails fast: the queue
+waits for it before merging. On `main`, tags, and
 dispatch it is the post-merge detection channel and keeps `--no-fail-fast`,
 so every independent failure stays attributable; a red run there is
 stop-the-line. The job compiles in one step (`cargo test --no-run`) and runs
@@ -199,8 +207,8 @@ The remaining jobs own contracts that need special infrastructure. They run afte
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
-- **V5 ↔ V9 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every non-documentation pull request, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it as for `Test Workspace`. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
-- **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every non-documentation pull request, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards as for `Test Workspace`. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
+- **V5 ↔ V9 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every non-documentation pull request, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
+- **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every non-documentation pull request, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
 - **Azurite Azure integration** runs only after merge, on tags, or by manual
   dispatch: its 90-minute ceiling would outrun `Test Workspace` on a pull
   request. It exercises configured storage, admission-lease, recovery,
@@ -268,6 +276,8 @@ For repository metadata and workflow changes:
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
+python3 scripts/check-storage-upgrade-ci.py --self-test
+python3 scripts/check-merge-group-triggers.py --self-test
 python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
 python3 scripts/check-azure-admission-boundary.py
@@ -305,3 +315,4 @@ Every release build sets `RUSTFLAGS` itself (`release.yml`, `release-edge.yml`, 
    exact-SHA vocabulary audit; a skipped pull-request context never authorizes
    publication.
 6. Update [branch-protection.md](branch-protection.md) only when the declared required contexts or policy actually change.
+7. Keep every required context reporting on the merge queue's temporary branch too: a workflow that owns one lists `merge_group` under `on:`; a job condition that admits `pull_request` by name (`== 'pull_request'`) also admits `merge_group`; a negative gate written for post-merge venues (`!= 'pull_request'`) also excludes `merge_group`, so the queue runs only what blocks it. `scripts/check-merge-group-triggers.py` enforces the first two ([branch-protection.md](branch-protection.md), Merge queue).

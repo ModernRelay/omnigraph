@@ -99,6 +99,9 @@ CI runs both.
 - GitHub requests reviewers from `.github/CODEOWNERS` when a change touches an
   owned crate; the request is advisory, not a merge gate (see
   [docs/dev/branch-protection.md](docs/dev/branch-protection.md)).
+- Merges into `main` go through the merge queue: click **Merge when ready**
+  once the checks have reported (same page, Merge queue); queueing needs write
+  access, so a fork author asks a maintainer to click it.
 
 New to the codebase? Read [AGENTS.md](AGENTS.md) — the architecture map and the
 always-on invariants every change is reviewed against.

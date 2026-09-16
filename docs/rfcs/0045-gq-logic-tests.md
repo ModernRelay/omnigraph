@@ -294,7 +294,8 @@ among Rust test targets only `omnigraph-gqt`'s (the corpus target and its
 unit tests), `Test omnigraph-server --features aws`, and `DST pinned suite`
 (`cargo test -p omnigraph-dst`, `dst.yml`) run on a pull request as
 required contexts (`Test Workspace` runs the remaining workspace targets on
-the pull request as a reporting context, CI above); a test-attributed
+the pull request and on the merge queue's branch as a required context since
+2026-09-16, CI above); a test-attributed
 `issue_N` function inside `crates/omnigraph-gqt/`, `crates/omnigraph-server/`,
 or `crates/omnigraph-dst/` therefore runs in a required context, and the
 Rust shape stays a naming check everywhere else, where a defined
@@ -2248,3 +2249,11 @@ historical command and configuration descriptions are not migration aliases.
   `STORE_PLACES` and validates the store hit). In the 2026-09-14
   entry of this log: "`--- fault` is reserved for storage-boundary faults"
   (no such section exists).
+- 2026-09-16, amendment from the PR that made CI listen to the merge queue
+  (`docs/dev/branch-protection.md`, Merge queue): `Test Workspace` is a
+  required context on pull requests and on the merge queue's branch. §CI's
+  parenthetical is rewritten to say so. Superseded sentence: "(`Test
+  Workspace` runs the remaining workspace targets on the pull request as a
+  reporting context, CI above)". The claim that a test-attributed `issue_N`
+  function inside the three named crates runs in a required context stands;
+  it now also holds for every other workspace crate through `Test Workspace`.
