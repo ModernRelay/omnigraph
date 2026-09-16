@@ -138,9 +138,10 @@ Repository metadata gates also check:
   text cargo-deny cannot read needs a `[[licenses.clarify]]` entry. A `path` copy of a
   crate, bare or behind `[patch]`, and a `.cargo/config.toml` source replacement
   keep no source for cargo-deny to check; `scripts/check-dependency-sources.py`,
-  run in the same job, refuses them: every `Cargo.lock` package outside the
-  workspace carries the crates.io source, no manifest declares a `[patch]`
-  table, and the cargo config declares no source replacement or path override.
+  run in the same job, refuses them: the source-less `Cargo.lock` packages are
+  exactly the workspace members by name and version, no manifest declares a
+  `[patch]` table, and neither `.cargo/config.toml` nor the deprecated
+  `.cargo/config` declares a source replacement or path override.
   Build scripts are outside both checks. An exemption that no longer matches
   anything fails the check, so the bump that clears an advisory or drops a
   license's last holder also removes its `deny.toml` row. The job is a required

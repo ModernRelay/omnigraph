@@ -4,10 +4,11 @@
 `cargo deny` classifies a crate by its resolved source and skips a crate that
 has none, so a `path` copy (bare or behind `[patch]`) and a `.cargo/config.toml`
 source replacement pass its `sources` check. This script holds the three places
-such a route shows up: every `Cargo.lock` package outside the workspace carries
-the crates.io source, no manifest declares a `[patch]` table, and the cargo
-config declares no source replacement or path override. Build scripts are
-outside both checks.
+such a route shows up: the source-less `Cargo.lock` packages are exactly the
+workspace members by name and version, no manifest declares a `[patch]` table,
+and neither cargo config file (`.cargo/config.toml` or the deprecated
+`.cargo/config`) declares a source replacement or path override. Build scripts
+are outside both checks.
 """
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 MEMBERS_RE = re.compile(r"^members\s*=\s*\[(.*?)\]", re.MULTILINE | re.DOTALL)
 QUOTED_RE = re.compile(r'"([^"]+)"')
 PACKAGE_NAME_RE = re.compile(r'^name\s*=\s*"([^"]+)"', re.MULTILINE)
+PACKAGE_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
+WORKSPACE_VERSION_RE = re.compile(r"^version\s*(?:\.workspace\s*=\s*true|=\s*\{\s*workspace\s*=\s*true\s*\})", re.MULTILINE)
+CONFIG_FILES = (".cargo/config.toml", ".cargo/config")
 LOCK_FIELD_RE = re.compile(r'^(name|version|source)\s*=\s*"([^"]*)"', re.MULTILINE)
 PATCH_TABLE_RE = re.compile(r"^\s*\[patch[.\]]", re.MULTILINE)
 CONFIG_OVERRIDE_RE = re.compile(
@@ -44,13 +48,32 @@ def member_manifests(root: Path) -> list[Path]:
     return manifests
 
 
-def package_name(manifest: Path) -> str | None:
+def workspace_package_version(root: Path) -> str | None:
+    text = (root / "Cargo.toml").read_text()
+    section = text.find("[workspace.package]")
+    if section < 0:
+        return None
+    match = PACKAGE_VERSION_RE.search(text, section)
+    return match.group(1) if match else None
+
+
+def package_identity(root: Path, manifest: Path) -> tuple[str, str] | None:
+    """The member's `(name, version)`; a `version.workspace = true` resolves through the root."""
     text = manifest.read_text()
     package_section = text.find("[package]")
     if package_section < 0:
         return None
-    match = PACKAGE_NAME_RE.search(text, package_section)
-    return match.group(1) if match else None
+    name = PACKAGE_NAME_RE.search(text, package_section)
+    if name is None:
+        return None
+    version = PACKAGE_VERSION_RE.search(text, package_section)
+    if version is not None:
+        return name.group(1), version.group(1)
+    if WORKSPACE_VERSION_RE.search(text, package_section) is not None:
+        inherited = workspace_package_version(root)
+        if inherited is not None:
+            return name.group(1), inherited
+    return name.group(1), "?"
 
 
 def lock_packages(lock: Path) -> list[dict[str, str]]:
@@ -65,7 +88,7 @@ def lock_packages(lock: Path) -> list[dict[str, str]]:
 def check(root: Path) -> tuple[list[str], str]:
     failures: list[str] = []
     manifests = member_manifests(root)
-    members = {name for name in (package_name(m) for m in manifests) if name}
+    members = {identity for identity in (package_identity(root, m) for m in manifests) if identity}
 
     registry = 0
     for package in lock_packages(root / "Cargo.lock"):
@@ -73,10 +96,10 @@ def check(root: Path) -> tuple[list[str], str]:
         version = package.get("version", "?")
         source = package.get("source")
         if source is None:
-            if name not in members:
+            if (name, version) not in members:
                 failures.append(
                     f"Cargo.lock: {name} {version} has no source and is not a workspace member "
-                    "(a path copy or a [patch] path entry)"
+                    "by name and version (a path copy or a [patch] path entry)"
                 )
         elif source == CRATES_IO:
             registry += 1
@@ -88,16 +111,18 @@ def check(root: Path) -> tuple[list[str], str]:
             line = manifest.read_text().count("\n", 0, match.start()) + 1
             failures.append(f"{manifest.relative_to(root)}:{line}: [patch] table replaces a dependency's code")
 
-    config = root / ".cargo" / "config.toml"
-    if config.is_file():
+    for relative in CONFIG_FILES:
+        config = root / relative
+        if not config.is_file():
+            continue
         text = config.read_text()
         for match in CONFIG_OVERRIDE_RE.finditer(text):
             line = text.count("\n", 0, match.start()) + 1
-            failures.append(f".cargo/config.toml:{line}: source replacement or path override: {match.group(1).strip()}")
+            failures.append(f"{relative}:{line}: source replacement or path override: {match.group(1).strip()}")
 
     summary = (
-        f"Dependency sources OK ({registry} crates.io packages, {len(members)} workspace members; "
-        "no [patch] table, no source replacement)."
+        f"Dependency sources OK ({registry} crates.io packages, {len(members)} workspace members by "
+        "name and version; no [patch] table, no source replacement)."
     )
     return failures, summary
 
@@ -131,13 +156,32 @@ def self_test() -> int:
         ),
         (
             "[patch] table in a member manifest",
-            {"Cargo.lock": lock_ok, "crates/a/Cargo.toml": '[package]\nname = "a"\n\n[patch.crates-io]\nb = { path = "../b" }\n'},
+            {"Cargo.lock": lock_ok, "crates/a/Cargo.toml": '[package]\nname = "a"\nversion = "0.1.0"\n\n[patch.crates-io]\nb = { path = "../b" }\n'},
             1,
         ),
         (
             "source replacement in the cargo config",
             {"Cargo.lock": lock_ok, ".cargo/config.toml": '[source.crates-io]\nreplace-with = "vendored"\n\n[source.vendored]\ndirectory = "vendor"\n'},
             3,
+        ),
+        (
+            "path copy named like a member at another version",
+            {"Cargo.lock": lock_ok + '\n[[package]]\nname = "a"\nversion = "9.9.9"\n'},
+            1,
+        ),
+        (
+            "path override in the deprecated .cargo/config",
+            {"Cargo.lock": lock_ok, ".cargo/config": 'paths = ["vendor/b"]\n'},
+            1,
+        ),
+        (
+            "member version inherited from [workspace.package]",
+            {
+                "Cargo.lock": lock_ok.replace('version = "0.1.0"', 'version = "0.2.0"', 1),
+                "Cargo.toml": '[workspace]\nmembers = ["crates/a"]\n\n[workspace.package]\nversion = "0.2.0"\n',
+                "crates/a/Cargo.toml": '[package]\nname = "a"\nversion.workspace = true\n',
+            },
+            0,
         ),
     ]
     for label, files, expected_failures in cases:
