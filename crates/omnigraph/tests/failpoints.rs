@@ -12033,7 +12033,7 @@ async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
 /// Real-backend coverage of the recovery-sidecar lifecycle the remaining
 /// sidecar writers still use: the index build stops after its confirmed
 /// effects, its sidecar PUT went through the S3 adapter, and the next write
-/// on the same handle LISTs `__recovery/`, rolls the sidecar forward, DELETEs
+/// on the same handle lists `__recovery/`, rolls the sidecar forward, deletes
 /// it and lands. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set.
 #[tokio::test]
 #[serial]
