@@ -164,6 +164,33 @@ jobs:
       - name: Check required storage upgrade coverage
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
+  cargo_deny:
+    name: Dependency Guard (cargo deny)
+    # `deny.toml` is the allowlist for dependency sources, licenses, advisories
+    # and version specs. The check reads `Cargo.lock`, the manifests and the
+    # RustSec database, builds nothing, and runs on every pull request.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # cargo-deny skips a crate with no source: a path copy, a `[patch]`
+      # path entry, or a config source replacement is refused here instead.
+      - name: Check dependency sources
+        run: python3 scripts/check-dependency-sources.py
+
+      # `arguments` replaces the action's default `--all-features`; the
+      # `[graph] all-features` line in `deny.toml` is what keeps the AWS
+      # SDK crates in scope. `--locked` refuses a rewritable Cargo.lock.
+      - name: Check dependency sources, advisories, licenses and bans
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+
   azure_contract_guards:
     name: Azure Contract Guards
     runs-on: ubuntu-latest
