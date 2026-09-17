@@ -59,7 +59,6 @@ pub(crate) fn clear_process_slots() {
     crate::lance_faults::set_seam_scheduler(None);
     crate::lance_faults::set_bytes_canary(None);
     omnigraph::storage::STORAGE.clear();
-    FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
 }
 
 /// The plain (unpaused, unseeded) current-thread tokio runtime used by
@@ -1245,44 +1244,6 @@ const BRANCH_POOL: [&str; 2] = ["b0", "b1"];
 /// Owned "main" for call sites needing `&[String]` (per-check
 /// mode differential runs main-only; final audit covers every branch).
 static MAIN_BRANCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "main".to_string());
-
-/// CORRUPTION AXIS (persisted tier) — FIRST-CONTACT FINDING (2026-08-13, seed 97's first
-/// run) + its named carve-out: recovery LISTS and RE-READS a
-/// foreign-named file in `__recovery/` (a misdirected sidecar, `dstm-`
-/// prefix) but neither heals nor removes it — permanent residue, silently
-/// re-consumed on every recovery pass. Issue candidate (Azim judges): what
-/// is the contract for an unrecognized sidecar file — quarantine, delete,
-/// or refuse? Until ruled, residue whose FILENAME carries our misdirect
-/// marker (only `misdirect_uri` mints `dstm-`) is recorded as a
-/// `s11b-foreign-sidecar-ignored` known-issue row instead of panicking;
-/// REAL-named residue keeps panicking (reopen must heal what it
-/// recognizes). Per-universe sink, cleared at universe start, drained into
-/// `UniverseReport.known_issues` (lance_faults slot precedent).
-static FOREIGN_SIDECAR_ROWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-fn is_foreign_sidecar(uri: &str) -> bool {
-    uri.rsplit_once('/')
-        .map(|(_, file)| file.starts_with("dstm-"))
-        .unwrap_or(false)
-}
-
-/// Partition residue: foreign-marked entries are recorded (root-normalized)
-/// and returned as tolerated; anything else is returned for the caller to
-/// panic on.
-fn partition_residue(residue: Vec<String>, root: &str, label: &str) -> Vec<String> {
-    let mut hard = Vec::new();
-    for uri in residue {
-        if is_foreign_sidecar(&uri) {
-            FOREIGN_SIDECAR_ROWS.lock().unwrap().push(format!(
-                "s11b-foreign-sidecar-ignored:{}@{label}",
-                uri.replace(root, "<root>")
-            ));
-        } else {
-            hard.push(uri);
-        }
-    }
-    hard
-}
 
 #[derive(Clone, Debug)]
 struct BranchSlot {
@@ -3982,10 +3943,6 @@ async fn assert_no_recovery_residue(
     at_op: usize,
 ) {
     let residue = recovery_residue(storage, root).await;
-    // Persisted tier: foreign-named (injected-misdirect) residue is the named
-    // carve-out `s11b-foreign-sidecar-ignored` — recorded, tolerated;
-    // real-named residue still panics (reopen heals what it recognizes).
-    let residue = partition_residue(residue, root, label);
     if !residue.is_empty() {
         detectors::violation(
             DET_RECOVERY_OBLIGATION,
@@ -5029,12 +4986,9 @@ fn composition_hypotheses(
 /// matching composition becomes the model, wholesale.
 struct WatchRuling {
     a_outcome: ReconcileOutcome,
-    /// `Some` exactly when an interrupt was passed. CANONICAL exactly-once
-    /// contract: the interrupting op's judgment is FINAL here and the call
-    /// site MUST NOT judge it again — the resolution's reopen empties
-    /// `__recovery/` of every recognized-name strand (the tolerated
-    /// foreign-named carve-out is an injected misdirect, never an op's own
-    /// strand), so nothing survives to change the op's fate.
+    /// `Some` exactly when an interrupt was passed; the interrupting op's
+    /// judgment is FINAL here (the call site MUST NOT judge it again): the
+    /// resolution's reopen empties `__recovery/` of every strand.
     e_outcome: Option<ReconcileOutcome>,
     matched: String,
     world: WorldModel,
@@ -5429,7 +5383,6 @@ impl UniverseEnvironment for RustEnvironment {
         }
         crate::lance_faults::set_active(lance_faults_state.clone());
         crate::lance_faults::set_kill(kill_state.clone());
-        FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
         let failing: Option<Arc<FailingStorage>> = if self.faults.is_some() || kill_state.is_some()
         {
             Some(Arc::new(FailingStorage::new(
@@ -6528,38 +6481,8 @@ impl UniverseScenario<RustResources> for Scenario {
                 "convergence completes within the 120 s real-clock bound",
             ),
         };
-        // FIRST-CONTACT FINDING of the corruption axis
-        // (2026-08-13, seed 97): a FOREIGN-NAMED sidecar permanently blocks
-        // maintenance — the recovery BARRIER parses the file's CONTENT
-        // (pending Mutation, op id) via directory listing, but the HEALER
-        // deletes `sidecar_uri(root, operation_id)` — the canonical path
-        // reconstructed from the op id (recovery.rs:7995), NOT the listed
-        // file's actual path — so the dstm- file is re-"healed" every
-        // reopen yet never removed, and the typed RecoveryRequired remedy
-        // ("reopen") provably does not clear it. Named carve-out: tolerate
-        // + record ONLY when the barrier names a foreign sidecar's op and
-        // foreign damage was injected; every other failure still panics.
         if let Err(err) = lively {
-            let text = format!("{err:?}");
-            let foreign_injected = failing
-                .as_ref()
-                .map(|f| {
-                    f.persisted_damage_snapshot()
-                        .values()
-                        .any(|v| *v == "misdirect-target")
-                })
-                .unwrap_or(false);
-            assert!(
-                foreign_injected && text.contains("RecoveryRequired"),
-                "ensure_indices in-universe: {err:?}"
-            );
-            FOREIGN_SIDECAR_ROWS.lock().unwrap().push(format!(
-                "s11b-foreign-sidecar-blocks-maintenance@final-audit: {}",
-                text.replace(root, "<root>")
-                    .chars()
-                    .take(160)
-                    .collect::<String>()
-            ));
+            panic!("ensure_indices in-universe: {err:?}");
         }
         // closing capture — the loop's final op plus the closing
         // ensure_indices' own commit, if it made one.
@@ -6605,7 +6528,6 @@ impl UniverseScenario<RustResources> for Scenario {
         // Persisted tier: injected residue must ALSO heal on this reopen — the
         // message names the injected verb when the survivor is attributed.
         let final_residue = recovery_residue(&storage, root).await;
-        let final_residue = partition_residue(final_residue, root, "final audit");
         if !final_residue.is_empty() {
             let ledger = failing
                 .as_ref()
@@ -6777,9 +6699,6 @@ impl UniverseScenario<RustResources> for Scenario {
             .expect("the recovery audit dataset reads back at the end of a universe");
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
-        // Persisted tier: drain the foreign-sidecar carve-out rows into the
-        // known-issues column (insertion order — deterministic).
-        known_issues.extend(FOREIGN_SIDECAR_ROWS.lock().unwrap().drain(..));
         UniverseReport {
             end_state: world.main.person_rows(),
             edges: world.main.edge_pairs(),

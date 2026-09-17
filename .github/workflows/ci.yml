@@ -25,20 +25,26 @@ env:
   FAILPOINT_FEATURES: omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 
 jobs:
+  # One output per set of jobs: `run_full_ci` (engine input: every job),
+  # `run_gqt` (also cases-only), `run_deployment` (also deployment-only);
+  # classes in docs/dev/ci.md, pinned by scripts/check-change-classes.py.
   classify_changes:
     name: Classify Changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
       run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
+      run_gqt: ${{ steps.filter.outputs.run_gqt }}
+      run_deployment: ${{ steps.filter.outputs.run_deployment }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
 
-      - name: Detect documentation-only changes
+      - name: Classify changed paths
         id: filter
         env:
           BEFORE_SHA: ${{ github.event.before }}
@@ -51,9 +57,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+          # No diff to classify (dispatch, tag, unknown base, empty diff):
+          # every job runs.
+          run_everything() {
+            printf 'run_full_ci=true\nrun_gqt=true\nrun_deployment=true\n' >> "$GITHUB_OUTPUT"
             exit 0
+          }
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            run_everything
           fi
 
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
@@ -71,33 +83,42 @@ jobs:
           fi
 
           if [[ -z "${base:-}" ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            run_everything
           fi
 
-          # Disable rename collapsing so moving source into docs still reports
-          # the source-side deletion and cannot become a docs-only false skip.
-          mapfile -t changed < <(git diff --name-only --no-renames "$base" "$head")
+          # Merge base (a branch behind main must not inherit its newer files),
+          # no rename collapsing (a source file moved into docs keeps its
+          # deletion), no path quoting (a non-ASCII name reaches the arms raw).
+          mapfile -t changed < <(git -c core.quotePath=false diff --name-only --no-renames --merge-base "$base" "$head")
           if [[ "${#changed[@]}" -eq 0 ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            run_everything
           fi
 
           run_full_ci=false
+          run_gqt=false
+          run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
+              crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;
+              Dockerfile|.dockerignore|docker/*|deploy/*) run_deployment=true ;;
               *)
                 run_full_ci=true
                 ;;
             esac
           done
 
+          if [[ "$run_full_ci" == "true" ]]; then
+            run_gqt=true
+            run_deployment=true
+          fi
+
           printf 'Changed files:\n'
           printf '  %s\n' "${changed[@]}"
-          echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
+          printf 'run_full_ci=%s\nrun_gqt=%s\nrun_deployment=%s\n' \
+            "$run_full_ci" "$run_gqt" "$run_deployment" | tee -a "$GITHUB_OUTPUT"
 
   check_agents_md:
     name: Check AGENTS.md Links
@@ -176,6 +197,16 @@ jobs:
       - name: Check required contexts report on the merge queue
         run: python3 scripts/check-merge-group-triggers.py --self-test
 
+      - name: Assert the classification copies match this workflow
+        run: |
+          python3 scripts/check-classify-copy.py --self-test
+          python3 scripts/check-classify-copy.py
+
+      - name: Replay the classifier and check class reader closure
+        run: |
+          python3 scripts/check-change-classes.py --self-test
+          python3 scripts/check-change-classes.py
+
   cargo_deny:
     name: Dependency Guard (cargo deny)
     # `deny.toml` is the allowlist for dependency sources, licenses, advisories
@@ -205,8 +236,11 @@ jobs:
 
   azure_contract_guards:
     name: Azure Contract Guards
-    # Reporting context: not on the merge queue's branch (docs/dev/branch-protection.md).
-    if: github.event_name != 'merge_group'
+    needs: classify_changes
+    # Reads the Dockerfile, the package workflow and the admission crates:
+    # engine input or deployment files. Reporting context: not on the merge
+    # queue's branch (docs/dev/branch-protection.md).
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_deployment == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -413,8 +447,9 @@ jobs:
 
   entrypoint_test:
     name: Container Entrypoint
+    needs: classify_changes
     # Reporting context: not on the merge queue's branch (docs/dev/branch-protection.md).
-    if: github.event_name != 'merge_group'
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_deployment == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -436,8 +471,9 @@ jobs:
 
   azure_deployment_validation:
     name: Azure Deployment Validation
+    needs: classify_changes
     # Reporting context: not on the merge queue's branch (docs/dev/branch-protection.md).
-    if: github.event_name != 'merge_group'
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_deployment == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -828,9 +864,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - name: Skip for documentation-only changes
+      - name: Skip when no engine input changed
         if: needs.classify_changes.outputs.run_full_ci != 'true'
-        run: echo "Documentation-only change detected; skipping aws feature build."
+        run: echo "No engine input changed; skipping aws feature build."
 
       - name: Checkout source
         if: needs.classify_changes.outputs.run_full_ci == 'true'

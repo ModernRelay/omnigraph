@@ -593,7 +593,7 @@ fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass
 
 /// Both forms of the issue 601 case misdirect the same arm put: one hit
 /// each with `write_text`, the canonical name requested, the `dstm-` name
-/// stored beside it, and the same known failure at step 3.
+/// stored beside it, and both pass: the heal deletes the listed uri.
 #[cfg(tokio_unstable)]
 #[test]
 fn store_effect_and_store_place_misdirect_the_same_put() {
@@ -627,7 +627,7 @@ fn store_effect_and_store_place_misdirect_the_same_put() {
         );
         let (_, summary) = report(&output);
         for attempt in summary["attempts"].as_array().unwrap() {
-            assert_eq!(attempt["known_failure"], true, "{form}");
+            assert_eq!(attempt["known_failure"], false, "{form}");
             let deliveries = attempt["outcome"]["Ok"]["evidence"]
                 .as_array()
                 .unwrap()

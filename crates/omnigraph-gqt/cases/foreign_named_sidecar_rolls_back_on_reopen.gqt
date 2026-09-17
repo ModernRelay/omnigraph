@@ -1,0 +1,61 @@
+# issue: none
+# notes: The roll-back leg of the #601 heal: the arm put is misdirected to `__recovery/dstm-<opid>.json` and the confirm put then fails, so the mutation surfaces the injected error and the foreign-named sidecar stays Armed with no visible commit.
+# notes: The reopen lists the foreign file, rolls the intent back, and deletes the sidecar at the uri it was listed from; the write after the reopen succeeds and the rolled-back row is absent. The sibling cases `issue_601_*` cover the roll-forward leg (mutation published, reopen finalizes).
+# notes: Two seams before one step name distinct seams (RFC 0066); the failing confirm put is `mutation_sidecar_confirm_put_failure_rolls_back.gqt` with the misdirect added.
+# notes: Red on the unfixed engine (`recovery.rs` of fe9eb339, 2026-09-16): step 3 refused with RecoveryRequired "pending Mutation recovery operation blocks writes on branch 'main'", the same barrier the `issue_601_*` cases were red on; the reopen had deleted the canonical name and left the foreign file.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: recovery.sidecar_write
+occurrence: 1
+action: misdirect
+scope: next_step
+
+--- seam
+at: mutation.sidecar_confirm_put
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+query add_row() {
+    insert Person { name: "bob" }
+}
+
+--- expect error: injected failpoint triggered: mutation.sidecar_confirm_put
+
+--- restart
+
+--- mutate
+query add_row_after_reopen() {
+    insert Person { name: "carol" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query rows_after_reopen() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"carol"}
+
+--- expect shape
+p.name: String

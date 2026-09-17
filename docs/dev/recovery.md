@@ -51,6 +51,20 @@ A crash may interrupt any step after 2. Re-running classification must be
 idempotent: an already-published outcome is success, an owned unpublished
 outcome converges once, and cleanup can be retried.
 
+A sidecar is written as `__recovery/<operation_id>.json`, but recovery trusts
+the body, not the name: every `.json` object under `__recovery/` with a valid
+body is healed as the operation its body names, and the heal re-reads,
+rewrites, and deletes the object at the uri it was listed from, never at a
+path rebuilt from the operation id. A file whose name disagrees with its
+operation id (a store write that landed under another name) is logged at
+`warn` with both and then healed like any other, so one such file per
+operation does not survive a read-write open. Two files for one operation
+(a misdirected confirm put beside its canonical arm, then a crash before
+publish) are not converged: the first heals and settles the operation, the
+second finds the settled outcome but carries no rollback plan, and the
+open is refused at that sidecar. That state is left as a known limitation
+of the sidecar lifecycle.
+
 ## Classification
 
 Recovery compares each sidecar slot with both manifest authority and the actual

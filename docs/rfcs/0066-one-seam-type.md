@@ -294,11 +294,14 @@ The arm put behind `recovery.sidecar_write` is the one store call between
 the seam and the handle (`crates/omnigraph/src/db/manifest/recovery.rs:1146`
 and `:1154`), so the misdirected object is `__recovery/dstm-<opid>.json`
 with a valid Armed body; the confirm put and the post-publish delete
-address the canonical name. The reopen at `--- restart` lists the
-directory, reads the foreign file, classifies the intent as the healer
-decides and deletes the canonical name, which does not exist, so the file
-stays; the write at the third step is refused with `RecoveryRequired`, and
-the marker's reason is copied from the red report. The same object placed
+address the canonical name. Before the
+[#601](https://github.com/ModernRelay/omnigraph/issues/601) fix the reopen
+at `--- restart` listed the directory, read the foreign file, classified the
+intent as the healer decided and deleted the canonical name, which did not
+exist, so the file stayed and the write at the third step was refused with
+`RecoveryRequired` (the marker's reason was copied from that red report);
+the fix heals a sidecar at the uri it was listed from, so both forms of the
+case pass without a marker. The same object placed
 by the store place form reads `at: storage.put`, `subject: __recovery/*`,
 `occurrence: 1`, `action: misdirect`; both forms produce one bucket state
 and one delivery record.
@@ -901,7 +904,8 @@ Owners extended (`docs/dev/testing.md:23,43,60`): `crates/omnigraph/tests/failpo
   marker's reason copied from the red report; the same bucket state reached
   through `storage.put` with `subject: __recovery/*` in the sibling case
   `issue_601_foreign_named_sidecar_via_store_place.gqt`, carrying the same
-  marker.
+  marker (both markers deleted by the #601 fix, which heals a sidecar at
+  the uri it was listed from; both cases green since).
 - `omnigraph-dst`: the decoration's rule list fires on the declared
   occurrence of the matching subject and on no other call.
 - DST: the pinned scenarios strict-replay unchanged, the empty rule list

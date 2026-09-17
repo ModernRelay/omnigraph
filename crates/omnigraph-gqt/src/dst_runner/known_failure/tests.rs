@@ -192,17 +192,20 @@ const STORE_CASE: &str = include_str!(concat!(
     "/cases/issue_601_foreign_named_sidecar_blocks_branch.gqt"
 ));
 
-/// The issue 601 case as written (a store effect on a decision seam) or
-/// rewritten onto the store place `storage.put` under `__recovery/*`, with
-/// the report a healthy run produces: one delivery carrying the hit.
+const STORE_MARKER: &str = "--- known_failure\nstep: 3\nmatch:\n  error: RecoveryRequired\n  reason: \"pending Mutation recovery operation blocks writes on branch 'main'\"\n\n--- schema\n";
+
+/// The issue 601 case with a step-3 `known_failure` marker re-inserted (the
+/// classifier needs one), as a decision-seam store effect or rewritten onto the
+/// store place `storage.put` under `__recovery/*`, plus a one-delivery report.
 fn store_fixture(store_place: bool) -> (Case, WorkerReport) {
+    let text = STORE_CASE.replace("--- schema\n", STORE_MARKER);
     let text = if store_place {
-        STORE_CASE.replace(
+        text.replace(
             "at: recovery.sidecar_write\n",
             "at: storage.put\nsubject: \"__recovery/*\"\n",
         )
     } else {
-        STORE_CASE.to_string()
+        text
     };
     let case = crate::parse_case("issue_601_foreign_named_sidecar_blocks_branch", &text).unwrap();
     let marker = case.known_failure.as_ref().unwrap();
