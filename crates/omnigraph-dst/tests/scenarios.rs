@@ -1271,128 +1271,47 @@ fn dst_lance_realm_faults_bite_and_oracles_hold() {
     assert!(a.verified > 0);
 }
 
-/// ONE spelling of the keep-serving scenario shared by the panel, the
-/// widened-arbitration regression, and the seed search — the panel's
-/// re-pin protocol ("screen at THIS test's parameters") holds by
-/// construction, not copy discipline.
-fn keep_serving_scenario(seed: u64, ops: usize, error_pct: u64) -> Scenario {
-    Scenario {
-        seed,
-        ops,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: seed * 100,
-            error_pct,
-            lance_realm: true,
-            ..Default::default()
-        }),
-        keep_serving_ops: 3,
-        ..Default::default()
-    }
-}
-
-/// The rendered detector tag a wedge red carries — built from the detector
-/// const, never hand-spelled.
-fn wedge_detector_tag() -> String {
-    format!(
-        "detector={}",
-        omnigraph_dst::harness::DET_LIVE_WRITE_AVAILABILITY
-    )
-}
-
-/// Keep-serving defer rows in a report (the wedge-shape evidence the
-/// panel's and the regression's shape asserts count).
-fn keep_serving_defer_rows(report: &omnigraph_dst::harness::UniverseReport) -> usize {
-    report
-        .known_issues
-        .iter()
-        .filter(|row| row.starts_with(omnigraph_dst::harness::KEEP_SERVING_DEFER_PREFIX))
-        .count()
-}
-
-/// Defer-implies-resolution invariant: a universe that deferred must also
-/// have resolved — the watch never outlives its universe unjudged. Keyed
-/// on the producer's exported prefixes, one spelling.
-fn assert_resolution_row(report: &omnigraph_dst::harness::UniverseReport, seed: u64) {
-    assert!(
-        report.known_issues.iter().any(|row| {
-            row.starts_with(omnigraph_dst::harness::KEEP_SERVING_HEALED_PREFIX)
-                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_INTERRUPTED_PREFIX)
-                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_EXPIRED_PREFIX)
-        }),
-        "seed {seed}: defer rows without a resolution row"
-    );
-}
-
-/// Availability panel under a short, harsh fault plan. Since RFC 0067 no
-/// writer the workload reaches arms a recovery intent, so no live handle can
-/// wedge on its own failed attempt; every panel seed must stay available,
-/// and any defer that still appears must resolve.
+/// Availability panel under a short, harsh fault plan (issue #554's
+/// descendant). The 13 seeds once wedged a live handle on its own failed
+/// attempt's recovery sidecar; since RFC 0067 no writer arms a recovery
+/// operation, so nothing can wedge and every seed must run green under the
+/// same weather — any red here is a genuine availability or oracle
+/// regression. ops is deliberately SHORT and error_pct HIGH so retry
+/// chains die instead of rescuing a commit.
 #[test]
 #[serial]
-fn dst_keep_serving_wedge_issue_554() {
-    // ops is deliberately SHORT: the panel seeds strand early — a longer
-    // life under this fault plan eventually strands an EFFECTFUL Armed
-    // intent (partial multi-table commit), which the engine CORRECTLY
-    // refuses to retire live; the detector's effect-free precision is
-    // enforced by scenario construction (verifying effect-freedom in the
-    // oracle itself is future work). error_pct is HIGH so retry chains
-    // die instead of rescuing the commit.
-    // Every member is a verified FLIP seed: wedges (or strands harmlessly)
-    // at engine HEAD and heals under the issue-554 engine fix. Seeds 12 and
-    // 18 were screened OUT — their strands stay wedged under the fix
-    // (effectful / excluded-class intents the engine correctly refuses to
-    // retire live — the detector's precision boundary, observed in the
-    // wild; not panel material).
+fn dst_availability_panel_survives_harsh_faults_issue_554() {
     const PANEL: [u64; 13] = [0, 4, 10, 11, 14, 15, 17, 20, 22, 23, 25, 26, 28];
-    let mut wedged: Vec<String> = Vec::new();
-    let mut defer_rows = 0usize;
     for seed in PANEL {
-        let sc = keep_serving_scenario(seed, 10, 80);
+        let sc = Scenario {
+            seed,
+            ops: 10,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed * 100,
+                error_pct: 80,
+                lance_realm: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let root = format!("shared-memory://dst-keep-serving-554-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                if defers > 0 {
-                    assert_resolution_row(&report, seed);
-                }
-                defer_rows += defers;
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                if message.contains(&wedge_detector_tag()) {
-                    wedged.push(format!("seed {seed}: {message}"));
-                } else {
-                    // A non-wedge red on a panel seed is a different bug —
-                    // surface it with its seed rather than folding it into
-                    // the wedge verdict.
-                    panic!("seed {seed}: {message}");
-                }
-            }
-        }
+        omnigraph_dst::harness::run_universe_caught(&root, &sc).unwrap_or_else(|panic| {
+            panic!(
+                "seed {seed}: {}",
+                omnigraph_dst::harness::panic_message(panic.as_ref())
+            )
+        });
     }
-    assert!(
-        wedged.is_empty(),
-        "ISSUE-554 PANEL RED: live handles wedged on {} of {} panel seeds.\n\
-         Orientation for a CI reader: at engine HEAD WITHOUT the #554 live-heal \
-         engine fix this red is DESIGNED and expected to flip green when that \
-         fix merges. If that fix is already on this branch's base, this is a \
-         REGRESSION in the live retirement of effect-free Armed intents.\n{}",
-        wedged.len(),
-        PANEL.len(),
-        wedged.join("\n")
-    );
-    // RFC 0067: mutation and load arm no intent, so the panel no longer
-    // requires a deferred-recovery row; `defer_rows` is evidence only.
-    let _ = defer_rows;
 }
 
 // The arbitration-widening regression pin
 // (`dst_keep_serving_widened_arbitration_no_false_reds` and its seed
 // search) retired with RFC 0067's last sidecar writer: a keep-serving
-// deferral needs a live handle refused on a pending recovery operation, and
-// no writer the workload reaches arms one any more (the 0..60 search found
-// no seed entering the shape). `reconcile_watch_resolution` stays with the
-// harness until the keep-serving machinery leaves with the classifier.
+// deferral needs a live handle refused on a pending recovery operation,
+// and no writer the workload reaches arms one any more (the 0..60 search
+// found no seed entering the shape). The keep-serving machinery itself
+// (`Scenario::keep_serving_ops`, the watch, the widened two-op
+// arbitration) followed once every sidecar writer was gone.
 
 /// ACK-LOSS: the inverse fault direction — the write HAPPENED, but you're
 /// told it failed (a dropped S3 200). Injected AFTER delegation on every
