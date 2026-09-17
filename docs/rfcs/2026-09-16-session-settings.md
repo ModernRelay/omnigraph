@@ -221,8 +221,8 @@ each refused where they arrive, with the definition's row in the message:
 ```
 set engine = v3;
 error: unknown value `v3` for setting `engine`; expected one of v1, v2
-set enigne = v2;                          (likewise reset enigne; and show enigne;)
-error: unknown setting `enigne`; expected one of rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency
+set turbo = v2;                          (likewise reset turbo; and show turbo;)
+error: unknown setting `turbo`; expected one of rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string `many`
 set stage_write_concurrency = 0;
@@ -565,8 +565,8 @@ named statement against `DEFINITIONS`: the name of a `set`, a `reset
 <name>` or a `show <name>` exists, and for a `set` the value's spelling
 matches the kind, an enum value is one of the declared ones, an integer is
 in range; the AST carries the checked `SettingId`, never the string, so
-`reset enigne;` and `show enigne;` are the unknown-setting error like `set
-enigne = v2;`. A failure is a parse error with the statement's position, which is
+`reset turbo;` and `show turbo;` are the unknown-setting error like `set
+turbo = v2;`. A failure is a parse error with the statement's position, which is
 what `omnigraph lint` reports offline (`omnigraph-cli/src/helpers.rs:947`).
 Scope is not the compiler's business: whether a `process` setting may be set
 depends on the door, so the door checks it.
@@ -991,7 +991,7 @@ contract:
   the baseline.
 - `show all;` returns one row per definition row, in the definition's
   order, under `--- expect ordered`.
-- `set engine = v3;`, `set enigne = v2;`, `reset enigne;`, `show enigne;`,
+- `set engine = v3;`, `set turbo = v2;`, `reset turbo;`, `show turbo;`,
   `set ann_nprobes = "many";` and
   `set stage_write_concurrency = 0;` are refused with the messages above;
   `set rrf_plan = force_prefilter;` in a case body is refused as a `process`
