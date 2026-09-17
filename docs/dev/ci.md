@@ -11,7 +11,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
 | GQT cases | `crates/omnigraph-gqt/cases/*.gqt` (the runner reads top-level files; a nested `.gqt` still classifies as a case) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
