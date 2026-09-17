@@ -173,7 +173,6 @@ const SENTINEL: &str = "// forbidden-api-allow:";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteProtocol {
     Exact(&'static str),
-    Bounded(&'static str),
     Composed(&'static str),
     ManifestAdoption,
     NativeRefControl,
@@ -189,7 +188,6 @@ impl WriteProtocol {
     fn label(self) -> String {
         match self {
             Self::Exact(name) => format!("exact adapter ({name})"),
-            Self::Bounded(name) => format!("bounded adapter ({name})"),
             Self::Composed(name) => format!("composed protocol ({name})"),
             Self::ManifestAdoption => "manifest adoption".into(),
             Self::NativeRefControl => "native ref control".into(),
@@ -210,7 +208,8 @@ const SYSTEM_COLUMNS_V9: WriteProtocol =
     WriteProtocol::Exact("SchemaApply v9 system-column upgrade (RFC 0040)");
 const MERGE_V9: WriteProtocol = WriteProtocol::Exact("BranchMerge v9");
 const INDICES_V9: WriteProtocol = WriteProtocol::Exact("EnsureIndices v9");
-const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
+const OPTIMIZE_V9: WriteProtocol =
+    WriteProtocol::Exact("Optimize (RFC 0067 detached rewrite and exact pin CAS)");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -601,7 +600,8 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
-        "stage_rename_columns", "stage_delete", "stage_create_indices",
+        "stage_rename_columns", "stage_delete", "stage_create_indices", "stage_compaction",
+        "stage_index_fold",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -649,11 +649,12 @@ gateway_surfaces! {
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache",
         "validate_full_text_scan", "is_full_text_index",
-        "can_fold_index", "has_foldable_unindexed_fragments",
+        "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_rename_columns", "renamed_schema", "stage_delete", "stage_create_indices",
+        "stage_compaction", "stage_index_fold",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -765,7 +766,7 @@ durable_calls! {
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/promotion.rs", ".into_dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/optimize.rs", ".delete(", 2, WriteProtocol::Composed("RFC 0067 reap of a promoted pin's detached manifest after promotion, and of aged surplus detached manifests under the cleanup age policy")),
-    ("storage_layer.rs", ".dataset()", 28, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 30, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
@@ -774,8 +775,8 @@ durable_calls! {
     ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
     ("table_store.rs", "CommitBuilder::new(", 4, WriteProtocol::Composed("staged commit primitive")),
-    ("table_store.rs", ".create_index_builder(", 3, WriteProtocol::Composed("staged index primitive")),
-    ("table_store.rs", ".execute_uncommitted(", 8, WriteProtocol::Composed("staged physical primitive")),
+    ("table_store.rs", ".create_index_builder(", 5, WriteProtocol::Composed("staged index primitive and RFC 0067 whole-rebuild fold")),
+    ("table_store.rs", ".execute_uncommitted(", 10, WriteProtocol::Composed("staged physical primitive")),
     ("db/omnigraph/system_column_upgrade.rs", "write_sidecar(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_exact(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".write_text(", 1, SYSTEM_COLUMNS_V9),
@@ -786,7 +787,6 @@ durable_calls! {
     ("db/omnigraph/system_column_upgrade.rs", "delete_sidecar(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".dataset()", 1, SYSTEM_COLUMNS_V9),
     ("db/manifest/migrations.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("RFC 0040 stamp advance on main's __manifest under the system-column upgrade intent")),
-    ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
     ("exec/merge.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached merge chain")),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached schema rewrite")),
@@ -794,7 +794,6 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
-    ("db/omnigraph/optimize.rs", "delete_sidecar(", 1, OPTIMIZE_V9),
     ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
     ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
     ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
@@ -804,7 +803,6 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".commit_updates_with_actor_with_expected(", 1, OPTIMIZE_V9),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -827,8 +825,9 @@ durable_calls! {
     ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "recover_schema_state_files(", 3, WriteProtocol::RecoveryExecutor),
     ("db/schema_state.rs", "promote_exact_schema_staging(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v9 data + physical manifest compaction")),
-    ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V9),
+    ("db/omnigraph/optimize.rs", "compact_files(", 1, WriteProtocol::PhysicalOnly),
+    ("db/omnigraph/optimize.rs", ".commit_staged_detached(", 3, WriteProtocol::Exact("RFC 0067 detached compaction rewrite, index fold and deferred index build")),
+    ("db/omnigraph/optimize.rs", "commit_updates_on_branch_with_expected(", 1, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", "cleanup_old_versions(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/schema_apply.rs", "cleanup_old_versions(", 1, WriteProtocol::Composed("SchemaApply hard-drop GC")),
@@ -889,9 +888,8 @@ durable_calls! {
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 10, WriteProtocol::Composed("Optimize v9 planning + read-only coverage and native-fork inventory + physical cleanup")),
-    ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
-    ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
+    ("db/omnigraph/optimize.rs", ".dataset()", 8, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 

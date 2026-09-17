@@ -1183,50 +1183,6 @@ fn dst_staleness_seed_search() {
     }
 }
 
-/// SEARCH INSTRUMENT for the ack-loss client-retry pin: enumerate fault
-/// seeds for each base seed and print the retries and reconcile verdicts,
-/// so the pin can be re-chosen when the storage-action schedule shifts.
-/// Not part of the suite.
-#[test]
-#[serial]
-#[ignore = "instrument: ack-loss client-retry seed search — run explicitly"]
-fn dst_ack_loss_seed_search() {
-    for (seed, ack_loss_pct, ops) in [(226251u64, 15u64, 1usize), (79, 20, 30)] {
-        for offset in 1u64..=40 {
-            let fault_seed = seed * 100 + offset;
-            let sc = Scenario {
-                seed,
-                ops,
-                faults: Some(omnigraph_dst::harness::FaultPlan {
-                    seed: fault_seed,
-                    error_pct: 0,
-                    read_error_pct: 0,
-                    latency_pct: 0,
-                    max_latency_ms: 1,
-                    lance_realm: false,
-                    ack_loss_pct,
-                    client_retry: true,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            match omnigraph_dst::harness::run_universe_caught(
-                &format!("shared-memory://dst-ackretry-search-{seed}-{fault_seed}"),
-                &sc,
-            ) {
-                Ok(a) => println!(
-                    "seed {seed} fault {fault_seed}: retries={} verdicts={:?}",
-                    a.client_retries, a.reconcile_verdicts
-                ),
-                Err(panic) => println!(
-                    "seed {seed} fault {fault_seed}: RED {}",
-                    omnigraph_dst::harness::panic_message(&*panic)
-                ),
-            }
-        }
-    }
-}
-
 /// the UNBOUNDED-staleness probe (instrument): every read and
 /// listing served maximally old. Expectation from the sequential legality
 /// structure: the engine's CAS refuses stale-based writes (typed
@@ -1366,11 +1322,10 @@ fn assert_resolution_row(report: &omnigraph_dst::harness::UniverseReport, seed: 
     );
 }
 
-/// Availability panel under a short, harsh fault plan. Since RFC 0067 a
-/// mutation or load arms no recovery intent, so no live handle can wedge on
-/// its own failed attempt; every panel seed must stay available. A deferred
-/// recovery row can still come from Optimize (seed 21 strands it and is
-/// excluded); any defer must resolve.
+/// Availability panel under a short, harsh fault plan. Since RFC 0067 no
+/// writer the workload reaches arms a recovery intent, so no live handle can
+/// wedge on its own failed attempt; every panel seed must stay available,
+/// and any defer that still appears must resolve.
 #[test]
 #[serial]
 fn dst_keep_serving_wedge_issue_554() {
@@ -1430,94 +1385,13 @@ fn dst_keep_serving_wedge_issue_554() {
     let _ = defer_rows;
 }
 
-/// ARBITRATION-WIDENING REGRESSION (#559, "arbitration uses future
-/// state"): a keep-serving resolution judges TWO unjudged ops — the
-/// deferred op and the interrupting op — so its legal set is every
-/// composition and order of the pair (`reconcile_watch_resolution`), never
-/// the one-op set. CANONICAL record of the three proven break shapes:
-/// before the widening these seeds fired false `CrashContract` reds on a
-/// correct engine because (1) the write-entry heal rolled the deferred
-/// op's strand forward mid-watch (the store outran the model), (2) a
-/// state-derived success baked the wrong composition ORDER into the model
-/// (seed 24: the fork copied model-main without the rolled-forward write),
-/// and (3) the resolution's own reopen healed the interrupting op's strand
-/// (seed 47: the after-state held an op no hypothesis contained).
-///
-/// The assert is shape-typed, not outcome-pinned: lance-realm strands are
-/// process-context-sensitive (the panel's lesson), so each seed may end
-/// green or wedge-red (`LiveWriteAvailability` — the pin's designed red at
-/// engine HEAD). Any OTHER red — `CrashContract`, `ArbitrationPhysical`, a
-/// bare panic — is the arbitration bug regressing. The defer-row shape
-/// assert makes total strand evaporation a loud re-pin signal instead of a
-/// vacuous green, and gives the resolution rows a mechanical reader.
-#[test]
-#[serial]
-fn dst_keep_serving_widened_arbitration_no_false_reds() {
-    // The identified false-red class members from the 0..60 search: the two
-    // instrumented specimens (24, 47) plus the other four CrashContract
-    // reds observed under the pre-widening arbitration (8, 16, 46, 51).
-    // The search totals implied a seventh; it never re-fired identifiably
-    // across contexts (lance-realm jitter) and is not individually pinned.
-    const SPECIMENS: [u64; 6] = [8, 16, 24, 46, 47, 51];
-    let mut defer_rows = 0usize;
-    for seed in SPECIMENS {
-        let sc = keep_serving_scenario(seed, 30, 15);
-        let root = format!("shared-memory://dst-keep-serving-widened-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                if defers > 0 {
-                    assert_resolution_row(&report, seed);
-                }
-                defer_rows += defers;
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                assert!(
-                    message.contains(&wedge_detector_tag()),
-                    "seed {seed}: non-wedge red on a widened-arbitration specimen \
-                     (a legal composition is missing from the arbitration's set): {message}"
-                );
-                // A wedge red proves the deferral shape was entered.
-                defer_rows += 1;
-            }
-        }
-    }
-    assert!(
-        defer_rows > 0,
-        "no specimen entered the keep-serving shape — the regression pin is \
-         vacuous; re-pick specimens via dst_keep_serving_wedge_seed_search"
-    );
-}
-
-/// SEARCH INSTRUMENT for the issue-554 catch: enumerate seeds 0..60,
-/// printing each seed's outcome (green with defer counts, or RED with the
-/// rendered violation), so the panel above can be (re)chosen — see the
-/// panel's two-step re-pin protocol.
-/// Not part of the suite — run explicitly with `-- --ignored --nocapture`.
-#[test]
-#[serial]
-#[ignore = "search: enumerate seeds for the issue-554 keep-serving wedge pin"]
-fn dst_keep_serving_wedge_seed_search() {
-    for seed in 0..60u64 {
-        let sc = keep_serving_scenario(seed, 30, 15);
-        let root = format!("shared-memory://dst-keep-serving-search-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                println!("seed {seed}: green (defer rows: {defers})");
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                let hit = message.contains(&wedge_detector_tag());
-                println!(
-                    "seed {seed}: RED{} — {message}",
-                    if hit { " (WEDGE)" } else { "" }
-                );
-            }
-        }
-    }
-}
+// The arbitration-widening regression pin
+// (`dst_keep_serving_widened_arbitration_no_false_reds` and its seed
+// search) retired with RFC 0067's last sidecar writer: a keep-serving
+// deferral needs a live handle refused on a pending recovery operation, and
+// no writer the workload reaches arms one any more (the 0..60 search found
+// no seed entering the shape). `reconcile_watch_resolution` stays with the
+// harness until the keep-serving machinery leaves with the classifier.
 
 /// ACK-LOSS: the inverse fault direction — the write HAPPENED, but you're
 /// told it failed (a dropped S3 200). Injected AFTER delegation on every
@@ -1564,52 +1438,15 @@ fn dst_ack_loss_bite_and_replay() {
     assert!(a.verified > 0);
 }
 
-/// An ack-lost write is published exactly once (RFC 0067: the manifest CAS
-/// is the one durable step, and a retried keyed insert meets its own row),
-/// so every client retry is judged `Applied` on the query channel; the
-/// row-count oracle and strict replay must agree with the model for both
-/// pinned fault schedules (`dst_ack_loss_seed_search` lists retrying seeds).
-#[test]
-#[serial]
-fn dst_ack_loss_client_retry() {
-    for (seed, fault_seed, ack_loss_pct, ops) in [(79, 7933, 20, 30), (79, 7937, 20, 30)] {
-        let sc = Scenario {
-            seed,
-            ops,
-            faults: Some(omnigraph_dst::harness::FaultPlan {
-                seed: fault_seed,
-                error_pct: 0,
-                read_error_pct: 0,
-                latency_pct: 0,
-                max_latency_ms: 1,
-                lance_realm: false,
-                ack_loss_pct,
-                client_retry: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let a = run_universe(&format!("shared-memory://dst-ackretry-{seed}-a"), &sc);
-        let b = run_universe(&format!("shared-memory://dst-ackretry-{seed}-b"), &sc);
-        omnigraph_dst::harness::assert_strict_replay(
-            &a,
-            &b,
-            "client-retry universes must replay identically",
-        );
-        assert!(
-            a.client_retries > 0,
-            "seed {seed} must exercise a client retry"
-        );
-        assert!(
-            !a.reconcile_verdicts.is_empty()
-                && a.reconcile_verdicts
-                    .iter()
-                    .all(|(_, verdict, _)| verdict == "Applied"),
-            "seed {seed}: every ack-lost attempt must be judged applied exactly once: {:?}",
-            a.reconcile_verdicts,
-        );
-    }
-}
+// The ack-loss client-retry pin (`dst_ack_loss_client_retry` and its seed
+// search) retired with RFC 0067's last sidecar writer: the standard
+// workload's only adapter-realm write whose lost acknowledgement failed an
+// op was the recovery sidecar, so no fault seed can exercise a client
+// retry any more (the search enumerated 80 schedules with zero retries).
+// The lost-acknowledgement contract of the manifest CAS itself is owned by
+// the failpoint suite (`GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT` cells per
+// writer); a Lance-realm ack-loss verb is the DST follow-up that would
+// bring the shape back under seeded schedules.
 
 /// CORRUPTION AXIS (read tier): the store LIES (read-time bit rot,
 /// truncated reads) and grows LATENT SECTOR ERRORS (persistent,

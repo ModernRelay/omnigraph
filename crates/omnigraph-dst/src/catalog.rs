@@ -1,5 +1,5 @@
 //! The full crash-window catalog for the hunt
-//! (`dst_hunt_crash_window_sweep`): 72 of the engine's decision seams
+//! (`dst_hunt_crash_window_sweep`): 73 of the engine's decision seams
 //! (`omnigraph::seams::catalog`) at the pinned engine version. A seam added
 //! to the engine enters here as never-reached until its workload exists.
 //!
@@ -7,7 +7,7 @@
 //! be a name the engine catalog declares, so a typo'd or renamed-away window
 //! fails the suite instead of compiling and silently never firing.
 
-pub const CRASH_WINDOWS: [&str; 72] = [
+pub const CRASH_WINDOWS: [&str; 73] = [
     "blob_read.post_capture",
     "branch_control.post_recovery_barrier",
     "branch_create.post_native",
@@ -53,7 +53,7 @@ pub const CRASH_WINDOWS: [&str; 72] = [
     "mutation.post_table_commit",
     "open.before_schema_contract_read",
     "optimize.before_compact",
-    "optimize.post_compact_pre_reindex",
+    "optimize.post_table_effect",
     "optimize.post_authority_capture_pre_gates",
     "optimize.post_phase_b_pre_manifest_commit",
     "optimize.post_recovery_check_pre_main_gate",
@@ -82,6 +82,7 @@ pub const CRASH_WINDOWS: [&str; 72] = [
     // remain stable.
     "branch_merge.rewrite_after_insert_pre_update",
     "branch_merge.post_publish_pre_promotion",
+    "optimize.post_publish_pre_promotion",
 ];
 
 #[cfg(test)]

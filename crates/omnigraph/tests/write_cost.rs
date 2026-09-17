@@ -28,7 +28,9 @@ use helpers::cost::{
     IoCounts, assert_flat, assert_grows, cost_harness, last_manifest_reads, local_graph, measure,
     measure_insert, measure_insert_as, measure_with_staged,
 };
-use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params};
+use helpers::{
+    MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params, mutate_main,
+};
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
@@ -225,6 +227,55 @@ async fn branch_merge_writes_no_control_object() {
         counts.delete() - before_delete,
         0,
         "a detached merge has no sidecar to delete after publication"
+    );
+}
+
+/// RFC 0067: Optimize arms no recovery sidecar. A run with compaction work on
+/// one table stages the rewrite detached, publishes and promotes it, and
+/// writes and deletes no control object (the adjacency artifact is a bytes
+/// object written only when an edge table advances).
+#[tokio::test]
+async fn optimize_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    for (name, age) in [("opt-a", 41), ("opt-b", 42), ("opt-c", 43)] {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+    drop(db);
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+        .await
+        .unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed),
+        "Person must compact: {stats:?}"
+    );
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached compaction arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached compaction has no sidecar to delete after publication"
     );
 }
 

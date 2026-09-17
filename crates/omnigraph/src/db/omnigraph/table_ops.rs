@@ -769,9 +769,9 @@ pub(super) struct IndexWorkStatus {
 /// index. Edges get BTree only (id, src, dst). This helper and the builder
 /// share `node_prop_index_kind` so they cannot drift — see its doc comment.
 #[derive(Default)]
-struct PlannedIndexWork {
-    specs: Vec<crate::storage_layer::IndexBuildSpec>,
-    pending: Vec<PendingIndex>,
+pub(super) struct PlannedIndexWork {
+    pub(super) specs: Vec<crate::storage_layer::IndexBuildSpec>,
+    pub(super) pending: Vec<PendingIndex>,
 }
 
 impl PlannedIndexWork {
@@ -1420,23 +1420,32 @@ pub(super) async fn build_indices_on_dataset(
     build_indices_on_dataset_for_catalog(db, &catalog, table_key, ds).await
 }
 
+/// The index batch a table needs at `ds`: every declared index it lacks.
+pub(super) async fn plan_index_work_on_dataset_for_catalog(
+    db: &Omnigraph,
+    catalog: &Catalog,
+    table_key: &str,
+    ds: &SnapshotHandle,
+) -> Result<PlannedIndexWork> {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        plan_index_work_node(db, catalog, type_name, table_key, ds).await
+    } else if table_key.starts_with("edge:") {
+        plan_index_work_edge_on_dataset(db, ds, catalog.system_columns).await
+    } else {
+        Err(OmniError::manifest(format!(
+            "invalid table key '{}'",
+            table_key
+        )))
+    }
+}
+
 pub(super) async fn build_indices_on_dataset_for_catalog(
     db: &Omnigraph,
     catalog: &Catalog,
     table_key: &str,
     ds: &mut SnapshotHandle,
 ) -> Result<Vec<PendingIndex>> {
-    let work = if let Some(type_name) = table_key.strip_prefix("node:") {
-        plan_index_work_node(db, catalog, type_name, table_key, ds).await?
-    } else if table_key.starts_with("edge:") {
-        plan_index_work_edge_on_dataset(db, ds, catalog.system_columns).await?
-    } else {
-        return Err(OmniError::manifest(format!(
-            "invalid table key '{}'",
-            table_key
-        )));
-    };
-
+    let work = plan_index_work_on_dataset_for_catalog(db, catalog, table_key, ds).await?;
     if work.specs.is_empty() {
         return Ok(work.pending);
     }

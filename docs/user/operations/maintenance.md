@@ -26,10 +26,23 @@ omnigraph optimize ./graph.omni
 omnigraph optimize ./graph.omni --json
 ```
 
-Optimize rewrites small fragments into fewer larger fragments, refreshes scalar
-and vector coverage, and builds missing declared indexes that are ready to build. It does not
-delete old versions or collect unused table forks. Use `cleanup` for storage
-reclamation.
+Optimize rewrites small fragments into fewer larger fragments, rebuilds each
+scalar or vector index whose coverage lags behind appended rows, and builds
+missing declared indexes that are ready to build. It does not delete old
+versions or collect unused table forks. Use `cleanup` for storage reclamation.
+
+Each table's work is staged as detached Lance versions of the table's current
+pin and published in one graph commit, like any other write. A run
+that fails before that commit leaves the graph unchanged and no recovery
+state; a run interrupted after it leaves pins the next write on each table,
+or `cleanup`, promotes onto the table's linear history. Optimize runs beside
+live writers: a write that lands on a table while its compaction is staged
+fails the run with a read-set conflict, and the next run re-plans from the
+new state. An update or delete prepared before an optimize published reports
+the same conflict and is retried by its caller. Lance compacts neighbouring
+fragments only when the same indexes cover them, so a table whose index
+coverage was uneven before a run may coalesce fully only on the next run,
+after the rebuilt coverage is in place.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -50,9 +63,10 @@ commit or maintenance work.
 A vector index whose property has no usable vectors remains pending rather than
 failing the run. Run optimize again after loading or generating vectors.
 
-Optimize refuses unexplained drift or an unresolved interrupted write. Reopen
-the graph read-write (or restart its server) to finish ordinary recovery; use
-`repair` only for drift that remains unexplained.
+Optimize refuses a table whose published write is blocked by a foreign commit
+on its linear history (`repair` reports it as `blocked_promotion`) and
+unexplained drift on a table's linear history; use `repair` for drift that
+remains unexplained.
 
 ## Rebuild full-text indexes
 

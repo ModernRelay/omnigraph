@@ -23,8 +23,11 @@ use datafusion::prelude::Expr;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
+use lance::dataset::optimize::{CompactionMetrics, CompactionOptions, plan_compaction};
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
-use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder, UpdateMode};
+use lance::dataset::transaction::{
+    Operation, RewriteGroup, Transaction, TransactionBuilder, UpdateMode,
+};
 use lance::dataset::write::merge_insert::inserted_rows::{KeyExistenceFilterBuilder, KeyValue};
 use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
@@ -34,8 +37,8 @@ use lance::dataset::{
     WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
+use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
-use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::{
     datatypes::BlobHandling,
     utils::{
@@ -545,6 +548,29 @@ pub enum PromotionCommit {
 // Sealed storage surface: `new_fragments`/`removed_fragment_ids` record the
 // read-your-writes fragment delta of a staged effect.
 #[allow(dead_code)]
+/// One foldable index whose segments leave fragments uncovered.
+struct IndexLag {
+    name: String,
+    fields: Vec<i32>,
+    vector: bool,
+}
+
+/// A staged index fold: the `CreateIndex` to commit detached, if any index
+/// lagged and could be folded, and the columns whose vector delta could not
+/// be trained.
+#[derive(Default)]
+pub struct StagedIndexFold {
+    pub staged: Option<StagedWrite>,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// A staged compaction: the `Rewrite` to commit detached and the metrics its
+/// tasks reported.
+pub struct StagedCompaction {
+    pub staged: StagedWrite,
+    pub metrics: CompactionMetrics,
+}
+
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
     transaction: Transaction,
@@ -2382,49 +2408,186 @@ impl TableStore {
         !is_system_index(index) && index.index_details.is_some() && !Self::is_full_text_index(index)
     }
 
-    /// Coverage candidates for ordinary optimize. Scalar segments use Lance's
-    /// per-name union: collectively complete coverage is a scalar no-op.
-    /// Vectors retain per-segment candidacy because default optimize can
-    /// rebalance a partition even when the segment union covers every fragment.
+    /// Whether a foldable index is a vector index.
+    pub(crate) fn index_is_vector(index: &IndexMetadata) -> bool {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| IndexDetails(details.clone()).is_vector())
+    }
+
+    /// Coverage candidates for ordinary optimize: foldable index names whose
+    /// segments, taken together, leave a fragment uncovered, plus vector
+    /// indexes split into more than one segment (each segment costs a nearest
+    /// scan its own probe set). RFC 0067 folds a lagging index by rebuilding
+    /// it whole (`stage_index_fold`), which leaves one segment either way.
     pub(crate) async fn has_foldable_unindexed_fragments(ds: &Dataset) -> Result<bool> {
-        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-        let mut names = std::collections::BTreeSet::new();
-        for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
-            if index
-                .index_details
-                .as_ref()
-                .is_some_and(|details| IndexDetails(details.clone()).is_vector())
-            {
-                if index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                    ds.fragments()
-                        .iter()
-                        .any(|fragment| !bitmap.contains(fragment.id as u32))
-                }) {
-                    return Ok(true);
-                }
-            } else {
-                names.insert(index.name.as_str());
+        Ok(!Self::foldable_index_lag(ds).await?.is_empty())
+    }
+
+    /// The partition count Lance reports for a vector index, or one when the
+    /// statistics do not name it.
+    async fn vector_partition_count(ds: &Dataset, name: &str) -> usize {
+        fn first_num_partitions(value: &serde_json::Value) -> Option<usize> {
+            match value {
+                serde_json::Value::Object(map) => map
+                    .get("num_partitions")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .or_else(|| map.values().find_map(first_num_partitions)),
+                serde_json::Value::Array(items) => items.iter().find_map(first_num_partitions),
+                _ => None,
             }
         }
-        for name in names {
+        ds.index_statistics(name)
+            .await
+            .ok()
+            .and_then(|stats| serde_json::from_str::<serde_json::Value>(&stats).ok())
+            .and_then(|stats| first_num_partitions(&stats))
+            .filter(|partitions| *partitions >= 1)
+            .unwrap_or(1)
+    }
+
+    async fn foldable_index_lag(ds: &Dataset) -> Result<Vec<IndexLag>> {
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+        let mut by_name = std::collections::BTreeMap::<String, Vec<&IndexMetadata>>::new();
+        for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
+            by_name.entry(index.name.clone()).or_default().push(index);
+        }
+        let mut lag = Vec::new();
+        for (name, segments) in by_name {
             // As on the public coverage surface, unknown coverage is not
             // evidence of work. Such legacy inventory needs explicit handling.
-            if indices
+            if segments
                 .iter()
-                .any(|index| index.name == name && index.fragment_bitmap.is_none())
+                .any(|segment| segment.fragment_bitmap.is_none())
             {
                 continue;
             }
-            if !ds
-                .unindexed_fragments(name)
-                .await
-                .map_err(OmniError::storage)?
-                .is_empty()
-            {
-                return Ok(true);
+            let mut covered = std::collections::HashSet::<u32>::new();
+            for segment in &segments {
+                if let Some(bitmap) = segment.fragment_bitmap.as_ref() {
+                    covered.extend(bitmap.iter());
+                }
             }
+            let vector = Self::index_is_vector(segments[0]);
+            let complete = ds
+                .fragments()
+                .iter()
+                .all(|fragment| covered.contains(&(fragment.id as u32)));
+            // A scalar index whose segments together cover every fragment
+            // is current. A vector index split into segments (Lance's own
+            // fold left deltas, or a partial rebuild) is collapsed into one.
+            if complete && !(vector && segments.len() > 1) {
+                continue;
+            }
+            lag.push(IndexLag {
+                name,
+                fields: segments[0].fields.clone(),
+                vector,
+            });
         }
-        Ok(false)
+        Ok(lag)
+    }
+
+    /// RFC 0067: stage one `CreateIndex` that folds every lagging foldable
+    /// index, ready to commit detached. Lance's own fold (`optimize_indices`)
+    /// merges the delta and previous segments through a crate-private path
+    /// and commits linearly; this rebuilds each lagging index whole under its
+    /// name with the public builder, which leaves the same single segment
+    /// Lance's merge would. A vector index the builder cannot train (a column
+    /// with no non-null rows) is skipped and reported by column.
+    pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
+        let lag = Self::foldable_index_lag(ds).await?;
+        if lag.is_empty() {
+            return Ok(StagedIndexFold::default());
+        }
+        let existing = ds.load_indices().await.map_err(OmniError::storage)?;
+        let read_version = ds.manifest.version;
+        let mut new_indices = Vec::new();
+        let mut removed_indices = Vec::new();
+        let mut skipped = Vec::new();
+        for item in lag {
+            let Some(column) = item
+                .fields
+                .first()
+                .and_then(|id| ds.schema().field_by_id(*id))
+                .map(|field| field.name.clone())
+            else {
+                continue;
+            };
+            let mut ds_clone = ds.clone();
+            let columns = [column.as_str()];
+            let built = if item.vector {
+                // Keep the index's partition count: the engine builds one
+                // partition, but a partitioned index (Lance's split, or an
+                // explicit build) keeps its shape across folds.
+                let partitions = Self::vector_partition_count(ds, &item.name).await;
+                let params =
+                    lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+                ds_clone
+                    .create_index_builder(&columns, IndexType::Vector, &params)
+                    .name(item.name.clone())
+                    .replace(true)
+                    .execute_uncommitted()
+                    .await
+            } else {
+                let params = ScalarIndexParams::default();
+                ds_clone
+                    .create_index_builder(&columns, IndexType::BTree, &params)
+                    .name(item.name.clone())
+                    .replace(true)
+                    .execute_uncommitted()
+                    .await
+            };
+            let new_idx = match built {
+                Ok(index) => index,
+                Err(error) if item.vector => {
+                    tracing::warn!(
+                        index = item.name.as_str(),
+                        column = column.as_str(),
+                        error = %error,
+                        "vector index fold skipped: the column cannot train an index"
+                    );
+                    skipped.push((column, error.to_string()));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(OmniError::storage_context(
+                        format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
+                        error,
+                    ));
+                }
+            };
+            if new_idx.dataset_version != read_version {
+                return Err(OmniError::manifest_internal(format!(
+                    "folded index '{}' was built from dataset version {}, expected {}",
+                    new_idx.name, new_idx.dataset_version, read_version
+                )));
+            }
+            removed_indices.extend(
+                existing
+                    .iter()
+                    .filter(|index| index.name == item.name)
+                    .cloned(),
+            );
+            if item.vector {
+                crate::instrumentation::record_stage_vector_index();
+            }
+            new_indices.push(new_idx);
+        }
+        let staged = (!new_indices.is_empty()).then(|| {
+            let transaction = TransactionBuilder::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+            )
+            .build();
+            StagedWrite::new(transaction, Vec::new(), Vec::new())
+        });
+        Ok(StagedIndexFold { staged, skipped })
     }
 
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
@@ -3989,6 +4152,67 @@ impl TableStore {
     /// readable until [`Self::commit_staged_create_exact`] atomically creates
     /// version 1. The transaction UUID can therefore be bound to a recovery
     /// identity before that first visible effect.
+    /// RFC 0067: plan and execute Lance compaction against a pinned base and
+    /// stage the result as one `Rewrite` transaction. The new fragments take
+    /// ids above the base's high-water mark, so the commit needs no
+    /// `ReserveFragments` (whose replay would not conflict with its twin). A
+    /// stable-row-id rewrite carries every index's coverage over to the new
+    /// fragments when Lance applies it. `None` when the plan has no task.
+    pub async fn stage_compaction(
+        &self,
+        ds: &Dataset,
+        options: &CompactionOptions,
+    ) -> Result<Option<StagedCompaction>> {
+        let plan = plan_compaction(ds, options)
+            .await
+            .map_err(OmniError::storage)?;
+        if plan.num_tasks() == 0 {
+            return Ok(None);
+        }
+        let mut results = Vec::with_capacity(plan.num_tasks());
+        for task in plan.compaction_tasks() {
+            results.push(task.execute(ds).await.map_err(OmniError::storage)?);
+        }
+        if results.iter().any(|result| result.row_addrs.is_some()) {
+            return Err(OmniError::manifest_internal(format!(
+                "compaction of {} produced an address-style rewrite; graph tables use stable row ids",
+                ds.uri()
+            )));
+        }
+        let mut next_id = ds.manifest().max_fragment_id().map_or(0, |id| id + 1);
+        let mut metrics = CompactionMetrics::default();
+        let mut groups = Vec::with_capacity(results.len());
+        let mut new_fragments = Vec::new();
+        let mut removed_fragment_ids = Vec::new();
+        for result in results {
+            metrics += result.metrics;
+            let mut fresh = result.new_fragments;
+            for fragment in &mut fresh {
+                fragment.id = next_id;
+                next_id += 1;
+            }
+            removed_fragment_ids.extend(result.original_fragments.iter().map(|f| f.id));
+            new_fragments.extend(fresh.iter().cloned());
+            groups.push(RewriteGroup {
+                old_fragments: result.original_fragments,
+                new_fragments: fresh,
+            });
+        }
+        let transaction = Transaction::new(
+            ds.version().version,
+            Operation::Rewrite {
+                groups,
+                rewritten_indices: Vec::new(),
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        Ok(Some(StagedCompaction {
+            staged: StagedWrite::new(transaction, new_fragments, removed_fragment_ids),
+            metrics,
+        }))
+    }
+
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,

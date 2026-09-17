@@ -338,7 +338,7 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
 /// data-table versions. The path must strip that config first. Without the strip,
 /// the aggressive policy below GCs old versions and the config survives the run.
 #[tokio::test]
-async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
+async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tables() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir
         .path()
@@ -383,16 +383,18 @@ async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
     db.optimize().await.unwrap();
 
     let ds = Dataset::open(&person_full).await.unwrap();
-    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    // (a) RFC 0067: every engine commit, the detached rewrite and its
+    // promotion included, skips Lance's auto-cleanup, so the stale config is
+    // inert and stays in place rather than costing a config commit.
     assert!(
-        !ds.config()
+        ds.config()
             .keys()
             .any(|k| k.starts_with("lance.auto_cleanup.")),
-        "optimize must clear stale auto_cleanup config on data tables; config = {:?}",
+        "the stale auto_cleanup config is inert and left alone; config = {:?}",
         ds.config()
     );
-    // (b) no version GC: every pre-optimize version survives (compaction + the
-    // config-clear each add versions, so the count only grows).
+    // (b) no version GC: every pre-optimize version survives (the compaction
+    // adds versions, so the count only grows).
     let versions_after = ds.versions().await.unwrap().len();
     assert!(
         versions_after >= versions_before,

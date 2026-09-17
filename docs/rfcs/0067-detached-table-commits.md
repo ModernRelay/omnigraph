@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on:
   - "Engine: the promotion reconciler with idempotent, order-preserving, uuid-checked replay and its crash and two-process evidence."
   - "Storage: cleanup that promotes pending pins first, reaps promoted and abandoned detached manifests, and keeps stock Lance version cleanup for the linear chain, on file, S3, and Azure."
-  - "Maintenance: Optimize staged as detached ReserveFragments and Rewrite transactions built from RewriteResult and promoted by replay."
+  - "Maintenance: Optimize staged as one detached Rewrite transaction built from the RewriteResults with fragment ids above the base high-water mark, lagging indexes rebuilt whole as a chained detached CreateIndex, published with an exact pin CAS and promoted by replay."
   - "Compatibility: format stamp v10, the pin shape with target version, staged id and transaction uuid, and the refusal fence for older binaries."
 ---
 
@@ -249,7 +249,7 @@ serving a write from the cache is exactly as safe as serving a read.
 | Branch merge | pre-minted chain of at most 1,024 transactions per table, confirmed-chain proof, partial-prefix rollback | chunks chain detached; pointer adoption pins the source's staged or linear version directly; abandoned chains are garbage; promotion replays each chunk in order, or restores the chain tip when the chain is long (row stamps of restored rows are then not monotonic, and the pruned change-feed and proven-pure-insert paths already fall back on `Restore`). The pre-minted identity keeps its uuid and binds to the version actually staged on, which for a chained chunk is detached; the pin publishes the linear base plus the chain length with the tip as its staged version. Prototyped: a merge of two inserts, an update and a delete produced a chain of three and promoted in order. |
 | Schema apply | exact Overwrite and create identities, Armed/EffectsConfirmed, rollback reclaims first-touch datasets | existing-table rewrites stage detached and promote; new-type creation is a linear v1 create at the identity path, which the accepted allocator makes deterministic, so the retry reclaims an unregistered leftover under the sentinel instead of needing a rollback; the staged contract records the graph commit that publishes it, and promotion follows the publication as idempotent work whose authority is that commit in lineage (an unpublished staging is discarded at the next read-write open) |
 | Ensure indices / FTS rebuild | one mixed CreateIndex per table under a sidecar | CreateIndex stages detached and promotes; index files live under the root `_indices/{uuid}`; the analyzer certificate is unchanged; the index is usable on the detached version (probe 4). Prototyped for ensure-indices: no sidecar, the pre-minted identity bound as for merge, and the branching suite's index cases pass. |
-| Optimize | bounded maintenance sidecar, one-mutation-process boundary, monotonic publication that adopts whatever pin is current | `plan_compaction`, execute each `CompactionTask` against the pinned base, stage a detached `ReserveFragments`, assign the reserved ids to the `RewriteResult` fragments, stage a detached `Rewrite` chained from the reservation, publish the tip, promote both by replay (probe 13). With stable row ids the tasks are not address-style, so no index remap and no fragment-reuse index. Publication must be an exact CAS on the pin the compaction was planned from: today's monotonic publish is safe only because the linear commit already serialized against concurrent writers, and under detached staging it would publish a compaction over a writer's newer pin and hide that writer's rows. A moved pin means the staged compaction is discarded and Optimize re-plans. Compaction is a single detached `Rewrite` with fragment ids allocated above the base's maximum; there is no `ReserveFragments`, whose replay would not conflict with its twin (see Promotion). A deferred index build commits detached after the rewrite and stays inside Optimize's one pin; the stale auto-cleanup config strip leaves Optimize for an explicit migration step, because a delete-only `UpdateConfig` replay does not conflict with its twin either. Index folding cannot: Lance 11 keeps `merge_indices` crate-private and `optimize_indices` only commits linearly, so folding is an upstream ask (an uncommitted optimize, or a public merge) and until then stays out of the detached Optimize, which leaves appended fragments uncovered until the ask lands or an explicit rebuild. Prototyped, including the cross-process loser. |
+| Optimize | bounded maintenance sidecar, one-mutation-process boundary, monotonic publication that adopts whatever pin is current | `plan_compaction`, execute each `CompactionTask` against the pinned base, assign the `RewriteResult` fragments ids above the base's high-water mark, stage one detached `Rewrite`, publish the tip, promote by replay (probe 13 prototyped a `ReserveFragments` plus `Rewrite` pair; the shipped step needs no reservation). With stable row ids the tasks are not address-style, so no index remap and no fragment-reuse index. Publication must be an exact CAS on the pin the compaction was planned from: today's monotonic publish is safe only because the linear commit already serialized against concurrent writers, and under detached staging it would publish a compaction over a writer's newer pin and hide that writer's rows. A moved pin means the staged compaction is discarded and Optimize re-plans. Compaction is a single detached `Rewrite` with fragment ids allocated above the base's maximum; there is no `ReserveFragments`, whose replay would not conflict with its twin (see Promotion). A deferred index build commits detached after the rewrite and stays inside Optimize's one pin; the stale auto-cleanup config strip leaves Optimize for an explicit migration step, because a delete-only `UpdateConfig` replay does not conflict with its twin either. Index folding through Lance's own merge cannot: Lance 11 keeps `merge_indices` crate-private and `optimize_indices` only commits linearly. The shipped step folds a lagging scalar or vector index by rebuilding it whole under its name with the public `CreateIndexBuilder` as a detached commit chained on the rewrite, which leaves the one segment Lance's merge would leave and keeps a vector index's partition count; a public uncommitted merge remains an upstream ask that would make the fold incremental. Prototyped, including the cross-process loser. |
 | Graph branch create / delete | native `__manifest` refs, no sidecar | unchanged |
 
 Detached commits require at least one retry configured (probe 2) and cannot
@@ -841,14 +841,20 @@ the sidecar path. The remaining failures with it on, every one classified:
   `maintenance::non_strict_load_refuses_uncovered_drift_before_folding_it`,
   `recovery::drift_guard_advice_ignores_other_branch_sidecars`), where a
   foreign linear commit no longer blocks a write; the stale auto-cleanup
-  config strip (`maintenance::optimize_clears_stale_auto_cleanup_on_data_tables_too`),
-  which leaves Optimize for an explicit migration step because its replay
-  would not conflict with its twin; the sidecar write count in
+  config strip (`maintenance::optimize_clears_stale_auto_cleanup_on_data_tables_too`,
+  now `optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tables`),
+  which Optimize no longer performs because every engine commit and every
+  promotion skips Lance's auto-cleanup, so a stale key is inert, and a
+  delete-only `UpdateConfig` replay would not conflict with its twin; the
+  sidecar write count in
   `write_cost`; and two `warm_read_cost` cells that assert a read after a
   write must reopen the table, which no longer holds because the write
   stores the promoted handle in the read cache.
 - The index-folding upstream ask: `maintenance::optimize_reindexes_fragments_appended_after_index_build`
-  and the three `search::issue_567` cases.
+  and the three `search::issue_567` cases. The shipped step closes the
+  maintenance case with the detached whole rebuild; the search cases build
+  their partitioned index explicitly because the engine's own builds are
+  one-partition and a fold keeps the partition count.
 - Harness and cost gaps: the per-operation wrapper's blind spot in
   `write_cost`, the merge open-count contract in `merge_cost` pending
   held-handle promotion for merges, and the one `changes_cost` cell above.
@@ -926,7 +932,7 @@ The extended run adds the same-handle, other-process and cleanup actors
   the next writer promotes; most existing cells are deleted with the code.
 - `maintenance.rs`: promote-then-clean ordering, reaping of promoted and
   abandoned detached manifests, retained snapshots, sibling branches, and the
-  S3/Azure suites; Optimize staged as detached ReserveFragments and Rewrite.
+  S3/Azure suites; Optimize staged as one detached Rewrite.
 - `maintenance.rs::non_strict_load_refuses_uncovered_drift_before_folding_it`
   and `recovery.rs::drift_guard_advice_ignores_other_branch_sidecars`: both
   expect a write to be refused while a foreign linear commit exists; under
@@ -944,9 +950,10 @@ The extended run adds the same-handle, other-process and cleanup actors
   promotion race on the local filesystem, kept as a `heavy-repro:` owner.
 - DST: retire the two sidecar carve-outs; add the S3-shaped promotion race
   and a blocked promotion.
-- `maintenance.rs`: Optimize staged detached with exact-base publication,
-  including the cross-process loser; cleanup's promote-first ordering and
-  detached-manifest reaping across branches that share a pin.
+- `maintenance.rs`: Optimize staged detached with exact-base publication
+  (the cross-process loser is a `detached_commit_matrix` race cell); cleanup's
+  promote-first ordering and detached-manifest reaping across branches that
+  share a pin.
 - `merge_cost.rs`: the open-count contract requires merge promotion from
   held handles.
 
@@ -987,9 +994,9 @@ pin is unreadable to an older binary until promoted, and a `cleanup` before
 a downgrade promotes everything.
 
 Still not validated after the prototype, and therefore the gates that
-remain: index folding inside Optimize, which needs the upstream ask;
-promotion from held handles for merge and Optimize (a cost, not a
-correctness, gap); Azure; Lance 12 for probes 8 to 14; the server's
+remain: an incremental index fold inside Optimize, which needs the upstream
+ask (the shipped fold is a whole rebuild); Azure; Lance 12 for probes 8 to
+14; the server's
 promotion-after-acknowledgement and its counters; DST scenarios; and the
 manifest-byte cost on a copy of the production graph rather than a fixture.
 

@@ -813,7 +813,7 @@ query nearest_all_17000($q: Vector(4)) {
 }
 "#;
 
-async fn issue_567_optimized_docs(uri: &str) -> Omnigraph {
+async fn issue_567_partitioned_docs(uri: &str) -> Omnigraph {
     let mut lines = (0..ISSUE_567_ROWS)
         .map(|row| {
             let keep = row >= 19_000;
@@ -860,11 +860,72 @@ query delete_middle() {
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
     load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
+    // The engine builds one-partition flat vector indexes, and RFC 0067's fold
+    // keeps an index's partition count, so the multi-partition shape these
+    // cases exercise is built here explicitly: four partitions with fixed
+    // centroids along the embedding axis, replacing the engine's index under
+    // its name, then published from the table head through repair.
+    {
+        use lance::index::DatasetIndexExt;
+        let doc_path = db
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Doc")
+            .unwrap()
+            .dataset_path
+            .clone();
+        let doc_uri = format!("{}/{}", uri.trim_end_matches('/'), doc_path);
+        // forbidden-api-allow: test builds a partitioned vector index directly on the Lance dataset.
+        let mut ds = lance::Dataset::open(&doc_uri).await.unwrap();
+        let partitions = 4usize;
+        let step = ISSUE_567_ROWS as f32 / partitions as f32;
+        let mut values = Vec::with_capacity(partitions * 4);
+        for partition in 0..partitions {
+            values.extend([step * (partition as f32 + 0.5), 0.0, 0.0, 0.0]);
+        }
+        let centroids = arrow_array::FixedSizeListArray::try_new(
+            std::sync::Arc::new(arrow_schema::Field::new(
+                "item",
+                arrow_schema::DataType::Float32,
+                true,
+            )),
+            4,
+            std::sync::Arc::new(arrow_array::Float32Array::from(values)),
+            None,
+        )
+        .unwrap();
+        let ivf = lance_index::vector::ivf::IvfBuildParams::try_with_centroids(
+            partitions,
+            std::sync::Arc::new(centroids),
+        )
+        .unwrap();
+        let params = lance::index::vector::VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::L2,
+            ivf,
+        );
+        ds.create_index(
+            &["embedding"],
+            lance_index::IndexType::Vector,
+            Some("embedding_idx".to_string()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    db.repair(omnigraph::db::RepairOptions {
+        confirm: true,
+        force: true,
+    })
+    .await
+    .unwrap();
+    // The delete leaves the partitioned index with tombstoned rows: the
+    // underfilled partitions the ladder and rescan cases exercise.
     let deleted = mutate_main(&mut db, delete_query, "delete_middle", &params(&[]))
         .await
         .unwrap();
     assert_eq!(deleted.affected_nodes, ISSUE_567_DELETED);
-    db.optimize().await.unwrap();
     db
 }
 
@@ -873,14 +934,14 @@ query delete_middle() {
 /// scan is short of `k` and the scan-site ladder widens it until `limit` fills.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn issue_567_bounded_nearest_and_rrf_retry_after_optimized_ivf_underfill() {
+async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill() {
     const ROWS: usize = ISSUE_567_ROWS;
     let queries = ISSUE_567_QUERIES;
 
     let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let mut db = issue_567_partitioned_docs(uri).await;
 
     use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
     let probes = QueryIoProbes::default();
@@ -1036,7 +1097,7 @@ async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
     let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let mut db = issue_567_partitioned_docs(uri).await;
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
@@ -1098,7 +1159,7 @@ async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
     let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", Some("1"))]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let mut db = issue_567_partitioned_docs(uri).await;
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
@@ -1158,7 +1219,7 @@ async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
     let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let mut db = issue_567_partitioned_docs(uri).await;
 
     let probes = QueryIoProbes::default();
     let result = with_query_io_probes(probes.clone(), async {
@@ -1240,7 +1301,7 @@ async fn issue_567_flat_scan_returns_the_admitted_rows_in_nearest_order() {
     let _env = EnvGuard::set(&[("OMNIGRAPH_ANN_NPROBES", None)]);
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = issue_567_optimized_docs(uri).await;
+    let mut db = issue_567_partitioned_docs(uri).await;
     let q = vector_param("$q", &ISSUE_567_FAR_QUERY);
     let mut expected = ISSUE_567_FAR_DOCS
         .iter()

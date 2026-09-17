@@ -56,6 +56,10 @@ enum Writer {
     /// Schema apply adding a nullable Person property: one detached rewrite
     /// of Person, no row change, the contract staged and installed.
     SchemaApply,
+    /// Optimize over a Person table with four small fragments: one detached
+    /// compaction rewrite, no row change, published with an exact CAS on the
+    /// pin it was planned from.
+    Optimize,
 }
 
 fn city_schema() -> String {
@@ -115,6 +119,7 @@ impl Writer {
             Writer::EnsureIndices => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
             Writer::Merge => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
             Writer::SchemaApply => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
+            Writer::Optimize => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
         }
     }
 
@@ -126,6 +131,7 @@ impl Writer {
             Writer::EnsureIndices => "ensure_indices",
             Writer::Merge => "merge",
             Writer::SchemaApply => "schema_apply",
+            Writer::Optimize => "optimize",
         }
     }
 
@@ -147,7 +153,17 @@ impl Window {
         let index = writer == Writer::EnsureIndices;
         let merge = writer == Writer::Merge;
         let schema = writer == Writer::SchemaApply;
+        let optimize = writer == Writer::Optimize;
         match self {
+            Window::PostDetached(n) if optimize => {
+                (catalog::OPTIMIZE_POST_TABLE_EFFECT.name(), n as u64)
+            }
+            Window::PrePublish if optimize => {
+                (catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(), 1)
+            }
+            Window::PostPublish if optimize => {
+                (catalog::OPTIMIZE_POST_PUBLISH_PRE_PROMOTION.name(), 1)
+            }
             Window::PostDetached(n) if schema => {
                 (catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.name(), n as u64)
             }
@@ -318,6 +334,7 @@ fn rfc0067_matrix_child_process() {
                     .map(|_| ()),
                 "insert_and_friend" => insert_and_friend(&mut db, &name).await,
                 "schema_apply" => db.apply_schema(&city_schema()).await.map(|_| ()),
+                "optimize" => db.optimize().await.map(|_| ()),
                 _ => insert(&mut db, &name).await,
             };
             if let Err(error) = outcome {
@@ -399,6 +416,15 @@ async fn run_cell(
         .await
         .unwrap();
     }
+    // An optimize cell needs compaction work: three more single-row commits
+    // leave Person with four small fragments.
+    if writer == Writer::Optimize {
+        for seed in 0..3 {
+            insert(&mut db, &format!("m{index}_seed{seed}"))
+                .await
+                .unwrap();
+        }
+    }
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
 
@@ -419,6 +445,7 @@ async fn run_cell(
                     .await
                     .map(|_| ()),
                 Writer::SchemaApply => db.apply_schema(&city_schema()).await.map(|_| ()),
+                Writer::Optimize => db.optimize().await.map(|_| ()),
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
@@ -589,6 +616,25 @@ async fn run_cell(
         sidecar_operation_ids(dir.path()).is_empty(),
         "{cell}: a recovery sidecar was written"
     );
+    if writer == Writer::Optimize && recovery != Recovery::ReadOnly {
+        // Whatever the window left, the next runs re-plan from the current
+        // pins and leave every pin promoted. Lance bins neighbouring
+        // fragments only under the same index coverage, so a run that folds
+        // an index can make the next run's compaction plan non-empty; the
+        // contract here is promotion, not a single-run fixpoint.
+        let fresh = Omnigraph::open(&root).await.unwrap();
+        for run in 1..=2 {
+            fresh.optimize().await.unwrap_or_else(|error| {
+                panic!("{cell}: optimize run {run} after recovery failed: {error}")
+            });
+            assert_eq!(
+                linear_head(&person_uri).await,
+                table_pin(&fresh, "node:Person").await,
+                "{cell}: optimize run {run} leaves Person promoted"
+            );
+        }
+        drop(fresh);
+    }
     if writer == Writer::EnsureIndices && recovery != Recovery::ReadOnly {
         // Whatever the window left, the next pass converges: it builds what
         // is missing, and a promoted batch leaves it nothing to publish.
@@ -653,6 +699,7 @@ async fn run_matrix() {
         Writer::EnsureIndices,
         Writer::Merge,
         Writer::SchemaApply,
+        Writer::Optimize,
     ];
     let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {

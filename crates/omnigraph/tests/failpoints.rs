@@ -17,10 +17,7 @@ use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
 use serial_test::serial;
 
-use helpers::recovery::{
-    RecoveryExpectation, TableExpectation, assert_post_recovery_invariants, branch_head_commit_id,
-    sidecar_operation_ids, single_sidecar_operation_id,
-};
+use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, collect_column_strings, count_rows,
     count_rows_branch, init_and_load, mixed_params, mutate_branch, mutate_main, node_blob_cell,
@@ -94,43 +91,6 @@ async fn graph_with_unbuilt_indexes(dir: &tempfile::TempDir) -> Omnigraph {
         .await
         .unwrap();
     db
-}
-
-/// The standard graph plus three more single-row Person commits, so Optimize
-/// has compaction work on `node:Person`.
-async fn graph_with_optimize_work(dir: &tempfile::TempDir) -> Omnigraph {
-    let mut db = init_and_load(dir).await;
-    for (name, age) in [("opt-a", 41), ("opt-b", 42), ("opt-c", 43)] {
-        mutate_main(
-            &mut db,
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", name)], &[("$age", age)]),
-        )
-        .await
-        .unwrap();
-    }
-    db
-}
-
-/// RFC 0067 left mutation, load, the index writer and branch merge with no
-/// recovery sidecar, so the tests of the recovery machinery itself (discovery,
-/// the cleanup barrier, the storage-fault contracts, in-process healing) take
-/// their pending, roll-forward-eligible sidecar from Optimize: on a graph
-/// with compaction work it stops after its physical effects and before the
-/// manifest commit. Returns the sidecar's operation id.
-async fn leave_confirmed_optimize_sidecar(db: &Omnigraph, root: &std::path::Path) -> String {
-    let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-    let err = db
-        .optimize()
-        .await
-        .expect_err("optimize must stop after its physical effects");
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"),
-        "unexpected error: {err}"
-    );
-    single_sidecar_operation_id(root)
 }
 
 /// Run one independent-process writer through the public load entry point.
@@ -1057,134 +1017,6 @@ async fn cross_handle_refresh_waits_for_live_confirmed_writer() {
     );
 }
 
-/// Recovery discovery lists before it can know which branch/table gates to
-/// acquire. A live writer may publish and delete its completed sidecar between
-/// that LIST and the sidecar GET. The disappearance is successful concurrent
-/// completion, not a storage failure: discovery must skip the vanished URI,
-/// preserve every other error as loud, and let the unrelated branch write
-/// proceed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn recovery_discovery_skips_sidecar_deleted_after_list() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let initial = graph_with_optimize_work(&dir).await;
-    initial.branch_create("feature").await.unwrap();
-    drop(initial);
-
-    let db_a = Arc::new(Omnigraph::open(&uri).await.unwrap());
-    let db_b = Arc::new(Omnigraph::open(&uri).await.unwrap());
-
-    // Writer A: Optimize on main, parked with its sidecar live and its
-    // physical effects done, before the manifest commit that publishes them.
-    let writer_rendezvous = helpers::failpoint::Rendezvous::park_first(
-        &catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
-    );
-    let writer_db = Arc::clone(&db_a);
-    let writer = tokio::spawn(async move { writer_db.optimize().await });
-    writer_rendezvous.wait_until_reached().await;
-
-    let recovery_dir = dir.path().join("__recovery");
-    assert_eq!(
-        std::fs::read_dir(&recovery_dir).unwrap().count(),
-        1,
-        "precondition: writer A has one confirmed live sidecar"
-    );
-
-    let discovery_rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
-    let follower_db = Arc::clone(&db_b);
-    let follower = tokio::spawn(async move {
-        follower_db
-            .mutate(
-                "feature",
-                MUTATION_QUERIES,
-                "insert_person",
-                &mixed_params(&[("$name", "FeatureFollower")], &[("$age", 33)]),
-            )
-            .await
-    });
-    discovery_rendezvous.wait_until_reached().await;
-
-    writer_rendezvous.release();
-    writer
-        .await
-        .unwrap()
-        .expect("writer A must publish and delete its sidecar normally");
-    assert!(
-        !recovery_dir.exists() || std::fs::read_dir(&recovery_dir).unwrap().next().is_none(),
-        "writer A must delete the sidecar that follower discovery already listed"
-    );
-
-    discovery_rendezvous.release();
-    follower
-        .await
-        .unwrap()
-        .expect("a listed-then-deleted sidecar must not fail the feature write");
-
-    let main_names = collect_column_strings(&read_table(&db_b, "node:Person").await, "name");
-    assert!(!main_names.iter().any(|name| name == "FeatureFollower"));
-
-    let feature_names = collect_column_strings(
-        &helpers::read_table_branch(&db_b, "feature", "node:Person").await,
-        "name",
-    );
-    assert!(feature_names.iter().any(|name| name == "FeatureFollower"));
-    assert!(
-        !recovery_dir.exists() || std::fs::read_dir(&recovery_dir).unwrap().next().is_none(),
-        "both successful writes must leave no recovery sidecars"
-    );
-}
-
-/// Read-only open has a separate best-effort discovery loop because it does
-/// not run recovery. It must apply the same LIST -> GET disappearance rule:
-/// another process that removes a completed sidecar in that window cannot make
-/// an otherwise coherent read-only open fail. The process-local schema gate
-/// prevents this race against an in-process writer, so the test deletes the
-/// listed file directly to model the cross-process completion.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn read_only_recovery_discovery_skips_sidecar_deleted_after_list() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = graph_with_optimize_work(&dir).await;
-    let person_rows = helpers::count_rows(&db, "node:Person").await;
-    leave_confirmed_optimize_sidecar(&db, dir.path()).await;
-    let recovery_dir = dir.path().join("__recovery");
-    assert_eq!(
-        std::fs::read_dir(&recovery_dir).unwrap().count(),
-        1,
-        "precondition: the interrupted writer left one valid sidecar"
-    );
-
-    let discovery_rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::RECOVERY_POST_SIDECAR_LIST_PRE_READ);
-    let reader_uri = uri.clone();
-    let reader = tokio::spawn(async move { Omnigraph::open_read_only(&reader_uri).await });
-    discovery_rendezvous.wait_until_reached().await;
-
-    let listed_sidecar = std::fs::read_dir(&recovery_dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    std::fs::remove_file(&listed_sidecar).unwrap();
-
-    discovery_rendezvous.release();
-    let read_only = reader
-        .await
-        .unwrap()
-        .expect("a listed-then-deleted sidecar must not fail read-only open");
-    assert_eq!(
-        helpers::count_rows(&read_only, "node:Person").await,
-        person_rows,
-        "read-only open remains pinned to the last published manifest"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn graph_publish_failpoint_triggers_before_commit_append() {
@@ -1967,143 +1799,6 @@ async fn overwrite_load_rejects_disjoint_head_change_before_effects() {
     );
 }
 
-/// Stage A's entry-point heal and Stage C's effect gate are separated by
-/// reclaimable preparation. B can therefore observe a clean graph, stage, and
-/// pause while A leaves an EffectsConfirmed sidecar behind. Once B acquires
-/// the shared gates it must attribute the barrier to A's exact operation — not
-/// commit a second effect and not collapse the condition into generic manifest
-/// drift.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn follower_after_initial_heal_reports_exact_pending_recovery_operation() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    drop(graph_with_optimize_work(&dir).await);
-    let db_a = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
-    let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
-    let person_uri = node_table_uri(&db_a, "Person").await;
-    let initial_manifest_pin = helpers::snapshot_main(&db_a)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-
-    // B passes its initial (empty) recovery heal, stages from the old pin, and
-    // pauses before acquiring the effect gates.
-    let before_effect =
-        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
-    let follower_db = std::sync::Arc::clone(&db_b);
-    let follower = tokio::spawn(async move {
-        follower_db
-            .mutate(
-                "main",
-                MUTATION_QUERIES,
-                "insert_person",
-                &mixed_params(&[("$name", "Follower")], &[("$age", 44)]),
-            )
-            .await
-    });
-    before_effect.wait_until_reached().await;
-
-    // A, the index build, commits its exact Lance transactions, confirms the
-    // sidecar, then fails before manifest visibility.
-    {
-        let operation_id = leave_confirmed_optimize_sidecar(&db_a, dir.path()).await;
-        let sidecar: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(
-                dir.path()
-                    .join("__recovery")
-                    .join(format!("{operation_id}.json")),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            sidecar["writer_kind"], "Optimize",
-            "A must leave the confirmed index-build intent this race targets"
-        );
-
-        let a_effect_head = lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .latest_version_id()
-            .await
-            .unwrap();
-        assert!(
-            a_effect_head > initial_manifest_pin,
-            "A must advance the physical table before the barrier"
-        );
-        assert_eq!(
-            helpers::snapshot_main(&db_a)
-                .await
-                .unwrap()
-                .dataset("node:Person")
-                .unwrap()
-                .published_dataset_version,
-            initial_manifest_pin,
-            "A's failed publisher must leave the manifest pin unchanged"
-        );
-
-        before_effect.release();
-        let follower_err = follower
-            .await
-            .unwrap()
-            .expect_err("B must stop at A's recovery barrier before effects");
-        match follower_err {
-            OmniError::RecoveryRequired {
-                operation_id: actual,
-                ..
-            } => assert_eq!(
-                actual, operation_id,
-                "B must name the deterministic sidecar that owns the barrier"
-            ),
-            other => panic!("expected exact RecoveryRequired attribution, got: {other}"),
-        }
-
-        let after_b_head = lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .latest_version_id()
-            .await
-            .unwrap();
-        assert_eq!(
-            after_b_head, a_effect_head,
-            "B must not advance a second physical effect"
-        );
-        assert_eq!(
-            helpers::snapshot_main(&db_b)
-                .await
-                .unwrap()
-                .dataset("node:Person")
-                .unwrap()
-                .published_dataset_version,
-            initial_manifest_pin,
-            "B must not publish around A's pending recovery"
-        );
-        assert_eq!(
-            helpers::recovery::sidecar_operation_ids(dir.path()),
-            vec![operation_id.clone()],
-            "the attributed sidecar must remain available for recovery"
-        );
-    }
-
-    drop(before_effect);
-    drop(db_a);
-    drop(db_b);
-    let recovered = Omnigraph::open(&uri)
-        .await
-        .expect("A's confirmed sidecar must remain recoverable");
-    assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
-    let people = read_table(&recovered, "node:Person").await;
-    let names = collect_column_strings(&people, "name");
-    assert!(
-        !names.iter().any(|name| name == "Follower"),
-        "B's staged-but-uncommitted row must never become visible"
-    );
-}
-
 /// Separately-opened handles share the root-scoped branch gate. Once A's exact
 /// Lance effect is durable, a disjoint B write on the same graph branch must
 /// wait through A's manifest publish instead of moving graph_head and forcing
@@ -2500,360 +2195,6 @@ async fn azure_schema_apply_recovers_source_and_destination_after_partial_rename
     storage.delete_prefix(&uri).await.unwrap();
 }
 
-/// Regression for iss-schema-apply-reopen-recovery-race: the open-time
-/// recovery sweep's roll-forward must CONVERGE (not fatally error the open)
-/// when a concurrent writer advances the manifest past the sidecar's pin
-/// during the classify→publish window.
-///
-/// Two concurrent `Omnigraph::open` sweeps race the same pending sidecar.
-/// One is parked at `recovery.before_roll_forward_publish` (after it has
-/// classified `RolledPastExpected`, before its publish CAS); the other falls
-/// through, rolls the sidecar forward (manifest v → v+1), and deletes it. The
-/// parked sweep then loses its publish CAS at the now-stale `expected = v`.
-/// The manifest already reached the sidecar's goal, so this is convergence,
-/// not a logical conflict — the open must succeed, not panic with
-/// `PublishedDatasetVersionMismatch`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn open_sweep_roll_forward_converges_when_manifest_advances_concurrently() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-
-    // Setup: leave one pending sidecar (every table at Lance v+1, manifest v).
-    let person_rows = {
-        let db = graph_with_optimize_work(&dir).await;
-        leave_confirmed_optimize_sidecar(&db, dir.path()).await;
-        helpers::count_rows(&db, "node:Person").await
-    };
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .count(),
-        1,
-        "exactly one pending sidecar must persist for the sweep to roll forward"
-    );
-
-    // Park the FIRST sweep to reach the publish window; later arrivals fall
-    // through. wait_until_reached gates the second open so it is guaranteed
-    // to be the one that converges the sidecar.
-    let rv =
-        helpers::failpoint::Rendezvous::park_first(&catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH);
-
-    let uri_parked = uri.clone();
-    let parked_open = tokio::spawn(async move { Omnigraph::open(&uri_parked).await });
-    rv.wait_until_reached().await;
-
-    // A concurrent open rolls the sidecar forward (manifest v → v+1) and
-    // deletes it, advancing the manifest past the parked sweep's pin.
-    let converging_open = Omnigraph::open(&uri)
-        .await
-        .expect("the second open's sweep should roll the sidecar forward and succeed");
-    assert_eq!(
-        helpers::count_rows(&converging_open, "node:Person").await,
-        person_rows,
-        "the converging open serves the rows under the rolled-forward pointers"
-    );
-
-    // Release the parked sweep: its publish CAS finds the manifest already at
-    // the goal. It must converge, not fail the open.
-    rv.release();
-    parked_open
-        .await
-        .expect("the parked open task must not panic")
-        .expect(
-            "the open-time sweep must converge when the manifest already reached \
-             the sidecar's goal, not fail the open with PublishedDatasetVersionMismatch",
-        );
-
-    // The sidecar is gone and the graph is readable and consistent.
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        assert_eq!(
-            std::fs::read_dir(&recovery_dir).unwrap().count(),
-            0,
-            "the sidecar must be gone after both sweeps converge"
-        );
-    }
-    let db = Omnigraph::open(&uri).await.unwrap();
-    assert_eq!(helpers::count_rows(&db, "node:Person").await, person_rows);
-
-    // Exactly one RolledForward audit row for this recovery event: the loser's
-    // convergence path must NOT append a duplicate once the winner already
-    // recorded the audit and deleted the sidecar (append-idempotent per
-    // operation_id). Two rows here would be the duplicate-audit regression.
-    let kinds = helpers::recovery::recovery_audit_kinds(dir.path()).await;
-    assert_eq!(
-        kinds.len(),
-        1,
-        "exactly one recovery audit row expected after concurrent convergence, got {kinds:?}"
-    );
-}
-
-/// Refresh-time recovery (Option B): the in-process `Omnigraph::refresh`
-/// runs roll-forward-only recovery, closing the long-running-server
-/// residual without restart.
-///
-/// Setup: an index build stops after its confirmed effects. The sidecar
-/// persists. Without dropping the engine, call `db.refresh()`. The
-/// post-condition: sidecar gone; the rows still served; a subsequent
-/// mutation on the same handle succeeds without restart.
-#[tokio::test]
-#[serial]
-async fn refresh_runs_roll_forward_recovery_in_process() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = graph_with_optimize_work(&dir).await;
-    let person_rows = helpers::count_rows(&db, "node:Person").await;
-    leave_confirmed_optimize_sidecar(&db, dir.path()).await;
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .count(),
-        1,
-        "exactly one sidecar must persist after the finalize failure"
-    );
-
-    // Recovery: explicit refresh runs roll-forward-only recovery in-process,
-    // no restart needed.
-    db.refresh().await.expect("refresh must succeed");
-
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert!(
-            remaining.is_empty(),
-            "sidecar must be deleted by refresh-time roll-forward; remaining: {:?}",
-            remaining,
-        );
-    }
-    assert_eq!(helpers::count_rows(&db, "node:Person").await, person_rows);
-
-    // A direct Person mutation also succeeds without PublishedDatasetVersionMismatch.
-    mutate_main(
-        &mut db,
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
-    )
-    .await
-    .expect("Person insert must succeed after refresh-time recovery");
-    assert_eq!(
-        helpers::count_rows(&db, "node:Person").await,
-        person_rows + 1
-    );
-}
-
-/// Destructive version GC must not erase the transaction/version history that
-/// schema-v3 recovery uses to prove exact effect ownership. A pending sidecar
-/// is therefore a graph-wide cleanup barrier, checked before orphan reclaim or
-/// any per-table fault-isolated GC begins.
-#[tokio::test]
-#[serial]
-async fn cleanup_refuses_pending_v3_sidecar_before_version_gc() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let mut db = graph_with_optimize_work(&dir).await;
-    leave_confirmed_optimize_sidecar(&db, dir.path()).await;
-
-    let person_uri = node_table_uri(&db, "Person").await;
-    let before = lance::Dataset::open(&person_uri).await.unwrap();
-    let before_head = before.version().version;
-    let before_versions = before.versions().await.unwrap().len();
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .count(),
-        1,
-        "test precondition: one v3 sidecar is pending"
-    );
-
-    let err = db
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
-        .await
-        .expect_err("cleanup must not outrun recovery");
-    assert!(
-        err.to_string()
-            .contains("cleanup requires a clean recovery state"),
-        "unexpected cleanup error: {err}"
-    );
-
-    let after = lance::Dataset::open(&person_uri).await.unwrap();
-    assert_eq!(after.version().version, before_head);
-    assert_eq!(after.versions().await.unwrap().len(), before_versions);
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .count(),
-        1,
-        "refused cleanup must leave recovery ownership intact"
-    );
-
-    drop(db);
-    Omnigraph::open(&uri)
-        .await
-        .expect("read-write reopen resolves the retained sidecar");
-}
-
-/// Storage-fault contract for the recovery AUDIT write (injected at
-/// `recovery.record_audit`): a failure after the roll-forward's manifest
-/// publish aborts that recovery attempt loudly and keeps the sidecar;
-/// re-entry detects the already-published manifest (stale-sidecar path),
-/// records exactly one `RolledForward` audit row, and converges — the
-/// documented retry tolerance in `record_audit`'s contract, exercised
-/// end-to-end through a real injected failure.
-#[tokio::test]
-#[serial]
-async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
-    use omnigraph::loader::{LoadMode, load_jsonl};
-
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = graph_with_optimize_work(&dir).await;
-    let person_rows = helpers::count_rows(&db, "node:Person").await;
-
-    // Pending sidecar with real drift.
-    leave_confirmed_optimize_sidecar(&db, dir.path()).await;
-
-    // The next write's heal rolls forward (manifest publish lands) but
-    // the audit write fails — the write must fail loudly and the sidecar
-    // must survive for the retry.
-    {
-        let _failpoint = catalog::RECOVERY_RECORD_AUDIT.fire_always();
-        let err = load_jsonl(
-            &db,
-            r#"{"type":"Person","data":{"name":"Bob","age":25}}
-"#,
-            LoadMode::Merge,
-        )
-        .await
-        .expect_err("an audit write failure mid-heal must fail the write");
-        assert!(
-            err.to_string()
-                .contains("injected failpoint triggered: recovery.record_audit"),
-            "unexpected error: {err}"
-        );
-        let recovery_dir = dir.path().join("__recovery");
-        assert_eq!(
-            std::fs::read_dir(&recovery_dir).unwrap().count(),
-            1,
-            "the sidecar must survive an audit write failure so the retry can record it"
-        );
-    }
-
-    // Fault cleared: the next write converges — stale-sidecar audit
-    // recovery (manifest already advanced) + the write itself.
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"Carol","age":41}}
-"#,
-        LoadMode::Merge,
-    )
-    .await
-    .expect("recovery must converge once the audit fault clears");
-
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
-    }
-    // Carol landed; Bob's write failed before staging anything — the heal
-    // error aborted his load at entry.
-    assert_eq!(
-        helpers::count_rows(&db, "node:Person").await,
-        person_rows + 1
-    );
-    // Exactly one audit row despite two recovery attempts: the first
-    // attempt's audit failed before any row landed; the retry recorded
-    // the roll-forward once.
-    let audit_uri = format!(
-        "{}/_graph_commit_recoveries.lance",
-        uri.trim_end_matches('/')
-    );
-    let audit_rows = lance::Dataset::open(&audit_uri)
-        .await
-        .expect("audit dataset exists after the retried recovery")
-        .count_rows(None)
-        .await
-        .unwrap();
-    assert_eq!(audit_rows, 1, "exactly one recovery audit row");
-}
-
-/// Storage-fault contract for the `__recovery/` LIST (S3 ListObjectsV2,
-/// injected at `recovery.sidecar_list`): every consumer fails loudly —
-/// the write-entry heal fails the write, the open-time sweep fails the
-/// open — rather than silently skipping recovery over a pending sidecar
-/// (which would be consumer tolerance of drift). Once the fault clears,
-/// open recovers normally.
-#[tokio::test]
-#[serial]
-async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
-    use omnigraph::loader::{LoadMode, load_jsonl};
-
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = graph_with_optimize_work(&dir).await;
-    let person_rows = helpers::count_rows(&db, "node:Person").await;
-    leave_confirmed_optimize_sidecar(&db, dir.path()).await;
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .count(),
-        1
-    );
-
-    let _failpoint = catalog::RECOVERY_SIDECAR_LIST.fire_always();
-
-    // Write-entry heal: the list failure surfaces as the write's error —
-    // no silent skip that would proceed over the pending sidecar.
-    let err = load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"Bob","age":25}}
-"#,
-        LoadMode::Merge,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: recovery.sidecar_list"),
-        "the write-entry heal must surface a list failure loudly; got: {err}"
-    );
-
-    // Open-time sweep: a fresh ReadWrite open fails on the same fault.
-    drop(db);
-    let err = Omnigraph::open(&uri)
-        .await
-        .err()
-        .expect("open must fail while the sidecar list fault is active");
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: recovery.sidecar_list"),
-        "the open-time sweep must surface a list failure loudly; got: {err}"
-    );
-
-    // Fault cleared: open recovers the pending sidecar normally.
-    drop(_failpoint);
-    let db = Omnigraph::open(&uri).await.unwrap();
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        assert_eq!(
-            std::fs::read_dir(&recovery_dir).unwrap().count(),
-            0,
-            "open after the fault clears must recover the sidecar"
-        );
-    }
-    assert_eq!(helpers::count_rows(&db, "node:Person").await, person_rows);
-}
-
 #[tokio::test]
 #[serial]
 async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() {
@@ -2884,72 +2225,6 @@ async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() 
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
     assert_no_staging_files(dir.path());
     assert_no_recovery_sidecars(dir.path());
-}
-
-/// Same heal contract for the branch-merge entry point: a pending
-/// roll-forward-eligible sidecar on the target branch (here from an index
-/// build) must be healed (with its recovery audit row) before the merge
-/// reads its target snapshot, not silently folded into the merge's publish.
-#[tokio::test]
-#[serial]
-async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = graph_with_optimize_work(&dir).await;
-    let main_rows = helpers::count_rows(&db, "node:Person").await;
-
-    // A feature branch with its own write, to merge back later.
-    db.branch_create("feature").await.unwrap();
-    helpers::mutate_branch(
-        &mut db,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-    )
-    .await
-    .unwrap();
-
-    // A failed index build on MAIN: the tables drift ahead of the manifest
-    // with a confirmed sidecar covering them.
-    leave_confirmed_optimize_sidecar(&db, dir.path()).await;
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("__recovery"))
-            .unwrap()
-            .count(),
-        1
-    );
-
-    // Merge on the SAME handle. The entry heal must consume the sidecar
-    // (with a recovery audit row) BEFORE the merge captures its target
-    // snapshot.
-    db.branch_merge("feature", "main").await.expect(
-        "branch merge on the same handle must heal sidecar-covered \
-         drift in-process instead of failing or folding it silently",
-    );
-
-    // No sidecar remains: the heal consumed the index build's sidecar; the
-    // merge deleted its own after publish.
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        assert_eq!(
-            std::fs::read_dir(&recovery_dir).unwrap().count(),
-            0,
-            "the index build's sidecar must be consumed by the entry heal, not left behind"
-        );
-    }
-    assert_eq!(
-        helpers::count_rows(&db, "node:Person").await,
-        main_rows + 1,
-        "the merged row is visible on main"
-    );
-    assert!(
-        helpers::recovery::recovery_audit_kinds(dir.path())
-            .await
-            .iter()
-            .any(|kind| kind == "RolledForward"),
-        "the heal must be attributed"
-    );
 }
 
 /// Discarding an orphaned-branch sidecar must be idempotent across a
@@ -4266,53 +3541,33 @@ async fn seed_two_productive_optimize_tables(uri: &str) {
     }
 }
 
-fn assert_optimize_v9_sidecar_tables(
-    graph_root: &std::path::Path,
-    operation_id: &str,
-    expected: &[&str],
-) {
-    let body = std::fs::read_to_string(
-        graph_root
-            .join("__recovery")
-            .join(format!("{operation_id}.json")),
-    )
-    .unwrap();
-    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["schema_version"], 9);
-    assert_eq!(json["writer_kind"], "Optimize");
-    let mut actual = json["tables"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|table| table["table_key"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    actual.sort_unstable();
-    let mut expected = expected.to_vec();
-    expected.sort_unstable();
-    assert_eq!(actual, expected, "Optimize sidecar pinned the wrong tables");
-}
-
+/// RFC 0067: a failure before Optimize publishes leaves no residue. The
+/// compaction rewrites are detached versions behind the pins, the manifest
+/// and every linear HEAD stay where they were, and the retry re-plans.
 #[tokio::test]
 #[serial(optimize)]
-async fn optimize_phase_b_failure_recovered_on_next_open() {
+async fn optimize_pre_publish_failure_leaves_no_residue() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let operation_id;
-
-    // Both node tables have multiple fragments, so one Optimize arms one
-    // multi-pin sidecar and completes both physical effects before the seam.
     seed_two_productive_optimize_tables(&uri).await;
-
-    let pre_failure_version = {
-        let db = Omnigraph::open(&uri).await.unwrap();
-        version_main(&db).await.unwrap()
-    };
-
-    // Failpoint fires AFTER compact_files advanced the Lance HEAD but BEFORE the
-    // graph-wide manifest publish. Exactly one multi-table sidecar persists.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let manifest_before = version_main(&db).await.unwrap();
+    let snapshot_before = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let person_pin = snapshot_before
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
+    let company_pin = snapshot_before
+        .dataset("node:Company")
+        .unwrap()
+        .published_dataset_version;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let company_uri = node_table_uri(&db, "Company").await;
     {
-        let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
         let err = db.optimize().await.unwrap_err();
         assert!(
@@ -4321,109 +3576,115 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
             ),
             "unexpected error: {err}"
         );
-
-        let recovery_dir = dir.path().join("__recovery");
-        let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(
-            sidecars.len(),
-            1,
-            "exactly one Optimize sidecar must persist after optimize failure"
-        );
-        operation_id = single_sidecar_operation_id(dir.path());
-        assert_optimize_v9_sidecar_tables(
-            dir.path(),
-            &operation_id,
-            &["node:Company", "node:Person"],
+        assert!(
+            !matches!(err, OmniError::RecoveryRequired { .. }),
+            "a failure before publication needs no recovery: {err}"
         );
     }
-
-    // Recovery: reopen runs the sweep. The Optimize sidecar classifies
-    // RolledPastExpected (loose-match) → RollForward → manifest extends to the
-    // compacted Lance HEAD.
-    let db = Omnigraph::open(&uri).await.unwrap();
-    let post_recovery_version = version_main(&db).await.unwrap();
-    assert!(
-        post_recovery_version > pre_failure_version,
-        "manifest version must advance post-recovery (compaction rolled forward); \
-         pre={pre_failure_version}, post={post_recovery_version}",
-    );
+    assert_no_recovery_sidecars(dir.path());
+    assert_eq!(version_main(&db).await.unwrap(), manifest_before);
+    for (uri, pin) in [(&person_uri, person_pin), (&company_uri, company_pin)] {
+        let head = lance::Dataset::open(uri).await.unwrap().version().version;
+        assert_eq!(head, pin, "a detached rewrite never moves the linear HEAD");
+    }
     drop(db);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForward {
-            tables: vec![
-                TableExpectation::main("node:Company"),
-                TableExpectation::main("node:Person"),
-            ],
-        },
-    )
-    .await
-    .unwrap();
-
-    // The healed table accepts an additive schema apply — its HEAD-vs-manifest
-    // precondition is satisfied because recovery published the compacted version.
     let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(version_main(&db).await.unwrap(), manifest_before);
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
+    let stats = db
+        .optimize()
+        .await
+        .expect("the retry re-plans from the pins");
+    assert!(
+        stats.iter().any(|stat| stat.committed),
+        "the retry compacts what the failed attempt staged again"
+    );
+    assert_person_pin_promoted(&db, "main").await;
     let desired = helpers::TEST_SCHEMA.replace(
         "    age: I32?\n}",
         "    age: I32?\n    nickname: String?\n}",
     );
     db.apply_schema(&desired)
         .await
-        .expect("schema apply after optimize recovery must succeed");
+        .expect("schema apply after optimize must succeed");
 }
 
-/// Lost acknowledgement after the one graph-wide manifest CAS: both table
-/// pointers and Optimize lineage are already visible, but the shared v2
-/// sidecar remains. Recovery must recognize a stale successful intent, preserve
-/// both pointers, record RolledForward, and remove the sidecar.
+/// RFC 0067: a lost acknowledgement of Optimize's manifest commit reports
+/// an error, but the pins are published; reads serve the compacted rows
+/// through the staged versions and the next writer or cleanup promotes.
 #[tokio::test]
 #[serial(optimize)]
-async fn optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar() {
+async fn optimize_lost_publish_acknowledgement_leaves_pending_pins_the_next_writer_promotes() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     seed_two_productive_optimize_tables(&uri).await;
-
-    let operation_id;
     {
         let db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
-        let error = db.optimize().await.unwrap_err();
-        assert!(
-            matches!(error, OmniError::RecoveryRequired { .. }),
-            "lost graph-publish acknowledgement must require recovery, got {error}"
-        );
-        operation_id = single_sidecar_operation_id(dir.path());
-        assert_optimize_v9_sidecar_tables(
-            dir.path(),
-            &operation_id,
-            &["node:Company", "node:Person"],
-        );
+        db.optimize()
+            .await
+            .expect_err("a lost publish acknowledgement surfaces as an error");
     }
-
-    // Opening read-write finalizes the already-visible outcome; it must not
-    // compensate either content-preserving table effect.
-    let recovered = Omnigraph::open(&uri).await.unwrap();
+    assert_no_recovery_sidecars(dir.path());
+    let mut recovered = Omnigraph::open(&uri).await.unwrap();
     assert_eq!(helpers::count_rows(&recovered, "node:Person").await, 4);
     assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 4);
-    drop(recovered);
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForward {
-            tables: vec![
-                TableExpectation::main("node:Company"),
-                TableExpectation::main("node:Person"),
-            ],
-        },
+    let (head, published) = person_head_and_published(&recovered, "main").await;
+    assert!(
+        head < published,
+        "the published pin is pending until a writer promotes it: head {head}, published {published}"
+    );
+    recovered
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(10),
+            older_than: None,
+        })
+        .await
+        .expect("cleanup promotes the pending pins");
+    assert_person_pin_promoted(&recovered, "main").await;
+    let stats = recovered.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .all(|stat| stat.type_key == "__manifest" || !stat.committed),
+        "nothing is left to compact after the promoted pins: {stats:?}"
+    );
+}
+
+/// RFC 0067: the seam after publication leaves Optimize's pins pending; the
+/// writer acknowledges, and the next writer of each table promotes.
+#[tokio::test]
+#[serial(optimize)]
+async fn optimize_post_publish_failure_leaves_pending_pins_the_next_writer_promotes() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_two_productive_optimize_tables(&uri).await;
+    let mut db = Omnigraph::open(&uri).await.unwrap();
+    {
+        let _failpoint = catalog::OPTIMIZE_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        let stats = db.optimize().await.expect("the publication is durable");
+        assert!(stats.iter().any(|stat| stat.committed));
+    }
+    assert_no_recovery_sidecars(dir.path());
+    let (head, published) = person_head_and_published(&db, "main").await;
+    assert!(
+        head < published,
+        "Person's pin stays pending: head {head}, published {published}"
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "erin")], &[("$age", 34)]),
     )
     .await
     .unwrap();
+    assert_person_pin_promoted(&db, "main").await;
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 5);
 }
 
 /// Pending-only index intent is status, not a physical effect. An untrainable
@@ -4432,7 +3693,7 @@ async fn optimize_post_manifest_failure_finalizes_multi_table_v2_sidecar() {
 /// NoMovement would spuriously roll back the sibling's maintenance after a crash.
 #[tokio::test]
 #[serial(optimize)]
-async fn optimize_excludes_pending_only_vector_table_from_v2_sidecar() {
+async fn optimize_publishes_no_pin_for_a_table_with_only_pending_index_work() {
     const SCHEMA: &str = r#"
 node Work {
     name: String @key
@@ -4491,26 +3752,44 @@ node Embedding {
         .unwrap();
     }
 
-    let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_once_at(1);
-    let error = db.optimize().await.unwrap_err();
-    assert!(matches!(error, OmniError::RecoveryRequired { .. }));
-    let operation_id = single_sidecar_operation_id(dir.path());
-    assert_optimize_v9_sidecar_tables(dir.path(), &operation_id, &["node:Work"]);
-    drop(db);
-
-    drop(Omnigraph::open(&uri).await.unwrap());
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledForward {
-            tables: vec![TableExpectation::main("node:Work")],
-        },
+    // RFC 0067: a table with only pending index work publishes no pin; a
+    // pre-publish failure leaves nothing, and the retry reports the pending
+    // work again.
+    {
+        let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_once_at(1);
+        let error = db.optimize().await.unwrap_err();
+        assert!(
+            !matches!(error, OmniError::RecoveryRequired { .. }),
+            "{error}"
+        );
+    }
+    assert_no_recovery_sidecars(dir.path());
+    let embedding_entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Embedding")
+        .unwrap()
+        .clone();
+    let embedding_uri = node_table_uri(&db, "Embedding").await;
+    let embedding_head = helpers::open_dataset_head_exact(
+        &embedding_uri,
+        embedding_entry.native_dataset_branch.as_deref(),
     )
-    .await
-    .unwrap();
-
+    .await;
+    assert_eq!(
+        embedding_head.version().version,
+        embedding_entry.published_dataset_version,
+        "a pending-only table never publishes a pin"
+    );
+    drop(db);
     let db = Omnigraph::open(&uri).await.unwrap();
     let stats = db.optimize().await.unwrap();
+    let work = stats
+        .iter()
+        .find(|stat| stat.type_key == "node:Work")
+        .expect("Work stat present");
+    assert!(work.committed, "the retry compacts Work");
     let embedding = stats
         .iter()
         .find(|stat| stat.type_key == "node:Embedding")
@@ -4531,18 +3810,16 @@ node Embedding {
     );
 }
 
-/// One graph-wide v2 sidecar makes partial physical completion an
-/// all-or-nothing recovery unit. One table stops before its first effect while
-/// its sibling finishes; no table pointer becomes graph-visible, and Full open
-/// compensates the moved sibling before publishing one rollback commit.
+/// RFC 0067: a failure after one table's detached rewrite and before the
+/// batch publishes leaves no residue: no pin moves, no lineage is added,
+/// no linear HEAD moves, and the retry compacts every table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
-async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
+async fn optimize_partial_table_effect_leaves_no_residue() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     seed_two_productive_optimize_tables(&uri).await;
-
     let db = Omnigraph::open(&uri).await.unwrap();
     let snapshot_before = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -4557,99 +3834,59 @@ async fn optimize_multi_table_partial_effect_rolls_back_under_one_v2_sidecar() {
         .unwrap()
         .published_dataset_version;
     let commits_before = db.list_commits(Some("main")).await.unwrap().len();
-    let person_rows = helpers::count_rows(&db, "node:Person").await;
-    let company_rows = helpers::count_rows(&db, "node:Company").await;
     let person_uri = node_table_uri(&db, "Person").await;
     let company_uri = node_table_uri(&db, "Company").await;
-
-    // The first table task to hit the seam returns; the other task proceeds.
-    // Collection waits for both, leaving one completed physical effect under
-    // the one shared sidecar and no graph publish.
-    let _failpoint = catalog::OPTIMIZE_BEFORE_COMPACT.fire_once_at(1);
+    let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
     let error = db.optimize().await.unwrap_err();
     assert!(
-        matches!(error, OmniError::RecoveryRequired { .. }),
-        "post-arm partial Optimize must require recovery, got {error}"
+        !matches!(error, OmniError::RecoveryRequired { .. }),
+        "a partial batch before publication needs no recovery: {error}"
     );
-    let operation_id = single_sidecar_operation_id(dir.path());
-    assert_optimize_v9_sidecar_tables(dir.path(), &operation_id, &["node:Company", "node:Person"]);
-
-    let snapshot_after_failure = db
+    assert_no_recovery_sidecars(dir.path());
+    let snapshot_after = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
     assert_eq!(
-        snapshot_after_failure
+        snapshot_after
             .dataset("node:Person")
             .unwrap()
             .published_dataset_version,
-        person_pin,
-        "partial Optimize must not publish Person"
+        person_pin
     );
     assert_eq!(
-        snapshot_after_failure
+        snapshot_after
             .dataset("node:Company")
             .unwrap()
             .published_dataset_version,
-        company_pin,
-        "partial Optimize must not publish Company"
+        company_pin
     );
     assert_eq!(
         db.list_commits(Some("main")).await.unwrap().len(),
         commits_before,
-        "partial Optimize must not publish graph lineage"
+        "a partial Optimize publishes no lineage"
     );
-
-    let person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .version()
-        .version;
-    let company_head = lance::Dataset::open(&company_uri)
-        .await
-        .unwrap()
-        .version()
-        .version;
-    assert_eq!(
-        [person_head > person_pin, company_head > company_pin]
-            .into_iter()
-            .filter(|moved| *moved)
-            .count(),
-        1,
-        "fixture must leave exactly one sibling physical effect before recovery"
-    );
+    for (uri, pin) in [(&person_uri, person_pin), (&company_uri, company_pin)] {
+        let head = lance::Dataset::open(uri).await.unwrap().version().version;
+        assert_eq!(head, pin, "a detached rewrite never moves the linear HEAD");
+    }
     drop(db);
-
-    // Read-write open owns the quiescent v2 intent and compensates the moved
-    // table; the no-movement sibling remains at its original pin.
     let recovered = Omnigraph::open(&uri).await.unwrap();
-    assert_eq!(
-        helpers::count_rows(&recovered, "node:Person").await,
-        person_rows
-    );
-    assert_eq!(
-        helpers::count_rows(&recovered, "node:Company").await,
-        company_rows
-    );
+    assert_eq!(helpers::count_rows(&recovered, "node:Person").await, 4);
+    assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 4);
     assert_eq!(
         recovered.list_commits(Some("main")).await.unwrap().len(),
-        commits_before + 1,
-        "recovery must publish exactly one compensation lineage commit"
+        commits_before
     );
-    drop(recovered);
-
-    assert_post_recovery_invariants(
-        dir.path(),
-        &operation_id,
-        RecoveryExpectation::RolledBack {
-            tables: vec![
-                TableExpectation::main("node:Company"),
-                TableExpectation::main("node:Person"),
-            ],
-        },
-    )
-    .await
-    .unwrap();
+    let stats = recovered.optimize().await.unwrap();
+    assert_eq!(
+        stats
+            .iter()
+            .filter(|stat| stat.type_key != "__manifest" && stat.committed)
+            .count(),
+        2,
+        "the retry compacts both tables: {stats:?}"
+    );
 }
 
 /// Optimize captures a complete authority token before entering any writer
@@ -4779,21 +4016,15 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
 
     let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
 
-    // Pause productive Person optimize after the under-main-gate recovery
-    // relist and after its Person sidecar is durable.
-    let failpoint = catalog::OPTIMIZE_BEFORE_COMPACT.hold().0;
+    // Park optimize before its first detached rewrite.
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_BEFORE_COMPACT);
 
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = Omnigraph::open(&uri_opt).await.unwrap();
         db.optimize().await
     });
-
-    // Wait until optimize reaches the pause (its Optimize sidecar is on disk).
-    assert!(
-        wait_for_sidecar(dir.path()).await,
-        "optimize never reached the pre-compact pause",
-    );
+    rendezvous.wait_until_reached().await;
 
     let writer_db = std::sync::Arc::clone(&db_b);
     let writer = tokio::spawn(async move {
@@ -4812,7 +4043,7 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
         "table-disjoint main writer must wait for Optimize's branch-gate lifetime"
     );
 
-    drop(failpoint); // release optimize
+    rendezvous.release();
     let result = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
         .await
         .expect("optimize task hung")
@@ -4840,9 +4071,12 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
         .expect("graph must remain healthy / re-optimizable");
 }
 
-/// Same as the insert cell, for a strict delete: the second handle waits for
-/// optimize, then replans from the manifest-visible post-optimize state and
-/// preserves the deletion.
+/// Same as the insert cell, for a strict delete. The second handle waits for
+/// optimize; Optimize's publication then moved the graph head the delete was
+/// prepared against, so the strict read-modify-write reports the typed
+/// read-set conflict instead of a silent rebase (RFC 0067: Optimize is an
+/// ordinary publication, not a recovery barrier), and the caller's retry
+/// lands on the compacted pins and preserves the deletion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
 async fn optimize_serializes_concurrent_delete_across_handles() {
@@ -4866,19 +4100,15 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
 
     let db_b = std::sync::Arc::new(Omnigraph::open(&uri).await.unwrap());
 
-    // Pause optimize BEFORE its compaction commits.
-    let failpoint = catalog::OPTIMIZE_BEFORE_COMPACT.hold().0;
+    // Park optimize before its first detached rewrite.
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_BEFORE_COMPACT);
 
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = Omnigraph::open(&uri_opt).await.unwrap();
         db.optimize().await
     });
-
-    assert!(
-        wait_for_sidecar(dir.path()).await,
-        "optimize never reached the pre-compact pause",
-    );
+    rendezvous.wait_until_reached().await;
 
     let writer_db = std::sync::Arc::clone(&db_b);
     let writer = tokio::spawn(async move {
@@ -4894,19 +4124,40 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         !writer.is_finished(),
-        "same-root delete must wait for optimize's guarded sidecar lifetime"
+        "same-root delete must wait for optimize's branch-gate lifetime"
     );
 
-    drop(failpoint); // release optimize
+    rendezvous.release();
     let result = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
         .await
         .expect("optimize task hung")
         .unwrap();
     result.expect("optimize must finish before the queued delete");
-    writer
+    let conflict = writer
         .await
         .expect("writer task panicked")
-        .expect("queued delete must resume after optimize");
+        .expect_err("a strict delete prepared before Optimize published reports the conflict");
+    assert!(
+        matches!(
+            &conflict,
+            OmniError::Manifest(omnigraph::error::ManifestError {
+                details: Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+                    member,
+                    ..
+                }),
+                ..
+            }) if member == "graph_head:main"
+        ),
+        "the queued delete must see Optimize's publication as a read-set change: {conflict}"
+    );
+    db_b.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "alice")], &[]),
+    )
+    .await
+    .expect("the retried delete lands on the compacted pins");
 
     // No lost write: alice's delete persisted (3 rows); graph remains re-optimizable.
     let db = Omnigraph::open(&uri).await.unwrap();
@@ -4918,82 +4169,6 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
     db.optimize()
         .await
         .expect("graph must remain healthy / re-optimizable");
-}
-
-/// Regression: the outer compaction retry loop must NOT misclassify optimize's OWN
-/// committed Phase-B work as external drift. Attempt 1 compacts (HEAD → V+1); if a
-/// LATER Phase-B op (reindex) then hits a retryable conflict, the reopened attempt
-/// sees Lance HEAD ahead of the manifest — from OUR compaction, not an external
-/// writer. The drift guard must skip it (we hold the sidecar) and converge, not
-/// delete the sidecar and return `skipped_for_drift` (which would strand uncovered
-/// drift). Reproduced by injecting one retryable reindex conflict after the compact.
-#[tokio::test]
-#[serial(optimize)]
-async fn optimize_retry_does_not_misclassify_own_head_drift() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-
-    {
-        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
-            db.mutate(
-                "main",
-                MUTATION_QUERIES,
-                "insert_person",
-                &mixed_params(&[("$name", name)], &[("$age", age)]),
-            )
-            .await
-            .unwrap();
-        }
-    }
-
-    // Inject exactly one retryable reindex conflict: attempt 1 compacts (HEAD+1) then
-    // "conflicts" on reindex → retry; attempt 2 reopens with HEAD ahead of the manifest
-    // from our own compaction — the misclassification trigger.
-    let _failpoint = catalog::OPTIMIZE_POST_COMPACT_PRE_REINDEX.fire_once_at(1);
-
-    let db = Omnigraph::open(&uri).await.unwrap();
-    let stats = db
-        .optimize()
-        .await
-        .expect("optimize must converge, not misclassify its own HEAD drift");
-    let person = stats
-        .iter()
-        .find(|s| s.type_key == "node:Person")
-        .expect("node:Person stat present");
-    assert!(
-        person.skipped.is_none(),
-        "node:Person must converge, not skipped_for_drift: {:?}",
-        person.skipped,
-    );
-
-    // No uncovered drift stranded: a follow-up optimize is clean and all rows read.
-    let stats2 = db.optimize().await.unwrap();
-    let person2 = stats2.iter().find(|s| s.type_key == "node:Person").unwrap();
-    assert!(
-        person2.skipped.is_none(),
-        "follow-up optimize must be clean (no stranded drift): {:?}",
-        person2.skipped,
-    );
-    assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
-}
-
-/// Poll until `optimize` has written its recovery sidecar (i.e. reached Phase B
-/// and is about to / has compacted), signalling it is parked at its failpoint.
-async fn wait_for_sidecar(root: &std::path::Path) -> bool {
-    let recovery_dir = root.join("__recovery");
-    for _ in 0..1000 {
-        if recovery_dir.exists()
-            && std::fs::read_dir(&recovery_dir)
-                .map(|d| d.count() > 0)
-                .unwrap_or(false)
-        {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    false
 }
 
 #[tokio::test]
@@ -7307,59 +6482,6 @@ async fn branch_merge_rechecks_late_sidecar_after_table_gates() {
     );
 }
 
-/// Cleanup's fast sidecar probe is only an optimization. A writer can fail
-/// after that probe; the schema/branch/table GC envelope and final recheck must
-/// refuse before Lance can delete recovery history.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn cleanup_rechecks_sidecars_under_gc_gates() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    drop(graph_with_optimize_work(&dir).await);
-
-    let cleanup_rv =
-        helpers::failpoint::Rendezvous::park_first(&catalog::CLEANUP_POST_RECOVERY_CHECK_PRE_GATES);
-    let cleanup_uri = uri.clone();
-    let cleanup_task = tokio::spawn(async move {
-        let mut db = Omnigraph::open(&cleanup_uri).await.unwrap();
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
-        .await
-    });
-    cleanup_rv.wait_until_reached().await;
-
-    let writer = Omnigraph::open(&uri).await.unwrap();
-    leave_confirmed_optimize_sidecar(&writer, dir.path()).await;
-    let person_uri = node_table_uri(&writer, "Person").await;
-    let before_versions = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .versions()
-        .await
-        .unwrap()
-        .len();
-    cleanup_rv.release();
-    let error = cleanup_task
-        .await
-        .unwrap()
-        .expect_err("authoritative under-gate check must refuse cleanup");
-    assert!(error.to_string().contains("after acquiring its GC gates"));
-    assert_eq!(
-        lance::Dataset::open(&person_uri)
-            .await
-            .unwrap()
-            .versions()
-            .await
-            .unwrap()
-            .len(),
-        before_versions,
-        "refused cleanup must not delete any recovery version history"
-    );
-}
-
 /// A delete parked at its primary-delete point while a concurrent update
 /// lands on the same table loses the manifest CAS as a strict read-set
 /// change: its detached effect is never published, the table's linear
@@ -8123,19 +7245,20 @@ async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
 }
 
-/// Real-backend coverage of the recovery-sidecar lifecycle the remaining
-/// sidecar writers still use: Optimize stops after its physical effects, its
-/// sidecar PUT went through the S3 adapter, and the next write on the same
-/// handle lists `__recovery/`, rolls the sidecar forward, deletes it and
-/// lands. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set.
+/// Real-backend coverage of the detached Optimize (RFC 0067) on an
+/// S3-compatible store: a compaction interrupted after its publication
+/// leaves pending pins whose staged versions serve the compacted rows; the
+/// next write on the same handle promotes Person and lands, and a reopen
+/// agrees. No `__recovery` object is written. Skips unless
+/// `OMNIGRAPH_S3_TEST_BUCKET` is set.
 #[tokio::test]
 #[serial]
-async fn s3_recovery_sidecar_lifecycle_heals_on_the_next_write() {
+async fn s3_optimize_pending_pin_is_promoted_by_the_next_write() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let Some(uri) = helpers::s3_test_graph_uri("failpoints") else {
         eprintln!(
-            "skipping s3_recovery_sidecar_lifecycle_heals_on_the_next_write: \
+            "skipping s3_optimize_pending_pin_is_promoted_by_the_next_write: \
              OMNIGRAPH_S3_TEST_BUCKET is not set"
         );
         return;
@@ -8158,18 +7281,24 @@ async fn s3_recovery_sidecar_lifecycle_heals_on_the_next_write() {
     }
     let rows = helpers::count_rows(&db, "node:Person").await;
     {
-        let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db
+        let _failpoint = catalog::OPTIMIZE_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        let stats = db
             .optimize()
             .await
-            .expect_err("optimize must stop after its physical effects");
+            .expect("the publication is durable before the promotion is interrupted");
         assert!(
-            err.to_string().contains(
-                "injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"
-            ),
-            "unexpected error: {err}"
+            stats
+                .iter()
+                .any(|stat| stat.type_key == "node:Person" && stat.committed),
+            "Person must compact: {stats:?}"
         );
     }
+    let (head, published) = person_head_and_published(&db, "main").await;
+    assert!(
+        head < published,
+        "the Person pin is pending on S3: head {head}, published {published}"
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, rows);
 
     load_jsonl(
         &db,
@@ -8178,12 +7307,14 @@ async fn s3_recovery_sidecar_lifecycle_heals_on_the_next_write() {
         LoadMode::Merge,
     )
     .await
-    .expect("the same-handle heal must converge on an S3-backed graph");
+    .expect("the next write promotes the pending pin and lands on S3");
+    assert_person_pin_promoted(&db, "main").await;
     assert_eq!(helpers::count_rows(&db, "node:Person").await, rows + 1);
 
     drop(db);
     let db = Omnigraph::open(&uri).await.unwrap();
     assert_eq!(helpers::count_rows(&db, "node:Person").await, rows + 1);
+    assert_person_pin_promoted(&db, "main").await;
 }
 
 /// Person HEAD and published version on `branch`, with the linear HEAD read

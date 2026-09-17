@@ -113,7 +113,7 @@ physical-effect proofs:
 | SchemaApply | Exact existing-table rewrites plus owned first-touch table creation and the complete schema/manifest delta | One main-branch graph commit |
 | BranchMerge | Pointer adoption, or a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (RFC 0067) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph commit | | One graph publication when work lands |
-| Optimize | Bounded compaction and index-fold maintenance over the complete planned table set | At most one monotonic main publication |
+| Optimize | One detached compaction `Rewrite` per productive table, chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
 the logical authority; clone/delete residue is derived physical state and is
@@ -151,7 +151,18 @@ detached manifest older than the threshold that no pending chain protects
 foreign linear commit occupies is blocked: a later mutation stages from the
 detached version and its own promotion waits behind the block, while the
 graph-global writers (schema apply, Optimize) promote every pending pin
-before they plan and refuse a blocked one. `omnigraph repair` reports blocked pins as
+before they plan and refuse a blocked one. Optimize plans each table's
+compaction from its pin and stages the rewrite detached with fragment ids
+above the base's high-water mark, so it needs no `ReserveFragments`; a
+lagging scalar or vector index is rebuilt whole as a detached commit under
+its name (Lance 11 folds only through a linear commit), keeping a vector
+index's partition count; the batch publishes once with an exact CAS on every
+planned pin, and a pin a concurrent writer moved fails the run with a
+read-set conflict so the next run re-plans. A failure before publication
+leaves nothing but reclaimable detached versions; one after it leaves
+pending pins the next writer or cleanup promotes. A strict mutation prepared
+before Optimize's publication reports the same read-set conflict as it would
+after any other writer. `omnigraph repair` reports blocked pins as
 `blocked_promotion` and never adopts the foreign commit. First-touch branch
 forks are created without an intent record; an unreferenced fork is garbage
 that cleanup classifies.

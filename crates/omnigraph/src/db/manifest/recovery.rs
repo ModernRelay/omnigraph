@@ -8278,6 +8278,7 @@ async fn delete_sidecar_by_operation_id(
 
 /// Arm the identity-aware Optimize protocol. Optimize has no writer-specific
 /// payload: its complete physical set is the table-pin vector itself.
+#[cfg(test)]
 pub(crate) fn new_optimize_sidecar_v9(tables: Vec<SidecarTablePin>) -> Result<RecoverySidecar> {
     let sidecar = new_unvalidated_sidecar(
         IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
@@ -8290,6 +8291,7 @@ pub(crate) fn new_optimize_sidecar_v9(tables: Vec<SidecarTablePin>) -> Result<Re
     Ok(sidecar)
 }
 
+#[cfg(test)]
 fn new_unvalidated_sidecar(
     schema_version: u32,
     writer_kind: SidecarKind,

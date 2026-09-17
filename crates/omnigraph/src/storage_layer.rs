@@ -539,6 +539,23 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// [`Self::commit_staged_create_exact`] succeeds.
     async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
 
+    /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
+    /// base, or `None` when there is nothing to compact.
+    async fn stage_compaction(
+        &self,
+        snapshot: &SnapshotHandle,
+        options: &lance::dataset::optimize::CompactionOptions,
+    ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
+
+    /// RFC 0067: stage one detached-ready fold of every foldable index whose
+    /// coverage lags the fragments, each rebuilt whole under its name; `None`
+    /// when every index is current. The second value names the vector
+    /// columns whose index could not be trained.
+    async fn stage_index_fold(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
+
     /// Atomically create version 1 from a staged read-version-0 transaction.
     /// Lance conflict retries are disabled so a concurrently-created dataset
     /// is rejected rather than overwritten.
@@ -1034,6 +1051,26 @@ impl TableStorage for TableStore {
         TableStore::stage_create(self, dataset_uri, batch)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_compaction(
+        &self,
+        snapshot: &SnapshotHandle,
+        options: &lance::dataset::optimize::CompactionOptions,
+    ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
+        Ok(
+            TableStore::stage_compaction(self, snapshot.dataset(), options)
+                .await?
+                .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
+        )
+    }
+
+    async fn stage_index_fold(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
+        let fold = TableStore::stage_index_fold(self, snapshot.dataset()).await?;
+        Ok((fold.staged.map(StagedHandle::new), fold.skipped))
     }
 
     async fn commit_staged_create_exact(

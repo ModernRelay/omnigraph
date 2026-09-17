@@ -4879,8 +4879,8 @@ struct WatchRuling {
 }
 
 /// The keep-serving resolution's arbitration (the #559 composition
-/// widening; regression evidence in
-/// `dst_keep_serving_widened_arbitration_no_false_reds`): judge the
+/// widening; its regression pin retired with RFC 0067, whose writers arm
+/// no recovery intent the workload could defer on): judge the
 /// deferred op A and the interrupting op E TOGETHER, against every legal
 /// composition and order of the pair. [`reconcile_after_failure`]'s one-op
 /// set assumes at most one unjudged op separates model from store; the
@@ -5868,9 +5868,10 @@ impl UniverseScenario<RustResources> for Scenario {
                         // future work, the pinned scenarios never sample
                         // those mid-wedge. The succeeding op is NOT applied
                         // to the model first — it rides into the resolution
-                        // as the known-applied interrupting op (the break
-                        // shapes live on
-                        // `dst_keep_serving_widened_arbitration_no_false_reds`);
+                        // as the known-applied interrupting op (the #559
+                        // break shapes: a heal rolling the deferred strand
+                        // forward mid-watch, a state-derived success baking
+                        // the wrong order, the resolution's own reopen);
                         // deferral contract on [`resolve_keep_serving_watch`].
                         if let Some(watch) = keep_serving_watch.take() {
                             let interrupt = WatchInterrupt {

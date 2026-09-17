@@ -2517,8 +2517,9 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
     // Metadata-only coverage cases, reusing this fixture's typed index
     // inventory. The synthetic empty segment borrows another index UUID;
     // no posting files are opened and these snapshots are never searched.
-    // A scalar's full union is a no-op, but vector segments may still need
-    // partition rebalancing, so preserve their previous per-segment candidacy.
+    // A scalar's full union is a no-op, but a vector index split into
+    // segments costs a nearest scan one probe set per segment, so the fold
+    // still collapses it into one (RFC 0067 rebuilds it whole).
     use lance::index::DatasetIndexExt;
     let inventory = new_ds.load_indices().await.unwrap();
     let mut coverage_ds = new_ds;
@@ -2560,7 +2561,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 .await
                 .unwrap(),
             expected_work,
-            "scalar union coverage must not suppress vector rebalance candidacy on {column}"
+            "scalar union coverage must not suppress the vector segment collapse on {column}"
         );
     }
 }

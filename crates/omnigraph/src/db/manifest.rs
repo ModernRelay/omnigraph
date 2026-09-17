@@ -72,8 +72,8 @@ pub(crate) use recovery::{
     RecoverySchemaApplyEffectKind, RecoverySidecarHandle, RecoverySystemColumnUpgrade,
     RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin, confirm_schema_apply_sidecar_v9,
     delete_sidecar, ensure_read_only_schema_coherent, heal_pending_sidecars_roll_forward,
-    list_sidecars, new_optimize_sidecar_v9, new_system_column_upgrade_sidecar_v9,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    list_sidecars, new_system_column_upgrade_sidecar_v9, recover_manifest_drift,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::DatasetEntry;
 #[cfg(test)]

@@ -33,7 +33,7 @@ mean an active sidecar uses an old outer schema.
 | BranchMerge | None since RFC 0067: chunks chain detached and publish as pins; the classifier keeps the kind for sidecars written before the change until it is removed |
 | SchemaApply | None for schema apply itself since RFC 0067: rewrites are detached pins, an added type is a linear create at its identity path, and the staged contract records its publishing commit, so the next read-write open promotes it when that commit is in lineage and discards it otherwise. The RFC 0040 system-column upgrade still writes the v9 exact protocol (rename-only table effects, unmarked schema staging and a `__manifest` stamp advance), recovered by roll-forward only |
 | EnsureIndices / full-text rebuild | None since RFC 0067: index batches are detached commits published as pins; the classifier keeps the kind for sidecars written before the change until it is removed |
-| Optimize | Bounded maintenance plan and complete graph-wide pointer outcome |
+| Optimize | None since RFC 0067: compaction, index folds and deferred index builds are detached commits published as pins with an exact CAS; the classifier keeps the kind for sidecars written before the change until it is removed |
 
 Pre-v9 identity-less artifacts are never upgraded by guessing from aliases.
 Unsupported future schemas are refused before their payload is interpreted.
@@ -194,11 +194,13 @@ The v8 storage fence keeps older binaries from exposing retired branches.
 ## Maintenance boundary
 
 SchemaApply carries exact transaction identities; Mutation, Load, the index
-writer and branch merge publish detached pins instead (RFC 0067). Optimize uses Lance maintenance operations that do not
-yet expose the same caller-owned transaction proof, so its classifier is
-bounded but looser and retains the documented one-mutation-process boundary for
-destructive recovery. Do not widen that claim to distributed takeover without
-a new proof and compatibility tests.
+writer, branch merge and Optimize publish detached pins instead (RFC 0067).
+Optimize executes Lance's compaction plan against the pinned base and stages
+the result as one exact `Rewrite` transaction, so it carries the same
+transaction identity as every other detached writer and needs no bounded
+classifier or one-mutation-process boundary. Do not widen that to a claim
+about concurrent Optimize runs: two runs over the same table race on the
+exact pin CAS and the loser re-plans.
 
 ## Test ownership
 
