@@ -487,7 +487,9 @@ snapshot` in embedded mode opens read-write
 Recovery runs under the same
 schema gate as every other schema apply. The existing schema-apply failpoints
 (`schema_apply.before_staging_write`, `after_staging_write`,
-`post_sidecar_pre_effect`, `post_table_commit`, `after_manifest_commit`)
+`post_sidecar_pre_effect` (renamed `post_lock_pre_effect` when RFC 0067
+moved the upgrade off its sidecar), `post_table_commit`,
+`after_manifest_commit`)
 apply unchanged, plus one new point between consecutive table renames, so
 the DST harness drives the half-renamed state, the state a crash-at-k-write
 run also reaches.

@@ -59,7 +59,7 @@ pub(crate) use metadata::TableVersionMetadata;
 use metadata::{
     OMNIGRAPH_ROW_COUNT_KEY, object_store_path_from_uri, table_version_metadata_for_state,
 };
-pub(crate) use migrations::{publish_stamp_advance, stamp_for_system_columns};
+pub(crate) use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
@@ -67,13 +67,9 @@ use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome}
 #[cfg(test)]
 pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
 pub(crate) use recovery::{
-    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
-    RecoveryLineageIntent, RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect,
-    RecoverySchemaApplyEffectKind, RecoverySidecarHandle, RecoverySystemColumnUpgrade,
-    RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin, confirm_schema_apply_sidecar_v9,
-    delete_sidecar, ensure_read_only_schema_coherent, heal_pending_sidecars_roll_forward,
-    list_sidecars, new_system_column_upgrade_sidecar_v9, recover_manifest_drift,
-    schema_apply_serial_queue_key, write_sidecar,
+    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryMode, SidecarKind,
+    ensure_read_only_schema_coherent, heal_pending_sidecars_roll_forward, list_sidecars,
+    recover_manifest_drift, schema_apply_serial_queue_key,
 };
 pub use state::DatasetEntry;
 #[cfg(test)]

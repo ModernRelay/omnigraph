@@ -153,10 +153,10 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// Before the first table effect. The RFC 0040 system-column upgrade fires
-    /// it once its ownership sidecar is durable; schema apply arms no sidecar
-    /// (RFC 0067) and fires it as its plain pre-effect seam.
-    pub static SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT = ("schema_apply.post_sidecar_pre_effect", Unreachable, [Fail]);
+    /// Under the schema-apply sentinel and every gate, before the first
+    /// table effect; shared by schema apply and the RFC 0040 system-column
+    /// upgrade, neither of which arms a sidecar (RFC 0067).
+    pub static SCHEMA_APPLY_POST_LOCK_PRE_EFFECT = ("schema_apply.post_lock_pre_effect", Unreachable, [Fail]);
 }
 
 decide_seam! {
@@ -771,7 +771,7 @@ where
 
     let mut published_commit: Option<String> = None;
     let effects = async {
-        fail(&SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
+        fail(&SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
         let mut expected_table_versions =
             HashMap::<crate::db::manifest::TableIdentity, u64>::new();
         let mut promotions = Vec::<crate::db::HeldPromotion>::new();

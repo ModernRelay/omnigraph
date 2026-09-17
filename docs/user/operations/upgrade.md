@@ -258,9 +258,9 @@ naming every offender under `system_columns_preflight`. Edge constraints
 such as `@unique(src, dst)` become `@unique(@src, @dst)`. Stop every server
 serving the graph and retain a verified backup first: a write from a server
 still running lands the graph in a refusal only a restore clears, and there
-is no reverse operation. An interrupted run is completed by the next
-read-write open (every CLI command except `--check`; a rerun then reports
-`already_current`), and a read-only handle refuses until then. A graph that
+is no reverse operation. A run interrupted before it publishes changes nothing: rerun
+it. One interrupted after is completed by the next read-write open (any CLI command but
+`--check`; a rerun reports `already_current`); a read-only handle refuses until then. A graph that
 already spells `__id`/`__src`/`__dst` reports `already_current`;
 cluster-managed graphs are refused.
 

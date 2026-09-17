@@ -205,7 +205,7 @@ const MUTATION_V9: WriteProtocol = WriteProtocol::Exact("Mutation v9");
 const LOAD_V9: WriteProtocol = WriteProtocol::Exact("Load v9");
 const SCHEMA_V9: WriteProtocol = WriteProtocol::Exact("SchemaApply v9");
 const SYSTEM_COLUMNS_V9: WriteProtocol =
-    WriteProtocol::Exact("SchemaApply v9 system-column upgrade (RFC 0040)");
+    WriteProtocol::Exact("system-column upgrade (RFC 0040, detached renames per RFC 0067)");
 const MERGE_V9: WriteProtocol = WriteProtocol::Exact("BranchMerge v9");
 const INDICES_V9: WriteProtocol = WriteProtocol::Exact("EnsureIndices v9");
 const OPTIMIZE_V9: WriteProtocol =
@@ -777,14 +777,9 @@ durable_calls! {
     ("table_store.rs", "CommitBuilder::new(", 4, WriteProtocol::Composed("staged commit primitive")),
     ("table_store.rs", ".create_index_builder(", 5, WriteProtocol::Composed("staged index primitive and RFC 0067 whole-rebuild fold")),
     ("table_store.rs", ".execute_uncommitted(", 10, WriteProtocol::Composed("staged physical primitive")),
-    ("db/omnigraph/system_column_upgrade.rs", "write_sidecar(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_exact(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", ".write_text(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "write_schema_contract_staging(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "confirm_schema_apply_sidecar_v9(", 1, SYSTEM_COLUMNS_V9),
+    ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached rename-only system-column effect")),
+    ("db/omnigraph/system_column_upgrade.rs", ".write_text(", 4, WriteProtocol::Exact("RFC 0067 staged and live schema contract source/IR/state")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_changes_with_intent_and_expected(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "promote_exact_schema_staging(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "delete_sidecar(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".dataset()", 1, SYSTEM_COLUMNS_V9),
     ("db/manifest/migrations.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("RFC 0040 stamp advance on main's __manifest under the system-column upgrade intent")),
     ("exec/merge.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached merge chain")),
@@ -810,7 +805,7 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text_if_absent(", 3, WriteProtocol::Composed("bootstrap init claim + strict `_schema.pg` defence + bind-time create-if-absent probe")),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
-    ("db/manifest/recovery.rs", ".write_text(", 4, WriteProtocol::RecoveryExecutor),
+    ("db/manifest/recovery.rs", ".write_text(", 3, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", ".commit_staged_exact(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "confirm_schema_apply_sidecar_v9(", 1, WriteProtocol::RecoveryExecutor),
     ("db/manifest/recovery.rs", "write_schema_contract_staging(", 1, WriteProtocol::RecoveryExecutor),

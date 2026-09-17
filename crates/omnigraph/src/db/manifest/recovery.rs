@@ -1006,6 +1006,9 @@ pub(crate) struct RecoverySidecar {
 /// the sidecar alive — it just records the URI to delete.
 #[derive(Debug, Clone)]
 pub(crate) struct RecoverySidecarHandle {
+    // No writer arms a sidecar since RFC 0067; only the in-source tests read
+    // the id until the classifier leaves with step 5.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) operation_id: String,
     pub(crate) sidecar_uri: String,
 }
@@ -1133,6 +1136,7 @@ decide_seam! {
 /// POSIX); object stores write via PutObject (atomic at the object level).
 /// Both are sufficient for sidecar semantics — readers either see the
 /// complete sidecar or none.
+#[cfg(test)]
 pub(crate) async fn write_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -8736,6 +8740,7 @@ pub(crate) fn new_schema_apply_sidecar_v9(
 /// are all rename-only table commits and whose only recovery outcome is
 /// roll-forward (see [`RecoverySystemColumnUpgrade`]).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn new_system_column_upgrade_sidecar_v9(
     actor_id: Option<String>,
     tables: Vec<SidecarTablePin>,

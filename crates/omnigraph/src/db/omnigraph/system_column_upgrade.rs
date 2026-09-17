@@ -1,15 +1,21 @@
 //! RFC 0040 Rollout step 3: the explicit system-column upgrade of one
 //! legacy-vintage graph. Renames `id`/`src`/`dst` to `__id`/`__src`/`__dst`
-//! in every node and edge table and promotes the current-vintage schema
-//! contract, as one exact `SchemaApply` intent whose only recovery outcome is
-//! roll-forward. Before RFC 0067 the step also advanced main's `__manifest`
-//! stamp from 8 to 9; since v10 both vintages share one stamp and the
-//! advance is a no-op, kept in the intent so the protocol shape is unchanged.
+//! in every node and edge table and installs the current-vintage schema
+//! contract. Since RFC 0067 it has schema apply's shape: each rename-only
+//! `Project` commits detached from the table's promoted pin, the staged
+//! contract names the graph commit that publishes it, one manifest CAS
+//! publishes every pin, and the held renames promote afterwards. It arms no
+//! recovery sidecar: a failure before the CAS leaves only reclaimable detached
+//! versions and a staging the next read-write open discards; one after it
+//! leaves pins the next writer promotes and a contract the next read-write
+//! open (or this handle's next write) installs. Since v10 both vintages share
+//! one `__manifest` stamp, so the upgrade moves no stamp; the vintage is the
+//! contract's `system-columns` feature.
 
 use super::*;
 use crate::db::manifest::UpgradeMode;
 use crate::db::schema_state::SchemaState;
-use crate::seams::{catalog, decide_seam, fail};
+use crate::seams::{catalog, fail};
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
 use serde::Serialize;
 
@@ -195,29 +201,12 @@ pub(super) async fn upgrade_system_columns(
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
     super::schema_apply::acquire_schema_apply_lock(db).await?;
-    let result = execute_with_lock(
-        db,
-        actor,
-        &accepted_ir,
-        &accepted_schema_state,
-        from_stamp,
-        to_stamp,
-    )
-    .await;
+    let result = execute_with_lock(db, actor, &accepted_ir, &accepted_schema_state).await;
     let release_result = super::schema_apply::release_schema_apply_lock(db).await;
-    let (graph_manifest_version, recovery_handle) = match (result, release_result) {
-        (Ok(done), Ok(())) => done,
+    let graph_manifest_version = match (result, release_result) {
+        (Ok(version), Ok(())) => version,
         (Ok(_), Err(err)) | (Err(err), _) => return Err(err),
     };
-    if let Err(err) =
-        crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
-    {
-        tracing::warn!(
-            error = %err,
-            operation_id = recovery_handle.operation_id.as_str(),
-            "system-column upgrade sidecar cleanup failed; the next open's recovery sweep will resolve it"
-        );
-    }
     report.outcome = SystemColumnUpgradeOutcome::Completed;
     report.stamp_after = to_stamp;
     report.graph_manifest_version = Some(graph_manifest_version);
@@ -276,25 +265,14 @@ async fn preflight(
     Ok(())
 }
 
-decide_seam! {
-    /// The RFC 0040 system-column upgrade has armed its intent (its stamp
-    /// advance is a no-op since v10) but has renamed no table yet: legacy
-    /// spellings under an Armed intent, the one state no other writer can
-    /// produce.
-    pub static SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE = ("system_column_upgrade.after_stamp_advance", Unreachable, [Fail]);
-}
-
-/// Returns the published graph version and the armed intent's handle: the
-/// caller retires the sidecar only after it released `__schema_apply_lock__`,
-/// so a crash in between leaves the record that re-enters lock cleanup.
+/// Stage, publish and install the upgrade under the schema-apply sentinel.
+/// Returns the published graph manifest version.
 async fn execute_with_lock(
     db: &Omnigraph,
     actor: Option<&str>,
     accepted_ir: &SchemaIR,
     accepted_schema_state: &SchemaState,
-    from_stamp: u32,
-    to_stamp: u32,
-) -> Result<(u64, crate::db::manifest::RecoverySidecarHandle)> {
+) -> Result<u64> {
     db.refresh_coordinator_only().await?;
     let accepted_source = db
         .storage
@@ -316,43 +294,6 @@ async fn execute_with_lock(
             coordinator.new_lineage_intent(actor, None)?,
         )
     };
-
-    let mut recovery_pins = Vec::new();
-    let mut recovery_effects = Vec::new();
-    let mut recovery_slots = Vec::new();
-    let mut planned_transactions = HashMap::<
-        crate::db::manifest::TableIdentity,
-        crate::table_store::StagedTransactionIdentity,
-    >::new();
-    for entry in snapshot.datasets() {
-        let planned = pre_minted_schema_transaction(entry.published_dataset_version);
-        recovery_pins.push(crate::db::manifest::SidecarTablePin {
-            table_fork_owner: None,
-            identity: entry.identity,
-            table_key: entry.type_key.clone(),
-            table_path: db.storage().dataset_uri(&entry.dataset_path),
-            expected_version: entry.published_dataset_version,
-            post_commit_pin: entry.published_dataset_version + 1,
-            confirmed_version: None,
-            table_branch: entry.native_dataset_branch.clone(),
-        });
-        planned_transactions.insert(entry.identity, planned.clone());
-        recovery_effects.push(crate::db::manifest::RecoverySchemaApplyEffect {
-            identity: entry.identity,
-            table_key: entry.type_key.clone(),
-            kind: crate::db::manifest::RecoverySchemaApplyEffectKind::SystemColumnRename {
-                planned_transaction: planned,
-                confirmed_transaction: None,
-            },
-        });
-        recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
-            identity: entry.identity,
-            table_key: entry.type_key.clone(),
-            expected_version: entry.published_dataset_version,
-            table_branch: entry.native_dataset_branch.clone(),
-            confirmed: None,
-        });
-    }
 
     let queue_keys: Vec<(String, Option<String>)> = snapshot
         .datasets()
@@ -412,6 +353,8 @@ async fn execute_with_lock(
         ));
     }
 
+    // Graph-global writer: promote every pending pin before planning, refuse
+    // a blocked one, and prove each rename applies before any effect.
     let mut existing_heads = HashMap::<String, SnapshotHandle>::new();
     for entry in snapshot.datasets() {
         let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
@@ -439,75 +382,20 @@ async fn execute_with_lock(
         existing_heads.insert(entry.type_key.clone(), head);
     }
 
-    let target_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&desired_ir)
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-    let recovery_authority = crate::db::manifest::RecoveryAuthorityToken {
-        branch_identifier: base_branch_identifier.clone(),
-        graph_head: base_graph_head.clone(),
-        schema_identity_domain: accepted_ir.schema_identity_domain.as_str().to_string(),
-        schema_ir_hash: accepted_schema_state.schema_ir_hash.clone(),
-        schema_identity_version: accepted_schema_state.schema_identity_version,
-    };
-    let recovery_lineage = crate::db::manifest::RecoveryLineageIntent {
+    // The staged contract is bound to this upgrade's graph commit (RFC 0067):
+    // recovery installs it once that commit is in lineage and discards it
+    // otherwise.
+    let publication = crate::db::schema_state::SchemaPublication {
         graph_commit_id: lineage_intent.graph_commit_id.clone(),
-        branch: lineage_intent.branch.clone(),
-        actor_id: lineage_intent.actor_id.clone(),
-        merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
-        created_at: lineage_intent.created_at,
+        parent_commit_id: base_graph_head.clone(),
     };
-    let mut sidecar = crate::db::manifest::new_system_column_upgrade_sidecar_v9(
-        actor.map(str::to_string),
-        recovery_pins,
-        recovery_authority,
-        recovery_lineage,
-        recovery_effects,
-        crate::db::manifest::RecoveryManifestDelta {
-            table_updates: recovery_slots,
-            registrations: Vec::new(),
-            renames: Vec::new(),
-            tombstones: Vec::new(),
-        },
-        target_schema_ir_hash.clone(),
-        crate::db::manifest::RecoverySystemColumnUpgrade {
-            from_stamp,
-            to_stamp,
-            manifest_version_after_stamp: None,
-        },
-    )?;
-    let recovery_handle =
-        crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?;
-    let recovery_operation_id = recovery_handle.operation_id.clone();
 
-    let post_arm_result = async {
-        fail(&catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
-        let manifest_version_after_stamp =
-            crate::db::manifest::publish_stamp_advance(db.root_uri(), from_stamp, to_stamp)
-                .await?;
-        sidecar
-            .protocol_v7
-            .as_mut()
-            .expect("new system-column upgrade sidecar is v7")
-            .system_column_upgrade
-            .as_mut()
-            .expect("new system-column upgrade sidecar carries its intent")
-            .manifest_version_after_stamp = Some(manifest_version_after_stamp);
-        db.refresh_coordinator_only().await?;
-        fail(&SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE)?;
-
-        fail(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
-        db.storage
-            .write_text(&schema_source_staging_uri(&db.root_uri), &desired_source)
-            .await?;
-        write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir, None).await?;
-        crate::db::schema_state::validate_exact_schema_staging_target(
-            db.root_uri(),
-            db.storage_adapter(),
-            &target_schema_ir_hash,
-        )
-        .await?;
-
-        let mut committed_transactions = HashMap::new();
-        let mut confirmed_updates = Vec::new();
+    let mut published_commit: Option<String> = None;
+    let effects = async {
+        fail(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
+        let mut promotions = Vec::<crate::db::HeldPromotion>::new();
+        let mut manifest_changes = Vec::new();
+        let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
         for entry in snapshot.datasets() {
             let head = existing_heads.remove(&entry.type_key).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -516,64 +404,77 @@ async fn execute_with_lock(
                 ))
             })?;
             let renames = system_column_renames(&entry.type_key);
-            let mut staged = db.storage().stage_rename_columns(&head, &renames).await?;
-            let planned = planned_transactions.get(&entry.identity).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "missing planned system-column rename transaction for '{}'",
-                    entry.type_key
-                ))
-            })?;
-            staged.bind_transaction_identity(planned)?;
-            let outcome = db.storage().commit_staged_exact(head, staged).await?;
-            if !outcome.is_exact() {
-                return Err(OmniError::manifest_internal(format!(
-                    "system-column rename of '{}' committed outside its exact transaction/version plan",
-                    entry.type_key
-                )));
-            }
-            committed_transactions.insert(entry.identity, outcome.committed_transaction().clone());
-            let renamed = outcome.into_snapshot();
+            let staged = db.storage().stage_rename_columns(&head, &renames).await?;
+            // The rename lands as a detached version behind a pin one past
+            // the published version; promotion replays it onto the linear
+            // HEAD after the manifest publishes. Lance refuses a `Project`
+            // replayed over its own twin, so racing promoters leave nothing.
             let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
-            let state = db.storage().table_state(&dataset_uri, &renamed).await?;
-            confirmed_updates.push(crate::db::DatasetUpdate {
-                identity: entry.identity,
-                type_key: entry.type_key.clone(),
-                published_dataset_version: state.version,
-                native_dataset_branch: entry.native_dataset_branch.clone(),
-                entity_count: state.row_count,
-                version_metadata: state.version_metadata,
+            let base = head.clone();
+            let (detached, transaction) =
+                db.storage().commit_staged_detached(head, staged).await?;
+            let state = db.storage().table_state(&dataset_uri, &detached).await?;
+            let published_dataset_version = entry.published_dataset_version + 1;
+            let version_metadata = state
+                .version_metadata
+                .with_staged(state.version, transaction.uuid.clone());
+            promotions.push(crate::db::HeldPromotion {
+                table_key: entry.type_key.clone(),
+                dataset_path: entry.dataset_path.clone(),
+                full_path: dataset_uri,
+                table_branch: entry.native_dataset_branch.clone(),
+                base,
+                chain: Vec::new(),
+                detached,
+                target: published_dataset_version,
+                uuid: transaction.uuid,
+                e_tag: version_metadata.e_tag().map(str::to_string),
             });
-            fail(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
-        }
-
-        crate::db::manifest::confirm_schema_apply_sidecar_v9(
-            db.root_uri(),
-            db.storage_adapter(),
-            &mut sidecar,
-            &confirmed_updates,
-            &committed_transactions,
-        )
-        .await?;
-        fail(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
-
-        let mut manifest_changes = Vec::with_capacity(confirmed_updates.len());
-        let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
-        for update in &confirmed_updates {
-            let planned = planned_transactions
-                .get(&update.identity)
-                .expect("every renamed table was planned");
             expected_versions.insert(
-                update.identity,
+                entry.identity,
                 crate::db::manifest::TableVersionExpectation {
-                    table_key: update.type_key.clone(),
-                    table_version: planned.read_version,
+                    table_key: entry.type_key.clone(),
+                    table_version: entry.published_dataset_version,
                     native_ref: crate::db::manifest::NativeRefPin::Exact(
-                        update.native_dataset_branch.clone(),
+                        entry.native_dataset_branch.clone(),
                     ),
                 },
             );
-            manifest_changes.push(ManifestChange::Update(update.clone()));
+            manifest_changes.push(ManifestChange::Update(crate::db::DatasetUpdate {
+                identity: entry.identity,
+                type_key: entry.type_key.clone(),
+                published_dataset_version,
+                native_dataset_branch: entry.native_dataset_branch.clone(),
+                entity_count: state.row_count,
+                version_metadata,
+            }));
+            fail(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
+
+        // The state file is written last, so a complete staging is exactly
+        // one whose state file exists; recovery reads the marker from it.
+        fail(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
+        let (_, ir_json, state_json) = crate::db::schema_state::render_schema_contract(
+            &desired_ir,
+            Some(publication.clone()),
+        )?;
+        db.storage
+            .write_text(&schema_source_staging_uri(&db.root_uri), &desired_source)
+            .await?;
+        db.storage
+            .write_text(
+                &crate::db::schema_state::schema_ir_staging_uri(&db.root_uri),
+                &ir_json,
+            )
+            .await?;
+        db.storage
+            .write_text(
+                &crate::db::schema_state::schema_state_staging_uri(&db.root_uri),
+                &state_json,
+            )
+            .await?;
+        fail(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
+
         let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
             crate::db::manifest::GraphHeadExpectation::new(
                 None,
@@ -595,38 +496,57 @@ async fn execute_with_lock(
                 &precondition,
             )
             .await?;
+        published_commit = Some(publication.graph_commit_id.clone());
+
         fail(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
-        crate::db::schema_state::promote_exact_schema_staging(
-            db.root_uri(),
-            db.storage_adapter(),
-            &target_schema_ir_hash,
+        // Install the contract from memory rather than by renaming the
+        // staging (another process's open may have discarded it), then retire
+        // the staging. Every write is idempotent; a crash here leaves the
+        // staged copy for the next open to install the same way.
+        db.storage
+            .write_text(&schema_source_uri(&db.root_uri), &desired_source)
+            .await?;
+        crate::db::schema_state::write_schema_contract(
+            &db.root_uri,
+            db.storage.as_ref(),
+            &crate::db::schema_state::SchemaContractText {
+                source: desired_source.clone(),
+                ir_json,
+                state_json,
+            },
         )
         .await?;
+        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref())
+            .await?;
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;
         db.coordinator.write().await.refresh().await?;
         db.runtime_cache.invalidate_all().await;
         db.invalidate_graph_index().await;
+        match fail(&catalog::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION) {
+            Ok(()) => db.promote_held_all(promotions).await,
+            Err(error) => {
+                tracing::warn!(error = %error, "system-column upgrade promotion interrupted; the next writer promotes")
+            }
+        }
         Ok::<u64, OmniError>(graph_manifest_version)
     }
     .await;
 
-    match post_arm_result {
-        Ok(version) => Ok((version, recovery_handle)),
-        Err(error) => Err(OmniError::recovery_required(
-            recovery_operation_id,
-            error.to_string(),
-        )),
-    }
-}
-
-/// Pre-mint the exact rename transaction identity the v9 sidecar records
-/// before the table effect commits.
-fn pre_minted_schema_transaction(
-    read_version: u64,
-) -> crate::table_store::StagedTransactionIdentity {
-    crate::table_store::StagedTransactionIdentity {
-        read_version,
-        uuid: format!("omnigraph-schema-{}", crate::dst_ids::new_ulid()),
+    match effects {
+        Ok(version) => Ok(version),
+        // Before publication nothing referenced is durable: the detached
+        // renames and the staged contract are garbage the next open and
+        // cleanup retire. After it the manifest is authoritative and only the
+        // contract installation is pending, which the next read-write open or
+        // this handle's write-entry heal completes from the staged copy.
+        Err(error) => Err(match published_commit {
+            Some(graph_commit_id) => {
+                db.pending_schema_install
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                OmniError::recovery_required(graph_commit_id, error.to_string())
+            }
+            None => error,
+        }),
     }
 }

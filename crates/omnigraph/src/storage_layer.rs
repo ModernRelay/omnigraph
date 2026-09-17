@@ -355,10 +355,6 @@ impl ExactCommitOutcome {
             && self.snapshot.version() == self.planned_transaction.read_version + 1
     }
 
-    pub fn committed_transaction(&self) -> &StagedTransactionIdentity {
-        &self.committed_transaction
-    }
-
     pub fn into_snapshot(self) -> SnapshotHandle {
         self.snapshot
     }

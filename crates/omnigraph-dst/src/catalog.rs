@@ -73,7 +73,7 @@ pub const CRASH_WINDOWS: [&str; 73] = [
     "schema_apply.after_manifest_commit",
     "schema_apply.after_staging_write",
     "schema_apply.before_staging_write",
-    "schema_apply.post_sidecar_pre_effect",
+    "schema_apply.post_lock_pre_effect",
     "schema_apply.post_publish_pre_promotion",
     "schema_apply.post_table_commit",
     "schema_reload.before_contract_read",

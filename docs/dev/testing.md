@@ -45,7 +45,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
-| System-column upgrade (RFC 0040 step 3: respelling in place on a served graph, no stamp change since v10) | `system_column_upgrade.rs` — check and execute, preflight refusals, every crash point rolled forward on reopen; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
+| System-column upgrade (RFC 0040 step 3: respelling in place on a served graph, no stamp change since v10) | `system_column_upgrade.rs` — check and execute, preflight refusals, every window before the manifest commit leaving no residue, a post-commit failure finished by the next read-write open or the same handle's next write, pending pins after a skipped promotion, the control-object cost; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
 | Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and `benchmark_scenario_contract.rs` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.

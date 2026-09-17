@@ -4837,11 +4837,11 @@ async fn rfc_0067_replaying_a_detached_transaction_promotes_an_identical_twin() 
 
 /// RFC 0067 §Promotion: two promoters racing on one pin both replay the same
 /// transaction at the same base, and the second is refused only when Lance's
-/// conflict rules see the twin. A keyed upsert, a delete, an index creation
-/// and a rewrite conflict with their twins; a bare append, a fragment
-/// reservation and a delete-only config update do not, and rebase onto the
-/// twin as a stray commit one past it. The RFC therefore stages only the
-/// first group as detached commits of their own.
+/// conflict rules see the twin. A keyed upsert, a delete, an index creation,
+/// a rewrite and a rename-only projection conflict with their twins; a bare
+/// append, a fragment reservation and a delete-only config update do not,
+/// and rebase onto the twin as a stray commit one past it. The RFC therefore
+/// stages only the first group as detached commits of their own.
 #[tokio::test]
 async fn rfc_0067_replay_over_its_own_twin_is_refused_only_for_self_conflicting_kinds() {
     use lance::dataset::optimize::plan_compaction;
@@ -5148,4 +5148,38 @@ async fn rfc_0067_replay_over_its_own_twin_is_refused_only_for_self_conflicting_
         "the Overwrite twin adds no version"
     );
     assert_eq!(rfc0067_ids(&head).await, vec!["o1"]);
+    let head = rfc0067_head(uri).await;
+    // Rename-only Project: refused (the RFC 0040 system-column upgrade's
+    // per-table effect), so it may stage detached like the others.
+    let mut renamed = head.schema().clone();
+    renamed
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "value")
+        .unwrap()
+        .name = "renamed_value".to_string();
+    let project = Transaction::new(
+        head.version().version,
+        Operation::Project {
+            schema: renamed,
+            preserves_nullability: true,
+        },
+        None,
+    );
+    let first = rfc0067_linear(head.clone())
+        .execute(project.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.version().version, head.version().version + 1);
+    assert!(first.schema().field("renamed_value").is_some());
+    let second = rfc0067_linear(head.clone()).execute(project).await;
+    assert!(
+        matches!(second, Err(lance::Error::RetryableCommitConflict { .. })),
+        "a rename-only Project replay over its twin must be refused: {second:?}"
+    );
+    assert_eq!(
+        rfc0067_head(uri).await.version().version,
+        first.version().version,
+        "the refused Project twin adds no version"
+    );
 }

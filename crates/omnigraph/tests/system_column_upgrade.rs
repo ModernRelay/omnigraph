@@ -1,13 +1,15 @@
 //! RFC 0040 Rollout step 3: the explicit system-column upgrade of a
-//! legacy-vintage graph, its preflight refusals, and its roll-forward-only
-//! recovery at every effect boundary.
+//! legacy-vintage graph, its preflight refusals, and its crash windows. Since
+//! RFC 0067 the upgrade arms no recovery sidecar: a failure before its one
+//! manifest commit leaves the graph unchanged, and one after it is finished
+//! by the next read-write open or the next write on the same handle.
 #![cfg(feature = "failpoints")]
 
 mod helpers;
 
 use std::fs;
 
-use helpers::recovery::{recovery_audit_kinds, sidecar_operation_ids};
+use helpers::recovery::sidecar_operation_ids;
 use helpers::*;
 use omnigraph::db::{
     Omnigraph, ReadTarget, SnapshotDataset, SnapshotId, SystemColumnUpgradeOptions,
@@ -290,7 +292,6 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     assert!(report.findings.is_empty());
     assert!(report.graph_manifest_version.is_some());
     assert_upgraded(&mut db, &dir, &export_before).await;
-    assert!(recovery_audit_kinds(dir.path()).await.is_empty());
 
     let entity = db
         .entity_at("node:Company", "company-1", version_before)
@@ -524,13 +525,45 @@ async fn system_column_upgrade_refuses_before_any_effect() {
     );
 }
 
-async fn crash_then_roll_forward(seam: &'static DecideSeam) {
+/// Person HEAD and published version on main.
+async fn person_head_and_pin(db: &Omnigraph, dir: &tempfile::TempDir) -> (u64, u64) {
+    let snapshot = snapshot_main(db).await.unwrap();
+    let entry = snapshot.dataset("node:Person").unwrap();
+    let uri = format!(
+        "{}/{}",
+        dir.path().to_str().unwrap().trim_end_matches('/'),
+        entry.dataset_path.trim_start_matches('/')
+    );
+    let head = open_dataset_head_exact(&uri, None).await;
+    (head.version().version, entry.published_dataset_version)
+}
+
+fn assert_no_staging(dir: &tempfile::TempDir) {
+    for staging in [
+        "_schema.pg.staging",
+        "_schema.ir.json.staging",
+        "__schema_state.json.staging",
+    ] {
+        assert!(
+            !dir.path().join(staging).exists(),
+            "{staging} must not outlive the open"
+        );
+    }
+}
+
+/// A failure before the upgrade's one manifest commit leaves the graph
+/// exactly as it was: the plain error, no sidecar, the sentinel released, the
+/// legacy contract still served (a read-only open included), every linear
+/// HEAD at its pin, any staged contract discarded by the next read-write
+/// open, and the retry completes.
+async fn crash_before_publication_leaves_no_residue(seam: &'static DecideSeam) {
     let failpoint = seam.name();
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
+    let (head_before, pin_before) = person_head_and_pin(&db, &dir).await;
 
     let error = {
         let _failpoint = seam.fire_always();
@@ -542,57 +575,98 @@ async fn crash_then_roll_forward(seam: &'static DecideSeam) {
         error.to_string().contains(failpoint),
         "unexpected error at {failpoint}: {error}"
     );
-    let operation_ids = sidecar_operation_ids(dir.path());
-    assert_eq!(
-        operation_ids.len(),
-        1,
-        "exactly one intent survives {failpoint}"
-    );
-    let sidecar: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(
-            dir.path()
-                .join("__recovery")
-                .join(format!("{}.json", operation_ids[0])),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(sidecar["writer_kind"], "SchemaApply");
-    assert_eq!(
-        sidecar["protocol_v7"]["system_column_upgrade"]["from_stamp"],
-        10
-    );
-    assert_eq!(
-        sidecar["protocol_v7"]["system_column_upgrade"]["to_stamp"],
-        10
-    );
     assert!(
-        sidecar["protocol_v7"]["effects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|effect| effect["kind"]["kind"] == "SystemColumnRename"),
-        "{sidecar}"
+        !matches!(error, omnigraph::error::OmniError::RecoveryRequired { .. }),
+        "nothing was published at {failpoint}, so nothing needs recovery: {error}"
+    );
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+    assert!(
+        !schema_apply_lock_present(&dir),
+        "a failed upgrade releases its sentinel"
+    );
+    assert_eq!(
+        person_head_and_pin(&db, &dir).await,
+        (head_before, pin_before),
+        "a detached rename never moves the linear HEAD or the pin"
     );
     drop(db);
 
     let read_only = Omnigraph::open_read_only(uri)
         .await
-        .err()
-        .expect("a read-only open must not serve an unfinished upgrade");
-    assert!(
-        read_only.to_string().contains("system-column upgrade")
-            || read_only.to_string().contains("read-write"),
-        "{read_only}"
+        .expect("an unpublished upgrade is invisible to a read-only open");
+    assert_eq!(
+        read_only.export_jsonl("main", &[]).await.unwrap(),
+        export_before
     );
+    drop(read_only);
+
+    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    assert_no_staging(&dir);
+    assert_eq!(
+        reopened.export_jsonl("main", &[]).await.unwrap(),
+        export_before
+    );
+    let report = reopened
+        .upgrade_system_columns(SystemColumnUpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
+    assert_upgraded(&mut reopened, &dir, &export_before).await;
+}
+
+#[tokio::test]
+async fn system_column_upgrade_pre_effect_failure_leaves_no_residue() {
+    crash_before_publication_leaves_no_residue(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT).await;
+}
+
+#[tokio::test]
+async fn system_column_upgrade_failure_after_the_first_rename_leaves_no_residue() {
+    crash_before_publication_leaves_no_residue(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT).await;
+}
+
+#[tokio::test]
+async fn system_column_upgrade_failure_before_staging_leaves_no_residue() {
+    crash_before_publication_leaves_no_residue(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE).await;
+}
+
+#[tokio::test]
+async fn system_column_upgrade_failure_after_staging_leaves_no_residue() {
+    crash_before_publication_leaves_no_residue(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE).await;
+}
+
+/// A failure after the manifest commit reports the published commit. The
+/// manifest already names the renamed tables, so a read-only open refuses
+/// the uninstalled contract and the next read-write open installs it.
+#[tokio::test]
+async fn system_column_upgrade_post_commit_failure_is_finished_by_the_next_open() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = legacy_graph_with_data(&dir).await;
+    let export_before = db.export_jsonl("main", &[]).await.unwrap();
+    let error = {
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
+        db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
+            .await
+            .expect_err("the failpoint must stop the upgrade after its commit")
+    };
+    assert!(
+        matches!(error, omnigraph::error::OmniError::RecoveryRequired { .. }),
+        "a published upgrade whose contract is not installed names its commit: {error}"
+    );
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+    drop(db);
+
+    let read_only = Omnigraph::open_read_only(uri)
+        .await
+        .err()
+        .expect("a read-only open must not serve a published upgrade under the old contract");
+    assert!(read_only.to_string().contains("read-write"), "{read_only}");
 
     let mut recovered = Omnigraph::open(uri)
         .await
-        .expect("the read-write open rolls the upgrade forward");
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"]
-    );
+        .expect("the read-write open installs the published contract");
+    assert_no_staging(&dir);
     assert_upgraded(&mut recovered, &dir, &export_before).await;
     let again = recovered
         .upgrade_system_columns(SystemColumnUpgradeOptions::default())
@@ -601,17 +675,19 @@ async fn crash_then_roll_forward(seam: &'static DecideSeam) {
     assert_eq!(again.outcome, SystemColumnUpgradeOutcome::AlreadyCurrent);
 }
 
+/// The same handle finishes its own published upgrade at its next write
+/// entry, without a reopen.
 #[tokio::test]
-async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
+async fn system_column_upgrade_post_commit_failure_heals_on_the_same_handle() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let mut db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
-        let _failpoint = catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT.fire_always();
+        let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
         db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
             .await
-            .expect_err("the failpoint must stop the upgrade after arming");
+            .expect_err("the failpoint must stop the upgrade after its commit");
     }
     let retried = tokio::time::timeout(
         std::time::Duration::from_secs(60),
@@ -621,54 +697,114 @@ async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
     .expect("the same-handle retry must not deadlock on the schema gate")
     .unwrap();
     assert_eq!(retried.outcome, SystemColumnUpgradeOutcome::AlreadyCurrent);
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"]
-    );
+    assert_no_staging(&dir);
     assert_upgraded(&mut db, &dir, &export_before).await;
 }
 
+/// With the promotion skipped the renamed tables stay pending pins: reads
+/// serve them through the staged versions, the next writer of a table
+/// promotes it, and cleanup promotes the rest.
 #[tokio::test]
-async fn system_column_upgrade_survives_an_interrupted_recovery() {
+async fn system_column_upgrade_skipped_promotion_leaves_pins_the_next_writer_promotes() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = legacy_graph_with_data(&dir).await;
+    let export_before = db.export_jsonl("main", &[]).await.unwrap();
+    {
+        let _failpoint = catalog::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        let report = db
+            .upgrade_system_columns(SystemColumnUpgradeOptions::default())
+            .await
+            .expect("the publication and the contract are durable");
+        assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
+    }
+    let (head, pin) = person_head_and_pin(&db, &dir).await;
+    assert!(
+        head < pin,
+        "the Person pin is pending: head {head}, pin {pin}"
+    );
+    assert_upgraded(&mut db, &dir, &export_before).await;
+    let (head, pin) = person_head_and_pin(&db, &dir).await;
+    assert_eq!(head, pin, "the load in the oracle promoted Person");
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(10),
+        older_than: None,
+    })
+    .await
+    .expect("cleanup promotes every remaining pin");
+}
+
+/// RFC 0067: the upgrade arms no recovery sidecar. Its only control-object
+/// writes are the three staged contract files and the three live ones, and
+/// its only deletes retire the staging.
+#[tokio::test]
+async fn system_column_upgrade_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    // Failpoints are process-global: take the scenario so a sibling test's
+    // armed seam cannot fire inside this run.
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = legacy_graph_with_data(&dir).await;
-    let export_before = db.export_jsonl("main", &[]).await.unwrap();
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
-        db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
-            .await
-            .expect_err("the failpoint must stop the upgrade after the first rename");
-    }
-    drop(db);
-    {
-        let _failpoint = catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH.fire_always();
-        Omnigraph::open(uri)
-            .await
-            .err()
-            .expect("the first recovery stops after confirming the intent, before publishing");
-    }
-    assert_eq!(sidecar_operation_ids(dir.path()).len(), 1);
-    let mut recovered = Omnigraph::open(uri)
+    drop(legacy_graph_with_data(&dir).await);
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = Omnigraph::open_with_storage(uri, adapter).await.unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    let report = db
+        .upgrade_system_columns(SystemColumnUpgradeOptions::default())
         .await
-        .expect("the second read-write open publishes the confirmed intent");
+        .unwrap();
+    assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
     assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"]
+        counts.write_text() - before_write_text,
+        6,
+        "the upgrade writes the staged and live contract files and no sidecar"
     );
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
+    assert_eq!(
+        counts.delete() - before_delete,
+        3,
+        "the upgrade deletes only its three staging files"
+    );
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
 }
 
 #[tokio::test]
-async fn system_column_upgrade_recovery_reclaims_a_dead_writers_lock() {
+async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = legacy_graph_with_data(&dir).await;
+    let export_before = db.export_jsonl("main", &[]).await.unwrap();
+    {
+        let _failpoint = catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT.fire_always();
+        db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
+            .await
+            .expect_err("the failpoint must stop the upgrade before its first effect");
+    }
+    let retried = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        db.upgrade_system_columns(SystemColumnUpgradeOptions::default()),
+    )
+    .await
+    .expect("the same-handle retry must not deadlock on the schema gate")
+    .unwrap();
+    assert_eq!(retried.outcome, SystemColumnUpgradeOutcome::Completed);
+    assert_upgraded(&mut db, &dir, &export_before).await;
+}
+
+/// A writer that dies holding the sentinel leaves it behind with nothing
+/// published; the next read-write open reclaims it and the upgrade runs.
+#[tokio::test]
+async fn system_column_upgrade_open_reclaims_a_dead_writers_lock() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     let crashed = {
-        let _failpoint = catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT.panic_at();
+        let _failpoint = catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT.panic_at();
         tokio::spawn(async move {
             db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
                 .await
@@ -678,100 +814,39 @@ async fn system_column_upgrade_recovery_reclaims_a_dead_writers_lock() {
     };
     assert!(
         crashed
-            .expect_err("the writer dies after arming, releasing nothing")
+            .expect_err("the writer dies under its sentinel, releasing nothing")
             .is_panic()
     );
     assert!(
         schema_apply_lock_present(&dir),
         "a dead writer leaves its lock behind"
     );
-    assert_eq!(sidecar_operation_ids(dir.path()).len(), 1);
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
 
     let mut recovered = Omnigraph::open(uri)
         .await
-        .expect("the read-write open rolls the upgrade forward");
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"]
-    );
+        .expect("the read-write open reclaims the stale sentinel");
     assert!(
         !schema_apply_lock_present(&dir),
-        "recovery reclaims the dead writer's lock"
+        "the open reclaims the dead writer's lock"
     );
+    assert_eq!(
+        recovered.export_jsonl("main", &[]).await.unwrap(),
+        export_before,
+        "nothing was published, so the graph is still the legacy one"
+    );
+    let report = recovered
+        .upgrade_system_columns(SystemColumnUpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
     assert_upgraded(&mut recovered, &dir, &export_before).await;
     recovered
         .apply_schema(UPGRADED_SCHEMA_WITH_ID_PROPERTY)
         .await
-        .expect("schema apply is live again after recovery");
+        .expect("schema apply is live again");
     recovered
         .branch_create("after-upgrade")
         .await
-        .expect("branch control is live again after recovery");
-}
-
-#[tokio::test]
-async fn system_column_upgrade_recovery_survives_a_crash_after_the_lock_reclaim() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = legacy_graph_with_data(&dir).await;
-    let export_before = db.export_jsonl("main", &[]).await.unwrap();
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
-        db.upgrade_system_columns(SystemColumnUpgradeOptions::default())
-            .await
-            .expect_err("the failpoint must stop the upgrade after the first rename");
-    }
-    drop(db);
-    {
-        let _failpoint = catalog::SYSTEM_COLUMN_UPGRADE_AFTER_LOCK_RECLAIM.fire_always();
-        Omnigraph::open(uri).await.err().expect(
-            "the first recovery stops after reclaiming the lock, before retiring the intent",
-        );
-    }
-    assert_eq!(
-        sidecar_operation_ids(dir.path()).len(),
-        1,
-        "the intent outlives the lock"
-    );
-    assert!(!schema_apply_lock_present(&dir));
-    let mut recovered = Omnigraph::open(uri)
-        .await
-        .expect("the second read-write open retires the intent");
-    assert!(sidecar_operation_ids(dir.path()).is_empty());
-    assert_eq!(
-        recovery_audit_kinds(dir.path()).await,
-        vec!["RolledForward"]
-    );
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
-}
-
-#[tokio::test]
-async fn system_column_upgrade_rolls_forward_before_the_stamp_advance() {
-    crash_then_roll_forward(&catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT).await;
-}
-
-#[tokio::test]
-async fn system_column_upgrade_rolls_forward_after_the_stamp_advance() {
-    crash_then_roll_forward(&catalog::SYSTEM_COLUMN_UPGRADE_AFTER_STAMP_ADVANCE).await;
-}
-
-#[tokio::test]
-async fn system_column_upgrade_rolls_forward_after_the_first_rename() {
-    crash_then_roll_forward(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT).await;
-}
-
-#[tokio::test]
-async fn system_column_upgrade_rolls_forward_after_the_stamp_before_staging() {
-    crash_then_roll_forward(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE).await;
-}
-
-#[tokio::test]
-async fn system_column_upgrade_rolls_forward_after_confirmation() {
-    crash_then_roll_forward(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE).await;
-}
-
-#[tokio::test]
-async fn system_column_upgrade_rolls_forward_after_the_manifest_commit() {
-    crash_then_roll_forward(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT).await;
+        .expect("branch control is live again");
 }

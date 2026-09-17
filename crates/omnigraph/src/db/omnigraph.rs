@@ -68,7 +68,6 @@ use super::schema_state::{
     read_schema_state_identity, recover_schema_state_files, render_schema_contract, schema_ir_uri,
     schema_source_staging_uri, schema_source_uri, schema_state_uri, validate_schema_contract,
     validate_schema_contract_text, validate_schema_ir_against_snapshot, write_schema_contract,
-    write_schema_contract_staging,
 };
 use super::{
     ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
