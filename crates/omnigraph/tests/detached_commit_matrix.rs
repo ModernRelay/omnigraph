@@ -28,7 +28,11 @@ use helpers::{
     MUTATION_QUERIES, Session, collect_column_strings, count_rows, init_and_load, mixed_params,
     mutate_main, read_table,
 };
-use omnigraph::db::{CleanupPolicyOptions, Omnigraph, ReadTarget};
+use omnigraph::db::{
+    CleanupPolicyOptions, Omnigraph, ReadTarget, SystemColumnUpgradeOptions,
+    SystemColumnUpgradeOutcome,
+};
+use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
 use serial_test::serial;
@@ -60,6 +64,18 @@ enum Writer {
     /// compaction rewrite, no row change, published with an exact CAS on the
     /// pin it was planned from.
     Optimize,
+    /// A two-row JSONL append through the loader's staging (the loader
+    /// crosses the same mutation seams; its fork/first-touch route is owned
+    /// by the DST load family).
+    Load,
+    /// An explicit full-text rebuild over a Person `String @index` property:
+    /// replaces the segments from rows through the index-maintenance
+    /// machinery, so it parks on the ensure-indices seams.
+    FtsRebuild,
+    /// The system-column upgrade (RFC 0040) on a graph born with the legacy
+    /// spellings: one rename-only detached Project per table, staged and
+    /// published through the schema-apply seams.
+    SystemColumnUpgrade,
 }
 
 fn city_schema() -> String {
@@ -120,6 +136,17 @@ impl Writer {
             Writer::Merge => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
             Writer::SchemaApply => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
             Writer::Optimize => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
+            Writer::Load => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
+            Writer::FtsRebuild => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
+            // The upgrade stages one detached commit per table; park after
+            // the first and the second to leave a half-staged tail.
+            Writer::SystemColumnUpgrade => vec![
+                PostDetached(1),
+                PostDetached(2),
+                PrePublish,
+                PostPublish,
+                InPromotion,
+            ],
         }
     }
 
@@ -132,6 +159,9 @@ impl Writer {
             Writer::Merge => "merge",
             Writer::SchemaApply => "schema_apply",
             Writer::Optimize => "optimize",
+            Writer::Load => "load",
+            Writer::FtsRebuild => "fts_rebuild",
+            Writer::SystemColumnUpgrade => "system_column_upgrade",
         }
     }
 
@@ -150,9 +180,9 @@ impl Writer {
 impl Window {
     /// The seam and the crossing to park on or return at.
     fn seam(self, writer: Writer) -> (&'static str, u64) {
-        let index = writer == Writer::EnsureIndices;
+        let index = matches!(writer, Writer::EnsureIndices | Writer::FtsRebuild);
         let merge = writer == Writer::Merge;
-        let schema = writer == Writer::SchemaApply;
+        let schema = matches!(writer, Writer::SchemaApply | Writer::SystemColumnUpgrade);
         let optimize = writer == Writer::Optimize;
         match self {
             Window::PostDetached(n) if optimize => {
@@ -272,6 +302,19 @@ async fn insert_and_friend(db: &Session, name: &str) -> omnigraph::error::Result
     .map(|_| ())
 }
 
+/// The Load writer's op: two fresh rows through the loader's staging.
+async fn load_two(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    let payload = format!(
+        "{{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_a\", \"age\": 30}}}}\n\
+         {{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_b\", \"age\": 31}}}}"
+    );
+    db.load_jsonl(&payload, LoadMode::Append).await.map(|_| ())
+}
+
+fn upgrade_execute() -> SystemColumnUpgradeOptions {
+    SystemColumnUpgradeOptions { check: false }
+}
+
 fn reclaim_everything() -> CleanupPolicyOptions {
     CleanupPolicyOptions {
         keep_versions: Some(1),
@@ -335,6 +378,12 @@ fn rfc0067_matrix_child_process() {
                 "insert_and_friend" => insert_and_friend(&db, &name).await,
                 "schema_apply" => db.apply_schema(&city_schema()).await.map(|_| ()),
                 "optimize" => db.optimize().await.map(|_| ()),
+                "load" => load_two(&db, &name).await,
+                "fts_rebuild" => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
+                "system_column_upgrade" => db
+                    .upgrade_system_columns(upgrade_execute())
+                    .await
+                    .map(|_| ()),
                 _ => insert(&db, &name).await,
             };
             if let Err(error) = outcome {
@@ -385,7 +434,21 @@ async fn run_cell(
     let cell = format!("cell {index}: {writer:?} {window:?} {fault:?} {recovery:?}");
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
-    let db = init_and_load(&dir).await;
+    // The upgrade writer needs a graph born with the legacy system-column
+    // spellings; every other writer starts from the standard fixture.
+    let db = if writer == Writer::SystemColumnUpgrade {
+        let db = helpers::session(
+            Omnigraph::init_with_legacy_system_columns_for_tests(&root, helpers::TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
+        db.load_jsonl(helpers::TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db
+    } else {
+        init_and_load(&dir).await
+    };
     let person_uri = table_uri(&db, "node:Person").await;
     let knows_uri = table_uri(&db, "edge:Knows").await;
     let write_name = format!("m{index}_w");
@@ -423,6 +486,25 @@ async fn run_cell(
             insert(&db, &format!("m{index}_seed{seed}")).await.unwrap();
         }
     }
+    // A full-text rebuild cell needs a built full-text index with rows
+    // behind it: a `String @index` Person property, one row carrying text,
+    // and the initial build.
+    if writer == Writer::FtsRebuild {
+        db.apply_schema(
+            &helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String? @index"),
+        )
+        .await
+        .unwrap();
+        db.load_jsonl(
+            &format!(
+                "{{\"type\": \"Person\", \"data\": {{\"name\": \"m{index}_fts\", \"city\": \"machine learning\"}}}}"
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+        db.ensure_indices().await.unwrap();
+    }
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
 
@@ -444,6 +526,12 @@ async fn run_cell(
                     .map(|_| ()),
                 Writer::SchemaApply => db.apply_schema(&city_schema()).await.map(|_| ()),
                 Writer::Optimize => db.optimize().await.map(|_| ()),
+                Writer::Load => load_two(&db, &write_name).await,
+                Writer::FtsRebuild => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
+                Writer::SystemColumnUpgrade => db
+                    .upgrade_system_columns(upgrade_execute())
+                    .await
+                    .map(|_| ()),
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
@@ -473,9 +561,10 @@ async fn run_cell(
             }
             if fault == Fault::Race {
                 let race_name = format!("m{index}_race");
-                if writer == Writer::SchemaApply {
+                if matches!(writer, Writer::SchemaApply | Writer::SystemColumnUpgrade) {
                     // The apply's durable sentinel refuses every concurrent
-                    // writer of the graph while it is in flight.
+                    // writer of the graph while it is in flight (the upgrade
+                    // runs through the same sentinel).
                     let refused = insert(&db, &race_name).await.unwrap_err();
                     assert!(
                         refused.to_string().contains("schema apply"),
@@ -507,6 +596,10 @@ async fn run_cell(
         Writer::MultiTable if visible => {
             model.names.insert(write_name.clone());
             model.knows += 1;
+        }
+        Writer::Load if visible => {
+            model.names.insert(format!("{write_name}_a"));
+            model.names.insert(format!("{write_name}_b"));
         }
         _ => {}
     }
@@ -652,6 +745,67 @@ async fn run_cell(
             .unwrap_or_else(|error| panic!("{cell}: second index pass failed: {error}"));
         drop(fresh);
     }
+    if writer == Writer::FtsRebuild && recovery != Recovery::ReadOnly {
+        // Whatever the window left, an explicit rebuild converges and
+        // leaves every pin promoted; a second rebuild is equally fine.
+        let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+        for run in 1..=2 {
+            fresh
+                .rebuild_full_text_indices_on("main")
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{cell}: full-text rebuild run {run} after recovery failed: {error}")
+                });
+            assert_eq!(
+                linear_head(&person_uri).await,
+                table_pin(&fresh, "node:Person").await,
+                "{cell}: rebuild run {run} leaves Person promoted"
+            );
+        }
+        drop(fresh);
+    }
+    if writer == Writer::SystemColumnUpgrade {
+        // The check preflight names the graph's vintage: AlreadyCurrent
+        // exactly when the upgrade's publication became visible.
+        let check = fresh
+            .upgrade_system_columns(SystemColumnUpgradeOptions { check: true })
+            .await
+            .unwrap_or_else(|error| panic!("{cell}: upgrade check failed: {error}"));
+        assert_eq!(
+            check.outcome == SystemColumnUpgradeOutcome::AlreadyCurrent,
+            visible,
+            "{cell}: check outcome {:?} vs visible={visible}",
+            check.outcome
+        );
+        if recovery != Recovery::ReadOnly {
+            // Whatever the window left, a fresh execute converges to the
+            // current vintage and a second check finds nothing to do.
+            let converge = helpers::session(Omnigraph::open(&root).await.unwrap());
+            let executed = converge
+                .upgrade_system_columns(upgrade_execute())
+                .await
+                .unwrap_or_else(|error| panic!("{cell}: upgrade after recovery failed: {error}"));
+            assert!(
+                matches!(
+                    executed.outcome,
+                    SystemColumnUpgradeOutcome::Completed
+                        | SystemColumnUpgradeOutcome::AlreadyCurrent
+                ),
+                "{cell}: converging upgrade outcome {:?}",
+                executed.outcome
+            );
+            let again = converge
+                .upgrade_system_columns(SystemColumnUpgradeOptions { check: true })
+                .await
+                .unwrap_or_else(|error| panic!("{cell}: post-converge check failed: {error}"));
+            assert_eq!(
+                again.outcome,
+                SystemColumnUpgradeOutcome::AlreadyCurrent,
+                "{cell}: the converged graph must be current"
+            );
+            drop(converge);
+        }
+    }
     format!(
         "{cell}: ack={acknowledged} visible={visible} person pin {person_pin} head {person_head}, knows pin {knows_pin} head {knows_head} {note}"
     )
@@ -698,6 +852,9 @@ async fn run_matrix() {
         Writer::Merge,
         Writer::SchemaApply,
         Writer::Optimize,
+        Writer::Load,
+        Writer::FtsRebuild,
+        Writer::SystemColumnUpgrade,
     ];
     let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {

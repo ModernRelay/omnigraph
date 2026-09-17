@@ -163,7 +163,9 @@ fn dst_hunt_crash_window_sweep() {
                     // Wide only where its ops are the ONLY route (load.*) —
                     // the wide die dilutes branch-verb frequency and measured
                     // as all merge windows going dark in an all-wide pass.
+                    // The schema face is scoped the same way.
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 };
                 let root = format!("shared-memory://dst-hunt-{w}-{seed}-{skip}");
@@ -203,6 +205,7 @@ fn dst_hunt_crash_window_sweep() {
                     crash_on_match: Some((window, skip)),
                     probe_only: true,
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 };
                 let root = format!("shared-memory://dst-probe-{w}-{seed}-{skip}");
@@ -1386,8 +1389,49 @@ fn dst_ack_loss_bite_and_replay() {
 // retry any more (the search enumerated 80 schedules with zero retries).
 // The lost-acknowledgement contract of the manifest CAS itself is owned by
 // the failpoint suite (`GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT` cells per
-// writer); a Lance-realm ack-loss verb is the DST follow-up that would
-// bring the shape back under seeded schedules.
+// writer); the Lance-realm ack-loss verb below brings the shape back under
+// seeded schedules.
+
+/// LANCE-REALM ACK-LOSS: the follow-up the retirement note above names.
+/// Write-class calls of Lance's own table IO — data files, txn files, and
+/// the `__manifest` dataset's commit puts, the graph-publication door
+/// itself — have their acknowledgement lost AFTER the store applied them.
+/// Under RFC 0067 nothing becomes graph-visible before the manifest
+/// commit, a failed attempt is presumed aborted, and a promotion replay is
+/// refused over its own twin, so every schedule must land in a state the
+/// arbitration accepts ("reconcile arbitrates which picture holds"): an
+/// op whose publication landed durably arbitrates Applied, one that died
+/// staging arbitrates NotApplied, and a client retry runs against its own
+/// durable-but-denied commits and must converge. Green oracles here ARE
+/// the presumed-abort verdict under seeded weather. Replay identity is
+/// deliberately not asserted (the lance-realm replay-envelope note above).
+#[test]
+#[serial]
+fn dst_lance_realm_ack_loss_bites_and_oracles_hold() {
+    let sc = Scenario {
+        seed: 89,
+        ops: 30,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: 8900,
+            lance_realm: true,
+            ack_loss_pct: 18,
+            client_retry: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let r = run_universe("shared-memory://dst-lance-ackloss", &sc);
+    println!(
+        "dst lance ack-loss: {} lance acks lost, {} adapter acks lost, {} client retries, {} legal rejections, {} checks",
+        r.lance_acks_lost, r.acks_lost, r.client_retries, r.legal_rejections, r.verified
+    );
+    assert!(
+        r.lance_acks_lost > 0,
+        "lance-realm acknowledgements should actually be lost (lance_acks_lost={})",
+        r.lance_acks_lost
+    );
+    assert!(r.verified > 0);
+}
 
 /// CORRUPTION AXIS (read tier): the store LIES (read-time bit rot,
 /// truncated reads) and grows LATENT SECTOR ERRORS (persistent,
@@ -1495,9 +1539,180 @@ fn dst_corruption_detections_attributed() {
 // The sidecar-weather pin (`dst_sidecar_weather_lost_and_misdirected`)
 // retired with the recovery sidecars (RFC 0067 step 5): the lost-write and
 // misdirected-write verbs act on adapter-realm content writes, which in a
-// standard universe were exactly the `__recovery/` sidecars, so they can no
-// longer bite. The verbs stay in the harness for a workload that writes
-// control objects again (the quarantined schema-apply slot).
+// standard universe were exactly the `__recovery/` sidecars, so they could
+// no longer bite. The `schema_ops` workload writes control objects again
+// (the schema contract files), and `dst_schema_weather_persisted_write_verbs`
+// below is that pin's successor.
+
+/// SCHEMA-OP REQUALIFICATION (the deferred half of the roll-12 quarantine):
+/// the sampler's schema face live under clean storage. Monotone additive
+/// applies interleave the standard mix on seeded schedules; the model
+/// ignores them by construction, so every oracle judges the surrounding
+/// workload across real staged-contract applies (RFC 0067's schema
+/// staging). The face's first seed scan discovered the engine's mono-branch
+/// restriction ("schema apply requires a graph with only main"), now a
+/// model-predicted legal refusal — so branchy schedules validate the typed
+/// refusal while branchless intervals run real applies. Clean IO in both
+/// realms ⇒ strict replay identity is asserted. Seed 7 emits three applies.
+#[test]
+#[serial]
+fn dst_schema_ops_randomized_oracles_hold_and_replay() {
+    let sc = Scenario {
+        seed: 7,
+        ops: 30,
+        schema_ops: true,
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-schema-ops-a", &sc);
+    let b = run_universe("shared-memory://dst-schema-ops-b", &sc);
+    println!(
+        "dst schema ops: {} applies sampled, {} legal rejections, {} checks",
+        a.schema_applies, a.legal_rejections, a.verified
+    );
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &b,
+        "schema-op universes must replay identically",
+    );
+    assert!(
+        a.schema_applies > 0,
+        "the schema face should actually emit (schema_applies={})",
+        a.schema_applies
+    );
+    assert!(a.verified > 0);
+}
+
+/// SCHEMA-APPLY CRASH WINDOWS under the randomized workload: inject a
+/// failure into the staged apply at each publication-shaped window
+/// (detached table commit, staged contract written,
+/// published-but-unpromoted), then let reconcile, recovery reopen, and the
+/// full oracle stack judge the aftermath — the windows the quarantine kept
+/// dark, now with the same bite-and-replay contract as the maintenance
+/// cells above. The post-publish window is ABSORBING by design (RFC 0067:
+/// promotion is advisory after publication — the injected error skips
+/// promotion and leaves a pending pin the next writer promotes), so its
+/// bite evidence is the persistent probe's crossing, not a death.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_schema_apply_crash_windows_bite_and_replay() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let cells: [(&str, u64, usize, bool); 3] = [
+        ("schema_apply.post_table_commit", 7, 30, true),
+        ("schema_apply.after_staging_write", 7, 30, true),
+        ("schema_apply.post_publish_pre_promotion", 7, 30, false),
+    ];
+    for (window, seed, ops, dies) in cells {
+        // Crossing proof first: same seed, record-only callback on the seam
+        // (`probe_only` swaps the injection for observation — same-seam
+        // probe_window + crash_on_match would double-install the seam).
+        let probe = Scenario {
+            seed,
+            ops,
+            schema_ops: true,
+            crash_on_match: Some((window, 0)),
+            probe_only: true,
+            ..Default::default()
+        };
+        let probed = run_universe(
+            &format!("shared-memory://dst-schema-probe-{window}"),
+            &probe,
+        );
+        assert!(
+            probed.crossed,
+            "schema cell {window}: the seam must actually be walked"
+        );
+        let sc = Scenario {
+            seed,
+            ops,
+            schema_ops: true,
+            crash_on_match: Some((window, 0)),
+            ..Default::default()
+        };
+        let first = run_universe(&format!("shared-memory://dst-schema-crash-{window}-a"), &sc);
+        assert_eq!(
+            first.crashes > 0,
+            dies,
+            "schema cell {window}: dying vs absorbing shape (crashes={})",
+            first.crashes
+        );
+        let second = run_universe(&format!("shared-memory://dst-schema-crash-{window}-b"), &sc);
+        omnigraph_dst::harness::assert_strict_replay(&first, &second, "schema cell: strict replay");
+    }
+}
+
+/// PERSISTED-TIER WRITE VERBS, revived (the successor of the retired
+/// sidecar-weather pin above): with the schema face on, the adapter realm's
+/// content writes are the schema contract files, and the write-time
+/// corruption / lost-write / misdirected-write verbs have live subjects
+/// again. These verbs are STORE LIES (success acknowledged, wrong or no
+/// bytes durable), so the contract is the violation tier's
+/// detected-or-harmless: either the damage only ever grazes writes whose
+/// loss the apply absorbs (universe completes, oracles green), or the
+/// engine detects the lie on the schema control plane and refuses LOUDLY,
+/// which fails the universe's own observation reads — a caught, typed,
+/// deterministic death, never silent acceptance. Seed 101 empirically takes
+/// the refusal arm (a misdirected `__schema_state.json` install); both arms
+/// assert pairwise determinism.
+#[test]
+#[serial]
+fn dst_schema_weather_persisted_lies_detected_or_harmless() {
+    let sc = Scenario {
+        seed: 101,
+        ops: 30,
+        schema_ops: true,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: 10100,
+            corrupt_write_pct: 10,
+            lose_write_pct: 8,
+            misdirect_write_pct: 8,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let a =
+        omnigraph_dst::harness::run_universe_caught("shared-memory://dst-schema-weather-a", &sc);
+    let b =
+        omnigraph_dst::harness::run_universe_caught("shared-memory://dst-schema-weather-b", &sc);
+    match (a, b) {
+        (Err(a), Err(b)) => {
+            let ma = omnigraph_dst::harness::panic_message(a.as_ref());
+            let mb = omnigraph_dst::harness::panic_message(b.as_ref());
+            for message in [&ma, &mb] {
+                assert!(
+                    message.contains("does not match the recorded schema state")
+                        || message.contains("schema"),
+                    "the death must be the engine's typed control-plane refusal, got: {message}"
+                );
+            }
+            assert_eq!(ma, mb, "the refusal arm must be deterministic");
+            println!(
+                "dst schema weather: refusal arm — {}",
+                ma.lines().next().unwrap_or("")
+            );
+        }
+        (Ok(a), Ok(b)) => {
+            println!(
+                "dst schema weather: harmless arm — {} applies, {} corrupted, {} lost, {} misdirected",
+                a.schema_applies, a.writes_corrupted, a.writes_lost, a.writes_misdirected
+            );
+            omnigraph_dst::harness::assert_strict_replay(
+                &a,
+                &b,
+                "schema-weather universes must replay identically",
+            );
+            assert!(
+                a.writes_corrupted + a.writes_lost + a.writes_misdirected > 0,
+                "the persisted-tier write verbs should actually bite again \
+                 (corrupted={} lost={} misdirected={})",
+                a.writes_corrupted,
+                a.writes_lost,
+                a.writes_misdirected
+            );
+        }
+        _ => panic!("the two same-seed universes took different arms — nondeterministic outcome"),
+    }
+}
 
 /// CRASH-STATE ENUMERATION (sampled; ALICE-style crash-state
 /// enumeration, mechanism: kill-at-kth-write). Failpoints test the
@@ -1830,6 +2045,7 @@ fn dst_predict_triage() {
                 probe_window: Some(window),
                 reach_target: Some(window),
                 wide: omnigraph_dst::harness::window_needs_wide(window),
+                schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                 ..Default::default()
             };
             let root = format!("shared-memory://dst-law8-{idx}-{base}");
@@ -2685,7 +2901,8 @@ fn dst_predict_born_on_both_person_probe() {
 /// `crash_on_match` probe_only (record-only crossing). Reports per-window
 /// crossed/not and the tally. Success target: every milestone-reachable
 /// window crosses in its single universe; the residue (recovery internals,
-/// schema quarantine, init/open) is expected dark for NAMED reasons.
+/// init/open) is expected dark for NAMED reasons. (The schema families
+/// left the dark list when the `schema_ops` face requalified them.)
 ///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
@@ -2712,6 +2929,7 @@ fn dst_window_reach_probe() {
                 reach_target: Some(window),
                 wide: omnigraph_dst::harness::window_needs_wide(window)
                     || setup.is_some_and(|(w, _)| omnigraph_dst::harness::window_needs_wide(w)),
+                schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                 ..Default::default()
             };
             let root = format!("shared-memory://dst-reach-{idx}-{attempt}");
@@ -2744,11 +2962,12 @@ fn dst_window_reach_probe() {
         errored.len()
     );
     // Non-regression floor: the census measured 50/66 on 2026-08-12; the
-    // 16 non-crossing windows all carry NAMED reasons (schema quarantine,
-    // birth-owned init, #473-blocked adopts, chunk thresholds,
-    // branch-from-branch first-touch shapes, kill-territory orphan
-    // discard). Floor 48 leaves margin for benign seed sensitivity; a
-    // bigger drop = a recipe-mechanism regression.
+    // then-16 non-crossing windows all carried NAMED reasons (schema
+    // quarantine — since requalified by the `schema_ops` face, whose
+    // windows now cross — birth-owned init, #473-blocked adopts, chunk
+    // thresholds, branch-from-branch first-touch shapes, kill-territory
+    // orphan discard). Floor 48 leaves margin for benign seed sensitivity;
+    // a bigger drop = a recipe-mechanism regression.
     assert!(
         crossed.len() >= 48,
         "milestone reach regressed below the measured 50 ({} crossed)",
@@ -2934,6 +3153,7 @@ fn dst_fleet() {
                     crash_on_match: Some((window, 0)),
                     reach_target: Some(window),
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 },
                 &mut failures,

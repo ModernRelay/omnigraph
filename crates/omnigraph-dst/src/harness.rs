@@ -161,11 +161,14 @@ pub struct FaultPlan {
     /// their acknowledgement lost — the effect is DURABLE (delegation
     /// happened), but the caller receives a marked error. The inverse of
     /// `error_pct`'s clean loss. Pressure-tests retry idempotency (see
-    /// `client_retry` and the CAS note on `write_text_if_match`). Adapter realm only
-    /// in v1 (the Lance realm's retry jitter sits outside the replay
-    /// envelope anyway). Rolls draw from the plan's rng stream ONLY when
-    /// this knob is nonzero, so zero-knob plans keep their exact
-    /// pre-existing draw sequences (pinned tests unchanged).
+    /// `client_retry` and the CAS note on `write_text_if_match`). Both
+    /// realms: the adapter realm always; the Lance realm too when
+    /// `lance_realm` is on — put/copy/per-item delete, which includes the
+    /// `__manifest` dataset's commit puts, the graph-publication door
+    /// (RFC 0067). Rolls draw from the plan's rng stream ONLY when this
+    /// knob is nonzero (the Lance hook draws from its own self-synchronized
+    /// counter namespace), so zero-knob plans keep their exact pre-existing
+    /// draw sequences (pinned tests unchanged).
     pub ack_loss_pct: u64,
     /// CLIENT RETRY: when a workload op fails with a lost
     /// acknowledgement, the harness plays the real client's move and
@@ -659,6 +662,12 @@ pub struct Scenario {
     /// sampler (die 12 → 16). Gated so every pre-existing pinned seed keeps
     /// its exact op stream.
     pub wide: bool,
+    /// schema-op workload: adds one die face emitting
+    /// `SchemaAddProperty` (a monotone additive apply on main, bounded by
+    /// `MAX_SCHEMA_EXTRAS`), the randomized requalification the roll-12
+    /// quarantine deferred. Gated like `wide` so every pre-existing pinned
+    /// seed keeps its exact op stream; composes with either die.
+    pub schema_ops: bool,
     /// Kill-at-kth-write: die at durable write #k (1-based). `usize::MAX`
     /// = count-only probe (learns W, never dies). Mechanism: `KillState`.
     pub die_at_write: Option<usize>,
@@ -1068,6 +1077,14 @@ pub struct UniverseReport {
     /// evidence the inverse fault direction (effect durable, ack lost)
     /// saw action (0 without `ack_loss_pct`).
     pub acks_lost: usize,
+    /// acknowledgements the LANCE realm actually lost — the same fault
+    /// direction on table IO and the `__manifest` commit puts (0 without
+    /// `ack_loss_pct` + `lance_realm`).
+    pub lance_acks_lost: usize,
+    /// schema-face ops the sampler actually emitted (attempts, not
+    /// successes) — evidence the `schema_ops` workload reached the
+    /// schema_apply/schema_reload families (0 without `Scenario::schema_ops`).
+    pub schema_applies: usize,
     /// Client retries performed after ack-lost ops
     /// (0 without `client_retry`).
     pub client_retries: usize,
@@ -1395,13 +1412,11 @@ enum Op {
     Optimize,
     Cleanup,
     EnsureIndices,
-    /// The widened families (sampled only under `Scenario::wide`).
-    /// Schema evolution is additive-only (extra optional Person props), so
-    /// it joins the logically-invisible set the model ignores. The focused
-    /// schema-add regression passes with Lance 11, but randomized schema-op
-    /// requalification is deferred (see the roll-12 note). Keep it out of the
-    /// sampler, with dead_code allowed, until that qualification is complete.
-    #[allow(dead_code)]
+    /// Monotone additive schema evolution (extra optional Person props), so
+    /// it joins the logically-invisible set the model ignores. Sampled only
+    /// under `Scenario::schema_ops` (the randomized requalification the
+    /// roll-12 quarantine deferred; the focused regression is
+    /// `dst_schema_add_property_after_mutation_preserves_traversal`).
     SchemaAddProperty {
         count: usize,
     },
@@ -1659,11 +1674,17 @@ enum WorldOp {
     },
 }
 
-/// 12-sided sampler (16-sided under `wide`): rolls 9–11 are the branch verbs
-/// (falling back to a data op when their precondition doesn't hold), rolls
-/// 12–15 the loader-walk families (schema evolution / mid-life load / refresh
-/// / sync), everything else the existing 9-op mix on a uniformly-sampled
-/// live branch (main included).
+/// The most extra optional properties one universe's schema-op face may
+/// stack onto Person: keeps a long universe's schema (and each apply's
+/// staged rewrite) bounded; past the cap the face falls back to a data op.
+const MAX_SCHEMA_EXTRAS: usize = 5;
+
+/// 12-sided sampler (16-sided under `wide`; one more face under
+/// `schema_ops`): rolls 9–11 are the branch verbs (falling back to a data op
+/// when their precondition doesn't hold), rolls 12–15 the loader-walk
+/// families (mid-life load / refresh / sync), the extra `schema_ops` face a
+/// monotone `SchemaAddProperty` on main, everything else the existing 9-op
+/// mix on a uniformly-sampled live branch (main included).
 #[allow(clippy::too_many_arguments)]
 fn sample_world_op(
     rng: &mut SplitMix64,
@@ -1671,18 +1692,38 @@ fn sample_world_op(
     next_ver: &mut i64,
     hostile: bool,
     wide: bool,
+    schema_ops: bool,
     schema_extras: &mut usize,
     fresh_load: &mut usize,
 ) -> WorldOp {
-    let die = if wide { rng.below(16) } else { rng.below(12) };
+    let base = if wide { 16 } else { 12 };
+    let die = rng.below(base + u64::from(schema_ops));
+    if schema_ops && die == base {
+        // The schema face: one more optional property, monotone (`count` is
+        // cumulative, so every apply is additive over the last — never a
+        // drop). Bounded; at the cap the face degrades to the ordinary
+        // uniform-branch data op below.
+        if *schema_extras < MAX_SCHEMA_EXTRAS {
+            *schema_extras += 1;
+            return WorldOp::Data {
+                branch: "main".to_string(),
+                op: Op::SchemaAddProperty {
+                    count: *schema_extras,
+                },
+            };
+        }
+        let names = world.branch_names();
+        let branch = names[rng.below(names.len() as u64) as usize].clone();
+        let op = sample_op(rng, world.state_of(&branch), next_ver, hostile);
+        return WorldOp::Data { branch, op };
+    }
     match die {
-        // Roll 12 is the quarantined SchemaAddProperty slot. The original
-        // poisoned-traversal sequence now passes with Lance 11, pinned by
-        // `dst_schema_add_property_after_mutation_preserves_traversal`.
-        // Randomized schema-op requalification is deferred: keep the load
-        // frequency and RNG stream unchanged for the substrate cost comparison.
-        // Re-enabling this slot and the schema_apply/schema_reload families in
-        // `workload_can_reach` belong to that separate qualification.
+        // Rolls 12|13 are the mid-life load family. (Roll 12 was the
+        // quarantined SchemaAddProperty slot; the randomized schema-op
+        // requalification now lives on the dedicated `schema_ops` face
+        // above, keeping this family's frequency and the RNG stream of
+        // every schema-less plan unchanged for the substrate cost
+        // comparison.)
         12 | 13 => {
             let _ = &schema_extras;
             // Loads run on main (`load_jsonl` targets the active branch)
@@ -1936,6 +1977,16 @@ pub fn window_needs_wide(window: &str) -> bool {
     matches!(window.split('.').next().unwrap_or(window), "load")
 }
 
+/// Does scheduling this window require the schema-op face
+/// (`Scenario::schema_ops`)? Scoped like `window_needs_wide`, and for the
+/// same dilution reason: only the schema families need the extra face.
+pub fn window_needs_schema_ops(window: &str) -> bool {
+    matches!(
+        window.split('.').next().unwrap_or(window),
+        "schema_apply" | "schema_reload"
+    )
+}
+
 /// Can the CURRENT workload produce any op reaching this window's family?
 /// The hunt uses this to SKIP unschedulable windows instead of burning matrix
 /// cells on them — the miss is reported as "unschedulable", not "never
@@ -1952,9 +2003,10 @@ pub fn workload_can_reach(window: &str) -> bool {
             | "optimize"
             | "cleanup"
             | "ensure_indices"
-            // schema_apply/schema_reload: the focused regression passes with
-            // Lance 11, but randomized schema-op requalification is deferred.
-            // Keep these families absent while the sampler excludes the op.
+            // schema_apply/schema_reload need the schema-op face
+            // (`window_needs_schema_ops`), the way "load" needs `wide`.
+            | "schema_apply"
+            | "schema_reload"
             | "load"
             | "mutation"
             | "graph_publish"
@@ -3567,6 +3619,22 @@ fn is_legal_rejection(
     {
         return true;
     }
+    // Mono-branch hypothesis: the engine refuses a schema apply while any
+    // non-main branch exists (entry-time, effect-free — discovered by the
+    // schema-face requalification's first seed scan). Predictable from the
+    // model's branch map, so the refusal is legal exactly when the model
+    // agrees a branch exists; a refusal on a branchless world stays red.
+    if matches!(
+        wop,
+        WorldOp::Data {
+            op: Op::SchemaAddProperty { .. },
+            ..
+        }
+    ) && !world.branches.is_empty()
+        && text.contains("requires a graph with only main")
+    {
+        return true;
+    }
     false
 }
 
@@ -5060,6 +5128,7 @@ impl UniverseScenario<RustResources> for Scenario {
         let mut legal_rejections = 0usize;
         let mut client_retries = 0usize;
         let mut maintenance_reruns = 0usize;
+        let mut schema_applies = 0usize;
         let mut reconcile_verdicts: Vec<(String, String, String)> = Vec::new();
         let known_issues: Vec<String> = Vec::new();
         // attributed detections — op failures whose reads
@@ -5113,10 +5182,20 @@ impl UniverseScenario<RustResources> for Scenario {
                     &mut next_ver,
                     sc.hostile,
                     sc.wide,
+                    sc.schema_ops,
                     &mut schema_extras,
                     &mut fresh_load,
                 )
             });
+            if matches!(
+                wop,
+                WorldOp::Data {
+                    op: Op::SchemaAddProperty { .. },
+                    ..
+                }
+            ) {
+                schema_applies += 1;
+            }
             // RETENTION HORIZON: `cleanup(keep_versions: 1)`
             // retires old table versions, so history recorded before a
             // cleanup is no longer RELIABLY readable (GC is lazy and
@@ -5864,6 +5943,10 @@ impl UniverseScenario<RustResources> for Scenario {
             .as_ref()
             .map(|s| s.injected())
             .unwrap_or(0);
+        let lance_acks_lost = lance_faults_state
+            .as_ref()
+            .map(|s| s.acks_lost())
+            .unwrap_or(0);
         let writes_observed = kill_state
             .as_ref()
             .map(|s| s.writes_observed())
@@ -5909,6 +5992,8 @@ impl UniverseScenario<RustResources> for Scenario {
             writes_observed,
             crash_state_hit,
             acks_lost,
+            lance_acks_lost,
+            schema_applies,
             client_retries,
             maintenance_reruns,
             reads_corrupted,

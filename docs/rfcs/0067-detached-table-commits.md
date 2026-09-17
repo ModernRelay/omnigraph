@@ -1007,8 +1007,17 @@ Still not validated after the prototype, and therefore the gates that
 remain: an incremental index fold inside Optimize, which needs the upstream
 ask (the shipped fold is a whole rebuild); Azure; Lance 12 for probes 8 to
 14; the server's
-promotion-after-acknowledgement and its counters; DST scenarios; and the
+promotion-after-acknowledgement and its counters; and the
 manifest-byte cost on a copy of the production graph rather than a fixture.
+The DST gate is closed: the suite runs green over the detached protocol,
+including a Lance-realm ack-loss verb that loses acknowledgements of the
+`__manifest` commit puts themselves under seeded schedules (the workload's
+client retries converge against their own durable-but-denied commits), the
+requalified randomized schema-apply face with its crash windows, and the
+revived persisted-write lie verbs against the schema control objects, which
+the engine answers with a loud typed refusal. The failure matrix covers ten
+writers — load, the explicit full-text rebuild, and the system-column
+upgrade included — across every window, fault and recovery actor.
 
 ## Throughput after this RFC
 
