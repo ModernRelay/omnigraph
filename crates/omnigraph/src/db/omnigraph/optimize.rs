@@ -1284,6 +1284,14 @@ pub async fn cleanup_all_datasets(
     // Any branch snapshot read failure aborts before the first table GC: an
     // unknown live reference is never evidence that a version is disposable.
     let mut oldest_live_main_version_by_path = std::collections::HashMap::<String, u64>::new();
+    // RFC 0067: a table whose pin a foreign commit blocks keeps its
+    // acknowledged rows only in a detached version, which stock version GC
+    // does not protect. Skip GC on it, and protect every link of its chain
+    // from the detached-manifest reaper below.
+    let mut blocked_gc_paths = std::collections::HashSet::<String>::new();
+    let mut protected_detached =
+        std::collections::HashMap::<String, std::collections::HashSet<u64>>::new();
+    let mut table_locations = std::collections::BTreeSet::<(String, Option<String>)>::new();
     for branch_target in &graph_branches {
         if branch_target
             .as_deref()
@@ -1304,11 +1312,22 @@ pub async fn cleanup_all_datasets(
             // RFC 0067: a pending pin is promoted before any version is
             // reclaimed, so stock Lance cleanup only ever sees linear history
             // and the pin's detached manifest becomes surplus.
+            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
+            table_locations.insert((full_path.clone(), entry.native_dataset_branch.clone()));
             if let (Some(staged), Some(uuid)) = (
                 entry.version_metadata.staged_version(),
                 entry.version_metadata.transaction_uuid(),
-            ) {
-                promote_pin_before_cleanup(db, entry, staged, uuid).await?;
+            ) && let Some(chain) = settle_pin_before_cleanup(db, entry, staged, uuid).await?
+            {
+                blocked_gc_paths.insert(full_path.clone());
+                let location = super::promotion::table_location(
+                    &full_path,
+                    entry.native_dataset_branch.as_deref(),
+                );
+                protected_detached
+                    .entry(location)
+                    .or_default()
+                    .extend(chain);
             }
             // Validate that the exact protected version is still openable
             // before GC starts. This catches pre-existing damage from an older
@@ -1323,7 +1342,6 @@ pub async fn cleanup_all_datasets(
             if entry.native_dataset_branch.is_some() {
                 continue;
             }
-            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
             if branch_target.is_none() {
                 let head = db.storage().open_dataset_head(&full_path, None).await?;
                 if head.version() != entry.published_dataset_version {
@@ -1344,6 +1362,12 @@ pub async fn cleanup_all_datasets(
     }
 
     let before_timestamp = options.older_than.map(|d| crate::dst_clock::now_utc() - d);
+    let reaped =
+        reap_detached_manifests(db, &table_locations, &protected_detached, before_timestamp)
+            .await?;
+    if reaped > 0 {
+        tracing::info!(reaped, "cleanup reaped aged surplus detached manifests");
+    }
     let reconciled = reconcile_orphaned_branches_under_control_gates(db, before_timestamp).await?;
     if !reconciled.reclaimed.is_empty() {
         tracing::info!(
@@ -1375,6 +1399,7 @@ pub async fn cleanup_all_datasets(
 
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
     let storage = db.storage();
+    let blocked_gc_paths = &blocked_gc_paths;
 
     // Fault-isolated per table: a single table's GC failure is recorded on its
     // stats row (`error: Some`) and logged, never aborting the healthy tables.
@@ -1384,6 +1409,13 @@ pub async fn cleanup_all_datasets(
         .map(|(table_key, full_path, live_main_floor)| async move {
             let outcome: Result<RemovalStats> = async {
                 fail(&CLEANUP_TABLE_GC)?;
+                if blocked_gc_paths.contains(&full_path) {
+                    return Err(OmniError::manifest_conflict(
+                        "a published write's promotion is blocked by a foreign commit at its \
+                         target version; version GC is skipped for this table until `omnigraph \
+                         repair` resolves the block",
+                    ));
+                }
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. It only needs a raw read borrow.
@@ -2017,17 +2049,17 @@ mod tests {
 }
 
 /// Promote one pending pin, then delete its detached manifest once the
-/// pin is linear (RFC 0067). A blocked pin is reported and left alone: its
-/// files stay protected by the unverified-file age gate, and the
-/// HEAD-equals-pin check refuses cleanup on it.
-async fn promote_pin_before_cleanup(
+/// pin is linear (RFC 0067). Returns the detached versions of a blocked
+/// pin's chain, which cleanup must neither GC around nor reap.
+async fn settle_pin_before_cleanup(
     db: &Omnigraph,
     entry: &crate::db::manifest::DatasetEntry,
     staged: u64,
     uuid: &str,
-) -> Result<()> {
+) -> Result<Option<Vec<u64>>> {
     let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
     let table_branch = entry.native_dataset_branch.as_deref();
+    let location = super::promotion::table_location(&full_path, table_branch);
     let outcome = super::promotion::promote_pin(
         db,
         &entry.type_key,
@@ -2040,7 +2072,6 @@ async fn promote_pin_before_cleanup(
     .await?;
     match outcome {
         super::promotion::Promotion::Promoted(_) | super::promotion::Promotion::AlreadyPromoted => {
-            let location = super::promotion::table_location(&full_path, table_branch);
             let detached = super::promotion::detached_manifest_path(&location, staged);
             if let Err(error) = db.storage_adapter().delete(&detached).await {
                 tracing::warn!(
@@ -2049,13 +2080,78 @@ async fn promote_pin_before_cleanup(
                     "could not delete a promoted pin's detached manifest; cleanup retries it"
                 );
             }
+            Ok(None)
         }
-        super::promotion::Promotion::Blocked(reason) => tracing::warn!(
-            table = entry.type_key.as_str(),
-            target = entry.published_dataset_version,
-            reason,
-            "cleanup found a blocked pin; its files stay protected by the age gate"
-        ),
+        super::promotion::Promotion::Blocked(reason) => {
+            tracing::warn!(
+                table = entry.type_key.as_str(),
+                target = entry.published_dataset_version,
+                reason,
+                "cleanup found a blocked pin; version GC is skipped for its table"
+            );
+            let (_, chain) = super::promotion::walk_chain(db, &location, staged).await?;
+            Ok(Some(
+                chain.into_iter().map(|(version, _)| version).collect(),
+            ))
+        }
     }
-    Ok(())
+}
+
+/// Reap detached manifests that no pending pin protects and that are older
+/// than the cleanup age policy (RFC 0067): the manifests of promoted pins a
+/// later write superseded, the intermediate links of promoted chains, and
+/// attempts that never published. A pin promoted in this pass had its
+/// manifest deleted already; a recent manifest may belong to a write still
+/// in flight, so the age gate is required and no policy reaps nothing.
+async fn reap_detached_manifests(
+    db: &Omnigraph,
+    locations: &std::collections::BTreeSet<(String, Option<String>)>,
+    protected: &std::collections::HashMap<String, std::collections::HashSet<u64>>,
+    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<u64> {
+    let Some(cutoff) = before_timestamp else {
+        return Ok(0);
+    };
+    let mut reaped = 0u64;
+    for (full_path, table_branch) in locations {
+        let handle = db
+            .storage()
+            .open_dataset_head(full_path, table_branch.as_deref())
+            .await?;
+        let dataset = handle.dataset();
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        let location = super::promotion::table_location(full_path, table_branch.as_deref());
+        let protected = protected.get(&location);
+        let mut files = store.read_dir_all(&dataset.versions_dir(), None);
+        while let Some(file) = files.next().await {
+            let file = file.map_err(OmniError::storage)?;
+            let Some(version) = file
+                .location
+                .filename()
+                .and_then(|name| name.strip_prefix('d'))
+                .and_then(|name| name.strip_suffix(".manifest"))
+                .and_then(|version| version.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if protected.is_some_and(|versions| versions.contains(&version))
+                || file.last_modified >= cutoff
+            {
+                continue;
+            }
+            let detached = super::promotion::detached_manifest_path(&location, version);
+            match db.storage_adapter().delete(&detached).await {
+                Ok(()) => reaped += 1,
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    detached,
+                    "could not reap a surplus detached manifest; cleanup retries it"
+                ),
+            }
+        }
+    }
+    Ok(reaped)
 }

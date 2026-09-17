@@ -1510,10 +1510,37 @@ pub(crate) async fn open_pinned_dataset(
                 .await?
                 .version()
                 .version;
-            if latest >= target_version {
-                return Err(error);
+            if latest < target_version {
+                return open_dataset(uri, VersionResolution::At(staged), session, wrapper).await;
             }
-            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+            // HEAD reached the target between the two reads, so a promotion
+            // may have landed the twin after the first probe missed it. Read
+            // the exact target once more before reporting reclaimed history.
+            match open_dataset(
+                uri,
+                VersionResolution::At(target_version),
+                session,
+                wrapper.clone(),
+            )
+            .await
+            {
+                Ok(dataset) => {
+                    let ours = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)
+                        .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+                    if ours {
+                        return Ok(dataset);
+                    }
+                    tracing::warn!(
+                        uri,
+                        target_version,
+                        staged,
+                        "pin target carries a foreign or unreadable transaction; resolving the staged version"
+                    );
+                    open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+                }
+                Err(OmniError::HistoricalVersionReclaimed { .. }) => Err(error),
+                Err(other) => Err(other),
+            }
         }
         Err(error) => Err(error),
     }

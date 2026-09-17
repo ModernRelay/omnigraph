@@ -2282,6 +2282,22 @@ impl Omnigraph {
                         ),
                     ));
                 }
+                // RFC 0067: a promotion that landed after this writer captured
+                // its snapshot moves HEAD one past the published version the
+                // writer holds. When the current manifest explains that HEAD,
+                // the writer's read set is merely stale and it reprepares
+                // instead of being sent to repair.
+                let graph_branch = normalized_branch.map(crate::branch_names::logical_branch_name);
+                if let Ok(current) = self.fresh_snapshot_for_branch_unchecked(graph_branch).await
+                    && let Some(entry) = current.dataset(table_key)
+                    && entry.published_dataset_version != expected_version
+                {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("published_dataset_version:{table_key}"),
+                        Some(expected_version.to_string()),
+                        Some(entry.published_dataset_version.to_string()),
+                    ));
+                }
                 Err(OmniError::manifest_conflict(format!(
                     "{} is at Lance HEAD version {}, ahead of published dataset version {}; \
                      run `omnigraph repair` before writing",

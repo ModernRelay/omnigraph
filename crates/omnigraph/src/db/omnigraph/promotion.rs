@@ -91,7 +91,7 @@ async fn target_state(
 /// staged from. Returns the base, or `None` when the walk met a predecessor
 /// whose detached manifest is already reaped, and the chain tip first as
 /// `(version, uuid)`.
-async fn walk_chain(
+pub(crate) async fn walk_chain(
     db: &Omnigraph,
     location: &str,
     tip: u64,

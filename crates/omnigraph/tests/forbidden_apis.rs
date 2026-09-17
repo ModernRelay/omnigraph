@@ -763,7 +763,7 @@ durable_calls! {
     ("storage_layer.rs", ".promote_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", ".promote_detached(", 1, WriteProtocol::Exact("RFC 0067 promotion replay")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/optimize.rs", ".delete(", 1, WriteProtocol::Composed("RFC 0067 reap of a promoted pin's detached manifest after promotion")),
+    ("db/omnigraph/optimize.rs", ".delete(", 2, WriteProtocol::Composed("RFC 0067 reap of a promoted pin's detached manifest after promotion, and of aged surplus detached manifests under the cleanup age policy")),
     ("storage_layer.rs", ".dataset()", 28, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
@@ -896,12 +896,12 @@ durable_calls! {
     // pinned snapshot handles, plus the same-lineage path reading each
     // side's schema to resolve its system column spellings (RFC 0040
     // Historical reads). Read-only — the diff stages and publishes nothing.
-    ("changes/mod.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
+    ("changes/mod.rs", ".dataset()", 5, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 9, WriteProtocol::Composed("Optimize v9 planning + read-only coverage and native-fork inventory + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 10, WriteProtocol::Composed("Optimize v9 planning + read-only coverage and native-fork inventory + physical cleanup")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
