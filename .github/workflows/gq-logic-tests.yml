@@ -27,21 +27,25 @@ jobs:
   # A job cannot depend on another workflow's job, so this is a verbatim
   # copy of `ci.yml`'s `classify_changes`; `ci.yml` is the source of truth,
   # and an unconditional step at the top of the test job, right after
-  # checkout, asserts the two stay identical.
+  # checkout, asserts every copy stays identical (the copies are discovered
+  # by `scripts/check-classify-copy.py`, which globs the workflows).
   classify_changes:
     name: Classify Changes (GQ Logic Tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
       run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
+      run_gqt: ${{ steps.filter.outputs.run_gqt }}
+      run_deployment: ${{ steps.filter.outputs.run_deployment }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
 
-      - name: Detect documentation-only changes
+      - name: Classify changed paths
         id: filter
         env:
           BEFORE_SHA: ${{ github.event.before }}
@@ -54,9 +58,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+          # No diff to classify (dispatch, tag, unknown base, empty diff):
+          # every job runs.
+          run_everything() {
+            printf 'run_full_ci=true\nrun_gqt=true\nrun_deployment=true\n' >> "$GITHUB_OUTPUT"
             exit 0
+          }
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            run_everything
           fi
 
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
@@ -74,33 +84,42 @@ jobs:
           fi
 
           if [[ -z "${base:-}" ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            run_everything
           fi
 
-          # Disable rename collapsing so moving source into docs still reports
-          # the source-side deletion and cannot become a docs-only false skip.
-          mapfile -t changed < <(git diff --name-only --no-renames "$base" "$head")
+          # Merge base (a branch behind main must not inherit its newer files),
+          # no rename collapsing (a source file moved into docs keeps its
+          # deletion), no path quoting (a non-ASCII name reaches the arms raw).
+          mapfile -t changed < <(git -c core.quotePath=false diff --name-only --no-renames --merge-base "$base" "$head")
           if [[ "${#changed[@]}" -eq 0 ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            run_everything
           fi
 
           run_full_ci=false
+          run_gqt=false
+          run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
+              crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;
+              Dockerfile|.dockerignore|docker/*|deploy/*) run_deployment=true ;;
               *)
                 run_full_ci=true
                 ;;
             esac
           done
 
+          if [[ "$run_full_ci" == "true" ]]; then
+            run_gqt=true
+            run_deployment=true
+          fi
+
           printf 'Changed files:\n'
           printf '  %s\n' "${changed[@]}"
-          echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
+          printf 'run_full_ci=%s\nrun_gqt=%s\nrun_deployment=%s\n' \
+            "$run_full_ci" "$run_gqt" "$run_deployment" | tee -a "$GITHUB_OUTPUT"
 
   qualification:
     name: GQT (${{ matrix.mode }})
@@ -119,21 +138,21 @@ jobs:
       # nested async engine frame, deeper than a default 2 MiB thread stack.
       RUST_MIN_STACK: 16777216
     steps:
-      # Check classification on documentation-only changes too.
+      # Check the classification copies on skipped changes too.
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Assert the classification copy matches ci.yml
+      - name: Assert the classification copies match ci.yml
         run: python3 scripts/check-classify-copy.py
 
-      # Documentation-only change: report success without building, so the
-      # required context is never left pending.
-      - name: Skip for documentation-only changes
-        if: needs.classify_changes.outputs.run_full_ci != 'true'
-        run: echo "Documentation-only change detected; skipping the GQ logic tests."
+      # No GQT input changed (engine code or a `.gqt` case): report success
+      # without building, so the required context is never left pending.
+      - name: Skip when no GQT input changed
+        if: needs.classify_changes.outputs.run_gqt != 'true'
+        run: echo "No GQT input changed; skipping the GQ logic tests."
 
       - name: Install system dependencies
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        if: needs.classify_changes.outputs.run_gqt == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
@@ -141,11 +160,11 @@ jobs:
       # The `rust-toolchain.toml` pin, not a floating `stable` action (see
       # the `fmt` job in ci.yml): rustc is part of the cache key.
       - name: Install pinned toolchain
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        if: needs.classify_changes.outputs.run_gqt == 'true'
         run: rustup toolchain install
 
       - name: Cache Rust build data
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        if: needs.classify_changes.outputs.run_gqt == 'true'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: |
@@ -156,25 +175,34 @@ jobs:
           cache-on-failure: true
 
       - name: Test unavailable DST runtime refusal
-        if: needs.classify_changes.outputs.run_full_ci == 'true' && matrix.mode == 'ordinary'
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
         # The flagless build shape this test exists for: an env RUSTFLAGS,
         # empty included, replaces the workspace `[build] rustflags`.
         env:
           RUSTFLAGS: ""
         run: cargo test -p omnigraph-gqt --locked --timings --lib --test runner_dispatch -- --nocapture
 
+      # A case's `at:` name arms a seam in the engine's seam guard, so a
+      # cases-only diff can change its verdict while `Test Workspace` is
+      # skipped; same flagless build as the step above.
+      - name: Run the seam guard the case corpus arms
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
+        env:
+          RUSTFLAGS: ""
+        run: cargo test -p omnigraph-engine --locked --timings --test failpoint_names_guard
+
       # The workspace .cargo/config.toml enables the seeded Tokio runtime
       # from any directory; these steps run from the repo root.
       - name: Run complete GQ logic tests with DST
-        if: needs.classify_changes.outputs.run_full_ci == 'true' && matrix.mode == 'dst'
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst'
         run: cargo test -p omnigraph-gqt --locked --timings -- --nocapture
 
       - name: Clippy GQT with DST
-        if: needs.classify_changes.outputs.run_full_ci == 'true' && matrix.mode == 'dst-clippy'
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst-clippy'
         run: cargo clippy -p omnigraph-gqt --all-targets --locked --timings -- -D warnings -W clippy::dbg_macro
 
       - name: Retain GQT invocation reports
-        if: always() && needs.classify_changes.outputs.run_full_ci == 'true' && matrix.mode != 'dst-clippy'
+        if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gqt-invocation-reports-${{ matrix.mode }}
@@ -182,7 +210,7 @@ jobs:
           if-no-files-found: error
 
       - name: Retain Cargo build timings
-        if: always() && needs.classify_changes.outputs.run_full_ci == 'true'
+        if: always() && needs.classify_changes.outputs.run_gqt == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gqt-build-timings-${{ matrix.mode }}

@@ -29,10 +29,11 @@ pull requests; the full OpenAPI, Rust presentation-string, and public-Rust
 audit runs after merge, on tags, and by manual dispatch. User documentation is
 intentionally outside this exact-occurrence audit and is validated by the
 documentation structure check.
-Documentation-only PRs still receive every required context; work-heavy steps
-may report as skipped. `Storage Upgrade Compatibility` is an explicit exception:
-both genuine predecessor migration journeys execute on every change, including
-documentation-only pull requests. Its fixture availability and required-context
+PRs outside the engine-input class (documentation, `.gqt` cases, deployment
+files; see the classes in [ci.md](ci.md)) still receive every required
+context; work-heavy steps may report as skipped. `Storage Upgrade Compatibility` is an explicit exception:
+both genuine predecessor migration journeys execute on every change, whatever
+its class. Its fixture availability and required-context
 contract are checked by `scripts/check-storage-upgrade-ci.py`. The repository
 policy change must still be applied by an administrator to affect GitHub.
 `Dependency Guard (cargo deny)` is required on every change: it builds nothing
@@ -55,9 +56,9 @@ longer land. `V5 ↔ V9
 Format Fence` and both `RustFS S3 Integration` shards stay reporting contexts:
 the queue merges on the required contexts alone, so the merger clicks **Merge
 when ready** only after they have reported on the pull request and none is
-red. All of them run again on every push to `main`, on tags, and by dispatch,
-where a red run makes `main` stop-the-line until fixed or reverted. See
-[ci.md](ci.md).
+red. All of them run again on every push to `main` that changes engine input,
+on tags, and by dispatch, where a red run makes `main` stop-the-line until
+fixed or reverted. See [ci.md](ci.md).
 
 The remaining policy is:
 
