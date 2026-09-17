@@ -4,7 +4,46 @@ Workflow YAML under `.github/workflows/` is the source of truth. This page expla
 
 ## Pull-request gates
 
-`ci.yml` always classifies the diff. Only recognized documentation files may take the documentation-only path; a text fixture under a crate is source code.
+`ci.yml` always classifies the diff (from the merge base with the base branch,
+so a branch behind `main` does not inherit `main`'s newer files as its own
+changes), and every job runs only when a path it reads changed. The classifier
+puts each changed path in one class:
+
+| Class | Paths | Jobs that run |
+|---|---|---|
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| GQT cases | `crates/omnigraph-gqt/cases/*.gqt` (the runner reads top-level files; a nested `.gqt` still classifies as a case) | the guards plus `GQ Logic Tests` (`run_gqt`) |
+| deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
+| engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
+
+A class exists only when the set of jobs reading its paths is closed; a path
+outside every class is engine input and runs every job. The `.gqt` corpus is
+read by the `omnigraph-gqt` crate (its `include_str!` cases and its harness,
+all under `GQ Logic Tests`, whose `dst-clippy` job compiles the crate so
+`Lint (clippy)` owes it nothing), by `scripts/check-fix-regression.py`
+(`Fix Regression Gate`, always on), and by the engine's seam guard
+`crates/omnigraph/tests/failpoint_names_guard.rs`, which counts a case's
+`at:` name as arming a seam: `Test Workspace` runs it on engine input and
+`GQT (ordinary)` runs it on `run_gqt`, so a cases-only PR that drops the last
+case arming a seam turns the guard red where the PR can see it. No crate
+reads a deployment file. `scripts/check-change-classes.py` keeps the
+literal-spelling half of this true: it replays the classifier over fixture
+diffs and fails when a string literal in a Rust or TOML file under `crates/`
+or `tools/` spells a class path (root-relative or `../`-relative) without the
+file being a listed reader; comments are not read, and a path assembled from
+pieces at runtime is invisible to it, so a reader of that shape is the
+reviewer's to list. It runs in `Check Workflow Action Pins` with its
+self-test. A dispatch, a tag, an unknown base or
+an empty diff runs every job. The diff is taken from the merge base, so a
+branch behind `main` does not see `main`'s newer files as its own.
+Workflows that gate on the classification carry a verbatim copy of the
+`Classify Changes` job (a job cannot depend on another workflow's job);
+`scripts/check-classify-copy.py` discovers every copy under
+`.github/workflows/` (`.yml` and `.yaml`, any line whose first token is
+`classify_changes:`) and holds it identical to `ci.yml`; a copy it cannot
+read fails the check rather than dropping out of it. It runs in
+`Check Workflow Action Pins` (with its self-test) and in every `GQT`
+qualification job.
 
 Merge queue entries trigger `ci.yml`, `gq-logic-tests.yml`, and `dst.yml`
 through `merge_group` (`checks_requested`). These runs check out the combined
@@ -48,11 +87,11 @@ Test jobs upload invocation reports, and all three jobs upload available
 Cargo build timings separately, including on failure.
 Every corpus case is enrolled, including cases whose required graph
 behavior currently fails. `Test Workspace` excludes this separately tested
-package; it does not silently skip DST cases. `GQ Logic Tests` takes the documentation-only skip the way
-the AWS job does and reports success without building; its workflow carries a
-verbatim copy of the `Classify Changes` job under the name
-`Classify Changes (GQ Logic Tests)`, and `scripts/check-classify-copy.py`
-holds that copy identical to `ci.yml`. `Fix Regression Gate`
+package; it does not silently skip DST cases. `GQ Logic Tests` runs when its
+input changed (engine input or a `.gqt` case, the classifier's `run_gqt`) and
+otherwise reports success without building, the way the AWS job does; its
+workflow carries the `Classify Changes` copy under the name
+`Classify Changes (GQ Logic Tests)`. `Fix Regression Gate`
 (`fix-regression-gate.yml`) holds every issue the PR body closes by keyword
 (`Closes #N`, `Closes ModernRelay/omnigraph#N`, or the issue URL) to a
 regression in the diff: a top-level `.gqt` case or a `#[test]`-attributed
@@ -74,8 +113,8 @@ module, an issue-named function with no test attribute), and a case skeleton,
 as a log line and as a GitHub error annotation. It is a policy check, so it runs on `pull_request_target`: the
 workflow and the script come from `main`, and the pull request head is fetched
 only as data for the diff range, never checked out or executed. It runs on
-body edits and label changes as well as pushes, builds nothing, and takes no
-documentation-only skip. On the merge queue's branch it reports a pass
+body edits and label changes as well as pushes, builds nothing, and runs for
+every change class. On the merge queue's branch it reports a pass
 without a check ([branch-protection.md](branch-protection.md), Merge queue).
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
@@ -114,7 +153,7 @@ wired. When re-enabled it checks OpenAPI, Rust presentation strings, and public
 Rust against the reviewed terminology inventory after merge, on tags, and by manual
 dispatch. User documentation is intentionally outside this exact-occurrence
 audit and is owned by `scripts/check-docs.py`. The AWS job reports a successful
-skip for a documentation-only change; formatting and Clippy are also skipped by
+skip when no engine input changed; formatting and Clippy are also skipped by
 the classifier without leaving required contexts pending.
 
 Automatic edge and versioned publication are jobs in the same CI run and cannot
@@ -168,11 +207,11 @@ Repository metadata gates also check:
   lockfile bump or a `deny.toml` exemption in its own pull request, not a
   rerun.
 
-Container entrypoint and Azure deployment-validation jobs test argument composition, non-destructive Bicep validation, bootstrap readiness/admission modes, and non-root image ownership.
+Container entrypoint and Azure deployment-validation jobs test argument composition, non-destructive Bicep validation, bootstrap readiness/admission modes, and non-root image ownership. They and the container/package binary-set and admission-direction guards run when engine input or a deployment file changed (the classifier's `run_deployment`).
 
 ## Full correctness graphs
 
-The workspace suite (`Test Workspace`) runs on every non-documentation pull request, on the merge queue's branch, on every push to `main`, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request and a merge-queue entry drop `--no-fail-fast`):
+The workspace suite (`Test Workspace`) runs on every pull request, merge-queue entry and push to `main` that changes engine input, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request and a merge-queue entry drop `--no-fail-fast`):
 
 ```bash
 cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --no-fail-fast \
@@ -207,8 +246,8 @@ The remaining jobs own contracts that need special infrastructure. They run afte
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
-- **V5 ↔ V9 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every non-documentation pull request, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
-- **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every non-documentation pull request, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
+- **V5 ↔ V9 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
+- **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every pull request that changes engine input, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
 - **Azurite Azure integration** runs only after merge, on tags, or by manual
   dispatch: its 90-minute ceiling would outrun `Test Workspace` on a pull
   request. It exercises configured storage, admission-lease, recovery,
@@ -232,9 +271,11 @@ every other crate; the default test jobs exclude it by name, and neither
 workflow sets `RUSTFLAGS` (an env `RUSTFLAGS` would replace the configured
 list):
 
-- **`dst.yml`** (per PR and on `main` pushes): the pinned deterministic
-  suite — every failure line carries the universe seed, so a red run is
-  reproducible locally from the log alone. The job also lints the shipped
+- **`dst.yml`** (per PR and `main` push that changes engine input, through
+  its own `Classify Changes (DST)` copy; a superseded PR run is cancelled,
+  which loses nothing because its cache saves are push-only): the pinned
+  deterministic suite — every failure line carries the universe seed, so a
+  red run is reproducible locally from the log alone. The job also lints the shipped
   engine shape (`-p`, no `dst` feature), which workspace feature
   unification hides from the default Clippy job. Whether the suite blocks
   a merge is the branch-protection required-contexts list.
@@ -294,7 +335,7 @@ shellcheck scripts/*.sh
 
 | Workflow | Trigger and output |
 |---|---|
-| `release-edge.yml` | Called by a non-documentation `main` CI run after its vocabulary audit, or manually for an already-audited current `main`; updates the rolling `edge` release and platform archives. |
+| `release-edge.yml` | Called by a `main` CI run that changed engine input, after its vocabulary audit, or manually for an already-audited current `main`; updates the rolling `edge` release and platform archives. A `main` push that changes only documentation, `.gqt` cases or deployment files makes no edge release: the binaries did not change (the container image is published from tags). |
 | `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the Windows installer. |
 | `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; publication remains paused until the registry-ownership policy changes. |
 | `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Manual backfills do not move `latest`. |
@@ -309,7 +350,7 @@ Every release build sets `RUSTFLAGS` itself (`release.yml`, `release-edge.yml`, 
 
 1. Preserve a reporting path for every branch-protection context on every pull request.
 2. Keep external Actions and reusable workflows pinned to full commit SHAs.
-3. Update the documentation classifier when adding a new documentation format; never classify by extension outside the approved docs paths.
+3. Update the classifier when adding a documentation format or a change class; a class needs a grep-verified closed set of reading jobs, every path outside a class runs every job, and never classify by extension outside the approved paths.
 4. Keep configured object-store jobs fail-closed on accidental skips.
 5. Keep every automatic artifact publisher transitively behind a successful
    exact-SHA vocabulary audit; a skipped pull-request context never authorizes

@@ -8,6 +8,9 @@
 # the reach-census floor, and the cost-count golden (a storage-cost
 # regression names the exact op and verb). Volume hunting lives in
 # dst-nightly.yml — same crate, same oracles, different budget.
+# Runs only when engine input changed (the suite reads no document, `.gqt`
+# case or deployment file) through the same `classify_changes` job as
+# ci.yml, a verbatim copy held identical by scripts/check-classify-copy.py.
 name: DST
 
 on:
@@ -17,6 +20,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: dst-${{ github.ref }}
+  # Cache saves are push-only, so a superseded PR run loses nothing when
+  # cancelled; main runs stay alive as ci.yml's do.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,8 +41,97 @@ env:
   LANCE_DETERMINISTIC_BACKOFF: "1"
 
 jobs:
+  classify_changes:
+    name: Classify Changes (DST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
+      run_gqt: ${{ steps.filter.outputs.run_gqt }}
+      run_deployment: ${{ steps.filter.outputs.run_deployment }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: filter
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          # No diff to classify (dispatch, tag, unknown base, empty diff):
+          # every job runs.
+          run_everything() {
+            printf 'run_full_ci=true\nrun_gqt=true\nrun_deployment=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            run_everything
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          else
+            base="$BEFORE_SHA"
+            head="$GITHUB_SHA"
+            if [[ "$base" == "0000000000000000000000000000000000000000" ]]; then
+              base="$(git rev-parse "${head}^" 2>/dev/null || true)"
+            fi
+          fi
+
+          if [[ -z "${base:-}" ]]; then
+            run_everything
+          fi
+
+          # Merge base (a branch behind main must not inherit its newer files),
+          # no rename collapsing (a source file moved into docs keeps its
+          # deletion), no path quoting (a non-ASCII name reaches the arms raw).
+          mapfile -t changed < <(git -c core.quotePath=false diff --name-only --no-renames --merge-base "$base" "$head")
+          if [[ "${#changed[@]}" -eq 0 ]]; then
+            run_everything
+          fi
+
+          run_full_ci=false
+          run_gqt=false
+          run_deployment=false
+          for path in "${changed[@]}"; do
+            case "$path" in
+              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
+              README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
+              LICENSE|LICENSE.md) ;;
+              crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;
+              Dockerfile|.dockerignore|docker/*|deploy/*) run_deployment=true ;;
+              *)
+                run_full_ci=true
+                ;;
+            esac
+          done
+
+          if [[ "$run_full_ci" == "true" ]]; then
+            run_gqt=true
+            run_deployment=true
+          fi
+
+          printf 'Changed files:\n'
+          printf '  %s\n' "${changed[@]}"
+          printf 'run_full_ci=%s\nrun_gqt=%s\nrun_deployment=%s\n' \
+            "$run_full_ci" "$run_gqt" "$run_deployment" | tee -a "$GITHUB_OUTPUT"
+
   dst-suite:
     name: DST pinned suite
+    needs: classify_changes
+    if: needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # Cold budget: the uncached build of the full dependency graph plus
     # the shipped-shape clippy pass measured ~30 min on the standard
