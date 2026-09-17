@@ -140,7 +140,14 @@ publication the writer promotes each pin from the handles it already holds,
 replaying the recorded transaction at `base` so the linear history gains an
 identical twin. A promotion that fails or is blocked never fails the write:
 the pin stays pending, readable through its staged version, and the next
-writer of that table or `cleanup` promotes it. A pin whose target version a
+writer of that table or `cleanup` promotes it. A writer whose captured
+snapshot predates a promotion sees the linear HEAD one past its published
+version; the current manifest explains that HEAD, so the writer reprepares
+(`ReadSetChanged`) rather than reporting drift. Cleanup deletes a promoted
+pin's detached manifest as soon as it promotes it, skips version GC on a
+table whose pin is blocked, and with `--older-than` reaps every other
+detached manifest older than the threshold that no pending chain protects
+(superseded pins, promoted chain links and attempts that never published). A pin whose target version a
 foreign linear commit occupies is blocked: a later mutation stages from the
 detached version and its own promotion waits behind the block, while the
 writers that still commit on the linear HEAD (schema apply, Optimize)

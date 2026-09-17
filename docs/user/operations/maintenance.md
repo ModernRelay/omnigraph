@@ -111,10 +111,11 @@ does not rewrite lost or corrupt data.
 
 A `blocked_promotion` classification names a table whose published write
 cannot land on the linear history because a foreign commit took its version.
-Reads and mutations keep working through the pin; branch merge,
-index maintenance, schema apply and optimize refuse that table until the
-block is resolved. Repair reports it and never adopts the foreign commit,
-with or without `--force`.
+Reads, mutations, branch merge and index maintenance keep working through
+the pin; schema apply and optimize refuse that table until the block is
+resolved, and `cleanup` skips version GC for it because only the pin's
+detached version holds the acknowledged rows. Repair reports it and never
+adopts the foreign commit, with or without `--force`.
 
 If you cannot verify suspicious drift, restore or rebuild from a trusted export
 or backup.
@@ -144,7 +145,7 @@ At least one retention option is required:
 | Option | Meaning |
 |---|---|
 | `--keep N` | Request retention of the newest `N` versions per retained node or edge dataset |
-| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff |
+| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff; also reap detached manifests older than the threshold that no pending write protects |
 
 When both are present, a version must be outside both retention windows before
 it can be removed. Live branches and other storage references may keep

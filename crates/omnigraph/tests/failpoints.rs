@@ -9530,3 +9530,418 @@ async fn branch_merge_pointer_adoption_carries_a_pending_pin() {
         main_rows + 1
     );
 }
+
+// Review-only repros for the RFC 0067 stack. Reuse the failure-window fixtures.
+// =====================================================================
+// RFC 0067 review cases (16 September 2026): the boundaries between pins,
+// promotion, the snapshot diff and cleanup. Each case reproduced a defect
+// against the stack before its fix.
+// =====================================================================
+
+/// RFC 0067: a handle whose snapshot predates another handle's write sees
+/// the table's linear HEAD one past its published version once that write's
+/// promotion lands. That is a stale read set, not foreign drift: the write
+/// reprepares from the current manifest instead of being refused with a
+/// repair conflict (seen as intermittent 409s from concurrent `/change`).
+#[tokio::test]
+#[serial]
+async fn rfc_0067_stale_handle_write_after_a_promotion_reprepares() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = init_and_load(&dir).await;
+    let mut second = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let stale = helpers::snapshot_main(&second).await.unwrap();
+    mutate_main(
+        &mut first,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "first-writer")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    assert_person_pin_promoted(&first, "main").await;
+    let (head, _) = person_head_and_published(&first, "main").await;
+    assert_eq!(
+        head,
+        stale
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version
+            + 1,
+        "the promotion moved HEAD one past the stale handle's published version"
+    );
+    mutate_main(
+        &mut second,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "second-writer")], &[("$age", 31)]),
+    )
+    .await
+    .expect("a stale handle reprepares instead of refusing with drift");
+    let names = collect_column_strings(&read_table(&second, "node:Person").await, "name");
+    assert!(names.contains(&"first-writer".to_string()), "{names:?}");
+    assert!(names.contains(&"second-writer".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_pending_pin_diff_keeps_the_acknowledged_insert() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = helpers::snapshot_id(&db, "main").await.unwrap();
+    leave_pending_person_pin(&db, "main", "pending-diff").await;
+    assert!(
+        collect_column_strings(&read_table(&db, "node:Person").await, "name")
+            .contains(&"pending-diff".to_string())
+    );
+    let after = helpers::snapshot_id(&db, "main").await.unwrap();
+    let changes = db
+        .diff_between(
+            ReadTarget::Snapshot(before),
+            ReadTarget::Snapshot(after),
+            &omnigraph::changes::ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.stats.inserts, 1,
+        "acknowledged insert absent from public diff: {changes:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_blocked_chain_diff_keeps_the_acknowledged_insert() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    leave_pending_person_pin(&db, "main", "blocked-diff-first").await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let mut raw = helpers::open_dataset_head_exact(&person_uri, None).await;
+    helpers::lance_delete_inline(&mut raw, "1 = 2").await;
+    let before = helpers::snapshot_id(&db, "main").await.unwrap();
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "blocked-diff-second")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    let after = helpers::snapshot_id(&db, "main").await.unwrap();
+    assert!(
+        collect_column_strings(&read_table(&db, "node:Person").await, "name")
+            .contains(&"blocked-diff-second".to_string())
+    );
+    let changes = db
+        .diff_between(
+            ReadTarget::Snapshot(before),
+            ReadTarget::Snapshot(after),
+            &omnigraph::changes::ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.stats.inserts, 1,
+        "acknowledged chain insert absent from public diff: {changes:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_cleanup_skips_version_gc_on_a_blocked_pin() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before = count_rows(&db, "node:Person").await;
+    leave_pending_person_pin(&db, "main", "blocked-cleanup").await;
+    let (_, target) = person_head_and_published(&db, "main").await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let mut raw = helpers::open_dataset_head_exact(&person_uri, None).await;
+    helpers::lance_delete_inline(&mut raw, "1 = 2").await;
+    assert_eq!(raw.version().version, target);
+    for entry in std::fs::read_dir(std::path::Path::new(&person_uri).join("data")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+    }
+    let stats = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        })
+        .await
+        .unwrap();
+    let person = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .expect("cleanup reports Person");
+    assert!(
+        person
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("blocked")),
+        "cleanup must report the skipped table: {person:?}"
+    );
+    assert_eq!(person.old_versions_removed, 0);
+    drop(db);
+    let reopened = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let rows = read_table(&reopened, "node:Person").await;
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), before + 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_cleanup_reaps_aged_surplus_detached_manifests() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    for name in ["reap-one", "reap-two", "reap-three"] {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+    }
+    let person_uri = node_table_uri(&db, "Person").await;
+    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
+    let before = raw.list_detached_manifests().await.unwrap();
+    assert!(before.len() >= 3);
+    for entry in std::fs::read_dir(std::path::Path::new(&person_uri).join("_versions")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().unwrap().to_string_lossy().starts_with('d') {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+    }
+    for _ in 0..2 {
+        db.cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        })
+        .await
+        .unwrap();
+    }
+    let remaining = raw.list_detached_manifests().await.unwrap();
+    assert!(
+        remaining.is_empty(),
+        "{} promoted detached manifests remain after two cleanups; before={}",
+        remaining.len(),
+        before.len()
+    );
+}
+
+mod rfc_0067_resolution_race {
+    use super::*;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use lance::io::WrappingObjectStore;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Debug)]
+    struct PromoteOnMiss {
+        base: Dataset,
+        transaction: lance::dataset::transaction::Transaction,
+        target_file: String,
+        fired: Arc<AtomicBool>,
+    }
+    impl WrappingObjectStore for PromoteOnMiss {
+        fn wrap(&self, _: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(RacingStore {
+                target,
+                fault: self.clone(),
+            })
+        }
+    }
+    #[derive(Debug)]
+    struct RacingStore {
+        target: Arc<dyn ObjectStore>,
+        fault: PromoteOnMiss,
+    }
+    impl std::fmt::Display for RacingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ReviewRacingStore")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for RacingStore {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let result = self.target.get_opts(location, options).await;
+            if location.filename() == Some(self.fault.target_file.as_str())
+                && matches!(&result, Err(object_store::Error::NotFound { .. }))
+                && !self.fault.fired.swap(true, Ordering::SeqCst)
+            {
+                let promoted =
+                    lance::dataset::CommitBuilder::new(Arc::new(self.fault.base.clone()))
+                        .with_max_retries(0)
+                        .with_skip_auto_cleanup(true)
+                        .execute(self.fault.transaction.clone())
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    promoted.version().version,
+                    self.fault.base.version().version + 1
+                );
+            }
+            result
+        }
+        async fn put_opts(
+            &self,
+            p: &Path,
+            data: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.target.put_opts(p, data, options).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            p: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(p, o).await
+        }
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.target.delete_stream(paths)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list(p)
+        }
+        fn list_with_offset(
+            &self,
+            p: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list_with_offset(p, offset)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.target.list_with_delimiter(p).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rfc_0067_reader_racing_a_promotion_opens_the_twin() {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let person_uri = node_table_uri(&db, "Person").await;
+        let base = helpers::open_dataset_head_exact(&person_uri, None).await;
+        let old = base
+            .list_detached_manifests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.version)
+            .collect::<std::collections::HashSet<_>>();
+        leave_pending_person_pin(&db, "main", "race-promotion").await;
+        let staged = base
+            .list_detached_manifests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| !old.contains(&m.version))
+            .unwrap();
+        let detached = lance::dataset::builder::DatasetBuilder::from_uri(&person_uri)
+            .with_version(staged.version)
+            .load()
+            .await
+            .unwrap();
+        let transaction = detached.read_transaction().await.unwrap().unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
+        let fault = PromoteOnMiss {
+            target_file: format!("{:020}.manifest", u64::MAX - (base.version().version + 1)),
+            base,
+            transaction,
+            fired: fired.clone(),
+        };
+        let probes = omnigraph::instrumentation::QueryIoProbes {
+            table_wrapper: Some(Arc::new(fault)),
+            ..Default::default()
+        };
+        let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let result = omnigraph::instrumentation::with_query_io_probes(
+            probes,
+            Box::pin(async {
+                let snapshot = helpers::snapshot_main(&fresh).await.unwrap();
+                snapshot.open_dataset("node:Person").await
+            }),
+        )
+        .await;
+        assert!(fired.load(Ordering::SeqCst), "race hook did not run");
+        assert!(
+            result.is_ok(),
+            "healthy promotion was reported as data loss: {:?}",
+            result.err()
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_pending_merge_diff_keeps_every_chunk() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _, _) = setup_branch_merge_multichunk_adopt(&dir).await;
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let before = helpers::snapshot_id(&db, "main").await.unwrap();
+    let before_rows = count_rows(&db, "node:Person").await;
+    {
+        let _fp = catalog::BRANCH_MERGE_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        db.branch_merge("feature", "main").await.unwrap();
+    }
+    let after = helpers::snapshot_id(&db, "main").await.unwrap();
+    let after_rows = count_rows(&db, "node:Person").await;
+    let changes = db
+        .diff_between(
+            ReadTarget::Snapshot(before),
+            ReadTarget::Snapshot(after),
+            &omnigraph::changes::ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.stats.inserts as usize,
+        after_rows - before_rows,
+        "diff omitted acknowledged merge chunks: {} inserts for {} added rows",
+        changes.stats.inserts,
+        after_rows - before_rows
+    );
+}
