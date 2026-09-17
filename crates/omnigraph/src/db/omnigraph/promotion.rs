@@ -384,7 +384,7 @@ async fn resolve_pinned_for_write(
     if dataset.version().version == target {
         // A linear pin: its table HEAD must be the pin itself. HEAD beyond it
         // is an effect no publication covers, which the shared baseline check
-        // attributes to its recovery operation or routes to explicit repair.
+        // reports as a stale read set or routes to explicit repair.
         db.ensure_existing_effect_baseline(
             table_key,
             table_branch,

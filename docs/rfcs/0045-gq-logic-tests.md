@@ -906,6 +906,14 @@ remain outside this format extension.
 
 ### Known recovery failures
 
+> Removed with RFC 0067 rollout step 5. The marker existed to keep a known
+> recovery-sidecar defect in the corpus without going red. No writer arms a
+> recovery sidecar any more, the classifier that produced those typed
+> failures is deleted, and no case carried the marker, so the section
+> parser, the `known_failure` attempt field and status code, and the
+> `unexpected_pass` refusal are gone; a `--- known_failure` section is now
+> an ordinary invalid case. The text below records the retired contract.
+
 An optional `--- known_failure` section immediately after `--- runner` records one
 known recovery failure while keeping the healthy operation expectations.
 It is a narrow corpus admission rule, not an expected-error assertion:

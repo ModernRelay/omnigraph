@@ -182,8 +182,8 @@ Before cleanup:
 4. resolve interrupted operations and any drift reported by `repair`;
 5. review the exact retention command and confirmation target.
 
-Cleanup fails closed if it cannot prove that pending recovery, live branches,
-or storage drift are safe. A failure to clean one backing dataset is reported in
+Cleanup fails closed if it cannot prove that live branches or storage drift
+are safe. A failure to clean one backing dataset is reported in
 the result; fix the cause and rerun cleanup to converge.
 
 ## Suggested cadence

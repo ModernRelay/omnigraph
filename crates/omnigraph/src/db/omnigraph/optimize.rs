@@ -70,7 +70,7 @@ pub struct CleanupPolicyOptions {
 #[non_exhaustive]
 pub enum SkipReason {
     /// The Lance dataset HEAD is ahead of the version recorded in
-    /// `__manifest`, and no recovery sidecar covers that movement. `optimize`
+    /// `__manifest`, and no pending pin explains that movement. `optimize`
     /// cannot infer whether the drift is benign maintenance or an external
     /// semantic write, so it leaves the dataset untouched and points operators at
     /// explicit `repair`.
@@ -126,7 +126,7 @@ pub struct DatasetOptimizeStats {
     pub lance_head_version: Option<u64>,
     /// Index work deferred this run, with the reason and remedy: a vector
     /// property without trainable vectors, or full-text coverage requiring an
-    /// explicit rebuild. Deferred work alone does not arm recovery or publish.
+    /// explicit rebuild. Deferred work alone does not stage or publish.
     pub pending_indexes: Vec<super::PendingIndex>,
 }
 
@@ -223,17 +223,10 @@ decide_seam! {
     pub static OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES = ("optimize.post_authority_capture_pre_gates", Unreachable, [Fail]);
 }
 
-decide_seam! {
-    /// After Optimize's broad recovery fast-path check, before the main-branch
-    /// writer gate is acquired. Tests arm a late recovery intent in this window
-    /// and prove the under-branch-gate check refuses to advance around it.
-    pub static OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE = ("optimize.post_recovery_check_pre_main_gate", Unreachable, [Fail]);
-}
-
 /// Run Lance maintenance across every node + edge dataset on `main` under one
 /// graph visibility envelope. Physical dataset work remains bounded-parallel,
-/// but every productive dataset shares one recovery sidecar and one monotonic
-/// manifest batch publish, so one public Optimize produces at most one graph
+/// but every productive dataset stages detached and the batch publishes once
+/// with an exact pin CAS, so one public Optimize produces at most one graph
 /// commit. The final physical `__manifest` compaction remains outside that
 /// graph-visible envelope because the system dataset is read directly at HEAD.
 pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
@@ -241,30 +234,10 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
 
-    // Refuse on an unrecovered graph. A pending recovery sidecar means a failed
-    // write left partial state that the open-time sweep must resolve (roll
-    // forward/back) first; compacting + publishing a table covered by such a
-    // sidecar could commit a partial write the sweep would roll back. Reopen the
-    // graph to run recovery, then re-run optimize.
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "optimize requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before optimizing",
-        ));
-    }
-    // Deterministic race seam: the broad fast-path probe above has completed,
-    // but main's branch-writer gate is not held yet. A writer may arm recovery
-    // in this window; the load-bearing check below runs only after Optimize owns
-    // the branch authority every sidecar-enrolled main writer must cross.
-    fail(&OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE)?;
-
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
-    // graph or schema publish therefore refuses this attempt before physical
-    // maintenance effects or recovery ownership.
+    // graph or schema publish therefore refuses this attempt before any
+    // physical maintenance effect.
     let authority_txn = db.open_write_txn(None).await?;
     fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
 
@@ -279,8 +252,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 
     // Optimize's one visibility point advances main's graph head, so its
     // authority is branch-wide even though physical effects are table-local.
-    // Retain main through the final physical-only __manifest compaction so a
-    // new main recovery intent cannot arm before raw manifest movement ends.
+    // Retain main through the final physical-only __manifest compaction.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
 
     let table_keys = all_table_keys(&catalog);
@@ -290,10 +262,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         .collect::<Vec<_>>();
     let table_guards = db.write_queue().acquire_many(&queue_keys).await;
 
-    // This relist is authoritative: every in-process writer that could have
-    // armed a main/global intent crosses one of the gates now held. The entry
-    // probe above is only a cheap fast-path/race seam.
-    ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
     // Whether this run advanced any edge table — consumed by the graph-index
@@ -341,9 +309,9 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         // RFC 0067: every productive table stages its rewrite (and any
         // deferred index build) as detached versions of its pin, the batch
         // publishes once with an exact CAS on the pins it planned from, and
-        // the writer promotes the versions it holds. No recovery sidecar: a
-        // failure before publication leaves garbage the reaper retires; one
-        // after it leaves pending pins the next writer or cleanup promotes.
+        // the writer promotes the versions it holds. A failure before
+        // publication leaves garbage the reaper retires; one after it leaves
+        // pending pins the next writer or cleanup promotes.
         let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
         let effect_results: Vec<Result<OptimizeEffectOutcome>> = futures::stream::iter(prepared)
             .map(|work| {
@@ -409,15 +377,15 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     }
     stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
 
-    // Data-table recovery/publish is finished. Release the sorted table and
-    // schema gates before physical internal maintenance; retain main's branch
-    // gate through that maintenance to preserve the late-intent barrier.
+    // Data-table publish and promotion are finished. Release the sorted table
+    // and schema gates before physical internal maintenance; retain main's
+    // branch gate through that maintenance.
     drop(table_guards);
     drop(schema_guard);
 
     // Compact the internal system tables too (RFC-013 step 2). They are not
     // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
-    // compact in place, no manifest publish, no sidecar. Appended after the
+    // compact in place, no manifest publish. Appended after the
     // data-table stats so the data-table cache invalidation above is computed from
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
@@ -781,29 +749,6 @@ async fn apply_optimize_table_effects(
     })
 }
 
-async fn ensure_no_pending_recovery_for_optimize_under_main_gate(db: &Omnigraph) -> Result<()> {
-    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
-    let blocking = sidecars.iter().find(|sidecar| {
-        sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
-            || sidecar
-                .branch
-                .as_deref()
-                .filter(|branch| *branch != "main")
-                .is_none()
-    });
-    if let Some(sidecar) = blocking {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            format!(
-                "pending {:?} recovery operation on branch '{}' blocks optimize",
-                sidecar.writer_kind,
-                sidecar.branch.as_deref().unwrap_or("main"),
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Bound on the app-level retry of an internal-table compaction against a
 /// concurrent live writer (see [`is_retryable_lance_conflict`]).
 const COMPACTION_RETRY_BUDGET: u32 = 5;
@@ -847,10 +792,9 @@ fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
 /// new-graph posture. The `delete_config_keys` commit itself does not GC: the
 /// resulting manifest no longer has the `interval` key, so the post-commit hook is a
 /// no-op. Returns whether any config was cleared (it advances Lance HEAD iff so).
-/// Recovery coverage differs by caller: the data-table path runs this inside the
-/// Optimize sidecar window; the internal-table path needs none (it commits at HEAD
+/// The internal-table path needs no crash protocol for it: it commits at HEAD
 /// and is read at HEAD — the strip is a content-preserving config commit, so a crash
-/// leaves the table readable and content-identical, see [`compact_internal_table`]).
+/// leaves the table readable and content-identical, see [`compact_internal_table`].
 async fn clear_stale_auto_cleanup_config(
     ds: &mut lance::Dataset,
 ) -> std::result::Result<bool, lance::Error> {
@@ -878,10 +822,10 @@ async fn clear_stale_auto_cleanup_config(
 /// their latest Lance HEAD, so compaction just advances that HEAD and the next
 /// reader transparently observes the compacted version. That makes this path much
 /// simpler than [`apply_optimize_table_effects`] — no manifest publish (nothing to publish
-/// to), and no recovery sidecar. The sidecar-free claim does NOT rest on
+/// to), and no detached staging. Crash safety does NOT rest on
 /// single-commit atomicity: `compact_files` can emit a `ReserveFragments` commit
 /// before the final `Rewrite` (and the config strip is a separate commit before
-/// both), so this advances HEAD over one or more commits. It needs no sidecar
+/// both), so this advances HEAD over one or more commits. That is safe
 /// because every one of those commits is content-preserving and the table is read
 /// at HEAD — a crash at any point leaves the table readable and content-identical,
 /// and the next `optimize` re-plans. Internal tables carry no Lance index (only
@@ -969,9 +913,10 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// After cleanup's fast empty-sidecar probe, before it acquires the closed
-    /// schema/branch/table GC gate set and performs the authoritative recheck.
-    pub static CLEANUP_POST_RECOVERY_CHECK_PRE_GATES = ("cleanup.post_recovery_check_pre_gates", Unreachable, [Fail]);
+    /// After cleanup's entry checks, before it captures authority and
+    /// acquires its schema/branch/table GC gate set: the one window where a
+    /// failure aborts the whole run (per-table GC failures are isolated).
+    pub static CLEANUP_PRE_GATES = ("cleanup.pre_gates", Unreachable, [Fail]);
 }
 
 /// Run Lance `cleanup_old_versions` on every node + edge dataset on `main`,
@@ -991,35 +936,17 @@ pub async fn cleanup_all_datasets(
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("cleanup").await?;
-
-    // Version GC must never run while recovery still needs exact Lance
-    // transaction/version history to prove effect ownership or resume an
-    // interrupted compensation. Refuse before orphan reconciliation or any
-    // per-table cleanup so this operation is all-or-nothing with respect to the
-    // recovery-history floor. A read-write reopen resolves the sidecar first.
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "cleanup requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before garbage-collecting versions",
-        ));
-    }
-    fail(&CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
+    fail(&CLEANUP_PRE_GATES)?;
 
     // GC must be bound to one accepted graph view. Capture before acquiring
     // writer gates, and revalidate after the complete schema/branch/table
     // envelope before deleting any version history.
     let authority_txn = db.open_write_txn(None).await?;
 
-    // Close the empty-check -> GC race. Mutation/load take schema then branch
-    // then table gates; current legacy sidecar writers take at least their table
-    // gates. Cleanup takes the conservative superset and holds it through every
-    // `cleanup_old_versions` call, then performs the authoritative sidecar check
-    // under those gates. Without this envelope a writer can arm+commit+fail after
-    // the fast check and GC can delete the exact transaction/version history
-    // Full recovery needs to prove ownership or Restore.
+    // Writers take schema, then branch, then table gates. Cleanup takes the
+    // conservative superset and holds it through every `cleanup_old_versions`
+    // call, so no in-process writer stages or promotes while versions are
+    // collected.
     let _cleanup_schema_guard = db
         .write_queue()
         .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -1043,15 +970,6 @@ pub async fn cleanup_all_datasets(
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
     let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
 
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "cleanup observed a recovery sidecar after acquiring its GC gates; reopen the graph \
-             read-write to recover before garbage-collecting versions",
-        ));
-    }
     db.revalidate_write_txn(&authority_txn).await?;
 
     // Lance protects versions referenced by its own per-dataset branches, but
@@ -1533,7 +1451,6 @@ async fn reconcile_orphaned_branches_under_control_gates(
     });
     let mut stats = BranchReconcileStats::default();
     let mut references = None;
-    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
     let storage = db.storage();
     for (identity, table_key, full_path) in table_targets {
         let inventory = async {
@@ -1598,12 +1515,6 @@ async fn reconcile_orphaned_branches_under_control_gates(
                     native.as_str() == "main"
                         || crate::db::is_internal_system_branch(native)
                         || references.contains_tree(identity, native)
-                        || sidecars.iter().any(|sidecar| {
-                            sidecar.tables.iter().any(|pin| {
-                                pin.identity == identity
-                                    && pin.table_branch.as_deref() == Some(native.as_str())
-                            })
-                        })
                 })
                 .cloned(),
         );

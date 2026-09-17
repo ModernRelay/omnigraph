@@ -25,13 +25,13 @@ mod migrations;
 // Entirely test-only since RFC-013 step 3a: with both reads (Fix 2) and writes
 // bypassing the Lance namespace, nothing in production routes through it; the
 // `LanceNamespace` impls are retained only to validate the contract in unit tests.
+#[path = "manifest/legacy_sidecars.rs"]
+mod legacy_sidecars;
 #[cfg(test)]
 #[path = "manifest/namespace.rs"]
 mod namespace;
 #[path = "manifest/publisher.rs"]
 pub(crate) mod publisher;
-#[path = "manifest/recovery.rs"]
-pub(crate) mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
 #[path = "manifest/upgrade.rs"]
@@ -54,6 +54,7 @@ use layout::{
     open_manifest_dataset_native_with_session, open_manifest_dataset_with_identifier_with_session,
     open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
+pub(crate) use legacy_sidecars::{pending_legacy_sidecars, refuse_legacy_sidecars};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{
@@ -64,13 +65,6 @@ pub(crate) use migrations::stamp_for_system_columns;
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
-#[cfg(test)]
-pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
-pub(crate) use recovery::{
-    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryMode, SidecarKind,
-    ensure_read_only_schema_coherent, heal_pending_sidecars_roll_forward, list_sidecars,
-    recover_manifest_drift, schema_apply_serial_queue_key,
-};
 pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
@@ -1277,7 +1271,7 @@ impl ManifestCoordinator {
 
     /// Read one exact native manifest ref for a control-plane liveness proof.
     /// The caller must hold the schema-control gate (and the target's ordinary
-    /// branch/table gates before destroying it), or full recovery quiescence.
+    /// branch/table gates before destroying it).
     /// Native refs must come from a listing in that same envelope. This does
     /// not capture a BranchIdentifier and must not serve general reads or OCC.
     pub(crate) async fn snapshot_native_under_control_gates(
@@ -1924,3 +1918,12 @@ mod system_roles_tests;
 #[cfg(test)]
 #[path = "manifest/tests.rs"]
 mod tests;
+
+/// The write-queue key that serializes every graph-global schema writer
+/// (schema apply and the system-column upgrade) against each other and
+/// against the passes that install or discard a staged schema contract. The
+/// name cannot collide with real table keys (those are `node:`/`edge:`
+/// prefixed).
+pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQueueKey {
+    ("__schema_apply__".to_string(), None)
+}

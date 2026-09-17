@@ -11,7 +11,6 @@ version axes. Never derive one axis from another.
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
 | CLI ↔ server wire | Prefer additive changes; documented breaking release boundaries require coordinated upgrades. No global version handshake. | Shared DTOs, OpenAPI drift tests, and release-specific migration guidance. |
 | Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, one value per system column vintage; explicit registered upgrades into the floor, otherwise rebuild; no open-time migration. | Main-manifest stamp guard on both bounds. |
-| Recovery sidecar | Independently versioned persisted protocol. | Sidecar grammar/version refusal before classification. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
 ## Current storage contract
@@ -54,7 +53,8 @@ spellings, before this binary serves it.
   edge table. Until v10 a v8 graph retained its stamp until
   `omnigraph schema upgrade-system-columns` converted it in place (RFC 0040
   Rollout step 3: stamp advance first, one rename-only commit per table,
-  schema promotion last, recovered by roll-forward only).
+  schema promotion last). Since v10 that upgrade moves no stamp and stages
+  detached renames like schema apply (RFC 0067).
 - v10 preserves v9's layout and lets a table registration carry
   `omnigraph.staged_version` and `omnigraph.transaction_uuid` (RFC 0067): the
   detached Lance version a pin was staged as and the transaction promotion
@@ -83,14 +83,13 @@ legacy decoder after main-root admission. A pending upgrade marker refuses
 normal opens until every branch validates and main activation completes.
 See [RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) for the offline protocol.
 
-## Recovery version
+## Recovery sidecars
 
-Active graph writers emit **recovery sidecar schema v9**. The retained
-writer-payload field names refer to earlier payload designs but the outer
-artifact is v9 and every table slot carries stable lifetime identity.
-
-Never change the recovery ceiling merely because the manifest schema changes,
-or lower it to match v6. See [recovery.md](recovery.md).
+There is no recovery sidecar protocol to version. Builds up to the 0.11 line
+wrote recovery sidecar schema v9 under `__recovery/`; since RFC 0067 no writer
+arms one and no build interprets one. A read-write open and the storage
+upgrade refuse a graph that still carries a sidecar until the build that
+wrote it has resolved it. See [recovery.md](recovery.md).
 
 ## Lance contract
 
@@ -200,12 +199,13 @@ GitHub Releases, and the TypeScript SDK ships through npm. Do not document
    plus refusal and rebuild fallback evidence.
 5. Update the upgrade guide and release notes.
 
-### Recovery
+### Pins and staged contracts
 
-1. Bump only when persisted ownership or classification meaning changes.
-2. Keep writer-kind validation exhaustive.
-3. Add malformed, old, future, crash, roll-forward, and compensation tests.
-4. Never infer missing lifetime identity from aliases.
+1. A change to what a pin or a staged schema contract records is a manifest
+   or contract format change: it takes a stamp or contract version and the
+   graph-storage checklist above.
+2. A new detached transaction kind needs its twin-replay surface guard first.
+3. Never infer missing lifetime identity from aliases.
 
 ### Lance
 

@@ -24,9 +24,11 @@ five more changes like this one?**
 
 2. **There is one graph-content publication door.** A graph change becomes
    authoritative through one `__manifest` publication containing every
-   visible table pointer and graph-lineage update. A writer may move Lance HEADs
-   first only under durable recovery ownership. Per-table publication is never
-   graph publication.
+   visible table pointer and graph-lineage update. A writer never moves a
+   table's linear HEAD before that publication: its effects are detached
+   commits the manifest pin names, and promotion onto the linear history
+   follows publication and is derived. Per-table publication is never graph
+   publication.
 
 3. **Every operation uses one coherent accepted view.** A read holds one
    immutable snapshot for its lifetime. A writer captures schema, catalog,
@@ -39,11 +41,14 @@ five more changes like this one?**
    They do not acknowledge or publish per statement or per table. The D2
    constructive-versus-destructive mutation split remains explicit.
 
-5. **Recovery is part of the commit protocol.** Any independently durable
-   effect that could become graph-visible must have enough persisted identity,
-   authority, and intended outcome to roll forward or compensate safely.
-   Ambiguous or foreign movement fails closed. Writers resolve or refuse
-   relevant recovery before replanning. See [recovery.md](recovery.md).
+5. **Crash convergence is part of the commit protocol.** An effect that is
+   durable before publication must be unreachable: a detached version or a
+   staged file nothing references, which a retry ignores and cleanup reclaims.
+   An effect that is published must carry in the manifest itself what finishes
+   it: a pin's target version, staged version and transaction uuid, a staged
+   schema contract's publishing commit. There is no side record to classify.
+   Ambiguous or foreign movement fails closed: a blocked pin is reported and
+   never adopted. See [recovery.md](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
    non-zero type, property, and table-incarnation identities. A rename
@@ -123,15 +128,13 @@ different:
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.
-- Some Optimize and destructive full-recovery decisions retain a
-  one-mutation-process boundary because Lance does not expose the exact
-  caller-owned maintenance transaction proof they would need for distributed
-  takeover. The live write-entry heal's effect-free retirement (issue #554)
-  relies on the same boundary: its proof-then-delete is fenced by
-  process-local gates, so a second mutation process's live Armed intent, or
-  an already-transmitted storage write of a just-dropped in-process writer,
-  is outside what it can observe — the same bounded residual the Full-sweep
-  abandonment of an effect-free intent has always carried.
+- The open-time decisions about a schema apply another process may still be
+  running retain a one-mutation-process boundary: a read-write open discards
+  an unpublished staged schema contract and reclaims a schema-apply sentinel,
+  fenced only by process-local gates. A live apply in another process loses
+  its staging and then installs its contract from memory, so the graph does
+  not tear, but its sentinel no longer excludes other writers. Table effects
+  carry no such boundary: a detached commit needs no takeover.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 
@@ -142,7 +145,8 @@ code, tests, guide, and—when irreversible—RFC.
 
 - Does one snapshot or authority token cover the whole operation?
 - Is graph visibility still one manifest publication?
-- Is every pre-publication durable effect owned by recovery?
+- Is every pre-publication durable effect unreachable until the manifest names
+  it, and does the pin or staged contract carry what finishing it needs?
 - Are names kept separate from stable identity?
 - Does a missing physical optimization preserve logical correctness?
 - Are retries, memory, I/O, and failure outcomes bounded?

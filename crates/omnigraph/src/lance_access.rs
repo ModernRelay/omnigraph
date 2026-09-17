@@ -20,7 +20,7 @@ static STORE_REGISTRY: LazyLock<Arc<ObjectStoreRegistry>> = LazyLock::new(|| {
 ///
 /// Its caches are deliberately disabled. Control paths still share the
 /// process-wide object-store clients, but they cannot retain mutable-tip
-/// metadata across Restore / branch-recreation boundaries.
+/// metadata across branch-recreation boundaries.
 static CONTROL_SESSION: LazyLock<Arc<Session>> =
     LazyLock::new(|| Arc::new(Session::new(0, 0, Arc::clone(&STORE_REGISTRY))));
 

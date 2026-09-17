@@ -467,12 +467,12 @@ pub enum IndexCoverage {
 /// Stable identity of one Lance transaction.
 ///
 /// Lance persists both fields in the transaction file referenced by the
-/// committed manifest. Recovery uses the pair, rather than a numeric table
-/// version alone, to prove that an observed HEAD was produced by the staged
-/// effect named in a recovery sidecar. The UUID distinguishes two writers that
-/// started from the same version. Lance may preserve both fields while
-/// rebasing, so enrolled callers must also require the achieved table version
-/// to be exactly `read_version + 1`.
+/// committed manifest. The pair, rather than a numeric table version alone,
+/// proves that an observed version was produced by a given staged effect.
+/// The UUID distinguishes two writers that started from the same version.
+/// Lance may preserve both fields while rebasing, so callers of the exact
+/// linear commit must also require the achieved table version to be exactly
+/// `read_version + 1`.
 ///
 /// RFC 0067 reads the same pair from the transaction file name the manifest
 /// records (`{read_version}-{uuid}.txn`, pinned in `lance_surface_guards`),
@@ -655,11 +655,9 @@ impl StagedWrite {
         StagedTransactionIdentity::from(&self.transaction)
     }
 
-    /// Bind a pre-minted recovery identity to a transaction staged after a
+    /// Bind a pre-minted transaction identity to a transaction staged after a
     /// deferred branch fork. The operation and read version still come from
-    /// Lance; only its otherwise-random UUID is replaced so the sidecar can be
-    /// durable before the target ref (and its branch-local fragment paths)
-    /// exist.
+    /// Lance; only its otherwise-random UUID is replaced.
     pub(crate) fn bind_transaction_identity(
         &mut self,
         planned: &StagedTransactionIdentity,
@@ -1008,8 +1006,8 @@ pub struct TableStore {
 
 decide_seam! {
     /// After Lance durably creates a target table ref, before the caller can
-    /// reopen and verify it. An error here is post-effect and must retain the
-    /// recovery sidecar.
+    /// reopen and verify it. An error here leaves an unreferenced fork that
+    /// cleanup reclaims.
     pub static FORK_POST_CREATE_PRE_OPEN = ("fork.post_create_pre_open", AnyWrite, [Fail]);
 }
 
@@ -1044,7 +1042,7 @@ impl TableStore {
     }
 
     /// Authorize, normalize, deduplicate, and probe every URI before any
-    /// external payload read, recovery arm, target HEAD/ref movement, or
+    /// external payload read, target ref creation, table commit, or
     /// graph-visible effect. Scalar-only preparation may already have produced
     /// temporary in-memory or staged inputs. The graph session supplies the
     /// process-wide shared registry, so one operation does not create cold
@@ -1375,14 +1373,14 @@ impl TableStore {
         )
         .await?;
 
-        // The ref is now independently durable. Any error from this point is an
-        // ambiguous/post-effect outcome to the caller and must retain an armed
-        // recovery intent rather than being treated as a safe pre-effect retry.
+        // The ref is now independently durable. Any error from this point
+        // leaves a fork no manifest publication references; cleanup reclaims it
+        // and the caller's retry forks under a fresh name.
         fail(&FORK_POST_CREATE_PRE_OPEN)?;
 
         // Re-open through the shared session for normal cache behavior. The
         // returned handle above is used only as proof that the matching branch
-        // dataset was openable during classification.
+        // dataset was openable after creation.
         drop(created);
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
@@ -1437,8 +1435,8 @@ impl TableStore {
 
     /// Explicitly batch-bounded variant used by RFC-023's branch-adopt chain.
     /// Unlike the environment-controlled default scanner size, this ceiling is
-    /// part of the recovery plan: one emitted batch becomes one pre-minted
-    /// strict keyed transaction.
+    /// part of the chunk plan: one emitted batch becomes one strict keyed
+    /// transaction.
     pub async fn scan_stream_for_rewrite_bounded(
         &self,
         ds: &Dataset,
@@ -1493,7 +1491,7 @@ impl TableStore {
             // `LANCE_DEFAULT_BATCH_SIZE` overrides Scanner::batch_size on the
             // pinned Lance revision. Split descriptor batches ourselves so an
             // environment setting cannot make one materialization read across
-            // writer-defined recovery chunks. `try_unfold` is sequential: at
+            // writer-defined transaction chunks. `try_unfold` is sequential: at
             // most one row's blob payload is read before downstream consumes it.
             let materialized = futures::stream::try_unfold(
                 (raw, None::<RecordBatch>, 0_usize, ds, self.clone()),
@@ -2611,40 +2609,6 @@ impl TableStore {
         })
     }
 
-    /// Legacy inline-commit append: writes fragments AND commits in one
-    /// call, advancing Lance HEAD as a side effect. Not on the
-    /// `TableStorage` trait surface — the staged primitive
-    /// `stage_append` + `commit_staged` is the engine write path. This
-    /// inherent method survives only for in-source recovery test setup,
-    /// so it is `#[cfg(test)]`-gated: engine code physically cannot call
-    /// it (which enforces "no new call sites" by construction and
-    /// silences the dead-code warning the non-test lib build would
-    /// otherwise emit).
-    #[cfg(test)]
-    pub(crate) async fn append_batch(
-        &self,
-        dataset_uri: &str,
-        ds: &mut Dataset,
-        batch: RecordBatch,
-    ) -> Result<TableState> {
-        if batch.num_rows() == 0 {
-            return self.table_state(dataset_uri, ds).await;
-        }
-        let schema = batch.schema();
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let params = WriteParams {
-            mode: WriteMode::Append,
-            allow_external_blob_outside_bases: true,
-            auto_cleanup: None,
-            skip_auto_cleanup: true,
-            ..Default::default()
-        };
-        ds.append(reader, Some(params))
-            .await
-            .map_err(OmniError::storage)?;
-        self.table_state(dataset_uri, ds).await
-    }
-
     pub async fn append_or_create_batch(
         dataset_uri: &str,
         dataset: Option<Dataset>,
@@ -2690,7 +2654,7 @@ impl TableStore {
 
     /// Stage a delete without advancing Lance HEAD — the two-phase analogue of
     /// `stage_merge_insert`. `DeleteBuilder::execute_uncommitted` writes the
-    /// per-fragment deletion files to object storage (Phase A) and returns an
+    /// per-fragment deletion files to object storage and returns an
     /// uncommitted `Operation::Delete` transaction; HEAD does NOT advance until
     /// `commit_staged`. A 0-row delete is a TRUE no-op: `None` (no transaction,
     /// no fragments, no version). For a non-empty delete the returned
@@ -3222,7 +3186,7 @@ impl TableStore {
     /// Resolve any URI-bearing logical blobs into a bounded in-memory keyed
     /// source batch without writing Lance files or advancing HEAD.
     ///
-    /// Deferred first-touch writes invoke this before arming recovery because
+    /// Deferred first-touch writes invoke this before their fork because
     /// their actual `MergeInsertBuilder` stage must wait until the target ref
     /// exists. Existing-table writes reach the same helper from
     /// [`Self::stage_keyed_write`].
@@ -3308,7 +3272,7 @@ impl TableStore {
     /// Validate one physical v6 graph-table batch without staging files or
     /// touching any Lance/manifest authority. This is deliberately separate
     /// from [`Self::stage_keyed_write`]: Overwrite and deferred first-touch
-    /// plans must fail before recovery arm / native-ref creation too.
+    /// plans must fail before native-ref creation too.
     pub fn validate_keyed_write_batch(
         &self,
         type_key: &str,
@@ -3586,7 +3550,7 @@ impl TableStore {
         // matched row. The one-row materialization shape is intentionally
         // conservative for blobs: it bounds payload allocation; the stream
         // normalizer below then coalesces those rows into ordinary bounded
-        // recovery-transaction chunks.
+        // transaction chunks.
         let raw = Self::scan_proven_insert_blob_row_ids(
             source,
             begin_version,
@@ -3913,7 +3877,8 @@ impl TableStore {
             .map(|(dataset, _)| dataset)
     }
 
-    /// Commit an RFC-022-enrolled staged effect with no commit-conflict retry.
+    /// Commit a staged effect on the linear history with no commit-conflict
+    /// retry.
     ///
     /// `CommitBuilder::with_max_retries(0)` gives Lance one commit attempt. It
     /// can still perform its initial conflict-resolution pass before that
@@ -3922,8 +3887,8 @@ impl TableStore {
     /// [`StagedWrite::transaction_identity`] AND require the returned dataset
     /// version to equal `read_version + 1`: Lance's preflight rebase can
     /// preserve the transaction fields while committing at a later version.
-    /// Either mismatch is a post-effect recovery case, not permission to widen
-    /// the prepared plan.
+    /// Either mismatch is a durable post-effect outcome, not permission to
+    /// widen the prepared plan.
     pub async fn commit_staged_exact(
         &self,
         ds: Arc<Dataset>,
@@ -4145,13 +4110,6 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
-    /// Stage creation of a new dataset without publishing its first manifest.
-    ///
-    /// Lance models creation as an `Operation::Overwrite` transaction based on
-    /// version 0. Data files may be written by this call, but the dataset is not
-    /// readable until [`Self::commit_staged_create_exact`] atomically creates
-    /// version 1. The transaction UUID can therefore be bound to a recovery
-    /// identity before that first visible effect.
     /// RFC 0067: plan and execute Lance compaction against a pinned base and
     /// stage the result as one `Rewrite` transaction. The new fragments take
     /// ids above the base's high-water mark, so the commit needs no
@@ -4213,6 +4171,12 @@ impl TableStore {
         }))
     }
 
+    /// Stage creation of a new dataset without publishing its first manifest.
+    ///
+    /// Lance models creation as an `Operation::Overwrite` transaction based on
+    /// version 0. Data files may be written by this call, but the dataset is not
+    /// readable until [`Self::commit_staged_create_exact`] atomically creates
+    /// version 1.
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
@@ -4251,7 +4215,7 @@ impl TableStore {
     /// The dataset schema with `renames` applied in place: each source field
     /// keeps its id, nullability, metadata (the unenforced primary key marker
     /// included) and indexes; only its name changes. Shared by the staged
-    /// rename primitive and the writer's pre-arm dry run so both build one shape.
+    /// rename primitive and the writer's preflight dry run so both build one shape.
     pub(crate) fn renamed_schema(
         ds: &Dataset,
         renames: &[(String, String)],
@@ -6139,7 +6103,7 @@ fn transaction_exact_id_filter<'a>(
 /// can be overridden by process configuration, and blob materialization emits
 /// one safe row at a time. This layer therefore splits oversized emissions,
 /// compacts retained-parent slices, and coalesces small emissions before the
-/// recovery planner observes any boundary.
+/// chunk planner observes any boundary.
 fn bounded_proven_insert_stream(
     schema: SchemaRef,
     raw: SendableRecordBatchStream,

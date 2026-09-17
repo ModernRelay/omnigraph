@@ -402,7 +402,7 @@ async fn run_step(
     let (_, schema_state) =
         crate::db::schema_state::load_validated_schema_contract(root, Arc::clone(&storage)).await?;
     report.graph_identity = Some(schema_state.schema_identity_domain.clone());
-    let sidecars = super::list_sidecars(root, storage.as_ref()).await?;
+    let sidecars = super::pending_legacy_sidecars(root, storage.as_ref()).await?;
     if !sidecars.is_empty() {
         report.outcome = UpgradeOutcome::RecoveryRequired;
         report.finding(

@@ -1082,15 +1082,16 @@ fn dst_v11_fault_injection_atomicity_and_replay() {
 #[test]
 #[serial]
 fn dst_staleness_bite_and_replay() {
-    // Seed 277 since RFC 0067 moved the storage-action schedule (seed 251
-    // then met a stale absence of a schema contract file, which the engine
-    // refuses as manual coordination, and the detached index writer moved
-    // it again; `dst_staleness_seed_search` lists the green seeds).
+    // Seed 278 since RFC 0067 moved the storage-action schedule three times
+    // (the detached writers, the detached index writer, then the removal of
+    // the per-write `__recovery/` listing): each earlier pin then met a stale
+    // absence of a schema contract file, which the engine refuses as manual
+    // coordination. `dst_staleness_seed_search` lists the green seeds.
     let sc = Scenario {
-        seed: 277,
+        seed: 278,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 27_700,
+            seed: 27_800,
             stale_read_pct: 15,
             stale_list_pct: 15,
             max_lag_ticks: 4,
@@ -1551,61 +1552,12 @@ fn dst_corruption_detections_attributed() {
     );
 }
 
-/// CORRUPTION AXIS (persisted tier) — SIDECAR WEATHER, self-healing verbs: lost writes
-/// (success fabricated, effect absent — the claim channel's
-/// claimed-but-invisible shape, inverse of ack-loss) and misdirected writes
-/// (landed at a wrong key in the same keyspace), riding the 08-13 write
-/// census: a standard universe's adapter-realm content writes are exactly
-/// the `__recovery/` sidecars. `error_pct` forces deaths so damaged
-/// sidecar states MEET recovery. Contract under judgment: the two-picture
-/// crash arbitration holds with recovery's own metadata sabotaged, and
-/// injected residue (a lost disarm's stale sidecar, a `dstm-` foreign
-/// file) must HEAL on reopen — recorded pre-reopen in
-/// `attributed_residue`, asserted empty after (the reopen-heals contract
-/// extended over injected residue). Persisted damage flows through
-/// SUSPENDED reads (stored bytes ignore call-path gates), so recovery
-/// genuinely consumes it — no unsuspension knob needed. Strict replay.
-#[test]
-#[serial]
-fn dst_sidecar_weather_lost_and_misdirected() {
-    let sc = Scenario {
-        seed: 97,
-        ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 9700,
-            error_pct: 12,
-            lose_write_pct: 15,
-            misdirect_write_pct: 10,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-s11b-a", &sc);
-    let b = run_universe("shared-memory://dst-s11b-b", &sc);
-    println!(
-        "dst sidecar-weather: {} lost, {} misdirected, {} consumed, {} residue rows, {} legal rejections",
-        a.writes_lost,
-        a.writes_misdirected,
-        a.persisted_consumed,
-        a.attributed_residue.len(),
-        a.legal_rejections
-    );
-    for row in &a.attributed_residue {
-        println!("dst sidecar-weather residue: {row}");
-    }
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &b,
-        "sidecar-weather universes must replay identically",
-    );
-    assert!(
-        a.writes_lost + a.writes_misdirected > 0,
-        "the persisted verbs should actually bite (lost={} misdirected={})",
-        a.writes_lost,
-        a.writes_misdirected
-    );
-    assert!(a.verified > 0);
-}
+// The sidecar-weather pin (`dst_sidecar_weather_lost_and_misdirected`)
+// retired with the recovery sidecars (RFC 0067 step 5): the lost-write and
+// misdirected-write verbs act on adapter-realm content writes, which in a
+// standard universe were exactly the `__recovery/` sidecars, so they can no
+// longer bite. The verbs stay in the harness for a workload that writes
+// control objects again (the quarantined schema-apply slot).
 
 /// CRASH-STATE ENUMERATION (sampled; ALICE-style crash-state
 /// enumeration, mechanism: kill-at-kth-write). Failpoints test the
@@ -1808,7 +1760,7 @@ fn dst_maintenance_obligations_bite_and_replay() {
     let _s = omnigraph::seams::FailScenario::setup();
     let cells: [(&str, u64, usize); 3] = [
         ("optimize.before_compact", 7, 24),
-        ("cleanup.post_recovery_check_pre_gates", 7, 24),
+        ("cleanup.pre_gates", 7, 24),
         ("ensure_indices.post_table_effect", 9, 24),
     ];
     for (window, seed, ops) in cells {
@@ -3320,10 +3272,12 @@ fn dst_v11_conservation_transfers() {
     assert_eq!(a, b, "conservation universes must replay identically");
 }
 
-/// DOUBLE-FAULT lever — CRASH-DURING-RECOVERY: die in a workload window,
-/// then die AGAIN inside the recovery sweep, then let a clean reopen finish.
-/// "Does recovery recover from its own death?" — the least-tested code in any
-/// storage engine. Must still land atomically and replay identically.
+/// DOUBLE-FAULT lever — CRASH-DURING-REOPEN: die in a workload window after a
+/// detached table commit, then die AGAIN inside the reopen, then let a clean
+/// reopen finish. Since RFC 0067 the reopen runs no recovery sweep over table
+/// effects (the unpublished detached commit is garbage), so the second fault
+/// lands on the open path itself, which every reopen crosses. Must still land
+/// atomically and replay identically.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
@@ -3335,9 +3289,7 @@ fn dst_lever1_crash_during_recovery() {
             6,
             omnigraph::seams::catalog::MUTATION_POST_TABLE_COMMIT.name(),
         )),
-        recovery_crash: Some(
-            omnigraph::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH.name(),
-        ),
+        recovery_crash: Some(omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ.name()),
         ..Default::default()
     };
     let a = run_universe("shared-memory://dst-l1-a", &sc);

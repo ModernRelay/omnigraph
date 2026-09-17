@@ -143,12 +143,9 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
             .table_fork_owner()
             .map(str::to_string)
     } else {
-        crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-            .await?
-            .iter()
-            .flat_map(|sidecar| sidecar.tables.iter())
-            .find(|pin| pin.identity == entry.identity && pin.table_branch == table_branch)
-            .and_then(|pin| pin.table_fork_owner.clone())
+        // A first-touch fork carries no intent record (RFC 0067); ownership
+        // of a fork the entry does not name yet is proven by ref equality.
+        None
     };
     let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
     let ds = db
@@ -243,13 +240,10 @@ async fn maintain_indices_for_branch(
     mode: IndexMaintenanceMode,
     actor: Option<&str>,
 ) -> Result<IndexMaintenanceOutcome> {
-    // RFC-022 entry recovery barrier: recovery may advance the manifest, so
-    // resolve or refuse every relevant intent before capturing the index
-    // plan's base.
-    // The final under-gate relist below remains necessary to close the race
-    // between this entry barrier and the first table effect.
-    db.heal_pending_recovery_sidecars_for_write(&[branch])
-        .await?;
+    // Install this handle's pending schema contract, if any, before capturing
+    // the index plan's base. The under-gate revalidation below closes the race
+    // between this capture and the first table effect.
+    db.settle_pending_schema_install().await?;
     db.ensure_schema_apply_idle("ensure_indices").await?;
     let txn = db.open_write_txn(branch).await?;
     let snapshot = txn.base.clone();
@@ -434,11 +428,6 @@ async fn maintain_indices_for_branch(
         .await;
     let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
 
-    db.ensure_no_pending_recovery_sidecars_under_gates(
-        &[active_branch.as_deref()],
-        "ensure_indices",
-    )
-    .await?;
     let live_snapshot = db.revalidate_write_txn(&txn).await?;
     for target in &targets {
         let prepared_entry = snapshot.dataset(&target.table_key).ok_or_else(|| {
@@ -543,14 +532,13 @@ async fn maintain_indices_for_branch(
                 ))
             })?;
             let ds = db
-                .fork_dataset_from_entry_state_under_intent(
+                .fork_dataset_from_entry_state(
                     &target.table_key,
                     target.identity,
                     &target.full_path,
                     entry.native_dataset_branch.as_deref(),
                     entry.published_dataset_version,
                     fork,
-                    None,
                 )
                 .await?;
             let work = &work_by_table[&target.table_key];
@@ -687,10 +675,10 @@ async fn maintain_indices_for_branch(
 /// indexable here (a list column or `Blob`).
 ///
 /// Shared by `build_indices_on_dataset_for_catalog` (which builds the index)
-/// and `index_work_status_on_dataset_for_catalog` (which decides recovery-
-/// sidecar pinning) so the two cannot drift: an enum or orderable scalar the
-/// builder gives a BTREE must also be reported as "needs work" until that
-/// BTREE exists, or the HEAD-advancing build would run without sidecar cover.
+/// and `index_work_status_on_dataset_for_catalog` (which decides whether a
+/// table has index work to commit) so the two cannot drift: an enum or
+/// orderable scalar the builder gives a BTREE must also be reported as "needs
+/// work" until that BTREE exists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NodePropIndexKind {
     Btree,
@@ -727,8 +715,8 @@ fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
 /// Whether a vector column currently has at least one non-null vector — the
 /// minimum for Lance IVF k-means to train (the `ivf_flat(1)` index we build
 /// needs >=1 vector). Used identically by index-work status planning (so an
-/// untrainable column is not pinned for recovery — avoiding a zero-commit pin
-/// that would roll back a sibling's index work) and by the vector build arm (so
+/// untrainable column is reported as pending instead of planned as a commit
+/// that stages nothing) and by the vector build arm (so
 /// vector staging is only attempted when it can succeed, keeping genuine
 /// build errors fatal instead of swallowed as pending). If index params
 /// become size-aware (dev-graph iss-687), this threshold moves with them.
@@ -746,8 +734,8 @@ async fn vector_column_trainable(
 
 /// Describes the index work visible from one already-selected dataset snapshot.
 /// `needs_commit` excludes pending-only work (today an untrainable vector
-/// column), which is load-bearing for multi-table recovery: a table that cannot
-/// advance HEAD must not become a zero-movement pin beside productive siblings.
+/// column): a table with nothing to stage must not become a publication target
+/// beside productive siblings.
 pub(super) struct IndexWorkStatus {
     pub(super) needs_commit: bool,
     pub(super) pending: Vec<PendingIndex>,
@@ -758,9 +746,7 @@ pub(super) struct IndexWorkStatus {
 /// for one operation-local accepted catalog and one selected dataset snapshot.
 /// The table must have at least one row (the ensure_indices loop has
 /// `if row_count > 0 { build_indices(...) }`, so empty tables produce
-/// zero commits and must NOT be pinned in the sidecar — pinning them
-/// would force `NoMovement` classification on recovery and trigger the
-/// all-or-nothing rollback of sibling tables' legitimate index work).
+/// zero commits and must NOT become publication targets).
 ///
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
 /// each one-column `@index`/`@key` property, the index `node_prop_index_kind`
@@ -1012,7 +998,7 @@ async fn plan_index_work_edge_on_dataset(
 #[derive(Debug)]
 pub(crate) struct OpenedForMutation {
     /// Immutable logical table lifetime captured from the same manifest entry
-    /// as `expected_version`. Writers carry this through recovery and publish;
+    /// as `expected_version`. Writers carry this through staging and publish;
     /// the mutable alias is never used as OCC identity.
     pub(crate) identity: crate::db::manifest::TableIdentity,
     /// The opened dataset, or `None` on the non-strict-txn open-skip path.
@@ -1028,9 +1014,8 @@ pub(crate) struct OpenedForMutation {
     /// staging reopen resolves it, promoting a pending predecessor first.
     pub(crate) entry: crate::db::DatasetEntry,
     /// RFC-022 first-touch named-branch writes stage against the inherited
-    /// source snapshot and defer the durable Lance ref creation until after
-    /// their v9 recovery intent (`protocol_v3` payload) is armed in
-    /// `StagedMutation::commit_all`.
+    /// source snapshot and defer the durable Lance ref creation until
+    /// `StagedMutation::commit_all` holds the gates.
     pub(crate) deferred_fork: Option<DeferredTableFork>,
 }
 
@@ -1170,11 +1155,11 @@ pub(super) async fn open_for_mutation_on_branch(
             })
         }
         Some(active_branch) => {
-            // RFC-022-enrolled mutation/load adapters must arm durable intent
-            // before creating a per-table Lance branch ref. Read and stage from
-            // the inherited source entry now; `commit_all` creates the target
-            // ref after its v9 sidecar is durable, then commits this transaction
-            // onto the new ref. Legacy writers retain the eager fork path below.
+            // RFC-022-enrolled mutation/load adapters create a per-table Lance
+            // branch ref only under the final gates. Read and stage from the
+            // inherited source entry now; `commit_all` creates the target ref,
+            // then commits this transaction detached on the new ref. Legacy
+            // writers retain the eager fork path below.
             let native_active = native_active.as_deref().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "branch '{active_branch}' resolved without a native ref"
@@ -1237,7 +1222,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
 ) -> Result<(SnapshotHandle, Option<String>)> {
     let identity = entry.identity;
     let entry_version = entry.published_dataset_version;
-    // `active_branch` is the logical branch (manifest reads, gates, sidecars);
+    // `active_branch` is the logical branch (manifest reads, gates, lineage);
     // `native_active` is its native ref (Lance opens, forks, entry names).
     match entry.native_dataset_branch.as_deref() {
         Some(branch)
@@ -1324,7 +1309,7 @@ pub(super) async fn fork_dataset_from_entry_state(
         .await
 }
 
-/// Classify a table fork against fresh graph publication and recovery authority.
+/// Classify a table fork against fresh graph publication authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
 pub(crate) enum ForkRefStatus {
@@ -1347,7 +1332,6 @@ async fn classify_fork_ref(
     _table_key: &str,
     identity: crate::db::manifest::TableIdentity,
     branch: &str,
-    excluding_operation_id: Option<&str>,
 ) -> ForkRefStatus {
     let references =
         match crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
@@ -1359,36 +1343,17 @@ async fn classify_fork_ref(
             Ok(references) => references,
             Err(_) => return ForkRefStatus::Indeterminate,
         };
-    classify_fork_ref_with_references(db, identity, branch, excluding_operation_id, &references)
-        .await
+    classify_fork_ref_with_references(identity, branch, &references)
 }
 
 /// Use a graph-wide proof captured under the same held schema control gate.
-/// Recovery pins are checked separately because an unpublished first-touch ref
-/// may be live even though no graph snapshot references it yet.
 #[cfg(test)]
-pub(crate) async fn classify_fork_ref_with_references(
-    db: &Omnigraph,
+pub(crate) fn classify_fork_ref_with_references(
     identity: crate::db::manifest::TableIdentity,
     branch: &str,
-    excluding_operation_id: Option<&str>,
     references: &crate::db::manifest::NativeForkReferences,
 ) -> ForkRefStatus {
     if fail(&crate::seams::catalog::CLASSIFY_FRESH_READ).is_err() {
-        return ForkRefStatus::Indeterminate;
-    }
-    let sidecars =
-        match crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await {
-            Ok(sidecars) => sidecars,
-            Err(_) => return ForkRefStatus::Indeterminate,
-        };
-    if sidecars.iter().any(|sidecar| {
-        Some(sidecar.operation_id.as_str()) != excluding_operation_id
-            && sidecar
-                .tables
-                .iter()
-                .any(|pin| pin.identity == identity && pin.table_branch.as_deref() == Some(branch))
-    }) {
         return ForkRefStatus::Indeterminate;
     }
     if references.owner_contains(identity, branch) {
@@ -1489,14 +1454,13 @@ async fn prepare_updates_for_commit(
         return Ok(Vec::new());
     }
 
-    // RFC-022 mutation/load adapter: the physical effect envelope must be
-    // closed before its recovery sidecar is armed. Building missing indexes
-    // here can add one extra staged CreateIndex commit per table, which is not
-    // the exact logical-data transaction promised by that sidecar. Indexes are derived
-    // state: enrolled mutation/load writes publish the exact data-table result
-    // and leave declared-index materialization to the existing
-    // ensure_indices/optimize reconciler. Legacy test/merge callers retain the
-    // shared rebuild tail below.
+    // RFC-022 mutation/load adapter: the published pin names exactly one
+    // detached logical-data transaction per table. Building missing indexes
+    // here would add an extra CreateIndex commit that pin does not name.
+    // Indexes are derived state: enrolled mutation/load writes publish the
+    // exact data-table result and leave declared-index materialization to the
+    // existing ensure_indices/optimize reconciler. Legacy test/merge callers
+    // retain the shared rebuild tail below.
     if txn.is_some() {
         return Ok(updates.to_vec());
     }
@@ -1740,8 +1704,8 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         };
         // The cache supplies only the already captured starting view. The
         // publisher still reads fresh state and enforces ExactGraphHead on
-        // every CAS attempt. On error, drop a taken cache view; recovery and
-        // the next capture must resolve any ambiguous durable publication.
+        // every CAS attempt. On error, drop a taken cache view; the next
+        // capture must resolve any ambiguous durable publication.
         let published = coordinator
             .commit_changes_with_intent_and_expected(
                 &changes,
@@ -1811,7 +1775,6 @@ mod classify_fork_ref_tests {
                     .native_dataset_branch
                     .as_deref()
                     .unwrap(),
-                None,
             )
             .await,
             ForkRefStatus::Legitimate,
@@ -1829,7 +1792,7 @@ mod classify_fork_ref_tests {
             ds.create_branch(&feature_native, v, None).await.unwrap();
         }
         assert_eq!(
-            classify_fork_ref(&db, "node:Person", person_identity, &feature_native, None).await,
+            classify_fork_ref(&db, "node:Person", person_identity, &feature_native).await,
             ForkRefStatus::Orphan,
             "a ref the manifest does not place on the branch must classify as Orphan"
         );
@@ -1848,7 +1811,7 @@ mod classify_fork_ref_tests {
             ds.create_branch(&dead_native, v, None).await.unwrap();
         }
         assert_eq!(
-            classify_fork_ref(&db, "node:Company", company_identity, &dead_native, None).await,
+            classify_fork_ref(&db, "node:Company", company_identity, &dead_native).await,
             ForkRefStatus::Orphan,
             "a fork of a dead incarnation must classify as Orphan while the logical name is live"
         );
@@ -1861,7 +1824,7 @@ mod classify_fork_ref_tests {
             ds.create_branch("ghost", v, None).await.unwrap();
         }
         assert_eq!(
-            classify_fork_ref(&db, "node:Person", person_identity, "ghost", None).await,
+            classify_fork_ref(&db, "node:Person", person_identity, "ghost").await,
             ForkRefStatus::Orphan,
             "a ref for a branch absent from the manifest must classify as Orphan"
         );
@@ -1902,11 +1865,11 @@ mod classify_fork_ref_tests {
             .clone()
             .unwrap();
         assert_eq!(
-            classify_fork_ref(&db, "node:Person", new_identity, &feature_native, None).await,
+            classify_fork_ref(&db, "node:Person", new_identity, &feature_native).await,
             ForkRefStatus::Legitimate
         );
         assert_eq!(
-            classify_fork_ref(&db, "node:Person", old_identity, &feature_native, None).await,
+            classify_fork_ref(&db, "node:Person", old_identity, &feature_native).await,
             ForkRefStatus::Orphan,
             "a live placement under the reused alias belongs only to the new incarnation"
         );

@@ -984,10 +984,19 @@ The extended run adds the same-handle, other-process and cleanup actors
 4. Detached writers: mutation/load, then ensure-indices, then merge, then
    schema apply, then Optimize. Each step deletes its sidecar kind and
    failpoint cells.
-5. Remove the classifier, `Restore` compensation, recovery modes, barrier,
-   drift repair, and fork creation. Update `writes.md`, `recovery.md`,
-   `merge.md`, `versioning.md`, `lance.md`'s compatibility table, and the
-   release notes.
+5. Move the last sidecar writer (the RFC 0040 system-column upgrade) onto
+   detached renames, then remove the classifier, `Restore` compensation,
+   recovery modes, the write-entry barrier, the recovery audit table and the
+   fork intents. Update `writes.md`, `recovery.md`, `merge.md`,
+   `versioning.md`, `lance.md`'s compatibility table, and the release notes.
+   As shipped: `db/manifest/recovery.rs` and `db/recovery_audit.rs` are
+   deleted; a read-write open and the storage upgrade refuse a graph that
+   still carries a sidecar from an older build (this build cannot interpret
+   one), and a read-only open never looks; the write-entry pass is only
+   `settle_pending_schema_install`. `repair`'s drift adoption stays: it is
+   not sidecar machinery, and it is the operator's one remedy for a foreign
+   linear commit that arrived before any pending pin, while how a blocked
+   table is unblocked remains the open question below.
 
 Each stop leaves `main` shippable; the stamp gates activation. Roll the
 server out before any CLI that writes to the same bucket, because a pending

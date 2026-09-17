@@ -147,8 +147,8 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// After each exact SchemaApply table transaction commits, before the next
-    /// table effect or durable EffectsConfirmed transition.
+    /// After each SchemaApply table effect commits (a detached rewrite or a
+    /// new-table create), before the next table effect or the publication.
     pub static SCHEMA_APPLY_POST_TABLE_COMMIT = ("schema_apply.post_table_commit", Unreachable, [Fail]);
 }
 
@@ -256,12 +256,9 @@ where
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
 
-    // Converge any pending recovery sidecar (Optimize, or the RFC 0040
-    // upgrade) before planning: a table rewrite over sidecar-covered drift
-    // would otherwise re-plan from the manifest pin and orphan the drifted
-    // commit (silently dropping its rows) while the stale sidecar lingers to
-    // misclassify against the post-apply pins.
-    db.heal_pending_recovery_sidecars().await?;
+    // Install this handle's published-but-uninstalled schema contract, if any,
+    // before planning against the accepted contract.
+    db.settle_pending_schema_install().await?;
 
     // Process-local schema-control gate. RFC-022 mutation/load commit paths
     // acquire this before their branch/table gates and retain it through
@@ -629,12 +626,6 @@ where
         .acquire_many(&schema_apply_queue_keys)
         .await;
 
-    // The entry heal ran before planning, but another writer can arm recovery
-    // while this apply waits for its effect gates. List again under the complete
-    // envelope before this writer claims any physical state.
-    db.ensure_no_pending_recovery_sidecars_under_gates(&[None], "schema_apply")
-        .await?;
-
     // The snapshot was captured before the branch/table waits. Revalidate the
     // complete authority token now, while those gates are held, so a stale
     // plan never stages an effect. Physical-only __manifest compaction may
@@ -736,9 +727,8 @@ where
 
     // Lance's logical Blob rewrite input cannot represent an existing
     // external offset/length range. Discover that unsupported persisted state
-    // across the complete rewrite set before recovery is armed or any added /
-    // lexically earlier table can move. The builder repeats this check as a
-    // defensive invariant after arm.
+    // across the complete rewrite set before any added / lexically earlier
+    // table can move. The builder repeats this check as a defensive invariant.
     for table_key in &rewritten_tables {
         if added_tables.contains(table_key) {
             continue;
@@ -762,8 +752,8 @@ where
     }
 
     // The staged contract is bound to this apply's graph commit (RFC 0067):
-    // recovery promotes it once that commit is in lineage and discards it
-    // otherwise. No recovery sidecar is written.
+    // a read-write open installs it once that commit is in lineage and
+    // discards it otherwise.
     let publication = crate::db::schema_state::SchemaPublication {
         graph_commit_id: lineage_intent.graph_commit_id.clone(),
         parent_commit_id: base_graph_head.clone(),
@@ -994,7 +984,7 @@ where
 
         // Stage the schema contract bound to this apply's graph commit. The
         // state file is written last, so a complete staging is exactly one
-        // whose state file exists; recovery reads the marker from it.
+        // whose state file exists; the install pass reads the marker from it.
         fail(&SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
         let (_, ir_json, state_json) = crate::db::schema_state::render_schema_contract(
             &desired_ir,
@@ -1088,8 +1078,8 @@ where
             // versions, a created dataset and the staged contract are garbage
             // that the next open and cleanup retire. After publication the
             // manifest is authoritative and only the contract installation
-            // is pending, which the next read-write open or write-entry heal
-            // completes from the staged copy.
+            // is pending, which the next read-write open or this handle's next
+            // write entry completes from the staged copy.
             return Err(match published_commit {
                 Some(graph_commit_id) => {
                     db.pending_schema_install
@@ -1207,7 +1197,7 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
 }
 
 pub(super) async fn release_schema_apply_lock(db: &Omnigraph) -> Result<()> {
-    // Idempotent: an open or a write-entry heal that settled this apply's
+    // Idempotent: an open or a `refresh` that installed this apply's
     // published staging may already have reclaimed the sentinel (RFC 0067).
     let mut coordinator = db.coordinator.write().await;
     if coordinator
@@ -1326,7 +1316,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
     RecordBatch::try_new(target_schema, columns).map_err(OmniError::arrow_internal)
 }
 
-/// Descriptor-only pre-arm validation for external Blob cells that a schema
+/// Descriptor-only pre-effect validation for external Blob cells that a schema
 /// rewrite will carry. Project only the source Blob columns that survive in
 /// the target schema; this performs no external-object lookup or payload read.
 async fn validate_schema_rewrite_external_ranges(

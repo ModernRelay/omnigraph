@@ -1566,50 +1566,6 @@ async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
 // the all-or-nothing recovery sweep would roll back; the operator must reopen
 // (run the recovery sweep) first.
 #[tokio::test]
-async fn optimize_defers_when_recovery_sidecar_is_pending() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-
-    // Simulate an in-process failed write that left a recovery sidecar on disk.
-    let recovery_dir = dir.path().join("__recovery");
-    std::fs::create_dir_all(&recovery_dir).unwrap();
-    let person_path = node_table_uri(&db, "Person").await;
-    let sidecar_json = format!(
-        r#"{{
-            "schema_version": 1,
-            "operation_id": "01H000000000000000000DEFR",
-            "started_at": "0",
-            "branch": null,
-            "actor_id": "act-test",
-            "writer_kind": "Mutation",
-            "tables": [
-                {{
-                    "table_key": "node:Person",
-                    "table_path": "{}",
-                    "expected_version": 1,
-                    "post_commit_pin": 2
-                }}
-            ]
-        }}"#,
-        person_path
-    );
-    std::fs::write(
-        recovery_dir.join("01H000000000000000000DEFR.json"),
-        sidecar_json,
-    )
-    .unwrap();
-
-    let err = db
-        .optimize()
-        .await
-        .expect_err("optimize must defer (error) while a recovery sidecar is pending");
-    assert!(
-        err.to_string().to_lowercase().contains("recovery"),
-        "optimize defer error should mention recovery; got: {err}",
-    );
-}
-
-#[tokio::test]
 async fn cleanup_without_any_policy_option_errors() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;

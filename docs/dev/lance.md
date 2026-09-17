@@ -207,7 +207,7 @@ changes only manifest configuration metadata and does not infer fork ownership
 or retire branches. Source v6/v7 graphs with reserved retirement metadata refuse;
 v8 no-op admission validates markers and counts only live logical refs
 while retaining physical ancestors. Older binaries must not expose retired refs
-as live branches. This stamp is separate from recovery-sidecar protocol versions.
+as live branches.
 See [versioning](versioning.md).
 
 Stock `Branches::get` and `list` include every physical ref. OmniGraph's logical

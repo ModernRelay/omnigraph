@@ -150,9 +150,10 @@ pub(super) struct PublishOutcome {
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
-    /// Compatibility/default publish behavior for bounded or recovery paths
-    /// that do not carry an exact graph-head precondition. Exact RFC-022
-    /// adapters call `publish_with_precondition` directly.
+    /// Publish without a graph-head precondition. Every production writer
+    /// calls `publish_with_precondition`; only the publisher's own tests use
+    /// this shorthand.
+    #[cfg(test)]
     async fn publish(
         &self,
         changes: &[ManifestChange],

@@ -4547,7 +4547,7 @@
               },
               {
                 "$ref": "#/components/schemas/ResourceLimitOutput",
-                "description": "Set when the request must be split into smaller graph commits. The\nrejected attempt has no durable sidecar and no dataset effect."
+                "description": "Set when the request must be split into smaller graph commits. The\nrejected attempt has no durable effect."
               }
             ]
           }

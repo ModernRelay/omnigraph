@@ -554,9 +554,9 @@ pub(crate) fn record_probe() {
 }
 
 /// Internal/system table directory names. An open of one of these is a metadata
-/// open (publisher CAS, recovery audit), NOT a data-table open. Kept in sync with
-/// the dir constants in `db/manifest/layout.rs` and `db/recovery_audit.rs`.
-const INTERNAL_TABLE_DIRS: [&str; 2] = ["__manifest", "_graph_commit_recoveries.lance"];
+/// open (publisher CAS), NOT a data-table open. Kept in sync with the dir
+/// constants in `db/manifest/layout.rs`.
+const INTERNAL_TABLE_DIRS: [&str; 1] = ["__manifest"];
 
 /// True when `uri`'s last path segment names an internal/system table.
 fn open_is_internal(uri: &str) -> bool {
@@ -1539,7 +1539,7 @@ pub(crate) async fn open_pinned_dataset(
 ///    store). No wrapper (production) adds nothing.
 /// 3. A caller-provided graph data `Session` warms Lance's metadata/index
 ///    caches across data-table opens. When absent (for example a detached
-///    historical snapshot or recovery helper), the process-wide zero-cache
+///    historical snapshot), the process-wide zero-cache
 ///    control session is attached instead. Every open therefore reuses the
 ///    shared object-store registry/client pool without letting mutable control
 ///    metadata become stale in a session cache.

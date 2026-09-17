@@ -17,8 +17,12 @@ const DELETE_FILTER_SUFFIX: &str = ")";
 /// per-transaction keyed-write chunks.
 const MERGE_VALIDATION_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 const MERGE_VALIDATION_RESOURCE: &str = "branch-merge retained validation delta bytes";
-/// Bound transaction-history metadata work independently of recovery's effect
-/// scan ceiling. This is an optimization budget, never a correctness limit.
+/// Maximum detached chunk commits one table may chain in a single merge. The
+/// writer rejects a larger plan before its first effect, which bounds the
+/// chain a promoter has to walk.
+const MAX_BRANCH_MERGE_DATA_TRANSACTIONS: u64 = 1024;
+/// Bound transaction-history metadata work independently of the chunk-chain
+/// ceiling. This is an optimization budget, never a correctness limit.
 const PURE_INSERT_HISTORY_MAX_VERSIONS: u64 = 1_024;
 const PURE_INSERT_HISTORY_READ_CONCURRENCY: usize = 8;
 
@@ -37,8 +41,8 @@ enum CandidateTableState {
     AdoptPureInserts(ProvenPureInsertAdopt),
     /// Adopt the source's state by applying a non-empty delta onto the target's
     /// lineage (strict-insert new + upsert changed + delete removed). The delta is
-    /// pre-computed at classification so this candidate can be recovery-pinned:
-    /// its publish advances Lance HEAD before the manifest commit.
+    /// pre-computed at classification so its publish can stage the complete
+    /// detached chunk chain before the manifest commit.
     AdoptWithDelta(AdoptDelta),
     RewriteMerged(StagedMergeResult),
 }
@@ -52,11 +56,9 @@ enum AdoptValidation {
 /// An existing target ref opened and verified against the target manifest pin
 /// under branch merge's final schema -> branch -> table gate envelope.
 ///
-/// The handle is carried through Phase A and consumed by the physical effect so
-/// the post-arm path cannot reopen a different HEAD. First-touch refs never
-/// construct this value: their target ref is created only after the v9 recovery
-/// envelope (whose retained merge payload field is `protocol_v4`)
-/// sidecar is durable.
+/// The handle is carried into the effect phase and consumed there, so the
+/// chain stages from exactly the pin that was verified. First-touch refs never
+/// construct this value: their target ref is created in the effect phase.
 #[derive(Debug)]
 struct PreparedExistingMergeTarget {
     current: SnapshotHandle,
@@ -84,7 +86,7 @@ fn captured_merge_target_ref(txn: &WriteTxn) -> Result<Option<&str>> {
 }
 
 /// Open an existing physical target without consulting the handle's binding.
-/// The final pre-arm baseline check still proves HEAD equals the captured pin,
+/// The pinned open refuses a linear HEAD that moved past the captured pin,
 /// and this exact handle is retained for the effect phase.
 async fn prepare_existing_merge_target(
     db: &Omnigraph,
@@ -102,7 +104,7 @@ async fn prepare_existing_merge_target(
             .is_some_and(|native| entry.version_metadata.is_table_fork_of(native, owner))
     }) {
         return Err(OmniError::manifest_internal(format!(
-            "merge target '{table_key}' requires a recovery-owned first touch"
+            "merge target '{table_key}' requires a first-touch fork this branch owns"
         )));
     }
     let native = entry.native_dataset_branch.as_deref();
@@ -151,14 +153,13 @@ async fn open_first_touch_merge_target(
     db.promote_inherited_pin(table_key, &full_path, entry)
         .await?;
     let current = db
-        .fork_dataset_from_entry_state_under_intent(
+        .fork_dataset_from_entry_state(
             table_key,
             entry.identity,
             &full_path,
             entry.native_dataset_branch.as_deref(),
             entry.published_dataset_version,
             native,
-            None,
         )
         .await?;
     fail(&BRANCH_MERGE_POST_FORK_PRE_COMMIT)?;
@@ -170,7 +171,7 @@ struct StagedTable {
     _dir: TempDir,
     dataset: Dataset,
     row_count: u64,
-    /// Exact row boundaries written by `StagedTableWriter`. Recovery planning
+    /// Exact row boundaries written by `StagedTableWriter`. Chunk planning
     /// consumes these, rather than assuming Lance's scanner will emit a
     /// particular physical batch shape.
     chunk_rows: Vec<usize>,
@@ -187,15 +188,15 @@ struct StagedMergeResult {
 ///
 /// Each chunk is independently bounded by both the keyed-write row ceiling and
 /// the exact UTF-8 byte length of the escaped `id IN (...)` filter handed to
-/// Lance. The chunk boundary is therefore also the recovery boundary: publish
-/// pre-mints and consumes one exact Lance transaction per chunk.
+/// Lance. The chunk boundary is therefore also the transaction boundary:
+/// publish commits one detached Lance transaction per chunk.
 #[derive(Debug)]
 struct DeleteIdChunks {
     id_col: &'static str,
     chunks: Vec<DeleteIdChunk>,
     /// Conservative retained-heap estimate for every owned id plus chunk/Vec
     /// bookkeeping. Per-chunk bounds alone would still permit a 1,024-chunk
-    /// plan to retain tens of GiB before recovery is armed.
+    /// plan to retain tens of GiB before the first effect.
     retained_bytes: u64,
 }
 
@@ -341,7 +342,7 @@ impl DeleteIdChunk {
         }
         if self.filter_bytes > KEYED_WRITE_MAX_BYTES {
             return Err(OmniError::manifest_internal(format!(
-                "branch merge delete chunk exceeds its armed byte bound: {} bytes",
+                "branch merge delete chunk exceeds its planned byte bound: {} bytes",
                 self.filter_bytes
             )));
         }
@@ -442,13 +443,13 @@ struct ProvenPureInsertAdopt {
     source_branch_identifier: lance::dataset::refs::BranchIdentifier,
     /// Native incarnation of the merge-base/target ref on which the source
     /// interval's absence proof is founded. Existing targets recheck this
-    /// under the final table gate before recovery is armed.
+    /// under the final table gate before the first effect.
     target_base_branch_identifier: lance::dataset::refs::BranchIdentifier,
     base_version: u64,
     source_version: u64,
     inserted_rows: u64,
-    /// Exact pre-arm row boundaries observed from the bounded source-interval
-    /// stream. Each boundary becomes one pre-minted filtered transaction.
+    /// Exact pre-effect row boundaries observed from the bounded
+    /// source-interval stream. Each boundary becomes one filtered transaction.
     chunk_rows: Vec<usize>,
 }
 
@@ -1215,10 +1216,10 @@ impl StagedTableWriter {
         self.chunk_rows.push(batch.num_rows());
         let chunk_count = u64::try_from(self.chunk_rows.len())
             .map_err(|_| OmniError::manifest_internal("branch merge chunk count exceeds u64"))?;
-        if chunk_count > crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
+        if chunk_count > MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
             return Err(OmniError::resource_limit(
-                "branch-merge recovery transaction chain",
-                crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS,
+                "branch-merge detached transaction chain",
+                MAX_BRANCH_MERGE_DATA_TRANSACTIONS,
                 chunk_count,
             ));
         }
@@ -1331,7 +1332,7 @@ async fn proven_insert_history_segments(
 /// Missing/cleaned transaction files and every unfamiliar operation are a
 /// normal miss: the caller falls back to the general ordered row diff.  Once a
 /// proof is returned, however, later scan/count mismatches fail closed rather
-/// than silently changing routes after recovery planning. Chunk planning is a
+/// than silently changing routes after chunk planning. Chunk planning is a
 /// separate pass: Blob tables must first add only this proven interval's
 /// descriptors to the operation-wide admission plan, then materialize rows
 /// with that shared preflight rather than opening external sources here.
@@ -1785,11 +1786,11 @@ mod pure_insert_certificate_tests {
 }
 
 /// Observe the exact row boundaries emitted by the bounded source-interval
-/// scanner before recovery is armed. The later physical pass reconstructs
+/// scanner before the first effect. The later physical pass reconstructs
 /// these same writer-defined chunks even if Lance chooses different physical
-/// batch boundaries, so recovery identities never depend on scanner layout.
-/// If the optimization would exceed the existing recovery-chain ceiling, it
-/// is a normal miss and the caller retains the general ordered-diff route.
+/// batch boundaries, so the planned chain never depends on scanner layout.
+/// If the optimization would exceed the chunk-chain ceiling, it is a normal
+/// miss and the caller retains the general ordered-diff route.
 async fn plan_proven_pure_insert_chunks(
     db: &Omnigraph,
     table_key: &str,
@@ -1831,7 +1832,7 @@ async fn plan_proven_pure_insert_chunks(
                 OmniError::manifest_internal("branch merge pure-insert plan row count overflow")
             })?;
         chunk_rows.push(batch.num_rows());
-        if chunk_rows.len() > crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS as usize {
+        if chunk_rows.len() > MAX_BRANCH_MERGE_DATA_TRANSACTIONS as usize {
             return Ok(None);
         }
     }
@@ -1919,8 +1920,8 @@ async fn revalidate_proven_pure_insert_source(
 /// recreated. The source history proves absence relative to one native base
 /// ref, so accepting a different ref with the same path/version would make the
 /// induction unsound. The prepared handle was freshly opened under the final
-/// schema -> branch -> table gate envelope; the ordinary baseline check below
-/// separately proves that its live HEAD still equals the manifest pin.
+/// schema -> branch -> table gate envelope; the pinned open that produced it
+/// separately proves that the table has not moved past the manifest pin.
 async fn revalidate_proven_pure_insert_target_incarnation(
     db: &Omnigraph,
     table_key: &str,
@@ -3602,7 +3603,7 @@ fn classify_merge_conflict(
 /// Physical merge staging is chunked, but the unified validator evaluates one
 /// cross-table `ChangeSet`. Without a second aggregate ceiling, many valid
 /// chunks (or many candidate tables) could be collected back into an unbounded
-/// resident delta before recovery was armed.
+/// resident delta before the first effect.
 #[derive(Debug)]
 struct MergeValidationBudget {
     retained_bytes: u64,
@@ -4446,10 +4447,10 @@ fn enforce_merge_transaction_ceiling(table_key: &str, transaction_count: usize) 
             "branch merge transaction count for '{table_key}' exceeds u64"
         ))
     })?;
-    if transaction_count > crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
+    if transaction_count > MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
         return Err(OmniError::resource_limit(
-            format!("branch-merge recovery transactions for {table_key}"),
-            crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS,
+            format!("branch-merge detached transactions for {table_key}"),
+            MAX_BRANCH_MERGE_DATA_TRANSACTIONS,
             transaction_count,
         ));
     }
@@ -4504,7 +4505,7 @@ fn plan_merge_chain_length(table_key: &str, candidate: &CandidateTableState) -> 
 }
 
 #[cfg(test)]
-mod recovery_chain_limit_tests {
+mod chain_limit_tests {
     use super::*;
     use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
 
@@ -4621,13 +4622,8 @@ mod recovery_chain_limit_tests {
     }
 
     #[test]
-    fn branch_merge_recovery_chain_ceiling_is_inclusive() {
-        let limit = crate::db::manifest::MAX_BRANCH_MERGE_DATA_TRANSACTIONS as usize;
-        assert_eq!(
-            crate::db::manifest::MAX_EFFECT_IDENTITY_SCAN_VERSIONS,
-            limit as u64 + 2,
-            "recovery must reserve one derived-index tail and one Restore"
-        );
+    fn branch_merge_chain_ceiling_is_inclusive() {
+        let limit = MAX_BRANCH_MERGE_DATA_TRANSACTIONS as usize;
         assert_eq!(
             enforce_merge_transaction_ceiling("node:Person", limit).unwrap(),
             limit as u64
@@ -4645,7 +4641,7 @@ mod recovery_chain_limit_tests {
                 ref resource,
                 limit: actual_limit,
                 actual,
-            } if resource == "branch-merge recovery transactions for node:Person"
+            } if resource == "branch-merge detached transactions for node:Person"
                 && actual_limit == limit as u64
                 && actual == limit as u64 + 1
         ));
@@ -4733,7 +4729,7 @@ async fn commit_detached_merge_stage(
 
 decide_seam! {
     /// After one bounded delete chunk committed while at least one later
-    /// delete chunk from the same Armed BranchMerge chain remains.
+    /// delete chunk from the same detached BranchMerge chain remains.
     pub static BRANCH_MERGE_BETWEEN_DELETE_CHUNKS = ("branch_merge.between_delete_chunks", BranchMerge, [Fail]);
 }
 
@@ -4791,8 +4787,8 @@ async fn publish_rewritten_merge_table(
     // (`stage_delete` + an exact commit) operates on rows the rewrite chose
     // to remove, not user-facing predicates, so Merge is the correct policy
     // here.
-    // Existing refs consume the same handle verified before Phase A. Only a
-    // first-touch target creates a ref here, under its armed recovery identity.
+    // Existing refs consume the same handle verified under the final gates.
+    // Only a first-touch target creates a ref here.
     let (mut current_ds, full_path, table_branch) = match prepared_target {
         Some(prepared) => prepared.into_parts(),
         None => {
@@ -4831,15 +4827,15 @@ async fn publish_rewritten_merge_table(
     }
 
     // Failpoint: crash after the Phase 1 merge_insert commit, before the delete.
-    // Models a partial Phase B on the three-way path — the merged constructive
-    // rows are on Lance HEAD but the delete has not committed and the
-    // achieved-version intent has not been recorded, so recovery must roll BACK.
-    // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_rolls_back.
+    // Models a partial chain on the three-way path — the merged constructive
+    // rows are committed detached but the delete is not, and nothing is
+    // published, so the graph is unchanged and the chain is garbage.
+    // See tests/failpoints.rs::branch_merge_rewrite_partial_after_merge_leaves_no_residue.
     fail(&BRANCH_MERGE_REWRITE_AFTER_MERGE_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via deletion vectors. Each row/byte-bounded
-    // filter chunk is staged through `stage_delete` and consumes one exact
-    // pre-minted transaction (MR-A — Lance 7.0's
+    // filter chunk is staged through `stage_delete` and commits one detached
+    // transaction (MR-A — Lance 7.0's
     // `DeleteBuilder::execute_uncommitted`, #6658, made delete a two-phase
     // staged write, so this no longer inline-commits).
     current_ds = commit_staged_delete_chunks(
@@ -4851,11 +4847,11 @@ async fn publish_rewritten_merge_table(
     )
     .await?;
 
-    // Failpoint: crash after the Phase 2 delete commit, before confirmation.
-    // Models a partial Phase B on the three-way path — constructive rows +
-    // deletes are on Lance HEAD but the achieved-version intent has not been
-    // recorded, so recovery must roll BACK. See
-    // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_rolls_back.
+    // Failpoint: crash after the Phase 2 delete commit, before publication.
+    // Models a complete but unpublished chain on the three-way path —
+    // constructive rows + deletes are committed detached but nothing is
+    // published, so the graph is unchanged and the chain is garbage. See
+    // tests/failpoints.rs::branch_merge_rewrite_partial_after_delete_leaves_no_residue.
     fail(&BRANCH_MERGE_REWRITE_AFTER_DELETE_PRE_CONFIRM)?;
 
     // Index coverage is reconciler-owned derived state. As on the adopt path,
@@ -4883,7 +4879,7 @@ async fn publish_rewritten_merge_table(
 
 /// Reassemble one exact writer-defined chunk from a scanner whose batches are
 /// only upper-bounded. Lance may legally emit shorter batches at fragment/page
-/// boundaries; recovery transaction planning must not depend on that physical
+/// boundaries; transaction chunk planning must not depend on that physical
 /// choice. At most one bounded scanner batch plus one bounded output chunk is
 /// retained at a time.
 async fn next_exact_staged_chunk(
@@ -4934,7 +4930,7 @@ async fn next_exact_staged_chunk(
         .map_err(|_| OmniError::manifest_internal("branch merge chunk bytes exceed u64"))?;
     if chunk.num_rows() > KEYED_WRITE_MAX_ROWS || chunk_bytes > KEYED_WRITE_MAX_BYTES {
         return Err(OmniError::manifest_internal(format!(
-            "branch merge reconstructed a keyed chunk outside its armed bound: {} rows / {chunk_bytes} bytes",
+            "branch merge reconstructed a keyed chunk outside its planned bound: {} rows / {chunk_bytes} bytes",
             chunk.num_rows()
         )));
     }
@@ -5052,7 +5048,7 @@ async fn commit_keyed_stream_chunks(
     }
     if has_extra_rows || observed_rows != expected_row_count {
         return Err(OmniError::manifest_internal(format!(
-            "branch merge table '{table_key}' streamed {observed_rows} keyed entities against an armed plan for {}",
+            "branch merge table '{table_key}' streamed {observed_rows} keyed entities against a plan for {}",
             expected_row_count
         )));
     }
@@ -5061,7 +5057,7 @@ async fn commit_keyed_stream_chunks(
 
 decide_seam! {
     /// After one bounded strict-insert chunk committed while at least one later
-    /// chunk from the same Armed BranchMerge transaction chain remains.
+    /// chunk from the same detached BranchMerge transaction chain remains.
     pub static BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS = ("branch_merge.adopt_between_insert_chunks", BranchMerge, [Fail]);
 }
 
@@ -5141,7 +5137,7 @@ decide_seam! {
 
 /// Apply an [`AdoptDelta`] onto the target's base lineage (the fast-forward /
 /// target-owns path). Both this path and general three-way publication retain
-/// separate insert, update, and delete payloads. Their recovery windows remain
+/// separate insert, update, and delete payloads. Their failure windows remain
 /// explicit because a partial transaction chain must not become graph-visible.
 ///
 /// The captured target transaction selects the target's own table lineage,
@@ -5156,8 +5152,8 @@ async fn publish_adopted_delta(
     prepared_target: Option<PreparedExistingMergeTarget>,
     expected_version: u64,
 ) -> Result<(crate::db::DatasetUpdate, MergeChain)> {
-    // Existing refs consume the same handle verified before Phase A. Only a
-    // first-touch target creates a ref here, under its armed recovery identity.
+    // Existing refs consume the same handle verified under the final gates.
+    // Only a first-touch target creates a ref here.
     let (mut current_ds, full_path, table_branch) = match prepared_target {
         Some(prepared) => prepared.into_parts(),
         None => {
@@ -5187,10 +5183,10 @@ async fn publish_adopted_delta(
     }
 
     // Failpoint: crash after the Phase 1a strict-insert commit, before the upsert.
-    // Models a partial Phase B — inserts are on Lance HEAD but the upserts/deletes
-    // have not committed and the achieved-version intent has not been recorded, so
-    // recovery must roll BACK (not publish the inserts-only state). See
-    // tests/failpoints.rs::branch_merge_adopt_partial_after_append_rolls_back.
+    // Models a partial chain — inserts are committed detached but the
+    // upserts/deletes are not, and nothing is published, so the inserts-only
+    // state never becomes visible and the chain is garbage. See
+    // tests/failpoints.rs::branch_merge_adopt_partial_after_append_leaves_no_residue.
     fail(&BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT)?;
 
     // Phase 1b: update the CHANGED rows. Classification proved these ids present
@@ -5198,8 +5194,8 @@ async fn publish_adopted_delta(
     // insertion and fails closed if final staging cannot update every id. The
     // changed ids are disjoint from the inserted ids (each id is classified into
     // exactly one of new / changed / deleted / unchanged in the single ordered
-    // walk). Every logical data step uses the next identity in the exact
-    // transaction chain armed before Phase B.
+    // walk). Every logical data step commits the next link of the detached
+    // transaction chain.
     if let Some(upsert_table) = &delta.upserts {
         current_ds = commit_staged_keyed_chunks(
             target_db,
@@ -5215,10 +5211,10 @@ async fn publish_adopted_delta(
     }
 
     // Failpoint: crash after the Phase 1b upsert commit, before the delete.
-    // Models a partial Phase B — inserts + upserts are on Lance HEAD but the delete
-    // has not committed and the achieved-version intent has not been recorded, so
-    // recovery must roll BACK. See
-    // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_rolls_back.
+    // Models a partial chain — inserts + upserts are committed detached but the
+    // delete is not, and nothing is published, so the graph is unchanged and
+    // the chain is garbage. See
+    // tests/failpoints.rs::branch_merge_adopt_partial_after_upsert_leaves_no_residue.
     fail(&BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE)?;
 
     // Phase 2: delete removed rows via row/byte-bounded deletion-vector
@@ -5344,7 +5340,7 @@ decide_seam! {
 
 decide_seam! {
     /// Candidate classification and validation have completed, before the
-    /// final source/target table-gate envelope and recovery arm. Tests use this
+    /// final source/target table-gate envelope and first effect. Tests use this
     /// boundary to prove a raw source-table ref delete/recreate cannot pass as
     /// the native incarnation whose immutable rows were proven.
     pub static BRANCH_MERGE_POST_CANDIDATE_VALIDATION = ("branch_merge.post_candidate_validation", BranchMerge, [Fail]);
@@ -5384,7 +5380,7 @@ impl Omnigraph {
             actor_id,
         )?;
         self.ensure_schema_apply_idle("branch_merge").await?;
-        // Keep the recovery/planning future out of the public API's callers;
+        // Keep the planning/publication future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.
         Box::pin(self.branch_merge_impl(source, target, actor_id)).await
@@ -5505,12 +5501,11 @@ impl Omnigraph {
         let relevant_branches = [source_branch.as_deref(), target_branch.as_deref()];
         // Branch merge is still a legacy per-table publisher, but its graph-ref
         // authority must be stable for the complete prepare -> publish window.
-        // First converge or reject relevant recovery intent, then join the same
-        // root-shared schema -> branch order used by native branch controls.
+        // First install any pending schema contract of this handle, then join the
+        // same root-shared schema -> branch order used by native branch controls.
         // Holding both branch gates through publication prevents a target
         // delete/recreate from reusing the branch name underneath a plan (ABA).
-        self.heal_pending_recovery_sidecars_for_write(&relevant_branches)
-            .await?;
+        self.settle_pending_schema_install().await?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -5519,8 +5514,6 @@ impl Omnigraph {
             .write_queue()
             .acquire_branches(&[source_branch.clone(), target_branch.clone()])
             .await;
-        self.ensure_no_pending_recovery_sidecars_under_gates(&relevant_branches, "branch_merge")
-            .await?;
         self.ensure_schema_apply_not_locked("branch_merge").await?;
         // Capture each branch as one coherent RFC-022 authority token plus
         // immutable snapshot. The target token is the coarse publish read set;
@@ -5575,7 +5568,7 @@ impl Omnigraph {
         outer_prepare_timing.finish();
         // Keep the deliberately large merge planner/publisher state out of the
         // operation shell's generated future. The inner operation composes
-        // ordered typed comparison, Blob materialization, validation, recovery,
+        // ordered typed comparison, Blob materialization, validation, staging,
         // and publication; carrying that state inline makes debug builds retain
         // large construction/projection temporaries across the shell's guards
         // and completion path. Boxing at this natural ownership boundary changes
@@ -5600,8 +5593,8 @@ impl Omnigraph {
         // folded its new snapshot and lineage into this same coordinator; an
         // unconditional coordinator refresh would only repeat durable reads. On an
         // error, refresh best-effort in case the durable publish landed but its
-        // acknowledgement was lost. Use the coordinator-only refresh so an
-        // in-flight recovery sidecar is never consumed by its own writer.
+        // acknowledgement was lost. Use the coordinator-only refresh: the full
+        // `refresh` reacquires the schema gate this task still holds.
         if target_was_active && merge_result.is_err() {
             if let Err(refresh_err) = self.refresh_coordinator_only().await {
                 tracing::warn!(
@@ -5647,7 +5640,7 @@ impl Omnigraph {
         ordered_table_keys.sort();
 
         let mut conflicts = Vec::new();
-        // Adopt planning, sidecar pins, and first-touch opens name the
+        // Adopt planning, table pins, and first-touch opens name the
         // target's forks by native ref; queue keys, gates, and lineage keep
         // the logical branch name.
         let target_active = captured_merge_target_ref(target_txn)?.map(str::to_string);
@@ -5757,8 +5750,8 @@ impl Omnigraph {
                         // forged/legacy interval. Keep it on the general adopt
                         // writer: its bounded chunk cache reads each normalized
                         // range once. The certified planner intentionally scans
-                        // its source twice (pre-arm chunk sizing + post-arm
-                        // publish), which would duplicate external object GETs.
+                        // its source twice (pre-effect chunk sizing + publish),
+                        // which would duplicate external object GETs.
                         tracing::debug!(
                             table_key,
                             "pure-insert history retained external Blob descriptors; using the general cached adopt path"
@@ -5954,21 +5947,18 @@ impl Omnigraph {
         }
         fail(&BRANCH_MERGE_POST_CANDIDATE_VALIDATION)?;
 
-        // Recovery sidecar: protect the complete physical effect set. Every
-        // `RewriteMerged` / `AdoptWithDelta` logical data step receives a
-        // pre-minted, sequential Lance transaction identity and commits with
-        // transparent retries disabled. Ref-only `AdoptSourceState` candidates
-        // have no data transaction, but a first-touch native target ref is still
-        // an independently durable v4 effect. Pointer-only manifest updates need
-        // no physical pin; they remain in the complete intended delta so a
-        // sibling effect's recovery publishes the merge atomically.
+        // Every `RewriteMerged` / `AdoptWithDelta` / `AdoptPureInserts` logical
+        // data step commits one detached link of its table's chain (RFC 0067).
+        // Ref-only `AdoptSourceState` candidates have no data transaction, and
+        // their pointer-only manifest updates publish in the same manifest CAS
+        // as every chain's pin, so the merge becomes visible atomically.
         //
         // This bridge still coexists with legacy maintenance writers that take
         // only `(table, branch)` queues. Acquire the conservative all-catalog
         // envelope for BOTH source and target, in the global sorted order, then
-        // re-run the sidecar barrier and re-read both manifest branches before
-        // Phase A. Planning remains outside table queues, but no plan derived
-        // from a stale source/target snapshot can cross into physical effects.
+        // re-read both manifest branches before the first effect. Planning
+        // remains outside table queues, but no plan derived from a stale
+        // source/target snapshot can cross into physical effects.
         let final_revalidation_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::FinalRevalidation,
         );
@@ -5980,11 +5970,6 @@ impl Omnigraph {
         let merge_queue_keys = self.table_queue_keys_for_branches(&merge_branches, catalog);
         let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
 
-        self.ensure_no_pending_recovery_sidecars_under_gates(
-            &[source_branch, target_branch],
-            "branch_merge after acquiring source/target table gates",
-        )
-        .await?;
         // Re-read both inputs against one accepted schema contract. Target
         // authority remains exact; source head movement is harmless, but its
         // native ref incarnation and schema identity must remain stable.

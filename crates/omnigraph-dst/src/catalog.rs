@@ -1,5 +1,5 @@
 //! The full crash-window catalog for the hunt
-//! (`dst_hunt_crash_window_sweep`): 73 of the engine's decision seams
+//! (`dst_hunt_crash_window_sweep`): 61 of the engine's decision seams
 //! (`omnigraph::seams::catalog`) at the pinned engine version. A seam added
 //! to the engine enters here as never-reached until its workload exists.
 //!
@@ -7,9 +7,9 @@
 //! be a name the engine catalog declares, so a typo'd or renamed-away window
 //! fails the suite instead of compiling and silently never firing.
 
-pub const CRASH_WINDOWS: [&str; 73] = [
+pub const CRASH_WINDOWS: [&str; 61] = [
     "blob_read.post_capture",
-    "branch_control.post_recovery_barrier",
+    "branch_control.pre_gates",
     "branch_create.post_native",
     "branch_delete.post_native",
     "branch_delete.post_table_gates",
@@ -25,7 +25,7 @@ pub const CRASH_WINDOWS: [&str; 73] = [
     "branch_merge.rewrite_after_delete_pre_confirm",
     "branch_merge.rewrite_after_merge_pre_delete",
     "classify.fresh_read",
-    "cleanup.post_recovery_check_pre_gates",
+    "cleanup.pre_gates",
     "cleanup.reconcile_fork",
     "cleanup.resolve_branch_snapshot",
     "cleanup.table_gc",
@@ -56,20 +56,8 @@ pub const CRASH_WINDOWS: [&str; 73] = [
     "optimize.post_table_effect",
     "optimize.post_authority_capture_pre_gates",
     "optimize.post_phase_b_pre_manifest_commit",
-    "optimize.post_recovery_check_pre_main_gate",
     "publish.load_state",
     "read.refresh_post_state_pre_lineage",
-    "recovery.before_roll_forward_publish",
-    "recovery.orphan_discard_audit_append",
-    "recovery.post_list_pre_gates",
-    "recovery.post_rollback_publish_pre_audit",
-    "recovery.post_sidecar_list_pre_read",
-    "recovery.post_table_restore_pre_publish",
-    "recovery.record_audit",
-    "recovery.sidecar_confirm",
-    "recovery.sidecar_delete",
-    "recovery.sidecar_list",
-    "recovery.sidecar_write",
     "schema_apply.after_manifest_commit",
     "schema_apply.after_staging_write",
     "schema_apply.before_staging_write",

@@ -781,8 +781,7 @@ impl Omnigraph {
     /// internally retried — when the local authoritative check observes a
     /// mismatch. This is not a distributed lease: an unsupported foreign
     /// writer that races after that check is rejected by the exact publisher,
-    /// but may require recovery after table effects and therefore returns
-    /// [`OmniError::RecoveryRequired`]. All other error behavior matches
+    /// which leaves the graph unchanged. All other error behavior matches
     /// [`Self::mutate_as`].
     pub async fn mutate_as_with_expected_head(
         &self,
@@ -930,18 +929,16 @@ impl Omnigraph {
         if let Some(name) = requested.as_deref() {
             crate::db::ensure_public_branch_ref(name, "mutate")?;
         }
-        // Stage A: converge any roll-forward-eligible sidecars, then close the
-        // barrier on every unresolved intent for this graph branch. This MUST
-        // run before `open_write_txn`: healing may advance the manifest, and a
-        // deferred Armed intent remains ownership even when no table HEAD moved.
-        self.heal_pending_recovery_sidecars_for_write(&[requested.as_deref()])
-            .await?;
-        // Capture one branch-wide write authority after the recovery barrier:
-        // native branch identity, exact optional graph head, accepted schema
-        // identity/catalog, and the base table snapshot. Execution, validation,
-        // staging, and publication all use this immutable attempt. `commit_all`
-        // revalidates the complete token under the root-shared schema → branch →
-        // sorted-table gates before it arms recovery or advances Lance HEAD.
+        // Install this handle's published-but-uninstalled schema contract, if
+        // any. This MUST run before `open_write_txn`, which captures the
+        // accepted schema identity and catalog.
+        self.settle_pending_schema_install().await?;
+        // Capture one branch-wide write authority: native branch identity,
+        // exact optional graph head, accepted schema identity/catalog, and the
+        // base table snapshot. Execution, validation, staging, and publication
+        // all use this immutable attempt. `commit_all` revalidates the complete
+        // token under the root-shared schema → branch → sorted-table gates
+        // before its first detached commit.
         let mut txn = self.open_write_txn(requested.as_deref()).await?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
@@ -962,10 +959,10 @@ impl Omnigraph {
         // Per-query staging accumulator. Inserts and updates push batches into
         // `pending`; deletes push predicates into `delete_predicates`. At the
         // boundary, `stage_all` prepares one exact transaction per touched table
-        // and `commit_all` records those identities in a durable schema-v3
-        // recovery intent before independently advancing the table HEADs. The
-        // publisher then makes the complete result graph-visible in one manifest
-        // CAS. Branch is threaded explicitly — no coordinator swap.
+        // and `commit_all` commits each as a detached version of its pinned
+        // base (RFC 0067). The publisher then makes the complete result
+        // graph-visible in one manifest CAS. Branch is threaded explicitly — no
+        // coordinator swap.
         let mut staging = MutationStaging::default();
 
         // Lower + validate up front so the touched-dataset set is known before
@@ -1027,9 +1024,9 @@ impl Omnigraph {
                 // `_queue_guards` holds the root-shared schema gate, branch
                 // effect gate, and sorted table gates acquired by `commit_all`.
                 // They remain held through manifest publication, covering the
-                // complete same-process sidecar/effect lifetime. They are a
-                // local serialization aid; the exact publisher precondition and
-                // durable v3 recovery plan remain the correctness authorities.
+                // complete same-process effect lifetime. They are a local
+                // serialization aid; the exact publisher precondition remains
+                // the correctness authority.
                 let super::staging::CommittedMutation {
                     updates,
                     expected_versions,
@@ -1038,13 +1035,11 @@ impl Omnigraph {
                 } = staged
                     .commit_all(self, requested.as_deref(), &txn, &lineage_intent)
                     .await?;
-                // Failpoint for the confirmed-effects → publisher boundary:
-                // table HEADs have advanced but graph visibility has not. The
-                // v3 sidecar already contains exact transaction identities,
-                // immutable manifest delta, and fixed lineage/rollback outcomes.
-                // Any failure from here is `RecoveryRequired`; synchronous heal
-                // or a read-write open converges the recorded outcome. See
-                // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
+                // Failpoint for the detached-effects → publisher boundary:
+                // every table effect is committed detached but nothing is
+                // graph-visible. A failure here leaves the graph unchanged and
+                // the detached versions as reclaimable garbage. See
+                // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
                 fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
                 let publish_result = self
                     .commit_updates_on_branch_with_expected(

@@ -83,7 +83,7 @@ pub(crate) struct TableVersionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     table_fork_owner: Option<String>,
     /// RFC 0067: the detached Lance version this pin was staged
-    /// as before publication. `None` on pins published by the sidecar path.
+    /// as before publication. `None` on a linear pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     staged_version: Option<u64>,
     /// RFC 0067: the uuid of the staged transaction; promotion

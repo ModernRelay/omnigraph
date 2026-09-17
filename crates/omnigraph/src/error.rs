@@ -183,7 +183,7 @@ pub enum OmniError {
         /// after an effect-free substrate conflict.
         entity_id: Option<String>,
     },
-    /// A write was rejected before recovery was armed because its bounded
+    /// A write was rejected before publication because its bounded
     /// physical plan would exceed an explicit safety ceiling. This is a
     /// retryable input-shaping error, not a partial-success signal.
     #[error("resource limit exceeded for {resource}: actual {actual}, limit {limit}")]
@@ -248,11 +248,12 @@ pub enum OmniError {
     /// A managed Blob range used reversed or out-of-bounds coordinates.
     #[error("blob range [{start}, {end}) is not satisfiable for a value of length {length}")]
     BlobRangeNotSatisfiable { start: u64, end: u64, length: u64 },
-    /// A durable recovery intent overlaps this write. Its physical effects may
-    /// already have landed, or it may still be armed before its first effect;
-    /// either way the sidecar named by `operation_id` must be resolved before
-    /// the caller retries. Treating this as ordinary OCC would let a writer
-    /// advance around unresolved commit ownership.
+    /// The graph commit named by `operation_id` is published but its schema
+    /// contract is not installed yet: schema apply or the system-column
+    /// upgrade failed after its manifest commit, or a read-only open found the
+    /// staged contract pending. A read-write open or the next write on the
+    /// publishing handle installs it. Treating this as ordinary OCC would
+    /// retry a change that is already committed.
     #[error("recovery required for operation {operation_id}: {reason}")]
     RecoveryRequired {
         operation_id: String,

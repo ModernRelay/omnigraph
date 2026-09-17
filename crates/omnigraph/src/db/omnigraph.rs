@@ -51,9 +51,6 @@ pub use system_column_upgrade::{
     SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
 };
-pub(crate) use system_column_upgrade::{
-    render_system_column_upgrade_target, system_column_renames,
-};
 pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
@@ -214,7 +211,7 @@ pub struct Omnigraph {
     table_store: TableStore,
     runtime_cache: RuntimeCache,
     /// RFC 0067: this handle's schema apply published its manifest commit but
-    /// could not install the schema contract. The next write-entry heal on
+    /// could not install the schema contract. The next write entry on
     /// this handle installs it from the staged copy; other handles and
     /// processes converge at their next read-write open.
     pending_schema_install: std::sync::atomic::AtomicBool,
@@ -249,8 +246,9 @@ pub struct Omnigraph {
     /// canonical local root identity (or opaque remote URI) in the process.
     /// Reachable from engine internals
     /// (mutation finalize, schema_apply, branch_merge, ensure_indices, fork
-    /// paths, and both live/open-time recovery). Sharing across independently
-    /// opened handles is required because Restore/ref deletion is destructive.
+    /// paths, and the open-time staged-contract pass). Sharing across
+    /// independently opened handles is required because ref deletion is
+    /// destructive.
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
     /// One hot non-bound authority coordinator, shared by merge preparation
     /// and branch-source capture, so repeated operations stop paying a fresh
@@ -302,20 +300,21 @@ pub struct Omnigraph {
     embedding_config: Option<Arc<crate::embedding::EmbeddingConfig>>,
 }
 
-/// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
+/// Whether [`Omnigraph::open`] settles a staged schema contract on open.
 ///
-/// Recovery requires Lance writes (`Dataset::restore`, `ManifestBatchPublisher::publish`).
+/// Settling writes: it installs or discards the staged contract files and
+/// reclaims a stale schema-apply sentinel.
 /// Read-only consumers — NDJSON export, `commit list`, `read`, schema
 /// inspection — should not trigger writes (they may run with read-only
 /// object-store credentials, and silent open-time mutations are
-/// surprising). They also don't need recovery: reads always resolve
+/// surprising). Table data needs no open-time pass: reads always resolve
 /// through the manifest pin, which is the consistent snapshot regardless
-/// of any Phase B → Phase C drift on the per-table side.
+/// of any pending promotion on the per-table side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
-    /// Run the recovery sweep on open. Default for `Omnigraph::open`.
+    /// Settle a staged schema contract on open. Default for `Omnigraph::open`.
     ReadWrite,
-    /// Skip the recovery sweep. Use for read-only consumers via
+    /// Perform no open-time writes. Use for read-only consumers via
     /// [`Omnigraph::open_read_only`].
     ReadOnly,
 }
@@ -338,15 +337,14 @@ pub struct InitOptions {
 
 decide_seam! {
     /// Branch delete holds the schema, target-branch, and fresh-catalog table
-    /// envelope and has completed its final recovery check, before the native
-    /// manifest-ref mutation.
+    /// envelope, before the native manifest-ref mutation.
     pub static BRANCH_DELETE_POST_TABLE_GATES = ("branch_delete.post_table_gates", BranchDelete, [Fail]);
 }
 
 decide_seam! {
-    /// After native branch control completed its first recovery barrier, before
-    /// it acquires schema -> branch -> table gates and performs the final check.
-    pub static BRANCH_CONTROL_POST_RECOVERY_BARRIER = ("branch_control.post_recovery_barrier", AnyWrite, [Fail]);
+    /// After native branch control settled this handle's pending schema
+    /// install, before it acquires its schema -> branch -> table gates.
+    pub static BRANCH_CONTROL_PRE_GATES = ("branch_control.pre_gates", AnyWrite, [Fail]);
 }
 
 decide_seam! {
@@ -690,13 +688,13 @@ impl Omnigraph {
     /// Open an existing graph (read-write).
     ///
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
-    /// Runs the open-time recovery sweep before returning — see [`OpenMode`].
+    /// Settles a staged schema contract before returning — see [`OpenMode`].
     pub async fn open(uri: &str) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
     /// Open an existing graph for read-only consumers (NDJSON export,
-    /// `commit list`, etc.). Skips the recovery sweep — see [`OpenMode`].
+    /// `commit list`, etc.). Performs no open-time writes — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
@@ -750,20 +748,20 @@ impl Omnigraph {
         crate::db::manifest::read_supported_internal_schema_version(&root).await?;
         // Hold the same schema gate through format preflight and contract
         // capture. A v3 live or staged IR must refuse before the local write
-        // probe, coordinator open, or either recovery sweep can change files.
+        // probe, coordinator open, or the staged-contract pass can change files.
         let schema_contract_guard = write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
             .await;
         crate::db::schema_state::refuse_unsupported_schema_versions(&root, storage.as_ref())
             .await?;
-        // Read-write opens write before the first user mutation (recovery
-        // sweeps, schema-stamp migration), and every write needs atomic
-        // create-if-absent; read-only opens perform no writes.
+        // Read-write opens write before the first user mutation (the
+        // staged-contract pass, schema-stamp migration), and every write needs
+        // atomic create-if-absent; read-only opens perform no writes.
         if matches!(mode, OpenMode::ReadWrite) {
             verify_local_create_if_absent(&root, storage.as_ref()).await?;
         }
-        // Open the coordinator first so the schema-staging recovery sweep can
-        // compare its snapshot against any leftover staging files.
+        // Open the coordinator first so the staged-contract pass can compare
+        // its snapshot against any leftover staging files.
         let control_session = lance_access.control_session();
         let mut coordinator =
             GraphCoordinator::open_with_session(&root, Arc::clone(&storage), &control_session)
@@ -773,26 +771,29 @@ impl Omnigraph {
         // schema gate from its final coordinator refresh through the complete
         // source/IR/state read and catalog construction. Otherwise an open can
         // observe a partial promotion, or publish an old catalog after a live
-        // apply completed. ReadOnly still performs no recovery writes; this gate
+        // apply completed. ReadOnly still performs no writes; this gate
         // only serializes its read with an in-process publisher.
-        // Refresh under the continuously held gate before either recovery or
-        // contract capture, preserving the coherent snapshot boundary.
+        // Refresh under the continuously held gate before either the
+        // staged-contract pass or contract capture, preserving the coherent
+        // snapshot boundary.
         coordinator.refresh().await?;
-        // Both the schema-state recovery sweep AND the manifest-drift
-        // recovery sweep are gated on `OpenMode::ReadWrite`. Read-only
-        // consumers (NDJSON export, `commit list`, schema show) shouldn't
-        // trigger object-store mutations: they may run with read-only
-        // credentials, and silent open-time writes are surprising. Both
-        // sweeps' work is recoverable on the next ReadWrite open. ReadOnly
-        // still performs the non-mutating coherence proof below: an exact
-        // SchemaApply manifest outcome cannot be served with the old schema
-        // contract merely because promotion is pending.
+        // The staged-contract pass is gated on `OpenMode::ReadWrite`.
+        // Read-only consumers (NDJSON export, `commit list`, schema show)
+        // shouldn't trigger object-store mutations: they may run with
+        // read-only credentials, and silent open-time writes are surprising.
+        // The next ReadWrite open does the work. ReadOnly still performs the
+        // non-mutating coherence proof below: a published SchemaApply
+        // manifest outcome cannot be served with the old schema contract
+        // merely because installation is pending.
         if matches!(mode, OpenMode::ReadWrite) {
-            // Schema staging is itself mutable recovery state. Hold the shared
-            // schema gate across BOTH its file pre-pass and the complete Full
-            // sidecar sweep, so the schema staging decision cannot go stale in a
-            // release/reacquire gap. The sweep adds branch → sorted table gates
-            // per sidecar under this outer guard.
+            // A sidecar under `__recovery/` can only come from a build that
+            // predates detached table commits (RFC 0067); this build cannot
+            // interpret one, so refuse before the staged-contract pass.
+            crate::db::manifest::refuse_legacy_sidecars(&root, storage.as_ref(), "read-write open")
+                .await?;
+            // A staged schema contract names the graph commit that publishes
+            // it: install it when that commit is in lineage, discard it
+            // otherwise. The caller holds the shared schema gate.
             recover_schema_state_files(
                 &root,
                 Arc::clone(&storage),
@@ -800,10 +801,10 @@ impl Omnigraph {
                 SchemaStagingPolicy::PromoteOrDiscard,
             )
             .await?;
-            // RFC 0067: a crashed schema apply leaves its durable sentinel
-            // behind with no sidecar to retire it. The open-time pass above
-            // settled its staging, so the sentinel is stale under the same
-            // one-mutation-process boundary; reclaim it before the sweep.
+            // A crashed schema apply or system-column upgrade leaves its
+            // durable sentinel behind. The pass above settled its staging, so
+            // the sentinel is stale under the same one-mutation-process
+            // boundary; reclaim it.
             if coordinator
                 .all_branches()
                 .await?
@@ -813,31 +814,16 @@ impl Omnigraph {
                 tracing::warn!("reclaiming the schema apply sentinel left by a crashed apply");
                 coordinator.branch_delete(SCHEMA_APPLY_LOCK_BRANCH).await?;
             }
-            // Recovery sweep: close the Phase B → Phase C residual on
-            // any sidecar left over from a crashed writer. Long-running
-            // processes additionally converge in-process: the staged-
-            // write entry points and `refresh` run the roll-forward-only
-            // heal (`heal_pending_sidecars_roll_forward`); only
-            // rollback-eligible sidecars it can neither roll forward nor
-            // retire as provably effect-free wait for this open-time sweep.
-            crate::db::manifest::recover_manifest_drift(
-                &root,
-                Arc::clone(&storage),
-                &mut coordinator,
-                crate::db::manifest::RecoveryMode::Full,
-                write_queue.as_ref(),
-            )
-            .await?;
         } else {
-            // ReadOnly performs no repair, but it must not expose a manifest
-            // that already contains a fixed SchemaApply outcome with the old
-            // live schema contract. Exact v7 intents can prove coherence from
-            // lineage + schema identity; legacy intents fail closed until a
-            // read-write open resolves them.
-            crate::db::manifest::ensure_read_only_schema_coherent(&root, storage.as_ref()).await?;
+            // ReadOnly writes nothing, but it must not pair a manifest that
+            // already carries a published schema outcome with the old live
+            // contract; only a read-write open installs the staged one.
+            crate::db::schema_state::ensure_read_only_schema_coherent(&root, storage.as_ref())
+                .await?;
         }
         fail(&OPEN_BEFORE_SCHEMA_CONTRACT_READ)?;
-        // Read _schema.pg (post-recovery — may have just been renamed in).
+        // Read _schema.pg (after the staged-contract pass — it may have just
+        // been installed).
         // The stamp guard and coordinator open above both read `__manifest`,
         // so reaching this point proves that manifest is readable; it does not
         // prove every referenced data table exists. A missing schema source is
@@ -1213,8 +1199,6 @@ impl Omnigraph {
     }
 
     /// Engine-level access to the object-store adapter (S3 / local fs).
-    /// Used by the recovery sidecar protocol — writers in the engine
-    /// call this to write/delete sidecars at `__recovery/{ulid}.json`.
     pub(crate) fn storage_adapter(&self) -> &dyn crate::storage::StorageAdapter {
         self.storage.as_ref()
     }
@@ -1222,8 +1206,8 @@ impl Omnigraph {
     /// Root-scoped writer queues (schema, branch, and `(table, branch)` gates).
     ///
     /// Engine-internal writers (mutation finalize, schema_apply,
-    /// branch_merge, ensure_indices, maintenance, and live/open-time recovery)
-    /// reach the queue manager via this accessor. Independently
+    /// branch_merge, ensure_indices, and maintenance) reach the queue
+    /// manager via this accessor. Independently
     /// opened handles whose local paths resolve to the same canonical root (or
     /// whose remote URIs match) return the same manager.
     /// Returns an `Arc` clone so callers can hold the manager across
@@ -1232,8 +1216,7 @@ impl Omnigraph {
         Arc::clone(&self.write_queue)
     }
 
-    /// Engine-level access to the graph's normalized root URI. Used by
-    /// the recovery sidecar protocol to compute `__recovery/` paths.
+    /// Engine-level access to the graph's normalized root URI.
     pub(crate) fn root_uri(&self) -> &str {
         &self.root_uri
     }
@@ -1287,7 +1270,7 @@ impl Omnigraph {
         }
     }
 
-    /// Capture a source after the branch-control gates and recovery checks.
+    /// Capture a source after the branch-control gates and schema-state checks.
     /// Reuse only a view whose complete manifest incarnation still matches;
     /// the returned coordinator belongs to this operation and never changes
     /// the handle's active branch. A miss uses the existing bounded authority
@@ -1796,7 +1779,7 @@ impl Omnigraph {
     }
 
     /// Revalidate a prepared mutation/load attempt after its branch/table
-    /// gates are held and before recovery is armed or any Lance HEAD advances.
+    /// gates are held and before any table effect.
     pub(crate) async fn revalidate_write_txn(&self, txn: &WriteTxn) -> Result<Snapshot> {
         // `commit_all` calls this while holding schema → branch → table gates.
         // Recheck the durable sentinel inside that critical section so a schema
@@ -1990,264 +1973,113 @@ impl Omnigraph {
         *self.feed_cut_cache.write().await = None;
     }
 
-    /// Re-read the handle-local coordinator state from storage AND run
-    /// in-process recovery. Closes the Phase B → Phase C residual (e.g.
-    /// `MutationStaging::finalize` crash mid-publish in a long-running
-    /// server) without restart.
+    /// Re-read the handle-local coordinator state from storage and install a
+    /// published schema contract another writer left staged, without restart.
     ///
-    /// Composition mirrors `Omnigraph::open_with_storage_and_mode`'s
-    /// recovery sequence, in the same order, with one restriction: the
-    /// manifest-drift heal runs in `RollForwardOnly` mode (rollback /
-    /// abort cases defer to the next ReadWrite open because
-    /// `Dataset::restore` is unsafe under concurrency). Each step:
+    /// 1. `coordinator.refresh()` re-reads the manifest.
+    /// 2. `recover_schema_state_files` in promote-only mode installs a staged
+    ///    contract whose publishing commit is already in lineage (RFC 0067)
+    ///    and leaves anything else alone, since the apply that staged it may
+    ///    still be live. A pending pin needs no pass here: reads resolve it
+    ///    through its staged version and the next writer promotes it.
+    /// 3. The schema view reloads if the source changed and the read caches
+    ///    drop.
     ///
-    /// 1. `coordinator.refresh()` — re-read manifest.
-    /// 2. `recover_schema_state_files` — complete an in-flight
-    ///    schema_apply's staging→final rename if a SchemaApply sidecar
-    ///    is on disk; idempotent + early-returns when no staging files
-    ///    exist. Required BEFORE manifest-drift recovery so a
-    ///    SchemaApply roll-forward doesn't publish the manifest while
-    ///    the staging files remain unrenamed (which would corrupt the
-    ///    graph: data on new schema, catalog on old).
-    /// 3. `heal_pending_sidecars_roll_forward` — close the
-    ///    finalize→publisher residual via roll-forward; defer rollback
-    ///    work to next ReadWrite open. Serializes against live writers
-    ///    by acquiring each sidecar's root-scoped schema → branch → sorted
-    ///    table gates, so refresh never rolls forward an in-flight writer's
-    ///    sidecar from under it, even from another handle.
-    /// 4. `runtime_cache.invalidate_all` — drop stale per-snapshot caches.
-    ///
-    /// Steady-state cost: two empty `list_dir` probes of `__recovery/` (the
-    /// standalone schema-staging guard and the sidecar healer). No additional
-    /// Lance reads.
-    ///
-    /// The staged-write entry points (`load_as`, `mutate_as`) run the
-    /// same heal via
-    /// [`heal_pending_recovery_sidecars`](Self::heal_pending_recovery_sidecars),
-    /// so a long-lived server converges on the next write without an
-    /// explicit refresh. Engine-internal callers that already hold an
-    /// in-flight sidecar (e.g. `schema_apply` mid-write) MUST use
-    /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
-    /// avoid the recovery sweep racing their own sidecar.
+    /// Steady-state cost: the staged-contract probe; no `__recovery/` listing
+    /// and no additional Lance reads. Engine-internal callers that hold the
+    /// schema gate MUST use
+    /// [`refresh_coordinator_only`](Self::refresh_coordinator_only).
     pub async fn refresh(&self) -> Result<()> {
-        // Standalone schema-staging reconcile ONLY when no recovery
-        // sidecar exists (legacy/manual staging residue). When sidecars
-        // exist, the heal below owns the reconcile — per SchemaApply
-        // sidecar, under that sidecar's queue guards — because an
-        // unserialized reconcile can promote a LIVE schema apply's
-        // staging files from under it, and a pre-promoted result would
-        // make the heal's own guarded reconcile see clean staging and
-        // wrongly defer the sidecar. The no-sidecar case cannot race a
-        // live apply: its sidecar is on disk before its staging files.
-        //
-        // Scope the coord write guard to the schema-state section only.
-        // `reload_schema_if_source_changed` (below) acquires
-        // `self.coordinator.read().await` when the on-disk schema source
-        // has drifted from the cached `schema_source`. Tokio's RwLock is
-        // not reentrant, so holding the write across that call deadlocks.
-        // Pinned by `composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
-        // The heal also takes the locks itself (schema → branch → tables →
-        // coordinator), so it must run after this guard is released.
         {
-            // Hold the schema-apply serialization key across the
-            // list-then-reconcile pair: without it, a live apply can
-            // write its sidecar + staging between the empty check and
-            // the reconcile (the same race, through a smaller window).
-            // Queue before coordinator — the documented lock order.
-            //
-            // Liveness note: with a pending NON-SchemaApply sidecar
-            // (e.g. a Mutation residual), this gate skips the standalone
-            // reconcile and the heal below reconciles only per
-            // SchemaApply sidecar — so pre-sidecar-era orphaned staging
-            // residue waits for the NEXT refresh after the sidecars are
-            // consumed. Convergence holds, one pass late. Do not "fix"
-            // by re-running the reconcile unserialized here: that is
-            // exactly the live-apply race this block exists to close.
+            // Queue before coordinator: the documented lock order. The schema
+            // gate keeps a live apply's staging writes and this pass apart.
+            // Scope the coordinator write guard to this block:
+            // `reload_schema_if_source_changed` takes the coordinator read
+            // lock, and Tokio's RwLock is not reentrant. Pinned by
+            // `composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
             let _serial = self
                 .write_queue
                 .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
                 .await;
-            if crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref())
-                .await?
-                .is_empty()
+            let mut coord = self.coordinator.write().await;
+            coord.refresh().await?;
+            let outcome = recover_schema_state_files(
+                &self.root_uri,
+                Arc::clone(&self.storage),
+                &coord.snapshot(),
+                SchemaStagingPolicy::PromoteOnly,
+            )
+            .await?;
+            // An installed staging completes a published apply whose writer
+            // died before releasing its sentinel; release it here so the
+            // caller's write is not refused until the next open.
+            if matches!(outcome, SchemaStateRecovery::Promoted)
+                && coord
+                    .all_branches()
+                    .await?
+                    .iter()
+                    .any(|branch| is_schema_apply_lock_branch(branch))
             {
-                let mut coord = self.coordinator.write().await;
-                coord.refresh().await?;
-                let outcome = recover_schema_state_files(
-                    &self.root_uri,
-                    Arc::clone(&self.storage),
-                    &coord.snapshot(),
-                    SchemaStagingPolicy::PromoteOnly,
-                )
-                .await?;
-                // A promoted staging completes a published apply whose writer
-                // died before releasing its sentinel; release it here so the
-                // caller's write is not refused until the next open.
-                if matches!(outcome, SchemaStateRecovery::Promoted)
-                    && coord
-                        .all_branches()
-                        .await?
-                        .iter()
-                        .any(|branch| is_schema_apply_lock_branch(branch))
-                {
-                    coord.branch_delete(SCHEMA_APPLY_LOCK_BRANCH).await?;
-                }
+                coord.branch_delete(SCHEMA_APPLY_LOCK_BRANCH).await?;
             }
-        } // ← guards released before the heal's queue acquisition
-        let _outcome = crate::db::manifest::heal_pending_sidecars_roll_forward(
-            &self.root_uri,
-            Arc::clone(&self.storage),
-            &self.coordinator,
-            &self.write_queue,
-        )
-        .await?;
+        }
         self.reload_schema_if_source_changed().await?;
         self.invalidate_read_caches().await;
         Ok(())
     }
 
-    /// Broad write-entry heal: converge any roll-forward-eligible recovery
-    /// sidecars, retire provably effect-free Armed mutation/load intents
-    /// (issue #554), and leave the remaining rollback-eligible intents for the
-    /// next ReadWrite open.
-    ///
-    /// Schema apply calls this broad barrier before acquiring its schema gate;
-    /// exact adapters then relist and revalidate relevant recovery and authority
-    /// under their own ordered effect gates. Mutation/load, branch merge, and
-    /// EnsureIndices use
-    /// [`heal_pending_recovery_sidecars_for_write`](Self::heal_pending_recovery_sidecars_for_write)
-    /// to reject relevant unresolved intents before capturing a base or plan.
-    ///
-    /// Steady-state cost here is one `list_dir` of `__recovery/` (typically
-    /// empty → immediate return). Exact adapters perform a second check under
-    /// their effect gates to close the post-prepare race. See
-    /// `recovery::heal_pending_sidecars_roll_forward` for the
-    /// concurrency contract (root-scoped ordered gate acquisition).
-    pub(crate) async fn heal_pending_recovery_sidecars(&self) -> Result<()> {
-        let _outcome = self.heal_pending_recovery_sidecars_outcome().await?;
-        Ok(())
-    }
-
-    /// RFC-022 synchronous write/control recovery barrier. Run the live-safe
-    /// healer, then reject any guarded unresolved intent on a relevant graph branch. A
-    /// SchemaApply intent is graph-global because it changes the accepted schema
-    /// identity used by every branch.
-    ///
-    /// `relevant_branches` must use the engine convention (`None` = main), but
-    /// this helper defensively folds `Some("main")` as well so load's explicit
-    /// base representation cannot create a second main identity.
-    pub(crate) async fn heal_pending_recovery_sidecars_for_write(
-        &self,
-        relevant_branches: &[Option<&str>],
-    ) -> Result<()> {
-        let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
-        let blocking = outcome.unresolved.iter().find(|intent| {
-            intent.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
-                || relevant_branches
-                    .iter()
-                    .any(|branch| branch.filter(|name| *name != "main") == intent.branch.as_deref())
-        });
-        if let Some(intent) = blocking {
-            let dataset_scope = if intent.table_keys.is_empty() {
-                "no dataset pins".to_string()
-            } else {
-                format!(
-                    "datasets {}",
-                    intent
-                        .table_keys
-                        .iter()
-                        .map(|type_key| crate::error::dataset_subject(type_key))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            return Err(OmniError::recovery_required(
-                intent.operation_id.clone(),
-                format!(
-                    "pending {:?} recovery operation on branch '{}' blocks the synchronous \
-                     write/control recovery barrier ({dataset_scope}); reopen the graph \
-                     read-write before retrying",
-                    intent.writer_kind,
-                    intent.branch.as_deref().unwrap_or("main"),
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Branch-delete recovery barrier.
-    ///
-    /// An unresolved sidecar on the branch being deleted is not a reason to
-    /// wedge deletion forever: once the native manifest ref is removed, that
-    /// sidecar's table effects are unreachable and the recovery sweep records an
-    /// orphan-discard audit. Safety comes from branch_delete subsequently taking
-    /// schema -> target branch -> every accepted-catalog table gate before the
-    /// ref mutation, which waits out any live in-process owner. SchemaApply
-    /// remains graph-global and must still block deletion.
-    async fn heal_pending_recovery_sidecars_for_branch_delete(&self, branch: &str) -> Result<()> {
-        let outcome = self.heal_pending_recovery_sidecars_outcome().await?;
-        if let Some(intent) = outcome
-            .unresolved
-            .iter()
-            .find(|intent| intent.writer_kind == crate::db::manifest::SidecarKind::SchemaApply)
+    /// Finish this handle's own published-but-uninstalled schema contract
+    /// before a write plans against the manifest (RFC 0067). A schema apply or
+    /// system-column upgrade whose manifest commit landed but whose contract
+    /// installation failed sets `pending_schema_install`; every write entry
+    /// calls this, and the flag keeps the common path free of any storage
+    /// probe. Other handles and processes converge at their next read-write
+    /// open or `refresh`.
+    pub(crate) async fn settle_pending_schema_install(&self) -> Result<()> {
+        if !self
+            .pending_schema_install
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(OmniError::recovery_required(
-                intent.operation_id.clone(),
-                format!(
-                    "pending SchemaApply recovery operation blocks deletion of branch '{branch}'; \
-                     reopen the graph read-write before retrying"
-                ),
-            ));
+            return Ok(());
         }
-        Ok(())
+        let result = {
+            let _serial = self
+                .write_queue
+                .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                .await;
+            let snapshot = self.coordinator.read().await.snapshot();
+            recover_schema_state_files(
+                &self.root_uri,
+                Arc::clone(&self.storage),
+                &snapshot,
+                SchemaStagingPolicy::PromoteOnly,
+            )
+            .await
+        };
+        match result {
+            Ok(recovery) => {
+                if matches!(recovery, SchemaStateRecovery::Promoted) {
+                    self.reload_schema_if_source_changed().await?;
+                    self.invalidate_read_caches().await;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.pending_schema_install
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
-    /// Gate-aware half of the recovery barrier.
+    /// Baseline check for a graph-global writer that plans from a table's
+    /// linear HEAD (schema apply, the system-column upgrade, promotion).
     ///
-    /// Callers run the healer before preparation, then acquire schema/branch
-    /// control gates. A different writer may arm an intent in that gap, so native
-    /// branch-control operations and RFC-022 data writers must list once more
-    /// under their complete gate set before any independently durable effect.
-    /// This helper deliberately does not invoke recovery: recovery acquires the
-    /// same gates and would self-deadlock.
-    pub(crate) async fn ensure_no_pending_recovery_sidecars_under_gates(
-        &self,
-        relevant_branches: &[Option<&str>],
-        operation: &str,
-    ) -> Result<()> {
-        let sidecars =
-            crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
-        let blocking = sidecars.iter().find(|sidecar| {
-            let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
-            sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
-                || relevant_branches
-                    .iter()
-                    .any(|branch| branch.filter(|name| *name != "main") == sidecar_branch)
-        });
-        if let Some(sidecar) = blocking {
-            return Err(OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                format!(
-                    "pending {:?} recovery operation on branch '{}' blocks {operation}",
-                    sidecar.writer_kind,
-                    sidecar.branch.as_deref().unwrap_or("main"),
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Final pre-arm ownership check for an existing physical table ref.
-    ///
-    /// Callers must already hold their complete schema -> branch -> table gate
-    /// envelope and must invoke this before writing their own recovery sidecar.
-    /// The manifest pin is the logical authority; a live Lance HEAD ahead of it
-    /// is either owned by an older recovery intent or is uncovered drift that
-    /// requires explicit operator repair. A new writer must never manufacture a
-    /// sidecar that retroactively claims that pre-existing physical effect.
-    ///
-    /// First-touch refs deliberately do not call this helper: their target ref
-    /// does not exist until after the writer's recovery intent is durable.
+    /// Callers hold their complete schema -> branch -> table gate envelope and
+    /// have already promoted any pending pin. The manifest pin is the logical
+    /// authority; a linear HEAD ahead of it is either explained by a newer
+    /// manifest (the caller's read set is stale and it reprepares) or is a
+    /// foreign commit that needs explicit operator repair.
     pub(crate) async fn ensure_existing_effect_baseline(
         &self,
         table_key: &str,
@@ -2272,143 +2104,38 @@ impl Omnigraph {
             return Ok(());
         }
 
-        let normalized_branch = table_branch.filter(|branch| *branch != "main");
-        let sidecars =
-            crate::db::manifest::list_sidecars(self.root_uri(), self.storage_adapter()).await;
-        match sidecars {
-            Ok(sidecars) => {
-                if let Some(owner) = sidecars.iter().find(|sidecar| {
-                    sidecar.tables.iter().any(|pin| {
-                        pin.table_key == table_key
-                            && pin
-                                .table_branch
-                                .as_deref()
-                                .filter(|branch| *branch != "main")
-                                == normalized_branch
-                    })
-                }) {
-                    return Err(OmniError::recovery_required(
-                        owner.operation_id.clone(),
-                        format!(
-                            "{} is at Lance HEAD version {}, ahead of published dataset version {}; \
-                             the pending recovery operation owns this drift",
-                            dataset_subject(table_key),
-                            head,
-                            expected_version,
-                        ),
-                    ));
-                }
-                // RFC 0067: a promotion that landed after this writer captured
-                // its snapshot moves HEAD one past the published version the
-                // writer holds. When the current manifest explains that HEAD,
-                // the writer's read set is merely stale and it reprepares
-                // instead of being sent to repair.
-                let graph_branch = normalized_branch.map(crate::branch_names::logical_branch_name);
-                if let Ok(current) = self.fresh_snapshot_for_branch_unchecked(graph_branch).await
-                    && let Some(entry) = current.dataset(table_key)
-                    && entry.published_dataset_version != expected_version
-                {
-                    return Err(OmniError::manifest_read_set_changed(
-                        format!("published_dataset_version:{table_key}"),
-                        Some(expected_version.to_string()),
-                        Some(entry.published_dataset_version.to_string()),
-                    ));
-                }
-                Err(OmniError::manifest_conflict(format!(
-                    "{} is at Lance HEAD version {}, ahead of published dataset version {}; \
-                     run `omnigraph repair` before writing",
-                    dataset_subject(table_key),
-                    head,
-                    expected_version,
-                )))
-            }
-            Err(list_error) => Err(OmniError::manifest_conflict(format!(
-                "{} is at Lance HEAD version {}, ahead of published dataset version {}; could not \
-                 classify the drift (sidecar listing failed: {}); run `omnigraph repair`, or \
-                 reopen the graph read-write if repair reports a pending recovery sidecar",
-                dataset_subject(table_key),
-                head,
-                expected_version,
-                list_error,
-            ))),
-        }
-    }
-
-    /// Final under-gate check for branch deletion. Target-branch sidecars are
-    /// intentionally allowed: the held complete table envelope proves no live
-    /// in-process owner can still be applying them, and deleting the branch
-    /// makes their effects unreachable. Only graph-global schema recovery can
-    /// still invalidate the operation.
-    async fn ensure_branch_delete_recovery_safe_under_gates(&self, branch: &str) -> Result<()> {
-        let sidecars =
-            crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref()).await?;
-        if let Some(sidecar) = sidecars
-            .iter()
-            .find(|sidecar| sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply)
+        // RFC 0067: a promotion that landed after this writer captured its
+        // snapshot moves HEAD one past the published version the writer
+        // holds. When the current manifest explains that HEAD, the writer's
+        // read set is merely stale and it reprepares instead of being sent
+        // to repair.
+        let graph_branch = table_branch
+            .filter(|branch| *branch != "main")
+            .map(crate::branch_names::logical_branch_name);
+        if let Ok(current) = self.fresh_snapshot_for_branch_unchecked(graph_branch).await
+            && let Some(entry) = current.dataset(table_key)
+            && entry.published_dataset_version != expected_version
         {
-            return Err(OmniError::recovery_required(
-                sidecar.operation_id.clone(),
-                format!(
-                    "pending SchemaApply recovery operation blocks deletion of branch '{branch}'"
-                ),
+            return Err(OmniError::manifest_read_set_changed(
+                format!("published_dataset_version:{table_key}"),
+                Some(expected_version.to_string()),
+                Some(entry.published_dataset_version.to_string()),
             ));
         }
-        Ok(())
-    }
-
-    async fn heal_pending_recovery_sidecars_outcome(
-        &self,
-    ) -> Result<crate::db::manifest::HealPendingOutcome> {
-        let outcome = crate::db::manifest::heal_pending_sidecars_roll_forward(
-            &self.root_uri,
-            Arc::clone(&self.storage),
-            &self.coordinator,
-            &self.write_queue,
-        )
-        .await?;
-        // RFC 0067: finish this handle's own published-but-uninstalled schema
-        // apply before the caller's write plans against the manifest. The
-        // flag keeps the common path free of any staging probe.
-        let mut installed = false;
-        if self
-            .pending_schema_install
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let result = {
-                let _serial = self
-                    .write_queue
-                    .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
-                    .await;
-                let snapshot = self.coordinator.read().await.snapshot();
-                recover_schema_state_files(
-                    &self.root_uri,
-                    Arc::clone(&self.storage),
-                    &snapshot,
-                    SchemaStagingPolicy::PromoteOnly,
-                )
-                .await
-            };
-            match result {
-                Ok(recovery) => installed = matches!(recovery, SchemaStateRecovery::Promoted),
-                Err(error) => {
-                    self.pending_schema_install
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    return Err(error);
-                }
-            }
-        }
-        if outcome.processed_any || installed {
-            self.reload_schema_if_source_changed().await?;
-            self.invalidate_read_caches().await;
-        }
-        Ok(outcome)
+        Err(OmniError::manifest_conflict(format!(
+            "{} is at Lance HEAD version {}, ahead of published dataset version {}; \
+             run `omnigraph repair` before writing",
+            dataset_subject(table_key),
+            head,
+            expected_version,
+        )))
     }
 
     async fn reload_schema_if_source_changed(&self) -> Result<()> {
-        // Recovery gates are intentionally scoped per sidecar and are released
-        // before this call. Reacquire the schema gate across the complete
-        // source/IR/state read and ArcSwap publication so a concurrent apply
-        // cannot interleave its sequential file promotions with this reload.
+        // Callers release their schema gate before this call. Reacquire it
+        // across the complete source/IR/state read and ArcSwap publication so a
+        // concurrent apply cannot interleave its sequential file promotions
+        // with this reload.
         let _schema_guard = self
             .write_queue
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -2447,12 +2174,11 @@ impl Omnigraph {
     }
 
     /// Refresh coordinator state and invalidate the runtime cache WITHOUT
-    /// running the recovery sweep. Engine-internal callers that hold an
-    /// in-flight sidecar (e.g. `schema_apply::apply_schema_with_lock`'s
-    /// internal lease-check refresh) need this variant: running recovery
-    /// here would observe the caller's own sidecar, classify it as
-    /// RolledPastExpected, and roll it forward — racing the caller's
-    /// own publish path.
+    /// the staged-contract pass. Engine-internal callers that already hold
+    /// the schema gate (e.g. `schema_apply::apply_schema_with_lock`'s
+    /// internal lease-check refresh) need this variant:
+    /// [`refresh`](Self::refresh) reacquires that gate and would act on the
+    /// caller's own staged contract.
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
         self.coordinator.write().await.refresh().await?;
         self.invalidate_read_caches().await;
@@ -3069,7 +2795,7 @@ impl Omnigraph {
     /// unbranched datasets keep inheriting `main`, while datasets inherited
     /// from an ancestor branch remain inherited when no index work is needed.
     /// When real index work exists they are forked into the active branch only
-    /// after the recovery sidecar is durable.
+    /// under the final gates.
     /// Returns the declared indexes that could not be materialized on this
     /// pass (today: vector properties with no trainable vectors yet). They are
     /// deferred, not errors; a later `ensure_indices`/`optimize` builds them
@@ -3160,10 +2886,10 @@ impl Omnigraph {
 
     /// Conservative table-gate envelope for graph-level control/maintenance.
     ///
-    /// Current legacy sidecar writers acquire `(table_key, target_branch)` gates
-    /// but do not all acquire the coarse schema/branch gates yet. A native branch
+    /// Legacy writers acquire `(table_key, target_branch)` gates but do not
+    /// all acquire the coarse schema/branch gates yet. A native branch
     /// operation or version-GC barrier therefore takes every catalog table key on
-    /// each graph branch it can affect before its final sidecar recheck. This is
+    /// each graph branch it can affect before its final authority recheck. This is
     /// intentionally broader than mutation/load's exact touched-dataset set.
     pub(crate) fn table_queue_keys_for_branches(
         &self,
@@ -3280,13 +3006,8 @@ impl Omnigraph {
         let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
         let source = self.active_branch().await;
-        let relevant = [source.as_deref(), Some(target.as_str())];
-        // Native ref control follows the same closed barrier shape as data
-        // writes: heal before accepting authority, then re-check under
-        // schema -> source/target branch gates.
-        self.heal_pending_recovery_sidecars_for_write(&relevant)
-            .await?;
-        fail(&BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
+        self.settle_pending_schema_install().await?;
+        fail(&BRANCH_CONTROL_PRE_GATES)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3302,8 +3023,6 @@ impl Omnigraph {
             &control_catalog,
         );
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
-        self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create")
-            .await?;
         self.ensure_schema_apply_not_locked("branch_create").await?;
         self.ensure_schema_state_valid().await?;
         let mut source_coord = self
@@ -3375,10 +3094,8 @@ impl Omnigraph {
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
-        let relevant = [branch.as_deref(), Some(target_branch.as_str())];
-        self.heal_pending_recovery_sidecars_for_write(&relevant)
-            .await?;
-        fail(&BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
+        self.settle_pending_schema_install().await?;
+        fail(&BRANCH_CONTROL_PRE_GATES)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3395,8 +3112,6 @@ impl Omnigraph {
             &control_catalog,
         );
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
-        self.ensure_no_pending_recovery_sidecars_under_gates(&relevant, "branch_create_from")
-            .await?;
         self.ensure_schema_apply_not_locked("branch_create_from")
             .await?;
         self.ensure_schema_state_valid().await?;
@@ -3444,9 +3159,8 @@ impl Omnigraph {
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
         let _export_exclusion = self.reserve_export_destructive_control()?;
         self.ensure_schema_state_valid().await?;
-        self.heal_pending_recovery_sidecars_for_branch_delete(&branch)
-            .await?;
-        fail(&BRANCH_CONTROL_POST_RECOVERY_BARRIER)?;
+        self.settle_pending_schema_install().await?;
+        fail(&BRANCH_CONTROL_PRE_GATES)?;
         let _schema_guard = self
             .write_queue()
             .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -3468,8 +3182,6 @@ impl Omnigraph {
         let table_queue_keys =
             self.table_queue_keys_for_branches(&[Some(branch.clone())], &control_catalog);
         let _table_guards = self.write_queue().acquire_many(&table_queue_keys).await;
-        self.ensure_branch_delete_recovery_safe_under_gates(&branch)
-            .await?;
         fail(&BRANCH_DELETE_POST_TABLE_GATES)?;
         self.ensure_schema_apply_not_locked("branch_delete").await?;
         self.ensure_schema_state_valid().await?;
@@ -3537,13 +3249,14 @@ impl Omnigraph {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind, txn).await
     }
 
-    /// Fork `table_key` onto `active_branch` from the given source state,
-    /// self-healing a manifest-unreferenced leftover fork if one is in the
-    /// way. Callers that reach this MUST already hold the per-`(table_key,
-    /// active_branch)` write queue (so the reclaim cannot race an in-process
-    /// fork) and must have confirmed via the live manifest that the table is
-    /// not yet on `active_branch`. Both the first-write fork path
-    /// (`open_owned_dataset_for_branch_write`) and `branch_merge` satisfy this.
+    /// Fork `table_key` onto `active_branch` from the given source state.
+    /// The fork name is unique per attempt, so a manifest-unreferenced
+    /// leftover from an earlier attempt is never in the way; cleanup reclaims
+    /// it. Callers that reach this MUST already hold the per-`(table_key,
+    /// active_branch)` write queue and must have confirmed via the live
+    /// manifest that the table is not yet on `active_branch`. Both the
+    /// first-write fork path (`open_owned_dataset_for_branch_write`) and
+    /// `branch_merge` satisfy this.
     pub(crate) async fn fork_dataset_from_entry_state(
         &self,
         table_key: &str,
@@ -3552,28 +3265,6 @@ impl Omnigraph {
         source_branch: Option<&str>,
         source_version: u64,
         active_branch: &str,
-    ) -> Result<SnapshotHandle> {
-        self.fork_dataset_from_entry_state_under_intent(
-            table_key,
-            identity,
-            full_path,
-            source_branch,
-            source_version,
-            active_branch,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn fork_dataset_from_entry_state_under_intent(
-        &self,
-        table_key: &str,
-        identity: crate::db::manifest::TableIdentity,
-        full_path: &str,
-        source_branch: Option<&str>,
-        source_version: u64,
-        active_branch: &str,
-        _operation_id: Option<&str>,
     ) -> Result<SnapshotHandle> {
         let canonical_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
         let canonical_full_path = self.storage().dataset_uri(&canonical_path);
@@ -3662,8 +3353,9 @@ impl Omnigraph {
         .await
     }
 
-    /// Mint the immutable lineage identity before recovery is armed. Parentage
-    /// remains publisher-resolved under the exact branch-head precondition.
+    /// Mint the immutable lineage identity before the first table effect.
+    /// Parentage remains publisher-resolved under the exact branch-head
+    /// precondition.
     pub(crate) async fn new_lineage_intent_for_branch(
         &self,
         branch: Option<&str>,

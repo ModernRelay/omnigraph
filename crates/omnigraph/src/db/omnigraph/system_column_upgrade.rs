@@ -4,8 +4,8 @@
 //! contract. Since RFC 0067 it has schema apply's shape: each rename-only
 //! `Project` commits detached from the table's promoted pin, the staged
 //! contract names the graph commit that publishes it, one manifest CAS
-//! publishes every pin, and the held renames promote afterwards. It arms no
-//! recovery sidecar: a failure before the CAS leaves only reclaimable detached
+//! publishes every pin, and the held renames promote afterwards. It writes no
+//! recovery record: a failure before the CAS leaves only reclaimable detached
 //! versions and a staging the next read-write open discards; one after it
 //! leaves pins the next writer promotes and a contract the next read-write
 //! open (or this handle's next write) installs. Since v10 both vintages share
@@ -87,8 +87,8 @@ pub(crate) fn system_column_renames(table_key: &str) -> Vec<(String, String)> {
 }
 
 /// The current-vintage contract the upgrade promotes, derived from the
-/// accepted legacy contract alone so the writer and the recovery executor
-/// render byte-identical staging.
+/// accepted legacy contract alone, so the preflight and the writer render the
+/// same staging.
 pub(crate) struct SystemColumnUpgradeTarget {
     pub(crate) desired_ir: SchemaIR,
     pub(crate) desired_source: String,
@@ -173,7 +173,7 @@ pub(super) async fn upgrade_system_columns(
     };
 
     if !options.check {
-        db.heal_pending_recovery_sidecars().await?;
+        db.settle_pending_schema_install().await?;
     }
     let schema_gate_key = crate::db::manifest::schema_apply_serial_queue_key();
     let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
@@ -301,8 +301,6 @@ async fn execute_with_lock(
         .collect();
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
     let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
-    db.ensure_no_pending_recovery_sidecars_under_gates(&[None], "system_column_upgrade")
-        .await?;
 
     db.refresh_coordinator_only().await?;
     let (current_branch_identifier, current_graph_head) = {
@@ -383,8 +381,8 @@ async fn execute_with_lock(
     }
 
     // The staged contract is bound to this upgrade's graph commit (RFC 0067):
-    // recovery installs it once that commit is in lineage and discards it
-    // otherwise.
+    // a read-write open installs it once that commit is in lineage and
+    // discards it otherwise.
     let publication = crate::db::schema_state::SchemaPublication {
         graph_commit_id: lineage_intent.graph_commit_id.clone(),
         parent_commit_id: base_graph_head.clone(),
@@ -452,7 +450,8 @@ async fn execute_with_lock(
         }
 
         // The state file is written last, so a complete staging is exactly
-        // one whose state file exists; recovery reads the marker from it.
+        // one whose state file exists; the install pass reads the marker from
+        // it.
         fail(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
         let (_, ir_json, state_json) = crate::db::schema_state::render_schema_contract(
             &desired_ir,
@@ -539,7 +538,7 @@ async fn execute_with_lock(
         // renames and the staged contract are garbage the next open and
         // cleanup retire. After it the manifest is authoritative and only the
         // contract installation is pending, which the next read-write open or
-        // this handle's write-entry heal completes from the staged copy.
+        // this handle's next write entry completes from the staged copy.
         Err(error) => Err(match published_commit {
             Some(graph_commit_id) => {
                 db.pending_schema_install

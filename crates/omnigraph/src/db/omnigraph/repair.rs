@@ -1,10 +1,11 @@
 //! Explicit repair for uncovered published-dataset/Lance-HEAD drift.
 //!
-//! Recovery sidecars handle deterministic crash residuals automatically. This
-//! module is for the different case: a dataset's Lance HEAD is ahead of the
-//! version recorded in `__manifest` and there is no sidecar encoding writer
-//! intent. `repair` classifies that uncovered drift from Lance transactions and
-//! only auto-publishes maintenance-only drift when the operator confirms.
+//! Pending pins converge automatically: the next writer or `cleanup` promotes
+//! them. This module is for the different case: a dataset's Lance HEAD is
+//! ahead of the version recorded in `__manifest` and no published pin explains
+//! the movement. `repair` classifies that uncovered drift from Lance
+//! transactions and only auto-publishes maintenance-only drift when the
+//! operator confirms.
 
 use lance::Dataset;
 use lance::dataset::transaction::Operation;
@@ -142,7 +143,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
 
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("repair").await?;
-    ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
     // Repair may adopt physical HEADs into graph authority. Bind the entire
     // attempt to one accepted view and revalidate after schema -> main -> table
@@ -169,7 +169,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         .map(|table_key| (table_key.clone(), None))
         .collect::<Vec<_>>();
     let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
-    ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
     let table_tasks = table_keys
@@ -342,19 +341,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         datasets: tables,
         graph_manifest_version: manifest_version,
     })
-}
-
-async fn ensure_no_pending_recovery_sidecars(db: &Omnigraph, operation: &str) -> Result<()> {
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(format!(
-            "{operation} requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before repairing"
-        )));
-    }
-    Ok(())
 }
 
 async fn classify_drift(

@@ -7,7 +7,7 @@ This is the ownership map for OmniGraph's tests. Read it before changing code: f
 1. Test at the boundary that owns the promise. Compiler behavior belongs in compiler tests; engine guarantees belong at the public engine API; HTTP and CLI behavior belongs at those transports.
 2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test. When the change fixes an issue, the `Fix Regression Gate` keys on `issue_N` in the test's name or the `.gqt` case's file name: extend an owner test by renaming it to carry `issue_N` in the same change, or add a row to the `issue_N_*.gqt` case (`docs/dev/ci.md`).
 3. Test logical results and durable state. Inspect Lance internals only for a compatibility fence, recovery fault, or physical-cost contract.
-4. Every failure path must prove what did *not* move: manifest head, table head, lineage, sidecar, or external I/O as appropriate.
+4. Every failure path must prove what did *not* move: manifest head, table head, lineage, schema staging, or external I/O as appropriate.
 5. Time and RSS measurements are decision instruments, not ordinary correctness gates. Deterministic operation counts may be CI contracts.
 
 The invariants behind these rules are in [invariants.md](invariants.md). Lance-dependent changes also require the upstream review and guards described in [lance.md](lance.md).
@@ -55,12 +55,13 @@ candidate scans, bounded page work, and caught-up versus backlog polling curves.
 
 ### Recovery and failpoints
 
-Recovery tests must cover the protocol layer, the writer, and the user-visible reopening behavior:
+Crash tests must cover the writer, the promotion that follows it, and the user-visible reopening behavior:
 
-- in-source tests own sidecar encoding, validation, classification, and exact publication rules;
-- `tests/recovery.rs` owns deterministic completed, partial, ambiguous, and foreign-effect outcomes;
-- `tests/failpoints.rs` owns crash windows around durable effects, including the RFC 0067 windows of a mutation or load (after a detached effect, before and after publication, between promotions) where the graph is unchanged or a pin stays pending;
-- the writer's normal integration owner proves pre-arm failures leave no residue.
+- `tests/failpoints.rs` owns crash windows around durable effects: after a detached effect, before and after publication, between promotions, where the graph is unchanged or a pin stays pending;
+- `tests/detached_commit_matrix.rs` owns the writer × window × fault × recovery-actor matrix under one oracle;
+- `tests/recovery.rs` owns what is left of open-time recovery: a clean open creates nothing, a sidecar from an older build refuses a read-write open and not a read-only one, and a read-only open never touches schema staging;
+- `tests/lance_surface_guards.rs` owns the twin-replay rules promotion depends on;
+- the writer's normal integration owner proves pre-effect failures leave no residue.
 
 To add a seam: declare it beside the site it guards, above the item that
 crosses it, with
@@ -79,7 +80,7 @@ helper takes a seam declaring exactly its effect, and that some site or case
 references it; `scripts/seam_corpus.py` lists every seam with where it is
 declared and which cases cover it.
 
-When adding a new writer or sidecar field, update all three layers. See [recovery.md](recovery.md).
+When adding a new writer, update all of these layers. See [recovery.md](recovery.md).
 
 ### Blob behavior
 
@@ -204,10 +205,7 @@ from any directory inside the checkout; a build that overrides it (an env
 `RUSTFLAGS` without the cfg, as CI's refusal step does) explicitly refuses
 DST cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
 defines supported targets, hooks, replay observations, and limits. The configured
-CI owner enrolls the complete corpus. A strict `--- known_failure` marker admits only
-the recorded typed recovery failure at its declared step, with verified fault
-delivery and matching replay. Reports label it `known_failure`; changed failures
-and unexpected passes fail CI. The healthy assertion stays in the case.
+CI owner enrolls the complete corpus.
 
 ### OpenAPI
 

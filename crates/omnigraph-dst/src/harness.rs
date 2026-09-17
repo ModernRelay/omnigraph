@@ -827,7 +827,7 @@ fn milestone_steps(window: &str) -> Vec<Milestone> {
         "cleanup.resolve_branch_snapshot" => {
             return vec![EnsureBranch, DataOnBranch, CleanupMain];
         }
-        "cleanup.table_gc" | "cleanup.post_recovery_check_pre_gates" => {
+        "cleanup.table_gc" | "cleanup.pre_gates" => {
             return vec![MutateMain, DeleteFixtureOnMain, CleanupMain];
         }
         // Recovery internals: build the PRIMARY crash's precondition (the
@@ -1121,13 +1121,6 @@ pub struct UniverseReport {
     /// The consumed reads themselves, `<verb> <op> <uri>` with the root
     /// normalized, so a pin can name WHICH stale object the engine read.
     pub persisted_consumed_reads: Vec<String>,
-    /// Every recovery audit row at the end of the universe, `<kind>
-    /// <operation_id>`, so a pin can tie a consumed sidecar read to the
-    /// finalization recovery gave that operation. Reading it opens the
-    /// recoveries dataset once after the final audit, harness observation
-    /// rather than engine work; the cost golden names it as `_audit l.list`
-    /// 64 -> 65.
-    pub recovery_audit: Vec<String>,
     /// Sidecar residue at the final audit attributed
     /// to injected lost/misdirected writes — recorded (never silently
     /// excused) and then REQUIRED to heal on one reopen (the
@@ -3680,7 +3673,7 @@ async fn maintenance_obligations(
     };
     let (rerun_window, kind) = match op {
         Op::Optimize => ("optimize.before_compact", "Optimize"),
-        Op::Cleanup => ("cleanup.post_recovery_check_pre_gates", "Cleanup"),
+        Op::Cleanup => ("cleanup.pre_gates", "Cleanup"),
         Op::EnsureIndices => (
             "ensure_indices.post_phase_b_pre_manifest_commit",
             "EnsureIndices",
@@ -6611,9 +6604,6 @@ impl UniverseScenario<RustResources> for Scenario {
             .as_ref()
             .map(|f| f.persisted_consumed_reads(root))
             .unwrap_or_default();
-        let recovery_audit = omnigraph::db::dst_recovery_audit_rows(root)
-            .await
-            .expect("the recovery audit dataset reads back at the end of a universe");
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
         // Persisted tier: drain the foreign-sidecar carve-out rows into the
@@ -6650,7 +6640,6 @@ impl UniverseScenario<RustResources> for Scenario {
             writes_misdirected,
             persisted_consumed,
             persisted_consumed_reads,
-            recovery_audit,
             attributed_residue,
             reconcile_verdicts,
             known_issues,

@@ -358,8 +358,8 @@ impl<'a> CommittedState<'a> {
     /// graph-branch snapshot on the write path (so a concurrent published edge
     /// is counted — #298), the pinned committed snapshot otherwise. Resolving
     /// through the fresh graph snapshot is load-bearing for first-touch named
-    /// branches: their table still inherits another Lance ref until this write's
-    /// sidecar is armed, so opening the target ref directly would be invalid.
+    /// branches: their table still inherits another Lance ref until this write
+    /// forks it, so opening the target ref directly would be invalid.
     async fn open_cardinality(&self, table_key: &str) -> Result<Option<Dataset>> {
         if self.overwritten.contains(table_key) {
             return Ok(None);

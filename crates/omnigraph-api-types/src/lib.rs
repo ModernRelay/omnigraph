@@ -1378,7 +1378,7 @@ pub struct ErrorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_conflict: Option<KeyConflictOutput>,
     /// Set when the request must be split into smaller graph commits. The
-    /// rejected attempt has no durable sidecar and no dataset effect.
+    /// rejected attempt has no durable effect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
     /// Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.

@@ -38,8 +38,7 @@
 //! `schema_apply` onto the staged surface). Phase 1b (call-site
 //! conversion) and Phase 9 landed in MR-854, which made `db.storage()`
 //! staged-only. The exact EnsureIndices adapter later retired the final
-//! inline-commit residual. Phase 7 (recovery reconciler) shipped as MR-847;
-//! Phase 8 (index reconciler) is tracked as MR-848.
+//! inline-commit residual. Phase 8 (index reconciler) is tracked as MR-848.
 
 pub(crate) mod lance_clone;
 
@@ -327,7 +326,7 @@ impl StagedHandle {
         self.inner.transaction_identity()
     }
 
-    /// Replace Lance's random transaction UUID with the identity durably armed
+    /// Replace Lance's random transaction UUID with the identity minted
     /// before a deferred first-touch fork. The read version must still match.
     pub(crate) fn bind_transaction_identity(
         &mut self,
@@ -337,11 +336,11 @@ impl StagedHandle {
     }
 }
 
-/// Result of the no-conflict-retry commit path used by RFC-022-enrolled
-/// writers. `is_exact` checks both transaction identity and achieved version:
-/// Lance's initial conflict-resolution pass can preserve `(read_version, uuid)`
-/// while committing at a later version. The table effect is durable when that
-/// happens, so the caller must leave its recovery sidecar armed.
+/// Result of the no-conflict-retry linear commit path. `is_exact` checks both
+/// transaction identity and achieved version: Lance's initial
+/// conflict-resolution pass can preserve `(read_version, uuid)` while
+/// committing at a later version. The table effect is durable when that
+/// happens, so the caller must not treat the outcome as effect-free.
 #[derive(Debug)]
 pub struct ExactCommitOutcome {
     snapshot: SnapshotHandle,
@@ -404,9 +403,9 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
 
-    /// Native identity of the branch backing an already-open snapshot. Used
-    /// by recovery-enrolled first-touch effects to confirm the exact ref they
-    /// created, closing delete/recreate ABA during later recovery.
+    /// Native identity of the branch backing an already-open snapshot. Branch
+    /// merge uses it to bind a proven source interval and its target to the
+    /// exact native ref incarnation, closing delete/recreate ABA.
     async fn branch_identifier(
         &self,
         snapshot: &SnapshotHandle,
@@ -565,7 +564,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Resolve bounded keyed-source inputs that require pre-stage I/O (today,
     /// absolute blob URIs) without writing Lance files or advancing HEAD.
-    /// Deferred first-touch writers call this before recovery arm because the
+    /// Deferred first-touch writers call this before their fork because the
     /// target ref needed by `stage_keyed_write` does not exist yet.
     async fn prepare_keyed_write_batch(
         &self,
@@ -601,7 +600,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// Validate the physical key contract shared by every v6 graph-table
     /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
     /// batch. Callers preparing a deferred first-touch or Overwrite plan must
-    /// invoke this before recovery is armed or a native branch ref is created.
+    /// invoke this before a native branch ref is created.
     fn validate_keyed_write_batch(
         &self,
         table_key: &str,
@@ -674,8 +673,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<StagedHandle>;
 
     /// Blob-aware full-row stream with an explicit batch ceiling. Branch
-    /// adoption uses this to turn a large all-new delta into an exact recovery
-    /// chain of bounded fenced writes instead of one delta-wide hash join.
+    /// adoption uses this to turn a large all-new delta into an exact chain of
+    /// bounded fenced writes instead of one delta-wide hash join.
     async fn scan_stream_for_rewrite_bounded(
         &self,
         source: &SnapshotHandle,
@@ -717,8 +716,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<SnapshotHandle>;
 
     /// Commit one staged effect with Lance conflict retries disabled and expose
-    /// the transaction identity that actually landed. Legacy callers retain
-    /// `commit_staged`; RFC-022 adapters opt into this method explicitly.
+    /// the transaction identity that actually landed. Other linear callers
+    /// retain `commit_staged`.
     async fn commit_staged_exact(
         &self,
         snapshot: SnapshotHandle,

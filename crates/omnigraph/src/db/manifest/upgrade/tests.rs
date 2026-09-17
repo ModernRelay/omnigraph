@@ -584,34 +584,11 @@ async fn storage_upgrade_refuses_preexisting_recovery_without_healing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     synthetic_v6_fixture(root).await;
-    let dataset = open(root, None).await.unwrap();
-    let entry = read_manifest_state(&dataset)
-        .await
-        .unwrap()
-        .entries
-        .remove(0);
-    let pin = super::super::recovery::SidecarTablePin {
-        identity: entry.identity,
-        table_key: entry.type_key,
-        table_path: format!(
-            "{}/{}",
-            normalize_root_uri(root).unwrap(),
-            entry.dataset_path
-        ),
-        expected_version: entry.published_dataset_version,
-        post_commit_pin: entry.published_dataset_version + 1,
-        confirmed_version: None,
-        table_branch: entry.native_dataset_branch,
-        table_fork_owner: None,
-    };
-    let sidecar = super::super::recovery::new_optimize_sidecar_v9(vec![pin]).unwrap();
+    // Any sidecar refuses: this build cannot interpret one (RFC 0067), so
+    // its content is irrelevant to the refusal.
     let recovery = dir.path().join("__recovery");
     std::fs::create_dir_all(&recovery).unwrap();
-    std::fs::write(
-        recovery.join(format!("{}.json", sidecar.operation_id)),
-        serde_json::to_vec(&sidecar).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(recovery.join("01TESTLEGACYSIDECAR.json"), b"{}").unwrap();
     let before = stored_files(dir.path());
     for check in [true, false] {
         let report = upgrade_storage(

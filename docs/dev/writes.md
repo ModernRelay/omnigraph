@@ -1,12 +1,13 @@
 # Graph write protocol
 
 **Audience:** engine and storage contributors
-**Authority:** current graph-visible write path; recovery classification is in
-[recovery.md](recovery.md)
+**Authority:** current graph-visible write path; what a crash leaves and who
+finishes it is in [recovery.md](recovery.md)
 
 Every successful graph-content write has one visibility point: a conditional
-`__manifest` publication. Lance table effects may happen earlier, but only
-after a durable recovery sidecar owns their exact intended outcome.
+`__manifest` publication. Table effects happen earlier, but as detached Lance
+commits of the pinned base that nothing references until that publication
+([RFC 0067](../rfcs/0067-detached-table-commits.md)).
 
 ## The protocol
 
@@ -17,33 +18,6 @@ prepare logical change and validate it
         ↓
 stage exact Lance transactions (no HEAD movement)
         ↓
-acquire schema → branch → sorted-table gates
-        ↓
-recheck recovery barrier and complete authority
-        ↓
-persist identity-bearing recovery sidecar
-        ↓
-commit participant table effects
-        ↓
-confirm achieved effects
-        ↓
-publish every table pointer + graph lineage in one manifest CAS
-        ↓
-audit and remove recovery sidecar
-```
-
-An error before the sidecar/effects leaves graph storage unchanged. Once any
-participant effect is possible, an error that cannot prove a complete terminal
-outcome returns `RecoveryRequired`; it never replans around the partial state.
-
-Mutation and load no longer take the sidecar branch of this protocol. Since
-[RFC 0067](../rfcs/0067-detached-table-commits.md) their participant effects
-are detached Lance commits of the pinned base, so nothing is graph-visible
-before the manifest CAS and nothing needs recovery after it:
-
-```text
-stage exact Lance transactions (no HEAD movement)
-        ↓
 acquire schema → branch → sorted-table gates, recheck the complete authority
         ↓
 commit each participant as a detached version of its pin
@@ -52,6 +26,15 @@ publish every pin (target, staged version, transaction uuid) + lineage in one ma
         ↓
 promote each pin from the held handles (best effort; a pending pin is promoted later)
 ```
+
+An error before the manifest CAS leaves the graph unchanged: the detached
+versions are unreferenced garbage and the caller retries from scratch. After
+it the write is acknowledged whether or not its promotion ran. No writer
+arms a recovery record, and no write replans around a partial state, because
+no partial state is ever visible. Schema apply and the system-column upgrade
+additionally stage and install the schema contract around their CAS; only
+they can report `RecoveryRequired`, naming a manifest commit that landed
+while the contract installation did not.
 
 ## Captured authority
 
@@ -73,7 +56,7 @@ reloading manifest history. The existing schema and branch gates still serialize
 conflicting control operations.
 
 Native branch creation uses an operation-local capture of the bound coordinator
-or that same one-entry cache after the control gates and recovery checks. Reuse
+or that same one-entry cache after the control gates. Reuse
 requires a fresh match of the complete manifest incarnation, including the
 native branch lifetime; a stale or missing view takes the existing refresh/open
 path. Captures share immutable lineage and the Lance session, copy current
@@ -98,8 +81,8 @@ Finalization acquires the root-shared gate order:
 4. coordinator publication.
 
 These gates order work inside one process. Correctness still depends on the
-persisted manifest precondition, exact Lance transaction identity, and recovery
-record. A retryable pre-effect attempt discards all staged work, captures a new
+persisted manifest precondition and the exact Lance transaction identity each
+pin records. A retryable pre-effect attempt discards all staged work, captures a new
 `WriteTxn`, and repeats boundedly; it never reuses batches against a new base.
 
 ## Writer adapters
@@ -211,8 +194,8 @@ Existing-table constructive transactions stage independently with bounded
 concurrency. `OMNIGRAPH_LOAD_CONCURRENCY` selects that width for both Load and
 ordinary insert/update mutations (default 8). Deferred first-touch branch
 effects and delete transactions remain serial. The setting changes only
-fragment preparation: every participant still crosses the same recovery
-boundary and one graph-manifest publication.
+fragment preparation: every participant still commits detached and crosses
+one graph-manifest publication.
 
 The D2 rule keeps one mutation query constructive (insert/update) or
 destructive (delete), never both. Compose mixed work through separate
@@ -229,8 +212,8 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   existing ID;
 - upsert updates or inserts without changing modes on retry;
 - a bare Lance Append is not a production graph-table write;
-- one table's keyed input is bounded to 8,192 rows and 32 MiB before recovery
-  arm.
+- one table's keyed input is bounded to 8,192 rows and 32 MiB before any
+  effect.
 
 An insertion-only transaction may carry the internal
 `omnigraph.insert_absence = "v1"` certificate after its absence and physical
@@ -255,8 +238,9 @@ The name has at most 80 ASCII bytes, independent of the logical branch name;
 the existing unique commit ID separates attempts across legacy owners.
 The base manifest version and graph commit ID already belong to the captured
 attempt. Name construction adds no storage request, version reservation, or
-rename. The existing recovery sidecar persists the exact name and owner before
-the native fork is created from the captured source ref and version.
+rename. The fork is created from the captured source ref and version without
+any intent record; a fork no manifest entry references is garbage that
+cleanup classifies.
 
 `TableVersionMetadata.table_fork_owner` records ownership in the existing
 manifest metadata. Existing owned writes retain the actual physical ref;
@@ -265,13 +249,13 @@ exact native-ref equality for legacy ownership. Parsing a name cannot establish
 ownership, because older legal names can resemble the new spelling.
 
 First-touch writes and merges leave old forks alone. A new attempt gets a new
-commit ID, while recovery of the same intent reuses its saved name. Correctness
-gates, exact effect identity, and baseline checks remain in place. The name's
+commit ID and therefore a new fork name. Correctness gates, exact effect
+identity, and baseline checks remain in place. The name's
 base version is preparation context; the successful manifest publication orders
 the new registration within that graph branch.
 
-Explicit `cleanup` protects every live table endpoint, relevant recovery, tags,
-and native ancestry before reclaiming unused forks. Branch deletion starts no
+Explicit `cleanup` protects every live table endpoint, pending pin chains,
+tags, and native ancestry before reclaiming unused forks. Branch deletion starts no
 background table reclamation. Branch deletion records retirement metadata on
 its exact native `__manifest` ref, so descendants keep their physical parent
 history while the logical name becomes unavailable. Cleanup reclaims unused
@@ -281,8 +265,7 @@ no additional storage request. Cold branch enumeration includes retained refs
 and filters retirement metadata; explicit cleanup reclaims unneeded refs.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
-registration, rename, tombstone, pointer, or recovery effect belongs to the
-same lifetime.
+registration, rename, tombstone, or pointer belongs to the same lifetime.
 
 ## External Blob inputs
 
@@ -290,7 +273,7 @@ Blob URI admission is part of preparation. The graph's
 `ExternalBlobPolicy` defaults to deny; served graphs retain only server-safe
 bases. The adapter normalizes and coalesces authorized sources, bounds selected
 reference count and URI metadata, probes each source once, and charges selected
-payload ranges before reading bytes or arming recovery.
+payload ranges before reading bytes or staging any effect.
 
 Overwrite can preserve an allowed external descriptor through Lance
 `WriteParams`. Keyed writes and row-writing merge paths materialize selected
@@ -306,11 +289,11 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Mutation or load fails before publication, after any detached effect | Typed error; no graph movement; the detached manifests are reclaimable garbage |
-| Mutation or load fails after publication, before promotion | Acknowledged; the pin stays pending, readable through its staged version, and the next writer of the table or cleanup promotes it |
-| Every owned table effect of a sidecar writer achieved, manifest not yet published | Recovery rolls the fixed outcome forward |
-| A proven subset achieved | Full recovery compensates or completes according to the writer's fixed plan |
-| Foreign or ambiguous effect | Fail closed; never claim or publish it |
+| Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached manifests are reclaimable garbage |
+| Any writer fails after publication, before promotion | Acknowledged; the pin stays pending, readable through its staged version, and the next writer of the table or cleanup promotes it |
+| Schema apply or the system-column upgrade fails after publication, before its contract is installed | `RecoveryRequired` naming the published commit; the next read-write open, `refresh`, or that handle's next write installs the staged contract |
+| A foreign linear commit occupies a pin's target version | The pin is blocked: content writers keep writing behind it, graph-global writers refuse the table, `repair` reports `blocked_promotion` |
+| A sidecar from a build that predates detached commits is present | A read-write open and the storage upgrade refuse until that build has resolved it |
 
 An acknowledgement is returned only after the manifest commit is durable and
 visible.
@@ -329,12 +312,16 @@ A new writer must:
 
 - declare its complete authority token and effect set;
 - use the shared gate order and publication primitive;
-- define exact recovery classification and compensation;
-- add its sidecar kind/shape and recovery tests;
+- stage every table effect as a detached commit whose replay conflicts with
+  its own twin (see the surface guards), publish pins, and promote held
+  handles after the CAS;
+- add its windows to `detached_commit_matrix.rs` and its crash cells to
+  `failpoints.rs`;
 - join the durable-call/source guards in `forbidden_apis.rs`;
 - prove bounds and crash windows at the owning layer.
 
 Design rationale and rejected alternatives live in
+[RFC 0067](../rfcs/0067-detached-table-commits.md),
 [RFC 0022](../rfcs/0022-unified-write-path.md),
 [RFC 0023](../rfcs/0023-key-conflict-fencing.md), and
 [RFC 0028](../rfcs/0028-stable-schema-identity.md).
