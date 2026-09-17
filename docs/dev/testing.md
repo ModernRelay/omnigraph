@@ -75,9 +75,12 @@ there is then a case, not an edit). A private module on the path from the
 crate root to the declaring file becomes `pub(crate)` for the re-export.
 `tests/failpoint_names_guard.rs` checks the index, that no static is left
 in the catalog, under a test module or without `pub`, that a single-effect
-helper takes a seam declaring exactly its effect, and that some site or case
-references it; `scripts/seam_corpus.py` lists every seam with where it is
-declared and which cases cover it.
+helper takes a seam declaring exactly its effect, that production code under
+`src/` crosses it, and that test code (an integration target, a `tests.rs` /
+`…_tests.rs` file, or any item gated on `cfg(test)`), the DST crate or a
+`.gqt` case (the `at` of a `--- seam` body, decoded as the runner decodes
+it) arms it; a crossing never counts as arming. `scripts/seam_corpus.py`
+lists every seam with where it is declared and which cases cover it.
 
 When adding a new writer or sidecar field, update all three layers. See [recovery.md](recovery.md).
 
