@@ -206,6 +206,7 @@ async fn drive_light_actor(
                 "age": op_idx as i32,
             })),
             branch: Some("main".to_string()),
+            settings: None,
         };
         let body = serde_json::to_vec(&request_body).unwrap();
         let req = Request::builder()

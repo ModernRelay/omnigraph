@@ -13,13 +13,15 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
 use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ReadRequest};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
-use omnigraph_server::{AppState, build_app};
+use omnigraph_server::{AppState, ProcessDefaults, build_app};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -122,9 +124,16 @@ pub async fn init_graph_with_schema_and_data(schema: &str, data: &str) -> tempfi
     Omnigraph::init(graph.to_str().unwrap(), schema)
         .await
         .unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
     temp
+}
+
+/// A session with the definition's defaults over a freshly opened handle:
+/// the engine methods that consult a setting (`load*`, `mutate*`, `query*`,
+/// `branch_merge*`) live on `Session`; everything else derefs to the handle.
+pub fn session(db: Omnigraph) -> Session {
+    Session::from_defaults(Arc::new(db), SessionSettings::default())
 }
 
 pub async fn init_graph_with_schema(schema: &str) -> tempfile::TempDir {
@@ -334,6 +343,21 @@ pub async fn app_for_loaded_graph() -> (tempfile::TempDir, Router) {
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
+    (temp, build_app(state))
+}
+
+/// [`app_for_loaded_graph`] with the process defaults every request's
+/// session starts from, the pair `omnigraph::settings::from_env_with`
+/// returns; a test seeds them here instead of the process environment.
+pub async fn app_for_loaded_graph_with_process_defaults(
+    defaults: ProcessDefaults,
+) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap()
+        .with_process_defaults(defaults);
     (temp, build_app(state))
 }
 
@@ -689,6 +713,7 @@ pub mod matrix {
                 name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": name, "age": age })),
                 branch: Some(branch.to_string()),
+                settings: None,
             })
             .unwrap();
             let r = self
@@ -770,6 +795,7 @@ pub mod matrix {
                 params: Some(json!({ "name": name })),
                 branch: Some(branch.to_string()),
                 snapshot: None,
+                settings: None,
             })
             .unwrap();
             let r = self
@@ -837,6 +863,7 @@ pub mod matrix {
                 name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": sentinel, "age": 99 })),
                 branch: Some("main".to_string()),
+                settings: None,
             })
             .unwrap();
             let r = self
@@ -881,6 +908,7 @@ pub mod matrix {
                     source,
                     target: Some(target),
                     delete_branch: false,
+                    settings: None,
                 })
                 .unwrap();
                 let response = app
@@ -917,6 +945,7 @@ pub mod matrix {
                     name: Some("insert_person".to_string()),
                     params: Some(json!({ "name": name, "age": age })),
                     branch: Some(branch),
+                    settings: None,
                 })
                 .unwrap();
                 let response = app
@@ -1031,7 +1060,7 @@ pub async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     {
-        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
         db.branch_create_from(ReadTarget::branch("main"), "feature")
             .await
             .unwrap();
@@ -1052,10 +1081,12 @@ pub async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
 
 pub async fn sdk_change_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
     let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap())
-        .await
-        .unwrap()
-        .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
+    let db = session(
+        Omnigraph::open(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>),
+    );
     let mut params: omnigraph_compiler::ParamMap = Default::default();
     // Parameter keys are bare names (no `$` prefix); the runtime resolves
     // `$name` references in the query body to `params["name"]`.
@@ -1099,6 +1130,7 @@ pub async fn http_change_decision(
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "ParityCharlie", "age": 30 })),
         branch: Some("main".to_string()),
+        settings: None,
     };
     let (status, _body) = json_response(
         &app,
@@ -1120,10 +1152,12 @@ pub async fn http_change_decision(
 
 pub async fn sdk_merge_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
     let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap())
-        .await
-        .unwrap()
-        .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
+    let db = session(
+        Omnigraph::open(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>),
+    );
     let result = db.branch_merge_as("feature", "main", Some(actor)).await;
     match result {
         Ok(_) => ParityDecision::Allow,
@@ -1150,6 +1184,7 @@ pub async fn http_merge_decision(
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        settings: None,
     };
     let (status, _body) = json_response(
         &app,

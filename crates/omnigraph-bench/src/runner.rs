@@ -23,11 +23,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
 use lance::io::WrappingObjectStore;
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::instrumentation::{
     CountingStorageAdapter, MergeTimingReading, MergeWriteProbes, QueryIoProbes, StorageReadCounts,
     with_merge_write_probes, with_query_io_probes,
 };
+use omnigraph::settings::SessionSettings;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -2865,7 +2867,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
 
 async fn open_counting(
     root_uri: &str,
-) -> RunnerResult<(Omnigraph, Arc<StorageReadCounts>, PreparationWriteGate)> {
+) -> RunnerResult<(Session, Arc<StorageReadCounts>, PreparationWriteGate)> {
     let storage = omnigraph::storage::storage_for_uri(root_uri).map_err(|error| {
         RunnerError::new(
             "storage_open_failed",
@@ -2874,14 +2876,19 @@ async fn open_counting(
     })?;
     let (storage, preparation_gate) = guard_preparation_writes(storage, root_uri);
     let (storage, counts) = CountingStorageAdapter::new(storage);
-    let db = Omnigraph::open_with_storage(root_uri, storage)
-        .await
-        .map_err(|error| {
-            RunnerError::new(
-                "engine_open_failed",
-                format!("could not open repetition store {root_uri}: {error}"),
-            )
-        })?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::open_with_storage(root_uri, storage)
+                .await
+                .map_err(|error| {
+                    RunnerError::new(
+                        "engine_open_failed",
+                        format!("could not open repetition store {root_uri}: {error}"),
+                    )
+                })?,
+        ),
+        SessionSettings::default(),
+    );
     Ok((db, counts, preparation_gate))
 }
 

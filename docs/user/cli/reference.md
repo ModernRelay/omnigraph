@@ -1,7 +1,6 @@
 # CLI reference
 
-This page is a map of the `omnigraph` command surface. The installed binary is
-the exact reference:
+This page maps the CLI; the installed binary is the exact reference:
 
 ```bash
 omnigraph --help
@@ -41,7 +40,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query, or the `branch list` statement | direct or served |
+| `query` | Run a read query, or the `branch list` or `show` statement | direct or served |
 | `mutate` | Run an insert/update/delete query, or a `branch create`, `branch delete`, or `branch merge` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
@@ -60,7 +59,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Preview or publish classified storage drift | direct |
 | `cleanup` | Delete old versions under an explicit retention policy | direct |
-| `graphs list` | List graphs on a server | served |
+| `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
@@ -71,19 +70,19 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `alias` | Invoke a personal stored-query alias | served |
 | `version` | Print build and storage-format information | local |
 
-The [CLI guide](index.md) gives end-to-end examples. Maintenance safety is
-covered in [Maintenance](../operations/maintenance.md).
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
 `--as` for actor attribution. Direct maintenance does not load server policy;
 see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
 
 ## Query inputs and output
 
-For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`. When the
-source contains multiple declarations, the positional name selects one. For a
-stored server query, omit the source and pass its registry name. Parameters
-come inline, `--params '{"name":"Ada"}'`, or from a file, `--params-file
-params.json`.
+For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`; with
+multiple declarations the positional name selects one. A stored server query is
+its registry name alone. Parameters come inline, `--params '{"name":"Ada"}'`,
+or from a file, `--params-file params.json`. `--set NAME=VALUE`, repeatable,
+gives a [session setting](index.md#session-settings) a value for the run of
+`query`, `mutate`, `branch merge`, `commit changes`, `changes poll`, `load`
+and `ingest`.
 
 The source may instead be one branch statement, `mutate -e 'branch create b0'`
 or `query -e 'branch list'` (control writes through `mutate`, the listing
@@ -92,17 +91,15 @@ or params; see [Work with branches](index.md#work-with-branches).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
-cells come from the JSON spelling in
-[JSON result spelling](../queries/index.md#json-result-spelling); `table`,
-`csv`, and `kv` print strings unquoted. `--format json` prints the envelope
-pretty and the `rows` array compact, verbatim.
+cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
+`table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
+envelope pretty and the `rows` array compact, verbatim.
 
 ### Machine-readable read and write positions
 
-When the read snapshot has an effective graph head, `omnigraph query --json`
-returns its `graph_commit_id` in the complete read envelope. The id and rows
-come from the same pinned snapshot; use that id when a later mutation must be
-conditional on the state that was read.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph
+head. The id and rows share one pinned snapshot; use that id for a later
+conditional mutation.
 
 Successful `mutate --json`, `load --json`, and compatibility
 `ingest --json` responses include `commit`, the exact commit published by
@@ -110,6 +107,10 @@ that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `graph_manifest_version`, optional parent and merged-parent ids, optional
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
 that changes no entities returns `"commit": null`.
+
+`--json` and read commands' `--format json` preserve a graph server's complete
+structured error on stdout (for example, `"code": "forbidden"`) and exit 1.
+Malformed responses remain diagnostics. Conditional mismatches retain exit 4.
 
 ### Conditional mutations
 
@@ -160,6 +161,13 @@ are refused. See [storage migration](../operations/upgrade.md#explicit-storage-m
 missing branch from an explicit base. Overwrite is destructive and may require
 `--yes` for non-local storage.
 
+In a selected managed folder, implicit `load --graph <ID>` uses the separate
+cached data credential. It requires `change`, plus `branch_create` when
+`--from` is present. Managed loads bound input to 32 MiB, responses to 8 MiB,
+and one request to 300 seconds; uncertain writes are never automatically
+retried. See [managed bulk loading](managed-data.md#bulk-loading) for limits,
+permissions, ordinary addressing, and reconciliation.
+
 Change-feed commands, cursor checkpointing, and baseline recovery are described
 in [Changes and Change Feeds](../branching/changes.md).
 
@@ -197,14 +205,9 @@ clusters:
     root: s3://company-data/omnigraph
 
 profiles:
-  prod-knowledge:
-    server: prod
-    default_graph: knowledge
-  company-admin:
-    cluster: company
-    default_graph: knowledge
-  local-dev:
-    store: file:///tmp/dev.omni
+  prod-knowledge: {server: prod, default_graph: knowledge}
+  company-admin: {cluster: company, default_graph: knowledge}
+  local-dev: {store: file:///tmp/dev.omni}
 
 aliases:
   experts:
@@ -217,9 +220,8 @@ aliases:
     format: table
 ```
 
-Each profile binds exactly one of `server`, `cluster`, or `store`. Select it
-with `--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled
-by a profile.
+Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
+`--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
 
 Bearer tokens never belong in `config.yaml`. Store a token with
 `omnigraph login <server>` or provide `OMNIGRAPH_BEARER_TOKEN` for the current
@@ -227,21 +229,19 @@ invocation.
 
 ## Managed cluster commands
 
-`omnigraph login --api ORIGIN` prints a verification URL and user code to
-stderr. Complete the browser login while the CLI polls. The resulting opaque
-service session is stored in the OS keychain under the canonical API origin:
-macOS Keychain, Windows Credential Manager, or encrypted Secret Service on
-Linux and BSD. There is no plaintext fallback. Sessions expire within 15
-minutes, and the CLI stores no refresh token; run login again after expiry.
-An unavailable keychain refuses the operation. Login JSON includes identity
-and expiry, never a token or device secret.
+`omnigraph login --api ORIGIN` reuses valid cached access or prints a WorkOS
+AuthKit verification URL and user code. The OS keychain holds provider-bound
+access and rotating refresh credentials; old opaque sessions are not reused.
+Access lasts at most 15 minutes; silent renewal ends eight hours after sign-in.
+Normal commands never open browser login. Login JSON reports identity and
+expiry metadata, never credentials. Temporary errors preserve cached access;
+an uncertain refresh is never replayed and may require explicit login.
+See the [authentication contract](../../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+for binding, coordination and refresh bounds.
 
-`omnigraph logout --api ORIGIN` revokes that session and removes only that
-origin's local entry. If revocation fails, the local entry is still removed
-and the error reports `revocation_confirmed: false`; the remote session
-remains subject to its expiry. Accepted runs continue after logout.
-The existing `login SERVER --token` and `logout SERVER` commands retain their
-named-server credential behavior.
+`omnigraph logout --api ORIGIN` requests provider-session revocation and clears
+local credentials. Its `provider_revocation_confirmed` result reports whether
+revocation succeeded. Accepted runs continue. Named-server login is unchanged.
 
 `omnigraph use CLUSTER_ID --api ORIGIN [--config DIR] [--json]` verifies access
 to the cluster, then atomically writes `DIR/.omnigraph/context`:
@@ -326,9 +326,12 @@ context is present. API failures never trigger direct execution.
 
 ## Managed data access
 
-Use `cluster token` to cache scoped data authority, then `query` or `mutate`
-with `--graph` from the managed folder. See [managed data access](managed-data.md)
-for permissions, offline behavior, expiry, and local credential clearing.
+After login and cluster selection, use `graphs list` to discover graphs, then
+`query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
+Missing or expired identity credentials are acquired before the operation;
+applied Cedar policy decides permissions. See [managed data access](managed-data.md)
+for offline behavior, identity binding, explicit restricted credentials,
+discovery and credential clearing.
 
 ## Confirmation rules
 

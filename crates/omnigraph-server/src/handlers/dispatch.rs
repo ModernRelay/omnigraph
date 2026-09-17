@@ -5,7 +5,8 @@
 
 use super::*;
 use crate::api::branch_statement_refusals as refusals;
-use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite};
+use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, SettingStmt, show_statement_name};
+use omnigraph_compiler::settings::{SettingId, SettingRow};
 
 /// The HTTP entry a GQ source arrived through. A branch statement is served
 /// only at its own door: `Query` serves `branch list`, `Mutate` serves
@@ -20,8 +21,9 @@ pub(crate) enum Door {
     Change,
 }
 
-/// What [`run_query`] answered: a declared query's rows, or the branch names
-/// of a `branch list` statement sorted in byte order.
+/// What [`run_query`] answered: a declared query's rows, the branch names
+/// of a `branch list` statement sorted in byte order, or the setting rows of
+/// a `show` statement in definition order.
 pub(crate) enum ReadDispatch {
     Rows {
         query_name: String,
@@ -30,10 +32,11 @@ pub(crate) enum ReadDispatch {
         graph_commit_id: Option<String>,
     },
     BranchList(Vec<String>),
+    Show(Vec<SettingRow>),
 }
 
 impl ReadDispatch {
-    /// Render either answer as the `ReadOutput` every read route serves.
+    /// Render any answer as the `ReadOutput` every read route serves.
     pub(crate) fn into_read_output(self) -> std::result::Result<ReadOutput, ApiError> {
         match self {
             ReadDispatch::Rows {
@@ -47,8 +50,62 @@ impl ReadDispatch {
             ReadDispatch::BranchList(branches) => {
                 api::branch_list_read_output(&branches).map_err(render_error)
             }
+            ReadDispatch::Show(rows) => api::show_read_output(&rows).map_err(render_error),
         }
     }
+}
+
+/// The `process` scope rule at a remote door: a `set` or `reset` of a
+/// `process` setting in a request's text is refused before anything runs.
+pub(super) fn refuse_process_settings(
+    settings: &[SettingStmt],
+) -> std::result::Result<(), ApiError> {
+    for id in settings.iter().filter_map(SettingStmt::id) {
+        id.refuse_from_request()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// A `set` or `reset` prefix at a deprecated door: `/read` and `/change`
+/// serve their legacy bodies under the process defaults alone, so the prefix
+/// is refused exactly as their `settings` field is.
+pub(super) fn refuse_settings_at_deprecated_route(
+    door: Door,
+    settings: &[SettingStmt],
+) -> std::result::Result<(), ApiError> {
+    if matches!(door, Door::Read | Door::Change) && !settings.is_empty() {
+        return Err(ApiError::bad_request(
+            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
+        ));
+    }
+    Ok(())
+}
+
+/// A source no door can pick a statement from: settings-only, or holding
+/// nothing at all.
+pub(super) fn refuse_empty_file(file: &QueryFile) -> std::result::Result<(), ApiError> {
+    match file.empty_kind() {
+        Some(EmptyFile::SettingsOnly) => Err(ApiError::bad_request(
+            crate::api::query_file_refusals::ONLY_SETTINGS,
+        )),
+        Some(EmptyFile::NoStatement) => Err(ApiError::bad_request(
+            crate::api::query_file_refusals::NO_QUERY,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The request's session with the source's `set` and `reset` lines applied,
+/// for the statements the engine does not parse itself (`branch merge`,
+/// `show`); the request's own session is unchanged.
+pub(super) fn session_with_prefix(
+    session: &Session,
+    settings: &[SettingStmt],
+) -> std::result::Result<Session, ApiError> {
+    session
+        .with_prefix(settings)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 /// Parse the source into its kind: `query` declarations or one branch
@@ -69,6 +126,14 @@ pub(super) fn read_at_write_door() -> ApiError {
     ApiError::bad_request(refusals::with_statement(
         refusals::READ_AT_WRITE_DOOR,
         BranchStmt::List.statement_name(),
+    ))
+}
+
+/// `show` is a read: the same refusal `branch list` meets at the write door.
+pub(super) fn show_at_write_door(id: Option<SettingId>) -> ApiError {
+    ApiError::bad_request(refusals::with_statement(
+        refusals::READ_AT_WRITE_DOOR,
+        &show_statement_name(id),
     ))
 }
 
@@ -113,6 +178,7 @@ pub(super) fn refuse_statement_envelope(
 pub(super) async fn run_branch_statement(
     state: &AppState,
     handle: &GraphHandle,
+    session: &Session,
     actor: Option<&AuthenticatedActor>,
     write: BranchWrite,
 ) -> std::result::Result<ChangeOutput, ApiError> {
@@ -139,7 +205,7 @@ pub(super) async fn run_branch_statement(
         BranchWrite::Merge { source, into } => {
             let target = into.unwrap_or_else(|| "main".to_string());
             let merge: api::BranchMergeOutcome =
-                branch_merge_body(state, handle, actor, &source, &target)
+                branch_merge_body(state, handle, session, actor, &source, &target)
                     .await?
                     .into();
             let commit = match merge {

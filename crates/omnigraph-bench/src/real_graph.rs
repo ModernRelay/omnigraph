@@ -778,7 +778,10 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
     use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::Session;
+    use omnigraph::loader::LoadMode;
+    use omnigraph::settings::SessionSettings;
+    use std::sync::Arc;
 
     fn export_rows(rows: &[&str]) -> LogicalContentSummary {
         let mut sink = LogicalGraphSink::default();
@@ -897,8 +900,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("graph");
         let uri = root.to_str().unwrap();
-        let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-        load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
         drop(db);
 
         let before =

@@ -6,7 +6,7 @@ use std::fs;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{ErrorOutput, ExportRequest, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
@@ -735,8 +735,8 @@ graphs:
         .join("graphs/knowledge.omni")
         .to_string_lossy()
         .to_string();
-    let db = Omnigraph::open(&graph_uri).await.unwrap();
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::open(&graph_uri).await.unwrap());
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
 
     let _guard = EnvGuard::set(&[
         ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
@@ -770,6 +770,7 @@ graphs:
         params: Some(serde_json::json!({ "q": "alpha" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (status, body) = json_response(
         &app,

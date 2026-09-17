@@ -81,10 +81,13 @@ mod fixture_controls;
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
+use std::sync::Arc;
 use std::time::Instant;
 
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -1104,7 +1107,10 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
     );
     let dir = tempfile::tempdir().expect("tempdir");
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, &schema).await.expect("init");
+    let db = Session::from_defaults(
+        Arc::new(Omnigraph::init(uri, &schema).await.expect("init")),
+        SessionSettings::default(),
+    );
 
     // Seed N rows on main in batches (merge-written fragments, matching the
     // embed workflow's write shape). JSONL strings are per-batch transients.
@@ -1171,7 +1177,7 @@ async fn merge_all_changed(args: &Args) -> serde_json::Value {
 
 #[cfg(unix)]
 async fn load_vector_rows(
-    db: &Omnigraph,
+    db: &Session,
     branch: &str,
     args: &Args,
     batch_rows: usize,
@@ -1693,7 +1699,10 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
     );
     let dir = tempfile::tempdir().expect("tempdir");
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, &schema).await.expect("init");
+    let db = Session::from_defaults(
+        Arc::new(Omnigraph::init(uri, &schema).await.expect("init")),
+        SessionSettings::default(),
+    );
 
     // Every ~1/selectivity-th row is a far-from-query "hit"; the rest cluster
     // near the query point (+e1 pole).
@@ -1814,7 +1823,7 @@ async fn nearest_prefilter(args: &Args) -> serde_json::Value {
 async fn rrf_gate(args: &Args) -> serde_json::Value {
     use lance::io::WrappingObjectStore;
     use lance_io::utils::tracking_store::IOTracker;
-    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_rrf_plan};
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 
     const ARTIFACTS: usize = 750;
     const FANOUT: usize = 2;
@@ -1846,7 +1855,10 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
                           edge ChunkOfArtifact: Chunk -> Artifact {\n    label: String\n}\n";
             let dir = tempfile::tempdir().expect("tempdir");
             let uri = dir.path().to_str().unwrap();
-            let db = Omnigraph::init(uri, schema).await.expect("init");
+            let db = Session::from_defaults(
+                Arc::new(Omnigraph::init(uri, schema).await.expect("init")),
+                SessionSettings::default(),
+            );
 
             // Both query terms in every row (rank ties are irrelevant here —
             // this is a cost instrument, not the equality oracle), padded to
@@ -1921,7 +1933,10 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
             // matrix wants — iteration 0 must pay real data opens and the
             // gate's cold CSR build.
             drop(db);
-            let db = Omnigraph::open(uri).await.expect("reopen");
+            let db = Session::from_defaults(
+                Arc::new(Omnigraph::open(uri).await.expect("reopen")),
+                SessionSettings::default(),
+            );
 
             // Constructing one `lit()` per eligible id plus the `IN`-list
             // `Expr` — the per-id predicate-BUILD cost, which prior
@@ -1950,19 +1965,25 @@ async fn rrf_gate(args: &Args) -> serde_json::Value {
             let _ = table.incremental_stats();
             let _ = manifest.incremental_stats();
 
+            let planned = Session::from_defaults(
+                Arc::clone(db.db()),
+                db.settings()
+                    .clone()
+                    .with("rrf_plan", plan_mode)
+                    .expect("rrf_plan setting"),
+            );
+
             let mut iterations: Vec<serde_json::Value> = Vec::new();
             for iter in 0..QUERY_ITERS {
                 let started = Instant::now();
-                let outcome = with_rrf_plan(
-                    plan_mode,
-                    db.query(
+                let outcome = planned
+                    .query(
                         ReadTarget::branch("main"),
                         &query_src,
                         "recall_rrf",
                         &query_params,
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                 let wall_ms = started.elapsed().as_millis() as u64;
                 let table_stats = table.incremental_stats();
                 let manifest_stats = manifest.incremental_stats();

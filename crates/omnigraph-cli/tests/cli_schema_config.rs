@@ -43,12 +43,22 @@ fn help_groups_commands_by_capability() {
         "capability legend (after_help) missing from --help:\n{stdout}"
     );
 
-    // The Commands list precedes the legend, so first occurrences sit in the
-    // list and must appear in order: an `any` data verb, then a `direct` verb,
-    // then the `control` verb.
+    // Match command names in the Commands list, not words in descriptions or
+    // the capability legend.
+    let commands: Vec<_> = stdout
+        .split_once("Commands:\n")
+        .and_then(|(_, tail)| tail.split_once("\n\n"))
+        .unwrap_or_else(|| panic!("Commands list missing from --help:\n{stdout}"))
+        .0
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter(|line| !line.starts_with(' '))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
     let pos = |needle: &str| {
-        stdout
-            .find(needle)
+        commands
+            .iter()
+            .position(|command| *command == needle)
             .unwrap_or_else(|| panic!("'{needle}' not found in --help:\n{stdout}"))
     };
     assert!(
@@ -617,6 +627,59 @@ fn graphs_subcommand_help_lists_list_only() {
         !lowered.contains("delete a graph"),
         "graph delete should not be in v0.6.0 help; got:\n{stdout}"
     );
+}
+
+#[test]
+fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_context() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use support::managed_http::{IntentApiFixture, IntentReply};
+    let directory = tempdir().unwrap();
+    fs::create_dir(directory.path().join(".omnigraph")).unwrap();
+    fs::write(
+        directory.path().join(".omnigraph/context"),
+        "malformed context",
+    )
+    .unwrap();
+    let claims = serde_json::json!({"version":2,"iss":"https://issuer.example","aud":"urn:omnigraph:data:c",
+        "sub":"alice","account_id":"a","cluster_id":"c","cluster_incarnation":"i",
+        "principal_kind":"human","assurance":"verified_human","iat":1,"exp":3601,"jti":"j"});
+    let token = format!(
+        "header.{}.signature",
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    for discovery in [false, true] {
+        let reply = if discovery {
+            serde_json::json!({"graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
+        } else {
+            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha"}]})
+        };
+        let server = IntentApiFixture::new(vec![IntentReply::json(200, reply.clone())]);
+        let mut command = cli();
+        command
+            .current_dir(directory.path())
+            .env("OMNIGRAPH_BEARER_TOKEN", &token)
+            .args(["graphs", "list", "--server", &server.origin, "--json"]);
+        if discovery {
+            command.arg("--discovery");
+        }
+        let output = output_success(&mut command);
+        let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(actual, reply);
+        assert_eq!(
+            server.requests()[0].path,
+            if discovery {
+                "/graphs/discovery"
+            } else {
+                "/graphs"
+            }
+        );
+        assert_eq!(
+            server.requests()[0].headers["authorization"],
+            format!("Bearer {token}")
+        );
+        server.assert_complete();
+    }
 }
 
 #[test]

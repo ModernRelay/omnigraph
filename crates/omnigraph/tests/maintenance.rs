@@ -17,7 +17,7 @@ use omnigraph::db::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
     RepairOptions, SkipReason,
 };
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
@@ -64,7 +64,7 @@ fn assert_same_dataset_entry(
     assert_eq!(after.entity_count, before.entity_count);
 }
 
-async fn add_person_fragments(db: &mut Omnigraph) {
+async fn add_person_fragments(db: &omnigraph::Session) {
     for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42), ("Heidi", 43)] {
         mutate_main(
             db,
@@ -77,7 +77,7 @@ async fn add_person_fragments(db: &mut Omnigraph) {
     }
 }
 
-async fn forge_person_compaction_drift(db: &mut Omnigraph, root: &str) -> (u64, u64, String) {
+async fn forge_person_compaction_drift(db: &omnigraph::Session, root: &str) -> (u64, u64, String) {
     add_person_fragments(db).await;
     let (manifest_version, _, full) = person_manifest_and_head(db, root).await;
     let mut ds = Dataset::open(&full).await.unwrap();
@@ -203,12 +203,12 @@ async fn optimize_after_load_then_again_is_idempotent() {
 #[tokio::test]
 async fn optimize_compacts_internal_tables() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Build version-history depth so `__manifest` accumulates fragments.
     for i in 0..20 {
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", &format!("p{i}"))], &[("$age", 30)]),
@@ -261,7 +261,7 @@ async fn optimize_compacts_internal_tables() {
     // Coherent after internal compaction: reads + a strict write still work.
     assert!(count_rows(&db, "node:Person").await > 0);
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "after_compact")], &[("$age", 40)]),
@@ -278,10 +278,10 @@ async fn optimize_compacts_internal_tables() {
 #[tokio::test]
 async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     for i in 0..5 {
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", &format!("v{i}"))], &[("$age", 30)]),
@@ -346,8 +346,8 @@ async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tab
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
-    add_person_fragments(&mut db).await; // multiple fragments → will_compact
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await; // multiple fragments → will_compact
 
     // Simulate an upgraded graph: set an aggressive stored auto_cleanup config on
     // the Person table. This is an out-of-band Lance commit (an `UpdateConfig` that
@@ -419,12 +419,11 @@ node Doc {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
 
     // Loads publish only data effects; establish the initial id + rank BTREEs
     // explicitly through the reconciler before creating partial coverage.
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
         LoadMode::Merge,
@@ -435,8 +434,7 @@ node Doc {
 
     // A second load with NEW keys appends a fragment the existing BTREEs do not
     // cover (the existence gate skips re-building an index that already exists).
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
         LoadMode::Merge,
@@ -574,29 +572,26 @@ async fn optimize_compacts_blob_table_alongside_plain_table() {
     let schema = "\
 node Doc {\n    slug: String @key\n    content: Blob?\n}\n\
 node Tag {\n    slug: String @key\n}\n";
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
 
     // Three two-row writes create the exact lance#7965 shape: payload + null in
     // fragment one, valid empty leading fragment two followed by a neighbouring
     // payload, and two more neighbouring payloads in fragment three.
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d0\",\"content\":\"base64:cm93LXplcm8=\"}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":null}}",
         LoadMode::Overwrite,
     )
     .await
     .unwrap();
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:\"}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"content\":\"base64:cm93LXRocmVl\"}}",
         LoadMode::Merge,
     )
     .await
     .unwrap();
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"content\":\"base64:cm93LWZvdXI=\"}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d5\",\"content\":\"base64:cm93LWZpdmU=\"}}",
         LoadMode::Merge,
@@ -619,15 +614,10 @@ node Tag {\n    slug: String @key\n}\n";
         "test precondition: valid empty must lead the second of three fragments"
     );
     // Plain table, also multi-fragment so it has something to compact.
-    load_jsonl(
-        &db,
-        "{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}",
-        LoadMode::Merge,
-    )
+    db.load_jsonl("{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}", LoadMode::Merge, )
     .await
     .unwrap();
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         "{\"type\":\"Tag\",\"data\":{\"slug\":\"t3\"}}",
         LoadMode::Merge,
     )
@@ -715,13 +705,13 @@ async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Several separate inserts → multiple Person fragments, so `compact_files`
     // actually merges and moves the Lance HEAD (a single fragment is a no-op).
     for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42), ("Heidi", 43)] {
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", name)], &[("$age", age as i64)]),
@@ -777,8 +767,8 @@ async fn optimize_skips_preexisting_manifest_head_drift() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
-    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
     let stats = db.optimize().await.unwrap();
     let person = stats
@@ -810,8 +800,8 @@ async fn repair_preview_reports_verified_maintenance_drift_without_healing() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
-    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
     let stats = db
         .repair(RepairOptions {
@@ -856,8 +846,8 @@ async fn repair_confirm_heals_verified_maintenance_drift() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
-    let (_, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let db = init_and_load(&dir).await;
+    let (_, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
     let stats = db
         .repair(RepairOptions {
@@ -985,16 +975,16 @@ async fn non_strict_load_refuses_uncovered_drift_before_folding_it() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
-    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
-    let err = load_jsonl(
-        &db,
-        "{\"type\":\"Person\",\"data\":{\"name\":\"Ivan\",\"age\":44}}",
-        LoadMode::Merge,
-    )
-    .await
-    .expect_err("merge load must not silently fold uncovered drift");
+    let err = db
+        .load_jsonl(
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Ivan\",\"age\":44}}",
+            LoadMode::Merge,
+        )
+        .await
+        .expect_err("merge load must not silently fold uncovered drift");
     assert!(
         err.to_string().contains("omnigraph repair"),
         "error should point at explicit repair; got: {err}"
@@ -1014,11 +1004,11 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
-    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
     let err = mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "remove_person",
         &mixed_params(&[("$name", "Alice")], &[]),
@@ -1061,8 +1051,8 @@ async fn schema_apply_refuses_uncovered_drift_before_arming_recovery() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
-    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
     let desired = TEST_SCHEMA.replace(
         "    age: I32?\n}",
         "    age: I32?\n    nickname: String?\n}",
@@ -1097,10 +1087,8 @@ async fn ensure_indices_refuses_uncovered_drift_before_arming_recovery() {
         .trim_end_matches('/')
         .to_string();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     let (manifest_before, head_before, _) = forge_person_delete_drift(&db, &root).await;
 
     let err = db
@@ -1152,11 +1140,7 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     )
     .await
     .unwrap();
-    load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#,
-        LoadMode::Merge,
-    )
+    db.load_jsonl(r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#, LoadMode::Merge, )
     .await
     .unwrap();
     db.ensure_indices().await.unwrap();
@@ -1313,7 +1297,7 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
 #[tokio::test]
 async fn full_text_rebuild_first_touches_inherited_main_without_changing_main() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     let inherited = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     db.ensure_indices_on("feature").await.unwrap();
@@ -1325,7 +1309,7 @@ async fn full_text_rebuild_first_touches_inherited_main_without_changing_main() 
             .dataset("node:Person")
             .unwrap(),
     );
-    add_person_fragments(&mut db).await;
+    add_person_fragments(&db).await;
     let main_before = snapshot_main(&db).await.unwrap();
     let main_commits_before = db.list_commits(None).await.unwrap();
     let feature_commits_before = db.list_commits(Some("feature")).await.unwrap();
@@ -1531,7 +1515,7 @@ async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
         .unwrap()
         .trim_end_matches('/')
         .to_string();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     db.mutate(
         "feature",
@@ -1541,7 +1525,7 @@ async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
     )
     .await
     .unwrap();
-    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
     let err = db
         .branch_merge("feature", "main")
@@ -1568,7 +1552,7 @@ async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
 #[tokio::test]
 async fn cleanup_without_any_policy_option_errors() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let err = db
         .cleanup(CleanupPolicyOptions::default())
@@ -1585,8 +1569,8 @@ async fn cleanup_without_any_policy_option_errors() {
 #[tokio::test]
 async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    add_person_fragments(&mut db).await;
+    let db = init_and_load(&dir).await;
+    add_person_fragments(&db).await;
 
     let people_before = count_rows(&db, "node:Person").await;
     assert!(
@@ -1634,7 +1618,7 @@ async fn cleanup_keep_one_preserves_head_and_table_remains_readable() {
 #[tokio::test]
 async fn cleanup_keep_exceeding_history_preserves_every_available_version() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let person_uri = node_table_uri(&db, "Person").await;
     let before = Dataset::open(&person_uri)
         .await
@@ -1668,7 +1652,7 @@ async fn cleanup_keep_exceeding_history_preserves_every_available_version() {
 #[tokio::test]
 async fn cleanup_older_than_zero_preserves_head() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Aggressive policy: every version is "older than zero seconds ago".
     // Lance must still preserve the head manifest, so the table is openable
@@ -1683,13 +1667,13 @@ async fn cleanup_older_than_zero_preserves_head() {
 
     // Smoke test: after aggressive cleanup, we can still read and write the
     // graph — head wasn't pruned.
-    load_jsonl(&db, TEST_DATA, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(TEST_DATA, LoadMode::Merge).await.unwrap();
 }
 
 #[tokio::test]
 async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
     let feature_before = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
@@ -1703,7 +1687,7 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
 
     // Move main far enough that keep=1 would collect the version inherited by
     // the lazy branch unless cleanup accounts for graph-level branch pins.
-    add_person_fragments(&mut db).await;
+    add_person_fragments(&db).await;
     let main_person_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -1749,15 +1733,15 @@ async fn cleanup_preserves_main_version_pinned_by_live_lazy_branch() {
 #[tokio::test]
 async fn cleanup_uses_oldest_pin_across_multiple_live_lazy_branches() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.branch_create("a-old").await.unwrap();
     let old_rows = count_rows_branch(&db, "a-old", "node:Person").await;
-    add_person_fragments(&mut db).await;
+    add_person_fragments(&db).await;
     db.branch_create("z-new").await.unwrap();
     let new_rows = count_rows_branch(&db, "z-new", "node:Person").await;
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Ivan")], &[("$age", 44)]),
@@ -1787,7 +1771,7 @@ async fn cleanup_uses_oldest_pin_across_multiple_live_lazy_branches() {
 #[tokio::test]
 async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
     let pinned_main_version = db
@@ -1797,7 +1781,7 @@ async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
         .dataset("node:Person")
         .unwrap()
         .published_dataset_version;
-    add_person_fragments(&mut db).await;
+    add_person_fragments(&db).await;
 
     // Simulate damage created by an older cleanup implementation: raw Lance
     // sees no native Person branch for the lazy graph branch and removes its
@@ -1862,8 +1846,8 @@ async fn cleanup_fails_closed_when_live_lazy_branch_pin_is_unopenable() {
 async fn cleanup_refuses_uncovered_main_head_drift_before_any_version_gc() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
-    let mut db = init_and_load(&dir).await;
-    let (manifest_version, head_version, _) = forge_person_compaction_drift(&mut db, &root).await;
+    let db = init_and_load(&dir).await;
+    let (manifest_version, head_version, _) = forge_person_compaction_drift(&db, &root).await;
     let company_uri = node_table_uri(&db, "Company").await;
     let company_versions_before = Dataset::open(&company_uri)
         .await
@@ -1910,7 +1894,7 @@ async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
     // refs or stale manifests. Assert the sequence preserves row content,
     // leaves head readable, and doesn't break a subsequent write.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let people_before = count_rows(&db, "node:Person").await;
     let companies_before = count_rows(&db, "node:Company").await;
@@ -1932,7 +1916,7 @@ async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
     assert_eq!(count_rows(&db, "node:Company").await, companies_before);
 
     // Table is still writable after the cleanup+optimize sequence.
-    load_jsonl(&db, TEST_DATA, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(TEST_DATA, LoadMode::Merge).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
 }
 
@@ -1944,7 +1928,7 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     // `cleanup` must reconcile it away: drop every Lance branch absent from the
     // manifest authority, without touching `main`.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let people_before = count_rows(&db, "node:Person").await;
     assert!(people_before > 0, "fixture should seed Person rows");
@@ -2084,7 +2068,7 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
 #[tokio::test]
 async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.branch_create("feature").await.unwrap();
     let feature_native = helpers::graph_native_ref(db.uri(), "feature").await;
@@ -2183,7 +2167,7 @@ async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() 
 #[tokio::test]
 async fn cleanup_age_window_preserves_recent_detached_fork_snapshot() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let base_count = count_rows(&db, "node:Company").await;
     db.branch_create("feature").await.unwrap();
     db.load_as(
@@ -2253,7 +2237,7 @@ async fn cleanup_age_window_preserves_recent_detached_fork_snapshot() {
             .contains_key(&native),
         "an exact endpoint inside the explicit age window must survive pointer detachment",
     );
-    let reopened = Omnigraph::open(db.uri()).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
     let after = reopened
         .query(
             ReadTarget::snapshot(saved_commit),
@@ -2291,7 +2275,7 @@ async fn cleanup_age_window_preserves_recent_detached_fork_snapshot() {
 #[tokio::test]
 async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let person_uri = node_table_uri(&db, "Person").await;
     let grouped = std::path::Path::new(&person_uri).join("tree/team");
     let old_file = grouped.join("data/topic/_transactions/old.txn");
@@ -2334,7 +2318,7 @@ async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
 #[tokio::test]
 async fn cleanup_age_window_preserves_recent_retirement_of_old_manifest_fork() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     let manifest_uri = dir.path().join("__manifest");
     let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
@@ -2417,7 +2401,7 @@ async fn cleanup_age_window_preserves_recent_retirement_of_old_manifest_fork() {
 #[tokio::test]
 async fn cleanup_age_window_preserves_recent_native_mutation_and_aged_parent() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let person_uri = node_table_uri(&db, "Person").await;
     let mut main = Dataset::open(&person_uri).await.unwrap();
     let base = main.version().version;
@@ -2513,7 +2497,7 @@ async fn cleanup_age_window_preserves_recent_native_mutation_and_aged_parent() {
 async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
     for child_writes in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = init_and_load(&dir).await;
+        let db = init_and_load(&dir).await;
         let main_companies = count_rows(&db, "node:Company").await;
         db.branch_create("feature").await.unwrap();
         db.load_as(
@@ -2626,7 +2610,7 @@ async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
 #[tokio::test]
 async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     db.load_as(
         "feature",
@@ -2741,10 +2725,9 @@ async fn index_build_tolerates_null_vector_rows() {
         n: I64 @index\n    \
         embedding: Vector(8)? @index\n\
         }\n";
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
     // Rows present, embeddings null (loaded but not yet embedded).
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
         LoadMode::Merge,
@@ -2802,9 +2785,8 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Doc {\n    slug: String @key\n    rank: I32\n}\n";
-    let db = Omnigraph::init(uri, v1).await.unwrap();
-    load_jsonl(
-        &db,
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
         LoadMode::Merge,
@@ -2854,9 +2836,8 @@ async fn optimize_materializes_index_after_type_rename() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Doc {\n    slug: String @key\n    rank: I32 @index\n}\n";
-    let db = Omnigraph::init(uri, v1).await.unwrap();
-    load_jsonl(
-        &db,
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
         LoadMode::Merge,

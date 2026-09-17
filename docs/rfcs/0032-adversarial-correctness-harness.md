@@ -485,8 +485,9 @@ Per the standing CI budget:
   local failpoint cells run in their existing workspace owners. `Test Workspace`
   already compiles one workspace feature superset with engine/cluster failpoints
   on every pull request and after merge; RFC 0032 does not add a second Cargo
-  invocation or a third feature graph. `Test Workspace` is a reporting context,
-  not a required one, so this is not described as a PR gate. Corpus file
+  invocation or a third feature graph. `Test Workspace` is a required context
+  on pull requests and on the merge queue's branch since 2026-09-16 (§15), so
+  its checked-in regressions gate a merge as part of that suite. Corpus file
   count/bytes and non-vacuous cases are
   asserted. The ordinary additions own an internally enforced **20 s** aggregate
   parent allocation and the failpoint sensitivity cells own **10 s**, both
@@ -685,3 +686,16 @@ CI already compiles one workspace feature superset with engine/cluster
 failpoints" and "The current CI does not run the full workspace suite on
 every PR, so this is not described as a PR gate." Nothing else in §8
 changes; the budgets and the RustFS child runner's placement are as written.
+
+## 15. Amendment (2026-09-16): `Test Workspace` is a required context
+
+Added when `main` moved to the merge queue (`docs/dev/branch-protection.md`,
+Merge queue). `Test Workspace` is a required context on pull requests and on
+the merge queue's branch, fail-fast in both, and keeps `--no-fail-fast` on
+`main`, tags, and dispatch. §8's first bullet is rewritten to say so.
+Superseded sentences: §8 "`Test Workspace` is a reporting context, not a
+required one, so this is not described as a PR gate." and §14 "RFC 0032's
+additions are not a PR gate because `Test Workspace` is not a required
+context, no longer because the suite skipped pull requests." The additions
+RFC 0032 describes now gate a merge through that suite; nothing else in §8 or
+§14 changes.

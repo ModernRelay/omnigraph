@@ -22,10 +22,11 @@ Run `omnigraph <command> --help` for the flags supported by your installed
 version. The [CLI reference](reference.md) summarizes addressing, commands,
 configuration, and output formats.
 
-For a managed cluster, first select it with `use` and request a scoped data
-credential with `cluster token`. Then run `query` or `mutate` from that folder
-with an explicit `--graph`. See [managed data access](managed-data.md)
-for permissions, expiry, offline operation, and local credential clearing.
+For a managed cluster, first select it with `use` and cache an identity
+credential with `cluster token`. Run `graphs list` to discover graph names,
+then `query` or `mutate` from that folder with an explicit `--graph`. Applied
+Cedar policy determines your permissions. See [managed data access](managed-data.md)
+for legacy restricted credentials, expiry, offline operation, and clearing.
 
 ## Create, load, and query a graph
 
@@ -88,6 +89,41 @@ omnigraph mutate -e 'branch delete "review/new-data"' --store ./graph.omni
 
 See [Branches and commits](../branching/index.md) for isolation, history, and
 merge behavior.
+
+## Session settings
+
+`--set NAME=VALUE`, repeatable, gives a [session
+setting](../queries/index.md#session-settings) a value for one invocation; the
+value is spelled as after `=` in a `set` line (`--set merge_lineage=off`). A `set`
+line in the source applies after `--set`, so the file wins.
+
+- `query --set`: applies to the read, `show` included.
+- `mutate --set`: applies to the mutation or branch statement.
+- `branch merge --set`: applies to the merge (`--set merge_lineage=verify`).
+- `commit changes --set`: sent as `set=NAME=VALUE` on the commit's change
+  read. The values are validated and select nothing in this release; a direct
+  run (`--store`) accepts them with no effect.
+- `changes poll --set`: sent as `set=NAME=VALUE` on the change feed read, with
+  the same validation and the same absence of effect.
+- `load --set` and `ingest --set`: a direct run (`--store`) applies them to the
+  staged write (`--set stage_write_concurrency=16`); a served run refuses any
+  `--set` before sending, since the served load and ingest routes carry no
+  `settings` field.
+
+```bash
+omnigraph query reports --query queries.gq --set merge_lineage=off --store ./graph.omni
+omnigraph branch merge review/new-data --into main --set merge_lineage=verify --store ./graph.omni
+```
+
+A direct run (`--store`) is the process, so it accepts a `process` setting
+from `--set`, the file and the environment. A served run (`--server`) sends
+`--set` values in the request's `settings` field, and a `--set` or `set` line
+naming a `process` setting is refused before anything is sent: `setting
+`<name>` is a process setting; it is read from the server's environment, not
+from a request`.
+
+A stored query takes no `--set`: `omnigraph query <name>` without `-e` or
+`--query` runs under the process defaults.
 
 ## Read Blob values
 

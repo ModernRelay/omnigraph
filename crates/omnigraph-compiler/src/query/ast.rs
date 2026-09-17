@@ -1,16 +1,96 @@
+use crate::settings::{SettingId, SettingValue};
+
 pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
-/// A parsed `.gq` source: a list of `query` declarations, or one branch
-/// statement.
+/// A parsed `.gq` source: the `set` and `reset` lines at its head, then its
+/// body, which is a list of `query` declarations, one branch statement, or
+/// one `show` statement.
 #[derive(Debug, Clone)]
-pub enum QueryFile {
+pub struct QueryFile {
+    pub settings: Vec<SettingStmt>,
+    pub body: FileBody,
+}
+
+/// What follows a file's settings prefix. `Queries` is empty for a file that
+/// holds no statement at all, prefix or not.
+#[derive(Debug, Clone)]
+pub enum FileBody {
     Queries(Vec<QueryDecl>),
     Branch(BranchStmt),
+    Show(Option<SettingId>),
+}
+
+/// Which empty a source is: no statement at all, or a settings prefix with
+/// nothing after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyFile {
+    NoStatement,
+    SettingsOnly,
+}
+
+/// One line of a file's settings prefix, its name and value already checked
+/// against the settings definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingStmt {
+    Set { id: SettingId, value: SettingValue },
+    Reset { id: Option<SettingId> },
+}
+
+impl SettingStmt {
+    /// `set` or `reset`, the keyword the line opens with.
+    pub fn statement_name(&self) -> &'static str {
+        match self {
+            SettingStmt::Set { .. } => "set",
+            SettingStmt::Reset { .. } => "reset",
+        }
+    }
+
+    /// The setting a line names; `None` for `reset all`.
+    pub fn id(&self) -> Option<SettingId> {
+        match self {
+            SettingStmt::Set { id, .. } => Some(*id),
+            SettingStmt::Reset { id } => *id,
+        }
+    }
+}
+
+/// `show <name>` or `show all`, the spelling refusals quote.
+pub fn show_statement_name(id: Option<SettingId>) -> String {
+    format!("show {}", id.map_or("all", SettingId::name))
 }
 
 impl QueryFile {
+    /// Which empty this file is, `None` when its body carries a statement:
+    /// the one reading of an empty `Queries` body every door shares.
+    pub fn empty_kind(&self) -> Option<EmptyFile> {
+        match &self.body {
+            FileBody::Queries(queries) if queries.is_empty() => Some(if self.settings.is_empty() {
+                EmptyFile::NoStatement
+            } else {
+                EmptyFile::SettingsOnly
+            }),
+            _ => None,
+        }
+    }
+
+    /// The declarations of a declaration file.
+    ///
+    /// # Errors
+    ///
+    /// The not-a-declaration message of a branch or `show` statement.
+    pub fn into_declarations(self) -> Result<Vec<QueryDecl>, String> {
+        match self.body {
+            FileBody::Queries(queries) => Ok(queries),
+            FileBody::Branch(stmt) => Err(stmt.not_a_declaration_message()),
+            FileBody::Show(id) => Err(format!(
+                "`{}` is a settings statement, not a query declaration",
+                show_statement_name(id)
+            )),
+        }
+    }
+
     /// The one declaration of a single-query file. Test support: production
-    /// code matches `QueryFile` instead.
+    /// code matches `body` instead.
     ///
     /// # Panics
     ///
@@ -18,15 +98,16 @@ impl QueryFile {
     #[doc(hidden)]
     #[track_caller]
     pub fn single_decl(&self) -> &QueryDecl {
-        match self {
-            QueryFile::Queries(queries) => match queries.as_slice() {
+        match &self.body {
+            FileBody::Queries(queries) => match queries.as_slice() {
                 [decl] => decl,
                 other => panic!(
                     "expected exactly one query declaration, got {}",
                     other.len()
                 ),
             },
-            QueryFile::Branch(stmt) => panic!("{}", stmt.not_a_declaration_message()),
+            FileBody::Branch(stmt) => panic!("{}", stmt.not_a_declaration_message()),
+            FileBody::Show(id) => panic!("`{}` is not a declaration", show_statement_name(*id)),
         }
     }
 }

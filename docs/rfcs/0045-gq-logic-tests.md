@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-10
+updated: 2026-09-15
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -294,7 +294,8 @@ among Rust test targets only `omnigraph-gqt`'s (the corpus target and its
 unit tests), `Test omnigraph-server --features aws`, and `DST pinned suite`
 (`cargo test -p omnigraph-dst`, `dst.yml`) run on a pull request as
 required contexts (`Test Workspace` runs the remaining workspace targets on
-the pull request as a reporting context, CI above); a test-attributed
+the pull request and on the merge queue's branch as a required context since
+2026-09-16, CI above); a test-attributed
 `issue_N` function inside `crates/omnigraph-gqt/`, `crates/omnigraph-server/`,
 or `crates/omnigraph-dst/` therefore runs in a required context, and the
 Rust shape stays a naming check everywhere else, where a defined
@@ -829,10 +830,15 @@ query unrelated_write() {
 --- expect affected: nodes=1 edges=0
 ```
 
-All four seam fields are required. `scope` accepts only `next_step`;
-`action` is `fail`, `contention`, or `skip`. `fail` selects the declared
-`Fail` effect, falling back to `Contention` for compatibility when `Fail`
-is absent. Explicit `contention` selects only `Contention`, and `skip`
+The four seam fields `at`, `occurrence`, `action` and `scope` are required.
+`subject` is optional on a `--- seam` block; a store place requires it, and
+a block whose catalog entry or `STORE_PLACES` row declares no subject
+refuses it. Its grammar and matching rule are RFC 0066 §Design **Subjects**,
+where the value a store place's crossing carries is the object's
+root-relative name. `scope` accepts only `next_step`; `action` is `fail`,
+`contention`, `skip`, or a store action, the first being `misdirect`. `fail`
+selects the declared `Fail` effect, falling back to `Contention` for
+compatibility when `Fail` is absent. Explicit `contention` selects only `Contention`, and `skip`
 selects only `Skip`; undeclared effects are refused. Thus a seam declaring
 both `Fail` and `Contention` lets a case choose either. `hold` is refused
 until a case can express two concurrent steps. `occurrence` is 1 to 1000000 and counts crossings of
@@ -841,17 +847,30 @@ retries. It starts at zero when the operation is armed. The installed
 decision passes the first N-1 crossings, fires on the Nth, and passes every
 later one. Target and storage do not change this meaning.
 
-The seam must exist in the engine's catalog and be crossed by the kind of
-step it precedes: a seam of operation `mutation` before a mutate step, one
-of `branch_merge`, `branch_create` or `branch_delete` before the matching
-branch statement, one of `any_write` before either; a seam whose operation
-no step starts is refused as unreachable. No caller-supplied code or
+With `subject`, `occurrence` counts only the crossings whose subject matches
+the glob; without it, every crossing.
+
+The seam must exist in the engine's catalog, or be a store place in the
+decoration's table `STORE_PLACES` (RFC 0066 §Design **Store places**), and
+be crossed by the kind of step it precedes: a seam of operation `mutation`
+before a mutate step, one of `branch_merge`, `branch_create` or
+`branch_delete` before the matching branch statement, one of `any_write`
+before either, a store place before either; a seam whose operation no step
+starts is refused as unreachable. No caller-supplied code or
 arbitrary action string is accepted. A new seam requires an implementation,
 a declared operation and set of effects in the catalog, and a proof case
 before a case may name it; the action must be among the declared effects. A
 seam that wraps one operation declares every outcome that operation can
 have, so a further action at a seam the catalog already lists needs a case
 and nothing else.
+
+Each admission refusal, the four the store shapes add included (a `subject`
+on a block whose entry or row declares none, a store action on a decision
+seam that does not declare it, an engine action on a store place, and a
+place-and-action pair the table lists but this amendment does not admit), is
+an `unsupported_environment:` report naming the directive's `at`, the entry
+or table row, and the reason (`declares no subject`, `does not admit action
+X`, `not admitted`).
 
 The selected operation must finish before seam cleanup can be considered
 complete. On cancellation or timeout, stop the isolated worker or quarantine
@@ -862,8 +881,8 @@ worker or quarantined graph does not count as a successful replay.
 
 Delivery is proven by the installed decision itself: the runner's decision
 counts every crossing and records `seam_delivered` with the seam name, the
-declared occurrence, the crossings seen once the site has fired and the
-effect that fired. A `fail` action on a seam declaring fail states the
+declared occurrence, the crossings counted over the step (for a store place,
+its matching calls) and the effect that fired. A `fail` action on a seam declaring fail states the
 injected error in its `--- expect error:` row; on a seam declaring
 contention the injected error is retryable, the publisher retries it, the
 step succeeds, and the delivery record is the proof. A `skip` step carries
@@ -875,11 +894,33 @@ cleanup fails it with `fault_cleanup_failed` and a timeout with `timeout`.
 A decision that leaked into another operation or graph
 fails isolation even if the expected rows match.
 
+A store action carries the healthy expectation of the step, since the engine
+sees success: the fault is in the bucket, and the case reads it back at a
+later step. Its delivery record carries, beside the seam name, occurrence,
+crossings and effect, `subject` (the glob as written for a store place; the
+site's declared subject for a store effect) and `hit`, an object with
+`method`, `requested` (the
+name the engine asked for) and, for `misdirect` only, `stored` (the name the
+store used); both names are root-relative, the domain `subject` is matched
+in. For a store place `declared_at` is the `STORE_PLACES` row and
+`fired_at` the adapter method that recorded the hit, both as `file:line`.
+The rule and any one-shot are installed and removed with the step's
+decisions, before the next operation or restart. A fired store effect whose
+hit the decoration never recorded fails the execution with
+`seam_unobserved`, as an unreached seam does, and so does a store place
+whose matching calls never reach the declared occurrence, the message
+carrying the matching calls seen.
+
 A seam directive attaches to the one operation it precedes. Several
 directives may precede one operation when they name distinct seams (two
 independent lost writes on one mutation); each is armed, counted and
 recorded on its own, and the same seam named twice before one operation is
-refused. Directives before restart/setup, orphan directives, and directives
+refused. The one exception is the store: at most one store action precedes
+an operation, as a store place or as a store effect on a decision seam, and
+a second is refused with `unsupported_environment: one store action per
+step`, naming both directives, since admission cannot tell whether two
+store actions reach one store call (RFC 0066 §Design **Store places**).
+Directives before restart/setup, orphan directives, and directives
 inside loops are refused in this phase; seams during setup remain out of
 scope. A case may contain up to 16 seam directives. No installed decision
 survives a restart, environment change, seed, or replay.
@@ -892,10 +933,36 @@ satisfy it. This amendment defines no production seam-control endpoint.
 HTTP seam execution stays unavailable until the test-only
 lifecycle/control owner proves this contract.
 
-`--- fault` is reserved for storage-boundary faults, injected at the object
-store rather than at a code seam; its grammar is a separate amendment, and
-until it lands a `--- fault` section is refused with a pointer to
-`--- seam`.
+There is no `--- fault` section: a fault injected at the object store is a
+`--- seam` naming a store place or a decision seam that declares a store
+effect, and a `--- fault` section is refused with a pointer to `--- seam`.
+The store places, their methods and the actions each honors are RFC 0066's
+table; a place-and-action pair outside it, or listed but not implemented, is
+refused at admission naming the table row. The two forms of one store fault:
+
+```text
+--- seam
+at: recovery.sidecar_write
+occurrence: 1
+action: misdirect
+scope: next_step
+```
+
+```text
+--- seam
+at: storage.put
+subject: __recovery/*
+occurrence: 1
+action: misdirect
+scope: next_step
+```
+
+The first selects the write by the engine line before it; the second by the
+object's name. Both land the sidecar's arm put as
+`__recovery/dstm-<opid>.json` and record one delivery. A mutation puts the
+sidecar name twice, the arm put then the confirm put, and deletes it once
+after publish; on `storage.put` with `subject: __recovery/*`,
+`occurrence: 1` is the arm put and `occurrence: 2` the confirm put.
 
 `--- restart` continues to mean closing the graph handle and reopening
 the same stored graph. It does not mean process crash or HTTP reconnect.
@@ -943,8 +1010,14 @@ Admission requires only `omnigraph-engine-dst` with
 `in-memory-object-store`, no loops, and at the declared step either an
 ordinary mutate with its healthy `ok` or `affected` expectation (for the
 `RecoveryRequired` matcher) or a `--- restart` (for the `Internal`
-matcher). At least one seam must precede that step. Seams at or after the
-marked step are refused.
+matcher). At least one seam, a store place included, must precede that step;
+the classifier resolves the name by exact membership, the engine catalog
+first and `STORE_PLACES` second, by the rule the runner arms with, compares
+the subject when one is declared, and validates each store delivery's `hit`
+(present and complete, `method` among the row's methods, `requested`
+matched by the subject, `stored` the `dstm-` transform of `requested` for
+`misdirect`), so a report with a missing or foreign hit is not a known
+failure. Seams at or after the marked step are refused.
 
 An execution qualifies only when every preceding assertion passes, every
 declared seam has its delivery record at its own operation, and the marked
@@ -2160,3 +2233,35 @@ historical command and configuration descriptions are not migration aliases.
     silent on `ok` being satisfied by a no-op merge; and the refusal string
     `a branch statement names its branches itself`, which now names the next
     action. Frontmatter `updated:` bumped to 2026-09-06.
+- 2026-09-15, from the RFC 0066 amendment on store faults: a fault injected
+  at the object store is a `--- seam` naming a store place or a decision
+  seam that declares a store effect, and no `--- fault` section exists.
+  Replaced sentences in §Seams at an explicit step: "All four seam fields
+  are required. `scope` accepts only `next_step`; `action` is `fail`,
+  `contention`, or `skip`" (now the four required fields, the optional
+  `subject` with its owner rule, and store actions in the action list); "The
+  seam must exist in the engine's catalog and be crossed by the kind of step
+  it precedes" (now the catalog or a store place in `STORE_PLACES`, with the
+  `unsupported_environment:` shape of each refusal); and the reserved
+  paragraph "`--- fault` is reserved for storage-boundary faults, injected
+  at the object store rather than at a code seam; its grammar is a separate
+  amendment, and until it lands a `--- fault` section is refused with a
+  pointer to `--- seam`" (now the two seam forms of a store fault and the
+  table that bounds them). The delivery paragraph gains the store's own hit,
+  `declared_at` and `fired_at` for a store place, and `seam_unobserved` for
+  an unreached store rule; "Several directives may precede one operation
+  when they name distinct seams" keeps its rule and gains the one exception,
+  at most one store action per operation. In §Known recovery failures: "At
+  least one seam must precede that step" (now a store place counts, and the
+  classifier resolves the name by exact membership in the engine catalog or
+  `STORE_PLACES` and validates the store hit). In the 2026-09-14
+  entry of this log: "`--- fault` is reserved for storage-boundary faults"
+  (no such section exists).
+- 2026-09-16, amendment from the PR that made CI listen to the merge queue
+  (`docs/dev/branch-protection.md`, Merge queue): `Test Workspace` is a
+  required context on pull requests and on the merge queue's branch. §CI's
+  parenthetical is rewritten to say so. Superseded sentence: "(`Test
+  Workspace` runs the remaining workspace targets on the pull request as a
+  reporting context, CI above)". The claim that a test-attributed `issue_N`
+  function inside the three named crates runs in a required context stands;
+  it now also holds for every other workspace crate through `Test Workspace`.

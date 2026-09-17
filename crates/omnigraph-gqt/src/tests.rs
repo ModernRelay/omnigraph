@@ -26,6 +26,14 @@ fn parses_a_minimal_case() {
 }
 
 #[test]
+fn a_fault_section_is_refused() {
+    let fault =
+        "--- fault\nat: recovery.sidecar_write\noccurrence: 1\naction: fail\nscope: next_step\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{fault}{QUERY}{EXPECT}");
+    assert!(refusal("x", &text).contains("there is no `--- fault` section"));
+}
+
+#[test]
 fn header_notes_repeat_and_continuation_lines_are_refused() {
     let text = format!(
         "# issue: 7\n# red_on: 2026-01-01, the run\n# notes: returned 8,\n# notes: not 20.\n{SCHEMA}{SEED}{QUERY}{EXPECT}"
@@ -1466,14 +1474,15 @@ async fn pinned_step_runs_only_its_pinned_path() {
             .await
             .unwrap_or_else(|e| panic!("{mode}: {e}"));
 
-        let (db, _uri, _dir) = open_case_store(&case).await.unwrap();
+        let (session, _uri, _dir) = open_case_store(&case).await.unwrap();
+        assert_eq!(session.settings().traversal().as_str(), mode);
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
         };
         let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
         let (outcome, counts) = under_traversal(
             Some(mode),
-            db.query(
+            session.query(
                 ReadTarget::branch("main"),
                 &step.source,
                 &step.name,
@@ -1499,6 +1508,85 @@ async fn pinned_step_runs_only_its_pinned_path() {
             );
         }
     }
+}
+
+/// A reset that zeroed the pin to `auto` would switch the pin check off
+/// silently; `pinned_mode` returning `None` drops the probes, and the
+/// stage fails loudly instead.
+#[tokio::test]
+async fn traversal_pin_survives_settings_steps_and_rebind() {
+    let text = format!(
+        "{HDR}# traversal: csr\n{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}{TRAVERSAL_QUERY}{TRAVERSAL_PARAMS}{TRAVERSAL_EXPECT}\
+         --- mutate\nset merge_lineage = off;\n\n--- expect ok\n\n\
+         --- mutate\nreset all;\n\n--- expect ok\n\n\
+         --- restart\n"
+    );
+    let case = parse_case("pinned", &text).unwrap();
+    let (mut session, uri, _dir) = open_case_store(&case).await.unwrap();
+    let Some(Item::Step(Step::Query(query))) = case.items.first() else {
+        panic!("first item is the query step");
+    };
+    assert_csr_pin_runs(&session, query, "baseline").await;
+
+    let baseline_lineage = SessionSettings::default().get(SettingId::MergeLineage);
+    let (mut settings_steps, mut reopens) = (0, 0);
+    for item in &case.items[1..] {
+        let Item::Step(step) = item else {
+            panic!("the case has no loops");
+        };
+        let stage = match step {
+            Step::Settings(s) => {
+                run_settings_step(&mut session, s, None)
+                    .unwrap_or_else(|f| panic!("{}: {}", f.label, f.message));
+                settings_steps += 1;
+                let name = s.statements[0].statement_name();
+                let lineage = session.settings().get(SettingId::MergeLineage);
+                match name {
+                    "set" => assert_eq!(lineage, "off"),
+                    "reset" => assert_eq!(lineage, baseline_lineage),
+                    other => panic!("unexpected statement `{other}`"),
+                }
+                format!("after `{name}`")
+            }
+            Step::Restart { .. } => {
+                let detached = session.detach();
+                let db = Omnigraph::open(&uri).await.unwrap();
+                session = detached.attach(Arc::new(db));
+                reopens += 1;
+                "after reopen".to_string()
+            }
+            other => panic!("unexpected step {other:?}"),
+        };
+        assert_csr_pin_runs(&session, query, &stage).await;
+    }
+    assert_eq!((settings_steps, reopens), (2, 1));
+}
+
+/// The session still pins `csr`, and a run of `step` through the runner's
+/// own pin plumbing expands on the csr path only.
+async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
+    assert_eq!(session.settings().traversal(), Traversal::Csr, "{stage}");
+    let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
+    let (outcome, counts) = under_traversal(
+        pinned_mode(session),
+        session.query(
+            ReadTarget::branch("main"),
+            &step.source,
+            &step.name,
+            &params,
+        ),
+    )
+    .await;
+    outcome.unwrap_or_else(|e| panic!("{stage}: {e}"));
+    let counts = counts.unwrap_or_else(|| panic!("{stage}: the pin dropped, no probes attached"));
+    let (indexed, csr) = (
+        counts.indexed.load(Ordering::Relaxed),
+        counts.csr.load(Ordering::Relaxed),
+    );
+    assert!(
+        csr >= 1 && indexed == 0,
+        "{stage}: indexed={indexed} csr={csr}"
+    );
 }
 
 #[test]
@@ -1577,11 +1665,153 @@ fn corpus_layout() {
 }
 
 #[test]
-fn runner_refuses_a_process_traversal_override() {
-    assert!(traversal_override_refusal(None).is_none());
-    let reason = traversal_override_refusal(Some(OsStr::new("csr"))).unwrap();
+fn runner_refuses_a_process_settings_override() {
+    assert!(settings_override_refusal(|_| None).is_none());
+    let one = |set: &'static str, value: &'static str| {
+        settings_override_refusal(move |name| (name == set).then(|| OsString::from(value)))
+    };
+    let reason = one("OMNIGRAPH_TRAVERSAL_MODE", "csr").unwrap();
     assert!(reason.contains("OMNIGRAPH_TRAVERSAL_MODE=csr"), "{reason}");
-    assert!(reason.contains("# traversal:"), "{reason}");
+    assert!(
+        reason.contains("names no setting any more and decides nothing"),
+        "{reason}"
+    );
+    let reason = one("OMNIGRAPH_MERGE_LINEAGE", "off").unwrap();
+    assert!(reason.contains("OMNIGRAPH_MERGE_LINEAGE=off"), "{reason}");
+    assert!(
+        reason.contains("`set merge_lineage = <value>;`"),
+        "{reason}"
+    );
+    for spec in DEFINITIONS {
+        assert!(one(spec.env, "x").is_some(), "{} is not refused", spec.env);
+    }
+    assert!(one("OMNIGRAPH_GQ_UNRELATED", "x").is_none());
+}
+
+const SET_MERGE_OFF: &str = "--- mutate\nset merge_lineage = off;\n--- expect ok\n";
+const SHOW_MERGE_LINEAGE: &str = "--- query\nshow merge_lineage;\n--- expect unordered\n{\"name\": \"merge_lineage\", \"value\": \"off\", \"default\": \"on\", \"source\": \"file\", \"scope\": \"request\"}\n--- expect shape\nname: String\nvalue: String\ndefault: String\nsource: String\nscope: String\n";
+
+/// The settings statements the compiler and the scope rule refuse, each with
+/// the definition's message (the Session settings RFC, The statements): the runner refuses
+/// the case at parse time, so no case can carry these as expectations.
+#[test]
+fn refuses_settings_statements_the_definition_refuses() {
+    let text = format!("{HDR}{SCHEMA}{SEED}--- mutate\nset merge_lineage = v3;\n--- expect ok\n");
+    let reason = refusal("x", &text);
+    assert!(reason.contains("unknown value `v3`"), "{reason}");
+    let text = format!("{HDR}{SCHEMA}{SEED}--- query\nshow traversal;\n--- expect unordered\n");
+    let reason = refusal("x", &text);
+    assert!(reason.contains("unknown setting `traversal`"), "{reason}");
+}
+
+/// A `process` setting in a case body is refused, with the line of the
+/// statement, and `reset all` names no setting so the scope rule accepts it.
+#[test]
+fn refuses_a_process_setting_anywhere_in_a_case_body() {
+    let needle = "`rrf_plan` is a process setting";
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- mutate\nset merge_lineage = off;\nset merge_lineage = on; set rrf_plan = force_prefilter;\n--- expect ok\n"
+    );
+    let reason = refusal("x", &text);
+    assert!(reason.contains(needle), "{reason}");
+    assert!(
+        reason.starts_with("line 16: "),
+        "the line is the offending statement's own, though it shares line 16 with an earlier `set`: {reason}"
+    );
+    let text =
+        format!("{HDR}{SCHEMA}{SEED}--- mutate\nreset all;\n--- expect ok\n{SHOW_MERGE_LINEAGE}");
+    let case = parse_case("x", &text).unwrap_or_else(|e| {
+        panic!("`reset all` names no setting, so the scope rule has nothing to refuse: {e}")
+    });
+    assert_eq!(case.items.len(), 2);
+}
+
+#[test]
+fn settings_step_and_show_take_their_section_and_expect() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{SET_MERGE_OFF}{SHOW_MERGE_LINEAGE}");
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Settings(settings)),
+        Item::Step(Step::Show(show)),
+    ] = case.items.as_slice()
+    else {
+        panic!("a settings step then a show step, got {:?}", case.items);
+    };
+    assert_eq!(settings.statements.len(), 1);
+    assert_eq!(show.id, Some(SettingId::MergeLineage));
+    assert!(show.prefix.is_empty());
+    assert!(matches!(
+        show.expect,
+        QueryExpect::Rows { ordered: false, .. }
+    ));
+
+    let text = format!("{HDR}{SCHEMA}{SEED}--- query\nset merge_lineage = off;\n--- expect ok\n");
+    assert!(
+        refusal("x", &text).contains("a settings step is a `--- mutate` step; use `--- mutate`")
+    );
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- mutate branch: b0\nset merge_lineage = off;\n--- expect ok\n"
+    );
+    assert!(refusal("x", &text).contains("drop the `branch:` argument"));
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- mutate\nset merge_lineage = off;\n--- expect affected: nodes=0 edges=0\n"
+    );
+    assert!(refusal("x", &text).contains("a settings step takes `ok`"));
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- mutate\nset merge_lineage = off;\n--- params\n{{}}\n--- expect ok\n"
+    );
+    assert!(refusal("x", &text).contains("a settings statement takes no params"));
+
+    let text = format!("{HDR}{SCHEMA}{SEED}--- mutate\nshow merge_lineage;\n--- expect ok\n");
+    assert!(
+        refusal("x", &text)
+            .contains("`show merge_lineage` under `--- mutate` is refused; use `--- query`")
+    );
+    let text = format!("{HDR}{SCHEMA}{SEED}--- query branch: b0\nshow all;\n--- expect ordered\n");
+    assert!(refusal("x", &text).contains("drop the `branch:` argument"));
+    let text = format!("{HDR}{SCHEMA}{SEED}--- query\nshow all;\n--- expect error: nope\n");
+    assert!(refusal("x", &text).contains("`show all` takes `unordered` or `ordered`"));
+    let text = format!("{HDR}{SCHEMA}{SEED}--- query\nshow all;\n--- expect ordered\n");
+    let case = parse_case("x", &text).unwrap();
+    assert!(
+        matches!(case.items.as_slice(), [Item::Step(Step::Show(_))]),
+        "a `show` step derives its shape and needs no `--- expect shape` section"
+    );
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nshow all;\n--- expect ordered\n--- expect shape\nname: String\n"
+    );
+    assert!(
+        refusal("x", &text).contains("`show` derives its shape"),
+        "a shape section that is not the derived shape is refused"
+    );
+
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- mutate\nset merge_lineage = off;\nbranch merge b0\n--- expect ok\n--- query\nset merge_lineage = on;\nbranch list\n--- expect unordered\n{{\"name\": \"main\"}}\n--- expect shape\nname: String\n"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Control(merge)),
+        Item::Step(Step::List(list)),
+    ] = case.items.as_slice()
+    else {
+        panic!("a merge then a list, got {:?}", case.items);
+    };
+    assert_eq!(
+        merge.prefix.len(),
+        1,
+        "a prefix before a control write rides on the step; before `branch list` it selects nothing and is accepted"
+    );
+    assert_eq!(
+        list.ordinal, 2,
+        "`ListStep` carries no prefix: the parser validates the prefix and then drops it, because `branch list` selects nothing for a setting to steer"
+    );
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nset merge_lineage = nope;\nbranch list\n--- expect unordered\n{{\"name\": \"main\"}}\n--- expect shape\nname: String\n"
+    );
+    assert!(
+        refusal("x", &text).contains("unknown value `nope`"),
+        "a prefix on `branch list` is validated at parse time and then dropped: `ListStep` carries none"
+    );
 }
 
 /// Same name battery as `scripts/check-fix-regression.py --self-test`

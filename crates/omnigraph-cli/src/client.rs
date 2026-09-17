@@ -22,22 +22,24 @@
 //! Same one-body-two-impls collapse, less ceremony.
 
 use std::io::Write;
+use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
+use omnigraph::settings::{SessionSettings, SettingId, SettingValue, Source};
+use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, Session};
 use omnigraph_api_types::{
     BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
     BranchListOutput, BranchMergeOutcome, BranchMergeOutput, BranchMergeRequest,
     BranchOutcomeOutput, ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest,
     ChangeFeedOutput, ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput,
     CommitListOutput, CommitOutput, EntityKindOutput, ErrorOutput, ExportRequest,
-    GraphBatchLoadOutput, GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
-    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
-    branch_list_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, ingest_receipt_output, read_output, schema_apply_output,
-    snapshot_payload,
+    GraphBatchLoadOutput, GraphDiscoveryResponse, GraphListResponse, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest,
+    SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output, change_baseline_output,
+    change_feed_output, change_scope, commit_changes_output, commit_output, ingest_receipt_output,
+    read_output, schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::BranchWrite;
@@ -52,13 +54,67 @@ use crate::blob_cli::{
 };
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, branch_statement_change_request,
+    RemoteErrorCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, build_blob_http_client, build_http_client, is_remote_uri,
     legacy_change_request_body, precondition_failed_cli, query_params_from_json, remote_json,
-    remote_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
-    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    remote_json_bounded, remote_response_json_bounded, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
+
+const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
+// Managed load transport has its own longer bounded receipt wait.
+// Managed queries and mutations share a thirty-second total request deadline.
+const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The engine owns parsed-table limits. This bound covers only the exact
+/// UTF-8 NDJSON body sent to the existing server route, before any request.
+fn read_managed_load_data(path: &str) -> Result<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MANAGED_LOAD_REQUEST_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MANAGED_LOAD_REQUEST_LIMIT {
+        bail!("managed load request exceeds 32 MiB; split the input into bounded batches");
+    }
+    String::from_utf8(bytes).map_err(|_| eyre!("managed load input must be valid UTF-8"))
+}
+
+fn load_request(
+    request: reqwest::RequestBuilder,
+    data: String,
+    managed: bool,
+) -> reqwest::RequestBuilder {
+    let request = if managed {
+        request.timeout(MANAGED_LOAD_TIMEOUT)
+    } else {
+        request
+    };
+    request
+        .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(data)
+}
+
+/// Why a served `load`/`ingest` refuses a `--set`: neither route's request
+/// type carries a `settings` field, so a value could only be dropped.
+const SETTINGS_AT_SERVED_LOAD: &str = "load and ingest take --set only on an embedded store; \
+                                       the served load and ingest routes carry no settings field";
+
+/// The `--set name=value` flags of one invocation, each checked against the
+/// settings definition (the Session settings RFC). Scope is the transport's: the embedded
+/// session accepts every setting, a remote request refuses a `process` one.
+pub(crate) fn parse_set_flags(flags: &[String]) -> Result<Vec<(SettingId, SettingValue)>> {
+    let mut settings = Vec::with_capacity(flags.len());
+    for flag in flags {
+        let Some((name, value)) = flag.split_once('=') else {
+            bail!("--set takes NAME=VALUE, got '{flag}'");
+        };
+        settings.push(SettingId::parse_assignment(name, value)?);
+    }
+    Ok(settings)
+}
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
@@ -119,13 +175,22 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 impl GraphClient {
     /// An already validated managed credential never enters legacy scope or token resolution.
     pub(crate) fn managed(endpoint: &str, graph: &str, token: String) -> Result<Self> {
+        Self::managed_url(remote_url(endpoint, &["graphs", graph], &[])?, token)
+    }
+
+    pub(crate) fn managed_registry(endpoint: &str, token: String) -> Result<Self> {
+        Self::managed_url(endpoint.to_owned(), token)
+    }
+
+    fn managed_url(base_url: String, token: String) -> Result<Self> {
         Ok(Self::Remote {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()?,
-            base_url: remote_url(endpoint, &["graphs", graph], &[])?,
+            base_url,
             token: Some(token),
             response_limit: Some(8 * 1024 * 1024),
         })
@@ -319,11 +384,69 @@ impl GraphClient {
         matches!(self, GraphClient::Remote { .. })
     }
 
-    /// Open the local engine. Direct-store access carries no Cedar policy
-    /// (RFC-011), so both read and write paths open bare; the actor is still
-    /// attributed on the write via the `_as` engine APIs.
-    async fn open_embedded(uri: &str) -> Result<Omnigraph> {
-        Ok(Omnigraph::open(uri).await?)
+    /// The process session for a graph verb without `--set`, so an invalid
+    /// setting variable refuses every `GraphClient` verb alike; direct-store
+    /// access carries no Cedar policy (RFC-011), the actor rides the `_as` APIs.
+    async fn open_embedded(uri: &str) -> Result<Session> {
+        Self::open_session(uri, &[]).await
+    }
+
+    /// The embedded CLI is the process (the Session settings RFC): one session over the
+    /// environment's defaults and the `--set` values, every setting accepted;
+    /// the source's own `set` lines apply per call, on top.
+    async fn open_session(uri: &str, settings: &[(SettingId, SettingValue)]) -> Result<Session> {
+        let (defaults, sources) = omnigraph::settings::from_env()?;
+        let mut session = Arc::new(Omnigraph::open(uri).await?).session(defaults, sources);
+        for (id, value) in settings {
+            session.set(*id, value, Source::Request)?;
+        }
+        Ok(session)
+    }
+
+    /// The request's `settings` field for the `--set` values. A `process`
+    /// setting is refused here, before anything is sent: the typed field
+    /// cannot carry it.
+    fn remote_settings(settings: &[(SettingId, SettingValue)]) -> Result<Option<SettingsRequest>> {
+        if settings.is_empty() {
+            return Ok(None);
+        }
+        let mut given = SessionSettings::default();
+        let mut request = SettingsRequest::default();
+        for (id, value) in settings {
+            id.refuse_from_request()?;
+            given.set(*id, value)?;
+            match id {
+                SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
+                SettingId::RrfPlan | SettingId::AnnNprobes | SettingId::StageWriteConcurrency => {
+                    bail!(
+                        "setting `{}` has request scope but no request field; add it to \
+                         `SettingsRequest`",
+                        id.name()
+                    )
+                }
+            }
+        }
+        Ok(Some(request))
+    }
+
+    /// The `set=<name>=<value>` query parameters of a remote change surface,
+    /// under the same scope rule as `remote_settings`.
+    fn set_query_values(settings: &[(SettingId, SettingValue)]) -> Result<Vec<String>> {
+        settings
+            .iter()
+            .map(|(id, value)| {
+                id.refuse_from_request()?;
+                Ok(format!("{}={value}", id.name()))
+            })
+            .collect()
+    }
+
+    /// Apply the source's `set` and `reset` lines to `session`, for the
+    /// statements the engine does not parse itself (`branch merge`, `show`).
+    fn apply_prefix(session: &mut Session, source: &str) -> Result<()> {
+        let prefixed = session.with_prefix(&parse_query(source)?.settings)?;
+        *session = prefixed;
+        Ok(())
     }
 
     pub(crate) async fn branch_list(&self) -> Result<BranchListOutput> {
@@ -344,8 +467,8 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
-                let mut branches = db.branch_list().await?;
+                let session = Self::open_embedded(uri).await?;
+                let mut branches = session.branch_list().await?;
                 branches.sort();
                 Ok(BranchListOutput { branches })
             }
@@ -370,7 +493,7 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
+                let db = Self::open_embedded(uri).await?;
                 let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
                 let internal_schema_version = db
                     .internal_schema_version_of(ReadTarget::branch(branch))
@@ -399,7 +522,7 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
+                let db = Self::open_embedded(uri).await?;
                 Ok(SchemaOutput {
                     schema_source: db.schema_source().to_string(),
                     system_columns: Some(db.catalog().system_columns.into()),
@@ -414,16 +537,25 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
-                ..
+                response_limit,
             } => {
                 let url = match branch {
                     Some(branch) => remote_url(base_url, &["commits"], &[("branch", branch)])?,
                     None => remote_url(base_url, &["commits"], &[])?,
                 };
-                remote_json(http, Method::GET, url, None, token.as_deref()).await
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    url,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
+                let db = Self::open_embedded(uri).await?;
                 let commits = db
                     .list_commits(branch)
                     .await?
@@ -441,20 +573,22 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
-                ..
+                response_limit,
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["commits", commit_id], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
-                Ok(commit_output(&db.get_commit(commit_id).await?))
+                let session = Self::open_embedded(uri).await?;
+                Ok(commit_output(&session.get_commit(commit_id).await?))
             }
         }
     }
@@ -468,6 +602,7 @@ impl GraphClient {
         page_token: Option<&str>,
         limit: Option<usize>,
         filter: &ChangeFilterArgs<'_>,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<CommitChangesOutput> {
         match self {
             GraphClient::Remote {
@@ -477,6 +612,7 @@ impl GraphClient {
                 ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
+                let set_values = Self::set_query_values(settings)?;
                 let mut query = Vec::new();
                 if let Some(page_token) = page_token {
                     query.push(("page_token", page_token));
@@ -490,6 +626,7 @@ impl GraphClient {
                         .iter()
                         .map(|(name, value)| (*name, value.as_str())),
                 );
+                query.extend(set_values.iter().map(|value| ("set", value.as_str())));
                 remote_json(
                     http,
                     Method::GET,
@@ -500,9 +637,9 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
+                let session = Self::open_session(uri, settings).await?;
                 let scope = change_scope(filter.kinds, filter.types, filter.ops);
-                let page = db
+                let page = session
                     .commit_changes_page(commit_id, &scope, page_token, limit, None)
                     .await?;
                 Ok(commit_changes_output(&page))
@@ -512,6 +649,7 @@ impl GraphClient {
 
     /// Fetch one bounded page of a captured feed poll. The caller continues
     /// with `next_page_token`; this method never aggregates pages in memory.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn poll_changes_page(
         &self,
         branch: Option<&str>,
@@ -520,6 +658,7 @@ impl GraphClient {
         page_token: Option<&str>,
         limit: Option<usize>,
         filter: &ChangeFilterArgs<'_>,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<ChangeFeedOutput> {
         // A page token continues one poll and supersedes the start position.
         let (cursor, start) = if page_token.is_some() {
@@ -535,6 +674,7 @@ impl GraphClient {
                 ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
+                let set_values = Self::set_query_values(settings)?;
                 let mut query = Vec::new();
                 if let Some(branch) = branch {
                     query.push(("branch", branch));
@@ -557,6 +697,7 @@ impl GraphClient {
                         .iter()
                         .map(|(name, value)| (*name, value.as_str())),
                 );
+                query.extend(set_values.iter().map(|value| ("set", value.as_str())));
                 remote_json(
                     http,
                     Method::GET,
@@ -567,7 +708,7 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
+                let session = Self::open_session(uri, settings).await?;
                 let position = if let Some(token) = page_token {
                     omnigraph::changes::ChangeFeedPosition::PageToken(token.to_string())
                 } else if let Some(cursor) = cursor {
@@ -577,7 +718,7 @@ impl GraphClient {
                         start.unwrap_or("now"),
                     )?)
                 };
-                let page = db
+                let page = session
                     .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
                         branch: branch.map(str::to_string),
                         position,
@@ -627,7 +768,7 @@ impl GraphClient {
                 if !status.is_success() {
                     let text = response.text().await?;
                     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
+                        return Err(RemoteErrorCli { output: error }.into());
                     }
                     bail!("server returned {}: {}", status, text);
                 }
@@ -660,7 +801,7 @@ impl GraphClient {
                 Ok(record.baseline)
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
+                let db = Self::open_embedded(uri).await?;
                 let scope = change_scope(filter.kinds, filter.types, filter.ops);
                 let baseline = db
                     .capture_change_baseline(branch.unwrap_or("main"), &scope, writer)
@@ -681,38 +822,44 @@ impl GraphClient {
         from: Option<&str>,
         data: &str,
         mode: CliLoadMode,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<LoadOutput> {
         match self {
             GraphClient::Remote {
                 http,
                 base_url,
                 token,
-                ..
+                response_limit,
             } => {
-                let data = std::fs::read_to_string(data)?;
+                if !settings.is_empty() {
+                    bail!("{}", SETTINGS_AT_SERVED_LOAD);
+                }
+                let data = if response_limit.is_some() {
+                    read_managed_load_data(data)?
+                } else {
+                    std::fs::read_to_string(data)?
+                };
                 let mut query = vec![("branch", branch), ("mode", mode.as_str())];
                 if let Some(from) = from {
                     query.push(("from", from));
                 }
-                let request = apply_bearer_token(
-                    http.request(
-                        Method::POST,
-                        remote_url(base_url, &["load", "ndjson"], &query)?,
+                let request = load_request(
+                    apply_bearer_token(
+                        http.request(
+                            Method::POST,
+                            remote_url(base_url, &["load", "ndjson"], &query)?,
+                        ),
+                        token.as_deref(),
                     ),
-                    token.as_deref(),
-                )
-                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-                .body(data);
+                    data,
+                    response_limit.is_some(),
+                );
+                // One attempt only. A lost response may follow a committed
+                // load or a created branch; neither can be replayed blindly.
                 let response = request.send().await?;
-                let status = response.status();
-                let text = response.text().await?;
-                if !status.is_success() {
-                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
-                    }
-                    bail!("server returned {}: {}", status, text);
-                }
-                let output: GraphBatchLoadOutput = serde_json::from_str(&text)?;
+                let output: GraphBatchLoadOutput =
+                    remote_response_json_bounded(response, token.as_deref(), *response_limit)
+                        .await?;
                 Ok(load_output_from_graph_batch(
                     base_url,
                     mode.as_str(),
@@ -720,9 +867,9 @@ impl GraphClient {
                 ))
             }
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_embedded(uri).await?;
+                let session = Self::open_session(uri, settings).await?;
                 let data = std::fs::read_to_string(data)?;
-                let receipt = db
+                let receipt = session
                     .load_graph_batch_as_with_receipt(
                         branch,
                         from,
@@ -752,6 +899,7 @@ impl GraphClient {
         from: &str,
         data: &str,
         mode: CliLoadMode,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<IngestOutput> {
         match self {
             GraphClient::Remote {
@@ -760,6 +908,9 @@ impl GraphClient {
                 token,
                 ..
             } => {
+                if !settings.is_empty() {
+                    bail!("{}", SETTINGS_AT_SERVED_LOAD);
+                }
                 let data = std::fs::read_to_string(data)?;
                 remote_json(
                     http,
@@ -776,8 +927,8 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_embedded(uri).await?;
-                let receipt = db
+                let session = Self::open_session(uri, settings).await?;
+                let receipt = session
                     .load_file_as_with_receipt(
                         branch,
                         Some(from),
@@ -798,6 +949,10 @@ impl GraphClient {
     /// the write runs only if the branch head commit still equals it. A
     /// mismatch surfaces as the typed [`PreconditionFailedCli`] on both
     /// transports so the verb can exit with `EXIT_PRECONDITION_FAILED` (4).
+    ///
+    /// A `--set` value travels in the `settings` field of `POST /mutate`
+    /// (the deprecated `/change` route refuses the field), so the legacy
+    /// body is sent only when there is neither a precondition nor a setting.
     pub(crate) async fn mutate(
         &self,
         branch: &str,
@@ -805,6 +960,7 @@ impl GraphClient {
         query_name: Option<&str>,
         params_json: Option<&Value>,
         expected_head: Option<&str>,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -813,14 +969,20 @@ impl GraphClient {
                 token,
                 response_limit,
             } => {
-                let (url, body) = if expected_head.is_some() {
+                let (url, body) = if expected_head.is_some() || !settings.is_empty() {
+                    let route: &[&str] = if expected_head.is_some() {
+                        &["mutate", "if-graph-commit"]
+                    } else {
+                        &["mutate"]
+                    };
                     (
-                        remote_url(base_url, &["mutate", "if-graph-commit"], &[])?,
+                        remote_url(base_url, route, &[])?,
                         serde_json::to_value(ChangeRequest {
                             query: query_source.to_string(),
                             name: query_name.map(ToOwned::to_owned),
                             params: params_json.cloned(),
                             branch: Some(branch.to_string()),
+                            settings: Self::remote_settings(settings)?,
                         })?,
                     )
                 } else {
@@ -844,9 +1006,9 @@ impl GraphClient {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
-                let db = Self::open_embedded(uri).await?;
+                let session = Self::open_session(uri, settings).await?;
                 let actor = actor.as_deref();
-                let receipt = db
+                let receipt = session
                     .mutate_as_with_expected_head_receipt(
                         branch,
                         query_source,
@@ -884,11 +1046,14 @@ impl GraphClient {
     /// merge`) from `-e`/`--query`: `POST /mutate` with the source alone, or
     /// the engine call the matching `branch` verb makes, answered as the
     /// server answers it (`branch` received the effect, both counts `0`,
-    /// `commit` the target's head after a publishing merge).
+    /// `commit` the target's head after a publishing merge). The `--set`
+    /// values and the source's `set` lines reach the merge, the one control
+    /// write that consults a setting.
     pub(crate) async fn branch_write_statement(
         &self,
         query_source: &str,
         write: BranchWrite,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -897,13 +1062,13 @@ impl GraphClient {
                 token,
                 response_limit,
             } => {
+                let mut request = branch_statement_change_request(query_source);
+                request.settings = Self::remote_settings(settings)?;
                 remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["mutate"], &[])?,
-                    Some(serde_json::to_value(branch_statement_change_request(
-                        query_source,
-                    ))?),
+                    Some(serde_json::to_value(request)?),
                     token.as_deref(),
                     None,
                     *response_limit,
@@ -928,20 +1093,19 @@ impl GraphClient {
                     }
                     BranchWrite::Merge { source, into } => {
                         let target = into.unwrap_or_else(|| "main".to_string());
-                        let merge: BranchMergeOutcome =
-                            self.branch_merge(&source, &target, false).await?.outcome;
+                        let mut session = Self::open_session(uri, settings).await?;
+                        Self::apply_prefix(&mut session, query_source)?;
+                        let merge: BranchMergeOutcome = session
+                            .branch_merge_as(&source, &target, actor.as_deref())
+                            .await?
+                            .into();
                         let commit = match merge {
                             BranchMergeOutcome::AlreadyUpToDate => None,
-                            BranchMergeOutcome::FastForward | BranchMergeOutcome::Merged => {
-                                match Self::open_embedded(uri).await {
-                                    Ok(db) => db
-                                        .list_commits(Some(&target))
-                                        .await
-                                        .ok()
-                                        .and_then(|commits| commits.first().map(commit_output)),
-                                    Err(_) => None,
-                                }
-                            }
+                            BranchMergeOutcome::FastForward | BranchMergeOutcome::Merged => session
+                                .list_commits(Some(&target))
+                                .await
+                                .ok()
+                                .and_then(|commits| commits.first().map(commit_output)),
                         };
                         (
                             target.clone(),
@@ -968,9 +1132,16 @@ impl GraphClient {
     }
 
     /// The `branch list` statement from `-e`/`--query`: `POST /query` with
-    /// the source alone, or the engine's ref list in byte order, both as the
-    /// one `ReadOutput` shape (`branch_list_read_output`).
-    pub(crate) async fn branch_list_statement(&self, query_source: &str) -> Result<ReadOutput> {
+    /// the source and the `--set` values, or the engine's ref list in byte
+    /// order, both as the one `ReadOutput` shape (`branch_list_read_output`).
+    /// Nothing in `branch list` consults a setting: the remote arm still runs
+    /// the scope refusal on the `--set` values, so a `process` one is never
+    /// sent; the embedded arm applies none.
+    pub(crate) async fn branch_list_statement(
+        &self,
+        query_source: &str,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ReadOutput> {
         match self {
             GraphClient::Remote {
                 http,
@@ -978,13 +1149,13 @@ impl GraphClient {
                 token,
                 response_limit,
             } => {
+                let mut request = branch_statement_query_request(query_source);
+                request.settings = Self::remote_settings(settings)?;
                 remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["query"], &[])?,
-                    Some(serde_json::to_value(branch_statement_query_request(
-                        query_source,
-                    ))?),
+                    Some(serde_json::to_value(request)?),
                     token.as_deref(),
                     None,
                     *response_limit,
@@ -997,6 +1168,44 @@ impl GraphClient {
         }
     }
 
+    /// The `show` statement from `-e`/`--query`: `POST /query` with the
+    /// source and the `--set` values, or the embedded session's rows after
+    /// the source's prefix, both as the one `ReadOutput` shape
+    /// (`show_read_output`).
+    pub(crate) async fn show_statement(
+        &self,
+        query_source: &str,
+        id: Option<SettingId>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ReadOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let mut request = branch_statement_query_request(query_source);
+                request.settings = Self::remote_settings(settings)?;
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(request)?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let mut session = Self::open_session(uri, settings).await?;
+                Self::apply_prefix(&mut session, query_source)?;
+                Ok(show_read_output(&session.show(id))?)
+            }
+        }
+    }
+
     /// `query` — run a read query against `target`. Folds `execute_read` /
     /// `execute_read_remote`; the embedded arm opens WITHOUT policy (reads
     /// never attach one), so this verb resolves via `resolve()`.
@@ -1006,6 +1215,7 @@ impl GraphClient {
         query_source: &str,
         query_name: Option<&str>,
         params_json: Option<&Value>,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<ReadOutput> {
         match self {
             GraphClient::Remote {
@@ -1028,6 +1238,7 @@ impl GraphClient {
                         params: params_json.cloned(),
                         branch,
                         snapshot,
+                        settings: Self::remote_settings(settings)?,
                     })?),
                     token.as_deref(),
                     None,
@@ -1039,8 +1250,8 @@ impl GraphClient {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
-                let db = Self::open_embedded(uri).await?;
-                let (result, graph_commit_id) = db
+                let session = Self::open_session(uri, settings).await?;
+                let (result, graph_commit_id) = session
                     .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
                 Ok(read_output(
@@ -1179,6 +1390,7 @@ impl GraphClient {
         source: &str,
         into: &str,
         delete_branch: bool,
+        settings: &[(SettingId, SettingValue)],
     ) -> Result<BranchMergeOutput> {
         match self {
             GraphClient::Remote {
@@ -1195,21 +1407,22 @@ impl GraphClient {
                         source: source.to_string(),
                         target: Some(into.to_string()),
                         delete_branch,
+                        settings: Self::remote_settings(settings)?,
                     })?),
                     token.as_deref(),
                 )
                 .await
             }
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_embedded(uri).await?;
+                let session = Self::open_session(uri, settings).await?;
                 let actor = actor.as_deref();
-                let outcome = db.branch_merge_as(source, into, actor).await?;
+                let outcome = session.branch_merge_as(source, into, actor).await?;
                 // Composed exactly like the server handler: the merge is
                 // durable, so a deletion refusal/failure is reported in the
                 // payload, never as an error (parity_matrix pins the two
                 // composition sites against drift).
                 let (branch_deleted, branch_delete_error) = if delete_branch {
-                    match db.branch_delete_as(source, actor).await {
+                    match session.branch_delete_as(source, actor).await {
                         Ok(()) => (Some(true), None),
                         Err(err) => (Some(false), Some(err.to_string())),
                     }
@@ -1313,7 +1526,7 @@ impl GraphClient {
                 if !status.is_success() {
                     let text = response.text().await?;
                     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        bail!(error.error);
+                        return Err(RemoteErrorCli { output: error }.into());
                     }
                     bail!("server returned {}: {}", status, text);
                 }
@@ -1324,7 +1537,7 @@ impl GraphClient {
                 Ok(())
             }
             GraphClient::Embedded { uri, .. } => {
-                let db = Omnigraph::open(uri).await?;
+                let db = Self::open_embedded(uri).await?;
                 db.export_jsonl_to_writer(branch, type_names, writer)
                     .await?;
                 writer.flush()?;
@@ -1525,6 +1738,30 @@ impl GraphClient {
             ),
         }
     }
+
+    /// Minimal existence inventory. No fallback to the metadata-bearing catalog.
+    pub(crate) async fn discover_graphs(&self) -> Result<GraphDiscoveryResponse> {
+        match self {
+            Self::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["graphs", "discovery"], &[])?,
+                    None,
+                    token.as_deref(),
+                    None,
+                    response_limit.or(Some(8 * 1024 * 1024)),
+                )
+                .await
+            }
+            Self::Embedded { .. } => bail!("graph discovery requires a server"),
+        }
+    }
 }
 
 fn validate_content_range(
@@ -1613,6 +1850,450 @@ fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeed
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn managed_mutations_use_thirty_second_deadline_without_retrying() {
+        // Exercise every mutation request owner through actual HTTP. Receipts
+        // can arrive after ten seconds, but the total thirty-second deadline
+        // still bounds uncertain writes without replaying them.
+        futures::future::join_all(
+            [
+                "ad-hoc",
+                "conditional",
+                "branch",
+                "stored",
+                "stored-conditional",
+            ]
+            .into_iter()
+            .flat_map(|form| {
+                [
+                    (form, std::time::Duration::from_millis(10_250), false),
+                    (form, std::time::Duration::from_millis(30_250), true),
+                ]
+            })
+            .map(|(form, delay, expect_timeout)| {
+                let commit = json!({
+                    "graph_commit_id": "head-after", "graph_branch": "main",
+                    "graph_manifest_version": 7, "parent_commit_id": "head-before",
+                    "merged_parent_commit_id": "head-source",
+                    "actor_id": "principal:alice", "created_at": 12345
+                });
+                let mut reply = json!({
+                    "branch": "main", "query_name": "m", "affected_nodes": 1,
+                    "affected_edges": 0, "actor_id": "principal:alice", "commit": commit
+                });
+                if form == "branch" {
+                    reply["query_name"] = json!("branch merge");
+                    reply["affected_nodes"] = json!(0);
+                    reply["outcome"] = json!({
+                        "kind": "merged", "source": "review", "target": "main",
+                        "merge": "fast_forward"
+                    });
+                }
+                let server = IntentApiFixture::with_response_delay(
+                    vec![IntentReply::json(200, reply)],
+                    delay,
+                );
+                let client =
+                    GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                        .unwrap();
+                // Finish synchronous client setup before join_all polls requests.
+                async move {
+                    let started = std::time::Instant::now();
+                    let (result, path) = match form {
+                        "branch" => (
+                            client
+                                .branch_write_statement(
+                                    "branch merge review into main",
+                                    BranchWrite::Merge {
+                                        source: "review".into(),
+                                        into: Some("main".into()),
+                                    },
+                                    &[],
+                                )
+                                .await,
+                            "/graphs/knowledge/mutate",
+                        ),
+                        "stored" | "stored-conditional" => (
+                            client
+                                .invoke_named::<ChangeOutput>(
+                                    "m",
+                                    true,
+                                    None,
+                                    Some("main".into()),
+                                    None,
+                                    (form == "stored-conditional").then_some("head-before"),
+                                )
+                                .await,
+                            if form == "stored-conditional" {
+                                "/graphs/knowledge/queries/m/if-graph-commit"
+                            } else {
+                                "/graphs/knowledge/queries/m"
+                            },
+                        ),
+                        _ => (
+                            client
+                                .mutate(
+                                    "main",
+                                    "mutation m() {}",
+                                    Some("m"),
+                                    None,
+                                    (form == "conditional").then_some("head-before"),
+                                    &[],
+                                )
+                                .await,
+                            if form == "conditional" {
+                                "/graphs/knowledge/mutate/if-graph-commit"
+                            } else {
+                                "/graphs/knowledge/change"
+                            },
+                        ),
+                    };
+                    if !expect_timeout {
+                        let result = result.unwrap_or_else(|error| panic!("{form}: {error}"));
+                        assert!(started.elapsed() >= std::time::Duration::from_secs(10));
+                        assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
+                        assert_eq!(result.actor_id.as_deref(), Some("principal:alice"));
+                    } else {
+                        let error =
+                            result.expect_err("mutation must stop at its thirty-second deadline");
+                        assert!(
+                            error
+                                .downcast_ref::<reqwest::Error>()
+                                .is_some_and(reqwest::Error::is_timeout),
+                            "{form}: {error}"
+                        );
+                        assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+                    }
+                    let requests = server.requests();
+                    assert_eq!(requests.len(), 1, "{form} must not retry");
+                    assert_eq!(requests[0].path, path);
+                    assert_eq!(
+                        requests[0].headers["authorization"],
+                        "Bearer data-credential"
+                    );
+                    if form.ends_with("conditional") {
+                        assert_eq!(
+                            requests[0].headers["omnigraph-if-graph-commit"],
+                            "head-before"
+                        );
+                    }
+                    if form.starts_with("stored") {
+                        assert_eq!(requests[0].body["expect_mutation"], true);
+                    }
+                    server.assert_complete();
+                }
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn managed_reads_use_thirty_second_deadline_without_retrying() {
+        futures::future::join_all(
+            ["ad-hoc", "stored", "commit-list", "commit-show"]
+                .into_iter()
+                .flat_map(|operation| {
+                    [
+                        (operation, std::time::Duration::from_millis(10_250), false),
+                        (operation, std::time::Duration::from_millis(30_250), true),
+                    ]
+                })
+                .map(|(operation, delay, expect_timeout)| {
+                    let commit = json!({
+                        "graph_commit_id": "commit-a", "graph_branch": "main",
+                        "graph_manifest_version": 7, "parent_commit_id": "prior",
+                        "merged_parent_commit_id": null, "actor_id": "principal:alice",
+                        "created_at": 12345
+                    });
+                    let reply = match operation {
+                        "commit-list" => json!({"commits": [commit]}),
+                        "commit-show" => commit,
+                        _ => json!({
+                            "query_name": "q", "target": {"branch":"main", "snapshot":null},
+                            "row_count": 1, "columns": ["value"], "rows": [{"value":42}],
+                            "graph_commit_id": "head"
+                        }),
+                    };
+                    let server = IntentApiFixture::with_response_delay(
+                        vec![IntentReply::json(200, reply.clone())],
+                        delay,
+                    );
+                    let client =
+                        GraphClient::managed(&server.origin, "knowledge", "data-credential".into())
+                            .unwrap();
+                    // Finish synchronous client setup before join_all polls requests.
+                    async move {
+                        let started = std::time::Instant::now();
+                        let (result, path) = match operation {
+                            "stored" => (
+                                client
+                                    .invoke_named::<ReadOutput>(
+                                        "q",
+                                        false,
+                                        None,
+                                        Some("main".into()),
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/queries/q",
+                            ),
+                            "commit-list" => (
+                                client
+                                    .list_commits(Some("main"))
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/commits?branch=main",
+                            ),
+                            "commit-show" => (
+                                client
+                                    .get_commit("commit-a")
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/commits/commit-a",
+                            ),
+                            _ => (
+                                client
+                                    .query(
+                                        ReadTarget::branch("main"),
+                                        "query q() {}",
+                                        Some("q"),
+                                        None,
+                                        &[],
+                                    )
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/query",
+                            ),
+                        };
+                        if expect_timeout {
+                            let error =
+                                result.expect_err("read must stop at its thirty-second deadline");
+                            assert!(
+                                error
+                                    .downcast_ref::<reqwest::Error>()
+                                    .is_some_and(reqwest::Error::is_timeout),
+                                "{operation}: {error}"
+                            );
+                            assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+                        } else {
+                            let output =
+                                result.unwrap_or_else(|error| panic!("{operation}: {error}"));
+                            assert!(started.elapsed() >= std::time::Duration::from_secs(10));
+                            assert_eq!(output, reply);
+                        }
+                        let requests = server.requests();
+                        assert_eq!(requests.len(), 1, "read must not retry");
+                        assert_eq!(requests[0].path, path);
+                        assert_eq!(
+                            requests[0].headers["authorization"],
+                            "Bearer data-credential"
+                        );
+                        server.assert_complete();
+                    }
+                }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn process_setting_is_refused_before_any_request_is_sent() {
+        let server = IntentApiFixture::new(vec![]);
+        let client =
+            GraphClient::managed(&server.origin, "knowledge", "data-credential".into()).unwrap();
+        let settings = parse_set_flags(&["stage_write_concurrency=4".to_string()]).unwrap();
+        const REFUSAL: &str = "setting `stage_write_concurrency` is a process setting; it is \
+                               read from the server's environment, not from a request";
+        let refused = [
+            (
+                "query",
+                client
+                    .query(
+                        ReadTarget::branch("main"),
+                        "query q() {}",
+                        Some("q"),
+                        None,
+                        &settings,
+                    )
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "mutate",
+                client
+                    .mutate("main", "mutation m() {}", Some("m"), None, None, &settings)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "branch list",
+                client
+                    .branch_list_statement("branch list", &settings)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "branch merge",
+                client
+                    .branch_merge("review", "main", false, &settings)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "changes poll",
+                client
+                    .poll_changes_page(
+                        Some("main"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        &ChangeFilterArgs {
+                            kinds: &[],
+                            types: &[],
+                            ops: &[],
+                        },
+                        &settings,
+                    )
+                    .await
+                    .map(|_| ()),
+            ),
+        ];
+        for (owner, result) in refused {
+            let error = result.expect_err(owner);
+            assert_eq!(error.to_string(), REFUSAL, "{owner}");
+        }
+        assert!(
+            server.requests().is_empty(),
+            "the scope refusal precedes the round trip"
+        );
+        server.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn request_setting_travels_in_the_settings_field_of_query_mutate_and_merge() {
+        let read = json!({
+            "query_name": "q", "target": {"branch":"main", "snapshot":null},
+            "row_count": 0, "columns": [], "rows": [], "graph_commit_id": "head"
+        });
+        let change = json!({
+            "branch": "main", "query_name": "m", "affected_nodes": 1,
+            "affected_edges": 0, "actor_id": "principal:alice", "commit": {
+                "graph_commit_id": "head-after", "graph_branch": "main",
+                "graph_manifest_version": 7, "parent_commit_id": "head-before",
+                "merged_parent_commit_id": null,
+                "actor_id": "principal:alice", "created_at": 12345
+            }
+        });
+        let merged = json!({
+            "source": "review", "target": "main", "outcome": "merged",
+            "actor_id": "principal:alice"
+        });
+        let server = IntentApiFixture::new(vec![
+            IntentReply::json(200, read),
+            IntentReply::json(200, change.clone()),
+            IntentReply::json(200, change),
+            IntentReply::json(200, merged),
+        ]);
+        let client =
+            GraphClient::managed(&server.origin, "knowledge", "data-credential".into()).unwrap();
+        let settings = parse_set_flags(&["merge_lineage=off".to_string()]).unwrap();
+        client
+            .query(
+                ReadTarget::branch("main"),
+                "query q() {}",
+                Some("q"),
+                None,
+                &settings,
+            )
+            .await
+            .unwrap();
+        client
+            .mutate("main", "mutation m() {}", Some("m"), None, None, &settings)
+            .await
+            .unwrap();
+        client
+            .mutate(
+                "main",
+                "mutation m() {}",
+                Some("m"),
+                None,
+                Some("head-before"),
+                &settings,
+            )
+            .await
+            .unwrap();
+        client
+            .branch_merge("review", "main", false, &settings)
+            .await
+            .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        let field = json!({"merge_lineage": "off"});
+        assert_eq!(requests[0].path, "/graphs/knowledge/query");
+        assert_eq!(requests[0].body["settings"], field);
+        assert_eq!(
+            requests[1].path, "/graphs/knowledge/mutate",
+            "a setting selects the canonical route over the legacy /change"
+        );
+        assert_eq!(requests[1].body["settings"], field);
+        assert!(
+            !requests[1]
+                .headers
+                .contains_key("omnigraph-if-graph-commit")
+        );
+        assert_eq!(requests[2].path, "/graphs/knowledge/mutate/if-graph-commit");
+        assert_eq!(
+            requests[2].headers["omnigraph-if-graph-commit"],
+            "head-before"
+        );
+        assert_eq!(requests[2].body["settings"], field);
+        assert_eq!(requests[3].path, "/graphs/knowledge/branches/merge");
+        assert_eq!(requests[3].body["settings"], field);
+        server.assert_complete();
+    }
+
+    #[test]
+    fn managed_load_request_has_its_own_deadline_and_exact_input_bound() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(32 * 1024 * 1024).unwrap();
+        assert_eq!(
+            read_managed_load_data(file.path().to_str().unwrap())
+                .unwrap()
+                .len(),
+            32 * 1024 * 1024
+        );
+        file.as_file().set_len(32 * 1024 * 1024 + 1).unwrap();
+        assert!(
+            read_managed_load_data(file.path().to_str().unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("32 MiB")
+        );
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap();
+        for (managed, expected) in [
+            (true, Some(std::time::Duration::from_secs(300))),
+            (false, None),
+        ] {
+            let request = load_request(http.post("https://data.example"), "{}\n".into(), managed)
+                .build()
+                .unwrap();
+            assert_eq!(request.timeout().copied(), expected);
+            assert_eq!(
+                request.headers()[reqwest::header::CONTENT_TYPE],
+                "application/x-ndjson"
+            );
+            assert_eq!(request.body().unwrap().as_bytes(), Some(b"{}\n".as_slice()));
+        }
+    }
 
     fn content_range_headers(value: &'static str) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();

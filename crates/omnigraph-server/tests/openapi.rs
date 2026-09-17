@@ -7,7 +7,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_server::{AppState, build_app, served_openapi};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -31,8 +31,11 @@ async fn init_loaded_graph() -> tempfile::TempDir {
     Omnigraph::init(graph.to_str().unwrap(), &schema)
         .await
         .unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let db = omnigraph::Session::from_defaults(
+        std::sync::Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap()),
+        omnigraph::settings::SessionSettings::default(),
+    );
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
     temp
 }
 
@@ -183,9 +186,11 @@ fn openapi_info_contains_version() {
 // The canonical served spec keeps `/healthz`, `/readyz`, and `/graphs` flat; every
 // protected route nests under `/graphs/{graph_id}/…`.
 const EXPECTED_PATHS: &[&str] = &[
+    "/.well-known/oauth-protected-resource",
     "/healthz",
     "/readyz",
     "/graphs",
+    "/graphs/discovery",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
     "/graphs/{graph_id}/read",
@@ -2088,11 +2093,13 @@ async fn auth_mode_healthz_still_has_no_security() {
         .body(Body::empty())
         .unwrap();
     let (_, json) = json_response(&app, request).await;
-    let healthz = &json["paths"]["/healthz"]["get"];
-    assert!(
-        healthz.get("security").is_none() || healthz["security"].is_null(),
-        "auth-mode: /healthz should still have no security"
-    );
+    for path in ["/healthz", "/.well-known/oauth-protected-resource"] {
+        let operation = &json["paths"][path]["get"];
+        assert!(
+            operation.get("security").is_none() || operation["security"].is_null(),
+            "auth-mode: {path} should still have no security"
+        );
+    }
 }
 
 #[test]
@@ -2253,7 +2260,12 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         .unwrap();
     let (_, json) = json_response(&app, request).await;
     let paths = json["paths"].as_object().unwrap();
-    for flat in ["/healthz", "/graphs"] {
+    for flat in [
+        "/healthz",
+        "/graphs",
+        "/graphs/discovery",
+        "/.well-known/oauth-protected-resource",
+    ] {
         assert!(
             paths.contains_key(flat),
             "{flat} must remain flat in multi mode"
@@ -2281,7 +2293,14 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
     let paths = json["paths"].as_object().unwrap();
     let mut checked = 0;
     for (path, item) in paths {
-        if path == "/healthz" || path == "/readyz" || path == "/graphs" {
+        if matches!(
+            path.as_str(),
+            "/healthz"
+                | "/readyz"
+                | "/graphs"
+                | "/graphs/discovery"
+                | "/.well-known/oauth-protected-resource"
+        ) {
             continue;
         }
         for method in ["get", "head", "post", "put", "delete", "patch"] {
@@ -2344,7 +2363,12 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         }
     }
 
-    for flat in ["/healthz", "/graphs"] {
+    for flat in [
+        "/healthz",
+        "/graphs",
+        "/graphs/discovery",
+        "/.well-known/oauth-protected-resource",
+    ] {
         let item = paths.get(flat).unwrap();
         for method in ["get", "head", "post", "put", "delete", "patch"] {
             if let Some(operation) = item.get(method).filter(|value| value.is_object()) {

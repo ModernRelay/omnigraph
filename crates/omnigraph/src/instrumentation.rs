@@ -204,7 +204,7 @@ pub struct QueryIoProbes {
     pub ann_flat_rescans: Arc<AtomicU64>,
     /// Requested maximum probe budget of the most recent nearest scan. Zero
     /// represents no maximum (the ladder's last rung, the overfetch loop's
-    /// exact pass, or `OMNIGRAPH_ANN_NPROBES=0`). Lance applies the value per
+    /// exact pass, or the setting `ann_nprobes = 0`). Lance applies the value per
     /// index delta, so the partitions read may be a multiple.
     pub ann_max_nprobes: Arc<AtomicU64>,
     /// Rows the most recent nearest scan returned (its `k` when full).
@@ -305,7 +305,7 @@ pub enum RrfGateFallback {
     /// The eligible set is empty: the postfilter plan yields the same empty
     /// join and `IN ()` edge semantics never arise (correctness fence).
     EmptyEligible,
-    /// `OMNIGRAPH_RRF_PLAN=force_postfilter` (or the scoped override) chose.
+    /// The setting `rrf_plan = force_postfilter` chose.
     Forced,
 }
 
@@ -345,58 +345,6 @@ fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
     QUERY_IO_PROBES.try_with(f).ok()
 }
 
-tokio::task_local! {
-    static TRAVERSAL_MODE_OVERRIDE: Option<&'static str>;
-}
-
-/// Force the Expand execution mode (`"indexed"` | `"csr"`) for the scope of `fut`
-/// WITHOUT mutating the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var. This is
-/// the general traversal-mode test seam: scope-bound (so it cannot leak — the
-/// override is gone when `fut` resolves or unwinds) and process-safe (it never
-/// touches shared state, so a forced-mode test never affects a concurrent test in
-/// the same binary, removing the need for `#[serial]` + a dedicated all-serial
-/// binary). Mirrors [`with_query_io_probes`]. The env var stays the production/ops
-/// escape hatch; this scoped override takes precedence over it
-/// (`exec::query::traversal_indexed_override`).
-pub async fn with_traversal_mode<F>(mode: &'static str, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    TRAVERSAL_MODE_OVERRIDE.scope(Some(mode), fut).await
-}
-
-/// The scoped traversal-mode override active for this task, if any. `None` in
-/// production (no scope installed), so the env var is consulted instead.
-pub(crate) fn traversal_mode_override() -> Option<&'static str> {
-    TRAVERSAL_MODE_OVERRIDE.try_with(|m| *m).ok().flatten()
-}
-
-tokio::task_local! {
-    static RRF_PLAN_OVERRIDE: Option<&'static str>;
-}
-
-/// Force the rrf prefilter gate's plan (`"force_prefilter"` |
-/// `"force_postfilter"`) for the scope of `fut` WITHOUT mutating the
-/// process-global `OMNIGRAPH_RRF_PLAN` env var. Mirrors
-/// [`with_traversal_mode`]: scope-bound (cannot leak) and process-safe (a
-/// forced-plan test never affects a concurrent test in the same binary). The
-/// force overrides only the gate's THRESHOLD decision, never a correctness
-/// fence — a forced-prefilter query rejected by a fence (shape, coverage,
-/// build error, empty eligible set) runs postfilter, and the
-/// `rrf_gate_verdicts` probe records why.
-pub async fn with_rrf_plan<F>(mode: &'static str, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    RRF_PLAN_OVERRIDE.scope(Some(mode), fut).await
-}
-
-/// The scoped rrf-plan override active for this task, if any. `None` in
-/// production (no scope installed), so the env var is consulted instead.
-pub(crate) fn rrf_plan_override() -> Option<&'static str> {
-    RRF_PLAN_OVERRIDE.try_with(|m| *m).ok().flatten()
-}
-
 #[cfg(debug_assertions)]
 tokio::task_local! {
     static RRF_GATE_SUBSET_DROP: Option<String>;
@@ -427,7 +375,6 @@ pub(crate) fn rrf_gate_subset_drop() -> Option<String> {
 }
 
 tokio::task_local! {
-    static STAGE_WRITE_CONCURRENCY_OVERRIDE: Option<usize>;
     static STAGE_WRITE_PROBES: StageWriteProbes;
 }
 
@@ -509,34 +456,6 @@ pub(crate) async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
         state: state.clone(),
     };
     Some(guard)
-}
-
-/// Force the fragment-writing stage width for the scope of `fut` WITHOUT
-/// mutating the process-global `OMNIGRAPH_LOAD_CONCURRENCY` env var. Same seam
-/// as [`with_traversal_mode`], for the same reason: a width-forcing test stays
-/// scope-bound and process-safe, so it never perturbs a concurrent test in the
-/// same binary and needs no `#[serial]`. The env var stays the production/ops
-/// escape hatch; this scoped override takes precedence over it
-/// (`exec::staging::stage_write_concurrency`).
-///
-/// `0` is not a concurrency: it is ignored in favour of the default, matching
-/// the env parse rules.
-pub async fn with_stage_write_concurrency<F>(concurrency: usize, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    STAGE_WRITE_CONCURRENCY_OVERRIDE
-        .scope(Some(concurrency), fut)
-        .await
-}
-
-/// The scoped staging-width override active for this task, if any. `None` in
-/// production (no scope installed), so the env var is consulted instead.
-pub(crate) fn stage_write_concurrency_override() -> Option<usize> {
-    STAGE_WRITE_CONCURRENCY_OVERRIDE
-        .try_with(|c| *c)
-        .ok()
-        .flatten()
 }
 
 pub(crate) fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {

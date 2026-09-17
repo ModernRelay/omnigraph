@@ -121,7 +121,10 @@ type's declared identity:
 
 ## Merge classification mode
 
-`OMNIGRAPH_MERGE_LINEAGE` selects how a branch merge finds what changed. `on`
+The `merge_lineage` [session setting](../queries/index.md#session-settings)
+(`request` scope; `set merge_lineage = off;` before the statement, `--set
+merge_lineage=off`, or the request's `settings` field; process default
+`OMNIGRAPH_MERGE_LINEAGE`) selects how a branch merge finds what changed. `on`
 (the release default) discovers candidates from Lance version metadata —
 fragment lists and deletion files — and compares candidate rows. Known deleted
 row positions use bounded direct reads. Candidate filtering may still scan data
@@ -136,7 +139,8 @@ everywhere — the operational fallback if merge results are ever in question.
 scan's result, and fails the merge loudly on any divergence (the debug-build
 default, used for validation; it costs both paths). A merge that succeeds
 produces the same result in every mode; only cost differs. An unrecognized
-value logs a warning and behaves as `off`.
+value is refused where it arrives: in the environment it refuses startup, in
+a request or a file it refuses that request.
 
 Later writes create fresh table storage when needed and leave unused former
 storage for explicit cleanup. They do not reclaim a previous table history as

@@ -5,13 +5,18 @@ pub mod cost;
 pub mod failpoint;
 pub mod recovery;
 
+use std::sync::Arc;
+
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
+pub use omnigraph::Session;
 use omnigraph::changes::{ChangeFilter, ChangeSet};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
+pub use omnigraph::settings::Traversal;
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, EntityKind};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -242,13 +247,35 @@ pub async fn graph_native_ref(root_uri: &str, logical: &str) -> String {
         .unwrap_or_else(|| panic!("no live ref for logical branch '{logical}'"))
 }
 
+/// A session with the definition's defaults over a freshly opened handle.
+pub fn session(db: Omnigraph) -> Session {
+    Session::from_defaults(Arc::new(db), SessionSettings::default())
+}
+
+/// The same handle under one setting changed from `db`'s values, the
+/// replacement for a scoped override: run the operation on the returned
+/// session.
+pub fn with_setting(db: &Session, name: &str, value: &str) -> Session {
+    let settings = db
+        .settings()
+        .clone()
+        .with(name, value)
+        .unwrap_or_else(|error| panic!("test setting {name} = {value}: {error}"));
+    Session::from_defaults(Arc::clone(db.db()), settings)
+}
+
+/// The same handle with the harness-only traversal field forced to one expand
+/// path: no setting name carries it, so the typed builder is the only door.
+pub fn with_traversal(db: &Session, mode: Traversal) -> Session {
+    let settings = db.settings().clone().with_traversal(mode);
+    Session::from_defaults(Arc::clone(db.db()), settings)
+}
+
 /// Init a graph and load the standard test data.
-pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
+pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
     // reconciled separately as derived state.
     db.ensure_indices().await.unwrap();
@@ -373,7 +400,7 @@ pub fn collect_column_strings(batches: &[RecordBatch], col: &str) -> Vec<String>
 }
 
 pub async fn query_main(
-    db: &mut Omnigraph,
+    db: &Session,
     query_source: &str,
     query_name: &str,
     params: &ParamMap,
@@ -383,7 +410,7 @@ pub async fn query_main(
 }
 
 pub async fn query_branch(
-    db: &mut Omnigraph,
+    db: &Session,
     branch: &str,
     query_source: &str,
     query_name: &str,
@@ -394,7 +421,7 @@ pub async fn query_branch(
 }
 
 pub async fn mutate_main(
-    db: &mut Omnigraph,
+    db: &Session,
     query_source: &str,
     query_name: &str,
     params: &ParamMap,
@@ -403,7 +430,7 @@ pub async fn mutate_main(
 }
 
 pub async fn mutate_branch(
-    db: &mut Omnigraph,
+    db: &Session,
     branch: &str,
     query_source: &str,
     query_name: &str,
@@ -414,7 +441,7 @@ pub async fn mutate_branch(
 
 /// Advance the manifest version `n` times (one commit per insert), building
 /// deep commit history for cost-budget tests (history depth, not row count).
-pub async fn commit_many(db: &mut Omnigraph, n: usize) {
+pub async fn commit_many(db: &Session, n: usize) {
     for i in 0..n {
         mutate_main(
             db,
@@ -429,7 +456,7 @@ pub async fn commit_many(db: &mut Omnigraph, n: usize) {
 
 /// Like [`commit_many`] but every commit carries an actor in its inline
 /// `__manifest` lineage row — the authenticated (server/CLI) write path.
-pub async fn commit_many_as(db: &mut Omnigraph, n: usize, actor: &str) {
+pub async fn commit_many_as(db: &Session, n: usize, actor: &str) {
     for i in 0..n {
         db.mutate_as(
             "main",
@@ -464,11 +491,11 @@ pub async fn version_branch(db: &Omnigraph, branch: &str) -> Result<u64> {
         .await
 }
 
-pub async fn sync_main(db: &mut Omnigraph) -> Result<()> {
+pub async fn sync_main(db: &Omnigraph) -> Result<()> {
     db.sync_branch("main").await
 }
 
-pub async fn sync_named_branch(db: &mut Omnigraph, branch: &str) -> Result<()> {
+pub async fn sync_named_branch(db: &Omnigraph, branch: &str) -> Result<()> {
     db.sync_branch(branch).await
 }
 

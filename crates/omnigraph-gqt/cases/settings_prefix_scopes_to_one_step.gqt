@@ -1,0 +1,75 @@
+# issue: none
+# notes: a settings prefix is accepted on a read step and scoped to it: the
+# notes: prefix `set merge_lineage = off;` rides on the one step, and the
+# notes: following `show merge_lineage` reports the session's own value and
+# notes: source unchanged after an accepted read and after a refused one (T6,
+# notes: unknown property). Nothing on a read observes `merge_lineage`, which
+# notes: only a merge reads, so the prefix's scope is the whole claim here; the
+# notes: arm oracle for the setting itself is
+# notes: `crates/omnigraph/tests/merge_cost.rs::merge_lineage_setting_selects_the_completed_classifier`.
+# notes: `settings_show_set_reset.gqt` carries why a fresh session reads
+# notes: `verify`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+
+--- mutate
+set merge_lineage = on;
+
+--- expect ok
+
+--- query
+set merge_lineage = off;
+query friends($n: String) {
+    match {
+        $a: Person
+        $a.name = $n
+        $a knows $b
+    }
+    return { $b.name }
+}
+
+--- params
+{"n": "alice"}
+
+--- expect unordered
+{"b.name": "bob"}
+
+--- expect shape
+b.name: String
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}
+
+--- query
+set merge_lineage = off;
+query salary() {
+    match { $p: Person }
+    return { $p.salary }
+}
+
+--- expect error: T6: type `Person` has no property `salary`
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}

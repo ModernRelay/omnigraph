@@ -107,7 +107,13 @@ impl EffectiveSettings {
                 ));
             }
         }
-        for key in ["FAILPOINTS", "OMNIGRAPH_TRAVERSAL_MODE"] {
+        let settings_variables = omnigraph_compiler::settings::DEFINITIONS
+            .iter()
+            .map(|spec| spec.env);
+        for key in std::iter::once("FAILPOINTS")
+            .chain(settings_variables)
+            .chain(crate::RETIRED_SETTING_ENVIRONMENT)
+        {
             if read(key).is_some() {
                 return Err(format!("environment_changed: worker inherited {key}"));
             }
@@ -145,6 +151,10 @@ mod tests {
                 "LANCE_MEM_POOL_SIZE",
                 "FAILPOINTS",
                 "OMNIGRAPH_TRAVERSAL_MODE",
+                "OMNIGRAPH_RRF_PLAN",
+                "OMNIGRAPH_MERGE_LINEAGE",
+                "OMNIGRAPH_ANN_NPROBES",
+                "OMNIGRAPH_LOAD_CONCURRENCY",
             ] {
                 assert!(
                     settings

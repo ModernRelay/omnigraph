@@ -37,7 +37,8 @@ use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::{
     MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
 };
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
 
@@ -708,7 +709,7 @@ pub fn assert_grows(
 /// Measure one committing `insert_person` to `main` — the canonical write the cost
 /// gates sweep over commit-history depth. Shared by `write_cost.rs` and
 /// `write_cost_s3.rs` so the measured write is defined once.
-pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
+pub async fn measure_insert(db: &omnigraph::Session, tag: &str) -> IoCounts {
     let (res, io) = measure(db.mutate(
         "main",
         MUTATION_QUERIES,
@@ -723,7 +724,7 @@ pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
 /// Like [`measure_insert`] but carries an actor — the authenticated (server/CLI)
 /// write path. The actor is written inline with the graph-lineage rows in
 /// `__manifest` (RFC-013 Phase 7), so its scan is part of `IoCounts::manifest_reads`.
-pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> IoCounts {
+pub async fn measure_insert_as(db: &omnigraph::Session, tag: &str, actor: &str) -> IoCounts {
     let (res, io) = measure(db.mutate_as(
         "main",
         MUTATION_QUERIES,
@@ -739,7 +740,7 @@ pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> Io
 // ── Backend fixtures — one knob, store-agnostic body ──
 
 /// Local tempdir graph (default; deterministic, every-PR).
-pub async fn local_graph(dir: &tempfile::TempDir) -> Omnigraph {
+pub async fn local_graph(dir: &tempfile::TempDir) -> omnigraph::Session {
     init_and_load(dir).await
 }
 
@@ -749,13 +750,18 @@ pub async fn local_graph(dir: &tempfile::TempDir) -> Omnigraph {
 /// (the rustfs CI job), any `init`/seed failure is a real failure and panics
 /// rather than silently skipping — otherwise a down/misconfigured store would let
 /// a bucket-gated gate pass vacuously. `name` disambiguates the prefix.
-pub async fn s3_graph(name: &str) -> Option<Omnigraph> {
+pub async fn s3_graph(name: &str) -> Option<omnigraph::Session> {
     let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let uri = format!("s3://{bucket}/cost-tests/{name}-{}", std::process::id());
-    let db = Omnigraph::init(&uri, TEST_SCHEMA)
-        .await
-        .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 graph init failed");
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+    let db = omnigraph::Session::from_defaults(
+        Arc::new(
+            Omnigraph::init(&uri, TEST_SCHEMA)
+                .await
+                .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 graph init failed"),
+        ),
+        SessionSettings::default(),
+    );
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 seed load failed");
     Some(db)

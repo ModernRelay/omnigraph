@@ -113,8 +113,12 @@ representation exceeds 32 MiB. Split a larger import into explicit commits; use
 one initial overwrite only when it fits, followed by merge chunks.
 
 Independent existing constructive datasets stage concurrently. The
-`OMNIGRAPH_LOAD_CONCURRENCY` environment variable controls that width for both
-Load and insert/update mutations (default 8); first-touch branch effects are
+`stage_write_concurrency` [session setting](../queries/index.md#session-settings)
+controls that width for both Load and insert/update mutations (default 8,
+range `1..=64`); it is `process` scope, so the server takes it from
+`OMNIGRAPH_LOAD_CONCURRENCY` and a direct CLI run from that variable or from
+`--set` on `load`, `ingest` or `mutate` (a JSONL input carries no `set` line),
+and an invalid or `0` value refuses startup instead of running the default. First-touch branch effects are
 deferred and delete staging remains serial. This affects preparation only—one
 request still publishes exactly one graph commit.
 

@@ -9,8 +9,12 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use std::sync::Arc;
+
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::{SessionSettings, Traversal};
 use omnigraph_compiler::ir::ParamMap;
 
 const SCHEMA: &str = r#"
@@ -93,7 +97,7 @@ fn generate_jsonl(n: usize, avg_degree: usize, seed: u64) -> String {
 }
 
 async fn time_query(
-    db: &Omnigraph,
+    db: &Session,
     name: &str,
     runs: usize,
 ) -> (std::time::Duration, std::time::Duration, usize) {
@@ -251,10 +255,17 @@ query sel($name: String) {
             // Fresh db per measurement so the query is cold (CSR pays its build).
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_str().unwrap();
-            let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-            load_jsonl(&db, &jsonl, LoadMode::Overwrite).await.unwrap();
-            // SAFE: example main drives queries sequentially; no concurrent env reader.
-            unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", mode) };
+            let db = Session::from_defaults(
+                Arc::new(Omnigraph::init(uri, SCHEMA).await.unwrap()),
+                SessionSettings::default(),
+            );
+            db.load_jsonl(&jsonl, LoadMode::Overwrite).await.unwrap();
+            let db = Session::from_defaults(
+                Arc::clone(db.db()),
+                db.settings()
+                    .clone()
+                    .with_traversal(Traversal::from_spelling(mode).unwrap()),
+            );
 
             let t = Instant::now();
             let r = db
@@ -272,7 +283,6 @@ query sel($name: String) {
                 rows
             );
         }
-        unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
         assert_eq!(
             rows_by_mode[0].1, rows_by_mode[1].1,
             "indexed and CSR must return identical rows (no silent drop under partial index coverage)"
@@ -293,12 +303,15 @@ async fn main() {
         let uri = dir.path().to_str().unwrap();
 
         let t = Instant::now();
-        let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
         let init_elapsed = t.elapsed();
 
         let jsonl = generate_jsonl(n, avg_deg, 42);
         let t = Instant::now();
-        load_jsonl(&db, &jsonl, LoadMode::Overwrite).await.unwrap();
+        db.load_jsonl(&jsonl, LoadMode::Overwrite).await.unwrap();
         let load_elapsed = t.elapsed();
 
         println!(

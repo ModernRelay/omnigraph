@@ -54,7 +54,9 @@ use layout::{
     open_manifest_dataset_native_with_session, open_manifest_dataset_with_identifier_with_session,
     open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
-pub(crate) use legacy_sidecars::{pending_legacy_sidecars, refuse_legacy_sidecars};
+pub(crate) use legacy_sidecars::{
+    pending_legacy_sidecars, refuse_legacy_sidecars, refuse_pending_recovery,
+};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{

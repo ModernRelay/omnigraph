@@ -11,8 +11,8 @@
 //!
 //! Each test is a sync `#[test]`: it builds its own runtime and `block_on`s per
 //! generated case (proptest closures are sync). The mode-equivalence test forces
-//! the Expand mode via the scoped `with_traversal_mode` seam — no env mutation, so
-//! no `#[serial]` and no leak across shrink/cases.
+//! the Expand mode with a session's `traversal` setting, so nothing leaks across
+//! shrink/cases and no `#[serial]` is needed.
 
 mod helpers;
 
@@ -22,9 +22,9 @@ use arrow_array::{Array, StringArray};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::with_traversal_mode;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 
@@ -149,11 +149,11 @@ fn config() -> Config {
     }
 }
 
-async fn load_graph(graph: &GenGraph) -> (tempfile::TempDir, Omnigraph) {
+async fn load_graph(graph: &GenGraph) -> (tempfile::TempDir, Session) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, &graph.to_jsonl(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(&graph.to_jsonl(), LoadMode::Overwrite)
         .await
         .unwrap();
     (dir, db)
@@ -167,7 +167,7 @@ fn one_param(val: &str) -> ParamMap {
 
 /// First-column strings, sorted (MULTISET — preserves duplicate-row count so
 /// mode comparisons catch dedup divergence, not just set divergence).
-async fn col0_sorted(db: &mut Omnigraph, name: &str, params: &ParamMap) -> Vec<String> {
+async fn col0_sorted(db: &Session, name: &str, params: &ParamMap) -> Vec<String> {
     let r = db
         .query(ReadTarget::branch("main"), QUERIES, name, params)
         .await
@@ -182,7 +182,7 @@ async fn col0_sorted(db: &mut Omnigraph, name: &str, params: &ParamMap) -> Vec<S
     v
 }
 
-async fn col0_set(db: &mut Omnigraph, name: &str, params: &ParamMap) -> HashSet<String> {
+async fn col0_set(db: &Session, name: &str, params: &ParamMap) -> HashSet<String> {
     col0_sorted(db, name, params).await.into_iter().collect()
 }
 
@@ -199,17 +199,16 @@ fn prop_expand_indexed_eq_csr() {
     runner
         .run(&arb_graph(), |graph| {
             let mismatch = rt.block_on(async {
-                let (_dir, mut db) = load_graph(&graph).await;
+                let (_dir, db) = load_graph(&graph).await;
+                let csr_db = with_traversal(&db, Traversal::Csr);
+                let indexed_db = with_traversal(&db, Traversal::Indexed);
                 for start in graph.persons.clone() {
                     let p = one_param(&start);
                     for q in ["friends", "related", "employers"] {
-                        // The seam is scope-bound: the forced mode is gone when the
-                        // wrapped future resolves, so it never leaks across runs.
-                        let csr = with_traversal_mode("csr", col0_sorted(&mut db, q, &p)).await;
-                        let indexed =
-                            with_traversal_mode("indexed", col0_sorted(&mut db, q, &p)).await;
+                        let csr = col0_sorted(&csr_db, q, &p).await;
+                        let indexed = col0_sorted(&indexed_db, q, &p).await;
                         // No override → auto (cost-based) path.
-                        let auto = col0_sorted(&mut db, q, &p).await;
+                        let auto = col0_sorted(&db, q, &p).await;
                         if csr != indexed || csr != auto {
                             return Some((start, q, csr, indexed, auto));
                         }
@@ -233,17 +232,17 @@ fn prop_results_subset_of_existing_nodes() {
     runner
         .run(&arb_graph(), |graph| {
             let bad = rt.block_on(async {
-                let (_dir, mut db) = load_graph(&graph).await;
+                let (_dir, db) = load_graph(&graph).await;
                 let persons: HashSet<String> = graph.persons.iter().cloned().collect();
                 let companies: HashSet<String> = graph.companies.iter().cloned().collect();
                 for start in graph.persons.clone() {
                     let p = one_param(&start);
-                    for f in col0_set(&mut db, "friends", &p).await {
+                    for f in col0_set(&db, "friends", &p).await {
                         if !persons.contains(&f) {
                             return Some(("friends", start, f));
                         }
                     }
-                    for c in col0_set(&mut db, "employers", &p).await {
+                    for c in col0_set(&db, "employers", &p).await {
                         if !companies.contains(&c) {
                             return Some(("employers", start, c));
                         }
@@ -266,10 +265,10 @@ fn prop_antijoin_partitions_persons() {
     runner
         .run(&arb_graph(), |graph| {
             let err = rt.block_on(async {
-                let (_dir, mut db) = load_graph(&graph).await;
-                let all = col0_set(&mut db, "all_persons", &ParamMap::new()).await;
-                let unemployed = col0_set(&mut db, "unemployed", &ParamMap::new()).await;
-                let employed = col0_set(&mut db, "employed", &ParamMap::new()).await;
+                let (_dir, db) = load_graph(&graph).await;
+                let all = col0_set(&db, "all_persons", &ParamMap::new()).await;
+                let unemployed = col0_set(&db, "unemployed", &ParamMap::new()).await;
+                let employed = col0_set(&db, "employed", &ParamMap::new()).await;
                 let overlap: Vec<_> = unemployed.intersection(&employed).cloned().collect();
                 let union: HashSet<_> = unemployed.union(&employed).cloned().collect();
                 if !overlap.is_empty() {

@@ -605,6 +605,200 @@ fn branch_merge_statement_conflict_exits_1_with_the_engine_message() {
     );
 }
 
+/// The one `show` row of a `--json` answer.
+fn shown_row(output: &std::process::Output) -> Value {
+    let payload = parse_stdout_json(output);
+    assert_eq!(payload["query_name"], "show");
+    assert_eq!(payload["row_count"], 1, "{payload}");
+    payload["rows"][0].clone()
+}
+
+#[test]
+fn set_flag_reaches_the_embedded_session_and_a_set_line_wins_over_it() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+
+    let baseline = shown_row(&output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg("show merge_lineage;")
+            .arg("--json"),
+    ));
+    assert_ne!(
+        baseline["value"], "off",
+        "the probe value must differ from the baseline: {baseline}"
+    );
+
+    let row = shown_row(&output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg("show merge_lineage;")
+            .arg("--set")
+            .arg("merge_lineage=off")
+            .arg("--json"),
+    ));
+    assert_eq!(row["name"], "merge_lineage");
+    assert_eq!(row["value"], "off");
+    assert_eq!(
+        row["source"], "request",
+        "`--set` is the invocation's request, the docs' `request` source: {row}"
+    );
+
+    let row = shown_row(&output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg("set merge_lineage = on;\nshow merge_lineage;")
+            .arg("--set")
+            .arg("merge_lineage=off")
+            .arg("--json"),
+    ));
+    assert_eq!(
+        row["value"], "on",
+        "the source's set line applies after --set"
+    );
+    assert_eq!(row["source"], "file");
+
+    let row = shown_row(&output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg("show stage_write_concurrency;")
+            .arg("--set")
+            .arg("stage_write_concurrency=4")
+            .arg("--json"),
+    ));
+    assert_eq!(row["scope"], "process");
+    assert_eq!(row["value"], "4");
+    assert_eq!(
+        row["source"], "request",
+        "the embedded CLI is the process, so --set carries a process row a \
+         server would refuse: {row}"
+    );
+
+    let row = shown_row(&output_success(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg("reset merge_lineage;\nshow merge_lineage;")
+            .arg("--set")
+            .arg("merge_lineage=off")
+            .arg("--json"),
+    ));
+    assert_eq!(
+        (&row["value"], &row["source"]),
+        (&baseline["value"], &baseline["source"]),
+        "`reset` drops the --set value to the process baseline (the build's \
+         default, or the environment's value), not to the value it replaced: {row}"
+    );
+}
+
+#[test]
+fn set_flag_refusals_happen_before_any_open_or_round_trip() {
+    let temp = tempdir().unwrap();
+    let absent = temp.path().join("absent.omni");
+    let definition_cases = [
+        (
+            "merge_lineage",
+            "--set takes NAME=VALUE, got 'merge_lineage'",
+        ),
+        (
+            "merge_lineage=fast",
+            "unknown value `fast` for setting `merge_lineage`",
+        ),
+    ];
+    for (flag, expected) in definition_cases {
+        let stderr = stderr_string(&output_failure(
+            embedded("query", &absent)
+                .arg("-e")
+                .arg("show merge_lineage;")
+                .arg("--set")
+                .arg(flag),
+        ));
+        assert!(
+            stderr.contains(expected),
+            "--set {flag}: expected {expected:?}; got: {stderr}"
+        );
+    }
+    let unreachable = "http://127.0.0.1:9";
+    let refusal = |args: &[&str]| -> String {
+        let mut command = cli();
+        command
+            .args(args)
+            .arg("--server")
+            .arg(unreachable)
+            .arg("--graph")
+            .arg("g");
+        stderr_string(&output_failure(&mut command))
+    };
+    const PROCESS_SCOPE: &str = "setting `stage_write_concurrency` is a process setting; it is \
+                                 read from the server's environment, not from a request";
+    const STORED_QUERY: &str =
+        "--set applies to an ad-hoc source (-e '<gq>' / --query <file>), not to a stored query";
+    let remote_cases: &[(&[&str], &str)] = &[
+        (
+            &[
+                "query",
+                "-e",
+                "show all;",
+                "--set",
+                "stage_write_concurrency=4",
+            ],
+            PROCESS_SCOPE,
+        ),
+        (
+            &[
+                "query",
+                "-e",
+                "branch list",
+                "--set",
+                "stage_write_concurrency=4",
+            ],
+            PROCESS_SCOPE,
+        ),
+        (
+            &[
+                "mutate",
+                "-e",
+                SET_AGE,
+                "--set",
+                "stage_write_concurrency=4",
+            ],
+            PROCESS_SCOPE,
+        ),
+        (
+            &[
+                "branch",
+                "merge",
+                "b0",
+                "--into",
+                "main",
+                "--set",
+                "stage_write_concurrency=4",
+            ],
+            PROCESS_SCOPE,
+        ),
+        (
+            &["query", "reports", "--set", "merge_lineage=off"],
+            STORED_QUERY,
+        ),
+        (
+            &["mutate", "add_source", "--set", "merge_lineage=off"],
+            STORED_QUERY,
+        ),
+    ];
+    for (args, expected) in remote_cases {
+        let stderr = refusal(args);
+        assert!(
+            stderr.contains(expected),
+            "{args:?}: expected {expected:?}; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("error sending request") && !stderr.contains("Connection refused"),
+            "{args:?}: the refusal must not follow a round trip (nothing listens on \
+             {unreachable}); got: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn query_check_alias_matches_lint_output() {
     let temp = tempdir().unwrap();

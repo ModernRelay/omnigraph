@@ -539,6 +539,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
         params: Some(json!({ "name": "Alice" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (read_status, read_body) = json_response(
         &app,
@@ -567,6 +568,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
+        settings: None,
     };
     let (change_status, change_body) = json_response(
         &app,
@@ -689,7 +691,7 @@ async fn schema_apply_route_soft_drops_property_via_http() {
     // Load a row that has the column we're about to drop.
     let graph = graph_path(temp.path());
     {
-        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
         db.load(
             "main",
             r#"{"type":"Person","data":{"name":"PreDrop","age":42}}"#,
@@ -801,7 +803,7 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
     .await;
     let graph = graph_path(temp.path());
     {
-        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
         db.load(
             "main",
             r#"{"type":"Person","data":{"name":"PreDropHard","age":50}}"#,

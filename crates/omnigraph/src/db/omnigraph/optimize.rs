@@ -924,7 +924,7 @@ decide_seam! {
 /// regardless (Lance invariant), and the requested cutoff is capped at the
 /// oldest main-dataset version inherited by a live lazy graph branch.
 pub async fn cleanup_all_datasets(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     options: CleanupPolicyOptions,
 ) -> Result<Vec<DatasetCleanupStats>> {
     if options.keep_versions.is_none() && options.older_than.is_none() {
@@ -1646,7 +1646,7 @@ pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> 
 #[cfg(all(test, feature = "failpoints"))]
 mod tests {
     use super::*;
-    use crate::loader::{LoadMode, load_jsonl};
+    use crate::loader::LoadMode;
 
     /// The internal-table compaction retry classifier: a concurrent live writer
     /// preempting our `Rewrite` is retryable (Lance prescribes app-rerun, and
@@ -1697,9 +1697,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let schema = "node Person { name: String @key }\nnode Company { name: String @key }\n";
-        let db = Omnigraph::init(uri, schema).await.unwrap();
-        load_jsonl(
-            &db,
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(Omnigraph::init(uri, schema).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n\
              {\"type\":\"Company\",\"data\":{\"name\":\"Acme\"}}",
             LoadMode::Merge,

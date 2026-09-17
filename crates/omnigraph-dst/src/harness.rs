@@ -11,10 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
+use omnigraph::Session;
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::error::{OmniError, Result as OmniResult};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
 use crate::detectors::{self, Channel, Detector, ObservationSource, Oracle};
@@ -59,7 +61,6 @@ pub(crate) fn clear_process_slots() {
     crate::lance_faults::set_seam_scheduler(None);
     crate::lance_faults::set_bytes_canary(None);
     omnigraph::storage::STORAGE.clear();
-    FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
 }
 
 /// The plain (unpaused, unseeded) current-thread tokio runtime used by
@@ -266,7 +267,7 @@ impl Default for FaultPlan {
 impl FaultPlan {
     /// All-zero plan: used when the crash-state enumeration needs the
     /// storage wrapper installed but no fault weather was requested.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             seed: 0,
             error_pct: 0,
@@ -1222,44 +1223,6 @@ const BRANCH_POOL: [&str; 2] = ["b0", "b1"];
 /// mode differential runs main-only; final audit covers every branch).
 static MAIN_BRANCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "main".to_string());
 
-/// CORRUPTION AXIS (persisted tier) — FIRST-CONTACT FINDING (2026-08-13, seed 97's first
-/// run) + its named carve-out: recovery LISTS and RE-READS a
-/// foreign-named file in `__recovery/` (a misdirected sidecar, `dstm-`
-/// prefix) but neither heals nor removes it — permanent residue, silently
-/// re-consumed on every recovery pass. Issue candidate (Azim judges): what
-/// is the contract for an unrecognized sidecar file — quarantine, delete,
-/// or refuse? Until ruled, residue whose FILENAME carries our misdirect
-/// marker (only `misdirect_uri` mints `dstm-`) is recorded as a
-/// `s11b-foreign-sidecar-ignored` known-issue row instead of panicking;
-/// REAL-named residue keeps panicking (reopen must heal what it
-/// recognizes). Per-universe sink, cleared at universe start, drained into
-/// `UniverseReport.known_issues` (lance_faults slot precedent).
-static FOREIGN_SIDECAR_ROWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-fn is_foreign_sidecar(uri: &str) -> bool {
-    uri.rsplit_once('/')
-        .map(|(_, file)| file.starts_with("dstm-"))
-        .unwrap_or(false)
-}
-
-/// Partition residue: foreign-marked entries are recorded (root-normalized)
-/// and returned as tolerated; anything else is returned for the caller to
-/// panic on.
-fn partition_residue(residue: Vec<String>, root: &str, label: &str) -> Vec<String> {
-    let mut hard = Vec::new();
-    for uri in residue {
-        if is_foreign_sidecar(&uri) {
-            FOREIGN_SIDECAR_ROWS.lock().unwrap().push(format!(
-                "s11b-foreign-sidecar-ignored:{}@{label}",
-                uri.replace(root, "<root>")
-            ));
-        } else {
-            hard.push(uri);
-        }
-    }
-    hard
-}
-
 #[derive(Clone, Debug)]
 struct BranchSlot {
     state: Model,
@@ -1504,7 +1467,7 @@ fn sample_op(rng: &mut SplitMix64, model: &Model, next_ver: &mut i64, hostile: b
     }
 }
 
-async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
+async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
     match op {
         Op::InsertV { name, age, ver } => mutate_on(
             db,
@@ -1584,7 +1547,7 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
                 "{}\n{{\"type\": \"Company\", \"data\": {{\"name\": \"lc0\"}}}}",
                 person_jsonl(people)
             );
-            Box::pin(load_jsonl(db, &payload, LoadMode::Merge))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Merge))
                 .await
                 .map(|_| ())
         }
@@ -1597,7 +1560,7 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
                 person_jsonl(people),
                 people[0].0
             );
-            Box::pin(load_jsonl(db, &payload, LoadMode::Append))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Append))
                 .await
                 .map(|_| ())
         }
@@ -2002,7 +1965,7 @@ pub fn workload_can_reach(window: &str) -> bool {
     )
 }
 
-async fn exec_world_op(db: &mut Omnigraph, wop: &WorldOp) -> OmniResult<()> {
+async fn exec_world_op(db: &Session, wop: &WorldOp) -> OmniResult<()> {
     match wop {
         WorldOp::Data { branch, op } => exec_op(db, branch, op).await,
         WorldOp::BranchCreate { name } => Box::pin(db.branch_create(name)).await,
@@ -2163,10 +2126,13 @@ fn is_merge_conflict_err(err: &OmniError) -> bool {
 /// and VIRTUAL-time latency on both read- and write-class calls, plus the
 /// corruption (read + persisted tiers) and bounded-staleness axes.
 #[derive(Debug)]
-struct FailingStorage {
+pub struct FailingStorage {
     inner: Arc<dyn StorageAdapter>,
     rng: Mutex<SplitMix64>,
     plan: FaultPlan,
+    /// The per-step targeting a logic test installs (store places and the
+    /// one-shot a store effect arms); consulted before every gate below.
+    targets: crate::store_places::Targets,
     /// Faults apply only once enabled — init and fixture load stay clean so
     /// every universe starts from the same healthy world.
     enabled: std::sync::atomic::AtomicBool,
@@ -2229,6 +2195,20 @@ enum WriteFate {
 }
 
 impl FailingStorage {
+    /// A zero plan, never enabled, so nothing is drawn from the generator:
+    /// only a targeted rule or an armed one-shot acts; `root` is what a
+    /// rule's subject is relative to.
+    pub fn quiet(inner: Arc<dyn StorageAdapter>, root: String) -> Arc<Self> {
+        let mut storage = Self::new(inner, FaultPlan::none(), None, None);
+        storage.targets = crate::store_places::Targets::new(Some(root));
+        Arc::new(storage)
+    }
+
+    /// The targeting state a runner installs rules on and drains hits from.
+    pub fn targets(&self) -> &crate::store_places::Targets {
+        &self.targets
+    }
+
     fn new(
         inner: Arc<dyn StorageAdapter>,
         plan: FaultPlan,
@@ -2239,6 +2219,7 @@ impl FailingStorage {
             inner,
             rng: Mutex::new(SplitMix64(plan.seed)),
             plan,
+            targets: crate::store_places::Targets::new(None),
             enabled: std::sync::atomic::AtomicBool::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
             lance,
@@ -2506,7 +2487,7 @@ impl FailingStorage {
     /// target URI to write to (`misdirect_uri`). Ledger records BOTH halves of the damage: the
     /// intended object is absent (misdirect-source), the foreign object
     /// exists (misdirect-target).
-    fn maybe_misdirect(&self, op: &str, uri: &str) -> Option<String> {
+    fn maybe_misdirect(&self, op: crate::store_places::PutMethod, uri: &str) -> Option<String> {
         if self.plan.misdirect_write_pct == 0 || !self.active() {
             return None;
         }
@@ -2514,6 +2495,46 @@ impl FailingStorage {
         if roll >= self.plan.misdirect_write_pct {
             return None;
         }
+        Some(self.misdirect_to(op, uri))
+    }
+
+    /// The rule or one-shot decision for this put, consulted before every
+    /// gate so an inactive decoration still honors it; `settle_put` records
+    /// the hit once the store has answered.
+    #[track_caller]
+    fn targeted_put(&self, uri: &str) -> Option<crate::store_places::Targeted> {
+        self.targets
+            .on_call(crate::store_places::StorePlace::Put, uri)
+    }
+
+    /// The store actions the three put hooks have an arm for; `admitted` on
+    /// the put row must stay within it.
+    pub const PUT_HOOK_ACTIONS: &[crate::store_places::StoreAction] =
+        &[crate::store_places::StoreAction::Misdirect];
+
+    fn settle_put(
+        &self,
+        targeted: Option<crate::store_places::Targeted>,
+        op: crate::store_places::PutMethod,
+        uri: &str,
+        stored: Option<&str>,
+        landed: bool,
+    ) {
+        if let Some(targeted) = targeted {
+            self.targets.record(
+                targeted,
+                crate::store_places::StorePlace::Put,
+                op.as_str(),
+                uri,
+                stored,
+                landed,
+            );
+        }
+    }
+
+    /// Runs only for a put `write_fault` let proceed.
+    fn misdirect_to(&self, op: crate::store_places::PutMethod, uri: &str) -> String {
+        let op = op.as_str();
         let target = misdirect_uri(uri);
         self.writes_misdirected
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2525,7 +2546,7 @@ impl FailingStorage {
         // injected damage as a bypass write.
         crate::write_census::record("adapter", op, &target, self.active());
         println!("dst s11 damage: misdirect {op} {uri} -> {target}");
-        Some(target)
+        target
     }
 
     /// latent sector check, called AFTER the per-call fault
@@ -2767,15 +2788,7 @@ impl FailingStorage {
     }
 }
 
-/// CORRUPTION AXIS (persisted tier) — pure misdirection transform: same directory,
-/// `dstm-` filename prefix (extension preserved) — the write lands at a
-/// wrong key inside the same keyspace, so listings still see it.
-pub(crate) fn misdirect_uri(uri: &str) -> String {
-    match uri.rsplit_once('/') {
-        Some((dir, file)) => format!("{dir}/dstm-{file}"),
-        None => format!("dstm-{uri}"),
-    }
-}
+pub use crate::store_places::misdirect_uri;
 
 /// pure, seeded read-time bit rot: substitute exactly one char
 /// (index = `pos_roll`, already reduced modulo the char count by the caller's
@@ -2913,21 +2926,57 @@ impl StorageAdapter for FailingStorage {
             .await
     }
     async fn write_text(&self, uri: &str, contents: &str) -> OmniResult<()> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_text", uri, true).await? {
+        let fate = match self.write_fault("write_text", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteText,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteText,
+                uri,
+                None,
+                false,
+            );
             return Ok(());
         }
-        let (target, stored);
-        match self.maybe_misdirect("write_text", uri) {
-            Some(t) => target = t,
-            None => target = uri.to_string(),
-        }
-        match self.maybe_corrupt_write("write_text", &target, contents) {
-            Some(s) => stored = s,
-            None => stored = contents.to_string(),
-        }
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteText, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteText, uri)
+                .unwrap_or_else(|| uri.to_string()),
+        };
+        let stored = self
+            .maybe_corrupt_write("write_text", &target, contents)
+            .unwrap_or_else(|| contents.to_string());
         self.staleness_base(&target).await;
         let out = self.inner.write_text(&target, &stored).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteText,
+            uri,
+            Some(&target),
+            out.is_ok(),
+        );
         if out.is_ok() {
             self.count_completion("write_text", uri);
             self.staleness_record(&target, Some(stored.clone()), None);
@@ -2935,40 +2984,114 @@ impl StorageAdapter for FailingStorage {
         self.lose_ack("write_text", uri, out).await
     }
     async fn write_bytes(&self, uri: &str, contents: &[u8]) -> OmniResult<()> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_bytes", uri, true).await? {
+        let fate = match self.write_fault("write_bytes", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteBytes,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteBytes,
+                uri,
+                None,
+                false,
+            );
             return Ok(());
         }
-        let target = match self.maybe_misdirect("write_bytes", uri) {
-            Some(t) => t,
-            None => uri.to_string(),
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteBytes, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteBytes, uri)
+                .unwrap_or_else(|| uri.to_string()),
         };
         // Write corruption and the staleness history stay text-only (see
         // `read_bytes_if_exists_bounded`): both are `String`-typed. Kill,
         // write faults, misdirection, completion counting and ack loss apply.
         let out = self.inner.write_bytes(&target, contents).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteBytes,
+            uri,
+            Some(&target),
+            out.is_ok(),
+        );
         if out.is_ok() {
             self.count_completion("write_bytes", uri);
         }
         self.lose_ack("write_bytes", uri, out).await
     }
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> OmniResult<bool> {
+        let targeted = self.targeted_put(uri);
         let _in_flight = self.kill.as_ref().map(|k| k.enter_write());
-        if let WriteFate::Lost = self.write_fault("write_text_if_absent", uri, true).await? {
+        let fate = match self.write_fault("write_text_if_absent", uri, true).await {
+            Ok(fate) => fate,
+            Err(error) => {
+                self.settle_put(
+                    targeted,
+                    crate::store_places::PutMethod::WriteTextIfAbsent,
+                    uri,
+                    None,
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let WriteFate::Lost = fate {
             // The engine believes the if-absent insert landed.
+            self.settle_put(
+                targeted,
+                crate::store_places::PutMethod::WriteTextIfAbsent,
+                uri,
+                None,
+                false,
+            );
             return Ok(true);
         }
-        let (target, stored);
-        match self.maybe_misdirect("write_text_if_absent", uri) {
-            Some(t) => target = t,
-            None => target = uri.to_string(),
-        }
-        match self.maybe_corrupt_write("write_text_if_absent", &target, contents) {
-            Some(s) => stored = s,
-            None => stored = contents.to_string(),
-        }
+        let target = match &targeted {
+            Some(targeted) => match targeted.action {
+                crate::store_places::StoreAction::Misdirect => {
+                    self.misdirect_to(crate::store_places::PutMethod::WriteTextIfAbsent, uri)
+                }
+                other => unreachable!(
+                    "store action {} is not admitted on storage.put",
+                    other.as_str()
+                ),
+            },
+            None => self
+                .maybe_misdirect(crate::store_places::PutMethod::WriteTextIfAbsent, uri)
+                .unwrap_or_else(|| uri.to_string()),
+        };
+        let stored = self
+            .maybe_corrupt_write("write_text_if_absent", &target, contents)
+            .unwrap_or_else(|| contents.to_string());
         self.staleness_base(&target).await;
         let out = self.inner.write_text_if_absent(&target, &stored).await;
+        self.settle_put(
+            targeted,
+            crate::store_places::PutMethod::WriteTextIfAbsent,
+            uri,
+            Some(&target),
+            matches!(out, Ok(true)),
+        );
         if matches!(out, Ok(true)) {
             self.count_completion("write_text_if_absent", uri);
             self.staleness_record(&target, Some(stored.clone()), None);
@@ -3197,7 +3320,7 @@ impl StorageAdapter for FailingStorage {
 
 // ----------------------------------------------------------------- oracles --
 
-async fn assert_matches_model(db: &Omnigraph, model: &Model, where_: &str) {
+async fn assert_matches_model(db: &Session, model: &Model, where_: &str) {
     assert_eq!(
         person_rows(db).await,
         model.person_rows(),
@@ -3214,7 +3337,7 @@ async fn assert_matches_model(db: &Omnigraph, model: &Model, where_: &str) {
 /// and edges — in the model's deterministic order. A branch that lists but
 /// cannot be read (torn create/delete) panics inside the readers: that IS the
 /// oracle for torn branch state.
-async fn observe_world(db: &Omnigraph) -> WorldState {
+async fn observe_world(db: &Session) -> WorldState {
     let mut names = db.branch_list().await.expect("branch list");
     names.sort();
     let mut ordered = vec!["main".to_string()];
@@ -3243,7 +3366,7 @@ pub async fn recovery_residue(storage: &Arc<dyn StorageAdapter>, root: &str) -> 
         .expect("list recovery residue")
 }
 
-async fn assert_world_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
+async fn assert_world_matches(db: &Session, world: &WorldModel, where_: &str) {
     assert_eq!(
         observe_world(db).await,
         world.render(),
@@ -3291,7 +3414,7 @@ async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String
 ///    surface as an engine Update the model-diff can't see) — no guessing,
 ///    per the ghost-tie-break lesson. Edge diffs ride on net 1 (edge change
 ///    ids are ULIDs, not model-addressable pairs).
-async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], where_: &str) {
+async fn assert_history_matches(db: &Session, history: &[(String, Model)], where_: &str) {
     for (commit_id, model) in history {
         let persons = Box::pin(person_rows_target(
             db,
@@ -3374,7 +3497,7 @@ async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], whe
 /// PHYSICAL-CHANNEL ORACLE (third audit channel, the one that counts rows): per
 /// branch, `export_jsonl` (no query machinery) must equal the model's physical
 /// expectation — persons exactly, Knows = every row ∪ ghosts, duplicates kept.
-async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
+async fn assert_physical_matches(db: &Session, world: &WorldModel, where_: &str) {
     for branch in world.branch_names() {
         let (persons, knows) = Box::pin(physical_view_on(db, &branch)).await;
         let m = world.state_of(&branch);
@@ -3615,7 +3738,7 @@ impl RetryEffect {
 /// engine failpoint around the rerun so the convergence assert provably
 /// fires — `dst_sensitivity_maintenance_rerun_failure_is_red`.
 async fn maintenance_obligations(
-    db: &mut Omnigraph,
+    db: &Session,
     world: &WorldModel,
     wop: &WorldOp,
     label: &str,
@@ -3766,10 +3889,6 @@ async fn assert_no_recovery_residue(
     at_op: usize,
 ) {
     let residue = recovery_residue(storage, root).await;
-    // Persisted tier: foreign-named (injected-misdirect) residue is the named
-    // carve-out `s11b-foreign-sidecar-ignored` — recorded, tolerated;
-    // real-named residue still panics (reopen heals what it recognizes).
-    let residue = partition_residue(residue, root, label);
     if !residue.is_empty() {
         detectors::violation(
             DET_RECOVERY_OBLIGATION,
@@ -3851,13 +3970,13 @@ struct Arbitration<'a> {
 /// Judge the failed op and its optional retry, then reopen and enforce
 /// recovery monotonicity. Unrelated unjudged ops require watch reconciliation.
 async fn reconcile_after_failure(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
     world: &WorldModel,
     arbitration: Arbitration<'_>,
-) -> (Omnigraph, ReconcileOutcome, &'static str) {
+) -> (Session, ReconcileOutcome, &'static str) {
     let Arbitration {
         label,
         at_op,
@@ -3923,8 +4042,12 @@ async fn reconcile_after_failure(
     let committed = visible == as_with;
     let fork_was_visible = as_fork_only.as_ref() == Some(&visible);
 
+    let settings = db.settings().clone();
     drop(db);
-    let db = reopen_under_storm(&storage, root, label, at_op, recovery_crash).await;
+    let db = Session::from_defaults(
+        Arc::new(reopen_under_storm(&storage, root, label, at_op, recovery_crash).await),
+        settings,
+    );
     let after = observe_world(&db).await;
     if !legal(&after) {
         detectors::violation(
@@ -4086,7 +4209,7 @@ async fn reconcile_after_failure(
 /// deterministic cache-warming side effect auto mode could equally cause;
 /// accepted and recorded.
 async fn assert_traversal_modes_agree(
-    db: &Omnigraph,
+    db: &Session,
     world: &WorldModel,
     branches: &[String],
     where_: &str,
@@ -4188,8 +4311,8 @@ pub fn classify_bystander_view(
 /// after which the bystander must equal fresh (`StaleAfterSync`).
 #[allow(clippy::too_many_arguments)]
 async fn check_sessions(
-    actor: &Omnigraph,
-    bystander: &Omnigraph,
+    actor: &Session,
+    bystander: &Session,
     root: &str,
     storage: &Arc<dyn StorageAdapter>,
     world: &WorldModel,
@@ -4199,12 +4322,17 @@ async fn check_sessions(
     do_catch_up: bool,
     where_: &str,
 ) {
-    let fresh = Box::pin(Omnigraph::open_read_only_with_storage(
-        root,
-        storage.clone(),
-    ))
-    .await
-    .expect("open fresh session");
+    let fresh = Session::from_defaults(
+        Arc::new(
+            Box::pin(Omnigraph::open_read_only_with_storage(
+                root,
+                storage.clone(),
+            ))
+            .await
+            .expect("open fresh session"),
+        ),
+        SessionSettings::default(),
+    );
 
     // Schema fingerprint — the dimension row equality cannot see
     // (the schema-add finding lives here).
@@ -4295,7 +4423,7 @@ enum CrashOutcome {
 #[cfg(feature = "failpoints")]
 #[allow(clippy::too_many_arguments)]
 async fn crash_op(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
@@ -4306,17 +4434,16 @@ async fn crash_op(
     expected_conflict: bool,
     failing: Option<&FailingStorage>,
     heads_before: &[(String, String)],
-) -> (Omnigraph, CrashOutcome) {
+) -> (Session, CrashOutcome) {
     assert!(
         !heads_before.is_empty(),
         "a scheduled crash requires pre-op commit heads for arbitration"
     );
-    let mut db = db;
     let result = {
         let _fp = omnigraph::seams::catalog::decide(failpoint)
             .unwrap_or_else(|| panic!("harness window {failpoint} names no catalog seam"))
             .fire_always();
-        exec_world_op(&mut db, wop).await
+        exec_world_op(&db, wop).await
     };
     match result {
         Ok(()) => {
@@ -4366,7 +4493,7 @@ async fn crash_op(
 #[cfg(not(feature = "failpoints"))]
 #[allow(clippy::too_many_arguments)]
 async fn crash_op(
-    _db: Omnigraph,
+    _db: Session,
     _storage: Arc<dyn StorageAdapter>,
     _root: &str,
     _wop: &WorldOp,
@@ -4377,7 +4504,7 @@ async fn crash_op(
     _expected_conflict: bool,
     _failing: Option<&FailingStorage>,
     _heads_before: &[(String, String)],
-) -> (Omnigraph, CrashOutcome) {
+) -> (Session, CrashOutcome) {
     panic!("crash scenarios require --features failpoints");
 }
 
@@ -4454,8 +4581,8 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
             .await
         };
 
-        async fn usable(db: &Omnigraph) -> bool {
-            load_jsonl(db, TEST_DATA, LoadMode::Overwrite).await.is_ok()
+        async fn usable(db: &Session) -> bool {
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.is_ok()
                 && !person_rows(db).await.is_empty()
         }
 
@@ -4463,6 +4590,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
         // open-crash universe, so fleet failure rows carry the detector.
         match init_result {
             Ok(db) => {
+                let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
                 if !usable(&db).await {
                     detectors::violation(
                         DET_BIRTH,
@@ -4476,6 +4604,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
             Err(_) => {
                 match Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await {
                     Ok(db) => {
+                        let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
                         if !usable(&db).await {
                             detectors::violation(
                                 DET_BIRTH,
@@ -4516,6 +4645,10 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
                         .await;
                         match reinit_result {
                             Ok(db) => {
+                                let db = Session::from_defaults(
+                                    Arc::new(db),
+                                    SessionSettings::default(),
+                                );
                                 if !usable(&db).await {
                                     detectors::violation(
                                         DET_BIRTH,
@@ -4571,15 +4704,20 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
         .expect("seeded runtime");
     runtime.block_on(async move {
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("clean init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("clean init"),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("clean load");
         let baseline = person_rows(&db).await;
@@ -4703,7 +4841,7 @@ impl std::fmt::Debug for RustResources {
 
 /// The storage-seam behavior: hands back the universe's one `FailingStorage`,
 /// ignoring the base adapter the engine offers (the instance already wraps it).
-struct FailingStorageDecorator(Arc<FailingStorage>);
+pub struct FailingStorageDecorator(pub Arc<FailingStorage>);
 
 impl omnigraph::seams::Behavior for FailingStorageDecorator {}
 
@@ -4745,7 +4883,6 @@ impl UniverseEnvironment for RustEnvironment {
         }
         crate::lance_faults::set_active(lance_faults_state.clone());
         crate::lance_faults::set_kill(kill_state.clone());
-        FOREIGN_SIDECAR_ROWS.lock().unwrap().clear();
         let failing: Option<Arc<FailingStorage>> = if self.faults.is_some() || kill_state.is_some()
         {
             Some(Arc::new(FailingStorage::new(
@@ -4855,15 +4992,20 @@ impl UniverseScenario<RustResources> for Scenario {
         let lance_faults_state = resources.lance_faults_state.clone();
         let kill_state = resources.kill_state.clone();
 
-        let mut db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init universe root");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let mut db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init universe root"),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load fixture");
 
@@ -4889,9 +5031,14 @@ impl UniverseScenario<RustResources> for Scenario {
 
         // the BYSTANDER session — born now (clean store), never
         // writes, read at every session check. The server's warm-idle shape.
-        let bystander = Box::pin(Omnigraph::open_with_storage(root, storage.clone()))
-            .await
-            .expect("open bystander session");
+        let bystander = Session::from_defaults(
+            Arc::new(
+                Box::pin(Omnigraph::open_with_storage(root, storage.clone()))
+                    .await
+                    .expect("open bystander session"),
+            ),
+            SessionSettings::default(),
+        );
         let mut bystander_last: Option<usize> = None;
         let mut bystander_trail: Vec<usize> = Vec::new();
         let mut session_checks = 0usize;
@@ -4914,7 +5061,7 @@ impl UniverseScenario<RustResources> for Scenario {
         let mut client_retries = 0usize;
         let mut maintenance_reruns = 0usize;
         let mut reconcile_verdicts: Vec<(String, String, String)> = Vec::new();
-        let mut known_issues: Vec<String> = Vec::new();
+        let known_issues: Vec<String> = Vec::new();
         // attributed detections — op failures whose reads
         // crossed the damage ledger (see the exec-site snapshot below).
         let mut corruption_detections: Vec<String> = Vec::new();
@@ -5069,7 +5216,7 @@ impl UniverseScenario<RustResources> for Scenario {
                         }
                         let ran = if op_targets_live(&world, &wop) {
                             Box::pin(maintenance_obligations(
-                                &mut db,
+                                &db,
                                 &world,
                                 &wop,
                                 &format!("crash:{failpoint}@op{i}"),
@@ -5132,10 +5279,10 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                     _ => None,
                 };
-                exec_world_op(&mut db, &wop).await
+                exec_world_op(&db, &wop).await
             };
             #[cfg(not(feature = "failpoints"))]
-            let exec_result = exec_world_op(&mut db, &wop).await;
+            let exec_result = exec_world_op(&db, &wop).await;
 
             // the dead flag — not the error text, not even the
             // op's verdict — is the authority. The dying op may surface a
@@ -5204,7 +5351,7 @@ impl UniverseScenario<RustResources> for Scenario {
                 }
                 let ran = if op_targets_live(&world, &wop) {
                     Box::pin(maintenance_obligations(
-                        &mut db,
+                        &db,
                         &world,
                         &wop,
                         &format!("crash-state:write#{}@op{i}", ks.writes_observed()),
@@ -5303,7 +5450,7 @@ impl UniverseScenario<RustResources> for Scenario {
                             && sc.faults.as_ref().is_some_and(|p| p.client_retry)
                         {
                             client_retries += 1;
-                            let retry = Box::pin(exec_world_op(&mut db, &wop)).await;
+                            let retry = Box::pin(exec_world_op(&db, &wop)).await;
                             if let Err(retry_err) = &retry
                                 && !(matches!(retry_err, OmniError::RecoveryRequired { .. })
                                     || is_legal_rejection(
@@ -5517,38 +5664,8 @@ impl UniverseScenario<RustResources> for Scenario {
                 "convergence completes within the 120 s real-clock bound",
             ),
         };
-        // FIRST-CONTACT FINDING of the corruption axis
-        // (2026-08-13, seed 97): a FOREIGN-NAMED sidecar permanently blocks
-        // maintenance — the recovery BARRIER parses the file's CONTENT
-        // (pending Mutation, op id) via directory listing, but the HEALER
-        // deletes `sidecar_uri(root, operation_id)` — the canonical path
-        // reconstructed from the op id (recovery.rs:7995), NOT the listed
-        // file's actual path — so the dstm- file is re-"healed" every
-        // reopen yet never removed, and the typed RecoveryRequired remedy
-        // ("reopen") provably does not clear it. Named carve-out: tolerate
-        // + record ONLY when the barrier names a foreign sidecar's op and
-        // foreign damage was injected; every other failure still panics.
         if let Err(err) = lively {
-            let text = format!("{err:?}");
-            let foreign_injected = failing
-                .as_ref()
-                .map(|f| {
-                    f.persisted_damage_snapshot()
-                        .values()
-                        .any(|v| *v == "misdirect-target")
-                })
-                .unwrap_or(false);
-            assert!(
-                foreign_injected && text.contains("RecoveryRequired"),
-                "ensure_indices in-universe: {err:?}"
-            );
-            FOREIGN_SIDECAR_ROWS.lock().unwrap().push(format!(
-                "s11b-foreign-sidecar-blocks-maintenance@final-audit: {}",
-                text.replace(root, "<root>")
-                    .chars()
-                    .take(160)
-                    .collect::<String>()
-            ));
+            panic!("ensure_indices in-universe: {err:?}");
         }
         // closing capture — the loop's final op plus the closing
         // ensure_indices' own commit, if it made one.
@@ -5578,9 +5695,14 @@ impl UniverseScenario<RustResources> for Scenario {
         // Durability + full oracle through a FRESH read-write handle.
         crate::cost::set_label("_audit");
         drop(db);
-        let db = Omnigraph::open_with_storage(root, storage.clone())
-            .await
-            .expect("final reopen");
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, storage.clone())
+                    .await
+                    .expect("final reopen"),
+            ),
+            SessionSettings::default(),
+        );
         detectors::tagged(
             DET_WORLD,
             sc.ops,
@@ -5594,7 +5716,6 @@ impl UniverseScenario<RustResources> for Scenario {
         // Persisted tier: injected residue must ALSO heal on this reopen — the
         // message names the injected verb when the survivor is attributed.
         let final_residue = recovery_residue(&storage, root).await;
-        let final_residue = partition_residue(final_residue, root, "final audit");
         if !final_residue.is_empty() {
             let ledger = failing
                 .as_ref()
@@ -5670,9 +5791,14 @@ impl UniverseScenario<RustResources> for Scenario {
 
         // Query-channel variant: the READ-ONLY open path must agree (main;
         // branch reads through the read-only path are a candidate widening).
-        let ro = Omnigraph::open_read_only_with_storage(root, storage)
-            .await
-            .expect("read-only reopen");
+        let ro = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_read_only_with_storage(root, storage)
+                    .await
+                    .expect("read-only reopen"),
+            ),
+            SessionSettings::default(),
+        );
         detectors::tagged(
             DET_RO_AUDIT,
             sc.ops,
@@ -5763,9 +5889,6 @@ impl UniverseScenario<RustResources> for Scenario {
             .unwrap_or_default();
         let stale_reads_served = failing.as_ref().map(|f| f.stale_reads_count()).unwrap_or(0);
         let stale_lists_served = failing.as_ref().map(|f| f.stale_lists_count()).unwrap_or(0);
-        // Persisted tier: drain the foreign-sidecar carve-out rows into the
-        // known-issues column (insertion order — deterministic).
-        known_issues.extend(FOREIGN_SIDECAR_ROWS.lock().unwrap().drain(..));
         UniverseReport {
             end_state: world.main.person_rows(),
             edges: world.main.edge_pairs(),
@@ -5846,6 +5969,92 @@ mod corruption_verb_tests {
     fn mutations_are_deterministic() {
         assert_eq!(bit_rot_text("abcdef", 3), bit_rot_text("abcdef", 3));
         assert_eq!(truncate_text("abcdef", 3), truncate_text("abcdef", 3));
+    }
+
+    #[test]
+    fn put_row_admits_only_hook_actions() {
+        let row = crate::store_places::store_place("storage.put").expect("put row");
+        for action in row.admitted {
+            assert!(
+                super::FailingStorage::PUT_HOOK_ACTIONS.contains(action),
+                "{}",
+                action.as_str()
+            );
+        }
+    }
+
+    /// Every `(place, admitted action)` pair the table offers a case is driven
+    /// through the real hooks, so a pair the row admits and no hook applies is
+    /// a red test rather than a case that silently never delivers.
+    #[tokio::test]
+    async fn every_admitted_action_lands_through_its_hooks() {
+        use std::sync::Arc;
+
+        use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
+
+        use crate::store_places::{STORE_PLACES, StoreAction, Subject, TargetedRule};
+
+        let root = "shared-memory://dst-admitted-actions/graph";
+        for row in STORE_PLACES {
+            for action in row.admitted {
+                let base = Arc::new(ObjectStorageAdapter::in_memory());
+                let inner: Arc<dyn StorageAdapter> = base.clone();
+                let storage = super::FailingStorage::quiet(inner, root.to_string());
+                for method in row.methods {
+                    storage.targets().install_rule(TargetedRule::new(
+                        row.place,
+                        Subject::parse("**").expect("glob"),
+                        1,
+                        *action,
+                    ));
+                    let uri = format!("{root}/__recovery/{method}.json");
+                    let text = format!("text-{method}");
+                    let absent = format!("absent-{method}");
+                    match *method {
+                        "write_text" => storage.write_text(&uri, &text).await.expect("write_text"),
+                        "write_bytes" => storage
+                            .write_bytes(&uri, b"bytes")
+                            .await
+                            .expect("write_bytes"),
+                        "write_text_if_absent" => assert!(
+                            storage
+                                .write_text_if_absent(&uri, &absent)
+                                .await
+                                .expect("write_text_if_absent")
+                        ),
+                        other => unreachable!(
+                            "{} admits {} but {other} has no call here",
+                            row.name,
+                            action.as_str()
+                        ),
+                    }
+                    let hits = storage.targets().clear().hits;
+                    let label = format!("{} {} {method}", row.name, action.as_str());
+                    assert_eq!(hits.len(), 1, "{label}");
+                    assert!(hits[0].landed, "{label}");
+                    assert_eq!(hits[0].action, *action, "{label}");
+                    assert_eq!(hits[0].method, *method, "{label}");
+                    if *action == StoreAction::Misdirect {
+                        let stored = super::misdirect_uri(&uri);
+                        assert!(!base.exists(&uri).await.expect("exists"), "{label}");
+                        assert!(base.exists(&stored).await.expect("exists"), "{label}");
+                        match *method {
+                            "write_text" => assert_eq!(
+                                base.read_text(&stored).await.expect("read_text"),
+                                text,
+                                "{label}"
+                            ),
+                            "write_text_if_absent" => assert_eq!(
+                                base.read_text(&stored).await.expect("read_text"),
+                                absent,
+                                "{label}"
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

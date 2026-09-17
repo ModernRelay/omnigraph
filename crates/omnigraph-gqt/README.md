@@ -30,9 +30,17 @@ storage and other combinations fail admission explicitly; their names do not
 imply implementation or qualification.
 
 One engine instance survives ordinary steps and expected errors. Only
-`--- restart` replaces it, reopening the same storage. GQ operations and GQT
-rows, shape, affected counts, errors and loop semantics are shared by both paths.
-Unordered row comparison preserves duplicate counts.
+`--- restart` drops the engine and reopens the same storage. A case owns one
+session ([Session settings](../../docs/rfcs/2026-09-16-session-settings.md)) for
+its lifetime: a `--- mutate` step of only `set` and
+`reset` lines expects `ok` and changes that session for the steps that follow,
+across a restart; a `set` prefix before any other body applies to that step
+only; `show <name>` and `show all` are `--- query` rows steps with the five
+`String` columns `name`, `value`, `default`, `source`, `scope` in definition
+order, and that shape is derived, so a `show` step writes no `--- expect shape`
+section; a `process` setting in a case body refuses the case at parse time. GQ operations
+and GQT rows, shape, affected counts, errors and loop semantics are shared by
+both paths. Unordered row comparison preserves duplicate counts.
 
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
@@ -51,7 +59,10 @@ precede one operation when they name distinct seams (contention at
 publication and a failure before promotion on one mutation,
 `cases/mutation_pending_pin_survives_reopen.gqt`); each carries
 its own delivery record, and the same seam twice before one operation is
-refused:
+refused. The one exception is the store: at most one directive per step may
+act on the store, as a store place or as a store action on a decision seam; a
+second is refused at admission with `unsupported_environment: one store
+action per step`:
 
 ```yaml
 --- seam
@@ -61,9 +72,22 @@ action: fail
 scope: next_step
 ```
 
-All four fields are required. `at` names a decision seam in the engine's
-catalog (`omnigraph::seams::catalog`, RFC 0066); `action` is `fail`,
-`contention`, or `skip`. `fail` selects the fail effect when declared,
+The four fields `at`, `occurrence`, `action` and `scope` are required, and
+`subject` is optional. `at` names a decision seam in the engine's catalog
+(`omnigraph::seams::catalog`, RFC 0066) or a store place in `STORE_PLACES`
+(`omnigraph-dst`); a store place requires `subject`, a glob over the object's
+root-relative name (RFC 0066 §Design Subjects), and a block whose catalog
+entry or row declares no subject refuses it; a decision seam that declares a
+store effect carries its own subject, which a case does not restate. Quote a
+subject that begins with
+`*`: the case reader refuses an unquoted leading `*` as a YAML alias; a
+quoted subject is read as one scalar, so globset's `{a,b}` and `[!x]` forms
+are fine inside the quotes. A store
+place is admitted before a mutate or branch step (a branch create writes
+nothing through the adapter, so a store place before it is `seam_unobserved`). `action` is `fail`,
+`contention`, `skip`, or a store action, the first being `misdirect`, with
+`lose`, `error`, `corrupt` and `delay` spellable and refused at admission
+naming the table row until admitted. `fail` selects the fail effect when declared,
 otherwise contention for compatibility with existing cases. `contention`
 selects only contention, so a seam declaring both failure effects lets a
 case choose either. `skip` selects only skip; an undeclared effect is
@@ -95,8 +119,12 @@ admitted effect on the declared occurrence, and the report carries
 guards) and `fired_at` (the helper call whose crossing fired); an unfired seam fails
 with `seam_unobserved`. Text in data or an error cannot satisfy this check.
 
-`--- fault` is reserved for storage-boundary faults (a separate amendment)
-and is refused today with a pointer to `--- seam`. An old `--- fault` block
+There is no `--- fault` section: a fault injected at the object store is a
+`--- seam` naming a store place or a decision seam that declares a store
+effect, and a `--- fault` section is refused with a pointer to `--- seam`.
+The store places, their methods and the actions each honors are RFC 0066's
+table; a place-and-action pair outside it, or listed but not implemented, is
+refused at admission naming the table row. An old `--- fault` block
 converts by renaming the section and its `return_error` action to
 `action: fail`; `at`, `occurrence` and `scope` keep their names. Process crashes,
 concurrent steps, server/CLI sessions and network simulation are future
@@ -160,5 +188,11 @@ environment. A subset selection cannot bless a multi-environment case. It rewrit
 failure until a subsequent run confirms it. DST cannot bless. The legacy
 `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` helper applies to library mechanism tests;
 file invocations refuse that ambient override and take their timeout from the
-runner section. Ambient fault, entropy, pool and traversal overrides also refuse
-admission, including replay.
+runner section. Ambient fault, entropy and pool overrides also refuse
+admission, including replay, as does a set settings variable
+(`OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`, `OMNIGRAPH_ANN_NPROBES`,
+`OMNIGRAPH_LOAD_CONCURRENCY`) and the retired `OMNIGRAPH_TRAVERSAL_MODE`,
+which names no setting any more. A case session never reads the environment, so
+neither variable decides anything; the refusal keeps a stale one in a CI
+environment from being mistaken for a live control, and keeps the retired name
+from lingering. A case that must run one value writes it in a `set` step.

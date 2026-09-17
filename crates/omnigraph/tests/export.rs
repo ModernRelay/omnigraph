@@ -1,13 +1,12 @@
 mod helpers;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -250,17 +249,22 @@ async fn export_jsonl_round_trips_branch_snapshot() {
 
     let imported_main_dir = tempfile::tempdir().unwrap();
     let imported_feature_dir = tempfile::tempdir().unwrap();
-    let imported_main = Omnigraph::init(imported_main_dir.path().to_str().unwrap(), TEST_SCHEMA)
-        .await
-        .unwrap();
-    let imported_feature =
+    let imported_main = helpers::session(
+        Omnigraph::init(imported_main_dir.path().to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let imported_feature = helpers::session(
         Omnigraph::init(imported_feature_dir.path().to_str().unwrap(), TEST_SCHEMA)
             .await
-            .unwrap();
-    load_jsonl(&imported_main, &main_jsonl, LoadMode::Overwrite)
+            .unwrap(),
+    );
+    imported_main
+        .load_jsonl(&main_jsonl, LoadMode::Overwrite)
         .await
         .unwrap();
-    load_jsonl(&imported_feature, &feature_jsonl, LoadMode::Overwrite)
+    imported_feature
+        .load_jsonl(&feature_jsonl, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -336,7 +340,7 @@ node Document {
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(
+    let db = helpers::session(
         Omnigraph::init(dir.path().to_str().unwrap(), WIDE_SCHEMA)
             .await
             .unwrap(),
@@ -346,9 +350,7 @@ node Document {
         "data": { "key": "wide", "body": "λ".repeat(40_000) }
     })
     .to_string();
-    load_jsonl(db.as_ref(), &wide, LoadMode::Append)
-        .await
-        .unwrap();
+    db.load_jsonl(&wide, LoadMode::Append).await.unwrap();
     let expected = db.export_jsonl("main", &[]).await.unwrap();
     let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
     let mut chunks = Vec::new();
@@ -372,9 +374,11 @@ node Document {
 #[tokio::test]
 async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
     let source_dir = tempfile::tempdir().unwrap();
-    let source = Omnigraph::init(source_dir.path().to_str().unwrap(), U64_KEY_SCHEMA)
-        .await
-        .unwrap();
+    let source = helpers::session(
+        Omnigraph::init(source_dir.path().to_str().unwrap(), U64_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
 
     // Exercise the mutation path at its current signed-literal ceiling, then
     // exercise JSON import above that boundary. Both routes must derive the
@@ -388,16 +392,16 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
         )
         .await
         .unwrap();
-    load_jsonl(
-        &source,
-        &format!(
-            "{{\"type\":\"Counter\",\"data\":{{\"sequence\":{},\"label\":\"loader\"}}}}",
-            u64::MAX
-        ),
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
+    source
+        .load_jsonl(
+            &format!(
+                "{{\"type\":\"Counter\",\"data\":{{\"sequence\":{},\"label\":\"loader\"}}}}",
+                u64::MAX
+            ),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
 
     let expected = vec![
         (i64::MAX as u64, i64::MAX.to_string()),
@@ -427,10 +431,13 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
     assert_eq!(exported_keys, [i64::MAX as u64, u64::MAX]);
 
     let rebuilt_dir = tempfile::tempdir().unwrap();
-    let rebuilt = Omnigraph::init(rebuilt_dir.path().to_str().unwrap(), U64_KEY_SCHEMA)
-        .await
-        .unwrap();
-    let mismatch = load_jsonl(&rebuilt, &mismatched_rows.join("\n"), LoadMode::Overwrite)
+    let rebuilt = helpers::session(
+        Omnigraph::init(rebuilt_dir.path().to_str().unwrap(), U64_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let mismatch = rebuilt
+        .load_jsonl(&mismatched_rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap_err();
     assert!(
@@ -439,7 +446,8 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
     );
     assert_eq!(count_rows(&rebuilt, "node:Counter").await, 0);
 
-    load_jsonl(&rebuilt, &exported, LoadMode::Overwrite)
+    rebuilt
+        .load_jsonl(&exported, LoadMode::Overwrite)
         .await
         .unwrap();
     assert_eq!(
@@ -452,18 +460,21 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
 #[tokio::test]
 async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_trip() {
     let source_dir = tempfile::tempdir().unwrap();
-    let source = Omnigraph::init(
-        source_dir.path().to_str().unwrap(),
-        LEGACY_TEMPORAL_KEY_SCHEMA,
-    )
-    .await
-    .unwrap();
+    let source = helpers::session(
+        Omnigraph::init(
+            source_dir.path().to_str().unwrap(),
+            LEGACY_TEMPORAL_KEY_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
 
     // This is the genuine old-export shape: the physical id retains the
     // mutation literal spelling, while the key property is the exported typed
     // Arrow value. The loader accepts typed equality, persists the canonical
     // id, and rewrites edges even though the edge appears before its nodes.
-    load_jsonl(&source, LEGACY_TEMPORAL_KEY_DATA, LoadMode::Overwrite)
+    source
+        .load_jsonl(LEGACY_TEMPORAL_KEY_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     assert_eq!(
@@ -494,7 +505,8 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
             r#"{"type":"Instant","data":{"happened_at":1704067200000}}"#,
         ),
     ] {
-        let duplicate = load_jsonl(&source, duplicate_row, LoadMode::Append)
+        let duplicate = source
+            .load_jsonl(duplicate_row, LoadMode::Append)
             .await
             .unwrap_err();
         assert!(
@@ -529,19 +541,21 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
     );
 
     let rejected_dir = tempfile::tempdir().unwrap();
-    let rejected = Omnigraph::init(
-        rejected_dir.path().to_str().unwrap(),
-        LEGACY_TEMPORAL_KEY_SCHEMA,
-    )
-    .await
-    .unwrap();
-    let mismatch = load_jsonl(
-        &rejected,
-        r#"{"type":"CalendarDay","id":"2024-01-02","data":{"day":19723}}"#,
-        LoadMode::Overwrite,
-    )
-    .await
-    .unwrap_err();
+    let rejected = helpers::session(
+        Omnigraph::init(
+            rejected_dir.path().to_str().unwrap(),
+            LEGACY_TEMPORAL_KEY_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
+    let mismatch = rejected
+        .load_jsonl(
+            r#"{"type":"CalendarDay","id":"2024-01-02","data":{"day":19723}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap_err();
     assert!(
         mismatch.to_string().contains("does not match @key"),
         "a different typed Date must still be rejected: {mismatch}"
@@ -549,13 +563,16 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
     assert_eq!(count_rows(&rejected, "node:CalendarDay").await, 0);
 
     let rebuilt_dir = tempfile::tempdir().unwrap();
-    let rebuilt = Omnigraph::init(
-        rebuilt_dir.path().to_str().unwrap(),
-        LEGACY_TEMPORAL_KEY_SCHEMA,
-    )
-    .await
-    .unwrap();
-    load_jsonl(&rebuilt, &exported, LoadMode::Overwrite)
+    let rebuilt = helpers::session(
+        Omnigraph::init(
+            rebuilt_dir.path().to_str().unwrap(),
+            LEGACY_TEMPORAL_KEY_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
+    rebuilt
+        .load_jsonl(&exported, LoadMode::Overwrite)
         .await
         .unwrap();
     assert_eq!(
@@ -579,11 +596,13 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
 #[tokio::test]
 async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), LEGACY_TYPED_REMAP_SCHEMA)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), LEGACY_TYPED_REMAP_SCHEMA)
+            .await
+            .unwrap(),
+    );
 
-    load_jsonl(&db, LEGACY_TYPED_REMAP_DATA, LoadMode::Overwrite)
+    db.load_jsonl(LEGACY_TYPED_REMAP_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -606,13 +625,13 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
     assert_eq!(collect_column_strings(&edges, "__src"), ["16777217"]);
     assert_eq!(collect_column_strings(&edges, "__dst"), ["16777216"]);
 
-    let duplicate = load_jsonl(
-        &db,
-        r#"{"type":"Rounded","data":{"value":16777217}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+    let duplicate = db
+        .load_jsonl(
+            r#"{"type":"Rounded","data":{"value":16777217}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             duplicate,
@@ -626,22 +645,24 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
     assert_eq!(count_rows(&db, "node:Rounded").await, 1);
 
     let collision_dir = tempfile::tempdir().unwrap();
-    let collision = Omnigraph::init(
-        collision_dir.path().to_str().unwrap(),
-        LEGACY_TYPED_REMAP_SCHEMA,
-    )
-    .await
-    .unwrap();
-    let collision_error = load_jsonl(
-        &collision,
-        r#"
+    let collision = helpers::session(
+        Omnigraph::init(
+            collision_dir.path().to_str().unwrap(),
+            LEGACY_TYPED_REMAP_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
+    let collision_error = collision
+        .load_jsonl(
+            r#"
 {"type":"Padded","id":"00042","data":{"value":42}}
 {"type":"Padded","id":"42","data":{"value":42}}
 "#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     assert!(
         collision_error.to_string().contains("duplicate")
             || collision_error.to_string().contains("@unique violation")
@@ -654,9 +675,11 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
 #[tokio::test]
 async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), COMPOSITE_KEY_SCHEMA)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), COMPOSITE_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
     // Accepted SchemaIR canonicalizes constraint columns, so the bound catalog
     // owns tuple order (`slot`, then `tenant`) on every write surface.
     let canonical = r#"["7","acme"]"#;
@@ -664,7 +687,7 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
 {"edge":"Related","id":"related","from":"7","to":"7","data":{}}
 {"type":"Membership","id":"7","data":{"tenant":"acme","slot":7,"label":"legacy"}}
 "#;
-    load_jsonl(&db, legacy, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(legacy, LoadMode::Overwrite).await.unwrap();
 
     assert_eq!(
         collect_column_strings(&read_table(&db, "node:Membership").await, "__id"),
@@ -674,13 +697,13 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     assert_eq!(collect_column_strings(&edges, "__src"), [canonical]);
     assert_eq!(collect_column_strings(&edges, "__dst"), [canonical]);
 
-    let duplicate = load_jsonl(
-        &db,
-        r#"{"type":"Membership","data":{"tenant":"acme","slot":7,"label":"append"}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+    let duplicate = db
+        .load_jsonl(
+            r#"{"type":"Membership","data":{"tenant":"acme","slot":7,"label":"append"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(duplicate, OmniError::KeyConflict { .. }));
     assert_eq!(count_rows(&db, "node:Membership").await, 1);
 
@@ -722,19 +745,21 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     );
 
     let ambiguous_dir = tempfile::tempdir().unwrap();
-    let ambiguous = Omnigraph::init(ambiguous_dir.path().to_str().unwrap(), COMPOSITE_KEY_SCHEMA)
-        .await
-        .unwrap();
-    let ambiguity = load_jsonl(
-        &ambiguous,
-        r#"
+    let ambiguous = helpers::session(
+        Omnigraph::init(ambiguous_dir.path().to_str().unwrap(), COMPOSITE_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let ambiguity = ambiguous
+        .load_jsonl(
+            r#"
 {"type":"Membership","id":"7","data":{"tenant":"acme","slot":7,"label":"one"}}
 {"type":"Membership","id":"7","data":{"tenant":"globex","slot":7,"label":"two"}}
 "#,
-        LoadMode::Overwrite,
-    )
-    .await
-    .unwrap_err();
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap_err();
     assert!(
         ambiguity
             .to_string()
@@ -747,9 +772,11 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
 #[tokio::test]
 async fn composite_key_rebuild_accepts_mixed_pre_and_post_rename_scalar_ids() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), RENAMED_COMPOSITE_KEY_SCHEMA)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), RENAMED_COMPOSITE_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
 
     // In v5, physical identity used the first runtime @key component. Before
     // the lexical-crossing rename that was `alpha` (now `zzzz`, U32), while a
@@ -762,7 +789,7 @@ async fn composite_key_rebuild_accepts_mixed_pre_and_post_rename_scalar_ids() {
 {"type":"RenamedPair","id":"7","data":{"aaaa":19723,"zzzz":7,"label":"pre-rename"}}
 {"type":"RenamedPair","id":"2024-01-02","data":{"aaaa":"2024-01-02","zzzz":8,"label":"post-rename"}}
 "#;
-    load_jsonl(&db, legacy, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(legacy, LoadMode::Overwrite).await.unwrap();
 
     let mut ids = collect_column_strings(&read_table(&db, "node:RenamedPair").await, "__id");
     ids.sort();
@@ -782,9 +809,11 @@ async fn composite_key_rebuild_accepts_mixed_pre_and_post_rename_scalar_ids() {
 #[tokio::test]
 async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_effect() {
     let load_dir = tempfile::tempdir().unwrap();
-    let loader = Omnigraph::init(load_dir.path().to_str().unwrap(), NARROWING_SCHEMA)
-        .await
-        .unwrap();
+    let loader = helpers::session(
+        Omnigraph::init(load_dir.path().to_str().unwrap(), NARROWING_SCHEMA)
+            .await
+            .unwrap(),
+    );
     let boundaries = [
         serde_json::json!({"type":"SignedBoundary","data":{"value":i32::MAX}}),
         serde_json::json!({"type":"UnsignedBoundary","data":{"value":u32::MAX}}),
@@ -794,7 +823,8 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
     .map(|row| serde_json::to_string(&row).unwrap())
     .collect::<Vec<_>>()
     .join("\n");
-    load_jsonl(&loader, &boundaries, LoadMode::Append)
+    loader
+        .load_jsonl(&boundaries, LoadMode::Append)
         .await
         .unwrap();
 
@@ -805,9 +835,7 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
         ("FloatBoundary", serde_json::json!(f64::MAX)),
     ] {
         let row = serde_json::json!({"type":table,"data":{"value":bad_value}}).to_string();
-        let error = load_jsonl(&loader, &row, LoadMode::Append)
-            .await
-            .unwrap_err();
+        let error = loader.load_jsonl(&row, LoadMode::Append).await.unwrap_err();
         assert!(
             error.to_string().contains("range"),
             "{table} out-of-range load must fail clearly: {error}"
@@ -816,9 +844,11 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
     }
 
     let mutation_dir = tempfile::tempdir().unwrap();
-    let mutation = Omnigraph::init(mutation_dir.path().to_str().unwrap(), NARROWING_SCHEMA)
-        .await
-        .unwrap();
+    let mutation = helpers::session(
+        Omnigraph::init(mutation_dir.path().to_str().unwrap(), NARROWING_SCHEMA)
+            .await
+            .unwrap(),
+    );
     mutation
         .mutate(
             "main",
@@ -884,20 +914,23 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
 #[tokio::test]
 async fn export_jsonl_preserves_explicit_ids_for_non_key_graphs() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), NOTE_SCHEMA)
-        .await
-        .unwrap();
-    load_jsonl(&db, NOTE_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), NOTE_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(NOTE_DATA, LoadMode::Overwrite).await.unwrap();
 
     let exported = db.export_jsonl("main", &[]).await.unwrap();
 
     let imported_dir = tempfile::tempdir().unwrap();
-    let imported = Omnigraph::init(imported_dir.path().to_str().unwrap(), NOTE_SCHEMA)
-        .await
-        .unwrap();
-    load_jsonl(&imported, &exported, LoadMode::Overwrite)
+    let imported = helpers::session(
+        Omnigraph::init(imported_dir.path().to_str().unwrap(), NOTE_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    imported
+        .load_jsonl(&exported, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -960,11 +993,13 @@ node Document {
     ])
     .unwrap();
 
-    let db = Omnigraph::init(uri, BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(external_policy.clone())
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(uri, BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(external_policy.clone())
+            .unwrap(),
+    );
     let first_fragment = [
         serde_json::json!({
             "type": "Document",
@@ -983,20 +1018,16 @@ node Document {
     .map(|row| row.to_string())
     .collect::<Vec<_>>()
     .join("\n");
-    load_jsonl(&db, &first_fragment, LoadMode::Overwrite)
+    db.load_jsonl(&first_fragment, LoadMode::Overwrite)
         .await
         .unwrap();
     // Make valid-empty the first Blob in a later fragment. Lance encodes that
     // cell as a valid Inline 0/0 descriptor, the exact shape OmniGraph's old
     // field-value heuristic mistook for null.
-    load_jsonl(
-        &db,
-        concat!(
+    db.load_jsonl(concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"valid-empty\",\"content\":\"base64:\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"neighbor\",\"content\":\"base64:TmVpZ2hib3I=\"}}",
-        ),
-        LoadMode::Append,
-    )
+        ), LoadMode::Append, )
     .await
     .unwrap();
     // Export is descriptor-first for external references: reproducing the
@@ -1060,12 +1091,15 @@ node Document {
     // Round-trip: re-import and verify blob data survives
     let imported_dir = tempfile::tempdir().unwrap();
     let imported_uri = imported_dir.path().to_str().unwrap();
-    let imported = Omnigraph::init(imported_uri, BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(external_policy)
-        .unwrap();
-    load_jsonl(&imported, &exported, LoadMode::Overwrite)
+    let imported = helpers::session(
+        Omnigraph::init(imported_uri, BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(external_policy)
+            .unwrap(),
+    );
+    imported
+        .load_jsonl(&exported, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -1114,13 +1148,13 @@ node Document {
 
     // A later import into the already-populated v6 table must retain both the
     // physical PK contract and blob-v2 fidelity.
-    load_jsonl(
-        &imported,
-        r#"{"type":"Document","data":{"title":"later","content":"base64:AAECA/8="}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
+    imported
+        .load_jsonl(
+            r#"{"type":"Document","data":{"title":"later","content":"base64:AAECA/8="}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
     assert_exact_id_primary_key(&imported, "node:Document").await;
     let later = read_managed_blob_bytes(
         &imported,

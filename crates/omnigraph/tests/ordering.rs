@@ -13,8 +13,9 @@ mod helpers;
 
 use arrow_array::{Array, StringArray};
 
+use omnigraph::Session;
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::result::QueryResult;
 
@@ -35,17 +36,17 @@ fn names_in_order(result: &QueryResult) -> Vec<String> {
 }
 
 /// Init the standard schema and load a custom Person-only dataset.
-async fn init_people(dir: &tempfile::TempDir, jsonl: &str) -> Omnigraph {
+async fn init_people(dir: &tempfile::TempDir, jsonl: &str) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, jsonl, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(jsonl, LoadMode::Overwrite).await.unwrap();
     db
 }
 
 #[tokio::test]
 async fn ordering_descending() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let q = r#"
 query q() {
     match { $p: Person }
@@ -53,7 +54,7 @@ query q() {
     order { $p.age desc }
 }
 "#;
-    let got = names_in_order(&query_main(&mut db, q, "q", &ParamMap::new()).await.unwrap());
+    let got = names_in_order(&query_main(&db, q, "q", &ParamMap::new()).await.unwrap());
     // Charlie(35), Alice(30), Diana(28), Bob(25)
     assert_eq!(got, vec!["Charlie", "Alice", "Diana", "Bob"]);
 }
@@ -66,7 +67,7 @@ async fn ordering_multi_key_age_desc_name_asc() {
     let data = r#"{"type":"Person","data":{"name":"Bob","age":30}}
 {"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Person","data":{"name":"Charlie","age":25}}"#;
-    let mut db = init_people(&dir, data).await;
+    let db = init_people(&dir, data).await;
     let q = r#"
 query q() {
     match { $p: Person }
@@ -74,7 +75,7 @@ query q() {
     order { $p.age desc, $p.name asc }
 }
 "#;
-    let got = names_in_order(&query_main(&mut db, q, "q", &ParamMap::new()).await.unwrap());
+    let got = names_in_order(&query_main(&db, q, "q", &ParamMap::new()).await.unwrap());
     // age desc -> [30,30,25]; the 30-tie broken by name asc -> Alice before Bob.
     assert_eq!(got, vec!["Alice", "Bob", "Charlie"]);
 }
@@ -88,7 +89,7 @@ async fn ordering_tiebreak_by_key_is_deterministic() {
     let data = r#"{"type":"Person","data":{"name":"Bob","age":30}}
 {"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Person","data":{"name":"Charlie","age":25}}"#;
-    let mut db = init_people(&dir, data).await;
+    let db = init_people(&dir, data).await;
     let q = r#"
 query q() {
     match { $p: Person }
@@ -96,7 +97,7 @@ query q() {
     order { $p.age asc }
 }
 "#;
-    let got = names_in_order(&query_main(&mut db, q, "q", &ParamMap::new()).await.unwrap());
+    let got = names_in_order(&query_main(&db, q, "q", &ParamMap::new()).await.unwrap());
     // age asc -> Charlie(25), then the 30-tie broken by key asc -> Alice, Bob.
     assert_eq!(got, vec!["Charlie", "Alice", "Bob"]);
 }
@@ -109,13 +110,12 @@ async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
         "    since: Date?\n",
         "    since: Date?\n    label: String?\n",
     );
-    let mut db = Omnigraph::init(uri, &schema).await.unwrap();
+    let db = session(Omnigraph::init(uri, &schema).await.unwrap());
 
     // Put edge-b in the original fragment and append edge-a later, so storage
     // order is deliberately the reverse of physical edge-id order. The two
     // rows are otherwise tied: same user sort key and same endpoint ids.
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Person","data":{"name":"Bob","age":25}}
 {"edge":"Knows","id":"edge-b","from":"Alice","to":"Bob","data":{"label":"loaded-first"}}"#,
@@ -123,8 +123,7 @@ async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
     )
     .await
     .unwrap();
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"edge":"Knows","id":"edge-a","from":"Alice","to":"Bob","data":{"label":"id-first"}}"#,
         LoadMode::Merge,
     )
@@ -141,7 +140,7 @@ query q() {
     order { $p.age asc }
 }
 "#;
-    let got = names_in_order(&query_main(&mut db, q, "q", &ParamMap::new()).await.unwrap());
+    let got = names_in_order(&query_main(&db, q, "q", &ParamMap::new()).await.unwrap());
     assert_eq!(
         got,
         vec!["id-first", "loaded-first"],
@@ -156,7 +155,7 @@ async fn ordering_nulls_placement_asc_and_desc() {
     let data = r#"{"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Person","data":{"name":"Bob","age":null}}
 {"type":"Person","data":{"name":"Charlie","age":25}}"#;
-    let mut db = init_people(&dir, data).await;
+    let db = init_people(&dir, data).await;
 
     let asc = r#"
 query q() {
@@ -165,11 +164,7 @@ query q() {
     order { $p.age asc }
 }
 "#;
-    let got_asc = names_in_order(
-        &query_main(&mut db, asc, "q", &ParamMap::new())
-            .await
-            .unwrap(),
-    );
+    let got_asc = names_in_order(&query_main(&db, asc, "q", &ParamMap::new()).await.unwrap());
     // ASC: nulls_first -> Bob(null), then 25, 30.
     assert_eq!(got_asc, vec!["Bob", "Charlie", "Alice"]);
 
@@ -180,11 +175,7 @@ query q() {
     order { $p.age desc }
 }
 "#;
-    let got_desc = names_in_order(
-        &query_main(&mut db, desc, "q", &ParamMap::new())
-            .await
-            .unwrap(),
-    );
+    let got_desc = names_in_order(&query_main(&db, desc, "q", &ParamMap::new()).await.unwrap());
     // DESC: nulls last -> 30, 25, then Bob(null).
     assert_eq!(got_desc, vec!["Alice", "Charlie", "Bob"]);
 }

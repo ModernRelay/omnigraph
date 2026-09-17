@@ -75,7 +75,9 @@ unsupported. RFC 0023 owns the detailed proof and performance evidence.
 
 ## General route
 
-`OMNIGRAPH_MERGE_LINEAGE=on` (the release default) derives candidate IDs from
+The `merge_lineage` session setting at `on` (the release default, `verify` in
+a debug build; `request` scope, process default `OMNIGRAPH_MERGE_LINEAGE`,
+read by the merge from its session) derives candidate IDs from
 compatible pinned fragment and deletion metadata. Deletion differences remain
 compressed until bounded offset chunks are needed; known positions use direct
 reads against the pinned before-image. The 32 MiB candidate budget is checked

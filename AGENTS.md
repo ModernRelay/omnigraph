@@ -140,6 +140,9 @@ cargo clippy --workspace --all-targets --locked -- \
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
+python3 scripts/check-dependency-sources.py   # no path copy, [patch] table, or source replacement
+cargo deny --locked check               # from the repository root, after Cargo.lock is current; allowlist in deny.toml
+python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
 

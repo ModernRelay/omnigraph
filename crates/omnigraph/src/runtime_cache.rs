@@ -744,10 +744,15 @@ edge Likes: Person -> Person {}
 {"edge":"Likes","from":"b","to":"a"}"#;
 
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
-        crate::loader::load_jsonl(&db, DATA, crate::loader::LoadMode::Overwrite)
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(DATA, crate::loader::LoadMode::Overwrite)
             .await
             .unwrap();
         db.optimize().await.unwrap();

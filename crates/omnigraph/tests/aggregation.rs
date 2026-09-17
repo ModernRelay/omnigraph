@@ -3,7 +3,7 @@ mod helpers;
 use arrow_array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
@@ -13,11 +13,11 @@ use helpers::*;
 #[tokio::test]
 async fn friend_counts_grouped_by_person() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Test data: Alice knows Bob, Alice knows Charlie, Bob knows Diana
     // So: Alice=2 friends, Bob=1 friend (Charlie & Diana have no outgoing knows → dropped)
-    let result = query_main(&mut db, TEST_QUERIES, "friend_counts", &ParamMap::new())
+    let result = query_main(&db, TEST_QUERIES, "friend_counts", &ParamMap::new())
         .await
         .unwrap();
 
@@ -49,9 +49,9 @@ async fn friend_counts_grouped_by_person() {
 #[tokio::test]
 async fn total_people_global_count() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
-    let result = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::new())
+    let result = query_main(&db, TEST_QUERIES, "total_people", &ParamMap::new())
         .await
         .unwrap();
 
@@ -72,10 +72,10 @@ async fn total_people_global_count() {
 #[tokio::test]
 async fn age_stats_per_company() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Test data: Alice(30) worksAt Acme, Bob(25) worksAt Globex
-    let result = query_main(&mut db, TEST_QUERIES, "age_stats", &ParamMap::new())
+    let result = query_main(&db, TEST_QUERIES, "age_stats", &ParamMap::new())
         .await
         .unwrap();
 
@@ -139,10 +139,10 @@ async fn age_stats_per_company() {
 #[tokio::test]
 async fn top_connected_person() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Alice has 2 friends (most connected)
-    let result = query_main(&mut db, TEST_QUERIES, "top_connected", &ParamMap::new())
+    let result = query_main(&db, TEST_QUERIES, "top_connected", &ParamMap::new())
         .await
         .unwrap();
 
@@ -171,7 +171,7 @@ async fn top_connected_person() {
 #[tokio::test]
 async fn inline_count_with_no_friends() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Diana has no outgoing Knows edges, so she won't appear in friend_counts.
     // But Alice(2) and Bob(1) do. Verify the count matches.
@@ -185,7 +185,7 @@ query fc() {
     order { friends desc }
 }
 "#;
-    let result = query_main(&mut db, queries, "fc", &ParamMap::new())
+    let result = query_main(&db, queries, "fc", &ParamMap::new())
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
@@ -197,12 +197,12 @@ query fc() {
 async fn inline_global_count_empty() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
 
     // Load only nodes, no edges
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}"#;
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
     // Global count — should return 1 row with count=1
     let queries = r#"
@@ -211,7 +211,7 @@ query tc() {
     return { count($p) as total }
 }
 "#;
-    let result = query_main(&mut db, queries, "tc", &ParamMap::new())
+    let result = query_main(&db, queries, "tc", &ParamMap::new())
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
@@ -228,7 +228,7 @@ query tc() {
 #[tokio::test]
 async fn inline_min_max_string() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query name_range() {
@@ -239,7 +239,7 @@ query name_range() {
     }
 }
 "#;
-    let result = query_main(&mut db, queries, "name_range", &ParamMap::new())
+    let result = query_main(&db, queries, "name_range", &ParamMap::new())
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
@@ -264,7 +264,7 @@ query name_range() {
 #[tokio::test]
 async fn inline_multi_hop_aggregate() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Friends of friends count per person
     let queries = r#"
@@ -279,14 +279,9 @@ query fof_counts($name: String) {
 "#;
     // Alice → Bob, Charlie. Bob → Diana. Charlie → nobody.
     // So Alice's fof = [Diana] → count = 1
-    let result = query_main(
-        &mut db,
-        queries,
-        "fof_counts",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&db, queries, "fof_counts", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
 

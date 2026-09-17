@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use color_eyre::eyre::Result;
 use omnigraph_server::{
-    init_tracing, load_server_settings, load_server_settings_with_data_token_trust,
+    init_tracing, load_server_settings, load_server_settings_with_identity_trust,
     resolve_shutdown_grace, serve, serve_with_data_token_trust,
 };
 
@@ -28,6 +28,10 @@ struct Cli {
     /// Its canonical root must match this serving snapshot. Read once at boot.
     #[arg(long)]
     data_token_trust: Option<PathBuf>,
+    /// Public OIDC resource identity and admission snapshot. Its exact root and
+    /// resource are fixed at boot; keys/admissions refresh from this local file.
+    #[arg(long)]
+    oidc_identity_trust: Option<PathBuf>,
     /// Run without credential sources and without a policy file (MR-723).
     /// Required when no static tokens, signed-token trust, or policy is
     /// configured — otherwise startup refuses to prevent an unprotected deployment.
@@ -54,20 +58,21 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    match cli.data_token_trust {
-        Some(trust_path) => {
-            let settings = load_server_settings_with_data_token_trust(
+    match (cli.data_token_trust, cli.oidc_identity_trust) {
+        (data, oidc) if data.is_some() || oidc.is_some() => {
+            let settings = load_server_settings_with_identity_trust(
                 cli.cluster.as_ref(),
                 cli.bind,
                 cli.unauthenticated,
                 cli.require_all_graphs,
-                &trust_path,
+                data.as_deref(),
+                oidc.as_deref(),
             )
             .await?
             .with_shutdown_grace(resolve_shutdown_grace(cli.shutdown_grace_seconds)?);
             serve_with_data_token_trust(settings).await
         }
-        None => {
+        _ => {
             let mut settings = load_server_settings(
                 cli.cluster.as_ref(),
                 cli.bind,

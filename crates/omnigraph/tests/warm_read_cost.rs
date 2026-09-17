@@ -10,13 +10,15 @@ mod helpers;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
+use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 
 use helpers::cost::{cost_harness, last_manifest_reads, measure};
 use helpers::{
-    MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, commit_many, count_rows, first_column_sorted,
-    init_and_load, mixed_params, mutate_branch, mutate_main, params,
+    MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, Traversal, commit_many, count_rows,
+    first_column_sorted, init_and_load, mixed_params, mutate_branch, mutate_main, params, session,
+    with_traversal,
 };
 
 /// A warm same-branch read must do ZERO `__manifest` object-store reads and must
@@ -31,9 +33,9 @@ use helpers::{
 async fn warm_same_branch_read_does_no_resolution_opens() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = init_and_load(&dir).await;
+        let db = init_and_load(&dir).await;
         // Deep history: warm-read resolution cost must be flat in commit count.
-        commit_many(&mut db, 20).await;
+        commit_many(&db, 20).await;
 
         let (out, io) = measure(db.query(
             ReadTarget::branch("main"),
@@ -97,7 +99,7 @@ async fn multi_table_query_does_no_manifest_scans() {
 #[tokio::test]
 async fn external_commit_observed_by_warm_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let mut writer = init_and_load(&dir).await;
+    let writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
     let reader = Omnigraph::open(uri).await.unwrap();
 
@@ -105,7 +107,7 @@ async fn external_commit_observed_by_warm_reader() {
 
     // External commit through a separate handle.
     mutate_main(
-        &mut writer,
+        &writer,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "ext_new_person")], &[("$age", 41)]),
@@ -147,7 +149,7 @@ async fn warm_query_validates_schema_contract_once() {
     let _ = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
     let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
-    let db = Omnigraph::open_with_storage(uri, adapter).await.unwrap();
+    let db = session(Omnigraph::open_with_storage(uri, adapter).await.unwrap());
 
     let before_read_text = counts.read_text();
     let before_exists = counts.exists();
@@ -181,7 +183,7 @@ async fn schema_source_drift_is_caught_on_read() {
     let dir = tempfile::tempdir().unwrap();
     let _writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
-    let reader = Omnigraph::open(uri).await.unwrap();
+    let reader = session(Omnigraph::open(uri).await.unwrap());
 
     // Drift the on-disk schema source behind the reader's back.
     std::fs::write(
@@ -217,10 +219,10 @@ async fn schema_source_drift_is_caught_on_read() {
 async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = init_and_load(&dir).await;
+        let db = init_and_load(&dir).await;
         // The branch snapshot must stay warm and bounded at realistic history
         // depth; a shallow fixture would hide a cold manifest scan.
-        commit_many(&mut db, 20).await;
+        commit_many(&db, 20).await;
         db.branch_create("feature").await.unwrap();
         // Write to the branch so its tables are branch-owned (under tree/feature).
         db.mutate(
@@ -315,9 +317,9 @@ async fn cold_other_branch_resolution_uses_one_coherent_manifest_open() {
 async fn native_branch_controls_use_one_post_gate_manifest_capture() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = init_and_load(&dir).await;
-        commit_many(&mut db, 20).await;
-        let mut writer = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+        let db = init_and_load(&dir).await;
+        commit_many(&db, 20).await;
+        let mut writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
 
         // Keep each assertion phase on the heap: their control/write futures
         // are large in debug builds. All phases share this one tracked fixture.
@@ -334,7 +336,7 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
     .await;
 }
 
-async fn assert_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnigraph) {
+async fn assert_bound_branch_control_cost(db: &Session, writer: &mut Session) {
     let (created, create_io) = measure(db.branch_create("feature")).await;
     created.unwrap();
     assert_eq!(
@@ -401,7 +403,7 @@ async fn assert_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnigraph
     assert_eq!(main_fresh.num_rows(), 1);
 }
 
-async fn assert_non_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnigraph) {
+async fn assert_non_bound_branch_control_cost(db: &Session, writer: &mut Session) {
     db.branch_create("feature").await.unwrap();
     let (created_from, create_from_io) = measure(db.branch_create_from("feature", "review")).await;
     created_from.unwrap();
@@ -474,7 +476,7 @@ async fn assert_non_bound_branch_control_cost(db: &Omnigraph, writer: &mut Omnig
     );
 }
 
-async fn assert_branch_control_source_incarnation(db: &Omnigraph, writer: &mut Omnigraph) {
+async fn assert_branch_control_source_incarnation(db: &Session, writer: &mut Session) {
     // External deletion/recreation does not invalidate this handle's cache.
     // Reusing that slot must therefore compare native lifetime, including
     // when the replacement starts again at the same manifest version.
@@ -529,7 +531,7 @@ async fn assert_branch_control_source_incarnation(db: &Omnigraph, writer: &mut O
 }
 
 #[cfg(feature = "failpoints")]
-async fn assert_cached_borrower_survives_branch_delete(db: &Omnigraph, writer: &mut Omnigraph) {
+async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mut Session) {
     for branch in ["main_fresh", "review_recreated"] {
         writer.branch_delete(branch).await.unwrap();
     }
@@ -652,13 +654,12 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Omnigraph, writer: &
             "{branch} payload changed"
         );
     }
-    writer
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
-        .await
-        .unwrap();
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
     assert!(
         lance::Dataset::open(&table_uri)
             .await
@@ -701,13 +702,12 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Omnigraph, writer: &
         .as_deref()
         .unwrap();
     assert_ne!(recreated_fork, source_fork);
-    writer
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
-        .await
-        .unwrap();
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
     let refs = lance::Dataset::open(&table_uri)
         .await
         .unwrap()
@@ -739,13 +739,13 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Omnigraph, writer: &
 #[tokio::test]
 async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     let dir = tempfile::tempdir().unwrap();
-    let mut writer = init_and_load(&dir).await;
+    let writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
-    let reader = Omnigraph::open(uri).await.unwrap();
+    let reader = session(Omnigraph::open(uri).await.unwrap());
 
     writer.branch_create("feature").await.unwrap();
     mutate_branch(
-        &mut writer,
+        &writer,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -784,7 +784,7 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
 
     writer.branch_delete("feature").await.unwrap();
     mutate_main(
-        &mut writer,
+        &writer,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "MainOnly")], &[("$age", 44)]),
@@ -870,13 +870,13 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
 #[tokio::test]
 async fn recreated_branch_owned_table_handle_uses_table_etag() {
     let dir = tempfile::tempdir().unwrap();
-    let mut writer = init_and_load(&dir).await;
+    let writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
-    let reader = Omnigraph::open(uri).await.unwrap();
+    let reader = session(Omnigraph::open(uri).await.unwrap());
 
     writer.branch_create("feature").await.unwrap();
     mutate_branch(
-        &mut writer,
+        &writer,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -908,7 +908,7 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
     writer.branch_delete("feature").await.unwrap();
     writer.branch_create("feature").await.unwrap();
     mutate_branch(
-        &mut writer,
+        &writer,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -988,13 +988,13 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = init_and_load(&dir).await;
+        let writer = init_and_load(&dir).await;
         let uri = dir.path().to_str().unwrap();
-        let reader = Omnigraph::open(uri).await.unwrap();
+        let reader = session(Omnigraph::open(uri).await.unwrap());
 
         writer.branch_create("feature").await.unwrap();
         mutate_branch(
-            &mut writer,
+            &writer,
             "feature",
             MUTATION_QUERIES,
             "insert_person_and_friend",
@@ -1032,7 +1032,7 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
         writer.branch_delete("feature").await.unwrap();
         writer.branch_create("feature").await.unwrap();
         mutate_branch(
-            &mut writer,
+            &writer,
             "feature",
             MUTATION_QUERIES,
             "insert_person_and_friend",
@@ -1107,9 +1107,9 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
 #[tokio::test]
 async fn stale_read_refreshes_manifest_only_when_exact_head_exists() {
     let dir = tempfile::tempdir().unwrap();
-    let mut writer = init_and_load(&dir).await;
+    let writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
-    let reader = Omnigraph::open(uri).await.unwrap();
+    let reader = session(Omnigraph::open(uri).await.unwrap());
     // Establish the reader's warm coordinator.
     reader
         .query(
@@ -1123,7 +1123,7 @@ async fn stale_read_refreshes_manifest_only_when_exact_head_exists() {
 
     // External commit advances the on-disk manifest behind the reader.
     mutate_main(
-        &mut writer,
+        &writer,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
@@ -1165,12 +1165,12 @@ async fn stale_read_refreshes_manifest_only_when_exact_head_exists() {
 async fn repeat_warm_read_reuses_table_handles() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = init_and_load(&dir).await;
+        let db = init_and_load(&dir).await;
         // Deep history: the win must hold regardless of commit count.
-        commit_many(&mut db, 10).await;
+        commit_many(&db, 10).await;
         // A writer holds the version it landed (RFC 0067), so the cold read
         // is measured on a fresh handle.
-        let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+        let db = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
 
         // Cold first read: opens the touched table.
         let (cold_out, cold) = measure(db.query(
@@ -1216,7 +1216,7 @@ async fn repeat_warm_read_reuses_table_handles() {
 #[tokio::test]
 async fn write_invalidates_table_cache_for_changed_table() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let before = count_rows(&db, "node:Person").await;
 
@@ -1233,7 +1233,7 @@ async fn write_invalidates_table_cache_for_changed_table() {
     // Write Person: its version advances, so the cached (table, branch, version)
     // key is now superseded.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "cache_miss_one")], &[("$age", 50)]),
@@ -1268,11 +1268,9 @@ async fn write_invalidates_table_cache_for_changed_table() {
 
 // ─── Topology-index build cost (A1 cross-branch reuse + A2 scoped build) ─────
 //
-// These force the CSR build path (the indexed path builds no topology) via the
-// scoped `with_traversal_mode` seam — no process-global env, so they are safe in
-// this mixed serial/non-serial binary and need no `#[serial]`. They read the
-// `graph_build_count` / `graph_edges_built` probes off a directly-constructed
-// `QueryIoProbes`.
+// These force the CSR build path (the indexed path builds no topology) through
+// `helpers::with_traversal` and read the `graph_build_count` /
+// `graph_edges_built` probes off a directly-constructed `QueryIoProbes`.
 
 /// A1: a fresh (unwritten) branch reuses main's cached CSR topology index
 /// (`graph_build_count == 0`), and the reused index returns correct results for
@@ -1280,11 +1278,11 @@ async fn write_invalidates_table_cache_for_changed_table() {
 #[tokio::test]
 async fn fresh_branch_traversal_reuses_main_graph_index() {
     let dir = tempfile::tempdir().unwrap();
-    let mut writer = init_and_load(&dir).await;
+    let writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
     // A Knows edge on main so there is topology to build and then reuse.
     mutate_main(
-        &mut writer,
+        &writer,
         MUTATION_QUERIES,
         "insert_person_and_friend",
         &mixed_params(
@@ -1297,20 +1295,19 @@ async fn fresh_branch_traversal_reuses_main_graph_index() {
 
     // Separate reader handle. As in production, the reader never creates the
     // branch, so creating it does not invalidate the reader's warm cache.
-    let reader = Omnigraph::open(uri).await.unwrap();
+    let reader = session(Omnigraph::open(uri).await.unwrap());
+    let csr_reader = with_traversal(&reader, Traversal::Csr);
 
     // Reader warms main on the CSR path: builds and caches the topology index.
-    let warm = with_traversal_mode(
-        "csr",
-        reader.query(
+    let warm = csr_reader
+        .query(
             ReadTarget::branch("main"),
             TEST_QUERIES,
             "friends_of",
             &params(&[("$name", "Walker")]),
-        ),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
     assert_eq!(
         first_column_sorted(&warm),
         vec!["Alice"],
@@ -1326,16 +1323,13 @@ async fn fresh_branch_traversal_reuses_main_graph_index() {
         graph_build_count: Arc::clone(&graph_build),
         ..Default::default()
     };
-    let on_branch = with_traversal_mode(
-        "csr",
-        with_query_io_probes(
-            probes,
-            reader.query(
-                ReadTarget::branch("feature"),
-                TEST_QUERIES,
-                "friends_of",
-                &params(&[("$name", "Walker")]),
-            ),
+    let on_branch = with_query_io_probes(
+        probes,
+        csr_reader.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
         ),
     )
     .await
@@ -1360,11 +1354,11 @@ async fn fresh_branch_traversal_reuses_main_graph_index() {
 #[tokio::test]
 async fn single_edge_query_builds_only_referenced_edge() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // A Knows edge so the referenced build has topology; the fixture also defines
     // WorksAt, so a build-all would touch more than one edge.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person_and_friend",
         &mixed_params(
@@ -1380,16 +1374,14 @@ async fn single_edge_query_builds_only_referenced_edge() {
         graph_edges_built: Arc::clone(&graph_edges),
         ..Default::default()
     };
-    let result = with_traversal_mode(
-        "csr",
-        with_query_io_probes(
-            probes,
-            db.query(
-                ReadTarget::branch("main"),
-                TEST_QUERIES,
-                "friends_of",
-                &params(&[("$name", "Walker")]),
-            ),
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let result = with_query_io_probes(
+        probes,
+        csr_db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Walker")]),
         ),
     )
     .await
@@ -1411,7 +1403,7 @@ async fn warm_query_memoizes_catalog_and_compiled_query_until_schema_apply() {
     let dir = tempfile::tempdir().unwrap();
     let writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
-    let reader = Omnigraph::open(uri).await.unwrap();
+    let reader = session(Omnigraph::open(uri).await.unwrap());
     let no_params = params(&[]);
     let total_people = |probes: QueryIoProbes| {
         with_query_io_probes(

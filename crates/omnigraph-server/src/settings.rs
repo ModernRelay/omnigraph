@@ -266,6 +266,30 @@ pub async fn load_server_settings_with_data_token_trust(
     cli_require_all_graphs: bool,
     trust_path: &Path,
 ) -> Result<ManagedServerConfig> {
+    load_server_settings_with_identity_trust(
+        cli_cluster,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+        Some(trust_path),
+        None,
+    )
+    .await
+}
+
+/// Validate every enabled identity profile against the same opened serving
+/// store before any engine can open. Direct/static configuration is unchanged.
+pub async fn load_server_settings_with_identity_trust(
+    cli_cluster: Option<&PathBuf>,
+    cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
+    data_trust_path: Option<&Path>,
+    oidc_trust_path: Option<&Path>,
+) -> Result<ManagedServerConfig> {
+    if data_trust_path.is_none() && oidc_trust_path.is_none() {
+        bail!("at least one explicit identity trust profile is required");
+    }
     let cluster_dir = required_cluster(cli_cluster)?;
     let cluster_arg = cluster_dir.to_string_lossy();
     let bound = if cluster_arg.contains("://") {
@@ -275,7 +299,12 @@ pub async fn load_server_settings_with_data_token_trust(
     }
     .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
     let canonical_root = bound.canonical_root().to_string();
-    let trust = data_tokens::DataTokenTrust::read(trust_path, &canonical_root)?;
+    let trust = data_trust_path
+        .map(|path| data_tokens::DataTokenTrust::read(path, &canonical_root))
+        .transpose()?;
+    let oidc_trust = oidc_trust_path
+        .map(|path| oidc_identity::OidcIdentityTrust::read(path, &canonical_root))
+        .transpose()?;
     let config = settings_from_snapshot(
         cluster_dir,
         cli_bind,
@@ -287,6 +316,7 @@ pub async fn load_server_settings_with_data_token_trust(
         config,
         canonical_root,
         trust,
+        oidc_trust,
     })
 }
 

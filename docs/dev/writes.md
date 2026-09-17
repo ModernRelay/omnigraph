@@ -191,7 +191,10 @@ chain as reclaimable garbage; a target that advanced meanwhile makes the
 merge lose its manifest CAS and return the ordinary conflict.
 
 Existing-table constructive transactions stage independently with bounded
-concurrency. `OMNIGRAPH_LOAD_CONCURRENCY` selects that width for both Load and
+concurrency. The `stage_write_concurrency` session setting (`process` scope,
+range `1..=64`; process default `OMNIGRAPH_LOAD_CONCURRENCY`, an invalid or
+`0` value refusing startup instead of running the default) selects that
+width for both Load and
 ordinary insert/update mutations (default 8). Deferred first-touch branch
 effects and delete transactions remain serial. The setting changes only
 fragment preparation: every participant still commits detached and crosses

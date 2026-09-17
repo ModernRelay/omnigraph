@@ -19,10 +19,7 @@ pub(super) fn handles(command: &ClusterCommand) -> bool {
 }
 
 fn client(origin: &str) -> Result<Api> {
-    Api::new(
-        origin.into(),
-        Some(auth::credential(&auth::CONTROL_STORE, origin)?),
-    )
+    Api::authenticated(origin.into())
 }
 
 fn context_required(config: &Path) -> Result<Context> {

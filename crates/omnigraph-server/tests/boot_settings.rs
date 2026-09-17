@@ -14,6 +14,33 @@ use tower::ServiceExt;
 mod support;
 use support::*;
 
+#[tokio::test]
+async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = omnigraph_server::PolicySource::Inline(
+        "version: 1\ngroups:\n  operators: [operator]\nrules:\n  - id: inventory\n    allow:\n      actors: {group: operators}\n      actions: [graph_list]\n  - id: configuration\n    allow:\n      actors: {group: operators}\n      actions: [config_manage]\n".into(),
+    );
+    let state = omnigraph_server::open_multi_graph_state(
+        Vec::new(),
+        vec![("operator".into(), "static-token".into())],
+        Some(&source),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let (status, payload) = json_response(&app, get_request("/graphs", "static-token")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, serde_json::json!({"graphs":[]}));
+    let (status, _) = json_response(&app, get_request("/graphs/discovery", "static-token")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "new cluster policies do not reclassify static credentials"
+    );
+}
+
 /// External consumers may construct and exhaustively destructure the legacy
 /// public settings and identity records without opting into managed trust.
 #[test]
@@ -121,6 +148,59 @@ async fn data_trust_root_mismatch_refuses_before_recovery_open() {
     assert!(
         staging.exists(),
         "invalid trust must not open the graph for recovery"
+    );
+}
+
+#[tokio::test]
+async fn oidc_root_mismatch_refuses_even_beside_valid_native_trust_before_recovery() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey as _, traits::PublicKeyParts as _};
+    use serde_json::json;
+
+    let temp = converged_cluster_dir("").await;
+    let staging = temp.path().join("graphs/knowledge.omni/_schema.pg.staging");
+    fs::copy(temp.path().join("people.pg"), &staging).unwrap();
+    let root = format!(
+        "file://{}",
+        fs::canonicalize(temp.path()).unwrap().display()
+    );
+    let mut native = data_tokens::DataTokens::new();
+    native.document["canonical_root"] = json!(root);
+    let native_path = temp.path().join("native-trust.json");
+    fs::write(&native_path, serde_json::to_vec(&native.document).unwrap()).unwrap();
+
+    let key = RsaPrivateKey::from_pkcs8_pem(include_str!("fixtures/oidc-test-key.pem")).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let oidc = json!({"version":1,"revision":1,"generated_at":now,"expires_at":now+300,
+        "issuer":"https://identity.example","audience":"https://data.example/clusters/A",
+        "organization_id":"org_example","account_id":"account_1","cluster_id":"A",
+        "cluster_incarnation":"one","canonical_root":"s3://wrong/root",
+        "keys":[{"kid":"one","kty":"RSA","alg":"RS256","use":"sig",
+            "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}],
+        "principals":[]});
+    let oidc_path = temp.path().join("oidc-trust.json");
+    fs::write(&oidc_path, serde_json::to_vec(&oidc).unwrap()).unwrap();
+    let refused = omnigraph_server::load_server_settings_with_identity_trust(
+        Some(&temp.path().to_path_buf()),
+        Some("127.0.0.1:0".into()),
+        true,
+        true,
+        Some(&native_path),
+        Some(&oidc_path),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("OIDC identity snapshot or serving-root binding")
+    );
+    assert!(
+        staging.exists(),
+        "OIDC failure opened the graph for recovery"
     );
 }
 

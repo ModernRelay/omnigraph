@@ -2,6 +2,10 @@ name: CI
 
 on:
   pull_request:
+  # Required contexts must also report on the merge queue's temporary branch
+  # (docs/dev/branch-protection.md, Merge queue).
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - main
@@ -21,38 +25,55 @@ env:
   FAILPOINT_FEATURES: omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 
 jobs:
+  # One output per set of jobs: `run_full_ci` (engine input: every job),
+  # `run_gqt` (also cases-only), `run_deployment` (also deployment-only);
+  # classes in docs/dev/ci.md, pinned by scripts/check-change-classes.py.
   classify_changes:
     name: Classify Changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
       run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
+      run_gqt: ${{ steps.filter.outputs.run_gqt }}
+      run_deployment: ${{ steps.filter.outputs.run_deployment }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
 
-      - name: Detect documentation-only changes
+      - name: Classify changed paths
         id: filter
         env:
           BEFORE_SHA: ${{ github.event.before }}
           EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+          # No diff to classify (dispatch, tag, unknown base, empty diff):
+          # every job runs.
+          run_everything() {
+            printf 'run_full_ci=true\nrun_gqt=true\nrun_deployment=true\n' >> "$GITHUB_OUTPUT"
             exit 0
+          }
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            run_everything
           fi
 
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             base="$PR_BASE_SHA"
             head="$PR_HEAD_SHA"
+          elif [[ "$EVENT_NAME" == "merge_group" ]]; then
+            base="$MERGE_GROUP_BASE_SHA"
+            head="$MERGE_GROUP_HEAD_SHA"
           else
             base="$BEFORE_SHA"
             head="$GITHUB_SHA"
@@ -62,33 +83,42 @@ jobs:
           fi
 
           if [[ -z "${base:-}" ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            run_everything
           fi
 
-          # Disable rename collapsing so moving source into docs still reports
-          # the source-side deletion and cannot become a docs-only false skip.
-          mapfile -t changed < <(git diff --name-only --no-renames "$base" "$head")
+          # Merge base (a branch behind main must not inherit its newer files),
+          # no rename collapsing (a source file moved into docs keeps its
+          # deletion), no path quoting (a non-ASCII name reaches the arms raw).
+          mapfile -t changed < <(git -c core.quotePath=false diff --name-only --no-renames --merge-base "$base" "$head")
           if [[ "${#changed[@]}" -eq 0 ]]; then
-            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            run_everything
           fi
 
           run_full_ci=false
+          run_gqt=false
+          run_deployment=false
           for path in "${changed[@]}"; do
             case "$path" in
               docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc) ;;
               README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
+              crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;
+              Dockerfile|.dockerignore|docker/*|deploy/*) run_deployment=true ;;
               *)
                 run_full_ci=true
                 ;;
             esac
           done
 
+          if [[ "$run_full_ci" == "true" ]]; then
+            run_gqt=true
+            run_deployment=true
+          fi
+
           printf 'Changed files:\n'
           printf '  %s\n' "${changed[@]}"
-          echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
+          printf 'run_full_ci=%s\nrun_gqt=%s\nrun_deployment=%s\n' \
+            "$run_full_ci" "$run_gqt" "$run_deployment" | tee -a "$GITHUB_OUTPUT"
 
   check_agents_md:
     name: Check AGENTS.md Links
@@ -164,8 +194,53 @@ jobs:
       - name: Check required storage upgrade coverage
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
+      - name: Check required contexts report on the merge queue
+        run: python3 scripts/check-merge-group-triggers.py --self-test
+
+      - name: Assert the classification copies match this workflow
+        run: |
+          python3 scripts/check-classify-copy.py --self-test
+          python3 scripts/check-classify-copy.py
+
+      - name: Replay the classifier and check class reader closure
+        run: |
+          python3 scripts/check-change-classes.py --self-test
+          python3 scripts/check-change-classes.py
+
+  cargo_deny:
+    name: Dependency Guard (cargo deny)
+    # `deny.toml` is the allowlist for dependency sources, licenses, advisories
+    # and version specs. The check reads `Cargo.lock`, the manifests and the
+    # RustSec database, builds nothing, and runs on every pull request.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # cargo-deny skips a crate with no source: a path copy, a `[patch]`
+      # path entry, or a config source replacement is refused here instead.
+      - name: Check dependency sources
+        run: python3 scripts/check-dependency-sources.py
+
+      # `arguments` replaces the action's default `--all-features`; the
+      # `[graph] all-features` line in `deny.toml` is what keeps the AWS
+      # SDK crates in scope. `--locked` refuses a rewritable Cargo.lock.
+      - name: Check dependency sources, advisories, licenses and bans
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+
   azure_contract_guards:
     name: Azure Contract Guards
+    needs: classify_changes
+    # Reads the Dockerfile, the package workflow and the admission crates:
+    # engine input or deployment files. Reporting context: not on the merge
+    # queue's branch (docs/dev/branch-protection.md).
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_deployment == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -182,9 +257,10 @@ jobs:
   graph_vocabulary_guard:
     name: Graph Vocabulary Guard
     # Keep this exact reporting context while it remains required by branch
-    # protection, but do not run the substrate-sized audit on pull requests.
-    # The full audit still runs after merge, on tags, and by manual dispatch.
-    if: github.event_name != 'pull_request'
+    # protection, but do not run the substrate-sized audit on pull requests or
+    # on the merge queue's branch (a skipped required job satisfies both). The
+    # full audit still runs after merge, on tags, and by manual dispatch.
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     env:
       # Single switch for the vocabulary audit, disabled by decision on
@@ -371,6 +447,9 @@ jobs:
 
   entrypoint_test:
     name: Container Entrypoint
+    needs: classify_changes
+    # Reporting context: not on the merge queue's branch (docs/dev/branch-protection.md).
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_deployment == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -392,6 +471,9 @@ jobs:
 
   azure_deployment_validation:
     name: Azure Deployment Validation
+    needs: classify_changes
+    # Reporting context: not on the merge queue's branch (docs/dev/branch-protection.md).
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_deployment == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -419,7 +501,7 @@ jobs:
     needs: classify_changes
     # Own job so a fmt failure cannot mask the clippy result; fmt compiles
     # nothing, so no dep or cache steps.
-    if: github.event_name == 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -440,10 +522,10 @@ jobs:
   lint:
     name: Lint (clippy)
     needs: classify_changes
-    # PR gate. Lints stay `warn` in-tree; only this job denies, so a new
-    # toolchain's lints cannot break local builds. Main-push runs exist only
-    # to seed the cache (see save-if below).
-    if: (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.classify_changes.outputs.run_full_ci == 'true'
+    # PR and merge-queue gate. Lints stay `warn` in-tree; only this job denies,
+    # so a new toolchain's lints cannot break local builds. Main-push runs
+    # exist only to seed the cache (see save-if below).
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -491,15 +573,9 @@ jobs:
   test:
     name: Test Workspace
     needs: classify_changes
-    # Runs on every non-documentation pull request (fail-fast; a reporting
-    # context, not in `.github/branch-protection.json`: under strict checks a
-    # required 60-minute context would space merges an hour apart; wait for
-    # it before merging) and on main pushes, tags, and workflow_dispatch
-    # (`--no-fail-fast`: the post-merge detection channel; the main run also
-    # seeds the dependency cache PRs restore). openapi.json is not
-    # auto-regenerated: after server/API changes run
-    # `OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi`
-    # or the drift check fails this job.
+    # Required context (docs/dev/ci.md, Full correctness graphs): fail-fast on
+    # pull requests and the merge queue, `--no-fail-fast` on main, tags and
+    # dispatch (the run step below; the main run also seeds the cache).
     if: needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # The 2026-07-28 cold diagnostic spent 25m29s on the featureless workspace
@@ -581,11 +657,11 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/workspace-tests.log"
-          # A pull request is a gate: stop at the first red suite. Main,
-          # tag, and dispatch runs are detection channels: --no-fail-fast,
-          # so every independent failure is reported.
+          # A pull request and a merge-queue entry are gates: stop at the
+          # first red suite. Main, tag, and dispatch runs are detection
+          # channels: --no-fail-fast, so every independent failure is reported.
           no_fail_fast=()
-          if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "merge_group" ]]; then
             no_fail_fast+=(--no-fail-fast)
           fi
           cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
@@ -690,9 +766,11 @@ jobs:
   v5_v10_format_fence:
     name: V5 ↔ V10 Format Fence
     needs: classify_changes
-    # Pull requests too, as a reporting context like `Test Workspace`: a
-    # fence red reports on the pull request instead of first appearing on `main`.
-    if: needs.classify_changes.outputs.run_full_ci == 'true'
+    # Pull requests too, as a reporting context: a fence red reports on the
+    # pull request instead of first appearing on `main`.
+    # Not on the merge queue's branch: the queue merges on the required
+    # contexts alone, so a reporting run there would finish after the merge.
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # This job owns the immutable predecessor build in parallel with the
     # current-tree workspace job. The 2026-07-28 cold measurement was 25m40s
@@ -786,9 +864,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - name: Skip for documentation-only changes
+      - name: Skip when no engine input changed
         if: needs.classify_changes.outputs.run_full_ci != 'true'
-        run: echo "Documentation-only change detected; skipping aws feature build."
+        run: echo "No engine input changed; skipping aws feature build."
 
       - name: Checkout source
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -838,8 +916,9 @@ jobs:
     # five-shard layout repeated the same ~26-29m cold substrate compile five
     # times and maintained five target caches, pressuring GitHub's repository
     # cache cap. `fail-fast: false` lets both graphs report independently.
+    # Not on the merge queue's branch, same reason as the format fence.
     needs: classify_changes
-    if: needs.classify_changes.outputs.run_full_ci == 'true'
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # Same ceiling as `Test Workspace`: a pull request that bumps the substrate
     # compiles this graph cold too, and a timeout red names no test.
@@ -1038,7 +1117,7 @@ jobs:
     # manual dispatch. Keep it independent of `test` so cold backend graphs
     # start together and a failure reports at its real boundary.
     needs: classify_changes
-    if: github.event_name != 'pull_request' && needs.classify_changes.outputs.run_full_ci == 'true'
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # Cold failpoint and default-feature Lance graphs compile sequentially on
     # the first cache miss; keep the timeout above the RustFS shard envelope.

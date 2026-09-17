@@ -71,6 +71,7 @@ node Company {
                 )
                 .await
                 .unwrap();
+                let db = helpers::session(db);
                 for commit in 0..SEED_COMMITS {
                     let batch = if commit < person_commits {
                         (0..ROWS_PER_COMMIT)
@@ -211,6 +212,7 @@ node Document {
         )
         .await
         .unwrap();
+        let db = helpers::session(db);
         let batch = (0..DELTA_ROWS)
             .map(|row| {
                 format!(
@@ -287,6 +289,7 @@ async fn changes_page_size_one_skips_transaction_history_for_multi_version_inter
         )
         .await
         .unwrap();
+        let db = helpers::session(db);
         db.load_with_receipt(
             "main",
             concat!(
@@ -406,6 +409,7 @@ async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             for commit in 0..SEED_COMMITS {
                 let batch = if commit < person_commits {
                     (0..ROWS_PER_COMMIT)
@@ -484,6 +488,7 @@ node Document {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let batch: Vec<String> = (0..blob_rows)
                 .map(|i| {
                     format!(
@@ -552,6 +557,7 @@ async fn change_feed_caught_up_poll_is_data_flat() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let batch: Vec<String> = (0..rows)
                 .map(|i| format!(r#"{{"type":"Person","data":{{"name":"p{i:05}","age":1}}}}"#))
                 .collect();
@@ -625,6 +631,7 @@ async fn change_feed_caught_up_poll_manifest_reads_are_flat_in_history() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             // Build commit-history depth: one commit per load.
             for i in 0..depth {
                 db.load_with_receipt(
@@ -697,6 +704,7 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let now = db
                 .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
                     branch: None,
@@ -792,6 +800,7 @@ async fn change_feed_small_ceiling_poll_is_bounded_across_backlog_depths() {
             )
             .await
             .unwrap();
+            let db = helpers::session(db);
             let now = db
                 .poll_change_feed(omnigraph::changes::ChangeFeedRequest {
                     branch: None,

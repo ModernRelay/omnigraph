@@ -1,0 +1,206 @@
+# issue: none
+# notes: `off`, `on` and `verify` merge the same source update into three
+# notes: equally diverged targets and produce the same rows; the mode picks the
+# notes: classifier route, not the result, and the proof that three different
+# notes: routes ran is the route counters in
+# notes: `crates/omnigraph/tests/merge_cost.rs::merge_lineage_setting_selects_the_completed_classifier`,
+# notes: which a case cannot attach. The mutation arms before the branch work
+# notes: prove a settings prefix is scoped to its operation, including a
+# notes: refused one (T12): the session keeps `off`/`file` across all three.
+# notes: `settings_show_set_reset.gqt` carries why a fresh session reads
+# notes: `verify`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+set merge_lineage = off;
+
+--- expect ok
+
+--- mutate
+set merge_lineage = verify;
+query add() {
+    insert Person { name: "bob", age: 40 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name":"merge_lineage","value":"off","default":"on","source":"file","scope":"request"}
+
+--- mutate
+reset all;
+query birthday() {
+    update Person set { age: 33 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name":"merge_lineage","value":"off","default":"on","source":"file","scope":"request"}
+
+--- mutate
+set merge_lineage = on;
+query missing_key() {
+    insert Person { age: 99 }
+}
+
+--- expect error: T12
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name":"merge_lineage","value":"off","default":"on","source":"file","scope":"request"}
+
+--- query
+query main_before_branches() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":33}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate
+branch create source;
+
+--- expect ok
+
+--- mutate
+branch create target_off;
+
+--- expect ok
+
+--- mutate
+branch create target_on;
+
+--- expect ok
+
+--- mutate
+branch create target_verify;
+
+--- expect ok
+
+--- mutate branch: source
+query update_source() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: target_off
+query update_target() {
+    update Person set { age: 41 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: target_on
+query update_target() {
+    update Person set { age: 41 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: target_verify
+query update_target() {
+    update Person set { age: 41 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set merge_lineage = off;
+branch merge source into target_off;
+
+--- expect outcome: merged
+
+--- query branch: target_off
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"bob","p.age":41}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name":"merge_lineage","value":"off","default":"on","source":"file","scope":"request"}
+
+--- mutate
+set merge_lineage = on;
+branch merge source into target_on;
+
+--- expect outcome: merged
+
+--- query branch: target_on
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"bob","p.age":41}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate
+set merge_lineage = verify;
+branch merge source into target_verify;
+
+--- expect outcome: merged
+
+--- query branch: target_verify
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"bob","p.age":41}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate
+branch delete source;
+
+--- expect ok

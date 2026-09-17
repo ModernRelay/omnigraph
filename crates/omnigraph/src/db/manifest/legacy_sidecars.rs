@@ -62,6 +62,48 @@ pub(crate) async fn refuse_legacy_sidecars(
     ))
 }
 
+/// Nonmutating absence proof for callers without recovery authority (the
+/// cluster admission probe): every JSON object under `__recovery/` blocks,
+/// including malformed ones — absence is the only provable state — and so
+/// does any staged schema contract file, since only a read-write open may
+/// settle one. Listing is bounded; exceeding the bound refuses rather than
+/// walking an unbounded directory.
+pub(crate) async fn refuse_pending_recovery(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
+    let pending = storage
+        .list_dir_bounded(
+            &recovery_dir_uri(root_uri),
+            ".json",
+            crate::storage::ListDirBounds {
+                max_matching_entries: 1,
+                max_irrelevant_entries: 1024,
+                max_uri_bytes: 131_072,
+            },
+        )
+        .await?;
+    if !pending.is_empty() {
+        return Err(OmniError::recovery_required(
+            "pending-recovery",
+            "graph has pending recovery; resolve it with explicit recovery authority before retrying",
+        ));
+    }
+    for staging in [
+        crate::db::schema_state::schema_source_staging_uri(root_uri),
+        crate::db::schema_state::schema_ir_staging_uri(root_uri),
+        crate::db::schema_state::schema_state_staging_uri(root_uri),
+    ] {
+        if storage.exists(&staging).await? {
+            return Err(OmniError::recovery_required(
+                "pending-schema-recovery",
+                "graph has staged schema recovery; resolve it with explicit recovery authority before retrying",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

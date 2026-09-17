@@ -11,11 +11,12 @@ use std::fs;
 
 use helpers::recovery::sidecar_operation_ids;
 use helpers::*;
+use omnigraph::Session;
 use omnigraph::db::{
     Omnigraph, ReadTarget, SnapshotDataset, SnapshotId, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome,
 };
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::seams::{DecideSeam, FailScenario, catalog};
 use omnigraph_compiler::ir::ParamMap;
 
@@ -62,12 +63,14 @@ const OLD_PEOPLE_QUERY: &str =
     "query old_people() { match { $p: Person } return { $p.@id, $p.name } order { $p.@id asc } }";
 const OLD_COWORKERS_QUERY: &str = "query old_coworkers() { match { $p: Person\n $p worksat $c } return { $p.@id, $c.name } order { $p.@id asc } }";
 
-async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Omnigraph {
+async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init_with_legacy_system_columns_for_tests(uri, LEGACY_SCHEMA)
-        .await
-        .unwrap();
-    load_jsonl(&db, LEGACY_DATA, LoadMode::Overwrite)
+    let db = helpers::session(
+        Omnigraph::init_with_legacy_system_columns_for_tests(uri, LEGACY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(LEGACY_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -98,11 +101,7 @@ fn schema_apply_lock_present(dir: &tempfile::TempDir) -> bool {
         .unwrap_or_else(|error| panic!("{}: {error}", refs.display()))
 }
 
-async fn assert_history_readable(
-    db: &Omnigraph,
-    version_before: u64,
-    snapshot_before: &SnapshotId,
-) {
+async fn assert_history_readable(db: &Session, version_before: u64, snapshot_before: &SnapshotId) {
     let historical = db
         .run_query_at(
             version_before,
@@ -143,7 +142,7 @@ fn primary_key_of(ds: &SnapshotDataset) -> Vec<String> {
         .collect()
 }
 
-async fn assert_upgraded(db: &mut Omnigraph, dir: &tempfile::TempDir, expected_export: &str) {
+async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export: &str) {
     assert_eq!(
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
@@ -219,8 +218,7 @@ async fn assert_upgraded(db: &mut Omnigraph, dir: &tempfile::TempDir, expected_e
     assert_eq!(entity["@dst"], "company-1");
     assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), expected_export);
 
-    load_jsonl(
-        db,
+    db.load_jsonl(
         r#"{"type":"Person","id":"Carol","data":{"name":"Carol","age":41}}"#,
         LoadMode::Append,
     )
@@ -231,15 +229,13 @@ async fn assert_upgraded(db: &mut Omnigraph, dir: &tempfile::TempDir, expected_e
         3,
         "the graph keeps writing under the new spellings"
     );
-    load_jsonl(
-        db,
+    db.load_jsonl(
         r#"{"edge":"WorksAt","id":"works-carol","from":"Carol","to":"company-1","data":{}}"#,
         LoadMode::Append,
     )
     .await
     .expect("an edge insert satisfies the respelled @unique(@src, @dst)");
-    load_jsonl(
-        db,
+    db.load_jsonl(
         r#"{"edge":"WorksAt","id":"works-carol-again","from":"Carol","to":"company-1","data":{}}"#,
         LoadMode::Append,
     )
@@ -256,7 +252,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     let version_before = version_main(&db).await.unwrap();
     let snapshot_before = db.resolve_snapshot("main").await.unwrap();
@@ -291,7 +287,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     assert_eq!((report.stamp_before, report.stamp_after), (10, 10));
     assert!(report.findings.is_empty());
     assert!(report.graph_manifest_version.is_some());
-    assert_upgraded(&mut db, &dir, &export_before).await;
+    assert_upgraded(&db, &dir, &export_before).await;
 
     let entity = db
         .entity_at("node:Company", "company-1", version_before)
@@ -310,10 +306,10 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     assert_eq!((again.stamp_before, again.stamp_after), (10, 10));
     drop(db);
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(count_rows(&reopened, "node:Person").await, 3);
     let result = query_main(
-        &mut reopened,
+        &reopened,
         COMPANY_QUERY,
         "company_identity",
         &ParamMap::new(),
@@ -335,7 +331,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
 async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let version_before = version_main(&db).await.unwrap();
     let snapshot_before = db.resolve_snapshot("main").await.unwrap();
     let report = db
@@ -348,7 +344,7 @@ async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property()
         .await
         .expect("the upgraded namespace admits a user property named id");
     let live = query_main(
-        &mut db,
+        &db,
         "query ids() { match { $p: Person } return { $p.@id, $p.id } order { $p.@id asc } }",
         "ids",
         &ParamMap::new(),
@@ -600,7 +596,7 @@ async fn crash_before_publication_leaves_no_residue(seam: &'static DecideSeam) {
     );
     drop(read_only);
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_no_staging(&dir);
     assert_eq!(
         reopened.export_jsonl("main", &[]).await.unwrap(),
@@ -611,7 +607,7 @@ async fn crash_before_publication_leaves_no_residue(seam: &'static DecideSeam) {
         .await
         .unwrap();
     assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
-    assert_upgraded(&mut reopened, &dir, &export_before).await;
+    assert_upgraded(&reopened, &dir, &export_before).await;
 }
 
 #[tokio::test]
@@ -663,11 +659,13 @@ async fn system_column_upgrade_post_commit_failure_is_finished_by_the_next_open(
         .expect("a read-only open must not serve a published upgrade under the old contract");
     assert!(read_only.to_string().contains("read-write"), "{read_only}");
 
-    let mut recovered = Omnigraph::open(uri)
-        .await
-        .expect("the read-write open installs the published contract");
+    let recovered = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .expect("the read-write open installs the published contract"),
+    );
     assert_no_staging(&dir);
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
+    assert_upgraded(&recovered, &dir, &export_before).await;
     let again = recovered
         .upgrade_system_columns(SystemColumnUpgradeOptions::default())
         .await
@@ -681,7 +679,7 @@ async fn system_column_upgrade_post_commit_failure_is_finished_by_the_next_open(
 async fn system_column_upgrade_post_commit_failure_heals_on_the_same_handle() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
         let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
@@ -698,7 +696,7 @@ async fn system_column_upgrade_post_commit_failure_heals_on_the_same_handle() {
     .unwrap();
     assert_eq!(retried.outcome, SystemColumnUpgradeOutcome::AlreadyCurrent);
     assert_no_staging(&dir);
-    assert_upgraded(&mut db, &dir, &export_before).await;
+    assert_upgraded(&db, &dir, &export_before).await;
 }
 
 /// With the promotion skipped the renamed tables stay pending pins: reads
@@ -708,7 +706,7 @@ async fn system_column_upgrade_post_commit_failure_heals_on_the_same_handle() {
 async fn system_column_upgrade_skipped_promotion_leaves_pins_the_next_writer_promotes() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
         let _failpoint = catalog::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION.fire_always();
@@ -723,7 +721,7 @@ async fn system_column_upgrade_skipped_promotion_leaves_pins_the_next_writer_pro
         head < pin,
         "the Person pin is pending: head {head}, pin {pin}"
     );
-    assert_upgraded(&mut db, &dir, &export_before).await;
+    assert_upgraded(&db, &dir, &export_before).await;
     let (head, pin) = person_head_and_pin(&db, &dir).await;
     assert_eq!(head, pin, "the load in the oracle promoted Person");
     db.cleanup(omnigraph::db::CleanupPolicyOptions {
@@ -749,7 +747,7 @@ async fn system_column_upgrade_writes_no_control_object() {
     let uri = dir.path().to_str().unwrap();
     drop(legacy_graph_with_data(&dir).await);
     let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
-    let db = Omnigraph::open_with_storage(uri, adapter).await.unwrap();
+    let db = helpers::session(Omnigraph::open_with_storage(uri, adapter).await.unwrap());
 
     let before_write_text = counts.write_text();
     let before_delete = counts.delete();
@@ -775,7 +773,7 @@ async fn system_column_upgrade_writes_no_control_object() {
 async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
         let _failpoint = catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT.fire_always();
@@ -791,7 +789,7 @@ async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
     .expect("the same-handle retry must not deadlock on the schema gate")
     .unwrap();
     assert_eq!(retried.outcome, SystemColumnUpgradeOutcome::Completed);
-    assert_upgraded(&mut db, &dir, &export_before).await;
+    assert_upgraded(&db, &dir, &export_before).await;
 }
 
 /// A writer that dies holding the sentinel leaves it behind with nothing
@@ -823,9 +821,11 @@ async fn system_column_upgrade_open_reclaims_a_dead_writers_lock() {
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
 
-    let mut recovered = Omnigraph::open(uri)
-        .await
-        .expect("the read-write open reclaims the stale sentinel");
+    let recovered = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .expect("the read-write open reclaims the stale sentinel"),
+    );
     assert!(
         !schema_apply_lock_present(&dir),
         "the open reclaims the dead writer's lock"
@@ -840,7 +840,7 @@ async fn system_column_upgrade_open_reclaims_a_dead_writers_lock() {
         .await
         .unwrap();
     assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
+    assert_upgraded(&recovered, &dir, &export_before).await;
     recovered
         .apply_schema(UPGRADED_SCHEMA_WITH_ID_PROPERTY)
         .await

@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use helpers::recovery::sidecar_operation_ids;
 use helpers::{
-    MUTATION_QUERIES, collect_column_strings, count_rows, init_and_load, mixed_params, mutate_main,
-    read_table,
+    MUTATION_QUERIES, Session, collect_column_strings, count_rows, init_and_load, mixed_params,
+    mutate_main, read_table,
 };
 use omnigraph::db::{CleanupPolicyOptions, Omnigraph, ReadTarget};
 use omnigraph::seams::FailScenario;
@@ -250,7 +250,7 @@ async fn linear_head(uri: &str) -> u64 {
         .version
 }
 
-async fn insert(db: &mut Omnigraph, name: &str) -> omnigraph::error::Result<()> {
+async fn insert(db: &Session, name: &str) -> omnigraph::error::Result<()> {
     mutate_main(
         db,
         MUTATION_QUERIES,
@@ -261,7 +261,7 @@ async fn insert(db: &mut Omnigraph, name: &str) -> omnigraph::error::Result<()> 
     .map(|_| ())
 }
 
-async fn insert_and_friend(db: &mut Omnigraph, name: &str) -> omnigraph::error::Result<()> {
+async fn insert_and_friend(db: &Session, name: &str) -> omnigraph::error::Result<()> {
     mutate_main(
         db,
         MUTATION_QUERIES,
@@ -324,7 +324,7 @@ fn rfc0067_matrix_child_process() {
         .build()
         .unwrap()
         .block_on(async move {
-            let mut db = Omnigraph::open(&uri).await.unwrap();
+            let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
             let outcome: omnigraph::error::Result<()> = match op.as_str() {
                 "cleanup" => db.cleanup(reclaim_everything()).await.map(|_| ()),
                 "ensure_indices" => db.ensure_indices().await.map(|_| ()),
@@ -332,10 +332,10 @@ fn rfc0067_matrix_child_process() {
                     .branch_merge(&format!("src_{name}"), "main")
                     .await
                     .map(|_| ()),
-                "insert_and_friend" => insert_and_friend(&mut db, &name).await,
+                "insert_and_friend" => insert_and_friend(&db, &name).await,
                 "schema_apply" => db.apply_schema(&city_schema()).await.map(|_| ()),
                 "optimize" => db.optimize().await.map(|_| ()),
-                _ => insert(&mut db, &name).await,
+                _ => insert(&db, &name).await,
             };
             if let Err(error) = outcome {
                 println!("CHILD_ERR {error}");
@@ -385,7 +385,7 @@ async fn run_cell(
     let cell = format!("cell {index}: {writer:?} {window:?} {fault:?} {recovery:?}");
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let person_uri = table_uri(&db, "node:Person").await;
     let knows_uri = table_uri(&db, "edge:Knows").await;
     let write_name = format!("m{index}_w");
@@ -394,7 +394,7 @@ async fn run_cell(
     // own promotion was skipped.
     if writer == Writer::Cleanup {
         let _skip = catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.fire_always();
-        insert(&mut db, &format!("m{index}_pending")).await.unwrap();
+        insert(&db, &format!("m{index}_pending")).await.unwrap();
     }
     // An index cell needs index work: a declared BTREE the schema apply
     // records and leaves unbuilt.
@@ -420,9 +420,7 @@ async fn run_cell(
     // leave Person with four small fragments.
     if writer == Writer::Optimize {
         for seed in 0..3 {
-            insert(&mut db, &format!("m{index}_seed{seed}"))
-                .await
-                .unwrap();
+            insert(&db, &format!("m{index}_seed{seed}")).await.unwrap();
         }
     }
     let (mut model, _) = observe_model(&db).await;
@@ -436,8 +434,8 @@ async fn run_cell(
         Fault::Return => {
             let _fault = catalog::decide(seam).unwrap().fail_once_at(hit);
             let outcome: omnigraph::error::Result<()> = match writer {
-                Writer::Insert => insert(&mut db, &write_name).await,
-                Writer::MultiTable => insert_and_friend(&mut db, &write_name).await,
+                Writer::Insert => insert(&db, &write_name).await,
+                Writer::MultiTable => insert_and_friend(&db, &write_name).await,
                 Writer::Cleanup => Box::pin(db.cleanup(reclaim_everything())).await.map(|_| ()),
                 Writer::EnsureIndices => db.ensure_indices().await.map(|_| ()),
                 Writer::Merge => db
@@ -478,13 +476,13 @@ async fn run_cell(
                 if writer == Writer::SchemaApply {
                     // The apply's durable sentinel refuses every concurrent
                     // writer of the graph while it is in flight.
-                    let refused = insert(&mut db, &race_name).await.unwrap_err();
+                    let refused = insert(&db, &race_name).await.unwrap_err();
                     assert!(
                         refused.to_string().contains("schema apply"),
                         "{cell}: the sentinel must refuse the racer: {refused}"
                     );
                 } else {
-                    insert(&mut db, &race_name).await.unwrap();
+                    insert(&db, &race_name).await.unwrap();
                     model.names.insert(race_name);
                 }
                 std::fs::write(barrier.join("go"), b"1").unwrap();
@@ -517,12 +515,12 @@ async fn run_cell(
     let recovery_name = format!("m{index}_rec");
     match recovery {
         Recovery::SameHandle => {
-            insert(&mut db, &recovery_name).await.unwrap();
+            insert(&db, &recovery_name).await.unwrap();
             model.names.insert(recovery_name.clone());
         }
         Recovery::FreshHandle => {
-            let mut fresh = Omnigraph::open(&root).await.unwrap();
-            insert(&mut fresh, &recovery_name).await.unwrap();
+            let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+            insert(&fresh, &recovery_name).await.unwrap();
             model.names.insert(recovery_name.clone());
         }
         Recovery::OtherProcess => {
@@ -539,7 +537,7 @@ async fn run_cell(
             model.names.insert(recovery_name.clone());
         }
         Recovery::Cleanup => {
-            let mut fresh = Omnigraph::open(&root).await.unwrap();
+            let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
             Box::pin(fresh.cleanup(reclaim_everything()))
                 .await
                 .unwrap_or_else(|error| panic!("{cell}: recovery cleanup failed: {error}"));
@@ -548,7 +546,7 @@ async fn run_cell(
     }
 
     // The oracle.
-    let fresh = Omnigraph::open(&root).await.unwrap();
+    let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
     let (observed, duplicates) = observe_model(&fresh).await;
     assert!(!duplicates, "{cell}: duplicate Person keys");
     assert_eq!(observed, model, "{cell}: row model");
@@ -622,7 +620,7 @@ async fn run_cell(
         // fragments only under the same index coverage, so a run that folds
         // an index can make the next run's compaction plan non-empty; the
         // contract here is promotion, not a single-run fixpoint.
-        let fresh = Omnigraph::open(&root).await.unwrap();
+        let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         for run in 1..=2 {
             fresh.optimize().await.unwrap_or_else(|error| {
                 panic!("{cell}: optimize run {run} after recovery failed: {error}")
@@ -638,7 +636,7 @@ async fn run_cell(
     if writer == Writer::EnsureIndices && recovery != Recovery::ReadOnly {
         // Whatever the window left, the next pass converges: it builds what
         // is missing, and a promoted batch leaves it nothing to publish.
-        let fresh = Omnigraph::open(&root).await.unwrap();
+        let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         fresh
             .ensure_indices()
             .await

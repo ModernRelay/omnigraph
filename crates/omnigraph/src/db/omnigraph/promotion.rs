@@ -605,11 +605,16 @@ mod tests {
     const PERSON: &str = "node:Person";
 
     /// A graph whose Person table holds `a`..`h` after one linear load.
-    async fn graph_with_people() -> (tempfile::TempDir, Omnigraph) {
+    async fn graph_with_people() -> (tempfile::TempDir, crate::Session) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            crate::settings::SessionSettings::default(),
+        );
         let rows: Vec<String> = ('a'..='h')
             .map(|name| format!(r#"{{"type":"Person","data":{{"name":"{name}"}}}}"#))
             .collect();
@@ -665,7 +670,7 @@ mod tests {
         db.storage().count_rows(&handle, None).await.unwrap()
     }
 
-    async fn load_one(db: &Omnigraph, name: &str) {
+    async fn load_one(db: &crate::Session, name: &str) {
         let row = format!(r#"{{"type":"Person","data":{{"name":"{name}"}}}}"#);
         db.load_as("main", None, &row, LoadMode::Merge, None)
             .await

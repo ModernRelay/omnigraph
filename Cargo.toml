@@ -66,6 +66,7 @@ unicode-normalization = "=0.1.25"
 
 ulid = "1"
 futures = "0.3"
+globset = "0.4"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pest = "2"

@@ -23,13 +23,15 @@ use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
-use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph::{
+    BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy, Session,
+};
 
 use helpers::*;
 
 /// Insert `n` brand-new persons (fresh ids) onto `branch`, forking the Person
 /// table onto it. All rows are "new on source" — none collide with base ids.
-async fn append_new_persons(db: &mut Omnigraph, branch: &str, n: usize) {
+async fn append_new_persons(db: &Session, branch: &str, n: usize) {
     for i in 0..n {
         db.load(
             branch,
@@ -114,8 +116,8 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    append_new_persons(&mut feature, "feature", 5).await;
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    append_new_persons(&feature, "feature", 5).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
@@ -198,7 +200,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
         "fixture must advance the inherited native main ref beyond the lazy target pin"
     );
 
-    let source = Omnigraph::open(uri).await.unwrap();
+    let source = helpers::session(Omnigraph::open(uri).await.unwrap());
     source
         .load(
             "source",
@@ -210,7 +212,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
 
     let source_before = snapshot_branch(&source, "source").await.unwrap();
     let source_entry = source_before.dataset("node:Person").unwrap();
-    let merger = Omnigraph::open(uri).await.unwrap();
+    let merger = helpers::session(Omnigraph::open(uri).await.unwrap());
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge("source", "target"))
         .await
@@ -307,7 +309,7 @@ node Person {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
     main.load(
         "main",
         r#"{"type":"Person","data":{"name":"base","age":30}}"#,
@@ -316,7 +318,7 @@ node Person {
     .await
     .unwrap();
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .load(
             "feature",
@@ -359,7 +361,7 @@ node Person {
     // Keep this proof-composition fixture free of reconciled physical indexes:
     // it is about transaction-history induction, while nested branch index
     // artifact cloning belongs to Lance/EnsureIndices coverage.
-    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
     main.load(
         "main",
         r#"{"type":"Person","data":{"name":"base","age":30}}"#,
@@ -370,7 +372,7 @@ node Person {
     let base_count = count_rows(&main, "node:Person").await;
     main.branch_create("source").await.unwrap();
 
-    let source = Omnigraph::open(uri).await.unwrap();
+    let source = helpers::session(Omnigraph::open(uri).await.unwrap());
     source
         .load(
             "source",
@@ -471,7 +473,7 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
             "{{\"type\":\"Person\",\"data\":{{\"name\":\"ff_chunk_{i}\",\"age\":30}}}}\n"
         ));
     }
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .load("feature", &first_commit, LoadMode::Merge)
         .await
@@ -552,7 +554,7 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
     let base_count = count_rows(&main, "node:Person").await;
     main.branch_create("feature").await.unwrap();
 
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .load(
             "feature",
@@ -622,9 +624,11 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let main = if ancestor_history {
-            let main = Omnigraph::init(uri, "node Person {\n name: String @key\n age: I32\n }")
-                .await
-                .unwrap();
+            let main = helpers::session(
+                Omnigraph::init(uri, "node Person {\n name: String @key\n age: I32\n }")
+                    .await
+                    .unwrap(),
+            );
             main.load(
                 "main",
                 r#"{"type":"Person","data":{"name":"base","age":30}}"#,
@@ -639,8 +643,8 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         let base_count = count_rows(&main, "node:Person").await;
         main.branch_create("feature").await.unwrap();
 
-        let mut feature = Omnigraph::open(uri).await.unwrap();
-        append_new_persons(&mut feature, "feature", 2).await;
+        let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+        append_new_persons(&feature, "feature", 2).await;
 
         let base_snapshot = snapshot_main(&main).await.unwrap();
         let base_entry = base_snapshot.dataset("node:Person").unwrap();
@@ -759,7 +763,7 @@ async fn changed_only_adopt_uses_known_present_update() {
     let dir = tempfile::tempdir().unwrap();
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
     feature
         .mutate(
             "feature",
@@ -827,7 +831,7 @@ async fn three_way_merge_detects_empty_string_to_null_change() {
     const SET_BODY: &str = "query set_body($slug: String, $body: String) {\n    update Doc set { body: $body } where slug = $slug\n}";
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
     main.load(
         "main",
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\"}}",
@@ -837,7 +841,7 @@ async fn three_way_merge_detects_empty_string_to_null_change() {
     .unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     // feature: x body null → "".
     feature
         .mutate(
@@ -878,7 +882,7 @@ async fn three_way_merge_detects_row_prefix_named_property_change() {
     const SET_NOTES: &str = "query set_notes($slug: String, $notes: String) {\n    update Doc set { row_notes: $notes } where slug = $slug\n}";
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
     main.load(
         "main",
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\",\"row_notes\":\"before\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\",\"row_notes\":\"before\"}}",
@@ -888,7 +892,7 @@ async fn three_way_merge_detects_row_prefix_named_property_change() {
     .unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .mutate(
             "feature",
@@ -945,10 +949,10 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, WIDE_VALIDATION_SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, WIDE_VALIDATION_SCHEMA).await.unwrap());
     main.branch_create("feature").await.unwrap();
 
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     for (type_name, key, fill) in [("Alpha", "alpha", 'a'), ("Beta", "beta", 'b')] {
         let payload = fill.to_string().repeat(PER_TABLE_BYTES);
         let row = serde_json::json!({
@@ -1056,9 +1060,9 @@ const WIDE_ROW_SET_PAYLOAD: &str = "query set_payload($key: String, $payload: St
 /// single-row hard cap, plus three small rows. Overwrite load deliberately
 /// bypasses the keyed 32 MiB Arrow envelope (bulk-replacement contract), so a
 /// wider-than-cap logical row is legitimate pre-existing table state.
-async fn init_wide_row_graph(dir: &tempfile::TempDir, wide_payload_bytes: usize) -> Omnigraph {
+async fn init_wide_row_graph(dir: &tempfile::TempDir, wide_payload_bytes: usize) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap());
     let mut rows = serde_json::json!({
         "type": "Doc",
         "data": { "key": "wide", "payload": "x".repeat(wide_payload_bytes) },
@@ -1092,7 +1096,7 @@ async fn small_adopt_merge_succeeds_despite_unrelated_wide_row() {
     let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
 
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
     feature
         .mutate(
             "feature",
@@ -1144,7 +1148,7 @@ async fn divergent_merge_succeeds_despite_unrelated_wide_row() {
     let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
 
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
     feature
         .mutate(
             "feature",
@@ -1197,11 +1201,11 @@ async fn run_bounded_hydration_case(rows: String, expected_rows: usize, edited_k
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap());
     main.load("main", &rows, LoadMode::Overwrite).await.unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .mutate(
             "feature",
@@ -1300,8 +1304,8 @@ async fn fast_forward_merge_yields_source_state() {
     let base_knows_count = count_rows(&main, "edge:Knows").await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    append_new_persons(&mut feature, "feature", 5).await;
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    append_new_persons(&feature, "feature", 5).await;
     let mutation = feature
         .mutate(
             "feature",
@@ -1362,7 +1366,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     // Empty Chunk table → no vector index at init (KMeans can't train on 0 rows).
-    let main = Omnigraph::init(uri, VEC_SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, VEC_SCHEMA).await.unwrap());
     main.branch_create("feature").await.unwrap();
 
     // Load embedding-bearing chunks onto the branch. Load publishes only the
@@ -1375,7 +1379,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
             v.join(",")
         ));
     }
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .load("feature", &rows, LoadMode::Merge)
         .await
@@ -1406,7 +1410,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
 async fn merged_outcome_defers_vector_index_to_reconciler() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, VEC_SCHEMA).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, VEC_SCHEMA).await.unwrap());
     main.branch_create("feature").await.unwrap();
 
     let mut source_rows = String::new();
@@ -1417,7 +1421,7 @@ async fn merged_outcome_defers_vector_index_to_reconciler() {
             vector.join(",")
         ));
     }
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .load("feature", &source_rows, LoadMode::Merge)
         .await
@@ -1464,13 +1468,12 @@ query insert_doc($title: String, $content: Blob, $note: String) {
 /// survive the interval scan → streaming fenced-write round-trip.
 #[tokio::test]
 async fn fast_forward_merge_streams_blob_columns() {
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::loader::LoadMode;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(
-        &main,
+    let main = helpers::session(Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap());
+    main.load_jsonl(
         "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:U2VlZA==\",\"note\":\"base\"}}",
         LoadMode::Overwrite,
     )
@@ -1479,9 +1482,9 @@ async fn fast_forward_merge_streams_blob_columns() {
     main.branch_create("feature").await.unwrap();
 
     // Only the branch is mutated → fast-forward → adopt/fenced-insert path.
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         BLOB_INSERT,
         "insert_doc",
@@ -1577,11 +1580,13 @@ query set_note($title: String, $note: String) {
         ])
         .unwrap();
 
-        let main = Omnigraph::init(uri, BLOB_SCHEMA)
-            .await
-            .unwrap()
-            .with_external_blob_policy(policy.clone())
-            .unwrap();
+        let main = helpers::session(
+            Omnigraph::init(uri, BLOB_SCHEMA)
+                .await
+                .unwrap()
+                .with_external_blob_policy(policy.clone())
+                .unwrap(),
+        );
         let base_data = [
             serde_json::json!({
                 "type": "Document",
@@ -1605,11 +1610,13 @@ query set_note($title: String, $note: String) {
             .unwrap();
         main.branch_create("feature").await.unwrap();
 
-        let feature = Omnigraph::open(uri)
-            .await
-            .unwrap()
-            .with_external_blob_policy(policy.clone())
-            .unwrap();
+        let feature = helpers::session(
+            Omnigraph::open(uri)
+                .await
+                .unwrap()
+                .with_external_blob_policy(policy.clone())
+                .unwrap(),
+        );
         let source_data = [
             serde_json::json!({
                 "type": "Document",
@@ -1668,11 +1675,13 @@ query set_note($title: String, $note: String) {
             );
         }
 
-        let merger = Omnigraph::open(uri)
-            .await
-            .unwrap()
-            .with_external_blob_policy(policy)
-            .unwrap();
+        let merger = helpers::session(
+            Omnigraph::open(uri)
+                .await
+                .unwrap()
+                .with_external_blob_policy(policy)
+                .unwrap(),
+        );
         let probes = MergeWriteProbes::default();
         let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge(source, target))
             .await

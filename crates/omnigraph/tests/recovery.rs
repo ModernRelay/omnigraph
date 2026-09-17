@@ -100,16 +100,16 @@ async fn legacy_sidecar_refuses_a_read_write_open_and_not_a_read_only_one() {
 /// NoMovement → rollback.
 #[tokio::test]
 async fn recovery_ensure_indices_steady_state_no_sidecar() {
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::loader::LoadMode;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
+    db.load_jsonl(test_data, LoadMode::Append).await.unwrap();
     db.ensure_indices().await.unwrap();
     drop(db);
 

@@ -699,6 +699,26 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
 
+    /// Observe that no recovery sidecar or staged schema artifact is present.
+    /// Performs no graph open, recovery, cleanup, or object-body reads. Any
+    /// pending JSON, including malformed or unsupported sidecars, refuses.
+    /// Listing refuses beyond one matching file, 1,024 unrelated entries or
+    /// 128 KiB of URI bytes; three fixed schema-staging paths are also probed.
+    ///
+    /// This is a point-in-time observation under the process-local schema gate,
+    /// not writer exclusion or a transferable recovery capability. Callers must
+    /// retain their existing writer exclusion through any subsequent effect.
+    pub async fn ensure_no_pending_recovery(uri: &str) -> Result<()> {
+        let root = normalize_root_uri(uri)?;
+        let storage = storage_for_uri(&root)?;
+        let identity = write_queue_root_identity(&root)?;
+        let queues = crate::db::write_queue::WriteQueueManager::for_root(&identity);
+        let _schema_gate = queues
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        crate::db::manifest::refuse_pending_recovery(&root, storage.as_ref()).await
+    }
+
     /// Whether the selected graph-manifest dataset references files outside
     /// its own root through Lance `base_paths`.
     ///
@@ -2839,7 +2859,7 @@ impl Omnigraph {
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
     pub async fn failpoint_publish_table_head_without_index_rebuild_for_test(
-        &mut self,
+        &self,
         branch: &str,
         type_key: &str,
         table_branch: Option<&str>,
@@ -2870,7 +2890,7 @@ impl Omnigraph {
     /// given [`optimize::CleanupPolicyOptions`]. Destructive to version
     /// history. See [`optimize`] for details.
     pub async fn cleanup(
-        &mut self,
+        &self,
         options: optimize::CleanupPolicyOptions,
     ) -> Result<Vec<optimize::DatasetCleanupStats>> {
         optimize::cleanup_all_datasets(self, options).await
@@ -4689,10 +4709,12 @@ edge WorksAt: Person -> Company
         // no `__run__` branch behind, so schema apply proceeds.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
 
-        crate::loader::load_jsonl(
-            &db,
+        db.load_jsonl(
             r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
             crate::loader::LoadMode::Overwrite,
         )

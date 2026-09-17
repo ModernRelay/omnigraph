@@ -29,7 +29,7 @@ use std::time::Instant;
 use arrow_array::StringArray;
 
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 
 use helpers::*;
 
@@ -105,7 +105,7 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
     let filler = filler_block();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
 
     // Artifacts + edges first (small), then the chunk corpus in capped batches.
     let mut head = String::new();
@@ -114,7 +114,7 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
             "{{\"type\":\"Artifact\",\"data\":{{\"slug\":\"art-{a:04}\",\"name\":\"Artifact {a}\"}}}}\n"
         ));
     }
-    load_jsonl(&db, &head, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(&head, LoadMode::Overwrite).await.unwrap();
 
     let mut chunk_batch = String::new();
     for c in 0..CHUNKS {
@@ -122,9 +122,7 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
             "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"chunk-{c:05}\",\"text\":\"needle563 {filler}\"}}}}\n"
         ));
         if (c + 1) % LOAD_BATCH_ROWS == 0 || c + 1 == CHUNKS {
-            load_jsonl(&db, &chunk_batch, LoadMode::Append)
-                .await
-                .unwrap();
+            db.load_jsonl(&chunk_batch, LoadMode::Append).await.unwrap();
             chunk_batch.clear();
         }
     }
@@ -140,21 +138,21 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
             edge_rows += 1;
             // 8,192-keyed-entity write cap: flush well under it.
             if edge_rows == 4_000 {
-                load_jsonl(&db, &edges, LoadMode::Append).await.unwrap();
+                db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
                 edges.clear();
                 edge_rows = 0;
             }
         }
     }
     if edge_rows > 0 {
-        load_jsonl(&db, &edges, LoadMode::Append).await.unwrap();
+        db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
     }
 
     db.ensure_indices().await.unwrap();
 
     // The ranked read without the join stays under the i32 offset ceiling.
     let no_join = query_main(
-        &mut db,
+        &db,
         RANKED_JOIN_QUERY,
         "recall_no_join",
         &params(&[("$q", "needle563")]),
@@ -167,7 +165,7 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
     // Unbounded (issue #563, pre-cap), it materialized matched text x fanout
     // through the join and failed with "Offset overflow error: 2147489268".
     let joined = query_main(
-        &mut db,
+        &db,
         RANKED_JOIN_QUERY,
         "recall_join",
         &params(&[("$q", "needle563")]),
@@ -209,7 +207,7 @@ async fn times_join_free_ranked_read_issue_563() {
     let filler = filler_block();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
 
     let mut chunk_batch = String::new();
     for c in 0..CHUNKS {
@@ -217,16 +215,14 @@ async fn times_join_free_ranked_read_issue_563() {
             "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"chunk-{c:05}\",\"text\":\"needle563 {filler}\"}}}}\n"
         ));
         if (c + 1) % LOAD_BATCH_ROWS == 0 || c + 1 == CHUNKS {
-            load_jsonl(&db, &chunk_batch, LoadMode::Append)
-                .await
-                .unwrap();
+            db.load_jsonl(&chunk_batch, LoadMode::Append).await.unwrap();
             chunk_batch.clear();
         }
     }
     db.ensure_indices().await.unwrap();
 
     let warmup = query_main(
-        &mut db,
+        &db,
         RANKED_JOIN_QUERY,
         "recall_no_join",
         &params(&[("$q", "needle563")]),
@@ -239,7 +235,7 @@ async fn times_join_free_ranked_read_issue_563() {
     for _ in 0..5 {
         let started = Instant::now();
         let result = query_main(
-            &mut db,
+            &db,
             RANKED_JOIN_QUERY,
             "recall_no_join",
             &params(&[("$q", "needle563")]),

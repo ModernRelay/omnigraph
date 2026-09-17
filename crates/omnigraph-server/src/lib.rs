@@ -1,18 +1,23 @@
+// MCP's typed futures include the same recursive query-plan types as HTTP.
+#![recursion_limit = "256"]
+
 pub mod api;
 mod blob_transport;
 mod export_transport;
 mod handlers;
+mod mcp;
 mod settings;
 use handlers::*;
 use settings::*;
 pub use settings::{
     ServerRuntimeState, classify_server_runtime_state, load_server_settings,
-    load_server_settings_with_data_token_trust,
+    load_server_settings_with_data_token_trust, load_server_settings_with_identity_trust,
 };
 pub mod auth;
 pub mod data_tokens;
 pub mod graph_id;
 pub mod identity;
+pub mod oidc_identity;
 pub mod policy;
 pub mod queries;
 pub mod registry;
@@ -33,11 +38,11 @@ use api::{
     BlobReadQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
-    GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
-    QueryRequest, ReadOutput, ReadRequest, ReadinessOutput, SchemaApplyOutput, SchemaApplyRequest,
-    SchemaOutput, SnapshotQuery, graph_batch_load_receipt_output, ingest_receipt_output,
-    schema_apply_output, snapshot_payload,
+    GraphBatchLoadQuery, GraphDiscoveryEntry, GraphDiscoveryResponse, GraphInfo, GraphListResponse,
+    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
+    LegacyReadOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, ReadinessOutput,
+    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
+    graph_batch_load_receipt_output, ingest_receipt_output, schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -97,9 +102,11 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         description = "HTTP API for the Omnigraph graph database",
     ),
     paths(
+        mcp::resource_metadata,
         handlers::server_health,
         handlers::server_ready,
         handlers::server_graphs_list,
+        handlers::server_graphs_discovery,
         handlers::server_snapshot,
         handlers::server_blob_get,
         handlers::server_blob_head,
@@ -211,7 +218,8 @@ pub struct ServerConfig {
 pub struct ManagedServerConfig {
     config: ServerConfig,
     canonical_root: String,
-    trust: data_tokens::DataTokenTrust,
+    trust: Option<data_tokens::DataTokenTrust>,
+    oidc_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
 }
 
 impl ManagedServerConfig {
@@ -370,6 +378,7 @@ pub struct AppState {
     workload: Arc<workload::WorkloadController>,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
+    oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
     /// Server-level Cedar policy. Used by management endpoints (`GET
     /// /graphs`) which act on the registry resource, not on a per-graph
     /// resource. Loaded from the cluster-scoped policy binding when
@@ -385,6 +394,40 @@ pub struct AppState {
     /// Reported by `/readyz` so an orchestrator can check its own grace
     /// exceeds the server's.
     shutdown_grace: std::time::Duration,
+    /// The process defaults every request's session starts from and `reset`
+    /// returns to (the Session settings RFC): the settings definition's defaults, replaced
+    /// by `serve` with the values `settings::from_env` read at startup.
+    process_defaults: Arc<ProcessDefaults>,
+}
+
+/// The settings a process door seeds every session with, and where each
+/// value came from (`default` or `env`).
+#[derive(Debug, Clone)]
+pub struct ProcessDefaults {
+    pub settings: omnigraph::settings::SessionSettings,
+    pub sources: omnigraph::settings::Sources,
+}
+
+impl Default for ProcessDefaults {
+    fn default() -> Self {
+        Self {
+            settings: omnigraph::settings::SessionSettings::default(),
+            sources: [omnigraph::settings::Source::Default; omnigraph::settings::DEFINITIONS.len()],
+        }
+    }
+}
+
+impl ProcessDefaults {
+    /// Every definition row's variable, read once.
+    ///
+    /// # Errors
+    ///
+    /// A variable holding a value its setting refuses; the server does not
+    /// start then.
+    pub fn from_env() -> std::result::Result<Self, omnigraph::settings::SessionSettingsError> {
+        let (settings, sources) = omnigraph::settings::from_env()?;
+        Ok(Self { settings, sources })
+    }
 }
 
 struct OpenedGraph {
@@ -667,10 +710,12 @@ impl AppState {
             bearer_tokens,
             server_policy: None,
             data_token_trust: None,
+            oidc_identity_trust: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            process_defaults: Arc::new(ProcessDefaults::default()),
         }
     }
 
@@ -698,10 +743,12 @@ impl AppState {
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
             data_token_trust: None,
+            oidc_identity_trust: None,
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            process_defaults: Arc::new(ProcessDefaults::default()),
         })
     }
 
@@ -718,6 +765,37 @@ impl AppState {
         self.draining = draining;
         self.shutdown_grace = shutdown_grace;
         self
+    }
+
+    /// Attach the process defaults every session starts from (the Session settings RFC).
+    /// `serve` passes the environment's; a test may seed its own.
+    #[must_use]
+    pub fn with_process_defaults(mut self, defaults: ProcessDefaults) -> Self {
+        self.process_defaults = Arc::new(defaults);
+        self
+    }
+
+    /// One session for one request: the process defaults, then the typed
+    /// `settings` field with source `request`. The source's own `set` lines
+    /// apply inside the session method that runs the text.
+    pub(crate) fn session(
+        &self,
+        handle: &GraphHandle,
+        request: Option<&api::SettingsRequest>,
+    ) -> std::result::Result<omnigraph::Session, ApiError> {
+        let mut session = handle.engine.session(
+            self.process_defaults.settings.clone(),
+            self.process_defaults.sources,
+        );
+        for (id, value) in request
+            .map(api::SettingsRequest::assignments)
+            .unwrap_or_default()
+        {
+            session
+                .set(id, &value, omnigraph::settings::Source::Request)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        }
+        Ok(session)
     }
 
     /// The applied graphs this process does not serve, sorted: the boot
@@ -757,8 +835,34 @@ impl AppState {
         self
     }
 
+    /// Attach public OIDC identity admission validated against the serving root.
+    #[must_use]
+    pub fn with_oidc_identity_trust(
+        mut self,
+        trust: Arc<oidc_identity::OidcIdentityTrust>,
+    ) -> Self {
+        self.oidc_identity_trust = Some(trust);
+        self
+    }
+
+    pub(crate) fn oidc_resource_metadata(&self) -> Option<serde_json::Value> {
+        self.oidc_identity_trust
+            .as_ref()
+            .map(|trust| trust.resource_metadata())
+    }
+
+    pub(crate) fn oidc_resource_url(&self) -> Option<String> {
+        self.oidc_resource_metadata()?
+            .get("resource")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
     fn requires_bearer_auth(&self) -> bool {
-        if !self.bearer_tokens.is_empty() || self.data_token_trust.is_some() {
+        if !self.bearer_tokens.is_empty()
+            || self.data_token_trust.is_some()
+            || self.oidc_identity_trust.is_some()
+        {
             return true;
         }
         if self.server_policy.is_some() {
@@ -788,8 +892,13 @@ impl AppState {
                 .ok()?
                 .as_secs();
             self.data_token_trust
-                .as_ref()?
-                .verify_authenticated_at(provided_token, now)
+                .as_ref()
+                .and_then(|trust| trust.verify_authenticated_at(provided_token, now))
+                .or_else(|| {
+                    self.oidc_identity_trust
+                        .as_ref()?
+                        .verify_at(provided_token, i64::try_from(now).ok()?)
+                })
         })
     }
 }
@@ -1737,7 +1846,7 @@ mod api_error_tests {
 #[cfg(test)]
 mod external_blob_startup_tests {
     use super::*;
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::loader::LoadMode;
 
     #[tokio::test]
     async fn server_open_drops_embedded_only_external_blob_bases() {
@@ -1775,9 +1884,13 @@ mod external_blob_startup_tests {
             "{{\"type\":\"Doc\",\"data\":{{\"slug\":\"one\",\"payload\":\"file://{}\"}}}}\n",
             payload.display()
         );
-        let error = load_jsonl(opened.handle.engine.as_ref(), &data, LoadMode::Overwrite)
-            .await
-            .unwrap_err();
+        let error = omnigraph::Session::from_defaults(
+            Arc::clone(&opened.handle.engine),
+            omnigraph::settings::SessionSettings::default(),
+        )
+        .load_jsonl(&data, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, OmniError::ExternalBlobPolicy { .. }),
             "server projection must deny an embedded-only URI, got {error:?}"
@@ -1834,9 +1947,87 @@ mod external_blob_startup_tests {
     }
 }
 
+fn server_log_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    tracing_subscriber::registry()
+        .with(filter)
+        // rmcp logs full protocol requests at DEBUG and responses at TRACE.
+        // This independent metadata filter cannot be overridden by a more
+        // specific RUST_LOG directive and keeps graph values out of SDK logs.
+        .with(tracing_subscriber::filter::filter_fn(|metadata| {
+            let sdk = metadata.target() == "rmcp" || metadata.target().starts_with("rmcp::");
+            !sdk || *metadata.level() <= tracing::Level::WARN
+        }))
+        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+}
+
+/// Install native server logging with MCP protocol payload logs disabled.
+/// Embedders using their own subscriber must equivalently restrict the `rmcp`
+/// and `rmcp::*` targets to WARN/ERROR even when other targets use DEBUG/TRACE.
 pub fn init_tracing() {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = server_log_subscriber(filter, io::stdout).try_init();
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write_all(bytes)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn verbose_sdk_payloads_remain_filtered_under_specific_directives() {
+        for directives in ["trace", "debug,rmcp::service=trace"] {
+            let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+            let writer = captured.clone();
+            let subscriber =
+                server_log_subscriber(EnvFilter::new(directives), move || writer.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "rmcp::service", request = "PRIVATE_REQUEST_MARKER", "received request");
+                tracing::trace!(target: "rmcp::transport::streamable_http_server::tower", message = "PRIVATE_RESULT_MARKER");
+                tracing::debug!(target: "rmcp", "PRIVATE_ROOT_MARKER");
+                tracing::warn!(target: "rmcp::service", "SDK_WARNING_MARKER");
+                tracing::error!(target: "rmcp", "SDK_ERROR_MARKER");
+                tracing::debug!(target: "omnigraph_server", "NATIVE_DEBUG_MARKER");
+                tracing::debug!(target: "rmcp_extension", "UNRELATED_DEBUG_MARKER");
+            });
+            let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            for private in [
+                "PRIVATE_REQUEST_MARKER",
+                "PRIVATE_RESULT_MARKER",
+                "PRIVATE_ROOT_MARKER",
+            ] {
+                assert!(!output.contains(private), "{directives}: {output}");
+            }
+            for visible in [
+                "SDK_WARNING_MARKER",
+                "SDK_ERROR_MARKER",
+                "NATIVE_DEBUG_MARKER",
+                "UNRELATED_DEBUG_MARKER",
+            ] {
+                assert!(output.contains(visible), "{directives}: {output}");
+            }
+        }
+    }
 }
 
 /// Log each non-blocking advisory from a registry check report.
@@ -1972,6 +2163,7 @@ pub fn build_app(state: AppState) -> Router {
     // exposed — operators run `cluster apply` and restart.
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
+        .route("/graphs/discovery", get(server_graphs_discovery))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -1983,29 +2175,33 @@ pub fn build_app(state: AppState) -> Router {
         .nest("/graphs/{graph_id}", per_graph_protected)
         .merge(management);
 
-    Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(server_health))
         .route("/readyz", get(server_ready))
         .route("/openapi.json", get(server_openapi))
-        .merge(protected)
-        .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
+        .merge(protected);
+    if state.oidc_identity_trust.is_some() {
+        app = app.merge(mcp::router(state.clone()));
+    }
+    app.layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    serve_config(config, None).await
+    serve_config(config, None, None).await
 }
 
 /// Serve settings whose offline data-token trust was validated against their
 /// applied snapshot's canonical root before any graph engine open.
 pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
-    serve_config(config.config, Some(config.trust)).await
+    serve_config(config.config, config.trust, config.oidc_trust).await
 }
 
 async fn serve_config(
     config: ServerConfig,
     data_token_trust: Option<data_tokens::DataTokenTrust>,
+    oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
 ) -> Result<()> {
     // RFC 0049: the signal listener is installed before anything else, so
     // the shutdown bound covers startup. On the signal it sets `draining`,
@@ -2026,6 +2222,8 @@ async fn serve_config(
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
     let tokens = token_source.load().await?;
+    let process_defaults = ProcessDefaults::from_env()
+        .map_err(|error| eyre!("session setting refused at startup: {error}"))?;
 
     // For runtime-state classification, "any policy configured" means
     // either the top-level/single-mode policy file OR a server-level
@@ -2039,7 +2237,7 @@ async fn serve_config(
         } => server_policy.is_some() || graphs.iter().any(|g| g.policy.is_some()),
     };
     let runtime_state = classify_server_runtime_state(
-        !tokens.is_empty() || data_token_trust.is_some(),
+        !tokens.is_empty() || data_token_trust.is_some() || oidc_identity_trust.is_some(),
         has_policy_configured,
         config.allow_unauthenticated,
     )?;
@@ -2087,6 +2285,13 @@ async fn serve_config(
         Some(trust) => state.with_data_token_trust(trust),
         None => state,
     };
+    let state = match oidc_identity_trust {
+        Some(trust) => {
+            trust.start_refresh();
+            state.with_oidc_identity_trust(trust)
+        }
+        None => state,
+    };
     let listener = TcpListener::bind(&bind).await?;
     let listen_addr = listener.local_addr()?;
     {
@@ -2096,11 +2301,13 @@ async fn serve_config(
         stdout.flush()?;
     }
 
-    let state = state.with_boot_witness(
-        config.witness.clone(),
-        Arc::clone(&draining),
-        shutdown_grace,
-    );
+    let state = state
+        .with_boot_witness(
+            config.witness.clone(),
+            Arc::clone(&draining),
+            shutdown_grace,
+        )
+        .with_process_defaults(process_defaults);
     let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {
@@ -2146,8 +2353,8 @@ pub async fn open_multi_graph_state(
     // resource-model refactor maps to the singleton
     // `Omnigraph::Server::"root"` entity at evaluation time.
     let server_policy = match server_policy_source {
-        Some(PolicySource::File(path)) => Some(PolicyEngine::load_server(path)?),
-        Some(PolicySource::Inline(source)) => Some(PolicyEngine::load_server_from_source(source)?),
+        Some(PolicySource::File(path)) => Some(PolicyEngine::load_cluster(path)?),
+        Some(PolicySource::Inline(source)) => Some(PolicyEngine::load_cluster_from_source(source)?),
         None => None,
     };
 
