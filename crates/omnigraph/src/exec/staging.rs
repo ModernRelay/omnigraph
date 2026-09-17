@@ -161,37 +161,6 @@ pub(crate) struct MutationStaging {
     pub(crate) op_kinds: HashMap<String, MutationOpKind>,
 }
 
-/// Concurrency for the fragment-writing stage, shared by the loader and
-/// end-of-query mutation staging. Each staged write is an independent Lance
-/// dataset (manifest + fragments for a different table); ops within a single
-/// table stay serial under Lance's manifest OCC, so cross-table staging has
-/// no shared state to race.
-///
-/// The default of 8 preserves the loader's existing bound. Override it via
-/// `OMNIGRAPH_LOAD_CONCURRENCY`.
-pub(crate) const DEFAULT_STAGE_WRITE_CONCURRENCY: usize = 8;
-
-/// Resolution order: the scoped test override
-/// ([`crate::instrumentation::with_stage_write_concurrency`]), then
-/// `OMNIGRAPH_LOAD_CONCURRENCY`, then the default. Tests force a width through
-/// the scoped seam so they never mutate process-global environment.
-pub(crate) fn stage_write_concurrency() -> usize {
-    if let Some(scoped) = crate::instrumentation::stage_write_concurrency_override()
-        && scoped > 0
-    {
-        return scoped;
-    }
-    parse_stage_write_concurrency(std::env::var("OMNIGRAPH_LOAD_CONCURRENCY").ok().as_deref())
-}
-
-/// Pure half of [`stage_write_concurrency`], split out so the parse rules are
-/// unit-testable without mutating process-global environment.
-fn parse_stage_write_concurrency(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_STAGE_WRITE_CONCURRENCY)
-}
-
 decide_seam! {
     /// Between per-table fragment uploads
     /// inside `stage_all_with_concurrency`. A crash here
@@ -485,27 +454,16 @@ impl MutationStaging {
     /// under per-`(table_key, branch)` queue).
     ///
     /// Stages independent constructive (insert/update/overwrite) Lance
-    /// datasets concurrently at [`stage_write_concurrency`] — the same knob
-    /// the loader path has always run at. Deferred first-touch branch effects
-    /// and delete transactions remain serial. Publication is untouched:
-    /// everything after staging still funnels through the single manifest CAS.
-    /// Failure semantics are also untouched: the constructive staging stream
-    /// drains before the first error surfaces, exactly as the width-1
-    /// delegation it replaces did (any
-    /// staged-but-unpublished residue was already reclaimable, not
+    /// datasets `concurrency` at a time, the session's
+    /// `stage_write_concurrency` setting, shared by the loader and the
+    /// mutation path. Each staged write is an independent Lance dataset;
+    /// ops within a single table stay serial under Lance's manifest OCC, so
+    /// cross-table staging has no shared state to race. Deferred first-touch
+    /// branch effects and delete transactions remain serial. Publication is
+    /// untouched: everything after staging still funnels through the single
+    /// manifest CAS. The constructive staging stream drains before the first
+    /// error surfaces (any staged-but-unpublished residue is reclaimable, not
     /// graph-visible).
-    pub(crate) async fn stage_all(
-        self,
-        db: &crate::db::Omnigraph,
-        branch: Option<&str>,
-    ) -> Result<StagedMutation> {
-        self.stage_all_with_concurrency(db, branch, stage_write_concurrency())
-            .await
-    }
-
-    /// Loader-facing variant of [`stage_all`] that preserves
-    /// `OMNIGRAPH_LOAD_CONCURRENCY` for the fragment-writing stage while
-    /// still leaving all Lance HEAD movement to [`StagedMutation::commit_all`].
     pub(crate) async fn stage_all_with_concurrency(
         self,
         db: &crate::db::Omnigraph,
@@ -1729,55 +1687,4 @@ fn dedupe_merge_batches_by_id(
         return Ok(sliced.into_iter().next().unwrap());
     }
     arrow_select::concat::concat_batches(schema, &sliced).map_err(OmniError::arrow_internal)
-}
-
-#[cfg(test)]
-mod stage_write_concurrency_tests {
-    use super::{parse_stage_write_concurrency, stage_write_concurrency};
-    use crate::instrumentation::with_stage_write_concurrency;
-
-    // Pure parser, no process-global environment touched.
-    #[test]
-    fn resolves_default_override_and_junk() {
-        assert_eq!(
-            parse_stage_write_concurrency(None),
-            8,
-            "default without the env var"
-        );
-        assert_eq!(parse_stage_write_concurrency(Some("3")), 3, "override wins");
-        assert_eq!(
-            parse_stage_write_concurrency(Some("0")),
-            8,
-            "zero is not a concurrency"
-        );
-        assert_eq!(
-            parse_stage_write_concurrency(Some("banana")),
-            8,
-            "junk falls back to default"
-        );
-    }
-
-    /// The scoped seam must actually reach the resolver, and must not outlive its
-    /// future. Without this, a width-forcing test would silently run at the default
-    /// width on both sides of an equivalence comparison and prove nothing.
-    #[tokio::test]
-    async fn scoped_override_wins_and_does_not_leak() {
-        let outside_before = stage_write_concurrency();
-        assert_eq!(
-            with_stage_write_concurrency(3, async { stage_write_concurrency() }).await,
-            3,
-            "the scoped override must reach the resolver"
-        );
-        // 0 is not a concurrency: the scope is ignored, not obeyed.
-        assert_ne!(
-            with_stage_write_concurrency(0, async { stage_write_concurrency() }).await,
-            0,
-            "a zero override must fall back, never pin the width to zero"
-        );
-        assert_eq!(
-            stage_write_concurrency(),
-            outside_before,
-            "the override must be gone once its future resolves"
-        );
-    }
 }

@@ -40,7 +40,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query, or the `branch list` statement | direct or served |
+| `query` | Run a read query, or the `branch list` or `show` statement | direct or served |
 | `mutate` | Run an insert/update/delete query, or a `branch create`, `branch delete`, or `branch merge` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
@@ -76,11 +76,13 @@ see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-index
 
 ## Query inputs and output
 
-For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`. When the
-source contains multiple declarations, the positional name selects one. For a
-stored server query, omit the source and pass its registry name. Parameters
-come inline, `--params '{"name":"Ada"}'`, or from a file, `--params-file
-params.json`.
+For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`; with
+multiple declarations the positional name selects one. A stored server query is
+its registry name alone. Parameters come inline, `--params '{"name":"Ada"}'`,
+or from a file, `--params-file params.json`. `--set NAME=VALUE`, repeatable,
+gives a [session setting](index.md#session-settings) a value for the run of
+`query`, `mutate`, `branch merge`, `commit changes`, `changes poll`, `load`
+and `ingest`.
 
 The source may instead be one branch statement, `mutate -e 'branch create b0'`
 or `query -e 'branch list'` (control writes through `mutate`, the listing
@@ -89,10 +91,9 @@ or params; see [Work with branches](index.md#work-with-branches).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
-cells come from the JSON spelling in
-[JSON result spelling](../queries/index.md#json-result-spelling); `table`,
-`csv`, and `kv` print strings unquoted. `--format json` prints the envelope
-pretty and the `rows` array compact, verbatim.
+cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
+`table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
+envelope pretty and the `rows` array compact, verbatim.
 
 ### Machine-readable read and write positions
 
@@ -219,9 +220,8 @@ aliases:
     format: table
 ```
 
-Each profile binds exactly one of `server`, `cluster`, or `store`. Select it
-with `--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled
-by a profile.
+Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
+`--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
 
 Bearer tokens never belong in `config.yaml`. Store a token with
 `omnigraph login <server>` or provide `OMNIGRAPH_BEARER_TOKEN` for the current

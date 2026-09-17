@@ -31,9 +31,17 @@ storage and other combinations fail admission explicitly; their names do not
 imply implementation or qualification.
 
 One engine instance survives ordinary steps and expected errors. Only
-`--- restart` replaces it, reopening the same storage. GQ operations and GQT
-rows, shape, affected counts, errors and loop semantics are shared by both paths.
-Unordered row comparison preserves duplicate counts.
+`--- restart` drops the engine and reopens the same storage. A case owns one
+session ([Session settings](../../docs/rfcs/2026-09-16-session-settings.md)) for
+its lifetime: a `--- mutate` step of only `set` and
+`reset` lines expects `ok` and changes that session for the steps that follow,
+across a restart; a `set` prefix before any other body applies to that step
+only; `show <name>` and `show all` are `--- query` rows steps with the five
+`String` columns `name`, `value`, `default`, `source`, `scope` in definition
+order, and that shape is derived, so a `show` step writes no `--- expect shape`
+section; a `process` setting in a case body refuses the case at parse time. GQ operations
+and GQT rows, shape, affected counts, errors and loop semantics are shared by
+both paths. Unordered row comparison preserves duplicate counts.
 
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
@@ -229,5 +237,11 @@ environment. A subset selection cannot bless a multi-environment case. It rewrit
 failure until a subsequent run confirms it. DST cannot bless. The legacy
 `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` helper applies to library mechanism tests;
 file invocations refuse that ambient override and take their timeout from the
-runner section. Ambient fault, entropy, pool and traversal overrides also refuse
-admission, including replay.
+runner section. Ambient fault, entropy and pool overrides also refuse
+admission, including replay, as does a set settings variable
+(`OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`, `OMNIGRAPH_ANN_NPROBES`,
+`OMNIGRAPH_LOAD_CONCURRENCY`) and the retired `OMNIGRAPH_TRAVERSAL_MODE`,
+which names no setting any more. A case session never reads the environment, so
+neither variable decides anything; the refusal keeps a stale one in a CI
+environment from being mistaken for a live control, and keeps the retired name
+from lingering. A case that must run one value writes it in a `set` step.

@@ -25,9 +25,15 @@ use omnigraph_dst::rand::SplitMix64;
 use omnigraph_dst::{catalog, trace};
 use serial_test::serial;
 
+use omnigraph::Session;
 use omnigraph::db::{InitOptions, Omnigraph};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
+
+fn session(db: Omnigraph) -> Session {
+    Session::from_defaults(Arc::new(db), SessionSettings::default())
+}
 
 /// Seeded-runtime smoke: the tokio_unstable `rng_seed` current-thread
 /// runtime makes `select!` tie-breaks a pure function of the seed.
@@ -290,19 +296,21 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
     runtime.block_on(async move {
         let root = "shared-memory://dst-schema-add-traversal";
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let mut db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", "w3")], &[("$age", 69)]),
@@ -353,9 +361,11 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
         );
 
         drop(db);
-        let db2 = Omnigraph::open_with_storage(root, storage)
-            .await
-            .expect("reopen");
+        let db2 = session(
+            Omnigraph::open_with_storage(root, storage)
+                .await
+                .expect("reopen"),
+        );
         assert_eq!(
             person_rows(&db2).await,
             expected_persons,
@@ -810,10 +820,12 @@ async fn person_names_sorted(db: &Omnigraph) -> Vec<String> {
 /// Returns the observable end state.
 async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
     let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-    let mut db = Omnigraph::init_with_storage(root, TEST_SCHEMA, storage, InitOptions::default())
-        .await
-        .expect("init workload root");
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+    let db = session(
+        Omnigraph::init_with_storage(root, TEST_SCHEMA, storage, InitOptions::default())
+            .await
+            .expect("init workload root"),
+    );
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("seed data");
 
@@ -828,7 +840,7 @@ async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
         let result = match op {
             0 => {
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "insert_person",
                     &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -837,7 +849,7 @@ async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
             }
             1 => {
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "set_age",
                     &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -846,7 +858,7 @@ async fn run_seeded_workload(root: &str, seed: u64, ops: usize) -> Vec<String> {
             }
             _ => {
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "remove_person",
                     &mixed_params(&[("$name", name)], &[]),
@@ -905,7 +917,7 @@ async fn end_state(db: &Omnigraph) -> (Vec<(String, i64)>, usize) {
 /// under the seeded scheduler. An OCC loser's conflict is a LEGAL outcome
 /// when handles race on one root — retried (bounded); every other error is
 /// a real failure.
-async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
+async fn actor_workload(db: Session, actor_seed: u64, ops: usize) {
     let mut rng = SplitMix64(actor_seed);
     let names = ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"];
     for _ in 0..ops {
@@ -917,7 +929,7 @@ async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
             let result = match op {
                 0 => {
                     mutate_main(
-                        &mut db,
+                        &db,
                         MUTATION_QUERIES,
                         "insert_person",
                         &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -926,7 +938,7 @@ async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
                 }
                 1 => {
                     mutate_main(
-                        &mut db,
+                        &db,
                         MUTATION_QUERIES,
                         "set_age",
                         &mixed_params(&[("$name", name)], &[("$age", age)]),
@@ -935,7 +947,7 @@ async fn actor_workload(mut db: Omnigraph, actor_seed: u64, ops: usize) {
                 }
                 _ => {
                     mutate_main(
-                        &mut db,
+                        &db,
                         MUTATION_QUERIES,
                         "remove_person",
                         &mixed_params(&[("$name", name)], &[]),
@@ -993,24 +1005,28 @@ fn concurrent_universe(root: &'static str, seed: u64) -> (Vec<(String, i64)>, us
             omnigraph::dst_clock::LogicalClock::default(),
         ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init shared root");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init shared root"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("seed data");
         drop(db);
 
         let mut handles = Vec::new();
         for actor_seed in actor_seeds {
-            let actor_db = Omnigraph::open_with_storage(root, storage.clone())
-                .await
-                .expect("actor handle on shared root");
+            let actor_db = session(
+                Omnigraph::open_with_storage(root, storage.clone())
+                    .await
+                    .expect("actor handle on shared root"),
+            );
             handles.push(tokio::task::spawn_local(actor_workload(
                 actor_db, actor_seed, 12,
             )));
@@ -1019,9 +1035,11 @@ fn concurrent_universe(root: &'static str, seed: u64) -> (Vec<(String, i64)>, us
             handle.await.expect("actor task join");
         }
 
-        let db = Omnigraph::open_with_storage(root, storage)
-            .await
-            .expect("post-run handle");
+        let db = session(
+            Omnigraph::open_with_storage(root, storage)
+                .await
+                .expect("post-run handle"),
+        );
         end_state(&db).await
     })
 }
@@ -1075,11 +1093,12 @@ async fn dst_memory_graph_end_to_end() {
     let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
 
     // Init + load + index, all in memory.
-    let mut db =
+    let db = session(
         Omnigraph::init_with_storage(uri, TEST_SCHEMA, storage.clone(), InitOptions::default())
             .await
-            .expect("init on shared-memory root");
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            .expect("init on shared-memory root"),
+    );
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("load test data");
     db.ensure_indices().await.expect("ensure indices");
@@ -1089,7 +1108,7 @@ async fn dst_memory_graph_end_to_end() {
 
     // Mutate through the normal write path so a commit happens in-memory.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "DstSpike")], &[("$age", 1)]),
@@ -1101,9 +1120,11 @@ async fn dst_memory_graph_end_to_end() {
     // Reopen through a FRESH handle sharing only the adapter + the process:
     // proves both storage realms persist independent of the first handle.
     drop(db);
-    let db2 = Omnigraph::open_with_storage(uri, storage)
-        .await
-        .expect("reopen on shared-memory root");
+    let db2 = session(
+        Omnigraph::open_with_storage(uri, storage)
+            .await
+            .expect("reopen on shared-memory root"),
+    );
     assert_eq!(
         count_rows(&db2, "node:Person").await,
         persons + 1,
@@ -2359,15 +2380,17 @@ fn dst_lance_bytes_canary() {
             omnigraph::dst_clock::LogicalClock::default(),
         ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("fixtures");
         drop(db);
@@ -2567,15 +2590,17 @@ fn reborn_branch_cache_poison_body() {
             omnigraph::dst_clock::LogicalClock::default(),
         ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-f9-standalone",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-f9-standalone",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
         macro_rules! m {
@@ -2585,7 +2610,7 @@ fn reborn_branch_cache_poison_body() {
             };
         }
         // The two arming reads: exactly observe_world's surface.
-        async fn world_read(db: &Omnigraph) {
+        async fn world_read(db: &Session) {
             let mut names = db.branch_list().await.expect("branch list");
             names.sort();
             for name in names {
@@ -2593,7 +2618,7 @@ fn reborn_branch_cache_poison_body() {
                 let _ = Box::pin(omnigraph_dst::fixtures::knows_pairs_on(db, &name)).await;
             }
         }
-        let mut db = db;
+        let db = db;
         m!(
             db,
             "main",
@@ -2821,12 +2846,12 @@ fn dst_reborn_branch_cache_poison_minimal_shape_probe() {
         // EXACTLY observe_world's reads: person traversal + edge traversal
         // on the branch (the query channel — graph index machinery), not a
         // raw snapshot scan.
-        async fn read_branch(db: &Omnigraph, branch: &str) -> usize {
+        async fn read_branch(db: &Session, branch: &str) -> usize {
             let p = Box::pin(omnigraph_dst::fixtures::person_rows_on(db, branch)).await;
             let e = Box::pin(omnigraph_dst::fixtures::knows_pairs_on(db, branch)).await;
             p.len() + e.len()
         }
-        async fn insert(db: &mut Omnigraph, branch: &str, name: &str, age: i64) -> String {
+        async fn insert(db: &Session, branch: &str, name: &str, age: i64) -> String {
             let params = mixed_params(&[("$name", name)], &[("$age", age)]);
             match mutate_on(db, branch, MUTATION_QUERIES, "insert_person", &params).await {
                 Ok(_) => "OK".to_string(),
@@ -2837,68 +2862,74 @@ fn dst_reborn_branch_cache_poison_minimal_shape_probe() {
         // (a) fork -> read -> first write
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                &format!("{root_base}-a"),
-                TEST_SCHEMA,
-                storage,
-                InitOptions::default(),
-            )
-            .await
-            .expect("init a");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &format!("{root_base}-a"),
+                    TEST_SCHEMA,
+                    storage,
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init a"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures a");
             db.branch_create("b0").await.expect("branch a");
             let n = read_branch(&db, "b0").await;
-            let v = insert(&mut db, "b0", "mina", 1).await;
+            let v = insert(&db, "b0", "mina", 1).await;
             println!("dst cache-poison min (a) fork->read({n})->write: {v}");
         }
         // (b) prior churn on main, then fork -> read -> first write
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                &format!("{root_base}-b"),
-                TEST_SCHEMA,
-                storage,
-                InitOptions::default(),
-            )
-            .await
-            .expect("init b");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &format!("{root_base}-b"),
+                    TEST_SCHEMA,
+                    storage,
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init b"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures b");
             for i in 0..6 {
-                insert(&mut db, "main", &format!("mc{i}"), i).await;
+                insert(&db, "main", &format!("mc{i}"), i).await;
             }
             db.branch_create("b0").await.expect("branch b");
             let n = read_branch(&db, "b0").await;
-            let v = insert(&mut db, "b0", "minb", 2).await;
+            let v = insert(&db, "b0", "minb", 2).await;
             println!("dst cache-poison min (b) churn->fork->read({n})->write: {v}");
         }
         // (c) the second-life shape: fork, write, merge back, delete,
         // re-create, READ the reborn branch, then its first write.
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                &format!("{root_base}-c"),
-                TEST_SCHEMA,
-                storage,
-                InitOptions::default(),
-            )
-            .await
-            .expect("init c");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &format!("{root_base}-c"),
+                    TEST_SCHEMA,
+                    storage,
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init c"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures c");
             db.branch_create("b0").await.expect("branch c1");
-            insert(&mut db, "b0", "life1", 3).await;
+            insert(&db, "b0", "life1", 3).await;
             Box::pin(db.branch_merge("b0", "main"))
                 .await
                 .expect("merge c");
             Box::pin(db.branch_delete("b0")).await.expect("delete c");
             db.branch_create("b0").await.expect("branch c2");
             let n = read_branch(&db, "b0").await;
-            let v = insert(&mut db, "b0", "life2", 4).await;
+            let v = insert(&db, "b0", "life2", 4).await;
             println!(
                 "dst cache-poison min (c) life1->merge->delete->rebirth->read({n})->write: {v}"
             );
@@ -2935,24 +2966,26 @@ fn dst_predict_born_on_both_person_probe() {
         let _clock = omnigraph::dst_clock::CLOCK.install(std::sync::Arc::new(
             omnigraph::dst_clock::LogicalClock::default(),
         ));
-        let mut db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                root,
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("fixtures");
         db.branch_create("bb").await.expect("branch");
         // Same @key, same values, born on BOTH sides since the fork.
         let params = mixed_params(&[("$name", "bob2")], &[("$age", 41)]);
-        mutate_on(&mut db, "bb", MUTATION_QUERIES, "insert_person", &params)
+        mutate_on(&db, "bb", MUTATION_QUERIES, "insert_person", &params)
             .await
             .expect("insert on branch");
-        mutate_on(&mut db, "main", MUTATION_QUERIES, "insert_person", &params)
+        mutate_on(&db, "main", MUTATION_QUERIES, "insert_person", &params)
             .await
             .expect("insert on main");
         let merge = Box::pin(db.branch_merge("bb", "main")).await;
@@ -2973,10 +3006,10 @@ fn dst_predict_born_on_both_person_probe() {
         let p2b = mixed_params(&[("$name", "carol2")], &[("$age", 10)]);
         let p2m = mixed_params(&[("$name", "carol2")], &[("$age", 99)]);
         db.branch_create("bb2").await.expect("branch 2");
-        mutate_on(&mut db, "bb2", MUTATION_QUERIES, "insert_person", &p2b)
+        mutate_on(&db, "bb2", MUTATION_QUERIES, "insert_person", &p2b)
             .await
             .expect("insert on branch 2");
-        mutate_on(&mut db, "main", MUTATION_QUERIES, "insert_person", &p2m)
+        mutate_on(&db, "main", MUTATION_QUERIES, "insert_person", &p2m)
             .await
             .expect("insert on main 2");
         match Box::pin(db.branch_merge("bb2", "main")).await {
@@ -3457,14 +3490,16 @@ fn dst_v11_conservation_transfers() {
                 omnigraph::dst_clock::LogicalClock::default(),
             ));
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let mut db = Omnigraph::init_with_storage(
-                root,
-                TEST_SCHEMA,
-                storage.clone(),
-                InitOptions::default(),
-            )
-            .await
-            .expect("init");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init"),
+            );
 
             // Accounts: 4 people, ages summing to a fixed total.
             let accounts = ["acc0", "acc1", "acc2", "acc3"];
@@ -3475,7 +3510,7 @@ fn dst_v11_conservation_transfers() {
             for (name, bal) in &balances {
                 ver += 1;
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "insert_person_v",
                     &mixed_params(&[("$name", name)], &[("$age", *bal), ("$ver", ver)]),
@@ -3502,7 +3537,7 @@ fn dst_v11_conservation_transfers() {
                 ver += 1;
                 let vb = ver;
                 mutate_main(
-                    &mut db,
+                    &db,
                     MUTATION_QUERIES,
                     "transfer",
                     &mixed_params(
@@ -3623,15 +3658,17 @@ fn dst_lever2_branch_lifecycle() {
                 omnigraph::dst_clock::LogicalClock::default(),
             ));
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let db = Omnigraph::init_with_storage(
-                root,
-                TEST_SCHEMA,
-                storage.clone(),
-                InitOptions::default(),
-            )
-            .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("load");
 
@@ -3695,15 +3732,17 @@ fn dst_merge_version_collision_diverged_edge_table() {
             omnigraph::dst_clock::LogicalClock::default(),
         ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-merge-collision",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-merge-collision",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -3807,15 +3846,17 @@ fn dst_merge_duplicates_born_on_both_edge() {
             omnigraph::dst_clock::LogicalClock::default(),
         ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-class-probe",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-class-probe",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -3952,15 +3993,17 @@ edge WorksAt: Person -> Company
             omnigraph::dst_clock::LogicalClock::default(),
         ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-keyed-born-on-both",
-            KEYED_TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-keyed-born-on-both",
+                KEYED_TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -4080,7 +4123,7 @@ fn dst_classa_ablation_matrix_body() {
         ))
         .build_local(Default::default())
         .expect("seeded runtime");
-    async fn upsert(db: &Omnigraph, br: &str, name: &str, age: i64, ver: i64) {
+    async fn upsert(db: &Session, br: &str, name: &str, age: i64, ver: i64) {
         db.mutate(
             br,
             MUTATION_QUERIES,
@@ -4098,15 +4141,15 @@ fn dst_classa_ablation_matrix_body() {
             let (o, c, r) = (combo & 1 != 0, combo & 2 != 0, combo & 4 != 0);
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
             let root = format!("shared-memory://dst-classa-{combo}");
-            let mut db = Omnigraph::init_with_storage(
+            let db = session(Omnigraph::init_with_storage(
                 &root,
                 TEST_SCHEMA,
                 storage.clone(),
                 InitOptions::default(),
             )
             .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            .expect("init"));
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("load");
             // Churn: births + rewrite-upserts (deletion files) on main.
@@ -4190,15 +4233,15 @@ fn dst_classa_ablation_matrix_body() {
         // second merge, and the Knows fork before the Person fork.
         {
             let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-            let db = Omnigraph::init_with_storage(
+            let db = session(Omnigraph::init_with_storage(
                 "shared-memory://dst-classa-faithful",
                 TEST_SCHEMA,
                 storage.clone(),
                 InitOptions::default(),
             )
             .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            .expect("init"));
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("load");
             macro_rules! m {
@@ -4206,7 +4249,7 @@ fn dst_classa_ablation_matrix_body() {
                     $db.mutate($br, MUTATION_QUERIES, $q, &mixed_params($s, $n)).await
                 };
             }
-            let mut db = db;
+            let db = db;
             m!(db, "main", "set_age_v", &[("$name", "w5")], &[("$age", 70), ("$ver", 1)]).expect("op0");
             m!(db, "main", "insert_person", &[("$name", "w6")], &[("$age", 7)]).expect("op1");
             db.branch_create("b0").await.expect("op2");
@@ -4281,15 +4324,17 @@ fn dst_liveness_oracle_survives_cross_thread_work() {
             omnigraph::dst_clock::LogicalClock::default(),
         ));
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            "shared-memory://dst-liveness-bound",
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = session(
+            Omnigraph::init_with_storage(
+                "shared-memory://dst-liveness-bound",
+                TEST_SCHEMA,
+                storage.clone(),
+                InitOptions::default(),
+            )
+            .await
+            .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load");
 
@@ -5052,15 +5097,17 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
             .expect("setup runtime");
         let storage = storage.clone();
         runtime.block_on(async move {
-            let db = Omnigraph::init_with_storage(
-                root,
-                TEST_SCHEMA,
-                storage.clone(),
-                InitOptions::default(),
-            )
-            .await
-            .expect("init");
-            load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+            let db = session(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init"),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
                 .await
                 .expect("fixtures");
             drop(db);
@@ -5090,9 +5137,11 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                         .build_local(Default::default())
                         .expect("optimize runtime");
                     runtime.block_on(Box::pin(async move {
-                        let mut db = Omnigraph::open_with_storage(root, storage)
-                            .await
-                            .expect("optimize handle");
+                        let db = session(
+                            Omnigraph::open_with_storage(root, storage)
+                                .await
+                                .expect("optimize handle"),
+                        );
                         barrier.wait();
                         for round in 0..80u32 {
                             // Real work first: an optimize over an unchanged
@@ -5104,8 +5153,8 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                     &[("$name", name)],
                                     &[("$age", (round as i64) * 2 + j as i64 + 1)],
                                 );
-                                let _ = mutate_main(&mut db, MUTATION_QUERIES, "set_age", &params)
-                                    .await;
+                                let _ =
+                                    mutate_main(&db, MUTATION_QUERIES, "set_age", &params).await;
                             }
                             match Box::pin(db.optimize()).await {
                                 Ok(_) => {}
@@ -5155,9 +5204,11 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                         .build_local(Default::default())
                         .expect("churn runtime");
                     runtime.block_on(Box::pin(async move {
-                        let mut db = Omnigraph::open_with_storage(root, storage)
-                            .await
-                            .expect("churn handle");
+                        let db = session(
+                            Omnigraph::open_with_storage(root, storage)
+                                .await
+                                .expect("churn handle"),
+                        );
                         barrier.wait();
                         let mut i = 0u64;
                         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
@@ -5182,14 +5233,9 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                 &[("$name", format!("f12p{i}").as_str())],
                                 &[("$age", 77)],
                             );
-                            let _ = mutate_on(
-                                &mut db,
-                                &name,
-                                MUTATION_QUERIES,
-                                "insert_person",
-                                &params,
-                            )
-                            .await;
+                            let _ =
+                                mutate_on(&db, &name, MUTATION_QUERIES, "insert_person", &params)
+                                    .await;
                             if let Err(err) = Box::pin(db.branch_delete(&name)).await {
                                 let rendered = format!("{err:?}");
                                 assert!(

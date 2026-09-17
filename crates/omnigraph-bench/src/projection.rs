@@ -15,6 +15,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
@@ -28,8 +29,10 @@ use nix::fcntl::{Flock, FlockArg, OFlag, openat, renameat};
 use nix::sys::stat::{Mode, mkdirat};
 #[cfg(unix)]
 use nix::unistd::{UnlinkatFlags, unlinkat};
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph_compiler::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::result::QueryResult;
@@ -1102,15 +1105,20 @@ pub async fn rebuild_projection(
         })?;
     let graph_path = staging.path().join(GRAPH_DIRECTORY);
     let graph_uri = path_to_utf8(&graph_path)?;
-    let db = Omnigraph::init(graph_uri, PROJECTION_SCHEMA)
-        .await
-        .map_err(|error| {
-            ProjectionError::new(
-                "projection_graph_init_failed",
-                Some(&graph_path),
-                error.to_string(),
-            )
-        })?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::init(graph_uri, PROJECTION_SCHEMA)
+                .await
+                .map_err(|error| {
+                    ProjectionError::new(
+                        "projection_graph_init_failed",
+                        Some(&graph_path),
+                        error.to_string(),
+                    )
+                })?,
+        ),
+        SessionSettings::default(),
+    );
 
     load_points(&db, inventory.points.values()).await?;
     load_runs(&db, load_records).await?;
@@ -1747,7 +1755,7 @@ fn run_row(
 }
 
 async fn load_points<'a>(
-    db: &Omnigraph,
+    db: &Session,
     points: impl Iterator<Item = &'a PointRow>,
 ) -> Result<(), ProjectionError> {
     let mut batch = NdjsonBatch::default();
@@ -1766,7 +1774,7 @@ async fn load_points<'a>(
     Ok(())
 }
 
-async fn load_runs(db: &Omnigraph, records: ArchiveRecordIter) -> Result<(), ProjectionError> {
+async fn load_runs(db: &Session, records: ArchiveRecordIter) -> Result<(), ProjectionError> {
     let mut batch = NdjsonBatch::default();
     for archived in records {
         let archived = archived.map_err(projection_archive_error)?;
@@ -1793,7 +1801,7 @@ async fn load_runs(db: &Omnigraph, records: ArchiveRecordIter) -> Result<(), Pro
     Ok(())
 }
 
-async fn load_batch(db: &Omnigraph, body: &str) -> Result<(), ProjectionError> {
+async fn load_batch(db: &Session, body: &str) -> Result<(), ProjectionError> {
     db.load_graph_batch("main", body, LoadMode::Append)
         .await
         .map_err(|error| {
@@ -1831,15 +1839,20 @@ async fn verify_generation(
 
     let graph_path = generation_root.join(&manifest.graph_relative_path);
     let graph_path = require_real_directory(&graph_path, "projection_graph_invalid")?;
-    let db = Omnigraph::open_read_only(path_to_utf8(&graph_path)?)
-        .await
-        .map_err(|error| {
-            ProjectionError::new(
-                "projection_graph_open_failed",
-                Some(&graph_path),
-                error.to_string(),
-            )
-        })?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::open_read_only(path_to_utf8(&graph_path)?)
+                .await
+                .map_err(|error| {
+                    ProjectionError::new(
+                        "projection_graph_open_failed",
+                        Some(&graph_path),
+                        error.to_string(),
+                    )
+                })?,
+        ),
+        SessionSettings::default(),
+    );
     let observed = scan_graph_inventory(
         &db,
         expected_inventory,
@@ -1906,7 +1919,7 @@ async fn verify_generation(
 }
 
 async fn verify_graph_inventory(
-    db: &Omnigraph,
+    db: &Session,
     expected: &[InventoryEntry],
     expected_projected_rows_sha256: &str,
     expected_record_count: u64,
@@ -1935,7 +1948,7 @@ async fn verify_graph_inventory(
 }
 
 async fn scan_graph_inventory(
-    db: &Omnigraph,
+    db: &Session,
     expected: Option<&[InventoryEntry]>,
     expected_head: Option<&str>,
     path: Option<&Path>,
@@ -2097,7 +2110,7 @@ fn parse_inventory_page(
 }
 
 async fn scan_projected_rows(
-    db: &Omnigraph,
+    db: &Session,
     expected_head: Option<&str>,
     path: Option<&Path>,
 ) -> Result<ProjectedRowsScan, ProjectionError> {
@@ -2126,7 +2139,7 @@ async fn scan_projected_rows(
 }
 
 async fn scan_projected_point_rows(
-    db: &Omnigraph,
+    db: &Session,
     expected_head: Option<&str>,
     path: Option<&Path>,
 ) -> Result<(Sha256, usize, String), ProjectionError> {
@@ -2188,7 +2201,7 @@ async fn scan_projected_point_rows(
 }
 
 async fn scan_projected_run_rows(
-    db: &Omnigraph,
+    db: &Session,
     expected_head: Option<&str>,
     path: Option<&Path>,
 ) -> Result<(Sha256, usize, String), ProjectionError> {
@@ -2383,7 +2396,7 @@ fn observe_scan_head(
 
 async fn open_current_generation(
     projection_root: &Path,
-) -> Result<(Omnigraph, ProjectionManifestV1), ProjectionError> {
+) -> Result<(Session, ProjectionManifestV1), ProjectionError> {
     let pointer_path = projection_root.join(CURRENT_FILE);
     let pointer: CurrentPointerV1 = read_canonical_json(
         &pointer_path,
@@ -2435,22 +2448,27 @@ async fn open_current_generation(
     }
     let graph_path = generation_root.join(&manifest.graph_relative_path);
     let graph_path = require_real_directory(&graph_path, "projection_graph_invalid")?;
-    let db = Omnigraph::open_read_only(path_to_utf8(&graph_path)?)
-        .await
-        .map_err(|error| {
-            ProjectionError::new(
-                "projection_graph_open_failed",
-                Some(&graph_path),
-                error.to_string(),
-            )
-        })?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::open_read_only(path_to_utf8(&graph_path)?)
+                .await
+                .map_err(|error| {
+                    ProjectionError::new(
+                        "projection_graph_open_failed",
+                        Some(&graph_path),
+                        error.to_string(),
+                    )
+                })?,
+        ),
+        SessionSettings::default(),
+    );
     Ok((db, manifest))
 }
 
 async fn open_generation_by_id(
     projection_root: &Path,
     generation_id: &str,
-) -> Result<(Omnigraph, ProjectionManifestV1), ProjectionError> {
+) -> Result<(Session, ProjectionManifestV1), ProjectionError> {
     require_sha256(generation_id, "cursor generation id")?;
     let generation_root = projection_root
         .join(GENERATIONS_DIRECTORY)
@@ -2473,15 +2491,20 @@ async fn open_generation_by_id(
     }
     let graph_path = generation_root.join(&manifest.graph_relative_path);
     let graph_path = require_real_directory(&graph_path, "projection_graph_invalid")?;
-    let db = Omnigraph::open_read_only(path_to_utf8(&graph_path)?)
-        .await
-        .map_err(|error| {
-            ProjectionError::new(
-                "projection_graph_open_failed",
-                Some(&graph_path),
-                error.to_string(),
-            )
-        })?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::open_read_only(path_to_utf8(&graph_path)?)
+                .await
+                .map_err(|error| {
+                    ProjectionError::new(
+                        "projection_graph_open_failed",
+                        Some(&graph_path),
+                        error.to_string(),
+                    )
+                })?,
+        ),
+        SessionSettings::default(),
+    );
     Ok((db, manifest))
 }
 
@@ -4505,9 +4528,14 @@ mod tests {
     async fn projection_schema_accepts_rows_and_named_queries() {
         let root = tempfile::tempdir().unwrap();
         let graph = root.path().join("graph");
-        let db = Omnigraph::init(path_to_utf8(&graph).unwrap(), PROJECTION_SCHEMA)
-            .await
-            .unwrap();
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init(path_to_utf8(&graph).unwrap(), PROJECTION_SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
         let point_id = "a".repeat(64);
         let record_sha256 = "b".repeat(64);
         let point = PointRow {

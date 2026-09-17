@@ -2930,7 +2930,7 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
 #[tokio::test]
 async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     use crate::db::Omnigraph;
-    use crate::loader::{LoadMode, load_jsonl};
+    use crate::loader::LoadMode;
 
     let schema = "node Person {\n    name: String @key\n    age: I32?\n}\n";
     let seed = "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n\
@@ -2940,10 +2940,11 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // before upgrading.
     let dir_old = tempfile::tempdir().unwrap();
     let uri_old = dir_old.path().to_str().unwrap();
-    let db_old = Omnigraph::init(uri_old, schema).await.unwrap();
-    load_jsonl(&db_old, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db_old = crate::Session::from_defaults(
+        std::sync::Arc::new(Omnigraph::init(uri_old, schema).await.unwrap()),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    db_old.load_jsonl(seed, LoadMode::Overwrite).await.unwrap();
     let exported = db_old.export_jsonl("main", &[]).await.unwrap();
     assert!(
         exported.contains("alice") && exported.contains("bob"),
@@ -2976,8 +2977,12 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // Rebuild with this binary: fresh init + load the export.
     let dir_new = tempfile::tempdir().unwrap();
     let uri_new = dir_new.path().to_str().unwrap();
-    let db_new = Omnigraph::init(uri_new, schema).await.unwrap();
-    load_jsonl(&db_new, &exported, LoadMode::Overwrite)
+    let db_new = crate::Session::from_defaults(
+        std::sync::Arc::new(Omnigraph::init(uri_new, schema).await.unwrap()),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    db_new
+        .load_jsonl(&exported, LoadMode::Overwrite)
         .await
         .unwrap();
 

@@ -145,19 +145,20 @@ pub(crate) fn resolve_query_decls(
             }
         };
         let queries = match parse_query(&source) {
-            Ok(QueryFile::Queries(queries)) => queries,
-            Ok(QueryFile::Branch(stmt)) => {
-                diagnostics.push(Diagnostic::error(
-                    "query_parse_error",
-                    format!("graphs.{graph_id}.queries"),
-                    format!(
-                        "'{}' is not a stored-query file: {}",
-                        resolved.display(),
-                        stmt.not_a_declaration_message()
-                    ),
-                ));
-                continue;
-            }
+            Ok(file) => match stored_declarations(file) {
+                Ok(queries) => queries,
+                Err(message) => {
+                    diagnostics.push(Diagnostic::error(
+                        "query_parse_error",
+                        format!("graphs.{graph_id}.queries"),
+                        format!(
+                            "'{}' is not a stored-query file: {message}",
+                            resolved.display()
+                        ),
+                    ));
+                    continue;
+                }
+            },
             Err(err) => {
                 diagnostics.push(Diagnostic::error(
                     "query_parse_error",
@@ -1090,13 +1091,11 @@ pub(crate) fn validate_query_source(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let path = format!("graphs.{graph_id}.queries.{query_name}");
-    match parse_query(source) {
-        Ok(QueryFile::Branch(stmt)) => diagnostics.push(Diagnostic::error(
-            "query_parse_error",
-            path,
-            stmt.not_a_declaration_message(),
-        )),
-        Ok(QueryFile::Queries(queries)) => {
+    match parse_query(source)
+        .map_err(|err| err.to_string())
+        .and_then(stored_declarations)
+    {
+        Ok(queries) => {
             let Some(query_decl) = queries.iter().find(|q| q.name == query_name) else {
                 diagnostics.push(Diagnostic::error(
                     "query_key_mismatch",
@@ -1121,12 +1120,20 @@ pub(crate) fn validate_query_source(
                 ));
             }
         }
-        Err(err) => diagnostics.push(Diagnostic::error(
-            "query_parse_error",
-            path,
-            err.to_string(),
-        )),
+        Err(message) => diagnostics.push(Diagnostic::error("query_parse_error", path, message)),
     }
+}
+
+/// The declarations of a stored `.gq` source. A settings prefix, a branch
+/// statement and a `show` statement are refused by name: a stored query runs
+/// under the process defaults and is always a declaration.
+fn stored_declarations(
+    file: QueryFile,
+) -> Result<Vec<omnigraph_compiler::query::ast::QueryDecl>, String> {
+    if !file.settings.is_empty() {
+        return Err(omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS.to_string());
+    }
+    file.into_declarations()
 }
 
 /// Keys that existed in an unreleased development line and were removed.

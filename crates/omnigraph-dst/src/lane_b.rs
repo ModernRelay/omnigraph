@@ -39,7 +39,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use omnigraph::db::Omnigraph;
+use omnigraph::Session;
 
 use crate::fixtures::{
     fixture_knows, fixture_persons, knows_pairs_on, person_rows_on, physical_view_on,
@@ -181,7 +181,7 @@ fn assert_fixtures_intact(
 /// mismatch, channel disagreement, duplicate row, damaged fixture row),
 /// and on op-log corruption via [`oplog::parse`].
 pub async fn lane_b_replay_judge(
-    db: &Omnigraph,
+    db: &Session,
     log: &str,
     prefix: &str,
     label: &str,
@@ -298,7 +298,7 @@ pub async fn lane_b_replay_judge(
 /// matching. Persons only: edge cascade semantics on remove are not
 /// pinned here, so raw physical edges are not compared.
 async fn channel_agreement(
-    db: &Omnigraph,
+    db: &Session,
     branch: &str,
     prefix: &str,
     persons_query: &Persons,
@@ -314,7 +314,7 @@ async fn channel_agreement(
 }
 
 async fn weather_judge(
-    db: &Omnigraph,
+    db: &Session,
     s: &oplog::OplogSummary,
     prefix: &str,
     label: &str,

@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::{QueryDecl, QueryFile};
+use omnigraph_compiler::query::ast::QueryDecl;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
+use omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS;
 use omnigraph_compiler::types::{PropType, ScalarType};
 
 /// One loaded stored query. `source` is the full `.gq` file text — the
@@ -105,38 +106,41 @@ impl QueryRegistry {
         let mut errors = Vec::new();
 
         for spec in specs {
-            match parse_query(&spec.source) {
-                Ok(QueryFile::Branch(stmt)) => errors.push(LoadError {
-                    query: Some(spec.name),
-                    message: stmt.not_a_declaration_message(),
-                }),
-                Ok(QueryFile::Queries(queries)) => {
-                    match queries.into_iter().find(|q| q.name == spec.name) {
-                        Some(decl) => {
-                            by_name.insert(
-                                spec.name.clone(),
-                                StoredQuery {
-                                    name: spec.name,
-                                    source: Arc::from(spec.source),
-                                    decl,
-                                    expose: spec.expose,
-                                    tool_name: spec.tool_name,
-                                },
-                            );
-                        }
-                        None => errors.push(LoadError {
-                            query: Some(spec.name.clone()),
-                            message: format!(
-                                "no `query {}` declaration found in its `.gq` file \
-                                 (the registry key must match the query symbol)",
-                                spec.name
-                            ),
-                        }),
+            let declarations = parse_query(&spec.source)
+                .map_err(|err| err.to_string())
+                .and_then(|file| {
+                    if file.settings.is_empty() {
+                        file.into_declarations()
+                    } else {
+                        Err(STORED_QUERY_CARRIES_NO_SETTINGS.to_string())
                     }
-                }
-                Err(err) => errors.push(LoadError {
+                });
+            match declarations {
+                Ok(queries) => match queries.into_iter().find(|q| q.name == spec.name) {
+                    Some(decl) => {
+                        by_name.insert(
+                            spec.name.clone(),
+                            StoredQuery {
+                                name: spec.name,
+                                source: Arc::from(spec.source),
+                                decl,
+                                expose: spec.expose,
+                                tool_name: spec.tool_name,
+                            },
+                        );
+                    }
+                    None => errors.push(LoadError {
+                        query: Some(spec.name.clone()),
+                        message: format!(
+                            "no `query {}` declaration found in its `.gq` file \
+                                 (the registry key must match the query symbol)",
+                            spec.name
+                        ),
+                    }),
+                },
+                Err(message) => errors.push(LoadError {
                     query: Some(spec.name),
-                    message: err.to_string(),
+                    message,
                 }),
             }
         }

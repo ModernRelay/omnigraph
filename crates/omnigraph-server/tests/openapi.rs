@@ -7,7 +7,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_server::{AppState, build_app, served_openapi};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -31,8 +31,11 @@ async fn init_loaded_graph() -> tempfile::TempDir {
     Omnigraph::init(graph.to_str().unwrap(), &schema)
         .await
         .unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let db = omnigraph::Session::from_defaults(
+        std::sync::Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap()),
+        omnigraph::settings::SessionSettings::default(),
+    );
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
     temp
 }
 

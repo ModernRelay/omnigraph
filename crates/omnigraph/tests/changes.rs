@@ -168,15 +168,17 @@ async fn diff_empty_when_nothing_changed() {
 async fn diff_pairs_type_renames_by_identity_and_separates_reincarnations() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        r#"
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            r#"
 node Person { name: String @key }
 node Anchor { name: String @key }
 "#,
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap(),
+    );
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Alice"}}"#,
@@ -263,11 +265,11 @@ node Anchor { name: String @key }
 #[tokio::test]
 async fn diff_detects_node_insert() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = snapshot_id(&db, "main").await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -303,11 +305,11 @@ async fn diff_detects_node_insert() {
 #[tokio::test]
 async fn diff_detects_node_update() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = snapshot_id(&db, "main").await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
@@ -336,11 +338,11 @@ async fn diff_detects_node_update() {
 #[tokio::test]
 async fn diff_detects_node_delete_with_cascade() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = snapshot_id(&db, "main").await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "remove_person",
         &params(&[("$name", "Alice")]),
@@ -403,11 +405,11 @@ async fn diff_detects_node_delete_with_cascade() {
 #[tokio::test]
 async fn diff_detects_edge_insert_with_endpoints() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = snapshot_id(&db, "main").await.unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Bob"), ("$to", "Charlie")]),
@@ -448,12 +450,12 @@ async fn diff_detects_edge_insert_with_endpoints() {
 #[tokio::test]
 async fn filter_by_type_name_skips_non_matching() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = snapshot_id(&db, "main").await.unwrap();
 
     // Insert a person (node:Person) and add a friend (edge:Knows)
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "FilterTest")], &[("$age", 30)]),
@@ -482,12 +484,12 @@ async fn filter_by_type_name_skips_non_matching() {
 #[tokio::test]
 async fn filter_by_op_skips_unwanted_operations() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let v_before = snapshot_id(&db, "main").await.unwrap();
 
     // Insert Eve, update Bob, delete Alice
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -496,7 +498,7 @@ async fn filter_by_op_skips_unwanted_operations() {
     .unwrap();
 
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
@@ -532,16 +534,16 @@ async fn filter_by_op_skips_unwanted_operations() {
 async fn diff_after_merge_reports_actual_changes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.ensure_indices().await.unwrap();
     let v_before_branch = snapshot_id(&main, "main").await.unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Main updates Bob
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -551,7 +553,7 @@ async fn diff_after_merge_reports_actual_changes() {
 
     // Feature inserts Eve
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -610,9 +612,9 @@ async fn diff_commits_resolves_feature_commit_from_main_handle() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -657,9 +659,9 @@ async fn cross_branch_diff_honors_insert_only_filter() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -709,9 +711,9 @@ async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -742,11 +744,11 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     let before = snapshot_id(&feature, "feature").await.unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -755,7 +757,7 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
     .await
     .unwrap();
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "remove_person",
@@ -790,11 +792,11 @@ async fn same_branch_diff_across_first_lazy_fork_detects_update() {
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     let before = snapshot_id(&feature, "feature").await.unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -819,9 +821,9 @@ async fn diff_commits_cross_branch_reports_property_only_updates() {
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -848,13 +850,13 @@ async fn diff_commits_cross_branch_reports_property_only_updates() {
 async fn diff_commits_ignores_row_version_only_differences() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -865,7 +867,7 @@ async fn diff_commits_ignores_row_version_only_differences() {
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 55)]),
@@ -900,7 +902,7 @@ query set_body($slug: String, $body: String) {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
     // body omitted → null on main.
     db.load_with_receipt(
         "main",
@@ -912,10 +914,10 @@ query set_body($slug: String, $body: String) {
     let main_commit = head_commit_id(uri, None).await;
 
     db.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     // Set body to the empty string on feature: null → "".
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         SET_BODY,
         "set_body",
@@ -953,7 +955,7 @@ query set_notes($slug: String, $notes: String) {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
     db.load_with_receipt(
         "main",
         r#"{"type":"Doc","data":{"slug":"x","row_notes":"before"}}"#,
@@ -964,9 +966,9 @@ query set_notes($slug: String, $notes: String) {
     let main_commit = head_commit_id(uri, None).await;
 
     db.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         SET_NOTES,
         "set_notes",
@@ -1008,17 +1010,19 @@ async fn commit_changes_detects_same_length_blob_only_update_across_fragments() 
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        r#"
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            r#"
 node Document {
     title: String @key
     payload: Blob?
 }
 "#,
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap(),
+    );
 
     db.load_with_receipt(
         "main",
@@ -1085,7 +1089,7 @@ async fn change_feed_detects_same_length_blob_only_update() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap());
 
     db.load_with_receipt(
         "main",
@@ -1139,7 +1143,7 @@ async fn change_feed_detects_same_length_blob_only_update() {
 async fn cross_branch_diff_detects_same_length_blob_only_update() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap());
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
@@ -1150,7 +1154,7 @@ async fn cross_branch_diff_detects_same_length_blob_only_update() {
     let main_commit = head_commit_id(uri, None).await;
 
     db.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .load_with_receipt(
             "feature",
@@ -1189,7 +1193,7 @@ async fn cross_branch_diff_detects_same_length_blob_only_update() {
 async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branches() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap());
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
@@ -1203,7 +1207,7 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
 
     // "B" on branch-a and "C" on branch-b: both one byte, both relocate `doc`
     // to the first forked fragment, so the two managed descriptors collide.
-    let a = Omnigraph::open(uri).await.unwrap();
+    let a = helpers::session(Omnigraph::open(uri).await.unwrap());
     a.load_with_receipt(
         "branch-a",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qg=="}}"#,
@@ -1213,7 +1217,7 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
     .unwrap();
     let a_commit = head_commit_id(uri, Some("branch-a")).await;
 
-    let b = Omnigraph::open(uri).await.unwrap();
+    let b = helpers::session(Omnigraph::open(uri).await.unwrap());
     b.load_with_receipt(
         "branch-b",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:Qw=="}}"#,
@@ -1251,7 +1255,7 @@ async fn commit_changes_detects_same_length_blob_update_after_overwrite() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap());
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
@@ -1300,7 +1304,7 @@ async fn change_feed_detects_same_length_blob_update_after_overwrite() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, BLOB_DOC_SCHEMA).await.unwrap());
     db.load_with_receipt(
         "main",
         r#"{"type":"Document","data":{"title":"doc","payload":"base64:QQ=="}}"#,
@@ -1356,12 +1360,14 @@ async fn commit_changes_falls_back_for_overwrite_that_removes_an_id() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        "node Doc {\n    slug: String @key\n    body: String?\n}",
-    )
-    .await
-    .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            "node Doc {\n    slug: String @key\n    body: String?\n}",
+        )
+        .await
+        .unwrap(),
+    );
     db.load_with_receipt(
         "main",
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"x\",\"body\":\"a\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"y\",\"body\":\"b\"}}",
@@ -1685,17 +1691,19 @@ async fn commit_changes_use_the_commit_era_physical_schema() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        r#"
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            r#"
 node Document {
     title: String @key
     payload: String?
 }
 "#,
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap(),
+    );
     let scope = ChangeFeedScope::default();
     let old_commit = db
         .load_with_receipt(
@@ -1764,18 +1772,20 @@ async fn commit_changes_suppress_unchanged_blob_rows_and_physical_only_commits()
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        r#"
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            r#"
 node Document {
     title: String @key
     note: String?
     payload: Blob?
 }
 "#,
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap(),
+    );
     let scope = ChangeFeedScope::default();
     db.load_with_receipt(
         "main",
@@ -1857,9 +1867,10 @@ async fn commit_changes_update_carries_exact_before_and_after_images_including_n
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        r#"
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            r#"
 node Note {
     slug: String @key
     body: String?
@@ -1869,9 +1880,10 @@ edge Refs: Note -> Note {
     label: String?
 }
 "#,
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap(),
+    );
     let scope = ChangeFeedScope::default();
     db.load_with_receipt(
         "main",
@@ -2143,9 +2155,10 @@ async fn commit_changes_refuse_unprovable_schema_boundary() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        r#"
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            r#"
 node Person {
     name: String @key
     age: I32?
@@ -2155,9 +2168,10 @@ node Ghost {
     name: String @key
 }
 "#,
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap(),
+    );
     let scope = ChangeFeedScope::default();
     db.load_with_receipt(
         "main",
@@ -2283,7 +2297,7 @@ async fn change_feed_poll_follows_commits_from_another_handle() {
         .unwrap();
     let (cursor, _) = boundary_cursor(&now);
 
-    let db_b = Omnigraph::open(uri).await.unwrap();
+    let db_b = helpers::session(Omnigraph::open(uri).await.unwrap());
     db_b.load(
         "main",
         r#"{"type":"Person","data":{"name":"from-b"}}"#,
@@ -2321,9 +2335,11 @@ async fn change_feed_byte_budget_admits_one_solo_oversized_change_per_page() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, "node Person {\n    name: String @key\n}\n")
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(uri, "node Person {\n    name: String @key\n}\n")
+            .await
+            .unwrap(),
+    );
     let now = db
         .poll_change_feed(feed_request(
             None,
@@ -2369,9 +2385,11 @@ async fn change_feed_byte_budget_does_not_reset_solo_exception_per_commit() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, "node Person {\n    name: String @key\n}")
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(uri, "node Person {\n    name: String @key\n}")
+            .await
+            .unwrap(),
+    );
     let now = db
         .poll_change_feed(feed_request(
             None,
@@ -2643,9 +2661,9 @@ async fn change_feed_start_modes_now_aftercommit_beginning() {
     db.branch_create("feature").await.unwrap();
     let feature_handle = Omnigraph::open(uri).await.unwrap();
     drop(feature_handle);
-    let mut feature_db = Omnigraph::open(uri).await.unwrap();
+    let feature_db = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature_db,
+        &feature_db,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2688,14 +2706,14 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.ensure_indices().await.unwrap();
     let pre_merge_head = snapshot_id(&main, "main").await.unwrap();
 
     main.branch_create("side").await.unwrap();
-    let mut side = Omnigraph::open(uri).await.unwrap();
+    let side = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut side,
+        &side,
         "side",
         MUTATION_QUERIES,
         "insert_person",
@@ -2706,7 +2724,7 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
     // Diverge main so the merge is a true three-way merge commit rather than
     // a fast-forward adoption.
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 41)]),
@@ -3147,9 +3165,10 @@ async fn commit_changes_blocks_order_by_published_type_id() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(
-        uri,
-        r#"
+    let db = helpers::session(
+        Omnigraph::init(
+            uri,
+            r#"
 node Alpha { name: String @key }
 node Bravo { name: String @key }
 node Charlie { name: String @key }
@@ -3157,9 +3176,10 @@ node Delta { name: String @key }
 node Echo { name: String @key }
 node Foxtrot { name: String @key }
 "#,
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap(),
+    );
     let scope = ChangeFeedScope::default();
     let commit = db
         .load_with_receipt(
@@ -3241,9 +3261,11 @@ async fn long_ids_resume_exactly_with_bounded_commit_and_feed_tokens() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, "node Person {\n    name: String @key\n}")
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(uri, "node Person {\n    name: String @key\n}")
+            .await
+            .unwrap(),
+    );
     let now = db
         .poll_change_feed(feed_request(
             None,

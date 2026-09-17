@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::error::CompilerError;
 use crate::ir::ParamMap;
-use crate::query::ast::{Literal, Param, QueryDecl, QueryFile};
+use crate::query::ast::{Literal, Param, QueryDecl};
 use crate::query::parser::parse_query;
 
 const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
@@ -260,13 +260,12 @@ macro_rules! params {
 }
 
 pub fn find_named_query(query_source: &str, query_name: &str) -> RunInputResult<QueryDecl> {
-    match parse_query(query_source)? {
-        QueryFile::Queries(queries) => queries
-            .into_iter()
-            .find(|query| query.name == query_name)
-            .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name))),
-        QueryFile::Branch(stmt) => Err(RunInputError::message(stmt.not_a_declaration_message())),
-    }
+    parse_query(query_source)?
+        .into_declarations()
+        .map_err(RunInputError::message)?
+        .into_iter()
+        .find(|query| query.name == query_name)
+        .ok_or_else(|| RunInputError::message(format!("query '{}' not found", query_name)))
 }
 
 pub fn json_params_to_param_map(

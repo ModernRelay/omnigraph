@@ -308,7 +308,7 @@ match { $c: Company }
 return { $c.name }
 }
 "#;
-    let QueryFile::Queries(queries) = parse_query(input).unwrap() else {
+    let FileBody::Queries(queries) = parse_query(input).unwrap().body else {
         panic!("expected query declarations");
     };
     assert_eq!(queries.len(), 2);
@@ -1053,12 +1053,13 @@ return { $f.name }
 }
 
 fn parse_branch(input: &str) -> BranchStmt {
-    match parse_query(input).unwrap() {
-        QueryFile::Branch(stmt) => stmt,
-        QueryFile::Queries(queries) => panic!(
+    match parse_query(input).unwrap().body {
+        FileBody::Branch(stmt) => stmt,
+        FileBody::Queries(queries) => panic!(
             "expected a branch statement, got {} declarations",
             queries.len()
         ),
+        FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
     }
 }
 
@@ -1217,4 +1218,236 @@ return { $p.branch, $q.into as create }
     let insert =
         parse_query("query m() {\n    insert Knows { from: \"a\", to: \"b\" }\n}\n").unwrap();
     assert_eq!(insert.single_decl().mutations.len(), 1);
+}
+
+fn set(id: SettingId, value: SettingValue) -> SettingStmt {
+    SettingStmt::Set { id, value }
+}
+
+fn ident(text: &str) -> SettingValue {
+    SettingValue::Ident(text.to_string())
+}
+
+#[test]
+fn settings_prefix_parses_before_every_body() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let file = parse_query(&format!(
+        "set merge_lineage = off;\nreset merge_lineage;\nset ann_nprobes = 0;\nreset all;\n{decl}"
+    ))
+    .unwrap();
+    assert_eq!(
+        file.settings,
+        vec![
+            set(SettingId::MergeLineage, ident("off")),
+            SettingStmt::Reset {
+                id: Some(SettingId::MergeLineage)
+            },
+            set(SettingId::AnnNprobes, SettingValue::Integer(0)),
+            SettingStmt::Reset { id: None },
+        ]
+    );
+    assert_eq!(file.single_decl().name, "q");
+
+    let merge = parse_query("set merge_lineage = off;\nbranch merge b0 into main;\n").unwrap();
+    assert_eq!(
+        merge.settings,
+        vec![set(SettingId::MergeLineage, ident("off"))]
+    );
+    assert!(
+        matches!(merge.body, FileBody::Branch(ref stmt) if *stmt == merge_stmt("b0", Some("main")))
+    );
+    assert!(matches!(
+        parse_query("branch list").unwrap().body,
+        FileBody::Branch(BranchStmt::List)
+    ));
+
+    let only_settings = parse_query("set merge_lineage = on;").unwrap();
+    assert_eq!(only_settings.settings.len(), 1);
+    assert!(matches!(only_settings.body, FileBody::Queries(ref queries) if queries.is_empty()));
+    let empty = parse_query("").unwrap();
+    assert!(empty.settings.is_empty());
+    assert!(matches!(empty.body, FileBody::Queries(ref queries) if queries.is_empty()));
+
+    let quoted = parse_query("set merge_lineage = \"off\";\nshow all;").unwrap();
+    assert_eq!(
+        quoted.settings,
+        vec![set(
+            SettingId::MergeLineage,
+            SettingValue::Str("off".to_string())
+        )]
+    );
+    assert!(matches!(quoted.body, FileBody::Show(None)));
+    assert!(matches!(
+        parse_query("show merge_lineage;").unwrap().body,
+        FileBody::Show(Some(SettingId::MergeLineage))
+    ));
+    assert!(matches!(
+        parse_query("  set\n  stage_write_concurrency = 3 ; // width\n show all ;")
+            .unwrap()
+            .body,
+        FileBody::Show(None)
+    ));
+}
+
+fn merge_stmt(source: &str, into: Option<&str>) -> BranchStmt {
+    merge(source, into)
+}
+
+#[test]
+fn empty_kind_separates_a_settings_only_file_from_no_statement() {
+    use crate::query::ast::EmptyFile;
+
+    assert_eq!(
+        parse_query("").unwrap().empty_kind(),
+        Some(EmptyFile::NoStatement)
+    );
+    assert_eq!(
+        parse_query("set merge_lineage = on;").unwrap().empty_kind(),
+        Some(EmptyFile::SettingsOnly)
+    );
+    assert_eq!(
+        parse_query("set merge_lineage = on;\nshow all;")
+            .unwrap()
+            .empty_kind(),
+        None
+    );
+    assert_eq!(
+        parse_query("query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n")
+            .unwrap()
+            .empty_kind(),
+        None
+    );
+}
+
+#[test]
+fn settings_statements_are_checked_against_the_definition() {
+    for (input, needle) in [
+        (
+            "set merge_lineage = v3;",
+            "unknown value `v3` for setting `merge_lineage`; expected one of off, on, verify",
+        ),
+        ("set traversal = v2;", "unknown setting `traversal`"),
+        ("reset traversal;", "unknown setting `traversal`"),
+        ("show traversal;", "unknown setting `traversal`"),
+        (
+            "set ann_nprobes = \"many\";",
+            "takes an integer of at least 0, got a string `many`",
+        ),
+        (
+            "set stage_write_concurrency = 0;",
+            "takes an integer in 1..=64, got 0",
+        ),
+        (
+            "set stage_write_concurrency = 99999999999999999999;",
+            "takes an integer in 1..=64, got 99999999999999999999",
+        ),
+        (
+            "set merge_lineage = 5;",
+            "unknown value `5` for setting `merge_lineage`",
+        ),
+        (
+            "set search.nprobes = 5;",
+            "unknown setting `search.nprobes`",
+        ),
+    ] {
+        let err = parse_query_diagnostic(input).unwrap_err();
+        assert!(
+            err.message.contains(needle),
+            "{input}: {} (the full text is `settings::tests::messages_follow_the_definition`'s)",
+            err.message
+        );
+        assert!(err.span.is_some(), "{input} carries a position");
+    }
+    let rendered = parse_query("set merge_lineage = v3;")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        rendered.starts_with("parse error: unknown value `v3` for setting `merge_lineage`"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn settings_prefix_peek_agrees_with_the_parser() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    for (input, expected) in [
+        (format!("set merge_lineage = off;\n{decl}"), true),
+        (
+            format!("  \t\r\n// pinned\n/* block\n */ reset all;\n{decl}"),
+            true,
+        ),
+        (format!("/* set merge_lineage = off; */\n{decl}"), false),
+        (format!("// set merge_lineage = off;\n{decl}"), false),
+        (decl.to_string(), false),
+        ("show all;".to_string(), false),
+        ("setmerge_lineage = off;".to_string(), false),
+        ("reset_all;".to_string(), false),
+        (
+            "/* never closed set merge_lineage = off;".to_string(),
+            false,
+        ),
+        (String::new(), false),
+    ] {
+        assert_eq!(has_settings_prefix(&input), expected, "{input:?}");
+        if expected {
+            assert!(
+                !parse_query(&input).unwrap().settings.is_empty(),
+                "{input:?}"
+            );
+        } else if let Ok(file) = parse_query(&input) {
+            assert!(file.settings.is_empty(), "{input:?}");
+        }
+    }
+}
+
+#[test]
+fn settings_keywords_end_at_a_word_boundary_and_stand_at_the_head() {
+    for input in [
+        "setmerge_lineage = off;",
+        "set merge_lineage = off",
+        "set merge_lineage off;",
+        "set search . nprobes = 5;",
+        "resetall;",
+        "showall;",
+        "show all",
+        "show all; show all;",
+        "branch list; set merge_lineage = off;",
+        "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\nset merge_lineage = off;",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+    let err = parse_query("show all;\nbranch list").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a show statement stands alone in its file"),
+        "{err}"
+    );
+    let err = parse_query(
+        "branch list;\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n}\n",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a branch statement stands alone in its file"),
+        "{err}"
+    );
+}
+
+#[test]
+fn settings_keywords_stay_identifiers_inside_bodies() {
+    let input = r#"
+query q($all: String) {
+match {
+    $p: Person { set: $all }
+    $p show $q
+    $q.reset = "x"
+}
+return { $p.set, $q.traversal as all }
+}
+"#;
+    let file = parse_query(input).unwrap();
+    assert!(file.settings.is_empty());
+    assert_eq!(file.single_decl().name, "q");
+    assert_eq!(parse_branch("branch create set"), create("set", None));
+    assert_eq!(parse_branch("branch create all"), create("all", None));
 }

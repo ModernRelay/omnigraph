@@ -394,6 +394,40 @@ pub struct AppState {
     /// Reported by `/readyz` so an orchestrator can check its own grace
     /// exceeds the server's.
     shutdown_grace: std::time::Duration,
+    /// The process defaults every request's session starts from and `reset`
+    /// returns to (the Session settings RFC): the settings definition's defaults, replaced
+    /// by `serve` with the values `settings::from_env` read at startup.
+    process_defaults: Arc<ProcessDefaults>,
+}
+
+/// The settings a process door seeds every session with, and where each
+/// value came from (`default` or `env`).
+#[derive(Debug, Clone)]
+pub struct ProcessDefaults {
+    pub settings: omnigraph::settings::SessionSettings,
+    pub sources: omnigraph::settings::Sources,
+}
+
+impl Default for ProcessDefaults {
+    fn default() -> Self {
+        Self {
+            settings: omnigraph::settings::SessionSettings::default(),
+            sources: [omnigraph::settings::Source::Default; omnigraph::settings::DEFINITIONS.len()],
+        }
+    }
+}
+
+impl ProcessDefaults {
+    /// Every definition row's variable, read once.
+    ///
+    /// # Errors
+    ///
+    /// A variable holding a value its setting refuses; the server does not
+    /// start then.
+    pub fn from_env() -> std::result::Result<Self, omnigraph::settings::SessionSettingsError> {
+        let (settings, sources) = omnigraph::settings::from_env()?;
+        Ok(Self { settings, sources })
+    }
 }
 
 struct OpenedGraph {
@@ -681,6 +715,7 @@ impl AppState {
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            process_defaults: Arc::new(ProcessDefaults::default()),
         }
     }
 
@@ -713,6 +748,7 @@ impl AppState {
             witness: Arc::new(BootWitness::default()),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            process_defaults: Arc::new(ProcessDefaults::default()),
         })
     }
 
@@ -729,6 +765,37 @@ impl AppState {
         self.draining = draining;
         self.shutdown_grace = shutdown_grace;
         self
+    }
+
+    /// Attach the process defaults every session starts from (the Session settings RFC).
+    /// `serve` passes the environment's; a test may seed its own.
+    #[must_use]
+    pub fn with_process_defaults(mut self, defaults: ProcessDefaults) -> Self {
+        self.process_defaults = Arc::new(defaults);
+        self
+    }
+
+    /// One session for one request: the process defaults, then the typed
+    /// `settings` field with source `request`. The source's own `set` lines
+    /// apply inside the session method that runs the text.
+    pub(crate) fn session(
+        &self,
+        handle: &GraphHandle,
+        request: Option<&api::SettingsRequest>,
+    ) -> std::result::Result<omnigraph::Session, ApiError> {
+        let mut session = handle.engine.session(
+            self.process_defaults.settings.clone(),
+            self.process_defaults.sources,
+        );
+        for (id, value) in request
+            .map(api::SettingsRequest::assignments)
+            .unwrap_or_default()
+        {
+            session
+                .set(id, &value, omnigraph::settings::Source::Request)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        }
+        Ok(session)
     }
 
     /// The applied graphs this process does not serve, sorted: the boot
@@ -1779,7 +1846,7 @@ mod api_error_tests {
 #[cfg(test)]
 mod external_blob_startup_tests {
     use super::*;
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::loader::LoadMode;
 
     #[tokio::test]
     async fn server_open_drops_embedded_only_external_blob_bases() {
@@ -1817,9 +1884,13 @@ mod external_blob_startup_tests {
             "{{\"type\":\"Doc\",\"data\":{{\"slug\":\"one\",\"payload\":\"file://{}\"}}}}\n",
             payload.display()
         );
-        let error = load_jsonl(opened.handle.engine.as_ref(), &data, LoadMode::Overwrite)
-            .await
-            .unwrap_err();
+        let error = omnigraph::Session::from_defaults(
+            Arc::clone(&opened.handle.engine),
+            omnigraph::settings::SessionSettings::default(),
+        )
+        .load_jsonl(&data, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, OmniError::ExternalBlobPolicy { .. }),
             "server projection must deny an embedded-only URI, got {error:?}"
@@ -2151,6 +2222,8 @@ async fn serve_config(
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
     let tokens = token_source.load().await?;
+    let process_defaults = ProcessDefaults::from_env()
+        .map_err(|error| eyre!("session setting refused at startup: {error}"))?;
 
     // For runtime-state classification, "any policy configured" means
     // either the top-level/single-mode policy file OR a server-level
@@ -2228,11 +2301,13 @@ async fn serve_config(
         stdout.flush()?;
     }
 
-    let state = state.with_boot_witness(
-        config.witness.clone(),
-        Arc::clone(&draining),
-        shutdown_grace,
-    );
+    let state = state
+        .with_boot_witness(
+            config.witness.clone(),
+            Arc::clone(&draining),
+            shutdown_grace,
+        )
+        .with_process_defaults(process_defaults);
     let mut shutdown_rx = shutdown_rx;
     let served = axum::serve(listener, build_app(state))
         .with_graceful_shutdown(async move {

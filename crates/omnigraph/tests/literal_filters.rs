@@ -8,8 +8,9 @@ mod helpers;
 
 use arrow_array::{Array, StringArray};
 
+use omnigraph::Session;
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
@@ -43,14 +44,14 @@ const DATA: &str = r#"{"type":"Metric","data":{"name":"m1","label":"alpha one","
 {"edge":"Tagged","from":"m1","to":"basalt"}
 {"edge":"Tagged","from":"m3","to":"basalt"}"#;
 
-async fn metric_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn metric_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
     db
 }
 
-async fn sorted_metric_names(db: &mut Omnigraph, queries: &str, name: &str) -> Vec<String> {
+async fn sorted_metric_names(db: &mut Session, queries: &str, name: &str) -> Vec<String> {
     let r = query_main(db, queries, name, &ParamMap::new())
         .await
         .unwrap();
@@ -189,7 +190,7 @@ query seen_eq() { match { $m: Metric { seen: datetime("2024-06-01T12:00:00Z") } 
 #[tokio::test]
 async fn date_param_with_a_time_of_day_is_refused_from_a_rust_param_map() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = metric_db(&dir).await;
+    let db = metric_db(&dir).await;
     let mut params = ParamMap::new();
     params.insert(
         "d".to_string(),
@@ -198,7 +199,7 @@ async fn date_param_with_a_time_of_day_is_refused_from_a_rust_param_map() {
     let q = r#"
 query born_eq_param($d: Date) { match { $m: Metric  $m.born = $d } return { $m.name } }
 "#;
-    let err = query_main(&mut db, q, "born_eq_param", &params)
+    let err = query_main(&db, q, "born_eq_param", &params)
         .await
         .expect_err("a Date param with a time of day is refused on read");
     assert!(
@@ -226,7 +227,7 @@ query touch_born($d: Date) { update Metric set { active: false } where born = $d
         "d".to_string(),
         omnigraph_compiler::Literal::String("2024-06-01T02:00:00+05:00".to_string()),
     );
-    let err = query_main(&mut db, q, "born_eq_param", &params)
+    let err = query_main(&db, q, "born_eq_param", &params)
         .await
         .expect_err("a String literal bound to a Date parameter is refused");
     assert!(
@@ -246,7 +247,7 @@ query touch_born($d: Date) { update Metric set { active: false } where born = $d
 
     let mut params = ParamMap::new();
     params.insert("d".to_string(), omnigraph_compiler::Literal::Null);
-    let err = query_main(&mut db, q, "born_eq_param", &params)
+    let err = query_main(&db, q, "born_eq_param", &params)
         .await
         .expect_err("Null on a non-nullable Date parameter is refused");
     assert!(
@@ -292,7 +293,7 @@ query key_prefix() { match { $m: Metric  $m.name starts_with "m" } return { $m.n
         vec!["m1", "m2", "m3", "m4"]
     );
     // Param-bound needle takes the same path as a literal.
-    let r = query_main(&mut db, q, "prefix_param", &params(&[("$q", "alph")]))
+    let r = query_main(&db, q, "prefix_param", &params(&[("$q", "alph")]))
         .await
         .unwrap();
     assert_eq!(r.num_rows(), 1, "only m1's label starts with 'alph'");
@@ -306,7 +307,7 @@ query key_prefix() { match { $m: Metric  $m.name starts_with "m" } return { $m.n
 #[tokio::test]
 async fn cross_variable_string_predicate_is_not_hoisted() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = metric_db(&dir).await;
+    let db = metric_db(&dir).await;
     let q = r#"
 query cross() {
     match {
@@ -317,9 +318,7 @@ query cross() {
     return { $a.name, $b.name }
 }
 "#;
-    let r = query_main(&mut db, q, "cross", &ParamMap::new())
-        .await
-        .unwrap();
+    let r = query_main(&db, q, "cross", &ParamMap::new()).await.unwrap();
     // Only the three non-null self-pairs match; a wrongly-hoisted predicate
     // degenerates to `label starts_with label` on $b and returns 3×4 pairs.
     assert_eq!(
@@ -408,14 +407,14 @@ async fn standalone_string_predicate_is_hoisted_into_scan() {
     use std::sync::atomic::Ordering;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = metric_db(&dir).await;
+    let db = metric_db(&dir).await;
     let q =
         r#"query prefix() { match { $m: Metric  $m.label starts_with "alp" } return { $m.name } }"#;
 
     let probes = QueryIoProbes::default();
     let r = with_query_io_probes(
         probes.clone(),
-        query_main(&mut db, q, "prefix", &ParamMap::new()),
+        query_main(&db, q, "prefix", &ParamMap::new()),
     )
     .await
     .unwrap();
@@ -510,12 +509,12 @@ const CC_DATA: &str = r#"{"type":"Doc","data":{"slug":"d1","repoName":"acme"}}
 async fn camelcase_property_filter_executes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, CC_SCHEMA).await.unwrap());
+    db.load_jsonl(CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     let q =
         r#"query by_repo($r: String) { match { $d: Doc { repoName: $r } } return { $d.slug } }"#;
-    let r = query_main(&mut db, q, "by_repo", &params(&[("$r", "acme")]))
+    let r = query_main(&db, q, "by_repo", &params(&[("$r", "acme")]))
         .await
         .expect("camelCase property filter must execute, not fail at the Lance scan");
     assert_eq!(

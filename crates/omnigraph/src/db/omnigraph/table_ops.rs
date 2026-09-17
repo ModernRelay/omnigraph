@@ -106,7 +106,7 @@ pub(super) async fn rebuild_full_text_indices_on_as(
 
 #[cfg(feature = "failpoints")]
 pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     branch: &str,
     table_key: &str,
     table_branch: Option<&str>,
@@ -1888,9 +1888,14 @@ mod classify_fork_ref_tests {
     #[tokio::test]
     async fn classify_distinguishes_legitimate_unreferenced_and_ghost() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
         db.branch_create("feature").await.unwrap();
 
         // Legitimate: a real write forks Company onto `feature`, and the
@@ -1978,9 +1983,14 @@ mod classify_fork_ref_tests {
     #[tokio::test]
     async fn classify_does_not_adopt_a_reused_alias_across_incarnations() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
         let old_identity = db.snapshot().await.dataset("node:Person").unwrap().identity;
 
         db.apply_schema("node Company { name: String @key }\n")

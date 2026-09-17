@@ -6,7 +6,7 @@ use std::fs;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::{BlobCell, BlobContent, EntityKind};
 use omnigraph_server::api::{IngestRequest, ReadRequest};
 use omnigraph_server::{AppState, build_app};
@@ -67,9 +67,8 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     Omnigraph::init(&uri, &fs::read_to_string(fixture("test.pg")).unwrap())
         .await
         .unwrap();
-    let db = Omnigraph::open(&uri).await.unwrap();
-    load_jsonl(
-        &db,
+    let db = session(Omnigraph::open(&uri).await.unwrap());
+    db.load_jsonl(
         &fs::read_to_string(fixture("test.jsonl")).unwrap(),
         LoadMode::Overwrite,
     )
@@ -101,6 +100,7 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
         params: Some(json!({ "name": "Alice" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (read_status, read_body) = json_response(
         &app,
@@ -175,9 +175,8 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
 
         let graph_uri = format!("{root}/graphs/knowledge.omni");
-        let db = Omnigraph::open(&graph_uri).await.unwrap();
-        load_jsonl(
-            &db,
+        let db = session(Omnigraph::open(&graph_uri).await.unwrap());
+        db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
             LoadMode::Overwrite,
         )
@@ -355,9 +354,8 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
         assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
 
         let graph_uri = format!("{root}/graphs/knowledge.omni");
-        let db = Omnigraph::open(&graph_uri).await.unwrap();
-        load_jsonl(
-            &db,
+        let db = session(Omnigraph::open(&graph_uri).await.unwrap());
+        db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
             LoadMode::Overwrite,
         )

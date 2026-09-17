@@ -1,11 +1,13 @@
 use super::*;
 use crate::changes::row_compare::{RawRow, rows_equal};
 use crate::seams::{decide_seam, fail};
+use crate::session::Session;
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
 use crate::table_store::certified_insert_absence_rows;
 use futures::StreamExt;
+use omnigraph_compiler::settings::MergeLineage;
 
 const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
 const DELETE_FILTER_IN: &str = " IN (";
@@ -2321,20 +2323,6 @@ async fn stage_streaming_table_merge_walk(
 // the walk.
 // ---------------------------------------------------------------------------
 
-/// `OMNIGRAPH_MERGE_LINEAGE` = `off` (full-scan walk), `on` (lineage when the
-/// gate passes, walk otherwise), `verify` (run BOTH, compare classifications,
-/// keep the walk's result as the oracle). An unrecognized value disables the
-/// lineage path (with a warning) rather than silently taking a default.
-/// Defaults when unset: verify in debug builds (every merge in the engine
-/// test suite cross-checks the two paths), lineage in release builds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineageMergeMode {
-    Off,
-    On,
-    Verify,
-}
-
-const LINEAGE_MERGE_MODE_ENV: &str = "OMNIGRAPH_MERGE_LINEAGE";
 /// Ids per `id IN (...)` chunk on the candidate fetch path. Row-count bound
 /// only; the byte bound reuses the delete-filter budget machinery.
 const LINEAGE_FILTER_MAX_IDS: usize = 512;
@@ -2344,47 +2332,6 @@ const LINEAGE_FILTER_MAX_IDS: usize = 512;
 /// walk's own regime, and the gate's fail-closed contract must hold for
 /// budgets as well as preconditions.
 const LINEAGE_CANDIDATE_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
-
-fn lineage_merge_mode() -> LineageMergeMode {
-    match std::env::var(LINEAGE_MERGE_MODE_ENV) {
-        Ok(value) => match value.as_str() {
-            "off" => LineageMergeMode::Off,
-            "on" => LineageMergeMode::On,
-            "verify" => LineageMergeMode::Verify,
-            other => {
-                // An explicit-but-unrecognized request must not silently take
-                // a build-dependent default: this env var is the operational
-                // kill switch, and a typo'd "OFF" enabling the path it meant
-                // to disable is the worst reading. Disable, warn once.
-                static UNRECOGNIZED_WARNING: std::sync::Once = std::sync::Once::new();
-                UNRECOGNIZED_WARNING.call_once(|| {
-                    tracing::warn!(
-                        value = other,
-                        "unrecognized {LINEAGE_MERGE_MODE_ENV} value (expected off | on | \
-                         verify); lineage merge disabled"
-                    );
-                });
-                LineageMergeMode::Off
-            }
-        },
-        Err(std::env::VarError::NotPresent) => {
-            if cfg!(debug_assertions) {
-                LineageMergeMode::Verify
-            } else {
-                LineageMergeMode::On
-            }
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            static NOT_UNICODE_WARNING: std::sync::Once = std::sync::Once::new();
-            NOT_UNICODE_WARNING.call_once(|| {
-                tracing::warn!(
-                    "non-unicode {LINEAGE_MERGE_MODE_ENV} value; lineage merge disabled"
-                );
-            });
-            LineageMergeMode::Off
-        }
-    }
-}
 
 /// A gated lineage-merge plan: the three pinned datasets plus the candidate
 /// row-key superset discovered from fragment/deletion metadata, already
@@ -3160,7 +3107,7 @@ fn verify_lineage_agreement(
             });
         return Err(OmniError::manifest_internal(format!(
             "lineage-merge verify divergence for '{table_key}': {first_difference}; set \
-             {LINEAGE_MERGE_MODE_ENV}=off to run the walk only"
+             merge_lineage = off to run the walk only"
         )));
     }
     let walk_deleted: Vec<&String> = walk_result
@@ -3188,7 +3135,7 @@ fn verify_lineage_agreement(
             });
         return Err(OmniError::manifest_internal(format!(
             "lineage-merge verify divergence for '{table_key}': deleted ids differ ({detail}); \
-             set {LINEAGE_MERGE_MODE_ENV}=off to run the walk only"
+             set merge_lineage = off to run the walk only"
         )));
     }
     let counts = |result: Option<&StagedMergeResult>| {
@@ -3205,7 +3152,7 @@ fn verify_lineage_agreement(
         return Err(OmniError::manifest_internal(format!(
             "lineage-merge verify divergence for '{table_key}': staged insert/update counts differ \
              ({walk_counts:?} walk vs {lineage_counts:?} lineage); set \
-             {LINEAGE_MERGE_MODE_ENV}=off to run the walk only"
+             merge_lineage = off to run the walk only"
         )));
     }
     tracing::debug!(
@@ -3234,12 +3181,13 @@ fn stage_streaming_table_merge<'a>(
     target_snapshot: &'a Snapshot,
     conflicts: &'a mut Vec<MergeConflict>,
     external_preflight: &'a crate::table_store::ExternalBlobPreflight,
+    lineage: MergeLineage,
 ) -> std::pin::Pin<
     Box<impl std::future::Future<Output = Result<Option<StagedMergeResult>>> + Send + 'a>,
 > {
     Box::pin(async move {
-        match lineage_merge_mode() {
-            LineageMergeMode::Off => {
+        match lineage {
+            MergeLineage::Off => {
                 let result = stage_streaming_table_merge_walk(
                     target_db,
                     table_key,
@@ -3255,7 +3203,7 @@ fn stage_streaming_table_merge<'a>(
                 crate::instrumentation::record_completed_merge_classification(false);
                 Ok(result)
             }
-            LineageMergeMode::On => {
+            MergeLineage::On => {
                 match plan_lineage_merge(
                     catalog,
                     base_snapshot,
@@ -3297,7 +3245,7 @@ fn stage_streaming_table_merge<'a>(
                     }
                 }
             }
-            LineageMergeMode::Verify => {
+            MergeLineage::Verify => {
                 let mut walk_log = Vec::new();
                 let walk_result = stage_streaming_table_merge_walk(
                     target_db,
@@ -5360,7 +5308,7 @@ decide_seam! {
     pub static BRANCH_MERGE_POST_AUTHORITY_CAPTURE = ("branch_merge.post_authority_capture", BranchMerge, [Fail]);
 }
 
-impl Omnigraph {
+impl Session {
     pub async fn branch_merge(&self, source: &str, target: &str) -> Result<MergeOutcome> {
         self.branch_merge_as(source, target, None).await
     }
@@ -5390,9 +5338,12 @@ impl Omnigraph {
         // Keep the recovery/planning future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.
-        Box::pin(self.branch_merge_impl(source, target, actor_id)).await
+        Box::pin(self.branch_merge_impl(source, target, actor_id, self.settings().merge_lineage()))
+            .await
     }
+}
 
+impl Omnigraph {
     /// The merge base over the two captured lineages, with the records of
     /// merged parents that live in other branches read from those branches;
     /// a record no live branch holds leaves the walk at the base it found.
@@ -5487,6 +5438,7 @@ impl Omnigraph {
         source: &str,
         target: &str,
         actor_id: Option<&str>,
+        lineage: MergeLineage,
     ) -> Result<MergeOutcome> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
@@ -5594,6 +5546,7 @@ impl Omnigraph {
             &source_head_commit_id,
             is_fast_forward,
             actor_id,
+            lineage,
         ))
         .await;
         let outer_restore_timing = crate::instrumentation::start_merge_timing(
@@ -5631,6 +5584,7 @@ impl Omnigraph {
         source_head_commit_id: &str,
         is_fast_forward: bool,
         actor_id: Option<&str>,
+        lineage: MergeLineage,
     ) -> Result<MergeOutcome> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
@@ -5711,6 +5665,7 @@ impl Omnigraph {
                         target_snapshot,
                         &mut conflicts,
                         &empty_external_preflight,
+                        lineage,
                     )
                     .await?;
                     table_walk_timing.finish();
@@ -5926,6 +5881,7 @@ impl Omnigraph {
                 target_snapshot,
                 &mut conflicts,
                 &external_preflight,
+                lineage,
             )
             .await?;
             table_walk_timing.finish();

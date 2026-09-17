@@ -25,7 +25,11 @@ use std::future::Future;
 use helpers::cost::{
     IoCounts, assert_flat, assert_grows, cost_harness, local_graph, measure, measure_with_staged,
 };
-use helpers::{MUTATION_QUERIES, commit_many, mixed_params};
+use helpers::{
+    MUTATION_QUERIES, collect_column_strings, commit_many, mixed_params, read_table_branch,
+    with_setting,
+};
+use omnigraph::db::MergeOutcome;
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 
 /// Run an async test body on a thread with a large stack. The debug merge future
@@ -265,25 +269,19 @@ fn merge_validation_is_delta_scoped() {
                 deletion.lineage_candidate_address_take_max_rows(),
             );
             assert_eq!(result.unwrap(), omnigraph::db::MergeOutcome::Merged);
-            if std::env::var("OMNIGRAPH_MERGE_LINEAGE").as_deref() != Ok("off") {
-                assert_eq!(
-                    deletion.completed_lineage_classification_calls(),
-                    1,
-                    "the eligible deletion fixture must exercise lineage discovery, not silently fall back"
-                );
-            }
-            if deletion.completed_lineage_classification_calls() != 0 {
-                assert_eq!(deletion.lineage_candidate_address_take_calls(), 1);
-                assert_eq!(deletion.lineage_candidate_address_take_rows(), 1);
-                assert_eq!(deletion.lineage_candidate_address_take_max_rows(), 1);
-                assert_eq!(
-                    deletion.lineage_candidate_scan_rows(),
-                    1,
-                    "only the target's new one-row fragment may be scanned, not the {rows}-row deletion fragment"
-                );
-            } else {
-                assert_eq!(deletion.completed_full_walk_classification_calls(), 1);
-            }
+            assert_eq!(
+                deletion.completed_lineage_classification_calls(),
+                1,
+                "the eligible deletion fixture must exercise lineage discovery, not silently fall back"
+            );
+            assert_eq!(deletion.lineage_candidate_address_take_calls(), 1);
+            assert_eq!(deletion.lineage_candidate_address_take_rows(), 1);
+            assert_eq!(deletion.lineage_candidate_address_take_max_rows(), 1);
+            assert_eq!(
+                deletion.lineage_candidate_scan_rows(),
+                1,
+                "only the target's new one-row fragment may be scanned, not the {rows}-row deletion fragment"
+            );
             let snapshot = db
                 .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
                 .await
@@ -314,6 +312,85 @@ fn merge_validation_is_delta_scoped() {
     });
 }
 
+#[test]
+fn merge_lineage_setting_selects_the_completed_classifier() {
+    on_big_stack(|| async {
+        let mut merged_names: Vec<(&str, Vec<String>)> = Vec::new();
+        for (mode, expected_walks, expected_lineage) in
+            [("off", 1, 0), ("on", 0, 1), ("verify", 1, 1)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let db = with_setting(&local_graph(&dir).await, "merge_lineage", mode);
+            assert_eq!(
+                db.settings().merge_lineage(),
+                omnigraph::settings::MergeLineage::from_spelling(mode).unwrap()
+            );
+            let jsonl = (0..8)
+                .map(|i| {
+                    format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"lm-{i}\",\"age\":20}}}}\n")
+                })
+                .collect::<String>();
+            db.load("main", &jsonl, omnigraph::loader::LoadMode::Append)
+                .await
+                .unwrap();
+            db.branch_create("feature").await.unwrap();
+            db.mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "remove_person",
+                &mixed_params(&[("$name", "lm-0")], &[]),
+            )
+            .await
+            .unwrap();
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "lm-target")], &[("$age", 42)]),
+            )
+            .await
+            .unwrap();
+
+            let probes = MergeWriteProbes::default();
+            let outcome =
+                with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
+                    .await
+                    .unwrap();
+            assert_eq!(outcome, MergeOutcome::Merged, "merge_lineage = {mode}");
+            assert_eq!(
+                probes.completed_full_walk_classification_calls(),
+                expected_walks,
+                "merge_lineage = {mode}: completed full-walk classifications"
+            );
+            assert_eq!(
+                probes.completed_lineage_classification_calls(),
+                expected_lineage,
+                "merge_lineage = {mode}: completed lineage classifications"
+            );
+
+            let mut names = collect_column_strings(
+                &read_table_branch(&db, "main", "node:Person").await,
+                "name",
+            );
+            names.sort();
+            assert!(
+                !names.iter().any(|name| name == "lm-0"),
+                "merge_lineage = {mode}"
+            );
+            assert_eq!(names.iter().filter(|name| *name == "lm-target").count(), 1);
+            assert_eq!(names.iter().filter(|name| *name == "lm-1").count(), 1);
+            merged_names.push((mode, names));
+        }
+        for (mode, names) in &merged_names[1..] {
+            assert_eq!(
+                names, &merged_names[0].1,
+                "merge_lineage = {mode} must merge the same rows as {}",
+                merged_names[0].0
+            );
+        }
+    });
+}
+
 /// CLAIM 2: a merge's `__manifest` cost grows with commit-history depth on an
 /// un-compacted graph. The bound route performs four coherent manifest scans (five for a non-bound target), and
 /// each surviving append-only journal fold scans O(fragments) of `__manifest`.
@@ -327,13 +404,13 @@ fn merge_manifest_cost_grows_with_history() {
         cost_harness(async {
             for inactive_target in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
-                let mut db = local_graph(&dir).await;
+                let db = local_graph(&dir).await;
 
                 let mut curve: Vec<(u64, IoCounts)> = Vec::new();
                 let mut current = 0u64;
                 for d in [5u64, 80] {
                     if d > current {
-                        commit_many(&mut db, (d - current) as usize).await;
+                        commit_many(&db, (d - current) as usize).await;
                         current = d;
                     }
                     // Keep the handle bound to main in both variants. Named targets

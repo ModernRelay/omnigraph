@@ -96,6 +96,15 @@ pub(crate) fn parse_shape_body(body: &[(usize, &str)]) -> Result<Vec<ShapeLine>,
     Ok(lines)
 }
 
+/// One shape line as the section spells it: the comparison form for a
+/// derived shape and the refusal's text.
+pub(crate) fn spell_shape_line(line: &ShapeLine) -> String {
+    match &line.shape_type {
+        ShapeType::Scalar(prop_type) => format!("{}: {}", line.name, prop_type.display_name()),
+        ShapeType::Node(type_name) => format!("{}: {type_name}", line.name),
+    }
+}
+
 fn is_type_name(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_uppercase())

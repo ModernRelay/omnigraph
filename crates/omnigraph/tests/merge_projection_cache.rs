@@ -12,6 +12,7 @@ mod helpers;
 
 use std::future::Future;
 
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph};
 
 use helpers::cost::{cost_harness, measure};
@@ -84,7 +85,7 @@ fn branch_delete_purges_merge_authority_after_acquiring_branch_gate() {
 
 /// Update both branches through one handle, allowing publication to retain
 /// the acknowledged source and target projections.
-async fn diverge(db: &mut Omnigraph, round: i64) {
+async fn diverge(db: &Session, round: i64) {
     mutate_branch(
         db,
         "feature",
@@ -112,16 +113,16 @@ fn repeated_merge_refreshes_projection_incrementally() {
     on_big_stack(|| async {
         cost_harness(async {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = init_and_load(&dir).await;
+            let db = init_and_load(&dir).await;
             db.branch_create("feature").await.unwrap();
 
-            diverge(&mut db, 0).await;
+            diverge(&db, 0).await;
             let outcome = db.branch_merge("feature", "main").await.unwrap();
             assert_eq!(outcome, MergeOutcome::Merged);
 
             // Both writes use this handle. Publication returns the acknowledged
             // exact projections, so no deleted head row needs reconstructing.
-            diverge(&mut db, 1).await;
+            diverge(&db, 1).await;
 
             let (outcome, io) = measure(db.branch_merge("feature", "main")).await;
             assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
@@ -167,7 +168,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
             // handle's cached source is now stale, while its local target
             // publication remains acknowledged. This keeps the physical-take
             // cost fence non-vacuous after the local reuse optimization.
-            let foreign = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+            let foreign = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
             foreign.mutate(
                 "feature", MUTATION_QUERIES, "set_age",
                 &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
@@ -244,10 +245,10 @@ async fn merge_authority_cache_retains_only_one_non_bound_branch() {
 #[tokio::test]
 async fn branch_recreate_is_fenced_from_the_cached_projection() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
 
-    diverge(&mut db, 0).await;
+    diverge(&db, 0).await;
     assert_eq!(
         db.branch_merge("feature", "main").await.unwrap(),
         MergeOutcome::Merged

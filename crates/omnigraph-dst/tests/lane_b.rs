@@ -103,13 +103,18 @@ async fn open_fresh(
     root: &str,
 ) -> (
     std::sync::Arc<dyn omnigraph::storage::StorageAdapter>,
-    omnigraph::db::Omnigraph,
+    omnigraph::Session,
 ) {
     let storage: std::sync::Arc<dyn omnigraph::storage::StorageAdapter> =
         std::sync::Arc::new(omnigraph::storage::ObjectStorageAdapter::local());
-    let db = omnigraph::db::Omnigraph::open_with_storage(root, storage.clone())
-        .await
-        .expect("post-kill open+recovery must succeed");
+    let db = omnigraph::Session::from_defaults(
+        std::sync::Arc::new(
+            omnigraph::db::Omnigraph::open_with_storage(root, storage.clone())
+                .await
+                .expect("post-kill open+recovery must succeed"),
+        ),
+        omnigraph::settings::SessionSettings::default(),
+    );
     (storage, db)
 }
 
@@ -441,7 +446,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
     let root_str = root.to_str().expect("utf8 root").to_string();
 
     rt().block_on(async {
-        let (_storage, mut db) = open_fresh(&root_str).await;
+        let (_storage, db) = open_fresh(&root_str).await;
         let verdict = lane_b_replay_judge(&db, &log, "lb-7-", "red-proof baseline", false).await;
         assert_eq!(verdict, "without-op", "complete log must judge clean");
 
@@ -486,7 +491,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
 
         // (3) Phantom row planted behind the log's back.
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", "lb-7-phantom")], &[("$age", 44)]),
@@ -514,7 +519,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
             .collect();
         if names.len() >= 2 {
             mutate_main(
-                &mut db,
+                &db,
                 MUTATION_QUERIES,
                 "add_friend",
                 &mixed_params(
@@ -551,7 +556,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
     let root_str = root.to_str().expect("utf8 root").to_string();
 
     rt().block_on(async {
-        let (_storage, mut db) = open_fresh(&root_str).await;
+        let (_storage, db) = open_fresh(&root_str).await;
         let verdict =
             lane_b_replay_judge(&db, &log, "lb-9-", "weather red-proof baseline", true).await;
         assert_eq!(verdict, "weather-resolved");
@@ -568,7 +573,7 @@ fn dst_lane_b_judge_goes_red_under_seeded_blindness() {
             "weather judge stayed GREEN on a forged ack"
         );
         mutate_main(
-            &mut db,
+            &db,
             MUTATION_QUERIES,
             "insert_person",
             &mixed_params(&[("$name", "lb-9-phantom")], &[("$age", 44)]),

@@ -131,6 +131,11 @@ pub(crate) enum Command {
         branch: Option<String>,
         #[arg(long, conflicts_with = "branch")]
         snapshot: Option<String>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long, conflicts_with = "json")]
         format: Option<ReadOutputFormat>,
         #[arg(long, conflicts_with = "format")]
@@ -170,6 +175,11 @@ pub(crate) enum Command {
         /// `precondition_failure` body — re-read the branch and decide again.
         #[arg(long = "if-commit", value_name = "COMMIT_ID")]
         if_commit: Option<String>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -210,6 +220,11 @@ pub(crate) enum Command {
         /// Required — overwrite is destructive, so there is no default.
         #[arg(long)]
         mode: CliLoadMode,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
+        /// stores only: no served load route carries a `settings` field.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -226,6 +241,11 @@ pub(crate) enum Command {
         from: Option<String>,
         #[arg(long, default_value = "merge")]
         mode: CliLoadMode,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
+        /// stores only: no served load route carries a `settings` field.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -821,6 +841,11 @@ pub(crate) enum BranchCommand {
         /// and never fails the already-landed merge.
         #[arg(long)]
         delete_branch: bool,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -927,6 +952,11 @@ pub(crate) enum CommitCommand {
         /// Filter by operation (repeatable): insert | update | delete
         #[arg(long = "op", value_enum)]
         ops: Vec<ChangeOpArg>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -992,6 +1022,11 @@ pub(crate) enum ChangesCommand {
         /// Filter by operation (repeatable): insert | update | delete
         #[arg(long = "op", value_enum)]
         ops: Vec<ChangeOpArg>,
+        /// Session setting for this invocation (repeatable): `name=value` in
+        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
+        /// `settings` field (the Session settings RFC).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        settings: Vec<String>,
         #[arg(long)]
         json: bool,
     },

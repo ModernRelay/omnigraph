@@ -1,0 +1,48 @@
+# issue: none
+# notes: a set value survives `--- restart` with its source `file` (the runner
+# notes: detaches the case session, drops the old engine handle, reopens the
+# notes: same storage and reattaches the detached settings), and a reset after
+# notes: the restart returns to the case's baseline, so the restart kept the
+# notes: baseline too (the Session settings RFC, Logic tests).
+# notes: `settings_show_set_reset.gqt` carries why the baseline reads `verify`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+set merge_lineage = off;
+
+--- expect ok
+
+--- restart
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "off", "default": "on", "source": "file", "scope": "request"}
+
+--- mutate
+reset all;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}

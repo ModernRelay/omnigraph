@@ -1,0 +1,58 @@
+# issue: none
+# notes: `set`, `reset`, `show` and `all` are settings keywords only where a
+# notes: settings statement can start. Inside a query body they stay
+# notes: identifiers: `set` is a property name, `show` is an edge hop, and
+# notes: `all` is a branch name (the Session settings RFC, The statements). The schema spells
+# notes: the edge type `Show` because `.pg` type names start with an uppercase
+# notes: letter (`schema.pest` `type_name`); the traversal spells the same edge
+# notes: `show` (`query.pest` `edge_ident`, resolved by `normalize_edge_name`).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    set: String
+}
+
+edge Show: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice","set":"on"}}
+{"type":"Person","data":{"name":"bob","set":"off"}}
+{"edge":"Show","from":"alice","to":"bob"}
+
+--- query
+query keywords() {
+    match {
+        $a: Person
+        $a show $b
+    }
+    return { $a.set, $b.name }
+}
+
+--- expect unordered
+{"a.set": "on", "b.name": "bob"}
+
+--- expect shape
+a.set: String
+b.name: String
+
+--- mutate
+branch create all;
+
+--- expect ok
+
+--- query
+branch list;
+
+--- expect unordered
+{"name": "all"}
+{"name": "main"}
+
+--- expect shape
+name: String

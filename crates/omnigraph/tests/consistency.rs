@@ -10,7 +10,7 @@ use tokio::sync::Barrier;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -22,14 +22,14 @@ use helpers::*;
 #[tokio::test]
 async fn snapshot_returns_stale_data_after_write() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Snapshot BEFORE mutation
     let snap_before = snapshot_main(&db).await.unwrap();
 
     // Insert a new person
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -82,10 +82,9 @@ async fn snapshot_returns_stale_data_after_write() {
 async fn load_append_rejects_existing_id_without_update() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
 
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
         LoadMode::Overwrite,
     )
@@ -99,13 +98,13 @@ async fn load_append_rejects_existing_id_without_update() {
         .expect("Person entry before strict conflict")
         .published_dataset_version;
 
-    let err = load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"Alice","age":99}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+    let err = db
+        .load_jsonl(
+            r#"{"type":"Person","data":{"name":"Alice","age":99}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     match err {
         OmniError::KeyConflict {
             type_key,
@@ -174,18 +173,23 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
     };
 
     let exact_dir = tempfile::tempdir().unwrap();
-    let exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
-        .await
-        .unwrap();
-    load_jsonl(&exact, &jsonl(LIMIT), LoadMode::Append)
+    let exact = helpers::session(
+        Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    exact
+        .load_jsonl(&jsonl(LIMIT), LoadMode::Append)
         .await
         .expect("the exact keyed row limit is inclusive");
     assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
 
     let over_dir = tempfile::tempdir().unwrap();
-    let over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
-        .await
-        .unwrap();
+    let over = helpers::session(
+        Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
     let before = snapshot_main(&over).await.unwrap();
     let before_manifest = before.graph_manifest_version();
     let entry = before.dataset("node:Thing").unwrap();
@@ -196,7 +200,8 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
         entry.dataset_path.trim_start_matches('/')
     );
     let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
-    let error = load_jsonl(&over, &jsonl(LIMIT + 1), LoadMode::Append)
+    let error = over
+        .load_jsonl(&jsonl(LIMIT + 1), LoadMode::Append)
         .await
         .unwrap_err();
     assert!(
@@ -251,9 +256,11 @@ node Thing {
 "#;
 
     let dir = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
     let before = snapshot_main(&db).await.unwrap();
     let before_manifest = before.graph_manifest_version();
     let entry = before.dataset("node:Thing").unwrap();
@@ -268,7 +275,7 @@ node Thing {
     let wide = "x".repeat(LIMIT as usize + 1024);
     let input =
         format!("{{\"type\":\"Thing\",\"data\":{{\"key\":\"wide\",\"payload\":\"{wide}\"}}}}");
-    let error = load_jsonl(&db, &input, LoadMode::Append).await.unwrap_err();
+    let error = db.load_jsonl(&input, LoadMode::Append).await.unwrap_err();
     assert!(
         matches!(
             error,
@@ -409,9 +416,11 @@ node Attachment {
         (fd, watch)
     };
 
-    let db = Omnigraph::init(graph_dir.path().to_str().unwrap(), SCHEMA)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(graph_dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
     db.branch_create("feature").await.unwrap();
     let before = snapshot_branch(&db, "feature").await.unwrap();
     let before_manifest = before.graph_manifest_version();
@@ -479,7 +488,14 @@ node Attachment {
         ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
     ])
     .unwrap();
-    let db = db.with_external_blob_policy(policy.clone()).unwrap();
+    drop(db);
+    let db = helpers::session(
+        Omnigraph::open(graph_dir.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
 
     let missing_uri = url::Url::from_file_path(external_dir.path().join("missing.blob"))
         .expect("missing external blob path is absolute")
@@ -706,11 +722,13 @@ node Attachment {
     };
 
     let exact_graph = tempfile::tempdir().unwrap();
-    let exact = Omnigraph::init(exact_graph.path().to_str().unwrap(), SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
+    let exact = helpers::session(
+        Omnigraph::init(exact_graph.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
     let exact_input = external_overwrite_input(REFERENCE_LIMIT, 0, "exact");
     let exact_probes = omnigraph::instrumentation::MergeWriteProbes::default();
     omnigraph::instrumentation::with_merge_write_probes(
@@ -736,11 +754,13 @@ node Attachment {
     assert_eq!(count_rows(&exact, "node:Document").await, REFERENCE_LIMIT);
 
     let overflow_graph = tempfile::tempdir().unwrap();
-    let overflow = Omnigraph::init(overflow_graph.path().to_str().unwrap(), SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy)
-        .unwrap();
+    let overflow = helpers::session(
+        Omnigraph::init(overflow_graph.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
     overflow.branch_create("feature").await.unwrap();
     let overflow_before = snapshot_branch(&overflow, "feature").await.unwrap();
     let overflow_manifest = overflow_before.graph_manifest_version();
@@ -829,12 +849,13 @@ node Thing {
         .unwrap();
     let start = Arc::new(Barrier::new(SAME_KEY_WRITERS));
     let same_results = join_all(writers.into_iter().enumerate().map(|(writer, db)| {
+        let db = helpers::session(db);
         let start = Arc::clone(&start);
         async move {
             start.wait().await;
             let row =
                 format!(r#"{{"type":"Thing","data":{{"key":"SAME","value":"writer-{writer}"}}}}"#);
-            (writer, load_jsonl(&db, &row, LoadMode::Append).await)
+            (writer, db.load_jsonl(&row, LoadMode::Append).await)
         }
     }))
     .await;
@@ -882,16 +903,14 @@ node Thing {
         "the persisted row must belong to the sole successful writer"
     );
 
-    let left = Omnigraph::open(uri).await.unwrap();
-    let right = Omnigraph::open(uri).await.unwrap();
+    let left = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let right = helpers::session(Omnigraph::open(uri).await.unwrap());
     let (left, right) = tokio::join!(
-        load_jsonl(
-            &left,
+        left.load_jsonl(
             r#"{"type":"Thing","data":{"key":"LEFT","value":"l"}}"#,
             LoadMode::Append,
         ),
-        load_jsonl(
-            &right,
+        right.load_jsonl(
             r#"{"type":"Thing","data":{"key":"RIGHT","value":"r"}}"#,
             LoadMode::Append,
         ),
@@ -912,19 +931,19 @@ node Thing {
 async fn load_merge_upserts_existing_and_inserts_new() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
 
     // Load Alice(30) and Bob(25) via Overwrite
     let initial = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
-    load_jsonl(&db, initial, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(initial, LoadMode::Overwrite).await.unwrap();
 
     assert_eq!(count_rows(&db, "node:Person").await, 2);
 
     // Merge: Alice updated to age=31, Charlie is new
     let merge_data = r#"{"type": "Person", "data": {"name": "Alice", "age": 31}}
 {"type": "Person", "data": {"name": "Charlie", "age": 35}}"#;
-    load_jsonl(&db, merge_data, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(merge_data, LoadMode::Merge).await.unwrap();
 
     // Should have 3 persons total (not 4)
     assert_eq!(count_rows(&db, "node:Person").await, 3);
@@ -980,7 +999,7 @@ node Thing {
     optional_val: String?
 }
 "#;
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
 
     // Seed with 50 fully-populated rows (id + required + optional).
     let mut seed = String::new();
@@ -990,7 +1009,7 @@ node Thing {
 "#,
         ));
     }
-    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
 
     // Partial-schema delta — mirrors the bug report exactly: omits
     // `optional_val`. 25 existing keys + 5 new keys, one row per key.
@@ -1002,12 +1021,12 @@ node Thing {
         ));
     }
 
-    load_jsonl(&db, &delta, LoadMode::Merge)
+    db.load_jsonl(&delta, LoadMode::Merge)
         .await
         .expect("first merge must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
 
-    load_jsonl(&db, &delta, LoadMode::Merge)
+    db.load_jsonl(&delta, LoadMode::Merge)
         .await
         .expect("second merge against same keys must succeed");
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
@@ -1042,14 +1061,14 @@ node Thing {
     value: String
 }
 "#;
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
 
     let dupes = r#"{"type":"Thing","data":{"key":"DUP","value":"first"}}
 {"type":"Thing","data":{"key":"DUP","value":"second"}}
 "#;
 
     for mode in [LoadMode::Overwrite, LoadMode::Append, LoadMode::Merge] {
-        let err = load_jsonl(&db, dupes, mode).await.unwrap_err();
+        let err = db.load_jsonl(dupes, mode).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("@unique violation") && msg.contains("DUP"),
@@ -1081,9 +1100,11 @@ node Thing {
 
     for mode in [LoadMode::Append, LoadMode::Overwrite] {
         let dir = tempfile::tempdir().unwrap();
-        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
+        let db = helpers::session(
+            Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                .await
+                .unwrap(),
+        );
         db.branch_create("feature").await.unwrap();
 
         let before = snapshot_branch(&db, "feature").await.unwrap();
@@ -1182,14 +1203,14 @@ node ExternalID {
     @unique(source, external_id)
 }
 "#;
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
 
     // Same `source`, different `external_id` → unique on the composite key.
     // This is the exact repro from MR-983 and must be accepted.
     let composite_ok = r#"{"type":"ExternalID","data":{"slug":"a","source":"whatsapp","external_id":"+E.164"}}
 {"type":"ExternalID","data":{"slug":"b","source":"whatsapp","external_id":"pn:12345"}}
 "#;
-    load_jsonl(&db, composite_ok, LoadMode::Overwrite)
+    db.load_jsonl(composite_ok, LoadMode::Overwrite)
         .await
         .expect("rows unique on the composite (source, external_id) must be accepted");
     assert_eq!(count_rows(&db, "node:ExternalID").await, 2);
@@ -1199,7 +1220,8 @@ node ExternalID {
     let composite_dupe = r#"{"type":"ExternalID","data":{"slug":"c","source":"whatsapp","external_id":"dup"}}
 {"type":"ExternalID","data":{"slug":"d","source":"whatsapp","external_id":"dup"}}
 "#;
-    let err = load_jsonl(&db, composite_dupe, LoadMode::Overwrite)
+    let err = db
+        .load_jsonl(composite_dupe, LoadMode::Overwrite)
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1242,7 +1264,7 @@ query insert_item($slug: String, $a: String, $b: String) {
 
     // Two rows unique on the composite (a, b), where `a`/`b` carry a literal
     // `|`. Distinct under a tuple key; identical (`x|y|z`) under a `|`-join.
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     feature
         .mutate(
             "feature",
@@ -1305,7 +1327,7 @@ node Thing {
     optional_val: String?
 }
 "#;
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
 
     let mut seed = String::new();
     for i in 1..=50 {
@@ -1314,7 +1336,7 @@ node Thing {
 "#,
         ));
     }
-    load_jsonl(&db, &seed, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
 
     // Explicit ensure_indices between seed and the merges — the Window
     // 2 trigger. The eager-build behavior (MR-583) means the BTREE on
@@ -1334,11 +1356,11 @@ node Thing {
     // Both merges must succeed under the FirstSeen workaround.
     // `processed_row_ids` re-processes the same target row_id under
     // the default `SourceDedupeBehavior::Fail`; FirstSeen tolerates it.
-    load_jsonl(&db, &delta, LoadMode::Merge)
+    db.load_jsonl(&delta, LoadMode::Merge)
         .await
         .expect("first merge after ensure_indices must succeed");
     db.ensure_indices().await.unwrap();
-    load_jsonl(&db, &delta, LoadMode::Merge).await.expect(
+    db.load_jsonl(&delta, LoadMode::Merge).await.expect(
         "second merge after ensure_indices must succeed \
              (Window 2 canary: drop the FirstSeen setter in table_store.rs \
              only when this stays green WITHOUT it)",
@@ -1369,10 +1391,10 @@ query company($name: String) {
 }
 "#;
 
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
-    let result = query_main(&mut db, query, "company", &params(&[("$name", "Alice")]))
+    let result = query_main(&db, query, "company", &params(&[("$name", "Alice")]))
         .await
         .unwrap();
     assert_eq!(result.num_rows(), 1);
@@ -1389,12 +1411,12 @@ async fn explicit_target_query_sees_other_writer_commits_without_refresh() {
     let uri = dir.path().to_str().unwrap();
 
     // Two independent handles to the same graph
-    let mut db1 = Omnigraph::open(uri).await.unwrap();
-    let mut db2 = Omnigraph::open(uri).await.unwrap();
+    let db1 = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let db2 = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Writer 1 inserts Eve
     mutate_main(
-        &mut db1,
+        &db1,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -1404,7 +1426,7 @@ async fn explicit_target_query_sees_other_writer_commits_without_refresh() {
 
     // Explicit-target reads resolve the latest branch head and should see Eve
     let qr = query_main(
-        &mut db2,
+        &db2,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -1421,11 +1443,11 @@ async fn explicit_target_query_rebuilds_graph_index_after_external_edge_write() 
     drop(_db);
 
     let uri = dir.path().to_str().unwrap();
-    let mut db1 = Omnigraph::open(uri).await.unwrap();
-    let mut db2 = Omnigraph::open(uri).await.unwrap();
+    let db1 = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let db2 = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     let warm = query_main(
-        &mut db2,
+        &db2,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -1435,7 +1457,7 @@ async fn explicit_target_query_rebuilds_graph_index_after_external_edge_write() 
     assert_eq!(warm.num_rows(), 2);
 
     mutate_main(
-        &mut db1,
+        &db1,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Alice"), ("$to", "Diana")]),
@@ -1444,7 +1466,7 @@ async fn explicit_target_query_rebuilds_graph_index_after_external_edge_write() 
     .unwrap();
 
     let refreshed = query_main(
-        &mut db2,
+        &db2,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -1474,13 +1496,13 @@ async fn explicit_target_query_rebuilds_graph_index_after_external_edge_write() 
 async fn null_values_in_filter_and_projection() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
 
     // Load data: Alice has age, Bob has null age, Charlie has age
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Person", "data": {"name": "Bob"}}
 {"type": "Person", "data": {"name": "Charlie", "age": 35}}"#;
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
     // Filter: age > 30 should exclude Bob (null) and Alice (30), keep Charlie (35)
     let queries = r#"
@@ -1500,7 +1522,7 @@ query all_persons() {
 }
 "#;
 
-    let result = query_main(&mut db, queries, "older_than_30", &ParamMap::new())
+    let result = query_main(&db, queries, "older_than_30", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(result.num_rows(), 1);
@@ -1513,7 +1535,7 @@ query all_persons() {
     assert_eq!(names.value(0), "Charlie");
 
     // Projection: Bob's age should be null
-    let all = query_main(&mut db, queries, "all_persons", &ParamMap::new())
+    let all = query_main(&db, queries, "all_persons", &ParamMap::new())
         .await
         .unwrap();
     let batch = &all.batches()[0];
@@ -1540,11 +1562,11 @@ query all_persons() {
 #[tokio::test]
 async fn traversal_works_after_node_then_edge_insert() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Warm up the graph index cache by running a traversal
     let _ = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -1554,7 +1576,7 @@ async fn traversal_works_after_node_then_edge_insert() {
 
     // Insert a new node (does NOT invalidate graph index)
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Frank")], &[("$age", 40)]),
@@ -1564,7 +1586,7 @@ async fn traversal_works_after_node_then_edge_insert() {
 
     // Insert an edge from Frank → Alice (DOES invalidate graph index)
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Frank"), ("$to", "Alice")]),
@@ -1574,7 +1596,7 @@ async fn traversal_works_after_node_then_edge_insert() {
 
     // Traversal should work: Frank → Alice
     let result = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Frank")]),
@@ -1596,7 +1618,7 @@ async fn traversal_works_after_node_then_edge_insert() {
 #[tokio::test]
 async fn insert_edge_with_property() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Knows has `since: Date?` property
     let queries = r#"
@@ -1607,7 +1629,7 @@ query add_friend_since($from: String, $to: String, $since: Date) {
     let mut p = params(&[("$from", "Diana"), ("$to", "Bob")]);
     p.insert("since".to_string(), Literal::Date("2024-06-15".to_string()));
 
-    let result = mutate_main(&mut db, queries, "add_friend_since", &p)
+    let result = mutate_main(&db, queries, "add_friend_since", &p)
         .await
         .unwrap();
     assert_eq!(result.affected_edges, 1);
@@ -1649,10 +1671,10 @@ query add_friend_since($from: String, $to: String, $since: Date) {
 #[tokio::test]
 async fn update_nonexistent_returns_zero_affected() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let result = mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Nobody")], &[("$age", 99)]),
@@ -1666,10 +1688,10 @@ async fn update_nonexistent_returns_zero_affected() {
 #[tokio::test]
 async fn delete_nonexistent_returns_zero_affected() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let result = mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "remove_person",
         &params(&[("$name", "Nobody")]),
@@ -1697,7 +1719,7 @@ node Item {
     value: I32
 }
 "#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
 
     // Generate 500 items
     let mut lines = Vec::with_capacity(500);
@@ -1708,7 +1730,7 @@ node Item {
         ));
     }
     let data = lines.join("\n");
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
 
     assert_eq!(count_rows(&db, "node:Item").await, 500);
 
@@ -1723,7 +1745,7 @@ query high_value() {
     order { $i.value asc }
 }
 "#;
-    let result = query_main(&mut db, queries, "high_value", &ParamMap::new())
+    let result = query_main(&db, queries, "high_value", &ParamMap::new())
         .await
         .unwrap();
 
@@ -1753,12 +1775,12 @@ async fn long_lived_handle_prepares_strict_mutation_from_current_head() {
     drop(_db);
 
     let uri = dir.path().to_str().unwrap();
-    let mut db1 = Omnigraph::open(uri).await.unwrap();
-    let mut db2 = Omnigraph::open(uri).await.unwrap();
+    let db1 = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let db2 = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Writer 1 inserts Eve — advances the Person sub-table.
     mutate_main(
-        &mut db1,
+        &db1,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -1769,7 +1791,7 @@ async fn long_lived_handle_prepares_strict_mutation_from_current_head() {
     // Writer 2's handle predates Eve, but its strict attempt prepares from the
     // current head and succeeds in one call.
     mutate_main(
-        &mut db2,
+        &db2,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
@@ -1779,7 +1801,7 @@ async fn long_lived_handle_prepares_strict_mutation_from_current_head() {
 
     // Both Writer 1's insert and Writer 2's update are visible.
     let result = query_main(
-        &mut db2,
+        &db2,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Alice")]),
@@ -1793,7 +1815,7 @@ async fn long_lived_handle_prepares_strict_mutation_from_current_head() {
     );
 
     let eve = query_main(
-        &mut db2,
+        &db2,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),

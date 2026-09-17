@@ -11,10 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
+use omnigraph::Session;
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::{InitOptions, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::error::{OmniError, Result as OmniResult};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
 use crate::detectors::{self, Channel, Detector, ObservationSource, Oracle};
@@ -1489,7 +1491,7 @@ fn sample_op(rng: &mut SplitMix64, model: &Model, next_ver: &mut i64, hostile: b
     }
 }
 
-async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
+async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
     match op {
         Op::InsertV { name, age, ver } => mutate_on(
             db,
@@ -1569,7 +1571,7 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
                 "{}\n{{\"type\": \"Company\", \"data\": {{\"name\": \"lc0\"}}}}",
                 person_jsonl(people)
             );
-            Box::pin(load_jsonl(db, &payload, LoadMode::Merge))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Merge))
                 .await
                 .map(|_| ())
         }
@@ -1582,7 +1584,7 @@ async fn exec_op(db: &mut Omnigraph, branch: &str, op: &Op) -> OmniResult<()> {
                 person_jsonl(people),
                 people[0].0
             );
-            Box::pin(load_jsonl(db, &payload, LoadMode::Append))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Append))
                 .await
                 .map(|_| ())
         }
@@ -1987,7 +1989,7 @@ pub fn workload_can_reach(window: &str) -> bool {
     )
 }
 
-async fn exec_world_op(db: &mut Omnigraph, wop: &WorldOp) -> OmniResult<()> {
+async fn exec_world_op(db: &Session, wop: &WorldOp) -> OmniResult<()> {
     match wop {
         WorldOp::Data { branch, op } => exec_op(db, branch, op).await,
         WorldOp::BranchCreate { name } => Box::pin(db.branch_create(name)).await,
@@ -3369,7 +3371,7 @@ impl StorageAdapter for FailingStorage {
 
 // ----------------------------------------------------------------- oracles --
 
-async fn assert_matches_model(db: &Omnigraph, model: &Model, where_: &str) {
+async fn assert_matches_model(db: &Session, model: &Model, where_: &str) {
     assert_eq!(
         person_rows(db).await,
         model.person_rows(),
@@ -3386,7 +3388,7 @@ async fn assert_matches_model(db: &Omnigraph, model: &Model, where_: &str) {
 /// and edges — in the model's deterministic order. A branch that lists but
 /// cannot be read (torn create/delete) panics inside the readers: that IS the
 /// oracle for torn branch state.
-async fn observe_world(db: &Omnigraph) -> WorldState {
+async fn observe_world(db: &Session) -> WorldState {
     let mut names = db.branch_list().await.expect("branch list");
     names.sort();
     let mut ordered = vec!["main".to_string()];
@@ -3415,7 +3417,7 @@ pub async fn recovery_residue(storage: &Arc<dyn StorageAdapter>, root: &str) -> 
         .expect("list recovery residue")
 }
 
-async fn assert_world_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
+async fn assert_world_matches(db: &Session, world: &WorldModel, where_: &str) {
     assert_eq!(
         observe_world(db).await,
         world.render(),
@@ -3463,7 +3465,7 @@ async fn capture_history(db: &Omnigraph, main: &Model, history: &mut Vec<(String
 ///    surface as an engine Update the model-diff can't see) — no guessing,
 ///    per the ghost-tie-break lesson. Edge diffs ride on net 1 (edge change
 ///    ids are ULIDs, not model-addressable pairs).
-async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], where_: &str) {
+async fn assert_history_matches(db: &Session, history: &[(String, Model)], where_: &str) {
     for (commit_id, model) in history {
         let persons = Box::pin(person_rows_target(
             db,
@@ -3546,7 +3548,7 @@ async fn assert_history_matches(db: &Omnigraph, history: &[(String, Model)], whe
 /// PHYSICAL-CHANNEL ORACLE (third audit channel, the one that counts rows): per
 /// branch, `export_jsonl` (no query machinery) must equal the model's physical
 /// expectation — persons exactly, Knows = every row ∪ ghosts, duplicates kept.
-async fn assert_physical_matches(db: &Omnigraph, world: &WorldModel, where_: &str) {
+async fn assert_physical_matches(db: &Session, world: &WorldModel, where_: &str) {
     for branch in world.branch_names() {
         let (persons, knows) = Box::pin(physical_view_on(db, &branch)).await;
         let m = world.state_of(&branch);
@@ -3791,7 +3793,7 @@ impl RetryEffect {
 /// engine failpoint around the rerun so the convergence assert provably
 /// fires — `dst_sensitivity_maintenance_rerun_failure_is_red`.
 async fn maintenance_obligations(
-    db: &mut Omnigraph,
+    db: &Session,
     world: &WorldModel,
     wop: &WorldOp,
     label: &str,
@@ -4024,13 +4026,13 @@ struct Arbitration<'a> {
 /// Judge the failed op and its optional retry, then reopen and enforce
 /// recovery monotonicity. Unrelated unjudged ops require watch reconciliation.
 async fn reconcile_after_failure(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
     world: &WorldModel,
     arbitration: Arbitration<'_>,
-) -> (Omnigraph, ReconcileOutcome, &'static str) {
+) -> (Session, ReconcileOutcome, &'static str) {
     let Arbitration {
         label,
         at_op,
@@ -4098,8 +4100,12 @@ async fn reconcile_after_failure(
     let committed = visible == as_with;
     let fork_was_visible = as_fork_only.as_ref() == Some(&visible);
 
+    let settings = db.settings().clone();
     drop(db);
-    let db = reopen_under_storm(&storage, root, label, at_op, recovery_crash).await;
+    let db = Session::from_defaults(
+        Arc::new(reopen_under_storm(&storage, root, label, at_op, recovery_crash).await),
+        settings,
+    );
     let after = observe_world(&db).await;
     if !legal(&after) {
         detectors::violation(
@@ -4261,7 +4267,7 @@ async fn reconcile_after_failure(
 /// deterministic cache-warming side effect auto mode could equally cause;
 /// accepted and recorded.
 async fn assert_traversal_modes_agree(
-    db: &Omnigraph,
+    db: &Session,
     world: &WorldModel,
     branches: &[String],
     where_: &str,
@@ -4363,8 +4369,8 @@ pub fn classify_bystander_view(
 /// after which the bystander must equal fresh (`StaleAfterSync`).
 #[allow(clippy::too_many_arguments)]
 async fn check_sessions(
-    actor: &Omnigraph,
-    bystander: &Omnigraph,
+    actor: &Session,
+    bystander: &Session,
     root: &str,
     storage: &Arc<dyn StorageAdapter>,
     world: &WorldModel,
@@ -4374,12 +4380,17 @@ async fn check_sessions(
     do_catch_up: bool,
     where_: &str,
 ) {
-    let fresh = Box::pin(Omnigraph::open_read_only_with_storage(
-        root,
-        storage.clone(),
-    ))
-    .await
-    .expect("open fresh session");
+    let fresh = Session::from_defaults(
+        Arc::new(
+            Box::pin(Omnigraph::open_read_only_with_storage(
+                root,
+                storage.clone(),
+            ))
+            .await
+            .expect("open fresh session"),
+        ),
+        SessionSettings::default(),
+    );
 
     // Schema fingerprint — the dimension row equality cannot see
     // (the schema-add finding lives here).
@@ -4470,7 +4481,7 @@ enum CrashOutcome {
 #[cfg(feature = "failpoints")]
 #[allow(clippy::too_many_arguments)]
 async fn crash_op(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     wop: &WorldOp,
@@ -4481,17 +4492,16 @@ async fn crash_op(
     expected_conflict: bool,
     failing: Option<&FailingStorage>,
     heads_before: &[(String, String)],
-) -> (Omnigraph, CrashOutcome) {
+) -> (Session, CrashOutcome) {
     assert!(
         !heads_before.is_empty(),
         "a scheduled crash requires pre-op commit heads for arbitration"
     );
-    let mut db = db;
     let result = {
         let _fp = omnigraph::seams::catalog::decide(failpoint)
             .unwrap_or_else(|| panic!("harness window {failpoint} names no catalog seam"))
             .fire_always();
-        exec_world_op(&mut db, wop).await
+        exec_world_op(&db, wop).await
     };
     match result {
         Ok(()) => {
@@ -4541,7 +4551,7 @@ async fn crash_op(
 #[cfg(not(feature = "failpoints"))]
 #[allow(clippy::too_many_arguments)]
 async fn crash_op(
-    _db: Omnigraph,
+    _db: Session,
     _storage: Arc<dyn StorageAdapter>,
     _root: &str,
     _wop: &WorldOp,
@@ -4552,7 +4562,7 @@ async fn crash_op(
     _expected_conflict: bool,
     _failing: Option<&FailingStorage>,
     _heads_before: &[(String, String)],
-) -> (Omnigraph, CrashOutcome) {
+) -> (Session, CrashOutcome) {
     panic!("crash scenarios require --features failpoints");
 }
 
@@ -4629,8 +4639,8 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
             .await
         };
 
-        async fn usable(db: &Omnigraph) -> bool {
-            load_jsonl(db, TEST_DATA, LoadMode::Overwrite).await.is_ok()
+        async fn usable(db: &Session) -> bool {
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.is_ok()
                 && !person_rows(db).await.is_empty()
         }
 
@@ -4638,6 +4648,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
         // open-crash universe, so fleet failure rows carry the detector.
         match init_result {
             Ok(db) => {
+                let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
                 if !usable(&db).await {
                     detectors::violation(
                         DET_BIRTH,
@@ -4651,6 +4662,7 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
             Err(_) => {
                 match Box::pin(Omnigraph::open_with_storage(root, storage.clone())).await {
                     Ok(db) => {
+                        let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
                         if !usable(&db).await {
                             detectors::violation(
                                 DET_BIRTH,
@@ -4691,6 +4703,10 @@ pub fn run_birth_universe(root: &'static str, window: &'static str) -> BirthOutc
                         .await;
                         match reinit_result {
                             Ok(db) => {
+                                let db = Session::from_defaults(
+                                    Arc::new(db),
+                                    SessionSettings::default(),
+                                );
                                 if !usable(&db).await {
                                     detectors::violation(
                                         DET_BIRTH,
@@ -4746,15 +4762,20 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
         .expect("seeded runtime");
     runtime.block_on(async move {
         let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
-        let db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("clean init");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("clean init"),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("clean load");
         let baseline = person_rows(&db).await;
@@ -5012,7 +5033,7 @@ struct WatchRuling {
 /// through the physical channel like the one-op ghost tie-break.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_watch_resolution(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     deferred: &WorldOp,
@@ -5020,7 +5041,7 @@ async fn reconcile_watch_resolution(
     world: &WorldModel,
     label: &str,
     at_op: usize,
-) -> (Omnigraph, WatchRuling, &'static str) {
+) -> (Session, WatchRuling, &'static str) {
     let hyps = composition_hypotheses(world, deferred, interrupt);
     // The failure carries its own triage: a no-match red prints every
     // candidate composition it compared, so the reader can diff instead of
@@ -5054,13 +5075,17 @@ async fn reconcile_watch_resolution(
             "the pre-reopen world renders as a legal composition of the unjudged ops",
         );
     }
+    let settings = db.settings().clone();
     drop(db);
     // `recovery_crash: None` — the double-fault lever is deliberately not
     // exercised at watch resolutions (parity with the kill/fault reconcile
     // sites; the crash-window arm resolves BEFORE `crash_op`, so the lever
     // still fires on that crash's own reconcile). A keep-serving ×
     // double-fault arm is recorded future work.
-    let db = reopen_under_storm(&storage, root, label, at_op, None).await;
+    let db = Session::from_defaults(
+        Arc::new(reopen_under_storm(&storage, root, label, at_op, None).await),
+        settings,
+    );
     let after = observe_world(&db).await;
     let mut after_matches = matches_of(&after);
     if after_matches.is_empty() {
@@ -5232,7 +5257,7 @@ async fn reconcile_watch_resolution(
 /// remain the only obligation triggers.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_keep_serving_watch(
-    db: Omnigraph,
+    db: Session,
     storage: Arc<dyn StorageAdapter>,
     root: &str,
     failing: Option<&FailingStorage>,
@@ -5242,7 +5267,7 @@ async fn resolve_keep_serving_watch(
     row_site: &str,
     watch: KeepServingWatch,
     interrupt: Option<&WatchInterrupt<'_>>,
-) -> (Omnigraph, Option<(ReconcileOutcome, &'static str)>) {
+) -> (Session, Option<(ReconcileOutcome, &'static str)>) {
     known_issues.push(format!(
         "{row_site}:{} after {} refusals (first at op{})",
         watch.operation_id, watch.streak, watch.first_op
@@ -5497,15 +5522,20 @@ impl UniverseScenario<RustResources> for Scenario {
         let lance_faults_state = resources.lance_faults_state.clone();
         let kill_state = resources.kill_state.clone();
 
-        let mut db = Omnigraph::init_with_storage(
-            root,
-            TEST_SCHEMA,
-            storage.clone(),
-            InitOptions::default(),
-        )
-        .await
-        .expect("init universe root");
-        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+        let mut db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    root,
+                    TEST_SCHEMA,
+                    storage.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .expect("init universe root"),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
             .await
             .expect("load fixture");
 
@@ -5531,9 +5561,14 @@ impl UniverseScenario<RustResources> for Scenario {
 
         // the BYSTANDER session — born now (clean store), never
         // writes, read at every session check. The server's warm-idle shape.
-        let bystander = Box::pin(Omnigraph::open_with_storage(root, storage.clone()))
-            .await
-            .expect("open bystander session");
+        let bystander = Session::from_defaults(
+            Arc::new(
+                Box::pin(Omnigraph::open_with_storage(root, storage.clone()))
+                    .await
+                    .expect("open bystander session"),
+            ),
+            SessionSettings::default(),
+        );
         let mut bystander_last: Option<usize> = None;
         let mut bystander_trail: Vec<usize> = Vec::new();
         let mut session_checks = 0usize;
@@ -5740,7 +5775,7 @@ impl UniverseScenario<RustResources> for Scenario {
                         }
                         let ran = if op_targets_live(&world, &wop) {
                             Box::pin(maintenance_obligations(
-                                &mut db,
+                                &db,
                                 &world,
                                 &wop,
                                 &format!("crash:{failpoint}@op{i}"),
@@ -5803,10 +5838,10 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                     _ => None,
                 };
-                exec_world_op(&mut db, &wop).await
+                exec_world_op(&db, &wop).await
             };
             #[cfg(not(feature = "failpoints"))]
-            let exec_result = exec_world_op(&mut db, &wop).await;
+            let exec_result = exec_world_op(&db, &wop).await;
 
             // the dead flag — not the error text, not even the
             // op's verdict — is the authority. The dying op may surface a
@@ -5909,7 +5944,7 @@ impl UniverseScenario<RustResources> for Scenario {
                 }
                 let ran = if op_targets_live(&world, &wop) {
                     Box::pin(maintenance_obligations(
-                        &mut db,
+                        &db,
                         &world,
                         &wop,
                         &format!("crash-state:write#{}@op{i}", ks.writes_observed()),
@@ -6238,7 +6273,7 @@ impl UniverseScenario<RustResources> for Scenario {
                             && sc.faults.as_ref().is_some_and(|p| p.client_retry)
                         {
                             client_retries += 1;
-                            let retry = Box::pin(exec_world_op(&mut db, &wop)).await;
+                            let retry = Box::pin(exec_world_op(&db, &wop)).await;
                             if let Err(retry_err) = &retry
                                 && !(matches!(retry_err, OmniError::RecoveryRequired { .. })
                                     || is_legal_rejection(
@@ -6512,9 +6547,14 @@ impl UniverseScenario<RustResources> for Scenario {
         // Durability + full oracle through a FRESH read-write handle.
         crate::cost::set_label("_audit");
         drop(db);
-        let db = Omnigraph::open_with_storage(root, storage.clone())
-            .await
-            .expect("final reopen");
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(root, storage.clone())
+                    .await
+                    .expect("final reopen"),
+            ),
+            SessionSettings::default(),
+        );
         detectors::tagged(
             DET_WORLD,
             sc.ops,
@@ -6603,9 +6643,14 @@ impl UniverseScenario<RustResources> for Scenario {
 
         // Query-channel variant: the READ-ONLY open path must agree (main;
         // branch reads through the read-only path are a candidate widening).
-        let ro = Omnigraph::open_read_only_with_storage(root, storage)
-            .await
-            .expect("read-only reopen");
+        let ro = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_read_only_with_storage(root, storage)
+                    .await
+                    .expect("read-only reopen"),
+            ),
+            SessionSettings::default(),
+        );
         detectors::tagged(
             DET_RO_AUDIT,
             sc.ops,

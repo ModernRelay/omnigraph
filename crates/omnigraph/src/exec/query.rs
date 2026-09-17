@@ -8,6 +8,8 @@ use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
     record_rrf_gate_verdict,
 };
+use crate::session::Session;
+use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
 
 /// Bundles the per-handle embedding client cell with the optional injected
 /// config (RFC-012 Phase 5) so the lazy init uses the injected config when
@@ -33,8 +35,9 @@ impl EmbeddingResolver<'_> {
     }
 }
 
-impl Omnigraph {
-    /// Run a named query against an explicit branch or snapshot target.
+impl Session {
+    /// Run a named query against an explicit branch or snapshot target under
+    /// this session's settings and the source's `set` prefix.
     pub async fn query(
         &self,
         target: impl Into<ReadTarget>,
@@ -62,6 +65,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<(QueryResult, Option<String>)> {
+        let settings = self.effective(query_source)?;
         // Capture the manifest snapshot and immutable catalog under the same
         // schema-publication gate. SchemaApply publishes its fixed manifest
         // outcome before promoting files/ArcSwap; without this gate a query on
@@ -97,6 +101,7 @@ impl Omnigraph {
                 cell: self.embedding_cell(),
                 config: self.embedding_config_ref(),
             },
+            &settings,
         )
         .await?;
         Ok((result, head))
@@ -113,6 +118,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
+        let settings = self.effective(query_source)?;
         // Historical resolution still uses the current accepted catalog, so
         // capture both sides of that view under schema publication just like a
         // live-target query.
@@ -147,10 +153,13 @@ impl Omnigraph {
                 cell: self.embedding_cell(),
                 config: self.embedding_config_ref(),
             },
+            &settings,
         )
         .await
     }
+}
 
+impl Omnigraph {
     /// Compile `query_name` from `query_source` against `catalog`, cached in
     /// `ReadCaches::compiled_queries`; errors are never cached. INPUT CONTRACT:
     /// a hit needs the memoized `Arc` from `build_accepted_catalog_with_schema_gate_held`.
@@ -369,6 +378,7 @@ async fn extract_search_mode(
     params: &ParamMap,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
+    settings: &SessionSettings,
 ) -> Result<SearchMode> {
     if ir.order_by.is_empty() {
         return Ok(SearchMode::default());
@@ -390,7 +400,7 @@ async fn extract_search_mode(
             .unwrap_or(usize::MAX);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: ann_nprobes(),
+                ann_probe_budget: settings.ann_nprobes(),
                 ..Default::default()
             })
         }
@@ -431,9 +441,10 @@ async fn extract_search_mode(
                 .unwrap_or(60);
 
             let primary_mode =
-                extract_sub_search_mode(ir, primary, params, catalog, embedding).await?;
+                extract_sub_search_mode(ir, primary, params, catalog, embedding, settings).await?;
             let secondary_mode =
-                extract_sub_search_mode(ir, secondary, params, catalog, embedding).await?;
+                extract_sub_search_mode(ir, secondary, params, catalog, embedding, settings)
+                    .await?;
 
             Ok(SearchMode {
                 rrf: Some(RrfMode {
@@ -456,6 +467,7 @@ async fn extract_sub_search_mode(
     params: &ParamMap,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
+    settings: &SessionSettings,
 ) -> Result<SearchMode> {
     match expr {
         IRExpr::Nearest {
@@ -473,7 +485,7 @@ async fn extract_sub_search_mode(
                 .unwrap_or(100);
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: ann_nprobes(),
+                ann_probe_budget: settings.ann_nprobes(),
                 ..Default::default()
             })
         }
@@ -690,7 +702,8 @@ pub(super) fn check_param_date_literals(
     Ok(())
 }
 
-/// Execute a lowered QueryIR. Pure function — no state, no caches.
+/// Execute a lowered QueryIR. Pure function: no state, no caches; the
+/// traversal path, the rrf plan and the probe cap come from `settings`.
 pub async fn execute_query(
     ir: &QueryIR,
     params: &ParamMap,
@@ -698,6 +711,7 @@ pub async fn execute_query(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     embedding: &EmbeddingResolver<'_>,
+    settings: &SessionSettings,
 ) -> Result<QueryResult> {
     check_param_date_literals(params, &ir.params)?;
     let mut resolved_params = None;
@@ -717,7 +731,7 @@ pub async fn execute_query(
     }
     let params = resolved_params.as_ref().unwrap_or(params);
 
-    let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
+    let search_mode = extract_search_mode(ir, params, catalog, embedding, settings).await?;
 
     // Every large future awaited here is boxed: this function's state is
     // inline in its callers' (a `block_on` body in tests puts it on the 2 MiB
@@ -730,6 +744,7 @@ pub async fn execute_query(
             graph_index,
             catalog,
             rrf,
+            settings,
         ))
         .await;
     }
@@ -745,6 +760,7 @@ pub async fn execute_query(
             graph_index,
             catalog,
             &search_mode,
+            settings.rrf_plan(),
         ))
         .await
         {
@@ -769,6 +785,7 @@ pub async fn execute_query(
         graph_index,
         catalog,
         &search_mode,
+        settings,
     ))
     .await?;
 
@@ -798,6 +815,7 @@ pub async fn execute_query(
             graph_index,
             catalog,
             &uncapped,
+            settings,
         ))
         .await?;
         return Ok(QueryResult::new(retried.schema(), vec![retried]));
@@ -859,6 +877,7 @@ pub async fn execute_query(
                     graph_index,
                     catalog,
                     &wider,
+                    settings,
                 ))
                 .await?;
                 result_batch = retried;
@@ -898,6 +917,7 @@ async fn execute_query_once(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     search_mode: &SearchMode,
+    settings: &SessionSettings,
 ) -> Result<(RecordBatch, ScanReport)> {
     let has_aggregates = projections_have_aggregates(&ir.return_exprs);
 
@@ -929,6 +949,7 @@ async fn execute_query_once(
         &mut scan_report,
         final_expand_cap,
         &needed_columns,
+        settings,
     )
     .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -1085,38 +1106,6 @@ fn rrf_gate_max_ids() -> usize {
         .unwrap_or(DEFAULT_RRF_GATE_MAX_IDS)
 }
 
-/// The rrf gate's force hook. `OMNIGRAPH_RRF_PLAN` ∈ {auto (default),
-/// force_prefilter, force_postfilter}; the scoped test seam
-/// (`instrumentation::with_rrf_plan`) takes precedence over the
-/// process-global env var, mirroring `traversal_indexed_override`. A force
-/// overrides only the gate's THRESHOLD decision, never a correctness fence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RrfPlanForce {
-    Auto,
-    Prefilter,
-    Postfilter,
-}
-
-fn rrf_plan_force() -> RrfPlanForce {
-    let mode = crate::instrumentation::rrf_plan_override()
-        .map(str::to_string)
-        .or_else(|| std::env::var("OMNIGRAPH_RRF_PLAN").ok());
-    match mode.as_deref() {
-        Some("force_prefilter") => RrfPlanForce::Prefilter,
-        Some("force_postfilter") => RrfPlanForce::Postfilter,
-        // A diagnosis knob must not fail silent while someone is diagnosing:
-        // an unrecognized value runs auto, loudly.
-        Some(other) if !other.is_empty() && other != "auto" => {
-            tracing::warn!(
-                value = other,
-                "unrecognized OMNIGRAPH_RRF_PLAN value; running auto"
-            );
-            RrfPlanForce::Auto
-        }
-        _ => RrfPlanForce::Auto,
-    }
-}
-
 /// Top-level Expand ops whose `src_var` is the ranked variable — the
 /// admission table's eligibility sources, as (edge_type, direction) pairs.
 /// `None` is the shape fall-back: the ranked variable is some Expand's dst
@@ -1208,6 +1197,7 @@ async fn rrf_prefilter_gate(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     rrf: &RrfMode,
+    rrf_plan: RrfPlan,
 ) -> Option<EligibleIds> {
     let fall_back =
         |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
@@ -1229,12 +1219,11 @@ async fn rrf_prefilter_gate(
             });
         };
 
-    let force = rrf_plan_force();
-    if force == RrfPlanForce::Postfilter {
+    if rrf_plan == RrfPlan::ForcePostfilter {
         fall_back(RrfGateFallback::Forced, true, None, None);
         return None;
     }
-    let forced = force == RrfPlanForce::Prefilter;
+    let forced = rrf_plan == RrfPlan::ForcePrefilter;
 
     // Both arms must target one ranked variable, and at least one arm must
     // be bm25 — a nearest-only fusion has nothing the gate may prefilter.
@@ -1469,12 +1458,12 @@ async fn nearest_prefilter_gate(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     mode: &SearchMode,
+    rrf_plan: RrfPlan,
 ) -> NearestGatePlan {
     let Some((ranked_var, ..)) = mode.nearest.as_ref() else {
         return NearestGatePlan::Postfilter;
     };
-    let force = rrf_plan_force();
-    let forced = force != RrfPlanForce::Auto;
+    let forced = rrf_plan != RrfPlan::Auto;
     let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>, corpus: Option<u64>| {
         tracing::debug!(
             ?fallback,
@@ -1489,7 +1478,7 @@ async fn nearest_prefilter_gate(
             corpus,
         });
     };
-    if force == RrfPlanForce::Postfilter {
+    if rrf_plan == RrfPlan::ForcePostfilter {
         fall_back(RrfGateFallback::Forced, None, None);
         return NearestGatePlan::Postfilter;
     }
@@ -1576,6 +1565,7 @@ async fn execute_rrf_fusion(
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
     rrf: &RrfMode,
+    settings: &SessionSettings,
 ) -> Result<QueryResult> {
     debug_assert!(
         rrf.primary.bm25_scan_limit.is_none() && rrf.secondary.bm25_scan_limit.is_none(),
@@ -1592,7 +1582,8 @@ async fn execute_rrf_fusion(
     // `execute_node_scan` applies its filters unconditionally and has no arm
     // identity of its own. (The both-legs symmetry `fail_open_rrf_leg_targets`
     // enforces for COLUMNS deliberately does not extend to rows.)
-    let eligible = rrf_prefilter_gate(ir, snapshot, graph_index, catalog, rrf).await;
+    let eligible =
+        rrf_prefilter_gate(ir, snapshot, graph_index, catalog, rrf, settings.rrf_plan()).await;
     let gated = eligible.as_ref().map(|ids| {
         (
             arm_with_bm25_prefilter(&rrf.primary, ids),
@@ -1616,6 +1607,7 @@ async fn execute_rrf_fusion(
         &mut ScanReport::default(),
         None,
         &needed_columns,
+        settings,
     )
     .await?;
 
@@ -1631,6 +1623,7 @@ async fn execute_rrf_fusion(
         &mut ScanReport::default(),
         None,
         &needed_columns,
+        settings,
     )
     .await?;
 
@@ -2117,6 +2110,7 @@ fn execute_pipeline<'a>(
     // always pass `None`.
     final_expand_cap: Option<usize>,
     needed_columns: &'a HashMap<String, NeededColumns>,
+    settings: &'a SessionSettings,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         // Pre-pass: hoist filters onto the op that introduces their binding.
@@ -2283,6 +2277,7 @@ fn execute_pipeline<'a>(
                             edge_binding.as_deref(),
                             params,
                             emit_cap,
+                            settings.traversal(),
                         )
                         .await?;
                     }
@@ -2299,6 +2294,7 @@ fn execute_pipeline<'a>(
                             catalog,
                             outer_var,
                             needed_columns,
+                            settings,
                         )
                         .await?;
                     }
@@ -2443,27 +2439,6 @@ impl<'a> GraphIndexHandle<'a> {
     }
 }
 
-/// Explicit traversal-mode override. `OMNIGRAPH_TRAVERSAL_MODE=indexed|csr`
-/// forces the path (ops escape hatch + test hook). Both modes are semantically
-/// identical, so the override only changes which path runs, never the result.
-fn traversal_indexed_override() -> Option<bool> {
-    // The scoped test seam (`with_traversal_mode`) takes precedence over the
-    // process-global `OMNIGRAPH_TRAVERSAL_MODE` ops escape hatch.
-    let mode = crate::instrumentation::traversal_mode_override()
-        .map(str::to_string)
-        .or_else(|| std::env::var("OMNIGRAPH_TRAVERSAL_MODE").ok());
-    match mode.as_deref() {
-        Some("indexed") => Some(true),
-        Some("csr") => Some(false),
-        _ => None,
-    }
-}
-
-/// Guard Lance's IVF search against loading every payload partition when its
-/// centroid-distance heuristic expands the adaptive minimum. This is a
-/// maximum only: easy queries retain Lance's one-partition default.
-const DEFAULT_ANN_NPROBES: usize = 20;
-
 /// Per-rung multiplier of the probe ladder (20 → 80 → 320 → none).
 const ANN_PROBE_ESCALATION_FACTOR: usize = 4;
 
@@ -2561,32 +2536,6 @@ fn batches_hold_infinite_distance(batches: &[RecordBatch]) -> bool {
             .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
             .is_some_and(|distances| distances.iter().flatten().any(f32::is_infinite))
     })
-}
-
-/// `OMNIGRAPH_ANN_NPROBES`, the per-delta probe cap a nearest scan starts
-/// at: unset or empty is `DEFAULT_ANN_NPROBES`; `0` is no cap; anything
-/// else that is not a positive integer runs the default, loudly.
-fn ann_nprobes_from(value: Option<&str>) -> Option<usize> {
-    match value.map(str::trim) {
-        None | Some("") => Some(DEFAULT_ANN_NPROBES),
-        Some(other) => match other.parse::<usize>() {
-            Ok(0) => None,
-            Ok(maximum) => Some(maximum),
-            Err(_) => {
-                tracing::warn!(
-                    value = other,
-                    default = DEFAULT_ANN_NPROBES,
-                    "invalid OMNIGRAPH_ANN_NPROBES value (not a non-negative integer); using the default maximum"
-                );
-                Some(DEFAULT_ANN_NPROBES)
-            }
-        },
-    }
-}
-
-fn ann_nprobes() -> Option<usize> {
-    let value = std::env::var("OMNIGRAPH_ANN_NPROBES").ok();
-    ann_nprobes_from(value.as_deref())
 }
 
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
@@ -2942,6 +2891,7 @@ async fn execute_expand(
     edge_binding: Option<&str>,
     params: &ParamMap,
     emit_cap: Option<usize>,
+    traversal: Traversal,
 ) -> Result<()> {
     if let Some(cap) = emit_cap {
         // RecordBatch clones are Arc'd column handles — cheap insurance for
@@ -2963,6 +2913,7 @@ async fn execute_expand(
             edge_binding,
             params,
             Some(cap),
+            traversal,
         )
         .await?;
         // The cap is only legal when there are no `dst_filters`, so an
@@ -2996,6 +2947,7 @@ async fn execute_expand(
                 edge_binding,
                 params,
                 None,
+                traversal,
             )
             .await?;
         }
@@ -3017,6 +2969,7 @@ async fn execute_expand(
         edge_binding,
         params,
         None,
+        traversal,
     )
     .await
     .map(|_| ())
@@ -3042,6 +2995,7 @@ async fn execute_expand_dispatch(
     edge_binding: Option<&str>,
     params: &ParamMap,
     emit_cap: Option<usize>,
+    traversal: Traversal,
 ) -> Result<bool> {
     let frontier_rows = wide.num_rows();
     let effective_max_hops = max_hops.unwrap_or(min_hops.max(1));
@@ -3072,12 +3026,16 @@ async fn execute_expand_dispatch(
         return Ok(false);
     }
 
-    // Cardinality-first preliminary decision (no IO). The override wins; else the
-    // cost model decides under *optimistic* coverage. Optimistic is what lets us
-    // skip the dataset open on a clearly-CSR traversal: real coverage can only
-    // make the indexed path costlier, so if even a perfectly-indexed scan loses
-    // to CSR here, it loses for real.
-    let forced = traversal_indexed_override();
+    // Cardinality-first preliminary decision (no IO). A pinned traversal wins;
+    // else the cost model decides under *optimistic* coverage. Optimistic is
+    // what lets us skip the dataset open on a clearly-CSR traversal: real
+    // coverage can only make the indexed path costlier, so if even a
+    // perfectly-indexed scan loses to CSR here, it loses for real.
+    let forced = match traversal {
+        Traversal::Indexed => Some(true),
+        Traversal::Csr => Some(false),
+        Traversal::Auto => None,
+    };
     let lean_indexed = match forced {
         Some(v) => v,
         None => match gather_cost_inputs(
@@ -4171,6 +4129,7 @@ async fn execute_anti_join(
     catalog: &Catalog,
     outer_var: &str,
     needed_columns: &HashMap<String, NeededColumns>,
+    settings: &SessionSettings,
 ) -> Result<()> {
     // Only the bulk fast path consumes the CSR; the slow path's inner Expand
     // chooses its own access path. Realize the O(|E|) graph index ONLY when the
@@ -4243,6 +4202,7 @@ async fn execute_anti_join(
         &mut ScanReport::default(),
         None,
         needed_columns,
+        settings,
     )
     .await?;
 
@@ -5100,34 +5060,7 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch>
 
 #[cfg(test)]
 mod ann_probe_budget_tests {
-    use super::{DEFAULT_ANN_NPROBES, LadderStep, SearchMode, ann_nprobes_from, ladder_step};
-
-    #[test]
-    fn missing_value_uses_default_maximum() {
-        for value in [None, Some(""), Some("  ")] {
-            assert_eq!(ann_nprobes_from(value), Some(DEFAULT_ANN_NPROBES));
-        }
-    }
-
-    #[test]
-    fn positive_value_is_used_as_configured() {
-        assert_eq!(ann_nprobes_from(Some("7")), Some(7));
-        assert_eq!(ann_nprobes_from(Some(" 7 ")), Some(7));
-    }
-
-    #[test]
-    fn zero_means_no_cap() {
-        for value in [Some("0"), Some("00"), Some(" 0 ")] {
-            assert_eq!(ann_nprobes_from(value), None);
-        }
-    }
-
-    #[test]
-    fn invalid_values_use_default() {
-        for value in [Some("not-a-number"), Some("-5"), Some("1.5"), Some("20x")] {
-            assert_eq!(ann_nprobes_from(value), Some(DEFAULT_ANN_NPROBES));
-        }
-    }
+    use super::{LadderStep, SearchMode, ladder_step};
 
     #[test]
     fn uncapping_rows_leaves_the_probe_budget_alone() {
@@ -6192,9 +6125,12 @@ mod needed_columns_tests {
 mod column_projection_tests {
     use super::*;
     use omnigraph_compiler::SYSTEM_COLUMNS_V3;
+    use omnigraph_compiler::settings::SessionSettings;
+    use std::sync::Arc;
 
+    use crate::Session;
     use crate::db::ReadTarget;
-    use crate::loader::{LoadMode, load_jsonl};
+    use crate::loader::LoadMode;
 
     /// Embedding width. Wide enough (4 bytes/dim = 3 KiB/row) that the vector
     /// column dominates the table, without an unwieldy JSONL fixture.
@@ -6266,7 +6202,10 @@ query first_slug() {
     /// the query below reuses that same cached `Dataset`, hence the same store
     /// and the same tracker.
     async fn read_bytes(uri: &str, read: Read) -> u64 {
-        let db = Omnigraph::open(uri).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::open(uri).await.unwrap()),
+            SessionSettings::default(),
+        );
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let dataset = snapshot.open_lance_dataset("node:Chunk").await.unwrap();
         let store = dataset.object_store(None).await.unwrap();
@@ -6332,8 +6271,11 @@ query first_slug() {
     async fn slug_projection_does_not_read_vector_column_issue_564() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-        load_jsonl(&db, &seed_data(), LoadMode::Overwrite)
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(&seed_data(), LoadMode::Overwrite)
             .await
             .unwrap();
         drop(db);

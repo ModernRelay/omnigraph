@@ -248,9 +248,9 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
 }
 
-// Every public async inherent Omnigraph method (wherever its impl lives), plus
-// top-level loader convenience functions, must appear in either this read-only
-// set or WRITE_SURFACES. Within that supported API shape this is
+// Every public async inherent Omnigraph or Session method (wherever its impl
+// lives) must appear in either this read-only set or WRITE_SURFACES. Within
+// that supported API shape this is
 // name-independent: a newly named `transact`, `publish`, or `vacuum` method
 // cannot evade discovery.
 const READ_ONLY_SURFACES: &[(&str, &str)] = &[
@@ -1382,9 +1382,14 @@ impl<'ast> Visit<'ast> for CallInventory {
             self.macro_hits
                 .push("include! can hide unparsed durable calls".into());
         }
-        if ["Omnigraph", "GraphCoordinator", "ManifestCoordinator"]
-            .iter()
-            .any(|owner| tokens.contains(owner))
+        if [
+            "Omnigraph",
+            "Session",
+            "GraphCoordinator",
+            "ManifestCoordinator",
+        ]
+        .iter()
+        .any(|owner| tokens.contains(owner))
             && (tokens.contains("pub async fn") || tokens.contains("impl "))
         {
             self.macro_hits.push(format!(
@@ -1471,8 +1476,10 @@ fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
+/// The two owners of the public graph API: the handle, and the session that
+/// carries the operations consulting a setting (the Session settings RFC).
 fn is_omnigraph_type(ty: &Type) -> bool {
-    is_named_type(ty, "Omnigraph")
+    is_named_type(ty, "Omnigraph") || is_named_type(ty, "Session")
 }
 
 fn is_named_type(ty: &Type, expected: &str) -> bool {

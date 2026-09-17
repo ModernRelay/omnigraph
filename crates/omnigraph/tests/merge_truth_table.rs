@@ -47,9 +47,10 @@ mod helpers;
 use std::time::Instant;
 
 use helpers::{count_rows, first_column_sorted, mixed_params, mutate_branch, params, query_main};
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::error::{MergeConflictKind, OmniError};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 
 // ─── Fixture ────────────────────────────────────────────────────────────────
 
@@ -119,10 +120,10 @@ query knows_of($name: String) {
 }
 "#;
 
-async fn bootstrap(dir: &tempfile::TempDir) -> Omnigraph {
+async fn bootstrap(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TRUTH_SCHEMA).await.unwrap();
-    load_jsonl(&db, TRUTH_DATA, LoadMode::Overwrite)
+    let db = helpers::session(Omnigraph::init(uri, TRUTH_SCHEMA).await.unwrap());
+    db.load_jsonl(TRUTH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db
@@ -215,7 +216,7 @@ enum Apply {
     NetZeroKnowsFromAlice,
 }
 
-async fn apply(db: &mut Omnigraph, branch: &str, action: Apply) {
+async fn apply(db: &Session, branch: &str, action: Apply) {
     match action {
         Apply::Skip => {}
         Apply::InsertEve { age } => {
@@ -849,15 +850,15 @@ async fn run_direction(
     expected: &Expected,
 ) -> DirectionResult {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = bootstrap(&dir).await;
+    let db = bootstrap(&dir).await;
     db.branch_create("feature").await.unwrap();
 
     // One handle, two branches — matches the pattern in
     // `tests/branching.rs`. Using two `Omnigraph::open` handles for one
     // dataset is unnecessary here and only opens room for cache-coherency
     // surprises that are out of scope for this test.
-    apply(&mut db, "feature", left_op).await;
-    apply(&mut db, "main", right_op).await;
+    apply(&db, "feature", left_op).await;
+    apply(&db, "main", right_op).await;
 
     let merge_result = db.branch_merge("feature", "main").await;
     let outcome = match merge_result {
@@ -879,7 +880,7 @@ async fn run_direction(
             ActualOutcome::Merged | ActualOutcome::FastForward | ActualOutcome::AlreadyUpToDate
         )
     {
-        assert_state(&mut db, assert, label).await;
+        assert_state(&db, assert, label).await;
     }
 
     // Post-conflict invariant: `branch_merge` is atomic, so a failed
@@ -890,7 +891,7 @@ async fn run_direction(
     // to every conflict cell.
     if matches!(outcome, ActualOutcome::Conflicts(_)) {
         let expected_target = state_after_apply_only(right_op);
-        assert_state(&mut db, &expected_target, label).await;
+        assert_state(&db, &expected_target, label).await;
     }
 
     DirectionResult {
@@ -916,7 +917,7 @@ fn state_after_apply_only(action: Apply) -> GraphAssert {
     }
 }
 
-async fn assert_state(db: &mut Omnigraph, expected: &GraphAssert, label: &str) {
+async fn assert_state(db: &Session, expected: &GraphAssert, label: &str) {
     let person_count = count_rows(db, "node:Person").await;
     assert_eq!(
         person_count, expected.persons,
@@ -1102,25 +1103,20 @@ edge Knows: Person -> Person {
 async fn add_edge_add_edge_keyed_twin_converges() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main_db = Omnigraph::init(uri, KEYED_TRUTH_SCHEMA).await.unwrap();
-    load_jsonl(&main_db, TRUTH_DATA, LoadMode::Overwrite)
+    let main_db = helpers::session(Omnigraph::init(uri, KEYED_TRUTH_SCHEMA).await.unwrap());
+    main_db
+        .load_jsonl(TRUTH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     main_db.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     let insert = params(&[("$from", "Alice"), ("$to", "Carol")]);
+    mutate_branch(&main_db, "main", TRUTH_MUTATIONS, "insert_knows", &insert)
+        .await
+        .unwrap();
     mutate_branch(
-        &mut main_db,
-        "main",
-        TRUTH_MUTATIONS,
-        "insert_knows",
-        &insert,
-    )
-    .await
-    .unwrap();
-    mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         TRUTH_MUTATIONS,
         "insert_knows",
@@ -1140,7 +1136,7 @@ async fn add_edge_add_edge_keyed_twin_converges() {
     assert_eq!(count_rows(&main_db, "edge:Knows").await, 2);
     for (from, to) in [("Alice", "Carol"), ("Bob", "Carol")] {
         let knows = query_main(
-            &mut main_db,
+            &main_db,
             TRUTH_MUTATIONS,
             "knows_of",
             &params(&[("$name", from)]),

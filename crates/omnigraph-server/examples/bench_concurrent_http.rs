@@ -129,6 +129,7 @@ async fn drive_actor(
                 "value": op_idx as i32,
             })),
             branch: None,
+            settings: None,
         };
         let body = serde_json::to_vec(&request_body).unwrap();
         let req = Request::builder()
