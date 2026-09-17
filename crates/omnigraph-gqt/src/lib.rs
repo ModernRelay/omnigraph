@@ -922,7 +922,7 @@ fn line_holds_statement(text: &str, statement: &str, name: &str) -> bool {
         .any(|(at, _)| text[at + statement.len()..].trim_start().starts_with(name))
 }
 
-/// The `process` scope rule at the runner (RFC 0068, Logic tests): a case
+/// The `process` scope rule at the runner (the Session settings RFC, Logic tests): a case
 /// body may `set` or `reset` a `request` setting only; the refusal names
 /// the offending statement's line.
 fn refuse_process_settings(

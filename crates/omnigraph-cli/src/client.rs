@@ -103,7 +103,7 @@ const SETTINGS_AT_SERVED_LOAD: &str = "load and ingest take --set only on an emb
                                        the served load and ingest routes carry no settings field";
 
 /// The `--set name=value` flags of one invocation, each checked against the
-/// settings definition (RFC 0068). Scope is the transport's: the embedded
+/// settings definition (the Session settings RFC). Scope is the transport's: the embedded
 /// session accepts every setting, a remote request refuses a `process` one.
 pub(crate) fn parse_set_flags(flags: &[String]) -> Result<Vec<(SettingId, SettingValue)>> {
     let mut settings = Vec::with_capacity(flags.len());
@@ -391,7 +391,7 @@ impl GraphClient {
         Self::open_session(uri, &[]).await
     }
 
-    /// The embedded CLI is the process (RFC 0068): one session over the
+    /// The embedded CLI is the process (the Session settings RFC): one session over the
     /// environment's defaults and the `--set` values, every setting accepted;
     /// the source's own `set` lines apply per call, on top.
     async fn open_session(uri: &str, settings: &[(SettingId, SettingValue)]) -> Result<Session> {

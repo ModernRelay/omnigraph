@@ -1692,7 +1692,7 @@ const SET_MERGE_OFF: &str = "--- mutate\nset merge_lineage = off;\n--- expect ok
 const SHOW_MERGE_LINEAGE: &str = "--- query\nshow merge_lineage;\n--- expect unordered\n{\"name\": \"merge_lineage\", \"value\": \"off\", \"default\": \"on\", \"source\": \"file\", \"scope\": \"request\"}\n--- expect shape\nname: String\nvalue: String\ndefault: String\nsource: String\nscope: String\n";
 
 /// The settings statements the compiler and the scope rule refuse, each with
-/// the definition's message (RFC 0068, The statements): the runner refuses
+/// the definition's message (the Session settings RFC, The statements): the runner refuses
 /// the case at parse time, so no case can carry these as expectations.
 #[test]
 fn refuses_settings_statements_the_definition_refuses() {

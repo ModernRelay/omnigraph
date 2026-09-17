@@ -395,7 +395,7 @@ pub struct AppState {
     /// exceeds the server's.
     shutdown_grace: std::time::Duration,
     /// The process defaults every request's session starts from and `reset`
-    /// returns to (RFC 0068): the settings definition's defaults, replaced
+    /// returns to (the Session settings RFC): the settings definition's defaults, replaced
     /// by `serve` with the values `settings::from_env` read at startup.
     process_defaults: Arc<ProcessDefaults>,
 }
@@ -767,7 +767,7 @@ impl AppState {
         self
     }
 
-    /// Attach the process defaults every session starts from (RFC 0068).
+    /// Attach the process defaults every session starts from (the Session settings RFC).
     /// `serve` passes the environment's; a test may seed its own.
     #[must_use]
     pub fn with_process_defaults(mut self, defaults: ProcessDefaults) -> Self {

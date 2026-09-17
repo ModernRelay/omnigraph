@@ -213,3 +213,4 @@ then dated RFCs by date.
 | [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |
 | [2026-09-09](2026-09-09-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | accepted | complete |
 | [2026-09-14](2026-09-14-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
+| [2026-09-16](2026-09-16-session-settings.md) | Session settings | maintainer | draft | in-progress |

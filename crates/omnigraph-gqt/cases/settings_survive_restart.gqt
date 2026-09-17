@@ -3,7 +3,7 @@
 # notes: detaches the case session, drops the old engine handle, reopens the
 # notes: same storage and reattaches the detached settings), and a reset after
 # notes: the restart returns to the case's baseline, so the restart kept the
-# notes: baseline too (RFC 0068, Logic tests).
+# notes: baseline too (the Session settings RFC, Logic tests).
 # notes: `settings_show_set_reset.gqt` carries why the baseline reads `verify`.
 
 --- runner

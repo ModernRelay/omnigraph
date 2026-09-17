@@ -133,7 +133,7 @@ pub(crate) enum Command {
         snapshot: Option<String>,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (RFC 0068).
+        /// `settings` field (the Session settings RFC).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         settings: Vec<String>,
         #[arg(long, conflicts_with = "json")]
@@ -177,7 +177,7 @@ pub(crate) enum Command {
         if_commit: Option<String>,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (RFC 0068).
+        /// `settings` field (the Session settings RFC).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         settings: Vec<String>,
         #[arg(long)]
@@ -843,7 +843,7 @@ pub(crate) enum BranchCommand {
         delete_branch: bool,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (RFC 0068).
+        /// `settings` field (the Session settings RFC).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         settings: Vec<String>,
         #[arg(long)]
@@ -954,7 +954,7 @@ pub(crate) enum CommitCommand {
         ops: Vec<ChangeOpArg>,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (RFC 0068).
+        /// `settings` field (the Session settings RFC).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         settings: Vec<String>,
         #[arg(long)]
@@ -1024,7 +1024,7 @@ pub(crate) enum ChangesCommand {
         ops: Vec<ChangeOpArg>,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (RFC 0068).
+        /// `settings` field (the Session settings RFC).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         settings: Vec<String>,
         #[arg(long)]

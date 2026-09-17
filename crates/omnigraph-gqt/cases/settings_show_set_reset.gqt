@@ -4,7 +4,7 @@
 # notes: fresh case reports every default with source `default`; a settings step
 # notes: sets the value with source `file`; a reset returns to the default; the
 # notes: last assignment in one settings step wins; a settings prefix on a
-# notes: `show` step is scoped to that step (RFC 0068, Evidence and tests).
+# notes: `show` step is scoped to that step (the Session settings RFC, Evidence and tests).
 # notes: `merge_lineage` reads `verify` because `SessionSettings::default` picks
 # notes: `verify` under `cfg!(debug_assertions)` and the corpus runs in debug;
 # notes: the `default` column still reports the definition's `on`. The other

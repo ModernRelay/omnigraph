@@ -2953,7 +2953,7 @@ pub(crate) struct ParsedChangeParams {
     pub ops: Vec<api::ChangeOpOutput>,
     /// The `set=<name>=<value>` parameters, each checked against the settings
     /// definition and the `process` scope rule: validated here; consulted by
-    /// nothing until the `engine` setting lands (RFC 0068 rollout step 2).
+    /// nothing until the `engine` setting lands (the Session settings RFC's rollout step 2).
     pub settings: Vec<(SettingId, SettingValue)>,
 }
 

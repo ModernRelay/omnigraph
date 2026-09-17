@@ -32,7 +32,8 @@ imply implementation or qualification.
 
 One engine instance survives ordinary steps and expected errors. Only
 `--- restart` drops the engine and reopens the same storage. A case owns one
-session (RFC 0068) for its lifetime: a `--- mutate` step of only `set` and
+session ([Session settings](../../docs/rfcs/2026-09-16-session-settings.md)) for
+its lifetime: a `--- mutate` step of only `set` and
 `reset` lines expects `ok` and changes that session for the steps that follow,
 across a restart; a `set` prefix before any other body applies to that step
 only; `show <name>` and `show all` are `--- query` rows steps with the five

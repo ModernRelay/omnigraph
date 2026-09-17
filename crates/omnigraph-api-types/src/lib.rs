@@ -20,8 +20,8 @@ use serde_json::value::RawValue;
 use utoipa::openapi::schema::{ObjectBuilder, Type};
 use utoipa::{IntoParams, ToSchema};
 
-/// The settings definition every door reads (RFC 0068), re-exported so a
-/// wire consumer needs no second dependency for it.
+/// The settings definition every door reads (the Session settings RFC),
+/// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
 
 /// Lowercase wire name for the raw graph-head conditional-write token.
@@ -266,7 +266,7 @@ pub struct BranchMergeRequest {
     /// and never fails the already-landed merge.
     #[serde(default)]
     pub delete_branch: bool,
-    /// Session settings for this request (RFC 0068); see [`SettingsRequest`].
+    /// Session settings for this request (the Session settings RFC); see [`SettingsRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsRequest>,
 }
@@ -687,7 +687,7 @@ pub struct CommitChangesQuery {
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
     /// The value is validated here and selects nothing in this release: the
-    /// consumer is the `engine` setting, RFC 0068 rollout step 2.
+    /// consumer is the `engine` setting, the Session settings RFC's rollout step 2.
     #[serde(default)]
     pub set: Vec<String>,
 }
@@ -717,7 +717,7 @@ pub struct ChangeFeedQuery {
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
     /// The value is validated here and selects nothing in this release: the
-    /// consumer is the `engine` setting, RFC 0068 rollout step 2.
+    /// consumer is the `engine` setting, the Session settings RFC's rollout step 2.
     #[serde(default)]
     pub set: Vec<String>,
 }
@@ -838,7 +838,7 @@ pub struct QueryRequest {
     pub branch: Option<String>,
     /// Snapshot id to read from. Mutually exclusive with `branch`.
     pub snapshot: Option<String>,
-    /// Session settings for this request (RFC 0068); see [`SettingsRequest`].
+    /// Session settings for this request (the Session settings RFC); see [`SettingsRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsRequest>,
 }
@@ -999,7 +999,7 @@ pub struct ChangeRequest {
     /// Target branch. Defaults to `main`.
     #[serde(default)]
     pub branch: Option<String>,
-    /// Session settings for this request (RFC 0068); see [`SettingsRequest`].
+    /// Session settings for this request (the Session settings RFC); see [`SettingsRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsRequest>,
 }

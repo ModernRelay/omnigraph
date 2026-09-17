@@ -2,7 +2,7 @@
 # notes: `set`, `reset`, `show` and `all` are settings keywords only where a
 # notes: settings statement can start. Inside a query body they stay
 # notes: identifiers: `set` is a property name, `show` is an edge hop, and
-# notes: `all` is a branch name (RFC 0068, The statements). The schema spells
+# notes: `all` is a branch name (the Session settings RFC, The statements). The schema spells
 # notes: the edge type `Show` because `.pg` type names start with an uppercase
 # notes: letter (`schema.pest` `type_name`); the traversal spells the same edge
 # notes: `show` (`query.pest` `edge_ident`, resolved by `normalize_edge_name`).

@@ -1477,7 +1477,7 @@ fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// The two owners of the public graph API: the handle, and the session that
-/// carries the operations consulting a setting (RFC 0068).
+/// carries the operations consulting a setting (the Session settings RFC).
 fn is_omnigraph_type(ty: &Type) -> bool {
     is_named_type(ty, "Omnigraph") || is_named_type(ty, "Session")
 }

@@ -1367,7 +1367,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nThe value is validated here and selects nothing in this release: the\nconsumer is the `engine` setting, RFC 0068 rollout step 2.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nThe value is validated here and selects nothing in this release: the\nconsumer is the `engine` setting, the Session settings RFC's rollout step 2.",
             "required": false,
             "schema": {
               "type": "array",
@@ -1835,7 +1835,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nThe value is validated here and selects nothing in this release: the\nconsumer is the `engine` setting, RFC 0068 rollout step 2.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nThe value is validated here and selects nothing in this release: the\nconsumer is the `engine` setting, the Session settings RFC's rollout step 2.",
             "required": false,
             "schema": {
               "type": "array",
@@ -3838,7 +3838,7 @@
               },
               {
                 "$ref": "#/components/schemas/SettingsRequest",
-                "description": "Session settings for this request (RFC 0068); see [`SettingsRequest`]."
+                "description": "Session settings for this request (the Session settings RFC); see [`SettingsRequest`]."
               }
             ]
           },
@@ -4342,7 +4342,7 @@
               },
               {
                 "$ref": "#/components/schemas/SettingsRequest",
-                "description": "Session settings for this request (RFC 0068); see [`SettingsRequest`]."
+                "description": "Session settings for this request (the Session settings RFC); see [`SettingsRequest`]."
               }
             ]
           }
@@ -5344,7 +5344,7 @@
               },
               {
                 "$ref": "#/components/schemas/SettingsRequest",
-                "description": "Session settings for this request (RFC 0068); see [`SettingsRequest`]."
+                "description": "Session settings for this request (the Session settings RFC); see [`SettingsRequest`]."
               }
             ]
           },
