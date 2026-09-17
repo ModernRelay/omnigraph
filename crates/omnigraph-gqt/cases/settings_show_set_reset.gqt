@@ -1,0 +1,100 @@
+# issue: none
+# notes: the case session's show, set and reset: `show all` returns one row per
+# notes: definition row in definition order, so `--- expect ordered` applies; a
+# notes: fresh case reports every default with source `default`; a settings step
+# notes: sets the value with source `file`; a reset returns to the default; the
+# notes: last assignment in one settings step wins; a settings prefix on a
+# notes: `show` step is scoped to that step (RFC 0068, Evidence and tests).
+# notes: `merge_lineage` reads `verify` because `SessionSettings::default` picks
+# notes: `verify` under `cfg!(debug_assertions)` and the corpus runs in debug;
+# notes: the `default` column still reports the definition's `on`. The other
+# notes: `settings_*` cases point here for that rationale instead of repeating
+# notes: it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- query
+show all;
+
+--- expect ordered
+{"name": "rrf_plan", "value": "auto", "default": "auto", "source": "default", "scope": "process"}
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+{"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "process"}
+{"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- mutate
+set merge_lineage = off;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "off", "default": "on", "source": "file", "scope": "request"}
+
+--- mutate
+reset merge_lineage;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- mutate
+set merge_lineage = off;
+set merge_lineage = on;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}
+
+--- query
+set merge_lineage = off;
+reset all;
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "on", "default": "on", "source": "file", "scope": "request"}
+
+--- mutate
+reset all;
+
+--- expect ok
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}

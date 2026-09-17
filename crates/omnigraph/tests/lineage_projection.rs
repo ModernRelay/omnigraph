@@ -76,7 +76,7 @@ async fn graph_lineage_lives_only_in_manifest() {
 
     main.branch_create("feature").await.unwrap();
 
-    let feature = Omnigraph::open(&uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(&uri).await.unwrap());
     feature
         .mutate_as(
             "feature",

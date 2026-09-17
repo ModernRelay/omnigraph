@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 from urllib.parse import unquote
 
-
 ROOT = Path(__file__).resolve().parent.parent
 RFC_DIR = ROOT / "docs" / "rfcs"
 SKILL_DIR = ROOT / "skills" / "omnigraph"

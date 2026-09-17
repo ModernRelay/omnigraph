@@ -394,6 +394,70 @@ fn general_update_reports_completed_classifiers_and_keeps_update_semantics() {
     assert!(source.contains("aged fixture row missing"));
 }
 
+/// The `OMNIGRAPH_MERGE_LINEAGE` comparison in `benchmarks/README.md`: each
+/// measured merge child reads the process defaults before the fixture opens and
+/// records the mode (the per-mode route: `merge_cost.rs`, the refusal: `settings.rs`).
+#[test]
+fn measured_merge_children_take_merge_lineage_from_the_process_defaults() {
+    let source = include_str!("../benches/scenarios/rfc023.rs");
+    let reader = source
+        .split_once("fn measured_settings() -> SessionSettings")
+        .expect("one shared process-default reader")
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    assert!(reader.contains("omnigraph::settings::from_env()"));
+    assert!(reader.contains("Err(error) => panic!(\"process settings: {error}\")"));
+    assert!(!reader.contains("SessionSettings::default()"));
+
+    for (child, end) in [
+        ("pub(super) async fn fenced_adopt_operation", "/// Phase 3:"),
+        (
+            "pub(super) async fn general_merge_operation",
+            "async fn verify_fixture_row",
+        ),
+    ] {
+        let operation = source
+            .split_once(child)
+            .expect(child)
+            .1
+            .split_once(end)
+            .expect(end)
+            .0;
+        let read = operation
+            .find("let settings = measured_settings();")
+            .unwrap_or_else(|| panic!("{child}: reads the process defaults"));
+        let open = operation.find("Omnigraph::open(uri)").unwrap();
+        assert!(
+            read < open,
+            "{child}: the selector is read before the fixture opens"
+        );
+        assert_eq!(
+            operation.matches("Session::from_defaults(").count(),
+            1,
+            "{child}: one measured session"
+        );
+        assert!(
+            !operation.contains("SessionSettings::default()"),
+            "{child}: the measured merge must not run on default settings"
+        );
+        assert!(
+            operation.contains("\"merge_lineage\": db.settings().merge_lineage().as_str()"),
+            "{child}: records the mode it measured"
+        );
+    }
+    let general = source
+        .split_once("pub(super) async fn general_merge_operation")
+        .unwrap()
+        .1;
+    assert!(
+        general.find("let settings = measured_settings();").unwrap()
+            < general.find("helpers::cost::cost_harness").unwrap(),
+        "the selector is read before the cost harness starts"
+    );
+}
+
 #[test]
 fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
     let harness = include_str!("../benches/scenarios.rs");

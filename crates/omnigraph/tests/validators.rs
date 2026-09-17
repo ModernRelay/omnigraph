@@ -6,7 +6,7 @@
 mod helpers;
 
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 
 use helpers::{count_rows, mutate_main, params};
 
@@ -100,12 +100,12 @@ query drop_employment($person: String) {
 }
 "#;
 
-async fn init_with(schema: &str, data: &str) -> (tempfile::TempDir, Omnigraph) {
+async fn init_with(schema: &str, data: &str) -> (tempfile::TempDir, omnigraph::Session) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, schema).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
     if !data.is_empty() {
-        load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+        db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
     }
     (dir, db)
 }
@@ -130,7 +130,8 @@ async fn non_numeric_vector_element_rejected_on_jsonl_load() {
 
     // A null element (what json! produces for a non-finite float).
     let bad_null = r#"{"type":"Doc","data":{"slug":"d1","embedding":[0.1,null,0.3]}}"#;
-    let err = load_jsonl(&db, bad_null, LoadMode::Overwrite)
+    let err = db
+        .load_jsonl(bad_null, LoadMode::Overwrite)
         .await
         .unwrap_err();
     assert!(
@@ -141,7 +142,8 @@ async fn non_numeric_vector_element_rejected_on_jsonl_load() {
 
     // A string element.
     let bad_str = r#"{"type":"Doc","data":{"slug":"d2","embedding":[0.1,"0.2",0.3]}}"#;
-    let err = load_jsonl(&db, bad_str, LoadMode::Overwrite)
+    let err = db
+        .load_jsonl(bad_str, LoadMode::Overwrite)
         .await
         .unwrap_err();
     assert!(
@@ -153,7 +155,8 @@ async fn non_numeric_vector_element_rejected_on_jsonl_load() {
     // Pin the adjacent (existing) dimension check while we are here — no
     // loader vector validation had any coverage before this test.
     let bad_dim = r#"{"type":"Doc","data":{"slug":"d3","embedding":[0.1,0.2]}}"#;
-    let err = load_jsonl(&db, bad_dim, LoadMode::Overwrite)
+    let err = db
+        .load_jsonl(bad_dim, LoadMode::Overwrite)
         .await
         .unwrap_err();
     assert!(
@@ -164,7 +167,7 @@ async fn non_numeric_vector_element_rejected_on_jsonl_load() {
 
     // A valid row still loads.
     let good = r#"{"type":"Doc","data":{"slug":"d4","embedding":[0.1,0.2,0.3]}}"#;
-    load_jsonl(&db, good, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(good, LoadMode::Overwrite).await.unwrap();
 }
 
 // ─── Enum validation ─────────────────────────────────────────────────────────
@@ -173,7 +176,7 @@ async fn non_numeric_vector_element_rejected_on_jsonl_load() {
 async fn enum_rejected_on_jsonl_load() {
     let (_dir, db) = init_with(ENUM_SCHEMA, "").await;
     let bad = r#"{"type":"Person","data":{"name":"Alice","role":"superadmin"}}"#;
-    let err = load_jsonl(&db, bad, LoadMode::Overwrite).await.unwrap_err();
+    let err = db.load_jsonl(bad, LoadMode::Overwrite).await.unwrap_err();
     assert!(
         err.to_string().contains("invalid enum value 'superadmin'"),
         "got: {}",
@@ -183,9 +186,9 @@ async fn enum_rejected_on_jsonl_load() {
 
 #[tokio::test]
 async fn enum_rejected_on_mutation_insert() {
-    let (_dir, mut db) = init_with(ENUM_SCHEMA, ENUM_VALID_SEED).await;
+    let (_dir, db) = init_with(ENUM_SCHEMA, ENUM_VALID_SEED).await;
     let err = mutate_main(
-        &mut db,
+        &db,
         ENUM_MUTATIONS,
         "insert_person",
         &params(&[("$name", "Bob"), ("$role", "superadmin")]),
@@ -201,9 +204,9 @@ async fn enum_rejected_on_mutation_insert() {
 
 #[tokio::test]
 async fn enum_rejected_on_mutation_update() {
-    let (_dir, mut db) = init_with(ENUM_SCHEMA, ENUM_VALID_SEED).await;
+    let (_dir, db) = init_with(ENUM_SCHEMA, ENUM_VALID_SEED).await;
     let err = mutate_main(
-        &mut db,
+        &db,
         ENUM_MUTATIONS,
         "set_role",
         &params(&[("$name", "Alice"), ("$role", "superadmin")]),
@@ -223,19 +226,19 @@ async fn enum_rejected_on_mutation_update() {
 async fn range_rejected_on_jsonl_load() {
     let (_dir, db) = init_with(RANGE_SCHEMA, "").await;
     let bad = r#"{"type":"Person","data":{"name":"Alice","age":250}}"#;
-    let err = load_jsonl(&db, bad, LoadMode::Overwrite).await.unwrap_err();
+    let err = db.load_jsonl(bad, LoadMode::Overwrite).await.unwrap_err();
     assert!(err.to_string().contains("@range violation"), "got: {}", err);
 }
 
 #[tokio::test]
 async fn range_rejected_on_mutation_insert() {
-    let (_dir, mut db) = init_with(
+    let (_dir, db) = init_with(
         RANGE_SCHEMA,
         r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
     )
     .await;
     let err = mutate_main(
-        &mut db,
+        &db,
         RANGE_MUTATIONS,
         "insert_person",
         &helpers::mixed_params(&[("$name", "Bob")], &[("$age", 250)]),
@@ -247,13 +250,13 @@ async fn range_rejected_on_mutation_insert() {
 
 #[tokio::test]
 async fn range_rejected_on_mutation_update() {
-    let (_dir, mut db) = init_with(
+    let (_dir, db) = init_with(
         RANGE_SCHEMA,
         r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
     )
     .await;
     let err = mutate_main(
-        &mut db,
+        &db,
         RANGE_MUTATIONS,
         "set_age",
         &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 250)]),
@@ -270,7 +273,7 @@ async fn intra_batch_unique_rejected_on_jsonl_load() {
     let (_dir, db) = init_with(UNIQUE_SCHEMA, "").await;
     let bad = r#"{"type":"User","data":{"name":"Alice","email":"dup@example.com"}}
 {"type":"User","data":{"name":"Bob","email":"dup@example.com"}}"#;
-    let err = load_jsonl(&db, bad, LoadMode::Overwrite).await.unwrap_err();
+    let err = db.load_jsonl(bad, LoadMode::Overwrite).await.unwrap_err();
     assert!(
         err.to_string().contains("@unique violation on User.email"),
         "got: {}",
@@ -288,9 +291,9 @@ async fn intra_batch_unique_rejected_on_jsonl_load() {
 /// the second is rejected against the committed first (previously a gap).
 #[tokio::test]
 async fn cross_version_unique_rejected_on_mutation_insert() {
-    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    let (_dir, db) = init_with(UNIQUE_SCHEMA, "").await;
     mutate_main(
-        &mut db,
+        &db,
         UNIQUE_MUTATIONS,
         "insert_user",
         &params(&[("$name", "Bob"), ("$email", "dup@example.com")]),
@@ -298,7 +301,7 @@ async fn cross_version_unique_rejected_on_mutation_insert() {
     .await
     .unwrap();
     let err = mutate_main(
-        &mut db,
+        &db,
         UNIQUE_MUTATIONS,
         "insert_user",
         &params(&[("$name", "Carol"), ("$email", "dup@example.com")]),
@@ -318,9 +321,9 @@ async fn cross_version_unique_rejected_on_mutation_insert() {
 /// the committed same-id holder).
 #[tokio::test]
 async fn reinsert_existing_key_is_upsert_not_unique_violation() {
-    let (_dir, mut db) = init_with(UNIQUE_SCHEMA, "").await;
+    let (_dir, db) = init_with(UNIQUE_SCHEMA, "").await;
     mutate_main(
-        &mut db,
+        &db,
         UNIQUE_MUTATIONS,
         "insert_user",
         &params(&[("$name", "Alice"), ("$email", "alice@example.com")]),
@@ -328,7 +331,7 @@ async fn reinsert_existing_key_is_upsert_not_unique_violation() {
     .await
     .unwrap();
     mutate_main(
-        &mut db,
+        &db,
         UNIQUE_MUTATIONS,
         "insert_user",
         &params(&[("$name", "Alice"), ("$email", "alice@example.com")]),
@@ -353,21 +356,20 @@ edge Knows: Person -> Person
 #[tokio::test]
 async fn cross_version_unique_rejected_on_append_load() {
     let (_dir, db) = init_with(UNIQUE_SCHEMA, "").await;
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"User","data":{"name":"Bob","email":"dup@example.com"}}"#,
         LoadMode::Append,
     )
     .await
     .unwrap();
-    let err = load_jsonl(
-        &db,
-        r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}
+    let err = db
+        .load_jsonl(
+            r#"{"type":"User","data":{"name":"Carol","email":"dup@example.com"}}
 {"type":"User","data":{"name":"Dave","email":"dave@example.com"}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     assert!(
         err.to_string().contains("@unique violation on User.email"),
         "got: {}",
@@ -388,20 +390,19 @@ async fn cross_version_unique_rejected_on_append_load() {
 #[tokio::test]
 async fn cross_version_unique_rejected_on_date_column() {
     let (_dir, db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
         LoadMode::Append,
     )
     .await
     .unwrap();
-    let err = load_jsonl(
-        &db,
-        r#"{"type":"Task","data":{"name":"T2","due":"2026-06-29"}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+    let err = db
+        .load_jsonl(
+            r#"{"type":"Task","data":{"name":"T2","due":"2026-06-29"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     assert!(
         err.to_string().contains("@unique violation on Task.due"),
         "got: {}",
@@ -416,15 +417,13 @@ async fn cross_version_unique_rejected_on_date_column() {
 #[tokio::test]
 async fn noncolliding_write_to_date_unique_column_succeeds() {
     let (_dir, db) = init_with(DATE_UNIQUE_SCHEMA, "").await;
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Task","data":{"name":"T1","due":"2026-06-29"}}"#,
         LoadMode::Append,
     )
     .await
     .unwrap();
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"type":"Task","data":{"name":"T2","due":"2026-07-01"}}"#,
         LoadMode::Append,
     )
@@ -445,13 +444,13 @@ async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
 {"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}"#;
     let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
-    let err = load_jsonl(
-        &db,
-        r#"{"edge":"WorksAt","id":"E1","from":"Bob","to":"Acme","data":{}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .expect_err("moving Alice's only edge to Bob drops Alice below @card(1..)");
+    let err = db
+        .load_jsonl(
+            r#"{"edge":"WorksAt","id":"E1","from":"Bob","to":"Acme","data":{}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect_err("moving Alice's only edge to Bob drops Alice below @card(1..)");
     assert!(
         err.to_string().contains("@card violation") && err.to_string().contains("Alice"),
         "got: {}",
@@ -477,7 +476,7 @@ async fn merge_load_duplicate_edge_id_counts_once_per_card() {
     // (Bob->Beta). Alice stays at her one committed edge (E0).
     let batch = r#"{"edge":"WorksAt","id":"E1","from":"Alice","to":"Beta","data":{}}
 {"edge":"WorksAt","id":"E1","from":"Bob","to":"Beta","data":{}}"#;
-    load_jsonl(&db, batch, LoadMode::Merge)
+    db.load_jsonl(batch, LoadMode::Merge)
         .await
         .expect("a deduped edge id must not double-count Alice into a @card(0..1) violation");
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
@@ -493,10 +492,10 @@ async fn mutation_delete_edge_below_card_min_rejected() {
     let seed = r#"{"type":"Person","data":{"name":"Alice"}}
 {"type":"Company","data":{"name":"Acme"}}
 {"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}"#;
-    let (_dir, mut db) = init_with(CARD_MIN_SCHEMA, seed).await;
+    let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
     let err = mutate_main(
-        &mut db,
+        &db,
         CARD_MIN_DELETE_MUTATIONS,
         "drop_employment",
         &params(&[("$person", "Alice")]),
@@ -521,8 +520,8 @@ async fn mutation_delete_edge_below_card_min_rejected() {
 async fn merge_load_reupsert_existing_key_is_not_unique_violation() {
     let (_dir, db) = init_with(UNIQUE_SCHEMA, "").await;
     let row = r#"{"type":"User","data":{"name":"Alice","email":"alice@example.com"}}"#;
-    load_jsonl(&db, row, LoadMode::Merge).await.unwrap();
-    load_jsonl(&db, row, LoadMode::Merge)
+    db.load_jsonl(row, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(row, LoadMode::Merge)
         .await
         .expect("merge-load re-upserting an existing @key is not a unique violation");
 }
@@ -535,7 +534,7 @@ async fn overwrite_load_validates_ri_against_new_image() {
     let (_dir, db) = init_with(RI_SCHEMA, r#"{"type":"Person","data":{"name":"Alice"}}"#).await;
     let batch = r#"{"type":"Person","data":{"name":"Carol"}}
 {"edge":"Knows","from":"Carol","to":"Carol"}"#;
-    load_jsonl(&db, batch, LoadMode::Overwrite)
+    db.load_jsonl(batch, LoadMode::Overwrite)
         .await
         .expect("Overwrite RI validates against the new batch image, not the replaced committed");
 }
@@ -545,13 +544,13 @@ async fn overwrite_load_validates_ri_against_new_image() {
 #[tokio::test]
 async fn append_load_rejects_orphan_edge() {
     let (_dir, db) = init_with(RI_SCHEMA, r#"{"type":"Person","data":{"name":"Alice"}}"#).await;
-    let err = load_jsonl(
-        &db,
-        r#"{"edge":"Knows","from":"Alice","to":"Ghost"}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+    let err = db
+        .load_jsonl(
+            r#"{"edge":"Knows","from":"Alice","to":"Ghost"}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     assert!(
         err.to_string().contains("not found"),
         "orphan edge must be rejected, got: {}",
@@ -571,13 +570,15 @@ async fn overwrite_node_removal_rejects_retained_orphan_edge() {
 {"edge":"Knows","from":"Alice","to":"Bob"}"#;
     let (_dir, db) = init_with(RI_SCHEMA, seed).await;
 
-    let err = load_jsonl(
-        &db,
-        r#"{"type":"Person","data":{"name":"Alice"}}"#,
-        LoadMode::Overwrite,
-    )
-    .await
-    .expect_err("removing Bob via overwrite while Knows(Alice->Bob) is retained orphans the edge");
+    let err = db
+        .load_jsonl(
+            r#"{"type":"Person","data":{"name":"Alice"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .expect_err(
+            "removing Bob via overwrite while Knows(Alice->Bob) is retained orphans the edge",
+        );
     assert!(
         err.to_string().contains("not found"),
         "retained edge to an overwrite-removed node must be rejected, got: {}",
@@ -591,7 +592,7 @@ async fn overwrite_node_removal_rejects_retained_orphan_edge() {
 /// valid, but the validator retains the stale Alice->temp and false-rejects Carol.
 #[tokio::test]
 async fn chained_unique_update_then_reuse_freed_value_is_not_a_violation() {
-    let (_dir, mut db) = init_with(
+    let (_dir, db) = init_with(
         UNIQUE_SCHEMA,
         r#"{"type":"User","data":{"name":"Alice","email":"orig"}}"#,
     )
@@ -603,22 +604,20 @@ query reassign() {
     insert User { name: "Carol", email: "temp" }
 }
 "#;
-    mutate_main(&mut db, Q, "reassign", &params(&[]))
-        .await
-        .expect(
-            "Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision",
-        );
+    mutate_main(&db, Q, "reassign", &params(&[])).await.expect(
+        "Alice ends at 'final' and Carol takes the freed 'temp' — final image has no collision",
+    );
 }
 
 // ─── Edge cardinality ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn cardinality_rejected_on_mutation_insert_edge() {
-    let (_dir, mut db) = init_with(CARDINALITY_SCHEMA, CARDINALITY_SEED).await;
+    let (_dir, db) = init_with(CARDINALITY_SCHEMA, CARDINALITY_SEED).await;
 
     // First WorksAt edge — within @card(0..1).
     mutate_main(
-        &mut db,
+        &db,
         CARDINALITY_MUTATIONS,
         "add_employment",
         &params(&[("$person", "Alice"), ("$company", "Acme")]),
@@ -628,7 +627,7 @@ async fn cardinality_rejected_on_mutation_insert_edge() {
 
     // Second WorksAt for the same source — exceeds max=1.
     let err = mutate_main(
-        &mut db,
+        &db,
         CARDINALITY_MUTATIONS,
         "add_employment",
         &params(&[("$person", "Alice"), ("$company", "Beta")]),
@@ -657,17 +656,17 @@ async fn cardinality_rejected_on_mutation_insert_edge() {
 /// masks the bug (the same caveat as the served stale-view repro in `writes.rs`).
 #[tokio::test]
 async fn cardinality_rejected_for_stale_handle_after_concurrent_edge_commit() {
-    let (dir, mut db_a) = init_with(CARDINALITY_SCHEMA, CARDINALITY_SEED).await;
+    let (dir, db_a) = init_with(CARDINALITY_SCHEMA, CARDINALITY_SEED).await;
     let uri = dir.path().to_str().unwrap();
 
     // Handle B opens the same graph at the seed version (no edges yet); it then
     // never reads again, so its in-memory coordinator stays pinned at the seed.
-    let mut db_b = Omnigraph::open(uri).await.unwrap();
+    let db_b = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Handle A commits WorksAt(Alice -> Acme): Alice is now at the @card(0..1) max.
     // This advances the on-disk manifest; B's coordinator is now stale.
     mutate_main(
-        &mut db_a,
+        &db_a,
         CARDINALITY_MUTATIONS,
         "add_employment",
         &params(&[("$person", "Alice"), ("$company", "Acme")]),
@@ -680,7 +679,7 @@ async fn cardinality_rejected_for_stale_handle_after_concurrent_edge_commit() {
     // cardinality scan reopens: it MUST read live HEAD (Alice has 1) → reject (1+1 > 1),
     // not the stale base (Alice has 0) → which would wrongly pass and commit a 2nd edge.
     let err = mutate_main(
-        &mut db_b,
+        &db_b,
         CARDINALITY_MUTATIONS,
         "add_employment",
         &params(&[("$person", "Alice"), ("$company", "Beta")]),
@@ -703,7 +702,7 @@ async fn cardinality_rejected_on_jsonl_load() {
     let (_dir, db) = init_with(CARDINALITY_SCHEMA, CARDINALITY_SEED).await;
     let bad = r#"{"edge":"WorksAt","from":"Alice","to":"Acme"}
 {"edge":"WorksAt","from":"Alice","to":"Beta"}"#;
-    let err = load_jsonl(&db, bad, LoadMode::Append).await.unwrap_err();
+    let err = db.load_jsonl(bad, LoadMode::Append).await.unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("cardinality")
             || err.to_string().to_lowercase().contains("@card"),
@@ -739,10 +738,10 @@ query add_knows_since($from: String, $to: String, $since: String) {
 /// one row: the derived id makes the second insert an upsert of the first.
 #[tokio::test]
 async fn keyed_edge_reinsert_converges_to_one_row() {
-    let (_dir, mut db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     for _ in 0..2 {
         mutate_main(
-            &mut db,
+            &db,
             EDGE_KEY_MUTATIONS,
             "add_knows",
             &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -756,10 +755,10 @@ async fn keyed_edge_reinsert_converges_to_one_row() {
 /// Distinct endpoint pairs derive distinct ids and stay distinct rows.
 #[tokio::test]
 async fn keyed_edge_distinct_pairs_stay_distinct() {
-    let (_dir, mut db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     for (from, to) in [("Alice", "Bob"), ("Bob", "Alice")] {
         mutate_main(
-            &mut db,
+            &db,
             EDGE_KEY_MUTATIONS,
             "add_knows",
             &params(&[("$from", from), ("$to", to)]),
@@ -774,10 +773,10 @@ async fn keyed_edge_distinct_pairs_stay_distinct() {
 /// (last write wins on the derived id), matching the keyed-node contract.
 #[tokio::test]
 async fn keyed_edge_reinsert_updates_non_key_properties() {
-    let (_dir, mut db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     for since in ["2020", "2021"] {
         mutate_main(
-            &mut db,
+            &db,
             EDGE_KEY_MUTATIONS,
             "add_knows_since",
             &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", since)]),
@@ -802,10 +801,10 @@ edge Knows: Person -> Person {
 /// also pass it — the skip's observable effect is only the saved probe.)
 #[tokio::test]
 async fn keyed_edge_unique_group_equal_to_key_is_subsumed() {
-    let (_dir, mut db) = init_with(EDGE_KEY_UNIQUE_SCHEMA, EDGE_KEY_SEED).await;
+    let (_dir, db) = init_with(EDGE_KEY_UNIQUE_SCHEMA, EDGE_KEY_SEED).await;
     for _ in 0..2 {
         mutate_main(
-            &mut db,
+            &db,
             EDGE_KEY_MUTATIONS,
             "add_knows",
             &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -821,13 +820,13 @@ async fn keyed_edge_unique_group_equal_to_key_is_subsumed() {
 #[tokio::test]
 async fn keyed_edge_load_refuses_mismatched_explicit_id() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
-    let err = load_jsonl(
-        &db,
-        r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .unwrap_err();
+    let err = db
+        .load_jsonl(
+            r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
     assert!(
         err.to_string()
             .contains("does not match its canonical @key id"),
@@ -842,15 +841,15 @@ async fn keyed_edge_load_refuses_mismatched_explicit_id() {
 async fn keyed_edge_load_derives_and_converges_on_merge() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     let row = r#"{"edge":"Knows","from":"Alice","to":"Bob"}"#;
-    load_jsonl(&db, row, LoadMode::Merge).await.unwrap();
-    load_jsonl(&db, row, LoadMode::Merge)
+    db.load_jsonl(row, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(row, LoadMode::Merge)
         .await
         .expect("merge-load re-upserting an existing keyed edge converges");
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
 
     let explicit =
         r#"{"edge":"Knows","id":"[\"Alice\",\"Bob\"]","from":"Alice","to":"Bob","data":{}}"#;
-    load_jsonl(&db, explicit, LoadMode::Merge)
+    db.load_jsonl(explicit, LoadMode::Merge)
         .await
         .expect("an explicit id equal to the derivation is accepted");
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
@@ -860,13 +859,13 @@ async fn keyed_edge_load_derives_and_converges_on_merge() {
 #[tokio::test]
 async fn keyed_edge_append_load_refuses_mismatched_explicit_id() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
-    let err = load_jsonl(
-        &db,
-        r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap_err();
+    let err = db
+        .load_jsonl(
+            r#"{"edge":"Knows","id":"wrong","from":"Alice","to":"Bob","data":{}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
     assert!(
         err.to_string()
             .contains("does not match its canonical @key id"),
@@ -881,8 +880,8 @@ async fn keyed_edge_append_load_refuses_mismatched_explicit_id() {
 async fn keyed_edge_append_load_conflicts_on_committed_key() {
     let (_dir, db) = init_with(EDGE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     let row = r#"{"edge":"Knows","from":"Alice","to":"Bob"}"#;
-    load_jsonl(&db, row, LoadMode::Append).await.unwrap();
-    let err = load_jsonl(&db, row, LoadMode::Append).await.unwrap_err();
+    db.load_jsonl(row, LoadMode::Append).await.unwrap();
+    let err = db.load_jsonl(row, LoadMode::Append).await.unwrap_err();
     assert!(
         err.to_string().contains("already has this id"),
         "got: {}",
@@ -903,10 +902,10 @@ edge Knows: Person -> Person {
 /// converge, a distinct `since` is a distinct identity.
 #[tokio::test]
 async fn keyed_edge_scalar_member_derives_end_to_end() {
-    let (_dir, mut db) = init_with(EDGE_COMPOSITE_KEY_SCHEMA, EDGE_KEY_SEED).await;
+    let (_dir, db) = init_with(EDGE_COMPOSITE_KEY_SCHEMA, EDGE_KEY_SEED).await;
     for since in ["2020", "2020", "2021"] {
         mutate_main(
-            &mut db,
+            &db,
             EDGE_KEY_MUTATIONS,
             "add_knows_since",
             &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", since)]),
@@ -923,12 +922,12 @@ async fn keyed_edge_scalar_member_derives_end_to_end() {
 #[tokio::test]
 async fn keyed_edge_null_key_member_rejected_on_load() {
     let (_dir, db) = init_with(EDGE_COMPOSITE_KEY_SCHEMA, EDGE_KEY_SEED).await;
-    let err = load_jsonl(
-        &db,
-        r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":null}}"#,
-        LoadMode::Merge,
-    )
-    .await
-    .unwrap_err();
+    let err = db
+        .load_jsonl(
+            r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":null}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("since"), "got: {}", err);
 }

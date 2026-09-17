@@ -9,11 +9,12 @@ use std::fs;
 
 use helpers::recovery::{recovery_audit_kinds, sidecar_operation_ids};
 use helpers::*;
+use omnigraph::Session;
 use omnigraph::db::{
     Omnigraph, ReadTarget, SnapshotDataset, SnapshotId, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome,
 };
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::seams::{DecideSeam, FailScenario, catalog};
 use omnigraph_compiler::ir::ParamMap;
 
@@ -60,12 +61,14 @@ const OLD_PEOPLE_QUERY: &str =
     "query old_people() { match { $p: Person } return { $p.@id, $p.name } order { $p.@id asc } }";
 const OLD_COWORKERS_QUERY: &str = "query old_coworkers() { match { $p: Person\n $p worksat $c } return { $p.@id, $c.name } order { $p.@id asc } }";
 
-async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Omnigraph {
+async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init_with_legacy_system_columns_for_tests(uri, LEGACY_SCHEMA)
-        .await
-        .unwrap();
-    load_jsonl(&db, LEGACY_DATA, LoadMode::Overwrite)
+    let db = helpers::session(
+        Omnigraph::init_with_legacy_system_columns_for_tests(uri, LEGACY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(LEGACY_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -96,11 +99,7 @@ fn schema_apply_lock_present(dir: &tempfile::TempDir) -> bool {
         .unwrap_or_else(|error| panic!("{}: {error}", refs.display()))
 }
 
-async fn assert_history_readable(
-    db: &Omnigraph,
-    version_before: u64,
-    snapshot_before: &SnapshotId,
-) {
+async fn assert_history_readable(db: &Session, version_before: u64, snapshot_before: &SnapshotId) {
     let historical = db
         .run_query_at(
             version_before,
@@ -141,7 +140,7 @@ fn primary_key_of(ds: &SnapshotDataset) -> Vec<String> {
         .collect()
 }
 
-async fn assert_upgraded(db: &mut Omnigraph, dir: &tempfile::TempDir, expected_export: &str) {
+async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export: &str) {
     assert_eq!(
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
@@ -217,8 +216,7 @@ async fn assert_upgraded(db: &mut Omnigraph, dir: &tempfile::TempDir, expected_e
     assert_eq!(entity["@dst"], "company-1");
     assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), expected_export);
 
-    load_jsonl(
-        db,
+    db.load_jsonl(
         r#"{"type":"Person","id":"Carol","data":{"name":"Carol","age":41}}"#,
         LoadMode::Append,
     )
@@ -229,15 +227,13 @@ async fn assert_upgraded(db: &mut Omnigraph, dir: &tempfile::TempDir, expected_e
         3,
         "the graph keeps writing under the new spellings"
     );
-    load_jsonl(
-        db,
+    db.load_jsonl(
         r#"{"edge":"WorksAt","id":"works-carol","from":"Carol","to":"company-1","data":{}}"#,
         LoadMode::Append,
     )
     .await
     .expect("an edge insert satisfies the respelled @unique(@src, @dst)");
-    load_jsonl(
-        db,
+    db.load_jsonl(
         r#"{"edge":"WorksAt","id":"works-carol-again","from":"Carol","to":"company-1","data":{}}"#,
         LoadMode::Append,
     )
@@ -254,7 +250,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     let version_before = version_main(&db).await.unwrap();
     let snapshot_before = db.resolve_snapshot("main").await.unwrap();
@@ -289,7 +285,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     assert_eq!((report.stamp_before, report.stamp_after), (8, 9));
     assert!(report.findings.is_empty());
     assert!(report.graph_manifest_version.is_some());
-    assert_upgraded(&mut db, &dir, &export_before).await;
+    assert_upgraded(&db, &dir, &export_before).await;
     assert!(recovery_audit_kinds(dir.path()).await.is_empty());
 
     let entity = db
@@ -309,10 +305,10 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
     assert_eq!((again.stamp_before, again.stamp_after), (9, 9));
     drop(db);
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(count_rows(&reopened, "node:Person").await, 3);
     let result = query_main(
-        &mut reopened,
+        &reopened,
         COMPANY_QUERY,
         "company_identity",
         &ParamMap::new(),
@@ -334,7 +330,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
 async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let version_before = version_main(&db).await.unwrap();
     let snapshot_before = db.resolve_snapshot("main").await.unwrap();
     let report = db
@@ -347,7 +343,7 @@ async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property()
         .await
         .expect("the upgraded namespace admits a user property named id");
     let live = query_main(
-        &mut db,
+        &db,
         "query ids() { match { $p: Person } return { $p.@id, $p.id } order { $p.@id asc } }",
         "ids",
         &ParamMap::new(),
@@ -586,14 +582,16 @@ async fn crash_then_roll_forward(seam: &'static DecideSeam) {
         "{read_only}"
     );
 
-    let mut recovered = Omnigraph::open(uri)
-        .await
-        .expect("the read-write open rolls the upgrade forward");
+    let recovered = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .expect("the read-write open rolls the upgrade forward"),
+    );
     assert_eq!(
         recovery_audit_kinds(dir.path()).await,
         vec!["RolledForward"]
     );
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
+    assert_upgraded(&recovered, &dir, &export_before).await;
     let again = recovered
         .upgrade_system_columns(SystemColumnUpgradeOptions::default())
         .await
@@ -605,7 +603,7 @@ async fn crash_then_roll_forward(seam: &'static DecideSeam) {
 async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = legacy_graph_with_data(&dir).await;
+    let db = legacy_graph_with_data(&dir).await;
     let export_before = db.export_jsonl("main", &[]).await.unwrap();
     {
         let _failpoint = catalog::SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT.fire_always();
@@ -625,7 +623,7 @@ async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
         recovery_audit_kinds(dir.path()).await,
         vec!["RolledForward"]
     );
-    assert_upgraded(&mut db, &dir, &export_before).await;
+    assert_upgraded(&db, &dir, &export_before).await;
 }
 
 #[tokio::test]
@@ -650,14 +648,16 @@ async fn system_column_upgrade_survives_an_interrupted_recovery() {
             .expect("the first recovery stops after confirming the intent, before publishing");
     }
     assert_eq!(sidecar_operation_ids(dir.path()).len(), 1);
-    let mut recovered = Omnigraph::open(uri)
-        .await
-        .expect("the second read-write open publishes the confirmed intent");
+    let recovered = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .expect("the second read-write open publishes the confirmed intent"),
+    );
     assert_eq!(
         recovery_audit_kinds(dir.path()).await,
         vec!["RolledForward"]
     );
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
+    assert_upgraded(&recovered, &dir, &export_before).await;
 }
 
 #[tokio::test]
@@ -687,9 +687,11 @@ async fn system_column_upgrade_recovery_reclaims_a_dead_writers_lock() {
     );
     assert_eq!(sidecar_operation_ids(dir.path()).len(), 1);
 
-    let mut recovered = Omnigraph::open(uri)
-        .await
-        .expect("the read-write open rolls the upgrade forward");
+    let recovered = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .expect("the read-write open rolls the upgrade forward"),
+    );
     assert_eq!(
         recovery_audit_kinds(dir.path()).await,
         vec!["RolledForward"]
@@ -698,7 +700,7 @@ async fn system_column_upgrade_recovery_reclaims_a_dead_writers_lock() {
         !schema_apply_lock_present(&dir),
         "recovery reclaims the dead writer's lock"
     );
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
+    assert_upgraded(&recovered, &dir, &export_before).await;
     recovered
         .apply_schema(UPGRADED_SCHEMA_WITH_ID_PROPERTY)
         .await
@@ -735,15 +737,17 @@ async fn system_column_upgrade_recovery_survives_a_crash_after_the_lock_reclaim(
         "the intent outlives the lock"
     );
     assert!(!schema_apply_lock_present(&dir));
-    let mut recovered = Omnigraph::open(uri)
-        .await
-        .expect("the second read-write open retires the intent");
+    let recovered = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .expect("the second read-write open retires the intent"),
+    );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
     assert_eq!(
         recovery_audit_kinds(dir.path()).await,
         vec!["RolledForward"]
     );
-    assert_upgraded(&mut recovered, &dir, &export_before).await;
+    assert_upgraded(&recovered, &dir, &export_before).await;
 }
 
 #[tokio::test]

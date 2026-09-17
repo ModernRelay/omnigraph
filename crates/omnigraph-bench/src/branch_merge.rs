@@ -8,12 +8,15 @@
 
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write as _};
+use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryStreamExt;
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -810,9 +813,12 @@ pub async fn initialize_local_fixture(
         ));
     }
     let schema = schema_source(plan.tables);
-    let db = Omnigraph::init(root_uri, &schema)
-        .await
-        .map_err(|error| fixture_error(format!("initialize fixture at {root_uri}: {error}")))?;
+    let db = Session::from_defaults(
+        Arc::new(Omnigraph::init(root_uri, &schema).await.map_err(|error| {
+            fixture_error(format!("initialize fixture at {root_uri}: {error}"))
+        })?),
+        SessionSettings::default(),
+    );
     let base_load_commits = load_base(&db, plan).await?;
     if u64::try_from(base_load_commits).ok() != Some(preflight.base_load_commits) {
         return Err(fixture_error(format!(
@@ -1402,7 +1408,7 @@ fn edge_endpoints(plan: &BranchMergePlan, table: usize, row: usize) -> (String, 
     )
 }
 
-async fn load_base(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<usize> {
+async fn load_base(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<usize> {
     let payload = "x".repeat(plan.payload_bytes);
     let chunk_rows = load_chunk_rows(plan.payload_bytes)?;
     let mut commits = 0usize;
@@ -1492,7 +1498,7 @@ impl Side {
 }
 
 async fn diverge(
-    db: &Omnigraph,
+    db: &Session,
     branch: &str,
     side: Side,
     plan: &BranchMergePlan,
@@ -2571,7 +2577,10 @@ mod tests {
         assert_eq!(built.source_history_depth, 11);
         assert_eq!(built.target_history_depth, 11);
 
-        let db = Omnigraph::open(uri).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::open(uri).await.unwrap()),
+            SessionSettings::default(),
+        );
         let protected = capture_protected_branch_heads(&db).await.unwrap();
         let probes = MergeWriteProbes::default();
         let outcome = with_merge_write_probes(

@@ -1,50 +1,33 @@
 //! BTREE-indexed Expand path (`execute_expand_indexed`) coverage.
 //!
-//! These tests force the Expand execution mode via the scoped `with_traversal_mode`
-//! test seam — NOT the process-global `OMNIGRAPH_TRAVERSAL_MODE` env var — and
-//! assert the indexed path matches the CSR path (both are semantically identical:
-//! the indexed path serves neighbor lookups from the persisted src/dst BTREE
-//! instead of an in-memory CSR). The seam is scope-bound and process-safe, so
-//! these tests need no `#[serial]` and no dedicated binary.
+//! These tests force the Expand execution mode with a session's `traversal`
+//! setting and assert the indexed path matches the CSR path (both are
+//! semantically identical: the indexed path serves neighbor lookups from the
+//! persisted src/dst BTREE instead of an in-memory CSR). A setting belongs to
+//! one session, so these tests need no `#[serial]` and no dedicated binary.
 
 mod helpers;
 
-use omnigraph::IndexCoverage;
 use omnigraph::db::Omnigraph;
-use omnigraph::instrumentation::with_traversal_mode;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::{IndexCoverage, Session};
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
 
 /// Run `name` on main under the cost-chooser (auto) Expand mode; first column sorted.
-async fn sorted_names(
-    db: &mut Omnigraph,
-    queries: &str,
-    name: &str,
-    params: &ParamMap,
-) -> Vec<String> {
+async fn sorted_names(db: &Session, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
     first_column_sorted(&query_main(db, queries, name, params).await.unwrap())
 }
 
-/// Run the same query under CSR, indexed, and auto (cost-chooser) modes; assert
-/// all three produce identical results and return them. The forced modes use the
-/// scoped `with_traversal_mode` seam; the auto pass exercises `choose_expand_mode`
-/// end to end (whichever path it selects, the rows must match the forced paths —
-/// the chooser changes which path runs, never the result).
-async fn both_modes(
-    db: &mut Omnigraph,
-    queries: &str,
-    name: &str,
-    params: &ParamMap,
-) -> Vec<String> {
-    let csr = first_column_sorted(
-        &with_traversal_mode("csr", query_main(db, queries, name, params))
-            .await
-            .unwrap(),
-    );
+/// Run the same query under `csr`, `indexed` and `auto`, assert the three agree
+/// and return the rows: the chooser changes which path runs, never the result.
+async fn both_modes(db: &Session, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
+    let csr_db = with_traversal(db, Traversal::Csr);
+    let indexed_db = with_traversal(db, Traversal::Indexed);
+    let csr = first_column_sorted(&query_main(&csr_db, queries, name, params).await.unwrap());
     let indexed = first_column_sorted(
-        &with_traversal_mode("indexed", query_main(db, queries, name, params))
+        &query_main(&indexed_db, queries, name, params)
             .await
             .unwrap(),
     );
@@ -91,7 +74,7 @@ async fn key_column_index_coverage_detects_btree_presence() {
 #[tokio::test]
 async fn coverage_degrades_for_appended_unindexed_fragment() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // The fixture's explicit post-load `ensure_indices` covers every current
     // Knows fragment → Indexed.
@@ -105,7 +88,7 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
 
     // Append an edge → a new, unindexed fragment outside the index fragment_bitmap.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Alice"), ("$to", "Diana")]),
@@ -125,10 +108,10 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
 #[tokio::test]
 async fn indexed_matches_csr_one_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // friends_of: `$p knows $f` (Person -> Person, single hop).
     let got = both_modes(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -140,7 +123,7 @@ async fn indexed_matches_csr_one_hop_same_type() {
 #[tokio::test]
 async fn indexed_matches_csr_undirected_one_hop() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let queries = r#"
 query connected($name: String) {
     match {
@@ -151,7 +134,7 @@ query connected($name: String) {
 }
 "#;
     // Bob: outgoing Bob->Diana, incoming Alice->Bob — undirected sees both.
-    let got = both_modes(&mut db, queries, "connected", &params(&[("$name", "Bob")])).await;
+    let got = both_modes(&db, queries, "connected", &params(&[("$name", "Bob")])).await;
     assert_eq!(got, vec!["Alice", "Diana"], "out ∪ in neighbors of Bob");
 }
 
@@ -162,14 +145,14 @@ query connected($name: String) {
 #[tokio::test]
 async fn indexed_matches_csr_undirected_under_degraded_coverage() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Append an edge through the mutation path — an unindexed fragment that
     // degrades BTREE coverage on the Knows table (pinned by the coverage test
     // above). Diana->Alice also gives Alice a NEW incoming edge that only the
     // undirected form can see from Alice's side.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Diana"), ("$to", "Alice")]),
@@ -187,20 +170,14 @@ query connected($name: String) {
 }
 "#;
     // Alice: outgoing Bob, Charlie; incoming Diana (the fresh unindexed edge).
-    let got = both_modes(
-        &mut db,
-        queries,
-        "connected",
-        &params(&[("$name", "Alice")]),
-    )
-    .await;
+    let got = both_modes(&db, queries, "connected", &params(&[("$name", "Alice")])).await;
     assert_eq!(got, vec!["Bob", "Charlie", "Diana"]);
 }
 
 #[tokio::test]
 async fn indexed_matches_csr_multi_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let queries = r#"
 query reach($name: String) {
     match {
@@ -211,14 +188,14 @@ query reach($name: String) {
 }
 "#;
     // Alice -> Bob, Charlie (1 hop); Bob -> Diana (2 hops).
-    let got = both_modes(&mut db, queries, "reach", &params(&[("$name", "Alice")])).await;
+    let got = both_modes(&db, queries, "reach", &params(&[("$name", "Alice")])).await;
     assert_eq!(got, vec!["Bob", "Charlie", "Diana"]);
 }
 
 #[tokio::test]
 async fn indexed_matches_csr_cross_type() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let queries = r#"
 query employer($name: String) {
     match {
@@ -228,17 +205,17 @@ query employer($name: String) {
     return { $c.name }
 }
 "#;
-    let got = both_modes(&mut db, queries, "employer", &params(&[("$name", "Alice")])).await;
+    let got = both_modes(&db, queries, "employer", &params(&[("$name", "Alice")])).await;
     assert_eq!(got, vec!["Acme"], "Alice works at Acme");
 }
 
 #[tokio::test]
 async fn indexed_matches_csr_no_match() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     // Diana has no outgoing Knows edges → empty in both modes.
     let got = both_modes(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Diana")]),
@@ -250,7 +227,7 @@ async fn indexed_matches_csr_no_match() {
 #[tokio::test]
 async fn indexed_finds_unindexed_appended_edge() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Append Alice -> Diana AFTER the initial load. `ensure_indices`' existence
     // guard means the src/dst BTREE built on the first load does NOT cover this
@@ -258,7 +235,7 @@ async fn indexed_finds_unindexed_appended_edge() {
     // unindexed-fragment scan (fast_search=false default), so partial index
     // coverage never silently drops rows.
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Alice"), ("$to", "Diana")]),
@@ -266,15 +243,13 @@ async fn indexed_finds_unindexed_appended_edge() {
     .await
     .unwrap();
 
+    let indexed_db = with_traversal(&db, Traversal::Indexed);
     let got = first_column_sorted(
-        &with_traversal_mode(
-            "indexed",
-            query_main(
-                &mut db,
-                TEST_QUERIES,
-                "friends_of",
-                &params(&[("$name", "Alice")]),
-            ),
+        &query_main(
+            &indexed_db,
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
         )
         .await
         .unwrap(),
@@ -323,10 +298,10 @@ query reach($name: String) {
 "#;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
 
-    let got = both_modes(&mut db, QUERY, "reach", &params(&[("$name", "alice")])).await;
+    let got = both_modes(&db, QUERY, "reach", &params(&[("$name", "alice")])).await;
     assert_eq!(
         got,
         vec!["shared"],
@@ -360,10 +335,10 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
 {"edge":"Knows","from":"a","to":"b"}
 {"edge":"Knows","from":"b","to":"c"}
 {"edge":"Knows","from":"c","to":"a"}"#;
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
-    let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
+    let got = both_modes(&db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // From a: b (1 hop), c (2 hops); the c->a back-edge hits the seeded source
     // and is not re-emitted. No infinite loop, each node at most once.
     assert_eq!(got, vec!["b", "c"]);
@@ -381,10 +356,10 @@ async fn variable_hops_handle_self_loop() {
 {"type":"Person","data":{"name":"b"}}
 {"edge":"Knows","from":"a","to":"a"}
 {"edge":"Knows","from":"a","to":"b"}"#;
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
-    let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
+    let got = both_modes(&db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // a via its own self-edge (1 hop), b (1 hop). No infinite loop.
     assert_eq!(got, vec!["a", "b"]);
 }
@@ -412,17 +387,17 @@ query reach2($name: String) {
 {"edge":"Knows","from":"a","to":"b"}
 {"edge":"Knows","from":"b","to":"b"}
 {"edge":"Knows","from":"b","to":"c"}"#;
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
     let p = params(&[("$name", "a")]);
-    let exactly_two = both_modes(&mut db, EXACTLY_2, "reach2", &p).await;
+    let exactly_two = both_modes(&db, EXACTLY_2, "reach2", &p).await;
     assert_eq!(
         exactly_two,
         vec!["c"],
         "b is one hop away; its self-loop must not re-reach it at hop 2"
     );
-    let ranged = both_modes(&mut db, REACH_5, "reach", &p).await;
+    let ranged = both_modes(&db, REACH_5, "reach", &p).await;
     assert_eq!(ranged, vec!["b", "c"], "a range starting at 1 is unchanged");
 }
 
@@ -460,18 +435,18 @@ query friends_bound($name: String) {
 {"type":"Person","data":{"name":"b"}}
 {"edge":"Knows","from":"a","to":"a"}
 {"edge":"Knows","from":"a","to":"b"}"#;
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
     let p = params(&[("$name", "a")]);
-    let directed = both_modes(&mut db, QUERIES, "friends", &p).await;
+    let directed = both_modes(&db, QUERIES, "friends", &p).await;
     assert_eq!(
         directed,
         vec!["a", "b"],
         "directed single hop emits the self-loop"
     );
 
-    let undirected = both_modes(&mut db, QUERIES, "friends_undirected", &p).await;
+    let undirected = both_modes(&db, QUERIES, "friends_undirected", &p).await;
     // The self-loop row is reachable through both the out and in probes; set
     // semantics emit it once.
     assert_eq!(
@@ -482,7 +457,7 @@ query friends_bound($name: String) {
 
     // Auto mode only: an edge binding dispatches to execute_expand_bound
     // before any mode logic, so forcing csr/indexed does not apply.
-    let bound = sorted_names(&mut db, QUERIES, "friends_bound", &p).await;
+    let bound = sorted_names(&db, QUERIES, "friends_bound", &p).await;
     assert_eq!(
         bound,
         vec!["a", "b"],

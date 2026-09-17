@@ -7,7 +7,8 @@ use std::io::IsTerminal;
 use omnigraph_api_types::{
     ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
 };
-use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, QueryFile};
+use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, QueryFile, show_statement_name};
+use omnigraph_compiler::settings::SettingId;
 
 use super::*;
 use crate::operator;
@@ -879,11 +880,9 @@ pub(crate) fn select_named_query(
     query_file: QueryFile,
     requested_name: Option<&str>,
 ) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
-    let queries = match query_file {
-        QueryFile::Queries(queries) => queries,
-        QueryFile::Branch(stmt) => {
-            bail!("{}", stmt.not_a_declaration_message())
-        }
+    let queries = match query_file.into_declarations() {
+        Ok(queries) => queries,
+        Err(message) => bail!("{message}"),
     };
     let query = if let Some(name) = requested_name {
         queries
@@ -927,6 +926,14 @@ pub(crate) fn read_at_write_door() -> String {
     )
 }
 
+/// `show` is a read: the same refusal `branch list` meets at the write door.
+pub(crate) fn show_at_write_door(id: Option<SettingId>) -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::READ_AT_WRITE_DOOR,
+        &show_statement_name(id),
+    )
+}
+
 /// The server's envelope refusals for a branch statement, checked in its
 /// order: a request target, then a query name or parameters, then a commit
 /// precondition. Runs before any round trip or engine open.
@@ -947,7 +954,8 @@ pub(crate) fn refuse_statement_envelope(
     Ok(())
 }
 
-/// The `POST /query` body for `branch list`: the source alone.
+/// The `POST /query` body for `branch list` or `show`: the source alone; the
+/// caller fills `settings` from its `--set` values.
 pub(crate) fn branch_statement_query_request(query_source: &str) -> QueryRequest {
     QueryRequest {
         query: query_source.to_string(),
@@ -955,16 +963,19 @@ pub(crate) fn branch_statement_query_request(query_source: &str) -> QueryRequest
         params: None,
         branch: None,
         snapshot: None,
+        settings: None,
     }
 }
 
-/// The `POST /mutate` body for a control write: the source alone.
+/// The `POST /mutate` body for a control write: the source alone; the caller
+/// fills `settings` from its `--set` values.
 pub(crate) fn branch_statement_change_request(query_source: &str) -> ChangeRequest {
     ChangeRequest {
         query: query_source.to_string(),
         name: None,
         params: None,
         branch: None,
+        settings: None,
     }
 }
 

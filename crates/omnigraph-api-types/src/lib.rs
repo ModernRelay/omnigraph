@@ -10,11 +10,19 @@ use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::settings::{
+    MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
+};
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
+use utoipa::openapi::schema::{ObjectBuilder, Type};
 use utoipa::{IntoParams, ToSchema};
+
+/// The settings definition every door reads (RFC 0068), re-exported so a
+/// wire consumer needs no second dependency for it.
+pub use omnigraph_compiler::settings;
 
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
@@ -65,6 +73,65 @@ pub mod branch_statement_refusals {
 pub mod query_file_refusals {
     /// An empty or declaration-less source, from which no query can be picked.
     pub const NO_QUERY: &str = "query file contains no query";
+    /// A source whose only lines are `set` and `reset`: legal as a `.gqt`
+    /// step, refused at every HTTP route and CLI verb since nothing follows
+    /// the prefix in the same request.
+    pub const ONLY_SETTINGS: &str = "a file of only settings lines carries no statement";
+    /// Either carrier — the `settings` field or a `set`/`reset` prefix in the
+    /// source — at either deprecated route, which serve their legacy bodies
+    /// under the process defaults alone.
+    pub const SETTINGS_AT_DEPRECATED_ROUTE: &str = "the deprecated /read and /change routes take no settings, neither a settings field nor a set or reset prefix; use POST /query or POST /mutate";
+}
+
+/// The `settings` field of a request: one optional value per `request`-scope
+/// setting of the definition, applied to the request's session before the
+/// source's own `set` lines, so a `set` line in the request's text overrides
+/// the field. An absent field is empty. A `process` setting has no field
+/// here, so `{"stage_write_concurrency": 64}` is refused as an unknown field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct SettingsRequest {
+    /// `merge_lineage`: `off`, `on` or `verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = merge_lineage_schema)]
+    pub merge_lineage: Option<MergeLineage>,
+}
+
+impl SettingsRequest {
+    /// The assignments the field carries, in definition order, as the pairs
+    /// a session applies with source `request`.
+    pub fn assignments(&self) -> Vec<(SettingId, SettingValue)> {
+        let mut assignments = Vec::new();
+        if let Some(merge_lineage) = self.merge_lineage {
+            assignments.push((
+                SettingId::MergeLineage,
+                SettingValue::Ident(merge_lineage.as_str().to_string()),
+            ));
+        }
+        assignments
+    }
+}
+
+/// The OpenAPI schema of one setting, read from its definition row so the
+/// contract shows the row's values or range and its description.
+fn setting_schema(id: SettingId) -> utoipa::openapi::schema::Object {
+    let spec = id.spec();
+    let builder = ObjectBuilder::new().description(Some(spec.doc));
+    match spec.kind {
+        SettingKind::Enum(values) => builder
+            .schema_type(Type::String)
+            .enum_values(Some(values.iter().copied()))
+            .build(),
+        SettingKind::Integer { min, max } => builder
+            .schema_type(Type::Integer)
+            .minimum(Some(min))
+            .maximum(max)
+            .build(),
+    }
+}
+
+fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::MergeLineage)
 }
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -199,6 +266,9 @@ pub struct BranchMergeRequest {
     /// and never fails the already-landed merge.
     #[serde(default)]
     pub delete_branch: bool,
+    /// Session settings for this request (RFC 0068); see [`SettingsRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsRequest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -614,6 +684,12 @@ pub struct CommitChangesQuery {
     /// Repeatable filter: insert | update | delete.
     #[serde(default)]
     pub op: Vec<ChangeOpOutput>,
+    /// Repeatable session setting, `name=value` in GQ spelling
+    /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
+    /// The value is validated here and selects nothing in this release: the
+    /// consumer is the `engine` setting, RFC 0068 rollout step 2.
+    #[serde(default)]
+    pub set: Vec<String>,
 }
 
 /// Query parameters for the change feed poll.
@@ -638,6 +714,12 @@ pub struct ChangeFeedQuery {
     pub r#type: Vec<String>,
     #[serde(default)]
     pub op: Vec<ChangeOpOutput>,
+    /// Repeatable session setting, `name=value` in GQ spelling
+    /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
+    /// The value is validated here and selects nothing in this release: the
+    /// consumer is the `engine` setting, RFC 0068 rollout step 2.
+    #[serde(default)]
+    pub set: Vec<String>,
 }
 
 /// Body for the change baseline handshake.
@@ -721,6 +803,11 @@ pub struct ReadRequest {
     pub branch: Option<String>,
     /// Snapshot id to read from. Mutually exclusive with `branch`.
     pub snapshot: Option<String>,
+    /// Refused when present: the deprecated route runs under the process
+    /// defaults. Typed as raw JSON so the refusal names the field instead of
+    /// a deserialization error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Value>,
 }
 
 /// Inline read-query request for `POST /query`.
@@ -751,6 +838,9 @@ pub struct QueryRequest {
     pub branch: Option<String>,
     /// Snapshot id to read from. Mutually exclusive with `branch`.
     pub snapshot: Option<String>,
+    /// Session settings for this request (RFC 0068); see [`SettingsRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsRequest>,
 }
 
 /// Logical graph entity selected by the Blob delivery surface.
@@ -909,6 +999,9 @@ pub struct ChangeRequest {
     /// Target branch. Defaults to `main`.
     #[serde(default)]
     pub branch: Option<String>,
+    /// Session settings for this request (RFC 0068); see [`SettingsRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsRequest>,
 }
 
 /// Body for `POST /queries/{name}` — invokes the server-side stored query
@@ -1657,6 +1750,44 @@ pub fn branch_list_read_output(branches: &[String]) -> Result<ReadOutput, serde_
     })
 }
 
+/// The `show` answer: one row per setting in the order given, the five
+/// string columns `name`, `value`, `default`, `source`, `scope`; no target
+/// and no graph commit (the statement reads the session, not the store).
+pub fn show_read_output(rows: &[SettingRow]) -> Result<ReadOutput, serde_json::Error> {
+    #[derive(Serialize)]
+    struct Row<'a> {
+        name: &'a str,
+        value: &'a str,
+        default: &'a str,
+        source: &'a str,
+        scope: &'a str,
+    }
+    let rendered = rows
+        .iter()
+        .map(|row| Row {
+            name: row.name,
+            value: &row.value,
+            default: row.default,
+            source: row.source.as_str(),
+            scope: row.scope.as_str(),
+        })
+        .collect::<Vec<_>>();
+    Ok(ReadOutput {
+        query_name: "show".to_string(),
+        target: ReadTargetOutput {
+            branch: None,
+            snapshot: None,
+        },
+        row_count: rows.len(),
+        columns: SettingRow::COLUMNS
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+        rows: serde_json::value::to_raw_value(&rendered)?,
+        graph_commit_id: None,
+    })
+}
+
 pub fn ingest_output(
     uri: &str,
     result: &LoadResult,
@@ -1810,7 +1941,52 @@ pub struct GraphDiscoveryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omnigraph_compiler::settings::SettingScope;
     use serde_json::json;
+
+    /// `SettingsRequest` has one field per `request` row of the definition,
+    /// in definition order, spelled as the row's name; a `process` row has
+    /// none and is refused as an unknown field.
+    #[test]
+    fn settings_request_fields_are_the_request_rows_in_order() {
+        let request_rows: Vec<&str> = settings::DEFINITIONS
+            .iter()
+            .filter(|spec| spec.scope == SettingScope::Request)
+            .map(|spec| spec.name)
+            .collect();
+        let populated = SettingsRequest {
+            merge_lineage: Some(MergeLineage::Off),
+        };
+        let expected = format!("{{\"{}\":\"off\"}}", request_rows[0]);
+        assert_eq!(request_rows.len(), 1);
+        assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
+        assert_eq!(
+            populated
+                .assignments()
+                .iter()
+                .map(|(id, _)| id.name())
+                .collect::<Vec<_>>(),
+            request_rows
+        );
+        assert!(SettingsRequest::default().assignments().is_empty());
+        for spec in settings::DEFINITIONS
+            .iter()
+            .filter(|spec| spec.scope == SettingScope::Process)
+        {
+            let body = format!("{{\"{}\": \"{}\"}}", spec.name, spec.default);
+            let err = serde_json::from_str::<SettingsRequest>(&body).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "{}: {err}",
+                spec.name
+            );
+        }
+        let parsed: SettingsRequest =
+            serde_json::from_str("{\"merge_lineage\": \"verify\"}").unwrap();
+        assert_eq!(parsed.merge_lineage, Some(MergeLineage::Verify));
+        assert!(serde_json::from_str::<SettingsRequest>("{\"merge_lineage\": \"both\"}").is_err());
+        assert!(serde_json::from_str::<SettingsRequest>("{\"traversal\": \"csr\"}").is_err());
+    }
 
     #[test]
     fn entity_type_parts_projects_only_logical_node_and_edge_selectors() {

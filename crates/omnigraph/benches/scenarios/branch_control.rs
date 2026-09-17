@@ -11,9 +11,11 @@ use std::time::Instant;
 use arrow_array::{Array as _, FixedSizeListArray, Float32Array, StringArray};
 use futures::TryStreamExt as _;
 use lance::dataset::builder::DatasetBuilder;
+use omnigraph::Session;
 use omnigraph::db::{CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use serde::{Deserialize, Serialize};
 
 use super::{Args, fixture_controls, rfc023_limits, rfc023_scenarios};
@@ -169,9 +171,14 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
     for table in 1..args.tables {
         writeln!(schema, "\nnode Extra{table} {{ slug: String @key }}").unwrap();
     }
-    let db = Omnigraph::init(uri, &schema)
-        .await
-        .expect("initialize branch fixture");
+    let db = Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::init(uri, &schema)
+                .await
+                .expect("initialize branch fixture"),
+        ),
+        SessionSettings::default(),
+    );
     let patterns = rfc023_scenarios::vector_json_patterns(args.dims, args.seed);
     let plan = rfc023_limits::derive_chunk_plan(args.dims, "base", args.rows).unwrap();
     rfc023_scenarios::load_graph_rows(
@@ -343,7 +350,7 @@ pub(super) async fn setup(args: &Args) -> serde_json::Value {
 pub(super) async fn operation(args: &Args) -> serde_json::Value {
     super::helpers::cost::cost_harness(async {
     let root = root(args);
-    let ((mut db, operation_open_us), open_io) = super::helpers::cost::measure(async {
+    let ((db, operation_open_us), open_io) = super::helpers::cost::measure(async {
     let open_start = Instant::now();
     let db = Omnigraph::open(root.to_str().unwrap())
         .await
@@ -351,6 +358,7 @@ pub(super) async fn operation(args: &Args) -> serde_json::Value {
     let operation_open_us = open_start.elapsed().as_micros() as u64;
     (db, operation_open_us)
     }).await;
+    let db = Session::from_defaults(std::sync::Arc::new(db), SessionSettings::default());
     let prewarm = fixture_controls::prewarm(&db, args).await;
     let probes = MergeWriteProbes::default();
     let payload = if args.scenario == "branch-first-write" { one_row(args, "target-only") } else { String::new() };
@@ -459,9 +467,14 @@ pub(super) async fn verify(args: &Args) -> serde_json::Value {
     let started = Instant::now();
     let mut fixture: Fixture =
         serde_json::from_slice(&std::fs::read(root.join(EXPECTED_FILE)).unwrap()).unwrap();
-    let db = Omnigraph::open(root.to_str().unwrap())
-        .await
-        .expect("open branch verification");
+    let db = Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::open(root.to_str().unwrap())
+                .await
+                .expect("open branch verification"),
+        ),
+        SessionSettings::default(),
+    );
     if is_content_scenario(args) {
         return verify_content(args, &db, &fixture).await;
     }
@@ -727,7 +740,7 @@ fn expected_row(args: &Args, prefix: &str) -> (String, PayloadRow) {
     (key, row)
 }
 
-async fn prepare_cleanup(args: &Args, db: &Omnigraph, fixture: &mut Fixture) {
+async fn prepare_cleanup(args: &Args, db: &Session, fixture: &mut Fixture) {
     if fixture.collectible.is_empty() {
         db.branch_create("control-garbage").await.unwrap();
         db.load(
@@ -836,7 +849,7 @@ async fn verify_required_parent(db: &Omnigraph, fixture: &Fixture) {
     );
 }
 
-async fn verify_content(args: &Args, db: &Omnigraph, fixture: &Fixture) -> serde_json::Value {
+async fn verify_content(args: &Args, db: &Session, fixture: &Fixture) -> serde_json::Value {
     let mut names = db.branch_list().await.unwrap();
     names.sort();
     assert_eq!(names, fixture.branches.keys().cloned().collect::<Vec<_>>());

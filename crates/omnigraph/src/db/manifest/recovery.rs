@@ -11071,7 +11071,10 @@ node Person {
 "#;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(crate::db::Omnigraph::init(root, SCHEMA).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
 
         let txn = db.open_write_txn(None).await.unwrap();
         let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
@@ -11402,7 +11405,10 @@ node Person { age: I32? }
         let _scenario = crate::seams::FailScenario::setup();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(crate::db::Omnigraph::init(root, SCHEMA).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
 
         let txn = db.open_write_txn(None).await.unwrap();
         let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();

@@ -13,10 +13,10 @@ use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, MergeConflictKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::{
     BLOB_READ_RANGE_MAX_BYTES, BlobContent, ExternalBlobBase, ExternalBlobExecutionScope,
-    ExternalBlobPolicy,
+    ExternalBlobPolicy, Session,
 };
 
 use helpers::*;
@@ -150,10 +150,10 @@ fn write_sized_external_blob(path: &std::path::Path, bytes: u64) {
     file.flush().unwrap();
 }
 
-async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
-    load_jsonl(&db, SEARCH_DATA, LoadMode::Overwrite)
+    let db = helpers::session(Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap());
+    db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -164,10 +164,10 @@ async fn init_db_from_schema_and_data(
     dir: &tempfile::TempDir,
     schema: &str,
     data: &str,
-) -> Omnigraph {
+) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
     db
 }
 
@@ -218,7 +218,7 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     main.branch_create("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main", "feature"]);
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(
         count_rows_branch(&feature, "feature", "node:Person").await,
         4
@@ -237,7 +237,7 @@ async fn branch_create_open_list_and_lazy_branching_work() {
     assert_exact_id_primary_key_on_branch(&feature, "feature", "node:Person").await;
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -313,11 +313,11 @@ async fn explicit_target_query_reads_multiple_branches_from_one_handle() {
 #[tokio::test]
 async fn resolved_snapshot_stays_pinned_after_branch_advances() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let snapshot_id = db.resolve_snapshot("main").await.unwrap();
     mutate_main(
-        &mut db,
+        &db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -389,12 +389,12 @@ async fn explicit_target_load_writes_to_named_branch() {
 async fn branch_merge_updates_main_traversal() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "add_friend",
@@ -404,7 +404,7 @@ async fn branch_merge_updates_main_traversal() {
     .unwrap();
 
     let feature_qr = query_branch(
-        &mut feature,
+        &feature,
         "feature",
         TEST_QUERIES,
         "friends_of",
@@ -415,7 +415,7 @@ async fn branch_merge_updates_main_traversal() {
     assert_eq!(feature_qr.num_rows(), 3);
 
     let main_before = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -428,7 +428,7 @@ async fn branch_merge_updates_main_traversal() {
     assert_eq!(outcome, MergeOutcome::FastForward);
 
     let merged = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -442,9 +442,8 @@ async fn branch_merge_updates_main_traversal() {
 async fn branch_merge_with_blob_columns_preserves_blob_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(
-        &main,
+    let main = helpers::session(Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap());
+    main.load_jsonl(
         concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:\",\"note\":\"original\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
@@ -471,9 +470,9 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
 
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_main(
-        &mut main,
+        &main,
         BLOB_MUTATIONS,
         "update_doc_note",
         &params(&[("$title", "main-doc"), ("$note", "updated on main")]),
@@ -482,7 +481,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         BLOB_MUTATIONS,
         "insert_doc",
@@ -496,7 +495,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         BLOB_MUTATIONS,
         "update_doc_note",
@@ -515,7 +514,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     );
     let deletion_value = format!("base64:{deletion_encoded}");
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         BLOB_MUTATIONS,
         "insert_doc",
@@ -701,7 +700,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     );
 
     mutate_main(
-        &mut main,
+        &main,
         BLOB_MUTATIONS,
         "delete_doc",
         &params(&[("$title", "readme")]),
@@ -736,9 +735,8 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
     // would be needed to prove its path/version still denotes the old tree.
     let aba_dir = tempfile::tempdir().unwrap();
     let aba_uri = aba_dir.path().to_str().unwrap();
-    let aba = Omnigraph::init(aba_uri, BLOB_SCHEMA).await.unwrap();
-    load_jsonl(
-        &aba,
+    let aba = helpers::session(Omnigraph::init(aba_uri, BLOB_SCHEMA).await.unwrap());
+    aba.load_jsonl(
         r#"{"type":"Document","data":{"title":"aba","content":"base64:QmFzZQ==","note":"base"}}"#,
         LoadMode::Overwrite,
     )
@@ -887,9 +885,8 @@ node Marker {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(
-        &db,
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    db.load_jsonl(
         concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"doc\",\"content\":\"base64:T2xk\"}}\n",
             "{\"type\":\"Marker\",\"data\":{\"name\":\"base\"}}",
@@ -1043,11 +1040,13 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
     let encoded_alias = external_uri.replace("~source", "%7Esource");
     assert_ne!(encoded_alias, external_uri);
 
-    let setup = Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
+    let setup = helpers::session(
+        Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
     let converged_base = serde_json::json!({
         "type": "Document",
         "data": {
@@ -1063,16 +1062,20 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
         .unwrap();
     setup.branch_create("feature").await.unwrap();
 
-    let feature = Omnigraph::open(uri)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
-    let configured_main = Omnigraph::open(uri)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy.clone())
-        .unwrap();
+    let feature = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
+    let configured_main = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
     let target_data = format!(
         "{}\n{}",
         serde_json::json!({
@@ -1096,7 +1099,7 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
         .load("main", &target_data, LoadMode::Overwrite)
         .await
         .unwrap();
-    let main = Omnigraph::open(uri).await.unwrap();
+    let main = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     let external_data = format!(
         "{}\n{}\n{}\n{}",
@@ -1232,7 +1235,14 @@ async fn branch_merge_with_external_blob_uri_materializes_payload_body() {
         "denied merge must fail before recovery is armed"
     );
 
-    let main = main.with_external_blob_policy(policy.clone()).unwrap();
+    drop(main);
+    let main = helpers::session(
+        Omnigraph::open(uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy.clone())
+            .unwrap(),
+    );
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
@@ -1320,11 +1330,13 @@ async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
         ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
     ])
     .unwrap();
-    let main = Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy)
-        .unwrap();
+    let main = helpers::session(
+        Omnigraph::init(uri, MULTI_TABLE_EXTERNAL_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
     main.branch_create("pointer-target").await.unwrap();
     let pointer_data = serde_json::json!({
         "type": "Document",
@@ -1359,7 +1371,7 @@ async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
     assert_eq!(pointer.length, None);
     fs::remove_file(&pointer_path).unwrap();
 
-    let deny = Omnigraph::open(uri).await.unwrap();
+    let deny = helpers::session(Omnigraph::open(uri).await.unwrap());
     let outcome = deny.branch_merge("main", "pointer-target").await.unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
     let target_entry = snapshot_branch(&deny, "pointer-target")
@@ -1481,13 +1493,15 @@ async fn branch_merge_rejects_external_blob_payloads_pre_effect_body() {
             ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
         ])
         .unwrap();
-        let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA)
-            .await
-            .unwrap()
-            .with_external_blob_policy(policy)
-            .unwrap();
+        let db = helpers::session(
+            Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA)
+                .await
+                .unwrap()
+                .with_external_blob_policy(policy)
+                .unwrap(),
+        );
         let base = r#"{"type":"Document","data":{"title":"base"}}"#;
-        load_jsonl(&db, base, LoadMode::Overwrite).await.unwrap();
+        db.load_jsonl(base, LoadMode::Overwrite).await.unwrap();
         db.branch_create("feature").await.unwrap();
         db.load(
             "feature",
@@ -1589,9 +1603,9 @@ async fn branch_merge_rejects_managed_blob_payloads_pre_effect_body() {
     let dir = tempfile::tempdir().unwrap();
     let graph_path = dir.path().join("managed-aggregate-graph");
     let graph_uri = graph_path.to_str().unwrap();
-    let db = Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap();
+    let db = helpers::session(Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA).await.unwrap());
     let base = r#"{"type":"Document","data":{"title":"base"}}"#;
-    load_jsonl(&db, base, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(base, LoadMode::Overwrite).await.unwrap();
     db.branch_create("feature").await.unwrap();
     let payload_bytes = LIMIT / 2 + 1;
     for index in 0..2 {
@@ -1693,11 +1707,13 @@ async fn branch_merge_rejects_external_blob_reference_cells_pre_effect_body() {
         ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
     ])
     .unwrap();
-    let db = Omnigraph::init(graph_path.to_str().unwrap(), WIDE_BLOB_SCHEMA)
-        .await
-        .unwrap()
-        .with_external_blob_policy(policy)
-        .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), WIDE_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
     db.branch_create("feature").await.unwrap();
 
     let external_rows = |table: &str, key: &str, blob: &str, rows: usize, prefix: &str| {
@@ -1830,9 +1846,9 @@ async fn branch_merge_applies_node_insert_to_main() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -1844,9 +1860,9 @@ async fn branch_merge_applies_node_insert_to_main() {
     let outcome = feature.branch_merge("feature", "main").await.unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     let qr = query_main(
-        &mut reopened,
+        &reopened,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -1990,7 +2006,7 @@ fn assert_native_version_case(
             ),
             "{target}, {branch_updates} updates: adoption preserves the exact source ref and version"
         );
-        let reopened = Omnigraph::open(uri).await.unwrap();
+        let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
         for handle in [&main, &reopened] {
             let result = handle
                 .query(
@@ -2100,7 +2116,7 @@ fn assert_native_version_case(
             head_before,
             "empty adoption must not advance the physical target HEAD"
         );
-        let mut maintenance = Omnigraph::open(uri).await.unwrap();
+        let maintenance = Omnigraph::open(uri).await.unwrap();
         maintenance
             .cleanup(omnigraph::db::CleanupPolicyOptions {
                 keep_versions: Some(100),
@@ -2126,7 +2142,7 @@ fn assert_native_version_case(
             written.native_dataset_branch,
             target_entry.native_dataset_branch
         );
-        let reopened = Omnigraph::open(uri).await.unwrap();
+        let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
         for handle in [&main, &reopened] {
             for (branch, age) in [
                 ("borrower", 39 + branch_updates as i32),
@@ -2361,9 +2377,9 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2436,7 +2452,7 @@ async fn same_branch_insert_after_external_commit_is_linear() {
 
     // Handle A: a long-lived writer whose coordinator head stays pinned at the
     // load commit (C0) — it never refreshes before its own write below.
-    let mut a = init_and_load(&dir).await;
+    let a = init_and_load(&dir).await;
     let c0 = CommitGraph::open(uri)
         .await
         .unwrap()
@@ -2446,9 +2462,9 @@ async fn same_branch_insert_after_external_commit_is_linear() {
         .unwrap();
 
     // External writer B advances main: commit C1, parent C0.
-    let mut b = Omnigraph::open(uri).await.unwrap();
+    let b = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_main(
-        &mut b,
+        &b,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
@@ -2471,7 +2487,7 @@ async fn same_branch_insert_after_external_commit_is_linear() {
     // A writes to main WITHOUT refreshing. A's coordinator still thinks the head
     // is C0, so a pre-fix append parents the new commit on C0 instead of C1.
     mutate_main(
-        &mut a,
+        &a,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "local_a")], &[("$age", 40)]),
@@ -2516,9 +2532,9 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
 
     // A inserts the row it will later update; this is A's own commit (Ca), so
     // A's coordinator head is Ca.
-    let mut a = init_and_load(&dir).await;
+    let a = init_and_load(&dir).await;
     mutate_main(
-        &mut a,
+        &a,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "target")], &[("$age", 40)]),
@@ -2534,9 +2550,9 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
         .unwrap();
 
     // External writer B advances main: commit Cb, parent Ca.
-    let mut b = Omnigraph::open(uri).await.unwrap();
+    let b = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_main(
-        &mut b,
+        &b,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
@@ -2557,14 +2573,14 @@ async fn same_branch_update_after_external_commit_and_read_is_linear() {
 
     // A reads main: the stale-probe path refreshes A's exact manifest head and
     // table pins while deliberately leaving the derived lineage cache warm.
-    query_main(&mut a, TEST_QUERIES, "total_people", &params(&[]))
+    query_main(&a, TEST_QUERIES, "total_people", &params(&[]))
         .await
         .unwrap();
 
     // Strict update, no explicit refresh: pre-fix it appends off the stale head
     // Ca instead of Cb.
     mutate_main(
-        &mut a,
+        &a,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "target")], &[("$age", 99)]),
@@ -2605,9 +2621,9 @@ async fn branch_merge_records_actor_on_latest_commit() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2676,13 +2692,13 @@ async fn already_up_to_date_branch_merge_returns_without_new_commit() {
 async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -2691,7 +2707,7 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2704,7 +2720,7 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     assert_eq!(outcome, MergeOutcome::Merged);
 
     let bob = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Bob")]),
@@ -2717,7 +2733,7 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     assert_eq!(bob_ages.value(0), 26);
 
     let eve = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -2737,7 +2753,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let schema = "node Doc {\n    slug: String @key\n    tags: [String]\n}";
-    let mut main = Omnigraph::init(uri, schema).await.unwrap();
+    let main = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
     // Base: one element containing a comma.
     main.load_with_receipt(
         "main",
@@ -2748,7 +2764,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     .unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     // Feature changes it to two elements — displays identically to the base.
     feature
         .load_with_receipt(
@@ -2780,14 +2796,9 @@ query docs_with_tag($tag: String) {
     return { $d.slug }
 }
 "#;
-    let result = query_main(
-        &mut main,
-        queries,
-        "docs_with_tag",
-        &params(&[("$tag", "b")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&main, queries, "docs_with_tag", &params(&[("$tag", "b")]))
+        .await
+        .unwrap();
     let batch = result.concat_batches().unwrap();
     let slugs = batch
         .column(0)
@@ -2805,13 +2816,13 @@ query docs_with_tag($tag: String) {
 async fn branch_merge_allows_identical_updates_on_both_sides() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
@@ -2820,7 +2831,7 @@ async fn branch_merge_allows_identical_updates_on_both_sides() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -2833,7 +2844,7 @@ async fn branch_merge_allows_identical_updates_on_both_sides() {
     assert_eq!(outcome, MergeOutcome::Merged);
 
     let alice = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Alice")]),
@@ -2854,13 +2865,13 @@ async fn branch_merge_allows_identical_updates_on_both_sides() {
 async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_search_db(&dir).await;
+    let main = init_search_db(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         SEARCH_MUTATIONS,
         "set_doc_title",
         &params(&[("$slug", "ml-intro"), ("$title", "Orion ML Intro")]),
@@ -2869,7 +2880,7 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         SEARCH_MUTATIONS,
         "set_doc_title",
@@ -2882,7 +2893,7 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     assert_eq!(outcome, MergeOutcome::Merged);
 
     let result = query_main(
-        &mut main,
+        &main,
         SEARCH_QUERIES,
         "text_search",
         &params(&[("$q", "Orion")]),
@@ -2921,12 +2932,12 @@ async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut writer = Omnigraph::open(uri).await.unwrap();
-    let mut reader = Omnigraph::open(uri).await.unwrap();
-    let mut main_reader = Omnigraph::open(uri).await.unwrap();
+    let writer = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let reader = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let main_reader = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_branch(
-        &mut writer,
+        &writer,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2936,7 +2947,7 @@ async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
     .unwrap();
 
     let visible = query_branch(
-        &mut reader,
+        &reader,
         "feature",
         TEST_QUERIES,
         "get_person",
@@ -2947,7 +2958,7 @@ async fn explicit_target_reads_see_branch_local_writes_without_refresh() {
     assert_eq!(visible.num_rows(), 1);
 
     let main_result = query_main(
-        &mut main_reader,
+        &main_reader,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -2964,9 +2975,9 @@ async fn branch_created_from_non_main_inherits_branch_state() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -2999,9 +3010,9 @@ async fn branch_created_from_non_main_inherits_branch_state() {
         vec!["main", "experiment", "feature"]
     );
 
-    let mut experiment = Omnigraph::open(uri).await.unwrap();
+    let experiment = helpers::session(Omnigraph::open(uri).await.unwrap());
     let qr = query_branch(
-        &mut experiment,
+        &experiment,
         "experiment",
         TEST_QUERIES,
         "get_person",
@@ -3011,9 +3022,9 @@ async fn branch_created_from_non_main_inherits_branch_state() {
     .unwrap();
     assert_eq!(qr.num_rows(), 1);
 
-    let mut reopened_main = Omnigraph::open(uri).await.unwrap();
+    let reopened_main = helpers::session(Omnigraph::open(uri).await.unwrap());
     let main_qr = query_main(
-        &mut reopened_main,
+        &reopened_main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Eve")]),
@@ -3030,9 +3041,9 @@ async fn ensure_indices_on_child_branch_keeps_inherited_table_when_no_work_is_ne
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3124,9 +3135,9 @@ async fn branch_edge_only_write_only_branches_edge_table() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "add_friend",
@@ -3159,7 +3170,7 @@ async fn branch_edge_only_write_only_branches_edge_table() {
     );
 
     let feature_qr = query_branch(
-        &mut feature,
+        &feature,
         "feature",
         TEST_QUERIES,
         "friends_of",
@@ -3169,9 +3180,9 @@ async fn branch_edge_only_write_only_branches_edge_table() {
     .unwrap();
     assert_eq!(feature_qr.num_rows(), 3);
 
-    let mut reopened_main = Omnigraph::open(uri).await.unwrap();
+    let reopened_main = helpers::session(Omnigraph::open(uri).await.unwrap());
     let main_qr = query_main(
-        &mut reopened_main,
+        &reopened_main,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -3188,9 +3199,9 @@ async fn branch_merge_into_non_main_target_works() {
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3204,7 +3215,7 @@ async fn branch_merge_into_non_main_target_works() {
         .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "set_age",
@@ -3235,9 +3246,9 @@ async fn branch_merge_into_non_main_target_works() {
         "merging into another branch must preserve main's graph lineage"
     );
 
-    let mut experiment = Omnigraph::open(uri).await.unwrap();
+    let experiment = helpers::session(Omnigraph::open(uri).await.unwrap());
     let bob = query_branch(
-        &mut experiment,
+        &experiment,
         "experiment",
         TEST_QUERIES,
         "get_person",
@@ -3254,7 +3265,7 @@ async fn branch_merge_into_non_main_target_works() {
     assert_eq!(bob_ages.value(0), 26);
 
     let eve = query_branch(
-        &mut experiment,
+        &experiment,
         "experiment",
         TEST_QUERIES,
         "get_person",
@@ -3283,9 +3294,9 @@ async fn branch_merge_into_non_main_target_works() {
         "the named target must adopt the exact source table pointer"
     );
 
-    let mut reopened_main = Omnigraph::open(uri).await.unwrap();
+    let reopened_main = helpers::session(Omnigraph::open(uri).await.unwrap());
     let main_bob = query_main(
-        &mut reopened_main,
+        &reopened_main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Bob")]),
@@ -3305,13 +3316,13 @@ async fn branch_merge_into_non_main_target_works() {
 async fn branch_merge_reports_unique_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, UNIQUE_SCHEMA, UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, UNIQUE_SCHEMA, UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         UNIQUE_MUTATIONS,
         "insert_user",
         &params(&[("$name", "Bob"), ("$email", "dup@example.com")]),
@@ -3320,7 +3331,7 @@ async fn branch_merge_reports_unique_violation_conflict() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         UNIQUE_MUTATIONS,
         "insert_user",
@@ -3348,13 +3359,13 @@ async fn branch_merge_reports_unique_violation_conflict() {
 async fn branch_merge_reports_composite_unique_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -3363,7 +3374,7 @@ async fn branch_merge_reports_composite_unique_violation_conflict() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
@@ -3391,13 +3402,13 @@ async fn branch_merge_reports_composite_unique_violation_conflict() {
 async fn branch_merge_allows_distinct_composite_unique_pairs() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -3406,7 +3417,7 @@ async fn branch_merge_allows_distinct_composite_unique_pairs() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_UNIQUE_MUTATIONS,
         "add_knows",
@@ -3425,13 +3436,13 @@ async fn branch_merge_allows_distinct_composite_unique_pairs() {
 async fn branch_merge_reports_cardinality_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, CARDINALITY_SCHEMA, CARDINALITY_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, CARDINALITY_SCHEMA, CARDINALITY_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         CARDINALITY_MUTATIONS,
         "add_employment",
         &params(&[("$person", "Alice"), ("$company", "Acme")]),
@@ -3440,7 +3451,7 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         CARDINALITY_MUTATIONS,
         "add_employment",
@@ -3481,13 +3492,13 @@ query delete_person($name: String) {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // main (merge source): add an edge referencing Bob.
     mutate_main(
-        &mut main,
+        &main,
         MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -3497,7 +3508,7 @@ query delete_person($name: String) {
 
     // feature (merge target): delete Bob.
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATIONS,
         "delete_person",
@@ -3561,12 +3572,12 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
 async fn branch_delete_defers_owned_fork_cleanup_and_allows_recreate() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3605,7 +3616,7 @@ async fn branch_delete_defers_owned_fork_cleanup_and_allows_recreate() {
     );
     main.branch_create("feature").await.unwrap();
     mutate_branch(
-        &mut main,
+        &main,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3793,12 +3804,12 @@ async fn branch_delete_retires_legacy_physical_path_parents() {
 async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -3973,14 +3984,14 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         5
     );
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
     reopened.branch_create("feature").await.unwrap();
     assert_eq!(
         count_rows_branch(&reopened, "feature", "node:Person").await,
         4
     );
     mutate_branch(
-        &mut reopened,
+        &reopened,
         "experiment",
         MUTATION_QUERIES,
         "insert_person",
@@ -4033,15 +4044,15 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
     // After a non-FF merge, unchanged rows retain their original _row_created_at_version.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.ensure_indices().await.unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Main updates Bob's age → changes one row
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -4051,7 +4062,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
 
     // Feature inserts Eve → adds one row
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -4138,15 +4149,15 @@ async fn merge_delta_only_bumps_changed_rows() {
     // bumped. Only rows that were actually modified should get new version stamps.
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.ensure_indices().await.unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     // Main updates Bob's age → changes one Person row
     mutate_main(
-        &mut main,
+        &main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -4156,7 +4167,7 @@ async fn merge_delta_only_bumps_changed_rows() {
 
     // Feature inserts Eve → adds one Person row (makes it non-FF)
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         MUTATION_QUERIES,
         "insert_person",
@@ -4276,14 +4287,13 @@ query friend_edges() {
 async fn branch_merge_converges_born_on_both_keyed_edge() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
-        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -4292,7 +4302,7 @@ async fn branch_merge_converges_born_on_both_keyed_edge() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
@@ -4306,18 +4316,13 @@ async fn branch_merge_converges_born_on_both_keyed_edge() {
         .expect("identical born-on-both keyed edges converge without conflict");
 
     assert_eq!(count_rows(&main, "edge:Knows").await, 4);
-    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+    let plain = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
         .await
         .unwrap();
     assert_eq!(first_column_sorted(&plain).len(), 4);
-    let bound = query_main(
-        &mut main,
-        EDGE_KEY_MERGE_QUERIES,
-        "friend_edges",
-        &params(&[]),
-    )
-    .await
-    .unwrap();
+    let bound = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friend_edges", &params(&[]))
+        .await
+        .unwrap();
     assert_eq!(first_column_sorted(&bound).len(), 4);
 }
 
@@ -4329,14 +4334,14 @@ async fn branch_merge_converges_born_on_both_keyed_edge() {
 async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
+    let main =
         init_db_from_schema_and_data(&dir, EDGE_UNKEYED_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -4345,7 +4350,7 @@ async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
@@ -4359,18 +4364,13 @@ async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
         .expect("unkeyed born-on-both edges keep the documented multiset outcome");
 
     assert_eq!(count_rows(&main, "edge:Knows").await, 5);
-    let plain = query_main(&mut main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
+    let plain = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friends", &params(&[]))
         .await
         .unwrap();
     assert_eq!(first_column_sorted(&plain).len(), 4);
-    let bound = query_main(
-        &mut main,
-        EDGE_KEY_MERGE_QUERIES,
-        "friend_edges",
-        &params(&[]),
-    )
-    .await
-    .unwrap();
+    let bound = query_main(&main, EDGE_KEY_MERGE_QUERIES, "friend_edges", &params(&[]))
+        .await
+        .unwrap();
     assert_eq!(first_column_sorted(&bound).len(), 5);
 }
 
@@ -4380,14 +4380,13 @@ async fn branch_merge_keeps_both_born_on_both_unkeyed_edges() {
 async fn branch_merge_keeps_distinct_keyed_pairs() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
-        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
         &params(&[("$from", "Alice"), ("$to", "Bob")]),
@@ -4396,7 +4395,7 @@ async fn branch_merge_keeps_distinct_keyed_pairs() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows",
@@ -4418,14 +4417,13 @@ async fn branch_merge_keeps_distinct_keyed_pairs() {
 async fn branch_merge_reports_divergent_insert_for_keyed_edge() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
-        init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
+    let main = init_db_from_schema_and_data(&dir, EDGE_KEY_MERGE_SCHEMA, EDGE_KEY_MERGE_DATA).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
 
     mutate_main(
-        &mut main,
+        &main,
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows_since",
         &params(&[("$from", "Alice"), ("$to", "Bob"), ("$since", "2020")]),
@@ -4434,7 +4432,7 @@ async fn branch_merge_reports_divergent_insert_for_keyed_edge() {
     .unwrap();
 
     mutate_branch(
-        &mut feature,
+        &feature,
         "feature",
         EDGE_KEY_MERGE_MUTATIONS,
         "add_knows_since",

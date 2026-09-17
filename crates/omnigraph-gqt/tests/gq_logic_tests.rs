@@ -13,9 +13,7 @@
 use std::path::Path;
 
 fn case(path: &Path) -> datatest_stable::Result<()> {
-    if let Some(reason) = omnigraph_gqt::traversal_override_refusal(
-        std::env::var_os("OMNIGRAPH_TRAVERSAL_MODE").as_deref(),
-    ) {
+    if let Some(reason) = omnigraph_gqt::settings_override_refusal(std::env::var_os) {
         return Err(reason.into());
     }
     let bless = omnigraph_gqt::bless_from_env().map_err(|error| {

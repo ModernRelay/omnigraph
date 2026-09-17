@@ -47,7 +47,10 @@ updates into a diverged target; `--source-mode insert` selects new IDs instead.
 Their route counters report the classifier and write adapter actually used.
 Hold the delta fixed while changing `--rows` to measure scaling, and run
 `OMNIGRAPH_MERGE_LINEAGE=off`, `on`, and `verify` separately when comparing
-classification paths. Verify mode executes both paths and is not comparable
+classification paths: the operation child reads that variable through the
+process-default settings reader before it opens the fixture, records the
+mode as `merge_lineage` in its metrics, and refuses any other value with the
+reader's message. Verify mode executes both paths and is not comparable
 to a single-path throughput sample.
 
 ### Small graph-age fixtures

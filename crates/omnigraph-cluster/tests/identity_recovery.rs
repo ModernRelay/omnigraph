@@ -17,6 +17,13 @@ use omnigraph_cluster::{
 
 const SCHEMA: &str = "node Person { name: String @key }";
 
+fn session(db: Omnigraph) -> omnigraph::Session {
+    omnigraph::Session::from_defaults(
+        std::sync::Arc::new(db),
+        omnigraph::settings::SessionSettings::default(),
+    )
+}
+
 fn file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn collect(base: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in fs::read_dir(path).unwrap() {
@@ -80,7 +87,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     // The table transaction has committed while the graph manifest is unchanged.
     let graph = dir.path().join("graphs/knowledge.omni");
     let uri = graph.to_str().unwrap();
-    let writer = Box::pin(Omnigraph::open(uri)).await.unwrap();
+    let writer = session(Box::pin(Omnigraph::open(uri)).await.unwrap());
     {
         let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let error = Box::pin(writer.mutate_as(
@@ -145,7 +152,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     let legacy = Box::pin(apply_config_dir(dir.path())).await;
     assert!(legacy.ok && legacy.converged, "{:?}", legacy.diagnostics);
     assert_eq!(fs::read_dir(graph.join("__recovery")).unwrap().count(), 0);
-    let recovered = Box::pin(Omnigraph::open_read_only(uri)).await.unwrap();
+    let recovered = session(Box::pin(Omnigraph::open_read_only(uri)).await.unwrap());
     assert!(recovered.schema_source().contains("email"));
     let result = Box::pin(recovered.query(
         "main",

@@ -486,6 +486,14 @@ use lance::index::DatasetIndexExt;
 #[allow(unused_imports)]
 use omnigraph::db::{Omnigraph, ReadTarget};
 
+/// A session with the definition's defaults over a handle the fixture opened.
+fn session_over(db: Omnigraph) -> omnigraph::Session {
+    omnigraph::Session::from_defaults(
+        std::sync::Arc::new(db),
+        omnigraph::settings::SessionSettings::default(),
+    )
+}
+
 pub const POLICY_YAML: &str = r#"
 version: 1
 groups:
@@ -946,7 +954,8 @@ pub fn merge_managed_blob(graph: &Path, title: &str, bytes: &[u8]) {
         let db = omnigraph::db::Omnigraph::open(&graph.to_string_lossy())
             .await
             .unwrap();
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Merge)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Merge)
             .await
             .unwrap();
     });
@@ -983,7 +992,8 @@ pub fn init_blob_graph(graph: &Path) {
         let db = omnigraph::db::Omnigraph::init(&graph.to_string_lossy(), BLOB_CLI_SCHEMA)
             .await
             .unwrap();
-        omnigraph::loader::load_jsonl(&db, BLOB_CLI_DATA, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(BLOB_CLI_DATA, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });
@@ -1017,7 +1027,8 @@ pub fn init_external_blob_graph(
             }
         })
         .to_string();
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });
@@ -1113,7 +1124,8 @@ policies:
         let data = format!(
             "{BLOB_CLI_DATA}\n{{\"type\":\"Document\",\"data\":{{\"title\":\"external\",\"content\":\"{external_uri}\",\"note\":\"descriptor only\"}}}}"
         );
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });

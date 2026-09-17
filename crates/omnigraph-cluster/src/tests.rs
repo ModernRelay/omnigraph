@@ -4145,7 +4145,10 @@ async fn apply_executes_approved_graph_delete() {
 
     let old_root = dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni");
     let old_uri = derived_graph_uri(dir.path(), "old");
-    let export_db = Omnigraph::open(&old_uri).await.unwrap();
+    let export_db = omnigraph::Session::from_defaults(
+        std::sync::Arc::new(Omnigraph::open(&old_uri).await.unwrap()),
+        omnigraph::settings::SessionSettings::default(),
+    );
     let mut seed_params = omnigraph_compiler::ir::ParamMap::new();
     seed_params.insert(
         "name".to_string(),
@@ -5419,6 +5422,50 @@ fn query_discovery_rejects_a_named_branch_statement_file() {
                 && diagnostic.path == "graphs.knowledge.queries.b0"
                 && diagnostic.message.contains("branch statement")
         }),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
+/// A stored source opening with a settings prefix is refused by name before
+/// any declaration is read: the declaration below names a type the schema does
+/// not have, and no type-check diagnostic is reported for it.
+#[test]
+fn query_discovery_rejects_a_stored_source_with_a_settings_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("q.gq"),
+        "set merge_lineage = off;\nquery q() { match { $p: Ghost } return { $p.name } }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./q.gq\n",
+    )
+    .unwrap();
+
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    assert!(
+        out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "query_parse_error"
+                && diagnostic.path == "graphs.knowledge.queries"
+                && diagnostic
+                    .message
+                    .contains(omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS)
+        }),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "query_typecheck_error"),
         "{:?}",
         out.diagnostics
     );

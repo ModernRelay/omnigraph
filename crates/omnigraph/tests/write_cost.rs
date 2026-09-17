@@ -50,19 +50,19 @@ async fn internal_table_scans_are_flat_in_history() {
     cost_harness(async {
         const ACTOR: &str = "act-cost-gate";
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
+        let db = local_graph(&dir).await;
 
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
         for d in [10u64, 100] {
             if d > current {
-                commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+                commit_many_as(&db, (d - current) as usize, ACTOR).await;
                 current = d;
             }
             // Step 2: compaction folds all three internal tables' O(depth) fragments back
             // to a small constant, so the following write's scan of them is flat.
             db.optimize().await.unwrap();
-            let io = measure_insert_as(&mut db, &format!("lock_{d}"), ACTOR).await;
+            let io = measure_insert_as(&db, &format!("lock_{d}"), ACTOR).await;
             current += 1; // the measured write advanced depth by one
             eprintln!(
                 "depth~{d}: data={} __manifest={}",
@@ -89,8 +89,8 @@ async fn ensure_indices_manifest_reads_are_flat_in_history() {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         for depth in [10u64, 100] {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = local_graph(&dir).await;
-            commit_many(&mut db, depth as usize).await;
+            let db = local_graph(&dir).await;
+            commit_many(&db, depth as usize).await;
             db.optimize().await.unwrap();
 
             let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
@@ -125,10 +125,10 @@ async fn optimize_manifest_reads_are_flat_in_history() {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         for depth in [10u64, 100] {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = local_graph(&dir).await;
-            commit_many(&mut db, depth as usize).await;
+            let db = local_graph(&dir).await;
+            commit_many(&db, depth as usize).await;
             db.optimize().await.unwrap();
-            commit_many(&mut db, 3).await;
+            commit_many(&db, 3).await;
 
             let commits_before = db.list_commits(None).await.unwrap().len();
             let (result, io) = measure(db.optimize()).await;
@@ -189,18 +189,18 @@ async fn internal_table_scans_grow_without_compaction() {
     cost_harness(async {
         const ACTOR: &str = "act-cost-gate-served";
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
+        let db = local_graph(&dir).await;
 
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
         for d in [10u64, 100] {
             if d > current {
-                commit_many_as(&mut db, (d - current) as usize, ACTOR).await;
+                commit_many_as(&db, (d - current) as usize, ACTOR).await;
                 current = d;
             }
             // NO `db.optimize()` here — that omission is the whole point. The flat gate
             // above compacts before measuring and so never exercises this served regime.
-            let io = measure_insert_as(&mut db, &format!("served_{d}"), ACTOR).await;
+            let io = measure_insert_as(&db, &format!("served_{d}"), ACTOR).await;
             current += 1; // the measured write advanced depth by one
             eprintln!(
                 "depth~{d} (uncompacted): data={} __manifest={}",
@@ -244,16 +244,16 @@ async fn internal_table_scans_grow_without_compaction() {
 #[tokio::test]
 async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = local_graph(&dir).await;
+    let db = local_graph(&dir).await;
 
     let mut curve: Vec<(u64, IoCounts)> = Vec::new();
     let mut current = 0u64;
     for d in [10u64, 100] {
         if d > current {
-            commit_many(&mut db, (d - current) as usize).await;
+            commit_many(&db, (d - current) as usize).await;
             current = d;
         }
-        let io = measure_insert(&mut db, &format!("split_{d}")).await;
+        let io = measure_insert(&db, &format!("split_{d}")).await;
         current += 1;
         eprintln!(
             "depth~{d}: opener={} scan={} data_total={}",
@@ -291,9 +291,9 @@ async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
 #[tokio::test]
 async fn single_insert_data_write_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = local_graph(&dir).await;
-    commit_many(&mut db, 5).await;
-    let io = measure_insert(&mut db, "w").await;
+    let db = local_graph(&dir).await;
+    commit_many(&db, 5).await;
+    let io = measure_insert(&db, "w").await;
     eprintln!("single insert: data_writes={}", io.data_writes);
     assert!(
         io.data_writes <= 4,
@@ -318,9 +318,9 @@ async fn single_insert_data_write_is_bounded() {
 async fn write_op_count_ceiling_at_shallow_depth() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 5).await;
-        let io = measure_insert(&mut db, "ceil").await;
+        let db = local_graph(&dir).await;
+        commit_many(&db, 5).await;
+        let io = measure_insert(&db, "ceil").await;
         eprintln!(
             "depth~5: data={} __manifest={} total_reads={}",
             io.data_reads,
@@ -370,8 +370,8 @@ async fn multi_table_staging_is_flat_in_history() {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         for depth in [10u64, 100] {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = local_graph(&dir).await;
-            commit_many(&mut db, depth as usize).await;
+            let db = local_graph(&dir).await;
+            commit_many(&db, depth as usize).await;
             // Compact first for the same reason as the internal-table lock above:
             // the gate pins the periodically-compacted production shape.
             db.optimize().await.unwrap();
@@ -469,9 +469,11 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
     let _ = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
     let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
-    let db = omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
-        .await
-        .unwrap();
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
 
     let before_read_text = counts.read_text();
     let before_exists = counts.exists();
@@ -572,9 +574,9 @@ async fn manifest_reads_capture_warm_probe() {
     // under the limit.
     let fresh = Box::pin(async {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 3).await; // warm the coordinator
-        let io = measure_insert(&mut db, "fresh").await;
+        let db = local_graph(&dir).await;
+        commit_many(&db, 3).await; // warm the coordinator
+        let io = measure_insert(&db, "fresh").await;
         eprintln!("fresh-only warm write: __manifest={}", io.manifest_reads);
         io.manifest_reads
     })
@@ -583,9 +585,9 @@ async fn manifest_reads_capture_warm_probe() {
     // Ground truth (`cost_harness`): the same warm probe is now counted.
     cost_harness(async move {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = local_graph(&dir).await;
-        commit_many(&mut db, 3).await;
-        let io = measure_insert(&mut db, "ground_truth").await;
+        let db = local_graph(&dir).await;
+        commit_many(&db, 3).await;
+        let io = measure_insert(&db, "ground_truth").await;
         eprintln!("ground-truth warm write: __manifest={}", io.manifest_reads);
         assert!(
             io.manifest_reads > fresh,
@@ -631,20 +633,17 @@ node User {
     for rows in [4u64, 64] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = omnigraph::db::Omnigraph::init(uri, UNIQUE_COST_SCHEMA)
-            .await
-            .unwrap();
+        let db = helpers::session(
+            omnigraph::db::Omnigraph::init(uri, UNIQUE_COST_SCHEMA)
+                .await
+                .unwrap(),
+        );
         // Committed baseline so the cross-version `@unique` probe has a
         // non-empty committed view (an empty view skips the probe entirely).
-        omnigraph::loader::load_jsonl(
-            &db,
-            &users_jsonl("seed", 4),
-            omnigraph::loader::LoadMode::Append,
-        )
-        .await
-        .unwrap();
-        let (res, io) = measure(omnigraph::loader::load_jsonl(
-            &db,
+        db.load_jsonl(&users_jsonl("seed", 4), omnigraph::loader::LoadMode::Append)
+            .await
+            .unwrap();
+        let (res, io) = measure(db.load_jsonl(
             &users_jsonl(&format!("delta{rows}"), rows),
             omnigraph::loader::LoadMode::Append,
         ))

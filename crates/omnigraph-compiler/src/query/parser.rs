@@ -5,6 +5,7 @@ use pest_derive::Parser;
 use crate::error::{
     CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
+use crate::settings::{SessionSettings, SessionSettingsError, SettingId, SettingValue};
 
 use super::ast::*;
 
@@ -16,21 +17,59 @@ pub fn parse_query(input: &str) -> Result<QueryFile> {
     parse_query_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
 }
 
+/// Whether `input` opens with a settings statement: `set` or `reset` as the
+/// first token after leading whitespace and comments, closed by a word
+/// boundary as the grammar's keywords are. The gate a caller that needs only
+/// the prefix takes before `parse_query`, so a source without one is never
+/// parsed for it.
+pub fn has_settings_prefix(input: &str) -> bool {
+    let rest = skip_trivia(input);
+    ["set", "reset"].iter().any(|keyword| {
+        rest.strip_prefix(keyword).is_some_and(|after| {
+            !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    })
+}
+
+/// `input` after the grammar's `WHITESPACE` and `COMMENT`: an unterminated
+/// block comment consumes the rest, as it does in the parser.
+fn skip_trivia(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim_start_matches([' ', '\t', '\r', '\n']);
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            input = rest.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(rest) = trimmed.strip_prefix("/*") {
+            input = rest.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            return trimmed;
+        }
+    }
+}
+
 pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, ParseDiagnostic> {
     let pairs = QueryParser::parse(Rule::query_file, input).map_err(pest_error_to_diagnostic)?;
 
+    let mut settings = Vec::new();
     let mut queries = Vec::new();
-    let mut branch = None;
+    let mut statement = None;
     for pair in pairs {
         if let Rule::query_file = pair.as_rule() {
             for inner in pair.into_inner() {
                 match inner.as_rule() {
+                    Rule::setting_stmt => settings.push(parse_setting_stmt(inner)?),
                     Rule::branch_stmt => {
-                        branch = Some(parse_branch_stmt(inner)?);
+                        statement = Some(FileBody::Branch(parse_branch_stmt(inner)?));
+                    }
+                    Rule::show_stmt => {
+                        statement = Some(FileBody::Show(parse_setting_target(inner)?));
                     }
                     Rule::statement_trailer => {
+                        let subject = match statement {
+                            Some(FileBody::Show(_)) => "a show statement",
+                            _ => "a branch statement",
+                        };
                         return Err(ParseDiagnostic::new(
-                            "a branch statement stands alone in its file".to_string(),
+                            format!("{subject} stands alone in its file"),
                             Some(pair_span(&inner)),
                         ));
                     }
@@ -43,15 +82,106 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
             }
         }
     }
-    if let Some(stmt) = branch {
-        return Ok(QueryFile::Branch(stmt));
-    }
-    Ok(QueryFile::Queries(queries))
+    Ok(QueryFile {
+        settings,
+        body: statement.unwrap_or(FileBody::Queries(queries)),
+    })
 }
 
 fn pair_span(pair: &pest::iterators::Pair<Rule>) -> SourceSpan {
     let span = pair.as_span();
     render_span(SourceSpan::new(span.start(), span.end()))
+}
+
+fn parse_setting_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<SettingStmt, ParseDiagnostic> {
+    let form = pair
+        .into_inner()
+        .next()
+        .expect("grammar: setting_stmt holds one form");
+    match form.as_rule() {
+        Rule::set_stmt => {
+            let mut parts = form
+                .into_inner()
+                .filter(|inner| inner.as_rule() != Rule::kw_set);
+            let name = parts
+                .next()
+                .expect("grammar: set_stmt holds a setting_name");
+            let id = parse_setting_id(&name)?;
+            let value_pair = parts
+                .next()
+                .expect("grammar: set_stmt holds a setting_value");
+            let value = parse_setting_value(id, &value_pair)?;
+            SessionSettings::default()
+                .set(id, &value)
+                .map_err(|error| setting_diagnostic(error, &value_pair))?;
+            Ok(SettingStmt::Set { id, value })
+        }
+        Rule::reset_stmt => Ok(SettingStmt::Reset {
+            id: parse_setting_target(form)?,
+        }),
+        other => unreachable!("grammar: setting_stmt admits no {other:?}"),
+    }
+}
+
+/// The `<name>` or `all` after `reset` or `show`.
+fn parse_setting_target(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<Option<SettingId>, ParseDiagnostic> {
+    let target = pair
+        .into_inner()
+        .find(|inner| matches!(inner.as_rule(), Rule::kw_all | Rule::setting_name))
+        .expect("grammar: reset_stmt and show_stmt hold `all` or a setting_name");
+    match target.as_rule() {
+        Rule::kw_all => Ok(None),
+        Rule::setting_name => parse_setting_id(&target).map(Some),
+        other => unreachable!("grammar: a setting target admits no {other:?}"),
+    }
+}
+
+fn parse_setting_id(
+    name: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<SettingId, ParseDiagnostic> {
+    SettingId::parse(name.as_str()).map_err(|error| setting_diagnostic(error, name))
+}
+
+fn parse_setting_value(
+    id: SettingId,
+    pair: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<SettingValue, ParseDiagnostic> {
+    let token = pair
+        .clone()
+        .into_inner()
+        .next()
+        .expect("grammar: setting_value wraps an integer, an ident or a string_lit");
+    match token.as_rule() {
+        Rule::integer => token
+            .as_str()
+            .parse::<i64>()
+            .map(SettingValue::Integer)
+            .map_err(|_| {
+                setting_diagnostic(
+                    SessionSettingsError::OutOfRange {
+                        setting: id,
+                        got: token.as_str().to_string(),
+                    },
+                    pair,
+                )
+            }),
+        Rule::ident => Ok(SettingValue::Ident(token.as_str().to_string())),
+        Rule::string_lit => parse_string_lit(token.as_str())
+            .map(SettingValue::Str)
+            .map_err(compiler_error_to_diagnostic),
+        other => unreachable!("grammar: setting_value admits no {other:?}"),
+    }
+}
+
+fn setting_diagnostic(
+    error: SessionSettingsError,
+    at: &pest::iterators::Pair<Rule>,
+) -> ParseDiagnostic {
+    ParseDiagnostic::new(error.to_string(), Some(pair_span(at)))
 }
 
 fn parse_branch_stmt(

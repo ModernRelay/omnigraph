@@ -7,6 +7,7 @@ pub mod query;
 pub mod query_input;
 pub mod result;
 pub mod schema;
+pub mod settings;
 pub mod types;
 
 pub use catalog::schema_ir::{

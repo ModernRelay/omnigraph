@@ -7,9 +7,8 @@ use omnigraph::db::MergeOutcome;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{
     MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
-    with_traversal_mode,
 };
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
@@ -21,18 +20,16 @@ async fn s3_compatible_graph_lifecycle_works() {
         return;
     };
 
-    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = helpers::session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
-    let mut reopened = Omnigraph::open(&uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let snapshot = reopened.snapshot_of("main").await.unwrap();
     assert!(snapshot.dataset("node:Person").is_some());
     assert!(snapshot.dataset("edge:Knows").is_some());
 
     let alice = query_main(
-        &mut reopened,
+        &reopened,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Alice")]),
@@ -64,9 +61,9 @@ async fn s3_compatible_graph_lifecycle_works() {
         .await
         .unwrap();
 
-    let mut reopened_again = Omnigraph::open(&uri).await.unwrap();
+    let reopened_again = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let eve = query_main(
-        &mut reopened_again,
+        &reopened_again,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "RustFS-Eve")]),
@@ -78,7 +75,7 @@ async fn s3_compatible_graph_lifecycle_works() {
     assert_eq!(eve[0]["p.name"], "RustFS-Eve");
 
     let run_only = query_main(
-        &mut reopened_again,
+        &reopened_again,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "RunOnly")]),
@@ -97,13 +94,13 @@ async fn s3_branch_change_merge_flow_works() {
         return;
     };
 
-    let mut main = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&main, TEST_DATA, LoadMode::Overwrite)
+    let main = helpers::session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    main.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     main.branch_create("feature").await.unwrap();
 
-    let feature = Omnigraph::open(&uri).await.unwrap();
+    let feature = helpers::session(Omnigraph::open(&uri).await.unwrap());
     feature
         .mutate(
             "feature",
@@ -115,7 +112,7 @@ async fn s3_branch_change_merge_flow_works() {
         .unwrap();
 
     let before_merge = query_main(
-        &mut main,
+        &main,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Feature-Eve")]),
@@ -127,9 +124,9 @@ async fn s3_branch_change_merge_flow_works() {
     let outcome = main.branch_merge("feature", "main").await.unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
 
-    let mut reopened = Omnigraph::open(&uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let after_merge = query_main(
-        &mut reopened,
+        &reopened,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Feature-Eve")]),
@@ -155,10 +152,8 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     let schema =
         format!("{TEST_SCHEMA}\nnode Document {{\n    title: String @key\n    content: Blob\n}}\n");
     let graph_uri = format!("{uri}/graph");
-    let db = Omnigraph::init(&graph_uri, &schema).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = helpers::session(Omnigraph::init(&graph_uri, &schema).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
     db.load(
         "main",
@@ -170,9 +165,9 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
 
     // Direct-to-target writes: no run state machine, just the
     // published commit lands the row. Verify by reopening and reading.
-    let mut reopened = Omnigraph::open(&graph_uri).await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(&graph_uri).await.unwrap());
     let loaded = query_main(
-        &mut reopened,
+        &reopened,
         TEST_QUERIES,
         "get_person",
         &params(&[("$name", "Loaded-Over-S3")]),
@@ -198,7 +193,14 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
         ExternalBlobBase::new(&external_base, ExternalBlobExecutionScope::ServerSafe).unwrap(),
     ])
     .unwrap();
-    let db = db.with_external_blob_policy(policy).unwrap();
+    drop(db);
+    let db = helpers::session(
+        Omnigraph::open(&graph_uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
     let encoded_alias = external_uri.replace("~source", "%7Esource");
     assert_ne!(encoded_alias, external_uri);
     let rows = format!(
@@ -318,10 +320,8 @@ async fn s3_schema_apply_migrates_live_graph() {
         eprintln!("skipping s3 schema apply test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
-    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = helpers::session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
 
     let desired = format!("{TEST_SCHEMA}\nnode Note {{\n    title: String @key\n}}\n");
     let result = db.apply_schema(&desired).await.unwrap();
@@ -334,13 +334,9 @@ async fn s3_schema_apply_migrates_live_graph() {
     );
 }
 
-/// Graph-index (CSR topology) cross-branch reuse on a real object store, where the
-/// cache key's per-table `e_tag` is a genuine non-`None` token (Lance e_tag is
-/// `None` on local FS, so the local twin in `warm_read_cost.rs` keys on `None` —
-/// this exercises the e_tag-present path production runs). With e_tags present, a
-/// fresh lazy-fork branch reuses main's cached index (`graph_build_count == 0`).
-/// Forces CSR via the scoped `with_traversal_mode` seam (no env mutation, so no
-/// interference with the other tests in this binary).
+/// Graph-index cross-branch reuse on a real object store, where the cache key's
+/// per-table `e_tag` is a genuine token (the local twin in `warm_read_cost.rs`
+/// keys on `None`): a fresh lazy-fork branch reuses main's cached index.
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
     let Some(uri) = s3_test_graph_uri("graph-index-etag") else {
@@ -348,29 +344,29 @@ async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
         return;
     };
 
-    let writer = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    let writer = helpers::session(Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap());
     // TEST_DATA seeds Alice->Bob and Alice->Charlie Knows edges.
-    load_jsonl(&writer, TEST_DATA, LoadMode::Overwrite)
+    writer
+        .load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
     // Separate reader: it never creates the branch, so branch_create below does
     // not invalidate the reader's warm cache.
-    let reader = Omnigraph::open(&uri).await.unwrap();
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
 
     // Warm main on the CSR path: builds + caches the topology index keyed by the
     // edge table's physical identity incl. its real e_tag.
-    let warm = with_traversal_mode(
-        "csr",
-        reader.query(
+    let csr = helpers::with_traversal(&reader, Traversal::Csr);
+    let warm = csr
+        .query(
             ReadTarget::branch("main"),
             TEST_QUERIES,
             "friends_of",
             &params(&[("$name", "Alice")]),
-        ),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
     assert_eq!(
         first_column_sorted(&warm),
         vec!["Bob", "Charlie"],
@@ -386,16 +382,13 @@ async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
         graph_build_count: Arc::clone(&graph_build),
         ..Default::default()
     };
-    let on_branch = with_traversal_mode(
-        "csr",
-        with_query_io_probes(
-            probes,
-            reader.query(
-                ReadTarget::branch("feature"),
-                TEST_QUERIES,
-                "friends_of",
-                &params(&[("$name", "Alice")]),
-            ),
+    let on_branch = with_query_io_probes(
+        probes,
+        csr.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
         ),
     )
     .await

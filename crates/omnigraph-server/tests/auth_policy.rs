@@ -918,6 +918,7 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         params: Some(json!({ "name": "Alice" })),
         branch: None,
         snapshot: Some(snapshot_id.clone()),
+        settings: None,
     };
     let (status, body) = json_response(
         &app,
@@ -1050,7 +1051,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
     let graph = graph_path(temp.path());
 
     // Author a commit on an UNPROTECTED branch the read grant does not cover.
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -1142,6 +1143,7 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
+        settings: None,
     };
     let (main_status, main_body) = json_response(
         &app,
@@ -1166,6 +1168,7 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("feature".to_string()),
+        settings: None,
     };
     let (feature_status, feature_body) = json_response(
         &app,
@@ -1187,7 +1190,7 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
 async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -1218,6 +1221,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        settings: None,
     };
     let (deny_status, deny_body) = json_response(
         &app,
@@ -1404,18 +1408,85 @@ async fn branch_list_is_denied_by_a_branch_scoped_read_rule_as_the_route_is() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (status, body) = json_response(
-        &app,
-        statement_request("/query", "team-token", "branch list"),
-    )
-    .await;
-    assert_forbidden(status, body, "branch list under a protected-only read rule");
+    for statement in ["branch list", SHOW_SOURCES[0]] {
+        let (status, body) =
+            json_response(&app, statement_request("/query", "team-token", statement)).await;
+        assert_forbidden(
+            status,
+            body,
+            &format!("{statement} under a protected-only read rule"),
+        );
+    }
     let (status, body) = json_response(&app, get_request(&g("/branches"), "team-token")).await;
     assert_forbidden(
         status,
         body,
         "GET /branches under a protected-only read rule",
     );
+}
+
+const SHOW_SOURCES: [&str; 1] = ["show all;"];
+
+fn assert_show_rows(body: &Value, what: &str) {
+    assert_eq!(body["query_name"], "show", "{what}: {body}");
+    let rows = body["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{what}: {body}"));
+    assert_eq!(body["row_count"], rows.len(), "{what}: {body}");
+    let merge_lineage = rows
+        .iter()
+        .find(|row| row["name"] == "merge_lineage")
+        .unwrap_or_else(|| panic!("{what}: no merge_lineage row in {body}"));
+    assert_eq!(merge_lineage["scope"], "request", "{what}: {body}");
+    assert_eq!(merge_lineage["source"], "default", "{what}: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_takes_the_scope_free_read_decision_as_branch_list_does() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "reader-token"), ("act-ragnor", "admin-token")],
+        BRANCH_CONTROL_POLICY_YAML,
+    )
+    .await;
+
+    for source in SHOW_SOURCES {
+        let (status, body) =
+            json_response(&app, statement_request("/query", "admin-token", source)).await;
+        assert_forbidden(status, body, "show by an actor with no read rule");
+        let (status, body) =
+            json_response(&app, statement_request("/query", "reader-token", source)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_show_rows(&body, "show by a reader");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_change_only_credential_cannot_show_settings() {
+    let tokens = data_tokens::DataTokens::new();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&[&tokens.actor])).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("breakglass".into(), "explicit.static.credential".into())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    let app = build_app(state);
+    let change_only = tokens.token(json!([{"graph_id":"default","actions":["change"]}]));
+    let read = tokens.token(json!([{"graph_id":"default","actions":["read"]}]));
+
+    for source in SHOW_SOURCES {
+        let (status, body) =
+            json_response(&app, statement_request("/query", &change_only, source)).await;
+        assert_forbidden(status, body, "show by a change-only credential");
+        let (status, body) = json_response(&app, statement_request("/query", &read, source)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_show_rows(&body, "show by a read credential");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1429,6 +1500,7 @@ async fn authenticated_change_stamps_actor_on_commits() {
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
+        settings: None,
     };
     let (change_status, change_body) = json_response(
         &app,
@@ -1493,6 +1565,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Zoe", "age": 33 })),
         branch: Some("feature".to_string()),
+        settings: None,
     };
     let (change_status, _) = json_response(
         &app,
@@ -1511,6 +1584,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        settings: None,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -1570,6 +1644,7 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: true,
+        settings: None,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -1633,7 +1708,10 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
         omnigraph_server::RegistryLookup::Ready(handle) => handle,
         omnigraph_server::RegistryLookup::Gone => panic!("default graph must be registered"),
     };
-    let engine = Arc::clone(&handle.engine);
+    let engine = omnigraph::Session::from_defaults(
+        Arc::clone(&handle.engine),
+        omnigraph::settings::SessionSettings::default(),
+    );
 
     let mut params: omnigraph_compiler::ParamMap = Default::default();
     params.insert(
@@ -1716,6 +1794,7 @@ async fn default_deny_mode_rejects_change_with_forbidden() {
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "DefaultDeny", "age": 1 })),
         branch: Some("main".to_string()),
+        settings: None,
     };
     let (status, body) = json_response(
         &app,

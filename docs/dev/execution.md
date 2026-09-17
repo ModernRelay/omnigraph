@@ -63,7 +63,7 @@ BTREE is priced as a full edge scan per hop. `choose_expand_mode` and
 |---|---:|---|
 | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` | `1024` | A larger input frontier always selects CSR before the cost comparison. |
 | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS` | `6` | A larger effective maximum hop count always selects CSR before the cost comparison. |
-| `OMNIGRAPH_TRAVERSAL_MODE` | unset | `indexed` forces per-hop BTREE scans; `csr` forces the in-memory path. |
+| the expand path | cost model | No session setting names it: the cost model chooses, and only the harness forces one through `SessionSettings::with_traversal` (`Traversal::Indexed` for per-hop BTREE scans, `Traversal::Csr` for the in-memory path), as the GQT `# traversal:` header pin does. |
 
 The hop cap is a dispatch cap (the hop count is fully known at dispatch). A
 missing or nonnumeric value uses its default; a zero hop cap also uses the
@@ -118,8 +118,9 @@ operations; traversal or projection must not silently discard them. RRF
 executes its sources independently against the same graph snapshot and fuses
 their ordered results.
 
-A `nearest` scan carries a probe cap per index delta (`OMNIGRAPH_ANN_NPROBES`,
-default 20). `execute_node_scan` runs a probe ladder: a capped scan short of
+A `nearest` scan carries a probe cap per index delta (the `ann_nprobes`
+session setting, `process` scope, default 20, `0` is no cap; the process
+default is `OMNIGRAPH_ANN_NPROBES`). `execute_node_scan` runs a probe ladder: a capped scan short of
 `k` with partitions unread reruns at four times the cap, then uncapped. The
 stop rules (`ladder_step`) end the ladder on every other cause of a short
 scan, read from Lance's execution summary (`partitions_searched` /

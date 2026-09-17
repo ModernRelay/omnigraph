@@ -22,6 +22,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
@@ -64,7 +65,7 @@ fn additive_schema() -> String {
     )
 }
 
-fn install_policy(db: Omnigraph, dir_path: &Path) -> (Omnigraph, Arc<PolicyEngine>) {
+fn install_policy(db: Omnigraph, dir_path: &Path) -> (Session, Arc<PolicyEngine>) {
     install_policy_source(db, dir_path, POLICY_YAML)
 }
 
@@ -72,17 +73,18 @@ fn install_policy_source(
     db: Omnigraph,
     dir_path: &Path,
     source: &str,
-) -> (Omnigraph, Arc<PolicyEngine>) {
+) -> (Session, Arc<PolicyEngine>) {
     let policy_path = dir_path.join("policy.yaml");
     fs::write(&policy_path, source).unwrap();
     let engine = PolicyEngine::load_graph(&policy_path, dir_path.to_str().unwrap()).unwrap();
     let engine = Arc::new(engine);
-    let db = db.with_policy(Arc::clone(&engine) as Arc<dyn PolicyChecker>);
+    let db = helpers::session(db.with_policy(Arc::clone(&engine) as Arc<dyn PolicyChecker>));
     (db, engine)
 }
 
-async fn init_with_policy(dir: &tempfile::TempDir) -> (Omnigraph, Arc<PolicyEngine>) {
-    let db = init_and_load(dir).await;
+async fn init_with_policy(dir: &tempfile::TempDir) -> (Session, Arc<PolicyEngine>) {
+    drop(init_and_load(dir).await);
+    let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     install_policy(db, dir.path())
 }
 
@@ -92,11 +94,13 @@ async fn init_with_policy(dir: &tempfile::TempDir) -> (Omnigraph, Arc<PolicyEngi
 async fn init_with_policy_and_feature_branch(
     dir: &tempfile::TempDir,
     branch: &str,
-) -> (Omnigraph, Arc<PolicyEngine>) {
+) -> (Session, Arc<PolicyEngine>) {
     let db = init_and_load(dir).await;
     db.branch_create_from(ReadTarget::branch("main"), branch)
         .await
         .expect("setup: create feature branch before installing policy");
+    drop(db);
+    let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     install_policy(db, dir.path())
 }
 
@@ -466,9 +470,11 @@ async fn full_text_rebuild_enforces_selected_branch_before_effects_and_records_a
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
+    drop(db);
     // This actor can change unprotected feature, but not protected main.
     // A hardcoded main scope or a different maintenance action must fail.
     let policy = POLICY_YAML.replace("      branch_scope: any", "      branch_scope: unprotected");
+    let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
     let (db, _engine) = install_policy_source(db, dir.path(), &policy);
     let main_before = db.list_commits(None).await.unwrap();
     let feature_before = db.list_commits(Some("feature")).await.unwrap();

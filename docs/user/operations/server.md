@@ -222,6 +222,9 @@ keep their existing routes and do not expose MCP.
 `POST /query` and `POST /mutate` also serve the GQ branch statements:
 `branch list` on `/query`, and `branch create`, `branch delete`, and
 `branch merge` on `/mutate`. See [Branching](../branching/index.md).
+Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
+takes an optional `settings` field, and the two GET change routes a `set=`
+parameter; see [Session settings](../queries/index.md#session-settings).
 
 `/read`, `/change`, and `/ingest` are deprecated compatibility routes. New
 clients should use `/query`, `/mutate`, and `/load`.
@@ -328,19 +331,16 @@ branch; its terminal response supplies the durable cursor. If cleanup makes a
 cursor unreadable, the route returns `410 change_feed_gap`.
 
 `POST /graphs/{id}/changes/baseline` streams an entity snapshot followed by a
-terminal snapshot commit and resume cursor. See
-[Changes and Change Feeds](../branching/changes.md) for pagination,
-checkpointing, and recovery.
+terminal snapshot commit and resume cursor. For pagination, checkpointing and
+recovery see [Changes and Change Feeds](../branching/changes.md).
 
 ## Errors and retries
 
 Application errors are JSON and preserve a stable HTTP status plus structured
-details where available. Routing and request-extraction errors may be plain
-responses. Admission-limit responses use `429` and include `Retry-After`.
-Request/operation limits use `413`; interrupted writes that must recover use
-`503`.
-
-See [Troubleshooting](troubleshooting.md) before implementing retry logic.
+details where available. Routing errors may be plain responses. Admission-limit
+responses use `429` and include `Retry-After`; request and operation limits use
+`413`, and interrupted writes that must recover `503`. See
+[Troubleshooting](troubleshooting.md) before implementing retry logic.
 
 ## Deployment notes
 

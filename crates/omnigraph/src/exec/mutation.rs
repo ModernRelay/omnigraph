@@ -2,6 +2,7 @@ use super::*;
 
 use super::query::literal_to_sql;
 use crate::seams::{decide_seam, fail};
+use crate::session::Session;
 use crate::storage_layer::PendingScanBudget;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
@@ -527,8 +528,6 @@ use super::staging::{MutationStaging, PendingMode};
 /// touch records another predicate (`record_delete`), and `stage_all` combines
 /// them into one staged delete — there is no post-inline-commit reopen to
 /// special-case anymore.
-impl Omnigraph {}
-
 async fn open_table_for_mutation(
     db: &Omnigraph,
     staging: &mut MutationStaging,
@@ -674,7 +673,7 @@ decide_seam! {
     pub static MUTATION_POST_NO_EFFECT_PRE_GATE = ("mutation.post_no_effect_pre_gate", Mutation, [Fail]);
 }
 
-impl Omnigraph {
+impl Session {
     pub async fn mutate(
         &self,
         branch: &str,
@@ -820,6 +819,7 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
+        let settings = self.effective(query_source)?;
         self.mutate_with_current_actor(
             branch,
             query_source,
@@ -827,10 +827,13 @@ impl Omnigraph {
             params,
             actor_id,
             expected_head,
+            settings.stage_write_concurrency(),
         )
         .await
     }
+}
 
+impl Omnigraph {
     /// End-of-query validation for a constructive mutation: build the change-set
     /// from the accumulated staging and run the unified evaluator (value/enum,
     /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
@@ -865,6 +868,7 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
         expected_head: Option<&str>,
+        stage_write_concurrency: usize,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -881,6 +885,7 @@ impl Omnigraph {
                     &resolved_params,
                     actor_id,
                     expected_head,
+                    stage_write_concurrency,
                     &mut retryable,
                 )
                 .await
@@ -911,6 +916,7 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
         expected_head: Option<&str>,
+        stage_write_concurrency: usize,
         retryable: &mut bool,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
@@ -1010,7 +1016,9 @@ impl Omnigraph {
             }
             Ok(total) => {
                 self.validate_staged_mutation(&staging, &txn).await?;
-                let staged = staging.stage_all(self, requested.as_deref()).await?;
+                let staged = staging
+                    .stage_all_with_concurrency(self, requested.as_deref(), stage_write_concurrency)
+                    .await?;
                 fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
                 let lineage_intent = self
                     .new_lineage_intent_for_branch(requested.as_deref(), actor_id)

@@ -33,6 +33,7 @@ pub(crate) mod lance_access;
 pub mod loader;
 pub(crate) mod runtime_cache;
 pub mod seams;
+pub mod session;
 pub mod storage;
 pub(crate) mod storage_layer;
 pub(crate) mod table_store;
@@ -44,6 +45,8 @@ pub use blob::{
     ExternalBlobRef,
 };
 pub use changes::EntityKind;
+pub use omnigraph_compiler::settings;
+pub use session::Session;
 pub use table_store::IndexCoverage;
 
 /// Result of one mutation together with the exact commit published by it.

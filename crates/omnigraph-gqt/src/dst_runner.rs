@@ -297,6 +297,9 @@ fn invocation_id() -> String {
 }
 
 fn refuse_ambient() -> Result<(), String> {
+    let settings_variables = omnigraph_compiler::settings::DEFINITIONS
+        .iter()
+        .map(|spec| spec.env);
     for name in [
         "FAILPOINTS",
         "DST_ENTROPY_SEED",
@@ -304,8 +307,11 @@ fn refuse_ambient() -> Result<(), String> {
         "LANCE_CPU_THREADS",
         "LANCE_DETERMINISTIC_BACKOFF",
         crate::CASE_TIMEOUT_ENV,
-        "OMNIGRAPH_TRAVERSAL_MODE",
-    ] {
+    ]
+    .into_iter()
+    .chain(settings_variables)
+    .chain(crate::RETIRED_SETTING_ENVIRONMENT)
+    {
         if std::env::var_os(name).is_some() {
             return Err(format!(
                 "invalid_case: ambient {name} conflicts with file-owned execution; unset it"

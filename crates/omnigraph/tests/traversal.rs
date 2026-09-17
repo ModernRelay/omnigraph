@@ -3,8 +3,9 @@ mod helpers;
 use arrow_array::{Array, Int32Array, StringArray};
 use arrow_schema::DataType;
 
+use omnigraph::Session;
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
@@ -18,7 +19,7 @@ use helpers::*;
 #[tokio::test]
 async fn undirected_one_hop_unions_out_and_in_neighbors() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query connected($name: String) {
@@ -39,7 +40,7 @@ query connected_directional($name: String) {
     // Directional from Bob misses the incoming Alice->Bob edge — the
     // motivating dashboard bug.
     let directional = query_main(
-        &mut db,
+        &db,
         queries,
         "connected_directional",
         &params(&[("$name", "Bob")]),
@@ -52,7 +53,7 @@ query connected_directional($name: String) {
         "directional sees only outgoing"
     );
 
-    let undirected = query_main(&mut db, queries, "connected", &params(&[("$name", "Bob")]))
+    let undirected = query_main(&db, queries, "connected", &params(&[("$name", "Bob")]))
         .await
         .unwrap();
     assert_eq!(
@@ -63,14 +64,13 @@ query connected_directional($name: String) {
 
     // Dedup: add the reverse edge Diana->Bob so (Bob, Diana) exists both
     // ways; Diana must still appear exactly once.
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         r#"{"edge": "Knows", "from": "Diana", "to": "Bob"}"#,
         LoadMode::Merge,
     )
     .await
     .unwrap();
-    let deduped = query_main(&mut db, queries, "connected", &params(&[("$name", "Bob")]))
+    let deduped = query_main(&db, queries, "connected", &params(&[("$name", "Bob")]))
         .await
         .unwrap();
     assert_eq!(
@@ -83,7 +83,7 @@ query connected_directional($name: String) {
 #[tokio::test]
 async fn undirected_variable_hops() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query reach_both($name: String) {
@@ -97,14 +97,9 @@ query reach_both($name: String) {
     // Charlie's only edge is INCOMING (Alice->Charlie). Undirected: hop 1
     // reaches Alice; hop 2 from Alice reaches Bob (out) — Charlie itself is
     // the visited source, never re-emitted.
-    let result = query_main(
-        &mut db,
-        queries,
-        "reach_both",
-        &params(&[("$name", "Charlie")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&db, queries, "reach_both", &params(&[("$name", "Charlie")]))
+        .await
+        .unwrap();
     assert_eq!(
         first_column_sorted(&result),
         vec!["Alice", "Bob"],
@@ -115,7 +110,7 @@ query reach_both($name: String) {
 #[tokio::test]
 async fn undirected_anti_join_excludes_both_directions() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query isolated() {
@@ -135,14 +130,14 @@ query no_outgoing() {
 "#;
     // Directional `not`: keeps people with no OUTGOING edge — Charlie and
     // Diana (both have only incoming).
-    let directional = query_main(&mut db, queries, "no_outgoing", &ParamMap::new())
+    let directional = query_main(&db, queries, "no_outgoing", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(first_column_sorted(&directional), vec!["Charlie", "Diana"]);
 
     // Undirected `not`: no edge in EITHER direction — every fixture person
     // has at least one, so the result is empty.
-    let undirected = query_main(&mut db, queries, "isolated", &ParamMap::new())
+    let undirected = query_main(&db, queries, "isolated", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(undirected.num_rows(), 0, "everyone touches a Knows edge");
@@ -153,7 +148,7 @@ query no_outgoing() {
 #[tokio::test]
 async fn anti_join_predicated_negation() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // "People who do NOT work at Acme"
     // Inner pipeline: Expand(worksAt) + Filter(name="Acme") → 2 ops → slow path
@@ -171,7 +166,7 @@ query not_at_acme() {
 "#;
     // Test data: Alice→Acme, Bob→Globex. Charlie and Diana have no WorksAt.
     // Expected: everyone except Alice = {Bob, Charlie, Diana}
-    let result = query_main(&mut db, queries, "not_at_acme", &ParamMap::new())
+    let result = query_main(&db, queries, "not_at_acme", &ParamMap::new())
         .await
         .unwrap();
 
@@ -194,7 +189,7 @@ query not_at_acme() {
 #[tokio::test]
 async fn nested_anti_join_double_negation() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query no_nonacme_employer() {
@@ -210,7 +205,7 @@ query no_nonacme_employer() {
     return { $p.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+    let result = query_main(&db, queries, "no_nonacme_employer", &ParamMap::new())
         .await
         .unwrap();
 
@@ -233,7 +228,7 @@ query no_nonacme_employer() {
 #[tokio::test]
 async fn anti_join_fast_and_slow_paths_agree() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query fast() {
@@ -267,12 +262,12 @@ query slow() {
     };
 
     let fast = names(
-        query_main(&mut db, queries, "fast", &ParamMap::new())
+        query_main(&db, queries, "fast", &ParamMap::new())
             .await
             .unwrap(),
     );
     let slow = names(
-        query_main(&mut db, queries, "slow", &ParamMap::new())
+        query_main(&db, queries, "slow", &ParamMap::new())
             .await
             .unwrap(),
     );
@@ -304,8 +299,8 @@ async fn nested_anti_join_with_fanout_correlates_correctly() {
 {"edge":"WorksAt","from":"p1","to":"Globex"}
 {"edge":"WorksAt","from":"p2","to":"Globex"}
 {"edge":"WorksAt","from":"p3","to":"Acme"}"#;
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
     let queries = r#"
 query no_nonacme_employer() {
@@ -321,7 +316,7 @@ query no_nonacme_employer() {
     return { $p.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+    let result = query_main(&db, queries, "no_nonacme_employer", &ParamMap::new())
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
@@ -354,8 +349,8 @@ async fn anti_join_respects_multi_hop_bounds() {
 {"edge":"Knows","from":"a","to":"b"}
 {"edge":"Knows","from":"c","to":"d"}
 {"edge":"Knows","from":"d","to":"e"}"#;
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
     let queries = r#"
 query no_two_hop() {
@@ -366,7 +361,7 @@ query no_two_hop() {
     return { $p.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "no_two_hop", &ParamMap::new())
+    let result = query_main(&db, queries, "no_two_hop", &ParamMap::new())
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
@@ -398,10 +393,10 @@ const CHAIN_DATA: &str = r#"{"type": "Person", "data": {"name": "A"}}
 {"edge": "Knows", "from": "C", "to": "D"}
 "#;
 
-async fn init_chain(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_chain(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, CHAIN_SCHEMA).await.unwrap();
-    load_jsonl(&db, CHAIN_DATA, LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, CHAIN_SCHEMA).await.unwrap());
+    db.load_jsonl(CHAIN_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     db
@@ -410,7 +405,7 @@ async fn init_chain(dir: &tempfile::TempDir) -> Omnigraph {
 #[tokio::test]
 async fn variable_hops_1_to_3() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_chain(&dir).await;
+    let db = init_chain(&dir).await;
 
     let queries = r#"
 query reachable($name: String) {
@@ -421,7 +416,7 @@ query reachable($name: String) {
     return { $f.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "reachable", &params(&[("$name", "A")]))
+    let result = query_main(&db, queries, "reachable", &params(&[("$name", "A")]))
         .await
         .unwrap();
 
@@ -440,7 +435,7 @@ query reachable($name: String) {
 #[tokio::test]
 async fn variable_hops_2_to_3() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_chain(&dir).await;
+    let db = init_chain(&dir).await;
 
     let queries = r#"
 query far_reachable($name: String) {
@@ -451,14 +446,9 @@ query far_reachable($name: String) {
     return { $f.name }
 }
 "#;
-    let result = query_main(
-        &mut db,
-        queries,
-        "far_reachable",
-        &params(&[("$name", "A")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&db, queries, "far_reachable", &params(&[("$name", "A")]))
+        .await
+        .unwrap();
 
     let batch = result.concat_batches().unwrap();
     let names = batch
@@ -475,7 +465,7 @@ query far_reachable($name: String) {
 #[tokio::test]
 async fn variable_hops_exact_2() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_chain(&dir).await;
+    let db = init_chain(&dir).await;
 
     let queries = r#"
 query exactly_2($name: String) {
@@ -486,7 +476,7 @@ query exactly_2($name: String) {
     return { $f.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "exactly_2", &params(&[("$name", "A")]))
+    let result = query_main(&db, queries, "exactly_2", &params(&[("$name", "A")]))
         .await
         .unwrap();
 
@@ -507,7 +497,7 @@ query exactly_2($name: String) {
 #[tokio::test]
 async fn ordering_ascending() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query by_age_asc() {
@@ -516,7 +506,7 @@ query by_age_asc() {
     order { $p.age asc }
 }
 "#;
-    let result = query_main(&mut db, queries, "by_age_asc", &ParamMap::new())
+    let result = query_main(&db, queries, "by_age_asc", &ParamMap::new())
         .await
         .unwrap();
 
@@ -549,17 +539,17 @@ query by_age_asc() {
 async fn traversal_no_edges_returns_empty() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
 
     // Load only nodes, no edges
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Person", "data": {"name": "Bob", "age": 25}}
 {"type": "Company", "data": {"name": "Acme"}}"#;
-    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
 
     // Traversal should return empty, not crash
     let result = query_main(
-        &mut db,
+        &db,
         TEST_QUERIES,
         "friends_of",
         &params(&[("$name", "Alice")]),
@@ -569,7 +559,7 @@ async fn traversal_no_edges_returns_empty() {
     assert_eq!(result.num_rows(), 0);
 
     // Anti-join: everyone is "unemployed" since no WorksAt edges exist
-    let result = query_main(&mut db, TEST_QUERIES, "unemployed", &ParamMap::new())
+    let result = query_main(&db, TEST_QUERIES, "unemployed", &ParamMap::new())
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
@@ -586,7 +576,7 @@ async fn traversal_no_edges_returns_empty() {
 #[tokio::test]
 async fn filter_less_than() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query young($age: I32) {
@@ -598,7 +588,7 @@ query young($age: I32) {
     order { $p.age asc }
 }
 "#;
-    let result = query_main(&mut db, queries, "young", &int_params(&[("$age", 28)]))
+    let result = query_main(&db, queries, "young", &int_params(&[("$age", 28)]))
         .await
         .unwrap();
 
@@ -616,7 +606,7 @@ query young($age: I32) {
 #[tokio::test]
 async fn filter_greater_equal() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query at_least_30() {
@@ -628,7 +618,7 @@ query at_least_30() {
     order { $p.age asc }
 }
 "#;
-    let result = query_main(&mut db, queries, "at_least_30", &ParamMap::new())
+    let result = query_main(&db, queries, "at_least_30", &ParamMap::new())
         .await
         .unwrap();
 
@@ -647,7 +637,7 @@ query at_least_30() {
 #[tokio::test]
 async fn filter_less_equal() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query at_most_28() {
@@ -659,7 +649,7 @@ query at_most_28() {
     order { $p.age asc }
 }
 "#;
-    let result = query_main(&mut db, queries, "at_most_28", &ParamMap::new())
+    let result = query_main(&db, queries, "at_most_28", &ParamMap::new())
         .await
         .unwrap();
 
@@ -678,7 +668,7 @@ query at_most_28() {
 #[tokio::test]
 async fn filter_not_equal() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query not_alice() {
@@ -690,7 +680,7 @@ query not_alice() {
     order { $p.name asc }
 }
 "#;
-    let result = query_main(&mut db, queries, "not_alice", &ParamMap::new())
+    let result = query_main(&db, queries, "not_alice", &ParamMap::new())
         .await
         .unwrap();
 
@@ -712,7 +702,7 @@ query not_alice() {
 #[tokio::test]
 async fn insert_missing_required_property_fails() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Insert Person with no name — name is @key, so this should fail
     let queries = r#"
@@ -720,13 +710,7 @@ query insert_no_name($age: I32) {
     insert Person { age: $age }
 }
 "#;
-    let result = mutate_main(
-        &mut db,
-        queries,
-        "insert_no_name",
-        &int_params(&[("$age", 25)]),
-    )
-    .await;
+    let result = mutate_main(&db, queries, "insert_no_name", &int_params(&[("$age", 25)])).await;
 
     assert!(result.is_err(), "insert without @key property should fail");
 }
@@ -739,7 +723,7 @@ query insert_no_name($age: I32) {
 #[tokio::test]
 async fn traversal_destination_binding_constrains_source() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Only Alice works at Acme. The binding on $c must constrain $p.
     let queries = r#"
@@ -752,7 +736,7 @@ query at_acme() {
     return { $p.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "at_acme", &ParamMap::new())
+    let result = query_main(&db, queries, "at_acme", &ParamMap::new())
         .await
         .unwrap();
 
@@ -772,7 +756,7 @@ query at_acme() {
 #[tokio::test]
 async fn traversal_multi_variable_projection_aligned() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query employee_companies() {
@@ -784,7 +768,7 @@ query employee_companies() {
     return { $p.name, $c.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "employee_companies", &ParamMap::new())
+    let result = query_main(&db, queries, "employee_companies", &ParamMap::new())
         .await
         .unwrap();
 
@@ -813,7 +797,7 @@ query employee_companies() {
 #[tokio::test]
 async fn multi_hop_projection_aligned() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Alice knows Bob, Bob knows Diana.
     // Alice→Bob→Diana is the only 2-hop path.
@@ -827,14 +811,9 @@ query fof_chain($name: String) {
     return { $p.name, $mid.name, $fof.name }
 }
 "#;
-    let result = query_main(
-        &mut db,
-        queries,
-        "fof_chain",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&db, queries, "fof_chain", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
@@ -862,7 +841,7 @@ query fof_chain($name: String) {
 #[tokio::test]
 async fn multi_hop_with_intermediate_binding_filters() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Alice knows Bob and Charlie.
     // Bob knows Diana. Charlie knows nobody.
@@ -879,7 +858,7 @@ query fof_via($name: String, $mid_name: String) {
 }
 "#;
     let result = query_main(
-        &mut db,
+        &db,
         queries,
         "fof_via",
         &params(&[("$name", "Alice"), ("$mid_name", "Bob")]),
@@ -902,7 +881,7 @@ query fof_via($name: String, $mid_name: String) {
 #[tokio::test]
 async fn traversal_destination_filter_with_multi_return() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query at_acme_named() {
@@ -914,7 +893,7 @@ query at_acme_named() {
     return { $p.name, $c.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "at_acme_named", &ParamMap::new())
+    let result = query_main(&db, queries, "at_acme_named", &ParamMap::new())
         .await
         .unwrap();
 
@@ -939,7 +918,7 @@ query at_acme_named() {
 #[tokio::test]
 async fn traversal_destination_filter_pushdown_with_param() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query at_company($company: String) {
@@ -952,7 +931,7 @@ query at_company($company: String) {
 }
 "#;
     let result = query_main(
-        &mut db,
+        &db,
         queries,
         "at_company",
         &params(&[("$company", "Globex")]),
@@ -981,7 +960,7 @@ query at_company($company: String) {
 #[tokio::test]
 async fn fan_out_two_destinations() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query fan_out($name: String) {
@@ -995,7 +974,7 @@ query fan_out($name: String) {
 "#;
     // Alice knows Bob and Charlie, works at Acme.
     // Each friend paired with her company → 2 rows.
-    let result = query_main(&mut db, queries, "fan_out", &params(&[("$name", "Alice")]))
+    let result = query_main(&db, queries, "fan_out", &params(&[("$name", "Alice")]))
         .await
         .unwrap();
 
@@ -1023,7 +1002,7 @@ query fan_out($name: String) {
 #[tokio::test]
 async fn traversal_destination_filter_no_match() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query at_phantom() {
@@ -1035,7 +1014,7 @@ query at_phantom() {
     return { $p.name }
 }
 "#;
-    let result = query_main(&mut db, queries, "at_phantom", &ParamMap::new())
+    let result = query_main(&db, queries, "at_phantom", &ParamMap::new())
         .await
         .unwrap();
 
@@ -1047,7 +1026,7 @@ query at_phantom() {
 #[tokio::test]
 async fn negation_with_inner_destination_binding() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let queries = r#"
 query not_at_acme_binding() {
@@ -1062,7 +1041,7 @@ query not_at_acme_binding() {
 }
 "#;
     // Alice→Acme. Everyone else should be returned.
-    let result = query_main(&mut db, queries, "not_at_acme_binding", &ParamMap::new())
+    let result = query_main(&db, queries, "not_at_acme_binding", &ParamMap::new())
         .await
         .unwrap();
 
@@ -1086,12 +1065,11 @@ query not_at_acme_binding() {
 #[tokio::test]
 async fn edge_binding_filters_and_projects_edge_properties() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Fixture Knows edges (Alice->Bob, Alice->Charlie, Bob->Diana) carry no
     // `since`; give Alice two dated friendships on either side of the cutoff.
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         concat!(
             r#"{"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": "2020-05-01"}}"#,
             "\n",
@@ -1148,7 +1126,7 @@ query no_future_friend() {
     // Filter on the edge property: only the 2024 friendship survives the
     // cutoff, proving real `since` values flow through the bound edge.
     let recent = query_main(
-        &mut db,
+        &db,
         queries,
         "recent_friends",
         &params(&[("$name", "Alice")]),
@@ -1162,7 +1140,7 @@ query no_future_friend() {
     // edges, each with its own `since`. Null edge properties flow (fixture
     // Bob + Charlie rows); they don't drop rows.
     let all = query_main(
-        &mut db,
+        &db,
         queries,
         "all_friend_edges",
         &params(&[("$name", "Alice")]),
@@ -1186,7 +1164,7 @@ query no_future_friend() {
     // Otherwise projecting the edge property fails at runtime instead of
     // returning a well-typed zero-row result.
     let empty_source = query_main(
-        &mut db,
+        &db,
         queries,
         "empty_source_edge_projection",
         &params(&[("$name", "Nobody")]),
@@ -1203,7 +1181,7 @@ query no_future_friend() {
     // A real source with no matching edge exercises the scanner-empty arm.
     // The edge filter must see a typed zero-length column, not a missing one.
     let no_outgoing = query_main(
-        &mut db,
+        &db,
         queries,
         "no_outgoing_edge_filter",
         &params(&[("$name", "Diana")]),
@@ -1216,7 +1194,7 @@ query no_future_friend() {
     // The same zero-match edge schema must survive inside the correlated
     // anti-join. Every person has no friendship dated in the future; sources
     // with no outgoing row exercise the empty bound-edge arm per outer row.
-    let no_future = query_main(&mut db, queries, "no_future_friend", &ParamMap::new())
+    let no_future = query_main(&db, queries, "no_future_friend", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(
@@ -1237,7 +1215,7 @@ query knows_counts($name: String) {
 }
 "#;
     let counts = query_main(
-        &mut db,
+        &db,
         agg_queries,
         "knows_counts",
         &params(&[("$name", "Alice")]),

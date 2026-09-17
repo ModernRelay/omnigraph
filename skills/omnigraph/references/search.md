@@ -171,10 +171,15 @@ An indexed `nearest` scan reads a bounded number of partitions per index delta
 (`OMNIGRAPH_ANN_NPROBES`, default 20; `0` removes the cap) and widens only to
 fill the limit, so a filled limit does not make the ANN ranking exact. A scoped
 `nearest` whose survivors are always fewer than `limit` pays an exact
-whole-type pass on every execution. `OMNIGRAPH_RRF_GATE_RATIO`,
-`OMNIGRAPH_RRF_GATE_MAX_IDS`, and `OMNIGRAPH_RRF_PLAN` tune and diagnose the
-prefilter that a selective traversal pushes into a `nearest` or `rrf` scan;
-leave them unset in normal operation.
+whole-type pass on every execution. `OMNIGRAPH_RRF_GATE_RATIO` and
+`OMNIGRAPH_RRF_GATE_MAX_IDS` tune the prefilter that a selective traversal
+pushes into a `nearest` or `rrf` scan; leave them unset in normal operation.
+
+`OMNIGRAPH_ANN_NPROBES` and `OMNIGRAPH_RRF_PLAN` are not free tunables. Each is
+the process default of a `process`-scope session setting (`ann_nprobes`,
+`rrf_plan`): the server reads it once at startup and the CLI once per run, a
+value outside the setting's row refuses that start instead of running a
+default, and `show all;` reports the setting with its value and source.
 
 ## Model / Config
 

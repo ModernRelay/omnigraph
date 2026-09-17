@@ -11,10 +11,17 @@ async fn synthetic_v6_fixture(root: &str) {
 }
 
 async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
-    let db =
-        Omnigraph::init_with_legacy_system_columns_for_tests(root, "node Person { name: String }")
+    let db = crate::Session::from_defaults(
+        std::sync::Arc::new(
+            Omnigraph::init_with_legacy_system_columns_for_tests(
+                root,
+                "node Person { name: String }",
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        ),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
     db.mutate(
         "main",
         "query seed($name: String) { insert Person { name: $name } }",

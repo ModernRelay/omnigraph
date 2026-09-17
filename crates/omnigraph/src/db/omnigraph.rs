@@ -3088,7 +3088,7 @@ impl Omnigraph {
     #[cfg(feature = "failpoints")]
     #[doc(hidden)]
     pub async fn failpoint_publish_table_head_without_index_rebuild_for_test(
-        &mut self,
+        &self,
         branch: &str,
         type_key: &str,
         table_branch: Option<&str>,
@@ -3119,7 +3119,7 @@ impl Omnigraph {
     /// given [`optimize::CleanupPolicyOptions`]. Destructive to version
     /// history. See [`optimize`] for details.
     pub async fn cleanup(
-        &mut self,
+        &self,
         options: optimize::CleanupPolicyOptions,
     ) -> Result<Vec<optimize::DatasetCleanupStats>> {
         optimize::cleanup_all_datasets(self, options).await
@@ -4955,10 +4955,12 @@ edge WorksAt: Person -> Company
         // no `__run__` branch behind, so schema apply proceeds.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap()),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
 
-        crate::loader::load_jsonl(
-            &db,
+        db.load_jsonl(
             r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
             crate::loader::LoadMode::Overwrite,
         )

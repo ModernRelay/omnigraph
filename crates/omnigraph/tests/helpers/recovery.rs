@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use lance::Dataset;
+use omnigraph::Session;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{DatasetEntry, GraphCommit, Omnigraph, ReadTarget};
 use omnigraph::error::{OmniError, Result};
+use omnigraph::settings::SessionSettings;
 use omnigraph_compiler::ir::ParamMap;
 use serde::Deserialize;
 
@@ -489,13 +492,16 @@ async fn assert_idempotent_reopen(graph_root: &Path, operation_id: &str) -> Resu
 }
 
 async fn run_follow_up_mutations(graph_root: &Path, tables: Vec<TableExpectation>) -> Result<()> {
-    let mut db: Option<Omnigraph> = None;
+    let mut db: Option<Session> = None;
     for table in tables {
         let Some(mutation) = table.follow_up_mutation else {
             continue;
         };
         if db.is_none() {
-            db = Some(Omnigraph::open(&graph_uri(graph_root)).await?);
+            db = Some(Session::from_defaults(
+                Arc::new(Omnigraph::open(&graph_uri(graph_root)).await?),
+                SessionSettings::default(),
+            ));
         }
         let db = db.as_mut().unwrap();
         db.mutate(

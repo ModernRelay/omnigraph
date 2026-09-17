@@ -34,16 +34,16 @@ mod helpers;
 use arrow_array::{Array, StringArray};
 use serial_test::serial;
 
+use omnigraph::Session;
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::{
     QueryIoProbes, RrfGateFallback, RrfGatePlan, RrfGateVerdict, with_query_io_probes,
-    with_rrf_plan, with_traversal_mode,
 };
 // The subset-drop red-control seam is compiled out of release binaries
 // (an answer-corrupting API must not ship); its test is cfg-gated the same.
 #[cfg(debug_assertions)]
 use omnigraph::instrumentation::with_rrf_gate_subset_drop;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::result::QueryResult;
 
@@ -261,10 +261,10 @@ query no_traversal($q1: String, $q2: String) {
 }
 "#;
 
-async fn init_gate_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_gate_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
-    load_jsonl(&db, &gate_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, GATE_SCHEMA).await.unwrap());
+    db.load_jsonl(&gate_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -289,18 +289,16 @@ fn fused_slugs(result: &QueryResult) -> Vec<String> {
 /// cannot distinguish a gate that picks prefilter from one whose id push
 /// actually reaches the scan).
 async fn run_forced(
-    db: &mut Omnigraph,
+    db: &Session,
     plan: &'static str,
     query_name: &str,
     params: &ParamMap,
 ) -> (Vec<String>, Vec<RrfGateVerdict>, u64) {
     let probes = QueryIoProbes::default();
-    let result = with_query_io_probes(
-        probes.clone(),
-        with_rrf_plan(plan, async {
-            query_main(db, GATE_QUERIES, query_name, params).await
-        }),
-    )
+    let forced = with_setting(db, "rrf_plan", plan);
+    let result = with_query_io_probes(probes.clone(), async {
+        query_main(&forced, GATE_QUERIES, query_name, params).await
+    })
     .await
     .unwrap();
     let verdicts = probes.rrf_gate_verdicts.lock().unwrap().clone();
@@ -315,7 +313,7 @@ async fn run_forced(
 /// are row order — with float scores never compared). Red control (a): the
 /// probe must show the two runs took DIFFERENT plans; a same-plan pair fails
 /// here, never passes vacuously.
-async fn assert_plans_equivalent(db: &mut Omnigraph, query_name: &str, params: &ParamMap) {
+async fn assert_plans_equivalent(db: &Session, query_name: &str, params: &ParamMap) {
     let (prefilter_slugs, prefilter_verdicts, prefilter_scan_rows) =
         run_forced(db, "force_prefilter", query_name, params).await;
     let (postfilter_slugs, postfilter_verdicts, _) =
@@ -375,7 +373,7 @@ async fn assert_plans_equivalent(db: &mut Omnigraph, query_name: &str, params: &
 #[serial]
 async fn oracle_admission_sweep_prefilter_equals_postfilter() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_gate_db(&dir).await;
+    let db = init_gate_db(&dir).await;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
     for query_name in [
@@ -392,11 +390,11 @@ async fn oracle_admission_sweep_prefilter_equals_postfilter() {
         "direction_in",
         "several_expands",
     ] {
-        assert_plans_equivalent(&mut db, query_name, &text_params).await;
+        assert_plans_equivalent(&db, query_name, &text_params).await;
     }
 
     let hybrid_params = vector_and_string_params("$v", &[0.0, 0.0, 0.0, 0.0], "$q", "needle");
-    assert_plans_equivalent(&mut db, "bm25_secondary_position", &hybrid_params).await;
+    assert_plans_equivalent(&db, "bm25_secondary_position", &hybrid_params).await;
 }
 
 /// Stats-sensitive corpus for `stats_sensitive_corpus_plans_agree`: s-00..s-03
@@ -443,10 +441,10 @@ fn stats_seed_data() -> String {
     rows.join("\n")
 }
 
-async fn init_stats_db(dir: &tempfile::TempDir) -> Omnigraph {
+async fn init_stats_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
-    load_jsonl(&db, &stats_seed_data(), LoadMode::Overwrite)
+    let db = session(Omnigraph::init(uri, GATE_SCHEMA).await.unwrap());
+    db.load_jsonl(&stats_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
@@ -473,9 +471,9 @@ async fn init_stats_db(dir: &tempfile::TempDir) -> Omnigraph {
 #[serial]
 async fn stats_sensitive_corpus_plans_agree() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_stats_db(&dir).await;
+    let db = init_stats_db(&dir).await;
     let stats_params = params(&[("$q1", "alpha beta"), ("$q2", "gamma delta")]);
-    assert_plans_equivalent(&mut db, "single_hop_both_bm25", &stats_params).await;
+    assert_plans_equivalent(&db, "single_hop_both_bm25", &stats_params).await;
 }
 
 /// Red control (b), the superset fence's consumer-side observable: dropping
@@ -487,11 +485,11 @@ async fn stats_sensitive_corpus_plans_agree() {
 #[serial]
 async fn subset_injection_turns_the_oracle_red() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_gate_db(&dir).await;
+    let db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
 
     let (postfilter_slugs, _, _) = run_forced(
-        &mut db,
+        &db,
         "force_postfilter",
         "single_hop_both_bm25",
         &text_params,
@@ -503,14 +501,18 @@ async fn subset_injection_turns_the_oracle_red() {
         .clone();
 
     let probes = QueryIoProbes::default();
+    let prefilter_db = with_setting(&db, "rrf_plan", "force_prefilter");
     let corrupted = with_query_io_probes(
         probes.clone(),
-        with_rrf_gate_subset_drop(
-            survivor.clone(),
-            with_rrf_plan("force_prefilter", async {
-                query_main(&mut db, GATE_QUERIES, "single_hop_both_bm25", &text_params).await
-            }),
-        ),
+        with_rrf_gate_subset_drop(survivor.clone(), async {
+            query_main(
+                &prefilter_db,
+                GATE_QUERIES,
+                "single_hop_both_bm25",
+                &text_params,
+            )
+            .await
+        }),
     )
     .await
     .unwrap();
@@ -537,11 +539,11 @@ async fn subset_injection_turns_the_oracle_red() {
 #[serial]
 async fn antijoin_only_shape_falls_back() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_gate_db(&dir).await;
+    let db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
 
     let (slugs, verdicts, _) =
-        run_forced(&mut db, "force_prefilter", "antijoin_only", &text_params).await;
+        run_forced(&db, "force_prefilter", "antijoin_only", &text_params).await;
     assert_eq!(verdicts.len(), 1);
     assert_eq!(verdicts[0].plan, RrfGatePlan::Postfilter);
     assert_eq!(
@@ -566,7 +568,7 @@ async fn antijoin_only_shape_falls_back() {
 #[serial]
 async fn shape_fence_covers_all_fallback_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_gate_db(&dir).await;
+    let db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
 
     for query_name in [
@@ -574,8 +576,7 @@ async fn shape_fence_covers_all_fallback_rows() {
         "ranked_var_is_expand_dst",
         "no_traversal",
     ] {
-        let (_, verdicts, _) =
-            run_forced(&mut db, "force_prefilter", query_name, &text_params).await;
+        let (_, verdicts, _) = run_forced(&db, "force_prefilter", query_name, &text_params).await;
         assert_eq!(verdicts.len(), 1, "{query_name}: one verdict per rrf run");
         assert_eq!(
             verdicts[0].plan,
@@ -599,7 +600,7 @@ async fn shape_fence_covers_all_fallback_rows() {
 async fn natural_gate_prefilters_at_ratio_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
+    let db = session(Omnigraph::init(uri, GATE_SCHEMA).await.unwrap());
     let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
     rows.extend(gate_chunk_rows());
     for chunk in 4..=5 {
@@ -607,16 +608,16 @@ async fn natural_gate_prefilters_at_ratio_boundary() {
             r#"{{"edge":"ChunkOfArtifact","id":"eoa-{chunk:02}","from":"chunk-{chunk:02}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
-    load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
+    db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
+    let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
     let probes = QueryIoProbes::default();
     let _ = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, GATE_QUERIES, "single_hop_both_bm25", &text_params).await
+        query_main(&db, GATE_QUERIES, "single_hop_both_bm25", &text_params).await
     })
     .await
     .unwrap();
@@ -646,22 +647,18 @@ async fn natural_gate_prefilters_at_ratio_boundary() {
 #[serial]
 async fn oracle_holds_across_expand_routes() {
     async fn run_forced_with_route(
-        db: &mut Omnigraph,
+        db: &Session,
         plan: &'static str,
         route: &'static str,
         query_name: &str,
         params: &ParamMap,
     ) -> (Vec<String>, Vec<RrfGateVerdict>) {
         let probes = QueryIoProbes::default();
-        let result = with_query_io_probes(
-            probes.clone(),
-            with_traversal_mode(
-                route,
-                with_rrf_plan(plan, async {
-                    query_main(db, GATE_QUERIES, query_name, params).await
-                }),
-            ),
-        )
+        let routed = with_traversal(db, Traversal::from_spelling(route).unwrap());
+        let forced = with_setting(&routed, "rrf_plan", plan);
+        let result = with_query_io_probes(probes.clone(), async {
+            query_main(&forced, GATE_QUERIES, query_name, params).await
+        })
         .await
         .unwrap();
         let verdicts = probes.rrf_gate_verdicts.lock().unwrap().clone();
@@ -669,21 +666,15 @@ async fn oracle_holds_across_expand_routes() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_gate_db(&dir).await;
+    let db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
 
     for query_name in ["single_hop_both_bm25", "multi_hop"] {
-        let (pre_indexed, pre_verdicts) = run_forced_with_route(
-            &mut db,
-            "force_prefilter",
-            "indexed",
-            query_name,
-            &text_params,
-        )
-        .await;
-        let (post_csr, post_verdicts) =
-            run_forced_with_route(&mut db, "force_postfilter", "csr", query_name, &text_params)
+        let (pre_indexed, pre_verdicts) =
+            run_forced_with_route(&db, "force_prefilter", "indexed", query_name, &text_params)
                 .await;
+        let (post_csr, post_verdicts) =
+            run_forced_with_route(&db, "force_postfilter", "csr", query_name, &text_params).await;
         assert_eq!(pre_verdicts[0].plan, RrfGatePlan::Prefilter, "{query_name}");
         assert_eq!(
             post_verdicts[0].plan,
@@ -696,16 +687,10 @@ async fn oracle_holds_across_expand_routes() {
         );
 
         let (pre_csr, _) =
-            run_forced_with_route(&mut db, "force_prefilter", "csr", query_name, &text_params)
+            run_forced_with_route(&db, "force_prefilter", "csr", query_name, &text_params).await;
+        let (post_indexed, _) =
+            run_forced_with_route(&db, "force_postfilter", "indexed", query_name, &text_params)
                 .await;
-        let (post_indexed, _) = run_forced_with_route(
-            &mut db,
-            "force_postfilter",
-            "indexed",
-            query_name,
-            &text_params,
-        )
-        .await;
         assert_eq!(
             pre_csr, post_indexed,
             "{query_name}: prefilter+csr vs postfilter+indexed disagreed"
@@ -725,7 +710,7 @@ async fn oracle_holds_across_expand_routes() {
 #[serial]
 async fn partial_fts_coverage_falls_back() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_gate_db(&dir).await;
+    let db = init_gate_db(&dir).await;
     // Append one more matching, linked chunk AFTER ensure_indices: its
     // fragment is not in the FTS index's fragment bitmap.
     let appended = [
@@ -733,16 +718,11 @@ async fn partial_fts_coverage_falls_back() {
         r#"{"edge":"ChunkOfArtifact","id":"eoa-99","from":"chunk-99","to":"art-0","data":{"label":"of"}}"#,
     ]
     .join("\n");
-    load_jsonl(&db, &appended, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&appended, LoadMode::Append).await.unwrap();
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
-    let (prefilter_slugs, verdicts, _) = run_forced(
-        &mut db,
-        "force_prefilter",
-        "single_hop_both_bm25",
-        &text_params,
-    )
-    .await;
+    let (prefilter_slugs, verdicts, _) =
+        run_forced(&db, "force_prefilter", "single_hop_both_bm25", &text_params).await;
     assert_eq!(verdicts.len(), 1);
     assert_eq!(verdicts[0].plan, RrfGatePlan::Postfilter);
     assert_eq!(
@@ -756,7 +736,7 @@ async fn partial_fts_coverage_falls_back() {
 
     // Both runs postfilter, so results still agree.
     let (postfilter_slugs, _, _) = run_forced(
-        &mut db,
+        &db,
         "force_postfilter",
         "single_hop_both_bm25",
         &text_params,
@@ -772,10 +752,9 @@ async fn partial_fts_coverage_falls_back() {
 async fn empty_eligible_set_falls_back() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
+    let db = session(Omnigraph::init(uri, GATE_SCHEMA).await.unwrap());
     // Nodes only — no edge rows anywhere, so no Chunk is eligible.
-    load_jsonl(
-        &db,
+    db.load_jsonl(
         &[
             r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string(),
             gate_chunk_rows().join("\n"),
@@ -786,16 +765,11 @@ async fn empty_eligible_set_falls_back() {
     .await
     .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
+    let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
-    let (slugs, verdicts, _) = run_forced(
-        &mut db,
-        "force_prefilter",
-        "single_hop_both_bm25",
-        &text_params,
-    )
-    .await;
+    let (slugs, verdicts, _) =
+        run_forced(&db, "force_prefilter", "single_hop_both_bm25", &text_params).await;
     assert_eq!(verdicts.len(), 1);
     assert_eq!(verdicts[0].plan, RrfGatePlan::Postfilter);
     assert_eq!(
@@ -820,23 +794,23 @@ async fn empty_eligible_set_falls_back() {
 async fn natural_gate_prefilters_selective_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
+    let db = session(Omnigraph::init(uri, GATE_SCHEMA).await.unwrap());
     let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
     rows.extend(gate_chunk_rows());
     rows.push(
         r#"{"edge":"ChunkOfArtifact","id":"eoa-04","from":"chunk-04","to":"art-0","data":{"label":"of"}}"#
             .to_string(),
     );
-    load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
+    db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
+    let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
     let probes = QueryIoProbes::default();
     let natural = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, GATE_QUERIES, "single_hop_both_bm25", &text_params).await
+        query_main(&db, GATE_QUERIES, "single_hop_both_bm25", &text_params).await
     })
     .await
     .unwrap();
@@ -855,7 +829,7 @@ async fn natural_gate_prefilters_selective_fixture() {
     );
 
     let (postfilter_slugs, _, _) = run_forced(
-        &mut db,
+        &db,
         "force_postfilter",
         "single_hop_both_bm25",
         &text_params,
@@ -875,7 +849,7 @@ async fn natural_gate_prefilters_selective_fixture() {
 async fn decoy_flood_winner_holds_under_both_plans() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
+    let db = session(Omnigraph::init(uri, GATE_SCHEMA).await.unwrap());
     let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
     let chunks: [(&str, usize, usize); 7] = [
         ("decoy-1", 7, 1),
@@ -900,22 +874,17 @@ async fn decoy_flood_winner_holds_under_both_plans() {
             r#"{{"edge":"ChunkOfArtifact","id":"e-{slug}","from":"{slug}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
-    load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
+    db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
+    let db = db;
 
     let text_params = params(&[("$q1", "alpha"), ("$q2", "beta")]);
-    let (prefilter_slugs, prefilter_verdicts, _) = run_forced(
-        &mut db,
-        "force_prefilter",
-        "single_hop_both_bm25",
-        &text_params,
-    )
-    .await;
+    let (prefilter_slugs, prefilter_verdicts, _) =
+        run_forced(&db, "force_prefilter", "single_hop_both_bm25", &text_params).await;
     let (postfilter_slugs, postfilter_verdicts, _) = run_forced(
-        &mut db,
+        &db,
         "force_postfilter",
         "single_hop_both_bm25",
         &text_params,
@@ -943,7 +912,7 @@ async fn decoy_flood_winner_holds_under_both_plans() {
 async fn natural_gate_falls_back_on_broad_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, GATE_SCHEMA).await.unwrap();
+    let db = session(Omnigraph::init(uri, GATE_SCHEMA).await.unwrap());
     let mut rows = vec![r#"{"type":"Artifact","data":{"slug":"art-0"}}"#.to_string()];
     rows.extend(gate_chunk_rows());
     for chunk in 4..12 {
@@ -951,16 +920,16 @@ async fn natural_gate_falls_back_on_broad_fixture() {
             r#"{{"edge":"ChunkOfArtifact","id":"eoa-{chunk:02}","from":"chunk-{chunk:02}","to":"art-0","data":{{"label":"of"}}}}"#
         ));
     }
-    load_jsonl(&db, &rows.join("\n"), LoadMode::Overwrite)
+    db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
-    let mut db = db;
+    let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
     let probes = QueryIoProbes::default();
     let _ = with_query_io_probes(probes.clone(), async {
-        query_main(&mut db, GATE_QUERIES, "single_hop_both_bm25", &text_params).await
+        query_main(&db, GATE_QUERIES, "single_hop_both_bm25", &text_params).await
     })
     .await
     .unwrap();

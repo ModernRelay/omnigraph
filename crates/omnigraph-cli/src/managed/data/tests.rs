@@ -351,13 +351,21 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
             "query q() { return { 42 as value } }",
             Some("q"),
             None,
+            &[],
         )
         .await
         .unwrap();
     assert_eq!(result.row_count, 1);
     assert_eq!(result.rows.get(), "[{\"value\":42}]");
     let changed = client
-        .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"))
+        .mutate(
+            "main",
+            "mutation m() {}",
+            Some("m"),
+            None,
+            Some("head-a"),
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(changed.actor_id.as_deref(), Some("principal:alice"));
@@ -505,6 +513,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
                         Some("main"),
                         batch.to_str().unwrap(),
                         crate::cli::CliLoadMode::Append,
+                        &[],
                     )
                     .await
                     .unwrap_err();
@@ -1145,6 +1154,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                         None,
                         batch.path().to_str().unwrap(),
                         crate::cli::CliLoadMode::Append,
+                        &[],
                     )
                     .await
                     .unwrap_err(),
@@ -1156,6 +1166,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                         "query q() {}",
                         Some("q"),
                         None,
+                        &[],
                     )
                     .await
                     .unwrap_err(),
@@ -1187,11 +1198,11 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
         let server = IntentApiFixture::new(vec![IntentReply { status, headers: vec![], body: body.as_bytes().to_vec() }]);
         let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
         let error = match operation {
-            "load" => client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append).await.unwrap_err(),
+            "load" => client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append, &[]).await.unwrap_err(),
             "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
             "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
             _ => client
-            .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"))
+            .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"), &[])
             .await
             .unwrap_err(), };
         let rendered = if status == 412 {
@@ -1259,6 +1270,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
             Some("main"),
             batch.to_str().unwrap(),
             crate::cli::CliLoadMode::Append,
+            &[],
         )
         .await
         .unwrap();
@@ -1299,7 +1311,8 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                 "review",
                 Some("main"),
                 file.path().to_str().unwrap(),
-                crate::cli::CliLoadMode::Append
+                crate::cli::CliLoadMode::Append,
+                &[],
             )
             .await
             .unwrap_err()
@@ -1313,7 +1326,8 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                 "review",
                 Some("main"),
                 file.path().to_str().unwrap(),
-                crate::cli::CliLoadMode::Append
+                crate::cli::CliLoadMode::Append,
+                &[],
             )
             .await
             .unwrap_err()
@@ -1341,7 +1355,8 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                     "review",
                     Some("main"),
                     file.path().to_str().unwrap(),
-                    crate::cli::CliLoadMode::Append
+                    crate::cli::CliLoadMode::Append,
+                    &[],
                 )
                 .await
                 .is_err()
