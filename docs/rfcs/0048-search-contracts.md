@@ -1424,12 +1424,12 @@ engine's meaning-preserving rewrites and the caller's meaning-changing ones
 distinguishable.
 
 One measurement outranks the catalogue. For the agent workload of many
-small calls, the fixed per-request cost of reloading version-pinned control
-state (on a fragmented graph, measured in hundreds of object-store reads
-per request for the manifest alone) dwarfs any plan choice. Session-scoped
-caching of immutable version-pinned state and multi-statement requests at
-one snapshot are worth more than every rewrite above, and both are
-invariant-12-clean because the cached state is immutable.
+small calls, the fixed per-request floor dwarfs any plan choice: a trivial
+served read measures about 0.35 s on the 0.11.0 personal graph with a
+0.10–0.15 s round trip, and the engine's warm-read contract already
+excludes manifest reloads, so the rest is unattributed server-side work
+(#752). Attributing and cutting that floor, and multi-statement requests at
+one snapshot, are worth more than every rewrite above.
 
 ## Invariants
 
@@ -1834,7 +1834,7 @@ mechanism, not weakening the promised result.
 
 | Phase | Ships | Risk and reversibility | Owner | Gate |
 |---|---|---|---|---|
-| A — Truth first | Refusals (`T26`, `T27`, `FullTextIndexRequired`); retrieval as typed IR; projectable metrics; deterministic ties; `warnings`/`metrics`/`retrievals`/usage descriptors; the diagnostics contract; `explain` v0 (logical plan); coarse budgets through the existing `ResourceLimitExceeded` owner; session-scoped caching of version-pinned state | Low: no syntax or format change; refusals and additive fields | RFC 0047 | Characterization goldens; the traversal-target and unindexed regression cases green; per-request overhead measured |
+| A — Truth first | Refusals (`T26`, `T27`, `FullTextIndexRequired`); retrieval as typed IR; projectable metrics; deterministic ties; `warnings`/`metrics`/`retrievals`/usage descriptors; the diagnostics contract; `explain` v0 (logical plan); coarse budgets through the existing `ResourceLimitExceeded` owner; attribution of the served read floor through the usage descriptor | Low: no syntax or format change; refusals and additive fields | RFC 0047 | Characterization goldens; the traversal-target and unindexed regression cases green; the served read floor attributed (#752) |
 | B — The agent door | Stored queries as typed tools; `@description` on `.pg` declarations and in `schema show`; the one-page card; the in-context competence instrument with graph-computed ground truth; baseline measurements on today's language | None: the PG annotation is metadata | This RFC (agent-facing surface); composition RFC (instrument) | Instrument runs end to end; baseline recorded |
 | C — Representations, opt-in per field | `@analyzed` and analyzer profiles as an additive SchemaIR feature (unchanged graphs need no rebuild); resolved embedding recipes and defaults; `terms`/`match_terms` as a predicate; the exact scan baseline across index states; `bm25_v1` against the Decimal oracle; zero-edit membership through the existing FTS index, fuzzy through a budgeted scan | Medium: the format commitment is opt-in | Lexical RFC; this RFC (representation identity) | Membership laws across absent/partial/full/rebuilt indexes; oracle parity; the fuzzy and index-state regression cases green |
 | D — Kernel stages, additive, behind a setting | `filter`, `let`, `rank` (`lexical`, `knn`, `ann`, `rrf`, `ties:`), `group`, `order`/`limit` at any position with `of`/`per`, pure `return` with the aggregate sugar, `metric()`; typed stage IR with metric origin and fingerprints; coherent follow-up reads; exact physical paths only; the old grammar still parses and a session setting selects the kernel | Medium: additive syntax, no format; reversible | This RFC | Instrument A/B (first-try validity, turns) kernel versus current grammar; C2's terminal subset; barrier cost measured |
@@ -1846,9 +1846,14 @@ mechanism, not weakening the promised result.
 
 RFC 0047 is this phase and its ordered stages are the internal order. It
 ships first and alone because every item is a refusal of a wrong answer or
-an additive field. The session-scoped caching of immutable version-pinned
-state rides with it because the fixed per-request overhead, not plan choice,
-bounds the agent workload, and the cached state is invariant-12-clean.
+an additive field. The served read floor rides with it: the engine's
+warm-read contract (`warm_read_cost.rs`, since v0.7.1) already makes a warm
+same-branch read zero manifest reads and one version probe, and a trivial
+served read on the 0.11.0 personal graph measures about 0.35 s end to end
+with a 0.10–0.15 s round trip, so about 0.2 s of server-side work is
+unattributed. Phase A attributes it through the usage descriptor (#752) and
+cuts what the attribution shows; caching of immutable version-pinned state
+is invariant-12-clean if that is where the time is.
 
 **Exit:** characterization goldens before and after the retrieval-IR
 refactor; every ranked result totally ordered; descriptors in every
@@ -2010,7 +2015,7 @@ budgets as settings); cross-type search, `sub()` reductions and every
 | An in-context agent uses the kernel at least as well as today's grammar | B and D, before any removal | Keep the old grammar as the surface and revisit spellings with the instrument; nothing shipped is lost |
 | Exact-scan fuzzy matching is fast enough on real graphs (tables of 200k rows exist) | C | Zero-edit stays index-served; fuzzy stays budgeted and refuses loudly; acceleration moves earlier in F |
 | `@analyzed` can be an opt-in SchemaIR feature with no stamp bump for non-adopters | C's feature design | A versioned feature flag with the same no-rebuild property for non-adopters |
-| Session-scoped caching removes the fixed per-request overhead | A | Multi-statement requests carry the load; planner work in F is not the answer either way |
+| The served read floor (about 0.2 s server-side on a trivial read) is attributable and reducible | A (#752) | Multi-statement requests carry the load; planner work in F is not the answer either way |
 | Stage barriers cost little | D | Widen the rewrite catalogue with proven equivalences before E |
 
 ### Extensions after the initial release
@@ -2063,6 +2068,9 @@ still require prototypes; full production qualification belongs to its phase.
 
 ## Decision log
 
+- 2026-09-18 — corrected Phase A's performance item after measuring the
+  0.11.0 personal server: manifest reloads are already excluded by the
+  warm-read contract; the ~0.2 s server-side floor is attributed first (#752).
 - 2026-09-18 — adopted the kernel: this RFC's examples and the per-group
   selection section now use `limit … of … per`, `let`, `filter` and `sub(…)`;
   no semantic decision changed.
