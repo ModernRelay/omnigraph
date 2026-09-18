@@ -1111,7 +1111,12 @@ Commits per second per branch on RustFS with a compact and with a
 fragmented manifest, before and after each step, with the whole-run tracker
 rather than the per-operation harness that cannot see held handles. The
 prototype carries the instruments; the figures above are a cost model, not
-a benchmark.
+a benchmark. The `concurrent-writes` scenario in the engine's benchmark
+harness is that instrument
+([concurrent-writes throughput diagnostics](../../benchmarks/README.md#concurrent-writes-throughput-diagnostics)):
+a closed-loop, self-labeled diagnostic whose numbers are decision evidence
+for this path, not claims (RFC 0039 Rule 1 requires open-loop driving for
+claims).
 
 ## Unresolved questions
 

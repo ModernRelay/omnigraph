@@ -52,13 +52,16 @@ fn measured_settings() -> SessionSettings {
     }
 }
 
-/// Age is setup work for these two existing fixture families only.
+/// Age is setup work for these fixture families only.
 pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
     let supported = super::branch_control::is_scenario(&args.scenario)
-        || args.scenario == "general-merge-updates";
+        || args.scenario == "general-merge-updates"
+        || super::concurrent_writes::is_scenario(&args.scenario);
     if args.age_options_supplied && !supported {
         return Err(
-            "age/cache/layout controls require branch controls or general-merge-updates".into(),
+            "age/cache/layout controls require branch controls, general-merge-updates or \
+             concurrent-writes"
+                .into(),
         );
     }
     if args.history_commits > 256 || !args.history_commits.is_multiple_of(2) {
