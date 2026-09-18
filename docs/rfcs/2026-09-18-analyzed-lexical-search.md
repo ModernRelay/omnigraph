@@ -25,7 +25,7 @@ A String property becomes searchable by declaring `@analyzed`, which binds
 an immutable analyzer profile and a default scoring policy into the accepted
 schema. One typed lexical description, `terms(text, mode, max_edits)`, is
 consumed by two operators: `match_terms(field, terms(...))`, a Boolean
-predicate in `match`, and the `lexical` ranking source that
+predicate in `filter`, and the `lexical` ranking source that
 [RFC 0048](0048-search-contracts.md#lexical-sources) places inside a `rank` stage. Both apply the
 field's analyzer to document and query text at every edit budget, so the
 same query has one matched set whether the field is indexed, partially
@@ -203,16 +203,16 @@ Adding an analyzed query term cannot widen `mode: all`. Appending unrelated
 documents cannot remove existing predicate matches. A resource failure is a
 typed query failure, not an empty or truncated successful matched set.
 
-### Analyzed filtering in `match`
+### Analyzed filtering with `filter`
 
-Analyzed filtering alone remains an ordinary match predicate:
+Analyzed filtering alone is an ordinary predicate in a `filter` stage; it
+never sits inside the pattern block (the composition RFC's
+[pattern/predicate rule](2026-09-18-gq-composition-and-language-evolution.md#kernel-one-stage-per-job)):
 
 ```gq
 query organization_names($q: String) {
-  match {
-    $o: Organization
-    match_terms($o.name, terms($q, mode: all, max_edits: 1))
-  }
+  match { $o: Organization }
+  filter { match_terms($o.name, terms($q, mode: all, max_edits: 1)) }
   return { $o.slug, $o.name }
   order { $o.slug asc }
 }
@@ -238,7 +238,8 @@ rewrites stay there.
 The deprecation mapping is fixed here: `search(f, q)` and `match_text(f, q)`
 become `match_terms(f, terms(q))` (all terms, zero edits) and
 `fuzzy(f, q, n)` becomes `match_terms(f, terms(q, mode: all, max_edits: n))`
-with `n` clamped to the admitted range or refused. The mapping changes
+with `n` clamped to the admitted range or refused; the predicate moves from
+the `match` block to a `filter` stage after it. The mapping changes
 membership where today's answer depended on index state; the diagnostic says
 so. The legacy spellings never gain new semantics during the window.
 
@@ -280,7 +281,7 @@ or fuzzy scorer selector. Query-term repetition and order carry no extra
 weight; intentional source weighting belongs to explicit fusion or a separately
 specified future scoring operator.
 
-The deferred membership-preserving `score` operator uses this same kernel
+The deferred membership-preserving scoring feature in `let` uses this same kernel
 over its incoming targets, including targets that fail `Terms` membership:
 
 | Field/query outcome | Retrieval membership before its cut | Lexical feature |
@@ -690,10 +691,10 @@ later `main` revision.
 
 | Existing GQT owner | First observed failure | Required implementation and migration proof |
 |---|---|---|
-| [`fuzzy_query_bypasses_index_analyzer`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/fuzzy_query_bypasses_index_analyzer.gqt) | Step 2: capitalized `Introductio` returns no rows; `intro` is expected. | Phase 2 must apply the accepted field analyzer at every edit budget. Retain the lowercase and zero-edit controls and reach the later assertions. |
-| [`index_state_changes_text_matches`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/index_state_changes_text_matches.gqt) | Step 5, including the two mutation steps: `running` finds only the appended row and loses the indexed row. | Phase 2 must use one matching definition for indexed and uncovered rows. Complete the later `beto` assertion as well; passing the first repaired step is insufficient. |
-| [`search_on_traversal_target_is_dropped`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/search_on_traversal_target_is_dropped.gqt) | Step 2: traversal returns B, C and D where only B and D match. | Phase 3 must retain the target predicate and rank the traversal target. The later ranking assertion must return D, rather than fail for a missing score column. |
-| [`unindexed_search_is_case_sensitive`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/unindexed_search_is_case_sensitive.gqt) | Step 3: unindexed `deep` finds only the lowercase row; both rows are expected. | Phase 2 must preserve matching with and without an index. Migrate both field declarations to the intended accepted analyzer, and run both query-case controls. |
+| [`fuzzy_query_bypasses_index_analyzer`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/fuzzy_query_bypasses_index_analyzer.gqt) | Step 2: capitalized `Introductio` returns no rows; `intro` is expected. | Phase C must apply the accepted field analyzer at every edit budget. Retain the lowercase and zero-edit controls and reach the later assertions. |
+| [`index_state_changes_text_matches`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/index_state_changes_text_matches.gqt) | Step 5, including the two mutation steps: `running` finds only the appended row and loses the indexed row. | Phase C must use one matching definition for indexed and uncovered rows. Complete the later `beto` assertion as well; passing the first repaired step is insufficient. |
+| [`search_on_traversal_target_is_dropped`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/search_on_traversal_target_is_dropped.gqt) | Step 2: traversal returns B, C and D where only B and D match. | Phase D must retain the target predicate and rank the traversal target. The later ranking assertion must return D, rather than fail for a missing score column. |
+| [`unindexed_search_is_case_sensitive`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/unindexed_search_is_case_sensitive.gqt) | Step 3: unindexed `deep` finds only the lowercase row; both rows are expected. | Phase C must preserve matching with and without an index. Migrate both field declarations to the intended accepted analyzer, and run both query-case controls. |
 
 These cases were added in `b1df2041` and remain active regressions. During the
 coordinated query migration, rewrite their legacy `search`, `fuzzy` and `bm25`
@@ -816,6 +817,8 @@ relevance quality; Phase F chooses measured defaults.
 
 ## Decision log
 
+- 2026-09-18 — `match_terms` moved from the `match` block to a `filter`
+  stage under the adopted kernel.
 - 2026-09-18 — became Phase C of RFC 0048's rollout: `@analyzed` opt-in per
   field with no rebuild for non-adopters, zero-edit membership through the
   existing index, fuzzy through a budgeted scan.

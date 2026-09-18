@@ -177,7 +177,7 @@ queries to adopt ranking. Existing search queries still need the rewrites above.
   score or distance available for projection. Missing arm membership remains
   distinguishable from a computed score.
 - Ranking within a graph-defined population, further traversal of selected
-  targets, and `take` selection with per-group quotas. Local and final ordering
+  targets, and `limit … of … per` selection with per-group quotas. Local and final ordering
   can explicitly place missing values with `nulls first` or `nulls last`;
   omitting the modifier retains current ascending/descending defaults.
 - Inspectable query definitions and plans, retrieval/coverage metadata, and
@@ -299,21 +299,21 @@ cut is the shared `Terms` relation; ranking uses the field's resolved scoring
 policy (`bm25_v1` by default) with the
 [field-corpus statistics](2026-09-18-analyzed-lexical-search.md#lexical-scoring-and-shared-matching-semantics)
 that RFC owns. A source cannot change analysis, edit budget or statistics
-scope; those are field and query facts. `match_terms` in `match` is the same
+scope; those are field and query facts. `match_terms` in `filter` is the same
 description used as a Boolean predicate and introduces no rank or window.
 
 ### Clause composition and named stages
 
-**Kernel alignment (proposed 2026-09-18).** The
+**Kernel (adopted 2026-09-18).** This RFC's syntax is the
 [kernel](2026-09-18-gq-composition-and-language-evolution.md#kernel-one-stage-per-job)
-in the composition RFC keeps this section's `rank` block, `yield`, named
-arms and `metric()` unchanged and collapses the rest of this RFC's sketch:
-`select` becomes `order` + `limit`, `take` becomes `limit n of $x per { … }`,
-`score` becomes `let`, `collect`/`optional` blocks become `sub(…)`
-expressions under a reduction, scalar predicates leave `match` for
-`filter`, and stage tie keys are a `ties:` option on a source. The
-semantics below are unchanged by that proposal; the spellings in the
-examples are not yet rewritten to it.
+the composition RFC defines: `match` (patterns only), `filter`, `let`,
+`rank`, `group`, `order`, `limit n [of $x] [per { … }]`, `return`. The
+`rank` block, `yield`, named arms and `metric()` below are kernel forms;
+the earlier sketch's `select`, `take`, `score`, `collect` and `optional`
+spellings are replaced by `order` + `limit`, `limit … of … per`, `let`,
+and `sub(…)` under a reduction, scalar predicates live in `filter`, and
+stage tie keys are a `ties:` option on a source. The semantics of every
+section below are unchanged by the adoption; only spellings moved.
 
 The current grammar has one `match`, followed by `return`, optional `order`,
 and optional `limit`. The proposed extension admits explicit rank boundaries
@@ -414,7 +414,7 @@ as a batch of per-row queries. Correlated per-target retrieval requires a
 separate bounded operator contract; it is not implicit in repeated `match`.
 
 Analyzed filtering alone remains an ordinary match predicate; the
-[`match_terms` example](2026-09-18-analyzed-lexical-search.md#analyzed-filtering-in-match) and the rule that
+[`match_terms` example](2026-09-18-analyzed-lexical-search.md#analyzed-filtering-with-filter) and the rule that
 no adjacent source inherits its edit budget are in the lexical RFC.
 
 ### Language evolution
@@ -693,8 +693,8 @@ C1–C4, the grammar-evolution acceptance cases, are in
 [GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md#required-composition-examples).
 Of them only C2's terminal subset is in this release: retrieve, traverse,
 then terminally aggregate the selected population, with the candidate barrier
-kept before traversal and aggregation. Intermediate grouping, `let`,
-`select`, `score`, `optional` and `collect` are deferred there.
+kept before traversal and aggregation. Intermediate `group`, scoring
+features in `let`, and `sub()` reductions are deferred there.
 
 ### Target identity, fan-out, grouping, and metrics
 
@@ -760,8 +760,9 @@ A later rank stage establishes a new active order while earlier metrics keep
 their origin. Aggregation does not implicitly inherit a constituent target's
 rank. These ordering rules require golden plans and fan-out fixtures.
 
-Selection per group uses a `take` stage, with a named node/edge target, a
-nonempty `per` key tuple, an optional local `order`, and a required `limit`:
+Selection per group is the `limit` stage with a target and a partition:
+`limit n of $x per { key, … }`, where `$x` is a named node or edge binding
+and the key tuple is nonempty:
 
 ```gq
 query incidents_per_organization($q: String) {
@@ -770,7 +771,7 @@ query incidents_per_organization($q: String) {
     lexical($i.title, terms($q), candidates: 100) as incidents
     yield incidents
   }
-  take $i { per { $o.slug } limit 2 }
+  limit 2 of $i per { $o.slug }
   return { $o.slug, $i.slug, metric(incidents, rank) as rank }
   order { $o.slug asc, rank asc, $i.@id }
   limit 20
@@ -782,16 +783,18 @@ population, the quota retains at most two of those incidents per organization,
 and the final limit returns at most 20 binding rows. Neither later limit refills
 the source. `per { $o.slug, $o.category }` illustrates a composite group key.
 
-An omitted local `order` uses the latest ranking stage's rank. An explicit
-local order, such as `order { metric(incidents, rank) asc nulls last }`, chooses
-the pair winners without establishing a new global output order. With no
-ranking stage in scope, a local comparator is required; this also permits
-ordinary graph selection such as latest events per entity. Such input remains
-subject to whole-query budgets rather than requiring a synthetic search stage.
-Quota `limit` takes a non-null integer literal or parameter, must be nonnegative,
-and permits zero, consistent with ordinary limit semantics. It does not impose
-a source candidate-window cap; resource admission and checked arithmetic still
-apply. Without a final order or an earlier ranking, output remains unordered.
+The cut uses the active order: the latest ranking stage's rank, or an
+explicit `order { … }` stage immediately before it, such as
+`order { metric(incidents, rank) asc nulls last }`, which chooses the pair
+winners and orders the surviving rows until a later `order` reorders them.
+With no ranking stage in scope, a preceding `order` is required; this also
+permits ordinary graph selection such as latest events per entity. Such
+input remains subject to whole-query budgets rather than requiring a
+synthetic search stage. The count takes a non-null integer literal or
+parameter, must be nonnegative, and permits zero, consistent with ordinary
+limit semantics. It does not impose a source candidate-window cap; resource
+admission and checked arithmetic still apply. A `limit` without `of` counts
+rows; without a final order or an earlier ranking, output remains unordered.
 
 Ordering expressions in either location may append `nulls first` or
 `nulls last`. Omission preserves current GQ defaults: ascending puts nulls first,
@@ -857,7 +860,7 @@ ordinary graph operations.
 ### Lexical scoring
 
 The `bm25_v1` definition, the unified exact/fuzzy formula, the field-corpus
-statistics decision and the feature table for the deferred `score` operator
+statistics decision and the feature table for scoring features in `let`
 are owned by
 [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#lexical-scoring-and-shared-matching-semantics).
 Metrics produced by a `lexical` source carry the domain `Score<bm25_v1>`.
@@ -1744,7 +1747,7 @@ goldens and API/CLI contract tests still cover boundaries GQT does not invoke.
 The test-only staged compiler prototype that exercised the GQ examples in
 this RFC, multi-stage node and edge targets, non-leaking negation scopes,
 alias namespaces, metric domains and origins, aggregate output identity,
-final order/window separation, `take` key and comparator rules and the
+final order/window separation, per-group key and comparator rules and the
 rejection cases is retained on the evidence branch
 ([`staged_probe.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-compiler/src/query/staged_probe.rs)).
 It is partial compiler evidence, not a staged AST/IR or execution, and it is
@@ -2059,6 +2062,9 @@ still require prototypes; full production qualification belongs to its phase.
 
 ## Decision log
 
+- 2026-09-18 — adopted the kernel: this RFC's examples and the per-group
+  selection section now use `limit … of … per`, `let`, `filter` and `sub(…)`;
+  no semantic decision changed.
 - 2026-09-18 — replaced the single coordinated cutover with Phases A–G ordered
   by risk: truth first, the agent door, opt-in representations, additive
   kernel stages behind a setting, a deprecation cutover, acceleration,
