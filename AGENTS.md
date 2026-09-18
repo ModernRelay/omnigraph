@@ -86,6 +86,9 @@ The decision lens is ongoing liability: ask what a design looks like after five
 more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
+Always validate your assumptions and don't assume a certain function/modules/symbol will work in a certain way. Especially always validate your assumptions about Lance internals by reading the implementations in the upstream code.
+Reason from first principles about OmniGraph instead of in arbitrary database categories.
+Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md)
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:
@@ -108,10 +111,7 @@ working memory:
    Never acknowledge before durable graph visibility or return silent partial
    results.
 
-Do not add a custom WAL/transaction manager, a queue for manifest-derived work,
-inline vector/FTS rebuilds, raw public Lance writers, string-built query
-semantics, process-local locks advertised as distributed fencing, cloud-only
-correctness paths, or a shadow source of truth without an accepted RFC that
+Do not add a queue for manifest-derived work, inline vector/FTS rebuilds, raw public Lance writers, string-built query semantics, process-local locks advertised as distributed fencing, cloud-only correctness paths, or a shadow source of truth without an accepted RFC that
 changes the invariant.
 
 ## Build and test
