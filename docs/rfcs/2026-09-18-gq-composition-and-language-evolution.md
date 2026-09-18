@@ -46,7 +46,7 @@ and retrieve then aggregate. The stage boundaries RFC 0048 introduces expose
 information loss that a single `match`/`return` cannot express. Before that
 syntax freezes, the shared expression model, contextual keywords, scope
 transitions and null rules must be fixed once, or every later operator
-(intermediate grouping, `let`, `select`, `optional`, `collect`, typed unions)
+(intermediate grouping, `let`, subquery reductions, typed unions)
 will be a special case. RFC 0048's [agent workload](0048-search-contracts.md#agent-workload-and-design-objective)
 table states the requirements these rules serve.
 
@@ -96,7 +96,7 @@ Every operator declares its scope and population effect:
 | Predicate / ordinary projection | Preserve rows, duplicates, bindings and metric origins |
 | Traversal | Extend bindings with existing endpoint/edge-instance semantics; bounded reachability does not become path enumeration |
 | `rank` | Select distinct targets and retain their incoming binding rows |
-| `take` | Select target/group pairs; it does not create reusable group features |
+| `limit … of … per` | Select target/group pairs; it does not create reusable group features |
 | Group/reduction | Export keys and reduced values, discard unreduced member bindings/metrics |
 | Future optional/branch/collection | Explicit imports/exports, nullability, multiplicity and local scope |
 
@@ -238,9 +238,9 @@ change the tested RFC query examples.
 | Reusable intermediate grouping/reduction | No | Foundation | Examples C1–C2 export group keys/entities and reduced values; drop unreduced member bindings and active ranks. Group-stage implementation remains deferred. |
 | General distinct rows/entities and distinct aggregates | No dedicated syntax | Defer | Specify the identity/value tuple and duplicate equivalence; retrieval deduplication is not general `DISTINCT`. |
 | Distinct-target ranking with retained binding rows | Limited; legacy search exists without the new stage contract | Deliver | Each target gets one source rank; selecting it retains its associated binding rows. |
-| Quotas per explicit group, including ordinary non-search selection | No | Deliver through `take` | Select target/group pairs; use explicit reductions when order varies per pair; require local order without an active rank. |
-| Parent selection using reduced child metrics | Limited; terminal aggregates cannot feed a quota | Deliver through `take` reductions | Selection does not create reusable group features or implicit parent-source ranks. |
-| Top-N retrieval within every full group; row-dependent query inputs | No | Foundation | Examples C1/C4 require explicit correlation/partition scope, empty-group behavior and one total budget; implementation remains deferred. Global top-K plus `take` is different. |
+| Quotas per explicit group, including ordinary non-search selection | No | Deliver through `limit … of … per` | Select target/group pairs; use explicit reductions when order varies per pair; require local order without an active rank. |
+| Parent selection using reduced child metrics | Limited; terminal aggregates cannot feed a quota | Deliver through `limit … of … per` with explicit reductions | Selection does not create reusable group features or implicit parent-source ranks. |
+| Top-N retrieval within every full group; row-dependent query inputs | No | Foundation | Examples C1/C4 require explicit correlation/partition scope, empty-group behavior and one total budget; implementation remains deferred. Global top-K plus `limit … of … per` is different. |
 | Final ordering by properties/aliases and identity tie-breaks | Yes, with documented legacy search boundary-tie gaps | Keep; repair retrieval ties | Final ordering cannot change a previous source cutoff; each selection owns its complete comparator. |
 | Explicit `nulls first` / `nulls last` | No syntax; fixed ascending/descending defaults | Deliver | Apply consistently in local and final ordering; omission preserves existing defaults. |
 | Final row limit, including zero | Yes; integer literal | Keep | Counts output rows; it does not resize retrieval or bound all intermediate work. |
@@ -336,11 +336,8 @@ and enrichment.
 
 ```gq
 query composition_c1($q: String) {
-  match {
-    $i: Incident
-    $s hasIncident $i
-    $i.period = "prior" or $i.period = "current"
-  }
+  match { $i: Incident  $s hasIncident $i }
+  filter { $i.period = "prior" or $i.period = "current" }
   group {
     per { $s }
     reduce {
@@ -349,7 +346,8 @@ query composition_c1($q: String) {
     }
   }
   let { current_count - prior_count as increase }
-  select { order { increase desc, $s.@id asc } limit 1 }
+  order { increase desc, $s.@id asc }
+  limit 1
   match { $s hasReport $p }
   rank $p {
     lexical($p.text, terms($q), candidates: 2) as reports
@@ -364,10 +362,11 @@ query composition_c1($q: String) {
 
 `group` exports entity keys under their binding names and named reductions,
 discarding incident bindings. `let` adds row values whose sibling expressions
-read the incoming scope; numeric results do not become identities. `select`
-cuts rows, while `take` selects target/group pairs. Retain computed facts
-through the service cut and later report reads. Multiple selected services
-require C4's explicit correlation, not repeated global top-K plus `take`.
+read the incoming scope; numeric results do not become identities. `order`
+then `limit` cuts rows, while `limit … of … per` selects target/group pairs.
+Retain computed facts through the service cut and later report reads.
+Multiple selected services require C4's explicit correlation, not repeated
+global top-K plus a per-group cut.
 
 **C2 — Retrieve, traverse, then aggregate the selected population.** Selected
 p1/p2 have three bindings to project P (two from p1); eligible p3 falls outside
@@ -416,19 +415,17 @@ query composition_c3($q: String, $vector: Vector(3)) {
     knn($p.embedding, $vector, candidates: 2) as dense
     yield dense
   }
-  score $p {
-    lexical($p.text, terms($q), scoring: bm25_v1) as words_feature
-  }
+  let { lexical_score($p.text, terms($q), scoring: bm25_v1) as words_feature }
   return {
     $p.@id as passage_id, metric(words, rank) as lexical_rank,
-    metric(words, score) as lexical_score, feature(words_feature) as lexical_feature
+    metric(words, score) as lexical_score, words_feature as lexical_feature
   }
 }
 ```
 
-`score` preserves targets, bindings and comparator; it has no candidate window,
-output selector, rank or fusion vote. `feature` names a scorer; `metric`
-names retrieval membership. Reordering/cutting requires an explicit operation.
+A scoring feature in `let` preserves targets, bindings and comparator; it
+has no candidate window, output selector, rank or fusion vote. Its alias
+names a feature; `metric` names retrieval membership. Reordering/cutting requires an explicit operation.
 A hidden lexical top-K followed by a join can drop d2 and is invalid.
 Scoring uses accepted corpus statistics and charges their work even for a
 small target set.
@@ -448,11 +445,8 @@ null owner and empty typed list.
 
 ```gq
 query composition_c4($q: String) {
-  match {
-    $i: Incident
-    $s hasIncident $i
-    $i.period = "prior" or $i.period = "current"
-  }
+  match { $i: Incident  $s hasIncident $i }
+  filter { $i.period = "prior" or $i.period = "current" }
   group {
     per { $s }
     reduce {
@@ -461,20 +455,20 @@ query composition_c4($q: String) {
     }
   }
   let { current_count - prior_count as increase }
-  select { order { increase desc, $s.@id asc } limit 2 }
-  optional ($s) as owner {
-    match { $s ownedBy $person }
-    return { $person as person }
-  }
-  collect ($s) as reports {
-    match { $s hasReport $p }
-    rank $p {
-      lexical($p.text, terms($q), candidates: 2) as relevant
-      yield relevant
-    }
-    return { $p.@id as id, $p.text as text }
-    order { metric(relevant, rank) asc, $p.@id asc }
-    limit 2
+  order { increase desc, $s.@id asc }
+  limit 2
+  let {
+    one(sub($s) { match { $s ownedBy $person } return { $person as person } }) as owner,
+    collect(sub($s, $q) {
+      match { $s hasReport $p }
+      rank $p {
+        lexical($p.text, terms($q), candidates: 2) as relevant
+        yield relevant
+      }
+      return { $p.@id as id, $p.text as text }
+      order { metric(relevant, rank) asc, $p.@id asc }
+      limit 2
+    }) as reports
   }
   return {
     $s as service, prior_count as prior_count, current_count as current_count,
@@ -484,13 +478,13 @@ query composition_c4($q: String) {
 ```
 
 Imports explicitly distinguish `$entity` from computed row values; query
-parameters stay available. Child bindings/sources do not escape. `optional`
-returns a nullable object: zero rows produce null, one produces an object,
-and more than one requires explicit selection/collection or a cardinality
-error. `OwnedBy` is zero-or-one in this example.
+parameters stay available. Child bindings/sources do not escape.
+`one(sub …)` returns a nullable object: zero rows produce null, one produces
+an object, and more than one is a cardinality error unless the subquery
+selects or collects explicitly. `OwnedBy` is zero-or-one in this example.
 
-`collect` consumes ordered binding rows and requires a local comparator and
-output limit. Unique reports need an explicit identity reduction; source
+`collect(sub …)` consumes ordered binding rows and requires a local
+comparator and output limit. Unique reports need an explicit identity reduction; source
 windows do not bound later fan-out or cumulative parent work. Both children
 preserve the parent row, accepted snapshot and one whole-query budget.
 
@@ -723,9 +717,11 @@ and `optional (…) as …` blocks and maps Cypher's `CALL { }`, `EXISTS { }`,
 row-producing outer join (Cypher `OPTIONAL MATCH`), which fans out; the two
 are different operations, not two spellings.
 
-**Spellings this removes from RFC 0048's sketch.**
+**Spellings the kernel replaced in RFC 0048's earlier sketch** (adopted
+2026-09-18; RFC 0048 and the examples in this document now use the kernel
+forms).
 
-| RFC 0048 sketch | Kernel form |
+| Earlier sketch | Kernel form |
 |---|---|
 | `select { order { … } limit n }` | `order { … }` then `limit n` |
 | `take $i { per { $o.slug } order { … } limit 2 }` | `order { … }` (or the active rank) then `limit 2 of $i per { $o.slug }` |
@@ -887,45 +883,17 @@ query incidents_per_organization($q: String) {
   order { $o.slug asc, rank asc, $i.@id asc }
   limit 20
 }
-
-query composition_c4($q: String) {
-  match { $i: Incident  $s hasIncident $i }
-  filter { $i.period = "prior" or $i.period = "current" }
-  group {
-    per { $s }
-    reduce {
-      count_if($i.period = "prior") as prior_count,
-      count_if($i.period = "current") as current_count
-    }
-  }
-  let { current_count - prior_count as increase }
-  order { increase desc, $s.@id asc }
-  limit 2
-  let {
-    one(sub($s) { match { $s ownedBy $person } return { $person as person } }) as owner,
-    collect(sub($s, $q) {
-      match { $s hasReport $p }
-      rank $p { lexical($p.text, terms($q), candidates: 2) as relevant  yield relevant }
-      return { $p.@id as id, $p.text as text }
-      order { metric(relevant, rank) asc, $p.@id asc }
-      limit 2
-    }) as reports
-  }
-  return {
-    $s as service, prior_count, current_count, increase, owner, reports
-  }
-}
 ```
 
-Each example has one spelling per operation; the second no longer needs a
-`take` block, and the third no longer needs `select`, `optional` or
-`collect` stages. The semantics RFC 0048 specifies for pair selection,
-missing arms and nested budgets are unchanged; only the spellings moved.
+Each example has one spelling per operation; the second needs no separate
+per-group stage. [C1–C4](#required-composition-examples) are written in the
+same forms. The semantics RFC 0048 specifies for pair selection, missing arms
+and nested budgets are unchanged; only the spellings moved.
 
-**Decision needed.** Adopt the kernel as the grammar RFC 0048's Phase 0
-stabilizes against, and rewrite its sketch and the `take`/`score`/`select`
-sections accordingly, or keep the separate stage kinds and record why each
-extra spelling earns its place.
+**Decision (2026-09-18):** the kernel is adopted as the grammar RFC 0048's
+Phase 0 stabilizes against; RFC 0048's per-group selection section and this
+document's examples use its forms. A future stage kind earns its place by
+the rule in the principle above: it cannot be desugared.
 
 ## Invariants
 
@@ -936,7 +904,7 @@ extra spelling earns its place.
 - **Integrity failures are loud (8):** integer overflow, non-finite results,
   chained comparisons, unknown constructors and unresolved aliases are typed
   failures.
-- **Bounded resource use (11):** deferred operators (`collect`, `optional`,
+- **Bounded resource use (11):** deferred operators (subquery reductions,
   intermediate grouping) enter the language only with one whole-query budget
   and explicit empty-group, duplicate and cardinality rules.
 
@@ -1074,6 +1042,8 @@ before optimizing batching, and measure per-group rescan cost.
   collapses `select`, `take`, `score`, `collect` and `optional` and moves
   scalar predicates out of `match`. Recorded as a decision RFC 0048 must
   take before its syntax stabilizes; the moved-in text above is unchanged.
+- 2026-09-18 — kernel adopted; C1–C4 rewritten to `filter`, `order` +
+  `limit`, `let` scoring features and `sub()` reductions.
 - 2026-09-18 — programmability and composition became Phase G of RFC 0048's
   rollout; the in-context instrument gates Phases B, D and E.
 - 2026-09-18 — added programmability: transparent `define`, a typed plan
