@@ -7847,8 +7847,14 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
         ("cleanup.resolve_branch_snapshot", Driver::Cleanup),
         ("cleanup.reconcile_fork", Driver::Cleanup),
         ("cleanup.table_gc", Driver::Cleanup),
-        ("branch_merge.post_authority_capture", Driver::Merge),
-        ("branch_merge.post_candidate_validation", Driver::Merge),
+        (
+            catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE.name(),
+            Driver::Merge,
+        ),
+        (
+            catalog::BRANCH_MERGE_POST_CANDIDATE_VALIDATION.name(),
+            Driver::Merge,
+        ),
         ("schema_apply.post_lock_pre_effect", Driver::SchemaApply),
         ("schema_apply.before_staging_write", Driver::SchemaApply),
         ("schema_apply.after_manifest_commit", Driver::SchemaApply),
