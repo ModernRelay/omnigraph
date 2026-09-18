@@ -1860,7 +1860,9 @@ refactor; every ranked result totally ordered; descriptors in every
 transport; the two regression cases RFC 0047 owns green.
 
 **Open:** fuzzy analysis and index-state divergence remain until Phase C;
-whole-query admission remains engine version 2's.
+whole-query admission remains engine version 2's. The PR order, the
+prototype's status as a reference, and the stored-query deployment gate are
+in [RFC 0047's rollout](0047-search-plan-truth.md#rollout).
 
 #### Phase B: the agent door
 
@@ -2016,6 +2018,7 @@ budgets as settings); cross-type search, `sub()` reductions and every
 | Exact-scan fuzzy matching is fast enough on real graphs (tables of 200k rows exist) | C | Zero-edit stays index-served; fuzzy stays budgeted and refuses loudly; acceleration moves earlier in F |
 | `@analyzed` can be an opt-in SchemaIR feature with no stamp bump for non-adopters | C's feature design | A versioned feature flag with the same no-rebuild property for non-adopters |
 | The served read floor (about 0.2 s server-side on a trivial read) is attributable and reducible | A (#752) | Multi-statement requests carry the load; planner work in F is not the answer either way |
+| A deployed graph has no stored query that `T26`/`T27` refuse; if one exists, operators find it before upgrading | A, through `queries validate` and `cluster plan` before the release | A refused stored query quarantines its graph at boot; the diagnostics ship in the validators first, and the release note makes the check a precondition |
 | Stage barriers cost little | D | Widen the rewrite catalogue with proven equivalences before E |
 
 ### Extensions after the initial release
