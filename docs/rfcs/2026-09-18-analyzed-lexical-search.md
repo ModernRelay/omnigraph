@@ -192,7 +192,10 @@ retrieval. Its contract is:
 | Empty text | A query yielding no searchable terms is a typed error. A null or token-empty document does not match. |
 | Completeness | Every successful result satisfies the predicate exactly; an edit-tolerant predicate does not advertise approximate recall. |
 
-For a fixed schema, query, and document population, these are normative laws:
+For a fixed schema, query, and document population, these are normative laws
+(the operation's contract in the sense of
+[evaluating data systems from first principles](../dev/systems.md); an index
+is part of the physical realization and cannot appear in them):
 
 ```text
 matches(edits=0) ⊆ matches(edits=1) ⊆ matches(edits=2)
@@ -817,6 +820,8 @@ relevance quality; Phase F chooses measured defaults.
 
 ## Decision log
 
+- 2026-09-18 — named the membership laws as the operation's contract and the
+  index as physical realization, in the terms of `docs/dev/systems.md`.
 - 2026-09-18 — `match_terms` moved from the `match` block to a `filter`
   stage under the adopted kernel.
 - 2026-09-18 — became Phase C of RFC 0048's rollout: `@analyzed` opt-in per

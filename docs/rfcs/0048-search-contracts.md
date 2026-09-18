@@ -95,6 +95,18 @@ Lance owns versioned datasets and indexes; OmniGraph owns graph semantics,
 snapshot coordination and admission. DataFusion supplies relational operators
 where qualified. Missing acceleration may change cost, never logical meaning.
 
+In the terms of [evaluating data systems from first principles](../dev/systems.md),
+the first two rows are the observable contract: the accepted schema and the
+typed plan fix state, operations, guarantees and interface; the third row is
+the physical realization evaluated against that contract; the
+[agent workload](#agent-workload-and-design-objective) is the distribution of
+work it is optimized for. Every law under Design is a contract statement,
+every route in the native matrix is a mechanism judged against it under the
+stated work, `ann` is the one operation whose contract admits a
+nondeterministic result and says so, and the result descriptors report the
+guarantee record the guide's checklist asks for: completion, coverage,
+approximation and selection as separate facts, never one "consistency" flag.
+
 ### Agent workload and design objective
 
 Optimize reliable task completion within latency, execution and working-context
@@ -2071,6 +2083,8 @@ still require prototypes; full production qualification belongs to its phase.
 
 ## Decision log
 
+- 2026-09-18 — stated the contract / physical realization / distribution of
+  work split in the terms of `docs/dev/systems.md` (#745).
 - 2026-09-18 — corrected Phase A's performance item after measuring the
   0.11.0 personal server: manifest reloads are already excluded by the
   warm-read contract; the ~0.2 s server-side floor is attributed first (#752).
