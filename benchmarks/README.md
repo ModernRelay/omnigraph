@@ -142,6 +142,74 @@ These fixtures model accumulated history on the current format. They do not
 claim compatibility with old binary formats or legacy bare branch refs, and
 their constrained-runtime timings are not comparable to unrestricted runs.
 
+## Concurrent-writes throughput diagnostics
+
+The `concurrent-writes` scenario is the instrument RFC 0067's "What to
+measure before promising numbers" section asks for: sustained commits per
+second per branch under N concurrent writers, before and after each step of
+the RFC's throughput path, on a compact and on a fragmented manifest, on
+local storage and on an S3-compatible store. Its baseline exhibits the
+serialization the path's second step targets: every writer crosses the
+exclusive schema gate during publication, so adding writers raises
+service-time percentiles long before it raises the commit rate.
+
+```bash
+RUSTFLAGS= cargo bench --locked -p omnigraph-engine --bench scenarios -- \
+  --scenario concurrent-writes --writers 8 --duration-secs 30 \
+  --rows 256 --dims 8 --history-commits 64 --manifest-layout uncompacted \
+  --runs 3 --out /tmp/concurrent-writes.jsonl
+```
+
+`RUSTFLAGS=` (empty) is part of the command: the workspace Cargo
+configuration otherwise injects `--cfg tokio_unstable`, whose runtime cost
+is unmeasured, and the record's `attestation` block captures the cfg, the
+enabled engine features, `LANCE_MEM_POOL_SIZE`, and the effective Tokio
+worker count so a mixed comparison is visible rather than silent.
+
+**The driver is closed-loop and therefore not claim-grade.** Each writer
+task issues its next insert only after the previous acknowledgement, which
+is the right shape for finding the ceiling but — per RFC 0039 Rule 1 — is
+subject to coordinated omission: the driver pauses exactly when the system
+stalls. The record self-labels `driver: "closed-loop"` and
+`claim_grade: false`, and its latencies are `service_time_*` (time to serve
+one acknowledged write), never arrival latency. Claim-grade throughput or
+latency numbers require the future open-loop scheduled-arrival benchmark
+kind; these records are decision evidence for the RFC's ordered path.
+
+One repetition is one measured child: it builds a fresh `Chunk` fixture
+(`--rows`, `--dims`, the age and layout controls above), then runs
+`--writers` closed-loop tasks over clones of one `Session` — the production
+server shape — issuing insert-only mutations with disjoint per-worker keys
+for `--warmup-secs` plus `--duration-secs`. `--write-branches B` spreads
+writers round-robin over `B` forks instead of `main`. Setup, warm-up,
+verification and teardown sit outside the measured window. After every
+counter and clock is read, a fresh handle verifies exact per-branch row
+counts (seeded rows plus this run's acknowledgements) and reads sampled
+acknowledged keys back; any worker error, any key conflict, or a
+verification mismatch fails the run rather than emitting a green record.
+
+Op counting rides the ungated instrumentation surface: Lance manifest- and
+table-plane logical calls through per-run `IOTracker` wrappers installed on
+the graph open and on every writer task, and control-plane calls through
+`CountingStorageAdapter`. Counters are logical calls at the wrapping seam,
+not physical requests; the `io.per_op` block divides them by acknowledged
+commits, which is where a future group-commit change must show
+`manifest_writes_per_commit` falling below one. `--no-probes` runs the same
+workload without any counting for an A/B of the counting overhead.
+
+To measure an S3-compatible store, pass `--target-uri s3://bucket/prefix`;
+the child appends a unique `cw-{nanos}` segment, refuses (exit 78) when the
+store is unreachable, and deletes the prefix afterwards unless
+`--keep-fixture`. Credentials and endpoint come from the standard `AWS_*`
+variables; the RustFS recipe CI uses (`.github/workflows/ci.yml`, the
+`rustfs_integration` job: `docker run rustfs/rustfs`, then
+`AWS_ENDPOINT_URL_S3=http://127.0.0.1:9000`, `AWS_ALLOW_HTTP=true`,
+`AWS_S3_FORCE_PATH_STYLE=true`, access key pair, `create-bucket`) works
+verbatim on a laptop. The harness passes the parent environment through to
+the measured child, so exporting those variables is sufficient.
+
+These records are diagnostic evidence and do not enter the durable archive.
+
 ## Layout
 
 - `cases/*.case-v1.yaml` assigns the fixture, workload, environment, and
