@@ -406,33 +406,48 @@ prototype's retirement label must not be reused as a current-code fact.
 
 This RFC is Phase A of [RFC 0048's rollout](0048-search-contracts.md#implementation-phases):
 it ships first and alone, with no syntax or format change, because every
-item is a refusal of a wrong answer or an additive field. The ordered stages
-below are its internal order.
+item is a refusal of a wrong answer or an additive field. It lands as the
+pull requests below, in order; each is green on its own and carries its own
+regression test.
 
-The retained prototype supplies starting points; each stage must be checked
-against the revised scope:
+The retained prototype (closed PR #595, branch `search-contracts-p0-p1` at
+`3e459aad`, 11 commits on a 2026-09-01 base) is a design reference, not a
+cherry-pick source: `main` has since changed the same files by thousands of
+lines (`exec/query.rs`, `typecheck.rs`, `table_store.rs`, the API types), and
+a trial merge conflicts in eleven files. Its commit order and its tests are
+the specification; the code is re-derived against the current tree.
 
-1. Substrate fences for the Lance 11 update→optimize stale-vector window
-   (test-only; can land before acceptance as an ordinary change).
-2. `T27`, the `FullTextIndexRequired` refusal and the warning carrier
-   (engine → API → CLI → OpenAPI).
-3. Characterization goldens, then the retrieval-IR refactor (behavior-
-   equivalent by construction; goldens prove it).
-4. `T26` scan-rooted targets (compiler pass + engine backstops).
-5. Projectable metrics and deterministic ties (single-search, fusion,
-   aggregated).
-6. `metrics`/`retrievals` metadata with embedding coverage.
+| PR | Lands | Where it touches today's tree | Regression owner |
+|---|---|---|---|
+| 1 | The diagnostics contract: a structured compiler diagnostic (code, span, expectation, fix); pest's parse error mapped to the position of the deepest failure with the expected tokens and one fix (the measured `query name {` case needs a committal grammar rule or a recognizer for that shape); the CLI's `--json`/`jsonl` error output as `ErrorOutput` JSON with no colour or backtrace text; `ErrorOutput` gains additive `position`, `expected` and `fix` fields; OpenAPI regenerated | `CompilerError::Type("T33: …")` string prefixes in `typecheck.rs`; `parse_query` in `query/parser.rs`; `color_eyre::install()` in the CLI's `main.rs`; `ErrorOutput` in `omnigraph-api-types` | compiler parser/typecheck tests; CLI `cli_queries`; server `data_routes` and `openapi` |
+| 2 | `T27` and the `FullTextIndexRequired` refusal, replacing the flat bare-tokenizer fallback | the search and rank arms of `typecheck.rs`; the FTS scan path in `exec/query.rs` that chooses index or flat, keyed on `TableStore::has_fts_index_on`; a new `OmniError` variant shaped like `FullTextIndexRebuildRequired` | `issue_747_unindexed_search_is_case_sensitive.gqt` (its unindexed steps become `T27` refusals); a `search.rs` test that drops a declared property's physical index and expects the refusal. The refusal keys on index absence only: an uncovered tail of a built index keeps scanning with the index analyzer |
+| 3 | Characterization goldens for every retrieval shape, captured before the refactor | `search.rs` | the goldens themselves |
+| 4 | Retrieval as typed IR: `QueryIR::retrieval` (`Nearest { k }`, `Bm25 { scan_cap }`, `FuseRrf`) fixed by lowering; the executor's `SearchMode` resolved from it instead of from `order_by[0]` | `extract_search_mode` and `extract_sub_search_mode` in `exec/query.rs`; `ir/lower.rs`, `ir/mod.rs` | PR 3's goldens (behaviour-equivalent); the #587 gate composes unchanged |
+| 5 | `T26`: a `scan_root_variables` computation shared by lowering and typecheck, negation scopes checked with their own roots, an engine backstop; the `rrf_prefilter_gate` expand-dst fixture ported to assert the diagnostic | `ir/lower.rs`, `typecheck.rs`, `exec/query.rs` | `issue_750_search_on_traversal_target_is_dropped.gqt`; compiler typecheck/lower tests |
+| 6 | Projectable `rrf` (retire `T37`) and the total order: score, then trailing keys inside score ties, then stable id; boundary-tie plateau retained within an explicit budget or a typed failure | `exec/projection.rs`, fusion in `exec/query.rs` | `search.rs`, `ordering.rs`, `aggregation.rs`; the tie fixture with more tied rows than the native window and reversed id order |
+| 7 | Read descriptors: `warnings` (`search_order_ignored_by_aggregation`, `embedding_coverage_pending`), `metrics`, `retrievals` with known/unknown coverage by default and exact counts under a request-scoped `coverage` setting, `usage`; carried in JSON, the JSONL metadata record and Arrow metadata | `ReadOutput` in the API types; `read_format.rs`; a read-only `count_rows_matching` on `TableStore` registered in `forbidden_apis`; the settings table | server `data_routes`/`openapi`; CLI parity; `search.rs` coverage tests |
+| 8 | `explain` v0: the logical plan and the retrieval descriptor for a query, as a CLI flag and a route; no surface exists today | CLI `cli.rs`, server routes, API types | CLI and server tests; OpenAPI |
+| 9 | #752: attribute the served read floor per phase and report it through `usage`; independent of 1–8 | server instrumentation | a cost test pinning the object-store request count of a trivial served read |
 
-For the standalone slice, `implementation` advances to `in-progress` at the
-first landed stage and `complete` when stage 6 ships. For the combined release,
-record completion against the corresponding RFC 0048 phase evidence instead
-of requiring this interim sequence. Stages 2+ reference this RFC once accepted.
-The lexical replacement and staged language are sequenced by RFC 0048, not
-by a retirement commit in this rollout. Before porting prototype code, capture
-the current compiler/engine baseline and identify which guarantees already
-exist. If both designs are implemented together, build named stage IR and
-metadata directly, preserving this RFC's correctness gates without an interim
-language release or duplicate execution path.
+PR 6 is the one with open design work: retaining a boundary-tie plateau
+within a budget is this RFC's `blocked_on`. PRs 1–5 and 7–9 have no open
+questions.
+
+**Deployment gate.** `T26` and `T27` refuse queries the compiler accepts
+today. Stored queries persist as text and recompile when a server starts,
+and a registry that fails to compile quarantines its graph
+(`omnigraph-cluster`'s serve path), so a deployment carrying one such
+stored query would go dark on restart. PRs 2 and 5 therefore ship with the
+new diagnostics exposed through `queries validate` and `cluster plan`, and
+the release note tells operators to run them before upgrading; a refused
+stored query is a pre-upgrade finding, never a boot failure. The
+compatibility-surfaces RFC's cross-version job is the place this is
+checked mechanically once it exists.
+
+`implementation` advances to `in-progress` when PR 1 lands and to
+`complete` when PR 8 does; PR 9 is tracked by its issue. The lexical
+replacement and the staged language are sequenced by RFC 0048, not by this
+rollout.
 
 ## Unresolved questions
 
@@ -475,6 +490,9 @@ language release or duplicate execution path.
   blanket claim that all RRF arm windows follow the output limit: BM25 arms
   are uncapped; vector arms inherit that limit. Distinguished historical
   prototype results from current evidence and total ordering from ANN replay.
+- 2026-09-18 — replaced the six-stage rollout with the nine-PR order against
+  the current tree, recorded that the #595 prototype is a reference rather than
+  a cherry-pick source, and added the stored-query deployment gate.
 - 2026-09-18 — became Phase A of RFC 0048's rollout.
 - 2026-09-18 — added the diagnostics contract (code, position or stage,
   expectation, one fix; unknown names enumerate their set) for every
