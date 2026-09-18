@@ -394,13 +394,10 @@ prototype's retirement label must not be reused as a current-code fact.
 
 ## Rollout
 
-For a standalone RFC 0047 implementation, use the ordered stages below after
-acceptance. For the combined release, use
-[RFC 0048's implementation phases](0048-search-contracts.md#implementation-phases):
-plan identity and target validation belong to foundations/composition;
-projectable metrics and complete ties to retrieval/composition qualification;
-and warnings, retrieval descriptors, and coverage to the agent-facing read
-path. These are the same correctness obligations, implemented once.
+This RFC is Phase A of [RFC 0048's rollout](0048-search-contracts.md#implementation-phases):
+it ships first and alone, with no syntax or format change, because every
+item is a refusal of a wrong answer or an additive field. The ordered stages
+below are its internal order.
 
 The retained prototype supplies starting points; each stage must be checked
 against the revised scope:
@@ -468,6 +465,7 @@ language release or duplicate execution path.
   blanket claim that all RRF arm windows follow the output limit: BM25 arms
   are uncapped; vector arms inherit that limit. Distinguished historical
   prototype results from current evidence and total ordering from ANN replay.
+- 2026-09-18 — became Phase A of RFC 0048's rollout.
 - 2026-09-18 — added the diagnostics contract (code, position or stage,
   expectation, one fix; unknown names enumerate their set) for every
   compile diagnostic and typed read failure.

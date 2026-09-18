@@ -1013,8 +1013,9 @@ retain failed trajectories; a model revision reopens the measurement.
 ## Rollout
 
 No production work starts from this document. Its rules gate RFC 0048's
-syntax stabilization (the `Foundation` rows of the matrix) and the milestone
-below follows RFC 0048's initial release.
+Phase D syntax and its instrument gates Phases B, D and E; the
+programmability constructs and the milestone below are RFC 0048's
+[Phase G](0048-search-contracts.md#implementation-phases), after the cutover.
 
 ### Next delivery milestone: composed analytical answers
 
@@ -1073,6 +1074,8 @@ before optimizing batching, and measure per-group rescan cost.
   collapses `select`, `take`, `score`, `collect` and `optional` and moves
   scalar predicates out of `match`. Recorded as a decision RFC 0048 must
   take before its syntax stabilizes; the moved-in text above is unchanged.
+- 2026-09-18 — programmability and composition became Phase G of RFC 0048's
+  rollout; the in-context instrument gates Phases B, D and E.
 - 2026-09-18 — added programmability: transparent `define`, a typed plan
   input surface, multi-statement requests at one snapshot; procedural
   control flow, opaque functions and free inference calls excluded.

@@ -769,36 +769,41 @@ The exact lexical qualification matrix retains all preceding requirements:
 
 ## Rollout
 
-Phases are sequenced by [RFC 0048's implementation phases](0048-search-contracts.md#implementation-phases);
-this RFC's `implementation` status advances with Phase 2 and completes when
-the deprecation window has closed. The phase, restated here as the owner of
-the lexical work:
+This RFC is Phase C of [RFC 0048's rollout](0048-search-contracts.md#implementation-phases):
+representations, opt-in per field. Its `implementation` status advances with
+that phase and completes when Phase E's deprecation window has closed on the
+lexical spellings.
 
-**Input:** Phase 1 representations/resources and Phase 0 numeric oracles.
+**Input:** Phase 0's numeric oracles; RFC 0048's Phase A refusals in place.
 
-Build bounded NFC/analysis, complete `Terms` matching and unified
-exact/fuzzy scoring; exhaustive `knn` and declared `ann` are the vector half
-that RFC 0048 keeps. Charge statistics, coverage, scoring and selection to
-the shared context.
-Extend search/substrate owners and the
-[lexical qualification matrix](#qualification-matrix); observable rows,
-shapes and errors belong in GQT.
+`@analyzed` and its analyzer profiles ship as an additive SchemaIR feature
+that a graph adopts field by field: a graph that declares no `@analyzed`
+field is unchanged and needs no rebuild; a field that adopts it takes the NFC
+certificate and an index rebuild for that field. Build bounded NFC/analysis,
+complete `Terms` matching, `match_terms` as a predicate, and unified
+exact/fuzzy scoring against the Decimal oracle. The exact scan is the
+baseline at every index state; zero-edit membership is served through the
+existing FTS index and fuzzy membership through a budgeted scan until Phase F
+qualifies a native route. Charge statistics, coverage and scoring to the
+shared context. Extend search/substrate owners and the
+[qualification matrix](#qualification-matrix); observable rows, shapes and
+errors belong in GQT.
 
-**Exit:** predicate/retriever membership agreement before cuts, independent
-score and vector fixtures, total ties, all index/lifecycle states, and typed
-budget/cancellation failures. Assert that intended index/compaction states
-were reached; distinguish current from pinned answers and reopen snapshots.
+**Exit:** predicate and retriever membership agree before any cut; the
+membership laws hold across absent, partial, full and rebuilt indexes; oracle
+parity for scores; total ties; typed budget failures; export and
+reapplication preserve the resolved profile; the fuzzy and index-state
+regression cases green under `issue_N` names.
 
-**Open:** native fuzzy analysis, float32 BM25, stale statistics and native cuts
-are not substitutes for the accepted exact contract. Reproduce their
-counterexamples before reuse. Numerical parity does not establish relevance
-quality. Candidate-scoring/model operators and richer representations remain
-deferred; Phase 5 chooses measured defaults.
+**Open:** native fuzzy analysis, float32 BM25, stale statistics and native
+cuts are not substitutes for the accepted exact contract; reproduce their
+counterexamples before reuse in Phase F. Numerical parity does not establish
+relevance quality; Phase F chooses measured defaults.
 
 ## Unresolved questions
 
 1. Close the Phase 0 numeric policies/oracles and native route dispositions.
-   Phases 2/5 must qualify BM25 across supported targets, exact live-row
+   Phases C and F must qualify BM25 across supported targets, exact live-row
    statistics and native/fallback score/winner parity. Polymorphic field-corpus
    execution is deferred. Validate edit weights and maximum reduction on the
    owned task corpus before release; numerical fixtures alone do not establish
@@ -811,6 +816,9 @@ deferred; Phase 5 chooses measured defaults.
 
 ## Decision log
 
+- 2026-09-18 — became Phase C of RFC 0048's rollout: `@analyzed` opt-in per
+  field with no rebuild for non-adopters, zero-edit membership through the
+  existing index, fuzzy through a budgeted scan.
 - 2026-09-18 — split out of RFC 0048 at its 2026-09-13 revision with the
   lexical decisions unchanged. Replaced the hard removal of `fuzzy`, `search`
   and `match_text` with a one-release deprecation window and fixed the
