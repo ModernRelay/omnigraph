@@ -1124,7 +1124,8 @@ claims).
   keep the branch gate for same-branch writers and make the schema gate a
   shared/exclusive lock so cross-branch writers and independent merges stop
   serializing process-wide (#643); nothing in this RFC depends on the gates
-  for correctness.
+  for correctness. Proposed in
+  [Shared schema gate and the write critical section](2026-09-18-shared-schema-gate.md).
 - The chain length above which merge promotion uses `Restore` of the tip
   instead of per-chunk replay.
 - Group commit at the branch gate is a separate proposal; here it is N
