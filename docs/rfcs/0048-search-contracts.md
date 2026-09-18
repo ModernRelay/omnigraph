@@ -19,7 +19,7 @@ blocked_on:
   - "Phase 0 vector/fusion numeric policies and independent oracles; exact-tie route dispositions against pinned upstream code"
   - "Read options expressed as session settings (RFC 2026-09-16); whole-query resource admission owned by the engine version 2 memory/admission component named by RFC 0067 (PR #711)"
   - "Phase 0 minimal compiler/engine/GQT vertical slice with later-stage discovery and shared-resource refusal"
-  - "Phase 0 fixed mixed-workload corpus, judgments, budgets and acceptance protocol; production qualification belongs to Phases 1–6"
+  - "Phase 0 fixed mixed-workload corpus, judgments, budgets and acceptance protocol; production qualification belongs to Phases A–G"
 ---
 
 # RFC 0048: Search contracts and retrieval algebra
@@ -79,7 +79,7 @@ those boundaries. The [phase handoffs](#implementation-phases) name the
 remaining decisions, owners and required proof. Implementers must investigate
 open claims rather than treating proposed syntax or passing probes as truth.
 Frontmatter lists remaining design-acceptance gates; the
-[release gates](#phase-0-acceptance-versus-release-qualification) retain full
+[release gates](#acceptance-versus-release-qualification) retain full
 production obligations. Moving a check to its implementation phase does not
 waive it or make the current code correct.
 
@@ -553,7 +553,7 @@ The legacy spellings are not removed in the same release: they compile to
 the new typed IR with a deprecation diagnostic for one release and are
 removed in the next, with the GQ language major bump the
 [compatibility surfaces](2026-09-14-compatibility-surfaces.md) RFC defines.
-The lexical RFC fixes the mapping for its spellings; Phase 6 fixes the
+The lexical RFC fixes the mapping for its spellings; Phase E fixes the
 `nearest`, `order` and positional-`rrf` mapping.
 Rewritten application/stored queries and examples ship with the implementation.
 A rewrite must ask the caller to choose exact versus approximate retrieval
@@ -1354,7 +1354,7 @@ The [historical physical experiments](https://github.com/ModernRelay/omnigraph/b
 record configurations, timing/I/O/spill tables and controls. They support these
 implementation candidates, not production latency or a universal winner.
 Reproduce through the instrument on the evidence branch (it returns to the
-tree with Phase 3):
+tree with Phase F):
 
 ```sh
 cargo bench -p omnigraph-engine --bench scenarios -- \
@@ -1749,7 +1749,7 @@ rejection cases is retained on the evidence branch
 ([`staged_probe.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-compiler/src/query/staged_probe.rs)).
 It is partial compiler evidence, not a staged AST/IR or execution, and it is
 deliberately not in the tree: the production compiler owns these constructs
-when Phase 1 lands, and `.gqt` cases own their behaviour.
+when Phase D lands, and `.gqt` cases own their behaviour.
 
 The default-resolution fixtures and the exact lexical qualification matrix
 are in [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#qualification-matrix).
@@ -1770,45 +1770,47 @@ by this draft.
 
 ## Rollout
 
-Acceptance requires the frontmatter design gates to have concrete dispositions
-and owned evidence. Phase 0 supplies the decision work and prototypes needed
-for acceptance; the later phases implement and qualify the accepted contracts.
-Each phase can be reviewed in separate PRs. The public contract ships as one
-coordinated pre-stable change with one necessary format rebuild, without
-requiring users to adopt an interim language or rebuild after each phase.
+Three principles order the work. Irreversible commitments — SchemaIR
+features, `@analyzed` bindings, embedding recipes, index certificates, and
+language removals — ship last and opt-in; additive syntax, metadata,
+diagnostics, settings, stored queries and `explain` ship first. Information
+is front-loaded and commitment back-loaded: the in-context assumption is
+measured on a prototype surface before syntax freezes, and correctness ships
+before capability before performance. Every phase is worth shipping alone and
+revertible alone; no phase depends on a coordinated cutover with a mandatory
+format rebuild. Each phase can be reviewed in separate PRs.
 
-### Phase 0 acceptance versus release qualification
+### Acceptance versus release qualification
 
-An accepted design must name a feasible route, the interfaces it requires and
-the tests that can disprove it. It does not assert that all production routes
-already implement the contract. These obligations have separate completion
-points:
+Acceptance of this RFC requires the frontmatter design gates (Phase 0: the
+decision work and prototypes) to have concrete dispositions and owned
+evidence. An accepted design names a feasible route, the interfaces it
+requires and the tests that can disprove it; it does not assert that
+production routes implement the contract. Production status advances phase
+by phase in the frontmatter of the RFC that owns the phase. An explicit
+upstream dependency can close a route decision but cannot qualify or enable
+the route. No production gate is waived by this classification, and the four
+recorded GQT regressions remain release blockers for the phases that own them
+even though they need not be repaired to accept the design.
 
-| Package | Phase 0 acceptance gate | Production release gate / owner |
+| Package | Phase 0 acceptance gate | Production gate and phase |
 |---|---|---|
-| Language and composition | Checked syntax/types/plans for the initial stages and C1–C4; global-union compatibility proof; invalid-rewrite counterexamples; one actual compiler/engine/GQT slice with refusal | Phases 1/3: every enabled stage, walker, result type and optimized population boundary through GQT and mechanism owners. Deferred C1/C3/C4 execution remains outside this release. |
-| Schema and identity | Default lifetime, space/binding separation, concrete `.pg` syntax and canonical serialization prototype; export/reapply/rename/drop-readd fixtures; coordinated format disposition | Phases 1/6: accepted SchemaIR, provider qualification, migration and predecessor/rebuild tests. No unresolved provider identity silently accepted. |
-| Lexical/vector numerics | Complete numeric policies and independent oracles; discriminating native probes; explicit exact scan/fallback or upstream-dependency decisions | Phases 2/5: NFC/index parity, live statistics, fuzzy scoring, raw-vector rescoring, complete ties and all supported lifecycle states/targets. |
-| Resource/read interfaces | Typed request/result/error contracts and charging units; minimal shared-budget refusal and snapshot/fingerprint round-trip proofs; every unaccounted native allocation/dispatch assigned a route decision | Phases 1/4/5: actual preallocation/dispatch gates, bounded cancellation/cleanup, every renderer and policy/retention path, whole-query and fallback accounting. |
-| Retrieval evaluation | Frozen mixed tasks/corpus, judgment provenance, budgets, comparisons and acceptance criteria before tuning | Phase 5: measured correctness/quality/cost, source defaults and each enabled ANN family's effort mapping; retain failures and unsupported cases. |
-
-An unresolved design choice or a missing required prototype keeps Phase 0
-open. Production work scheduled above does not. An explicit upstream dependency
-can close a route decision, but cannot qualify or enable that route; the release
-still needs a working bounded implementation of every required capability.
-No production gate is waived by this classification. The four recorded GQT
-regressions remain release blockers even though they need not be repaired to
-accept the design.
+| Language and composition | Checked syntax/types/plans for the initial stages; the kernel decision; invalid-rewrite counterexamples; one compiler/engine/GQT slice with refusal | Phase D: every enabled stage, walker, result type and optimized population boundary through GQT and mechanism owners, plus the in-context instrument. C1/C3/C4 execution is Phase G. |
+| Schema and identity | Default lifetime, space/binding separation, concrete `.pg` syntax and canonical serialization prototype; export/reapply/rename/drop-readd fixtures; opt-in feature disposition | Phase C: accepted SchemaIR feature, provider qualification, no rebuild for non-adopters, predecessor tests. No unresolved provider identity silently accepted. |
+| Lexical/vector numerics | Complete numeric policies and independent oracles; discriminating native probes; exact scan/fallback decisions | Phase C (lexical) and D (vector): NFC/index parity, live statistics, fuzzy scoring, raw-vector rescoring, complete ties, all lifecycle states. Phase F: native parity. |
+| Resource/read interfaces | Read options as settings; typed result/error contracts; snapshot/fingerprint round-trip proofs; every unaccounted native allocation/dispatch assigned a route decision or handed to engine version 2 | Phase A: descriptors, diagnostics, coarse budgets. Phase D: coherent follow-up. Engine version 2: whole-query admission. |
+| Retrieval evaluation | Frozen mixed tasks/corpus, judgment provenance, budgets, comparisons and acceptance criteria before tuning | Phase B: the instrument and its baseline. Phase F: measured correctness/quality/cost, source defaults, each ANN family's effort mapping. |
 
 ### Implementation phases
 
-Phase 0 resolves the contracts; Phases 1–6 implement and qualify one coordinated
-release. Fixtures and transport/migration tooling can proceed once their
-required interfaces are fixed. Native experiments can begin against exact
-references, but enabling a route requires its semantic and resource gates.
+Phase 0 resolves the contracts; Phases A–G implement and qualify them one
+reversible step at a time, ordered by risk rather than by the sections of
+this RFC. Fixtures and tooling can proceed once their interfaces are fixed;
+native experiments can begin against exact references, but enabling a route
+requires its semantic and resource gates.
 
 These are required outcomes, not a claim that the proposed mechanisms work.
-For each package, inspect the actual checkout/lockfile and complete relevant
+For each phase, inspect the actual checkout/lockfile and the relevant
 [Lance documentation](../dev/lance.md), extend the [existing owner](../dev/testing.md),
 and record the revision, toolchain/configuration, command, result and limits.
 Use a test that would fail if the claim were false. Revalidate changed
@@ -1826,195 +1828,186 @@ Keep evidence in the [native matrix](#contract-to-code-qualification) and
 status in frontmatter. A contradictory probe requires revising the proposed
 mechanism, not weakening the promised result.
 
-#### Phase 0: resolve contracts and build the oracles
+| Phase | Ships | Risk and reversibility | Owner | Gate |
+|---|---|---|---|---|
+| A — Truth first | Refusals (`T26`, `T27`, `FullTextIndexRequired`); retrieval as typed IR; projectable metrics; deterministic ties; `warnings`/`metrics`/`retrievals`/usage descriptors; the diagnostics contract; `explain` v0 (logical plan); coarse budgets through the existing `ResourceLimitExceeded` owner; session-scoped caching of version-pinned state | Low: no syntax or format change; refusals and additive fields | RFC 0047 | Characterization goldens; the traversal-target and unindexed regression cases green; per-request overhead measured |
+| B — The agent door | Stored queries as typed tools; `@description` on `.pg` declarations and in `schema show`; the one-page card; the in-context competence instrument with graph-computed ground truth; baseline measurements on today's language | None: the PG annotation is metadata | This RFC (agent-facing surface); composition RFC (instrument) | Instrument runs end to end; baseline recorded |
+| C — Representations, opt-in per field | `@analyzed` and analyzer profiles as an additive SchemaIR feature (unchanged graphs need no rebuild); resolved embedding recipes and defaults; `terms`/`match_terms` as a predicate; the exact scan baseline across index states; `bm25_v1` against the Decimal oracle; zero-edit membership through the existing FTS index, fuzzy through a budgeted scan | Medium: the format commitment is opt-in | Lexical RFC; this RFC (representation identity) | Membership laws across absent/partial/full/rebuilt indexes; oracle parity; the fuzzy and index-state regression cases green |
+| D — Kernel stages, additive, behind a setting | `filter`, `let`, `rank` (`lexical`, `knn`, `ann`, `rrf`, `ties:`), `group`, `order`/`limit` at any position with `of`/`per`, pure `return` with the aggregate sugar, `metric()`; typed stage IR with metric origin and fingerprints; coherent follow-up reads; exact physical paths only; the old grammar still parses and a session setting selects the kernel | Medium: additive syntax, no format; reversible | This RFC | Instrument A/B (first-try validity, turns) kernel versus current grammar; C2's terminal subset; barrier cost measured |
+| E — Cutover | Release N: legacy spellings compile to the kernel with deprecation diagnostics and a rewrite tool for stored queries; GQ minor bump. Release N+1: removal and major bump under the compatibility-surfaces RFC | User-facing, bounded by the window; reversible until N+1 | This RFC and the lexical RFC (mappings) | Kernel not worse than the old grammar on the instrument; no un-migrated stored query |
+| F — Acceleration and qualification | Native lexical routes with parity oracles; ANN families qualified for recall against `knn`; statistics-driven prefilter/postfilter and route choice with differential oracles; late hydration; plan cache; engine version 2 planner integration through the rewrite catalogue | Performance only; every route behind a parity gate; piecemeal | This RFC with the engine version 2 planner RFC | Each route: oracle identical, cost measured; defaults chosen inside the evaluation envelope |
+| G — Programmability and composition | `fuse(expr)`, `define`, the typed plan surface, multi-statement requests, `sub()` reductions, type-union targets, path selectors, each its own increment | Additive, one at a time | Composition RFC | Each gated by the instrument and its own oracle |
 
-**Input:** fresh production baseline, capability matrix, open gates and
-archived experiments inspected at their recorded bases.
+#### Phase A: truth first
 
-**2026-09-13 decision checkpoint:** C3 retains partial term scores, distinguishes
-zero from null and preserves membership. Shared expressions have explicit
-precedence, typing, null and checked-arithmetic rules. Global execution is
-deferred with compatibility obligations retained. On base `dd6959c8` plus this
-change, Rust 1.97.1 passes all 367 compiler tests, the 13-case lexical oracle
-and both `staged_composition` native tests. This settles the stated policies;
-it does not complete any production evaluator or the phase's remaining gates.
+RFC 0047 is this phase and its ordered stages are the internal order. It
+ships first and alone because every item is a refusal of a wrong answer or
+an additive field. The session-scoped caching of immutable version-pinned
+state rides with it because the fixed per-request overhead, not plan choice,
+bounds the agent workload, and the cached state is invariant-12-clean.
 
-```bash
-# on the evidence branch at dd6959c8
-cargo +1.97.1 test --locked -p omnigraph-compiler
-cargo +1.97.1 test --locked -p omnigraph-engine --test search lexical_scoring_v1_reference_oracle -- --exact
-cargo +1.97.1 test --locked -p omnigraph-engine --test rrf_prefilter_gate staged_composition
-```
+**Exit:** characterization goldens before and after the retrieval-IR
+refactor; every ranked result totally ordered; descriptors in every
+transport; the two regression cases RFC 0047 owns green.
 
-| Decision package | Required disposition and proof |
-|---|---|
-| [Language](2026-09-18-gq-composition-and-language-evolution.md#language-evolution-and-compatibility) | Shared expressions, explicit output, namespaces, precedence, parameters and scope; parser/type/plan fixtures |
-| [Composition](2026-09-18-gq-composition-and-language-evolution.md#required-composition-examples) | C1–C4 syntax, type derivation, golden plans, physical feasibility and invalid-rewrite counterexamples |
-| [Selection/scoring](#target-identity-fan-out-grouping-and-metrics) | Target/binding/group multiplicity, total ties, live statistics, lexical/vector numeric policy and checked fusion arithmetic |
-| [Representations](#representation-identity-and-source-attribution) | Schema defaults and overrides, resolved encoder/Unicode/analyzer identity, export/reapplication and format coordination with RFCs 0040/0043/0044 |
-| [Global search](#graph-wide-discovery-across-entity-types) | Execution deferred by explicit decision; prove typed identity/source/table separation and future union/narrowing/projection compatibility before stabilization |
-| [Execution/read contract](#result-metadata-coherent-continuation-and-budgets) | Resource units, admission/interfaces, error/result types, fingerprints, replay and retention |
-| [Workload](#mixed-workload-qualification) | Fixed tasks/corpus, exact oracles, relevance judgments, recipes, budgets and acceptance criteria before tuning |
+**Open:** fuzzy analysis and index-state divergence remain until Phase C;
+whole-query admission remains engine version 2's.
 
-**Exit:** concrete design dispositions for every frontmatter gate and
-native-matrix row: a prototype-supported route, specified bounded fallback
-with its feasibility proof, or explicit upstream dependency. Carry a minimal
-query through the actual compiler/engine/GQT with success and shared-resource
-refusal; include later-stage descriptors, column demand, GQT detection and
-pre-scan parameter admission. Existing compiler, search, schema and read owners
-supply the evidence.
+#### Phase B: the agent door
 
-**Open:** logical goldens and native primitives do not establish integrated
-C1–C4 lowering, numeric/null evaluation or whole-query bounds. The archived
-lexical integration proves only its recorded slice. Full production C1/C3/C4
-and general C2 grouping are deferred, but their design proofs are due here.
-Global execution is explicitly deferred; its compatibility proof is still due.
-Do not start a dependent package before its interfaces are resolved.
+**Ships:** the [agent-facing surface](#agent-facing-surface): stored queries
+as typed tools with descriptions that state the population, the result and
+the one trade-off; `@description` on schema declarations, printed by
+`schema show`; the one-page card; the composition RFC's
+[in-context competence](2026-09-18-gq-composition-and-language-evolution.md#in-context-competence) instrument with a task
+set whose ground truth exact queries compute at a pinned snapshot.
 
-#### Phase 1: build representation, plan, and resource foundations
+**Exit:** the instrument runs against today's language and records
+first-try validity, turns to a correct query, task success and tokens per
+model; those numbers are the baseline every later spelling decision is
+measured against.
 
-**Input:** Phase 0's accepted interfaces and ordinary-query compatibility fixtures.
+**Open:** nothing that blocks another phase; this phase exists so that
+Phase D is decided on evidence.
 
-Implement resolved per-field representations/defaults, shared expressions,
-typed stage IR, metric/population identity and fingerprints. Analytical rows
-need no score. All operators share one snapshot, admission, cancellation and
-resource context. Extend compiler AST/IR/SchemaIR/descriptors, engine query
-execution, sealed TableStore and schema/rebuild owners; every stage walker
-must retain later reads and hidden columns.
+#### Phase C: representations, opt-in per field
 
-**Exit:** serialization, rename versus drop/re-add, parameter/refusal,
-default/override and export/reapplication fixtures; no drift with runtime
-defaults; one budget across stages/fallbacks. Close native allocation,
-shared-buffer and dispatched-I/O gates before claiming whole-query bounds.
-Exercise active reads/decode, retained plans/caches, output and encoder calls.
+**Input:** Phase 0's numeric oracles and schema-default decisions.
 
-**Open:** a shared DataFusion pool does not govern all native allocations or
-tasks. Inspect ownership and prove preallocation refusal, cancellation and
-cleanup. Typed extension points do not make deferred public operators available.
+Build resolved per-field representations, `@analyzed` with its analyzer and
+scorer defaults and embedding recipes with the schema-owned default, as an
+additive SchemaIR feature that a graph adopts field by field. A graph that
+declares neither is unchanged and needs no rebuild; a field that adopts
+`@analyzed` takes the NFC certificate and an index rebuild for that field.
+Build bounded NFC/analysis, complete `Terms` matching, unified exact/fuzzy
+scoring against the Decimal oracle, and the exact scan baseline that holds
+across every index state, with zero-edit membership served by the existing
+FTS index and fuzzy membership by a budgeted scan. Extend search/substrate
+owners and the lexical RFC's qualification matrix; observable rows, shapes
+and errors belong in GQT.
 
-#### Phase 2: implement complete lexical and vector retrieval
+**Exit:** the [lexical RFC's phase](2026-09-18-analyzed-lexical-search.md#rollout) exit; export/reapplication,
+rename versus drop/re-add, default/override and no-drift fixtures for both
+representation kinds; the fuzzy and index-state regression cases green.
 
-**Input:** Phase 1 representations/resources and Phase 0 numeric oracles.
+**Open:** native fuzzy analysis, float32 BM25, stale statistics and native
+cuts are not substitutes for the accepted exact contract (Phase F). A
+provider label is not an immutable encoder; unverifiable aliases are refused.
 
-The lexical half of this phase (bounded NFC analysis, complete `Terms`
-matching, unified exact/fuzzy scoring and qualified index acceleration) is
-owned by [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#rollout). This RFC's half builds
-exhaustive `knn` and declared `ann` with qualified fallback, charges
-statistics, coverage, scoring and selection to the shared context, and
-extends the search and substrate owners. Observable rows, shapes and errors
-belong in GQT.
+#### Phase D: kernel stages, additive, behind a setting
 
-**Exit:** predicate/retriever membership agreement before cuts, independent
-score and vector fixtures, total ties, all index/lifecycle states, and typed
-budget/cancellation failures. Assert that intended index/compaction states
-were reached; distinguish current from pinned answers and reopen snapshots.
+**Input:** Phase C representations, Phase B's baseline, Phase 0's kernel
+decision.
 
-**Open:** native cuts are not substitutes for the accepted exact contract.
-Numerical parity does not establish relevance quality. Candidate-scoring
-operators and richer representations remain deferred; Phase 5 chooses
-measured defaults.
-
-#### Phase 3: compose graph scope, fusion, and selection
-
-**Input:** Phase 2 reference retrievers and Phase 1 stage/resource interfaces.
-
-Connect graph-defined populations, named weighted RRF, inter-stage traversal,
-group quotas, final projection/order and existing terminal aggregates.
-Preserve distinct target identity, missing-arm metrics and every winning
-binding row. Extend IR/query execution, traversal/projection/aggregation,
-GQT and existing search/selection owners.
+Add the kernel stages to the production grammar without removing anything:
+`filter`, `let`, `rank` with `lexical`/`knn`/`ann`/`rrf` and `ties:`,
+`group`, `order`/`limit` at any position with `of`/`per`, pure `return` with
+the aggregate sugar, `metric()`. Lower them through typed stage IR carrying
+metric origin and fingerprints; preserve distinct target identity,
+missing-arm metrics and every winning binding row; exact physical paths only
+(scan-based lexical, exhaustive `knn`, the existing `ann`). Complete the
+coherent follow-up read path: `@id` lookup at a pinned snapshot and replay
+identity through every renderer. A session setting selects the kernel while
+both grammars parse, so the instrument compares them on the same tasks.
 
 **Exit:** executable counterexamples distinguish filter-before/after-cut,
 source windows from final limits, target counts from path counts, and
-missing membership from a new feature. C2's initial terminal subset returns
-three binding rows from p1/p2 and excludes p3. Test null/multiple group
-membership, metric reductions, inherited order and fan-out/sort refusal despite
-a small final result. No successful truncated aggregate.
+missing membership from a new feature; C2's terminal subset returns three
+binding rows from p1/p2 and excludes p3; null and multiple group membership,
+metric reductions and inherited order tested; the instrument shows the kernel
+at least as good as the old grammar on first-try validity and turns; barrier
+cost measured.
 
 **Open:** native relational probes do not prove GQ lowering, masks, metric
-carriage, descriptor walkers or order after payload reads. Compare optimized
-plans with independent oracles and retain the nullable dynamic-filter fence.
-Reusable intermediate groups, general distinct aggregates and full per-parent
-collection remain deferred.
+carriage or order after payload reads; compare optimized plans with the
+independent oracles and retain the nullable dynamic-filter fence.
 
-#### Phase 4: complete the agent-facing read path
+#### Phase E: cutover
 
-**Input:** Phase 0 read/error/fingerprint decisions and Phase 3 result semantics;
-transport work can begin earlier against fixed interfaces.
+**Input:** Phase D green on the instrument; the deprecation mappings fixed in
+the lexical RFC (`fuzzy`, `search`, `match_text`) and here (`nearest`,
+retrieval in `order`, positional `rrf`).
 
-Expose inline/stored queries, inspectable plans, metrics, completion/coverage/
-selection metadata and coherent identity-based source reads. Reuse existing
-snapshot carriers, descriptions/instructions and authorization. Extend API
-types, server data/stored-query/policy/OpenAPI owners and CLI parity.
+Release N: legacy spellings compile to the kernel and emit the deprecation
+diagnostic with the replacement; a rewrite tool migrates stored queries and
+`cluster.yaml` inline queries; GQ language minor bump. Release N+1: the
+spellings are removed with the GQ language major bump under the
+compatibility-surfaces RFC; the kernel becomes the only grammar and the
+session setting retires.
 
-**Exit:** discovery → pinned source read → expansion → verification, and
-graph-scoped retrieval → terminal aggregate through embedded, HTTP, stored-query
-and CLI paths. Include an entity without an application key. Change head so
-pinned/current answers differ; test expired/unavailable snapshots, revoked
-access, exact-coverage refusal, JSON/JSONL metadata and result types.
+**Exit:** the existing schema/rebuild, cross-version, API/OpenAPI, CLI and
+query owners prove rewrite idempotence and migrated journeys; no stored query
+in the fleet still uses a removed spelling; coordinated docs and release
+notes.
 
-**Open:** existing request fields do not prove renderer/client compatibility,
-general system-ID lookup or retention. A graph snapshot does not freeze an
-external encoder. Qualify identity and refusal boundaries; stable ranked
-cursors and durable result storage remain deferred.
+**Open:** actual client parsers; the recheck of format ownership as related
+RFCs land.
 
-#### Phase 5: qualify physical execution and measure retrieval
+#### Phase F: acceleration and qualification
 
-**Input:** exact references from Phase 2; full-pipeline trials additionally need
-Phases 3–4 and the fixed mixed-workload protocol.
+**Input:** exact references from Phases C and D; the fixed mixed-workload
+protocol.
 
-Compare each native route with the exact evaluator and composition oracle:
-graph masks, analyzer certificates, expansions, live statistics, tails, raw
-vectors, ties, partitions, fallback and cancellation. ANN is judged for recall
-against exact `knn`, not exact candidate equality. Use existing search/
-substrate owners and benchmark instruments.
+Compare each native route with the exact evaluator and the composition
+oracle: graph masks, analyzer certificates, expansions, live statistics,
+tails, raw vectors, ties, partitions, fallback and cancellation. ANN is
+judged for recall against exact `knn`, not exact candidate equality. Enable
+statistics-driven prefilter/postfilter and route choice through the
+[rewrite catalogue](#rewrite-catalogue-and-explain-contract) with a
+differential oracle per route pair; add late payload hydration and the plan
+cache; integrate with the engine version 2 planner as it lands.
 
-**Exit:** every enabled path passes semantic/resource gates. Freeze
-corpus/schema/snapshot, representations, model/recipes, windows, budgets,
-expected facts, judgments and pass/refusal criteria before trials. Report
-task/population errors, query repairs, round trips, context, quality and cost;
-retain failed trials and judgment provenance. Choose source-window defaults
-and each index family's `ann_default_v1` mapping only within that envelope.
+**Exit:** every enabled route passes its semantic and resource gates; source
+window defaults and each index family's `ann_default_v1` mapping chosen
+within the frozen evaluation envelope; task/population errors, repairs, round
+trips, context, quality and cost reported with failed trials retained.
 
-**Open:** the document pilot lacks independent human adjudication and broader
-analytical coverage. No universal join strategy, candidate window or effort
-mapping is established. Keep an unqualified native route disabled while a
-qualified fallback serves the contract; future operators need fresh trials.
+**Open:** an unqualified route stays disabled while the exact fallback serves
+the contract; no universal join strategy or effort mapping is established.
 
-#### Phase 6: ship the coordinated language and data migration
+#### Phase G: programmability and composition
 
-**Input:** qualified Phases 1–5, final schema/format identity and wire decisions.
-
-Follow the [migration sequence](#migration-sequence): finalize identities;
-prepare schema/query diagnostics and examples; export/init/load real predecessor
-fixtures; regenerate incompatible representations and reconcile indexes;
-verify ordinary and migrated queries, result types and follow-up; publish
-coordinated docs/release notes and remove legacy syntax/scaffolding.
-
-**Exit:** existing schema/rebuild, cross-version, API/OpenAPI, CLI and query
-owners prove mutual format refusal, compatible-value preservation, unresolved
-encoding refusal, rewrite idempotence and successful migrated journeys.
-Run the current [canonical checks](../dev/testing.md), including separate
-GQT and required environments. Users encounter one supported cutover.
-
-**Open:** recheck format ownership as related RFCs land, actual client parsers,
-and loss of old histories/snapshot references across rebuild. A skipped
-predecessor test is not upgrade evidence. Deferred composition and any explicitly
-deferred global-search capability must remain absent from release claims.
+Each increment is its own PR against the composition RFC's kernel:
+`fuse(expr)` with `rrf_v1` as its named policy, transparent `define`, the
+typed plan surface, multi-statement requests at one snapshot, `sub()`
+reductions, type-union targets for graph-wide search, path selectors. Each is
+additive, each is gated by the in-context instrument and its own oracle, and
+none is required for this RFC's `complete`.
 
 ### Release and completion criteria
 
-Phases 1–4 establish the full initial feature path; Phase 5 qualifies its
-execution and defaults; Phase 6 makes it a supported release. Fuzzy ranked
-retrieval, coherent follow-up, and whole-query resource bounds are required
-for that release. They cannot be moved to the extension list to mark the
-implementation complete. An acceleration path may remain disabled only when
-the qualified fallback preserves the promised semantics and resource behavior.
+Phases A–D establish the feature path; Phase E makes the kernel the one
+grammar; Phase F qualifies execution and defaults. This RFC's
+`implementation` is `complete` when Phases D, E and F have exited. Fuzzy
+ranked retrieval, coherent follow-up, and typed budget failures are required
+for that; they cannot be moved to the extension list. An acceleration path
+may remain disabled only when the qualified fallback preserves the promised
+semantics and resource behavior. Whole-query admission is engine version 2's
+completion criterion, not this RFC's.
 
 Frontmatter remains the implementation-status authority. Advance it when
 implementation lands, and mark it complete only after the release criteria
-and their owned evidence pass. Historical prototypes and current-code baseline
-tests do not count as completion of a new phase.
+and their owned evidence pass. Historical prototypes and current-code
+baseline tests do not count as completion of a new phase.
+
+### What is off the critical path
+
+The coordinated cutover with a mandatory export/init/load rebuild (replaced
+by opt-in representations and the deprecation window); native fuzzy
+acceleration (Phase F, after the scan baseline is the oracle); the
+whole-query resource ledger (engine version 2 owns it; Phase A ships coarse
+budgets as settings); cross-type search, `sub()` reductions and every
+`Foundation` row (Phase G).
+
+### Risk register
+
+| Assumption | Tested in | If wrong |
+|---|---|---|
+| An in-context agent uses the kernel at least as well as today's grammar | B and D, before any removal | Keep the old grammar as the surface and revisit spellings with the instrument; nothing shipped is lost |
+| Exact-scan fuzzy matching is fast enough on real graphs (tables of 200k rows exist) | C | Zero-edit stays index-served; fuzzy stays budgeted and refuses loudly; acceleration moves earlier in F |
+| `@analyzed` can be an opt-in SchemaIR feature with no stamp bump for non-adopters | C's feature design | A versioned feature flag with the same no-rebuild property for non-adopters |
+| Session-scoped caching removes the fixed per-request overhead | A | Multi-statement requests carry the load; planner work in F is not the answer either way |
+| Stage barriers cost little | D | Widen the rewrite catalogue with proven equivalences before E |
 
 ### Extensions after the initial release
 
@@ -2026,6 +2019,7 @@ Every later extension retains the stated semantic and qualification boundary.
 `Foundation` rows require their grammar/type/composition proofs before syntax
 stabilization while their broader operators remain deferred. These design
 proofs do not enlarge the advertised initial-release feature set.
+
 ### Next delivery milestone: composed analytical answers
 
 Owned by [GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md#next-delivery-milestone-composed-analytical-answers):
@@ -2033,7 +2027,7 @@ C1, C4 and C2's general grouping extensions after this RFC's initial release.
 
 ## Unresolved questions
 
-The [acceptance/release matrix](#phase-0-acceptance-versus-release-qualification)
+The [acceptance/release matrix](#acceptance-versus-release-qualification)
 assigns the completion point for each proof. In particular, decided interfaces
 still require prototypes; full production qualification belongs to its phase.
 
@@ -2053,17 +2047,22 @@ still require prototypes; full production qualification belongs to its phase.
    handed to the engine version 2 memory/admission component; resolve native
    allocation and dispatch gaps for graph masks, scoring, coverage,
    sort/spill and output there. Actual default limits, complete enforcement
-   and cancellation qualification belong to Phases 1/4/5.
+   and cancellation qualification belong to Phases D and F and to engine
+   version 2.
 4. Prototype the decided read options, envelope, retention/refusal boundaries
-   and canonical definition/semantic/execution identities. Phase 4 qualifies
+   and canonical definition/semantic/execution identities. Phase D qualifies
    all transports and authorization paths. Stable ranked cursors remain deferred.
 5. Freeze the mixed-workload corpus, judgments and acceptance protocol in
-   Phase 0. Phase 5 chooses ANN effort mappings and agent recipe defaults from
+   Phase 0. Phase F chooses ANN effort mappings and agent recipe defaults from
    the resulting evaluation. The document pilot alone is insufficient. Further
    multilingual profiles require matched-set evidence and versioned identities.
 
 ## Decision log
 
+- 2026-09-18 — replaced the single coordinated cutover with Phases A–G ordered
+  by risk: truth first, the agent door, opt-in representations, additive
+  kernel stages behind a setting, a deprecation cutover, acceleration,
+  programmability; added the risk register and what is off the critical path.
 - 2026-09-18 — decided that combination is an expression and retrieval is
   named: `fuse(expr)` as the general fusion source with `rrf_v1` as its named
   policy, explicit-mixing and missing-arm rules, structural identity,
