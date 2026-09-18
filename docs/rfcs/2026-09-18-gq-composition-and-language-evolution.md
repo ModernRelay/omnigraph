@@ -685,7 +685,7 @@ and one budget.
 
 | Stage | Job | Rows in → out | Rule |
 |---|---|---|---|
-| `match { pattern }` | Extend bindings by a graph pattern | Join; may fan out | Pattern items only: typed bindings with inline constraints (`{ name: "x" }`, `{ @id: $id }`), traversals and paths, `not { }`, `optional { }`. No scalar predicates. |
+| `match { pattern }` | Extend bindings by a graph pattern | Join; may fan out | Pattern items only: typed bindings with inline constraints (`{ name: "x" }`, `{ @id: $id }`), traversals and paths, `not { }`, `optional { }`. A scalar predicate is admitted only inside `optional { }` and `not { }`, where its placement changes the answer; nowhere else. |
 | `filter { predicate }` | Keep rows | Subset | The only home for scalar predicates, `match_terms` included. A `filter` after a cut is the "different question" the composition laws describe. |
 | `let { expr as name, … }` | Add columns | Same rows | Scalar expressions, subquery reductions and membership-preserving scoring features (`lexical_score($p.text, terms($q))`), which replaces RFC 0048's `score` stage. Siblings read the incoming scope. |
 | `rank $x { source … yield s }` | Select and order distinct targets | Ranked rows; losing targets drop | Sources are an open set; `candidates:` is the retriever's window; `ties: [key, …]` extends the stage comparator before stable identity; `yield` names the output. One form even for one source. |
@@ -727,6 +727,24 @@ are different operations, not two spellings.
 Mixing predicates into `match` is not only a second spelling: it is the
 mechanism behind the dropped traversal-target predicate that RFC 0047's `T26`
 refuses. Separating pattern from predicate removes the class.
+
+**Pattern versus predicate.** A pattern item creates rows: it introduces or
+joins bindings and its output is every way the shape matches, unbounded by
+its input. A predicate removes rows: it is a Boolean over bindings that
+already exist, evaluated row by row, and a predicate over an unbound
+variable is a type error (Datalog's safety condition). Every mature
+language keeps both a pattern-scoped and a table-scoped position, because
+the two differ exactly across outer joins, negation, aggregation and cuts:
+SQL's `ON` versus `WHERE` on a `LEFT JOIN` and `WHERE` versus `HAVING`,
+Cypher's `OPTIONAL MATCH … WHERE` versus a later `WITH … WHERE`, GQL's
+pattern `WHERE` versus its `FILTER` statement, SQL/PGQ's `GRAPH_TABLE`
+`WHERE` versus the enclosing `WHERE`, SPARQL's group-scoped `FILTER`. The
+rule here is the SQL `ON`/`WHERE` rule: a predicate may sit inside a pattern
+block only in the sub-patterns where moving it outside would change the
+answer, `optional { }` and `not { }`; inline constraints remain pattern
+properties; every other predicate is a `filter` stage. Gremlin, which makes
+no distinction and lets step order carry the meaning, is the counterexample:
+the planner cannot tell a shape from a selection.
 
 **Open sets.**
 
@@ -998,6 +1016,10 @@ before optimizing batching, and measure per-group rescan cost.
   collapses `select`, `take`, `score`, `collect` and `optional` and moves
   scalar predicates out of `match`. Recorded as a decision RFC 0048 must
   take before its syntax stabilizes; the moved-in text above is unchanged.
+- 2026-09-18 — fixed the pattern/predicate rule as SQL's `ON`/`WHERE` rule:
+  predicates inside a pattern block only within `optional { }` and
+  `not { }`, inline constraints as pattern properties, `filter` everywhere
+  else.
 - 2026-09-11/12 — added explicit `yield` integration, C1–C4 logical plans and
   native population/collection counterexamples. Phase 0 remains incomplete.
 - 2026-09-10 — made mixed analytical/graph/retrieval tasks the agent objective;
