@@ -662,7 +662,12 @@ design direction and does not claim implemented support.
 ### Kernel: one stage per job
 
 **Principle.** The language is a small kernel of stage kinds over binding
-tables plus one expression grammar. Each kernel stage has one job and one
+tables plus one expression grammar. In the terms of
+[evaluating data systems from first principles](../dev/systems.md), the
+kernel fixes operations before interface: each stage's semantics (population,
+multiplicity, order, metric origin) is stated as a contract, and a spelling
+is only ever an interface for one such operation, which is why a construct
+that cannot be desugared is a new operation and needs its own RFC. Each kernel stage has one job and one
 spelling. A convenience spelling is admitted only when it desugars to exactly
 one kernel form, `explain` shows that form, and the RFC that adds the spelling
 names the desugaring. A construct that cannot be desugared is a new kernel
@@ -1057,6 +1062,8 @@ before optimizing batching, and measure per-group rescan cost.
   collapses `select`, `take`, `score`, `collect` and `optional` and moves
   scalar predicates out of `match`. Recorded as a decision RFC 0048 must
   take before its syntax stabilizes; the moved-in text above is unchanged.
+- 2026-09-18 — stated the kernel as operations-before-interface in the terms
+  of `docs/dev/systems.md` (#745).
 - 2026-09-18 — kernel adopted; C1–C4 rewritten to `filter`, `order` +
   `limit`, `let` scoring features and `sub()` reductions.
 - 2026-09-18 — programmability and composition became Phase G of RFC 0048's
