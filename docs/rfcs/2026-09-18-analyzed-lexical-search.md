@@ -417,7 +417,7 @@ positive IDF to zero at `N = 2^24`; the
 allocating that corpus. Native scores or top-k cuts require new qualification;
 rescoring an incomplete native candidate set cannot establish exact winners.
 
-The [numerical fixtures](assets/0048-lexical-scoring-v1.json) and the
+The [numerical fixtures](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/fixtures/lexical_scoring_v1.json) and the
 [`lexical_scoring_v1_reference_oracle`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/search.rs)
 probe on the evidence branch cover the chosen formula, zero-edit behavior, repeated/reordered terms,
 alternative aggregation, overlapping groups, `all`/`any`, null/token-empty
@@ -661,7 +661,7 @@ The pinned tokenizer/edit-distance probe passed 73,008 comparisons against an
 independent Unicode-scalar evaluator at budgets zero through two. This covers
 the primitive, not the revised NFC pipeline, indexed completeness or budgets.
 
-The [Decimal oracle](assets/0048-lexical-scoring-v1.py)
+The [Decimal oracle](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/fixtures/lexical_scoring_v1.py)
 generates thirteen 80-digit reference cases. The float64 evaluator uses pinned
 `libm 0.2.16`, tolerance `2e-14 * max(1, expected)`, exact fixture order,
 repeated-term invariance, eligibility-independent scores/features, all/any
@@ -825,9 +825,9 @@ relevance quality; Phase F chooses measured defaults.
 - 2026-09-18 — split out of RFC 0048 at its 2026-09-13 revision with the
   lexical decisions unchanged. Replaced the hard removal of `fuzzy`, `search`
   and `match_text` with a one-release deprecation window and fixed the
-  mapping, following the compatibility-surfaces RFC. Moved the numerical
-  oracle fixtures to `assets/`; the oracle test and native probes stay on the
-  evidence branch until an evaluator exists.
+  mapping, following the compatibility-surfaces RFC. The numerical oracle
+  fixtures, the oracle test and the native probes stay on the evidence branch
+  until an evaluator exists.
 - 2026-09-13 — decided membership-independent lexical features, null and checked
   arithmetic policies, and deferred global execution. Extended the existing
   Decimal, compiler and DataFusion probes; default native arithmetic is not
