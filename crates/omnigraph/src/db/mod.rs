@@ -2,7 +2,6 @@ pub mod commit_graph;
 pub(crate) mod graph_coordinator;
 pub mod manifest;
 pub(crate) mod omnigraph;
-mod recovery_audit;
 mod schema_state;
 pub(crate) mod write_queue;
 
@@ -22,10 +21,8 @@ pub use omnigraph::{
     SkipReason, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
     SystemColumnUpgradeReport,
 };
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{DeferredTableFork, HeldPromotion, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
-#[cfg(feature = "dst")]
-pub use recovery_audit::dst_recovery_audit_rows;
 pub(crate) use schema_state::SchemaContractText;
 
 use crate::error::{OmniError, Result};
@@ -114,7 +111,7 @@ pub(crate) fn is_internal_system_branch(name: &str) -> bool {
 }
 
 /// Microseconds since the UNIX epoch — the `created_at` stamp threaded through
-/// every graph-lineage / recovery-audit / commit-graph row. One canonical
+/// every graph-lineage / commit-graph row. One canonical
 /// helper so the clock-error mapping (variant + message) cannot drift across
 /// the call sites that record those timestamps.
 pub(crate) fn now_micros() -> Result<i64> {

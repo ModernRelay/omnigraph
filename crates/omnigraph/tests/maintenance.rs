@@ -338,7 +338,7 @@ async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
 /// data-table versions. The path must strip that config first. Without the strip,
 /// the aggressive policy below GCs old versions and the config survives the run.
 #[tokio::test]
-async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
+async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tables() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir
         .path()
@@ -383,16 +383,18 @@ async fn optimize_clears_stale_auto_cleanup_on_data_tables_too() {
     db.optimize().await.unwrap();
 
     let ds = Dataset::open(&person_full).await.unwrap();
-    // (a) the stale auto_cleanup config was cleared (non-destructive by construction).
+    // (a) RFC 0067: every engine commit, the detached rewrite and its
+    // promotion included, skips Lance's auto-cleanup, so the stale config is
+    // inert and stays in place rather than costing a config commit.
     assert!(
-        !ds.config()
+        ds.config()
             .keys()
             .any(|k| k.starts_with("lance.auto_cleanup.")),
-        "optimize must clear stale auto_cleanup config on data tables; config = {:?}",
+        "the stale auto_cleanup config is inert and left alone; config = {:?}",
         ds.config()
     );
-    // (b) no version GC: every pre-optimize version survives (compaction + the
-    // config-clear each add versions, so the count only grows).
+    // (b) no version GC: every pre-optimize version survives (the compaction
+    // adds versions, so the count only grows).
     let versions_after = ds.versions().await.unwrap().len();
     assert!(
         versions_after >= versions_before,
@@ -1014,8 +1016,9 @@ async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
     .await
     .expect_err("strict delete must reject uncovered drift before staging the delete");
     assert!(
-        err.to_string().contains("expected"),
-        "delete should fail as a strict stale-version write; got: {err}"
+        err.to_string()
+            .contains("run `omnigraph repair` before writing"),
+        "delete should fail on the uncovered-drift guard at its pinned open; got: {err}"
     );
 
     let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
@@ -1546,50 +1549,6 @@ async fn branch_merge_refuses_uncovered_target_drift_before_arming_recovery() {
 // pending. Operating on an unrecovered graph could publish a partial write that
 // the all-or-nothing recovery sweep would roll back; the operator must reopen
 // (run the recovery sweep) first.
-#[tokio::test]
-async fn optimize_defers_when_recovery_sidecar_is_pending() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-
-    // Simulate an in-process failed write that left a recovery sidecar on disk.
-    let recovery_dir = dir.path().join("__recovery");
-    std::fs::create_dir_all(&recovery_dir).unwrap();
-    let person_path = node_table_uri(&db, "Person").await;
-    let sidecar_json = format!(
-        r#"{{
-            "schema_version": 1,
-            "operation_id": "01H000000000000000000DEFR",
-            "started_at": "0",
-            "branch": null,
-            "actor_id": "act-test",
-            "writer_kind": "Mutation",
-            "tables": [
-                {{
-                    "table_key": "node:Person",
-                    "table_path": "{}",
-                    "expected_version": 1,
-                    "post_commit_pin": 2
-                }}
-            ]
-        }}"#,
-        person_path
-    );
-    std::fs::write(
-        recovery_dir.join("01H000000000000000000DEFR.json"),
-        sidecar_json,
-    )
-    .unwrap();
-
-    let err = db
-        .optimize()
-        .await
-        .expect_err("optimize must defer (error) while a recovery sidecar is pending");
-    assert!(
-        err.to_string().to_lowercase().contains("recovery"),
-        "optimize defer error should mention recovery; got: {err}",
-    );
-}
-
 #[tokio::test]
 async fn cleanup_without_any_policy_option_errors() {
     let dir = tempfile::tempdir().unwrap();

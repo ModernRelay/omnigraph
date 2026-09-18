@@ -46,7 +46,7 @@ use super::{
     NativeRefPin, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
     TableIdentity, TableRegistration, TableRename, TableTombstone, WinnerRef,
 };
-use crate::seams::{contention, decide_seam};
+use crate::seams::{contention, decide_seam, fail};
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
 /// (`TooMuchWriteContention`). Lance's own `conflict_retries` is set to 0 in
@@ -150,9 +150,10 @@ pub(super) struct PublishOutcome {
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
-    /// Compatibility/default publish behavior for bounded or recovery paths
-    /// that do not carry an exact graph-head precondition. Exact RFC-022
-    /// adapters call `publish_with_precondition` directly.
+    /// Publish without a graph-head precondition. Every production writer
+    /// calls `publish_with_precondition`; only the publisher's own tests use
+    /// this shorthand.
+    #[cfg(test)]
     async fn publish(
         &self,
         changes: &[ManifestChange],
@@ -225,6 +226,15 @@ decide_seam! {
     /// The publisher's `load_publish_state` read, inside the CAS retry loop.
     /// Contention here proves the outer retry re-runs the load.
     pub static PUBLISH_LOAD_STATE = ("publish.load_state", AnyWrite, [Contention]);
+}
+
+decide_seam! {
+    /// After the `__manifest` merge-insert committed durably and before the
+    /// publisher acknowledges it: the graph is already published and visible,
+    /// only the caller's acknowledgement is at risk (the lost-ack window). A
+    /// failure here models a dropped acknowledgement of a durable commit; the
+    /// publisher's ambiguity read-back must recognize it as success (RFC 0067).
+    pub static PUBLISH_POST_MERGE_PRE_ACK = ("publish.post_merge_pre_ack", AnyWrite, [Fail]);
 }
 
 impl GraphNamespacePublisher {
@@ -965,6 +975,11 @@ impl GraphNamespacePublisher {
             .execute_reader(Box::new(reader))
             .await
             .map_err(map_lance_publish_error)?;
+        // The commit is durable and the graph is published; a failure here
+        // models the acknowledgement being lost after that (RFC 0067). It is
+        // an opaque error with no conflict details, so the publish loop's
+        // ambiguity arm reads the manifest back rather than reporting failure.
+        fail(&PUBLISH_POST_MERGE_PRE_ACK)?;
         Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
     }
 
@@ -1044,6 +1059,20 @@ pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
         ));
     }
     OmniError::storage(err)
+}
+
+/// Construct the typed in-doubt outcome for an ambiguous manifest publish: an
+/// opaque error whose read-back could not itself complete, so whether the
+/// commit is durable is genuinely unknown. Distinct from an opaque storage
+/// error so a caller does not blindly retry a possibly-durable write; kind
+/// Internal, so the server surfaces it as a server-side unknown rather than a
+/// definitive conflict (RFC 0067).
+fn publish_outcome_in_doubt(original: &OmniError, cause: impl std::fmt::Display) -> OmniError {
+    OmniError::manifest_internal(format!(
+        "manifest publish outcome is in doubt: the commit may be durable but it could not be \
+         confirmed ({cause}); reopen the graph to observe it and do not blindly retry a \
+         non-idempotent write. original error: {original}"
+    ))
 }
 
 #[async_trait]
@@ -1209,6 +1238,56 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 Err(err) => {
                     if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) {
                         continue;
+                    }
+                    // Ambiguity resolution (RFC 0067): a typed conflict (details
+                    // present) definitively did not land — surface it. An opaque
+                    // error may instead mean the `__manifest` merge-insert landed
+                    // durably and only its acknowledgement was lost (a dropped S3
+                    // 200), in which case the write is already graph-visible.
+                    // Since the stable lineage commit id is durably written into
+                    // the branch's `graph_head` row, read the manifest back and
+                    // check for it before reporting anything: returning an opaque
+                    // failure for a durable write invites a non-idempotent retry
+                    // to double-apply.
+                    let ambiguous = !matches!(&err, OmniError::Manifest(m) if m.details.is_some());
+                    if let (true, Some(intent)) = (ambiguous, lineage) {
+                        match self.dataset().await {
+                            Ok(reloaded) => match read_publish_scan(&reloaded).await {
+                                Ok(scan) => {
+                                    let branch_key =
+                                        intent.branch.as_deref().unwrap_or(MAIN_BRANCH_HEAD_KEY);
+                                    let landed = reloaded.version().version == new_manifest_version
+                                        && scan.graph_heads.get(branch_key)
+                                            == Some(&intent.graph_commit_id);
+                                    if landed {
+                                        // Durable; only the ack was lost. Return
+                                        // the exact success outcome this attempt
+                                        // would have produced.
+                                        known_state.version = reloaded.version().version;
+                                        return Ok(PublishOutcome {
+                                            dataset: reloaded,
+                                            parent_commit_id,
+                                            known_state,
+                                            base_incarnation,
+                                            projection: Some(Box::new(projection)),
+                                        });
+                                    }
+                                    // Our commit is not the branch head at our
+                                    // version: it never landed, or a later commit
+                                    // superseded it in the ack-loss window.
+                                    // Surface the original error; a retry
+                                    // re-checks authority and fails typed rather
+                                    // than double-applying.
+                                    return Err(err);
+                                }
+                                Err(scan_err) => {
+                                    return Err(publish_outcome_in_doubt(&err, scan_err));
+                                }
+                            },
+                            Err(readback_err) => {
+                                return Err(publish_outcome_in_doubt(&err, readback_err));
+                            }
+                        }
                     }
                     return Err(err);
                 }

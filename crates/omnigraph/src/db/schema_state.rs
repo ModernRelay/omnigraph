@@ -18,8 +18,9 @@ pub(crate) const SCHEMA_IR_FILENAME: &str = "_schema.ir.json";
 pub(crate) const SCHEMA_STATE_FILENAME: &str = "__schema_state.json";
 
 // Staging filenames used by atomic schema apply. Schema apply writes to these
-// first, then commits the manifest, then renames staging → final. Recovery on
-// open reconciles any leftover staging files against the manifest.
+// first, then commits the manifest, then installs the contract and retires the
+// staging. A read-write open reconciles any leftover staging files against the
+// manifest.
 pub(crate) const SCHEMA_SOURCE_STAGING_FILENAME: &str = "_schema.pg.staging";
 pub(crate) const SCHEMA_IR_STAGING_FILENAME: &str = "_schema.ir.json.staging";
 pub(crate) const SCHEMA_STATE_STAGING_FILENAME: &str = "__schema_state.json.staging";
@@ -34,7 +35,6 @@ const SCHEMA_IDENTITY_VERSION: u32 = 2;
 pub(crate) async fn refuse_unsupported_schema_versions(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    internal_schema_version: u32,
 ) -> Result<()> {
     #[derive(Deserialize)]
     struct VersionEnvelope {
@@ -78,31 +78,8 @@ pub(crate) async fn refuse_unsupported_schema_versions(
                 "schema feature '{unknown}' in {filename} is unknown to this build; upgrade omnigraph before opening this graph; open will not recover or migrate this schema"
             )));
         }
-        if let Some(required_stamp) =
-            stamp_covers_system_columns(internal_schema_version, &envelope.features)?
-        {
-            return Err(schema_lock_conflict(format!(
-                "graph internal schema v{internal_schema_version} cannot serve the system columns in {filename}; expected at least v{required_stamp}; open will not recover or migrate this schema"
-            )));
-        }
     }
     Ok(())
-}
-
-/// The stamp floor a graph's system column vintage demands. `Ok(Some(stamp))`
-/// carries the stamp the vintage needs, so both the pre-open gate and the
-/// post-catalog check phrase one rule rather than recomputing it.
-pub(crate) fn stamp_covers_system_columns(
-    internal_schema_version: u32,
-    features: &BTreeSet<String>,
-) -> Result<Option<u32>> {
-    let required_stamp = crate::db::manifest::stamp_for_system_columns(
-        omnigraph_compiler::system_columns_for_features(features),
-    )?;
-    if internal_schema_version < required_stamp {
-        return Ok(Some(required_stamp));
-    }
-    Ok(None)
 }
 
 const MISSING_SCHEMA_CONTRACT_MESSAGE: &str = "graph is missing the mandatory identity-bearing schema contract (_schema.ir.json and __schema_state.json); automatic bootstrap is not supported";
@@ -117,6 +94,20 @@ pub(crate) struct SchemaState {
     pub(crate) schema_ir_hash: String,
     pub(crate) schema_identity_version: u32,
     pub(crate) schema_identity_domain: String,
+    /// The graph commit that publishes this contract (RFC 0067). Schema apply
+    /// and the system-column upgrade stage the contract with the commit they
+    /// are about to publish; a read-write open promotes the staging when that
+    /// commit is in main's lineage and discards it otherwise. Init writes no
+    /// marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) publication: Option<SchemaPublication>,
+}
+
+/// The manifest publication a staged schema contract belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SchemaPublication {
+    pub(crate) graph_commit_id: String,
+    pub(crate) parent_commit_id: Option<String>,
 }
 
 impl SchemaState {
@@ -130,6 +121,7 @@ impl SchemaState {
                 .map_err(|error| schema_lock_conflict(error.to_string()))?,
             schema_identity_version: SCHEMA_IDENTITY_VERSION,
             schema_identity_domain: schema_ir.schema_identity_domain.as_str().to_string(),
+            publication: None,
         })
     }
 }
@@ -265,10 +257,12 @@ pub(crate) async fn read_schema_state_identity(
 /// the object store, with the state they encode.
 pub(crate) fn render_schema_contract(
     schema_ir: &SchemaIR,
+    publication: Option<SchemaPublication>,
 ) -> Result<(SchemaState, String, String)> {
     let ir_json = schema_ir_pretty_json(schema_ir)
         .map_err(|err| OmniError::manifest_internal(err.to_string()))?;
-    let state = SchemaState::from_ir(schema_ir)?;
+    let mut state = SchemaState::from_ir(schema_ir)?;
+    state.publication = publication;
     let state_json = serde_json::to_string_pretty(&state).map_err(|err| {
         OmniError::manifest_internal(format!("serialize schema state error: {}", err))
     })?;
@@ -290,26 +284,6 @@ pub(crate) async fn write_schema_contract(
         &contract.state_json,
     )
     .await
-}
-
-/// Variant of `write_schema_contract` that writes the IR + state JSON to the
-/// staging filenames. Used by atomic schema apply: staging files are written
-/// before the manifest commit, then renamed to the final names afterward.
-pub(crate) async fn write_schema_contract_staging(
-    root_uri: &str,
-    storage: &dyn StorageAdapter,
-    schema_ir: &SchemaIR,
-) -> Result<SchemaState> {
-    let (state, ir_json, state_json) = render_schema_contract(schema_ir)?;
-    write_schema_contract_to(
-        storage,
-        &schema_ir_staging_uri(root_uri),
-        &schema_state_staging_uri(root_uri),
-        &ir_json,
-        &state_json,
-    )
-    .await?;
-    Ok(state)
 }
 
 async fn write_schema_contract_to(
@@ -627,196 +601,184 @@ fn schema_manifest_conflict(detail: impl Into<String>) -> OmniError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaStateRecovery {
     Noop,
-    CleanedStaging,
-    CompletedStagingRename { schema_apply_sidecar: bool },
+    Discarded,
+    Promoted,
 }
 
-impl SchemaStateRecovery {
-    pub(crate) fn completed_schema_apply_sidecar_rename(self) -> bool {
-        matches!(
-            self,
-            Self::CompletedStagingRename {
-                schema_apply_sidecar: true,
-            }
-        )
+/// What the schema staging files on the object store are, judged against
+/// main's lineage (RFC 0067): the staged state carries the graph commit that
+/// publishes the contract, and that commit's presence in lineage is the only
+/// authority for promoting or discarding the staging.
+pub(crate) enum StagedContract {
+    /// No staging file exists.
+    None,
+    /// Staging files exist without the state file that closes the staging
+    /// write; the writer crashed before its contract staging was complete.
+    Incomplete,
+    /// A complete staging without a publication marker. No current writer
+    /// stages this way, so it is unowned and fails closed.
+    Unmarked,
+    /// A complete staging bound to one manifest publication.
+    Marked {
+        state: SchemaState,
+        /// The marker's commit is in main's lineage: the publication happened.
+        published: bool,
+    },
+}
+
+/// `thorough` also probes the source and IR staging files when the state
+/// file is absent, to tell an incomplete staging from none; a caller that
+/// only acts on a complete staging passes `false` and pays one probe.
+pub(crate) async fn inspect_staged_contract(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    thorough: bool,
+) -> Result<StagedContract> {
+    let state_staging = schema_state_staging_uri(root_uri);
+    if !storage.exists(&state_staging).await? {
+        if !thorough {
+            return Ok(StagedContract::None);
+        }
+        let any_other = storage.exists(&schema_source_staging_uri(root_uri)).await?
+            || storage.exists(&schema_ir_staging_uri(root_uri)).await?;
+        return Ok(if any_other {
+            StagedContract::Incomplete
+        } else {
+            StagedContract::None
+        });
     }
+    let state = read_schema_state_at(storage, &state_staging).await?;
+    let Some(publication) = state.publication.clone() else {
+        return Ok(StagedContract::Unmarked);
+    };
+    let (commits, _) =
+        crate::db::manifest::ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
+    let published = match commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == publication.graph_commit_id)
+    {
+        Some(commit) => {
+            if commit.parent_commit_id != publication.parent_commit_id
+                || commit.graph_branch.is_some()
+            {
+                return Err(schema_lock_conflict(format!(
+                    "schema staging names graph commit '{}' with parent {:?}, but lineage records that commit with parent {:?} on branch {:?}",
+                    publication.graph_commit_id,
+                    publication.parent_commit_id,
+                    commit.parent_commit_id,
+                    commit.graph_branch
+                )));
+            }
+            true
+        }
+        None => false,
+    };
+    Ok(StagedContract::Marked { state, published })
 }
 
-/// Reconcile leftover schema staging files (`_schema.pg.staging`,
-/// `_schema.ir.json.staging`, `__schema_state.json.staging`) against the
-/// manifest snapshot.
+/// Prove that a read-only open can pair its manifest snapshot with the live
+/// schema contract without writing. A staged contract names the graph commit
+/// that publishes it (RFC 0067): once that commit is in lineage the manifest
+/// already carries the new table set, and only a read-write open may install
+/// the contract files, so serving the old catalog over it would be
+/// incoherent. An unpublished staging is inert garbage the reader ignores.
+pub(crate) async fn ensure_read_only_schema_coherent(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
+    if let StagedContract::Marked {
+        state,
+        published: true,
+    } = inspect_staged_contract(root_uri, storage, false).await?
+    {
+        let graph_commit_id = state
+            .publication
+            .map(|publication| publication.graph_commit_id)
+            .unwrap_or_default();
+        return Err(OmniError::recovery_required(
+            graph_commit_id.clone(),
+            format!(
+                "read-only open found SchemaApply manifest outcome for graph commit '{}' but the schema contract promotion is pending; run a read-write open to finish it",
+                graph_commit_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// What a read-write pass may do with schema staging it does not own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaStagingPolicy {
+    /// The open-time pass: promote a published staging, discard an unpublished
+    /// one. Discarding relies on the one-mutation-process boundary: a live
+    /// apply in another process loses its staging, and its own promotion then
+    /// installs the contract from memory.
+    PromoteOrDiscard,
+    /// The write-entry pass and `refresh`: promote a published staging and
+    /// leave anything else alone, since the apply that wrote it may still be
+    /// live.
+    PromoteOnly,
+}
+
+/// Promote or discard schema staging left by a crashed schema apply.
 ///
-/// Atomic schema apply writes these staging files before committing the
-/// manifest, then renames them to their final names. A crash mid-apply can
-/// leave staging files behind. This function determines whether the crash
-/// happened before or after the manifest commit and either deletes the
-/// staging files (pre-commit) or completes the rename (post-commit).
-///
-/// The discriminator is the manifest's set of registered table keys: it
-/// matches the schema source whose state corresponds to the manifest's
-/// current version. For migrations that change the table set
-/// (add/remove/rename a node or edge type), this is unambiguous. For
-/// property-only migrations where both schemas imply the same table set,
-/// recovery cannot disambiguate from staging files alone and returns an
-/// operator-actionable error rather than guessing.
+/// RFC 0067: the staged `__schema_state.json.staging` names the graph commit
+/// that publishes the contract. That commit in main's lineage means the
+/// manifest already carries the new registrations, so the contract files must
+/// follow (promotion is idempotent per file); its absence means the manifest
+/// never moved, so the staging is garbage.
 pub(crate) async fn recover_schema_state_files(
     root_uri: &str,
     storage: Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
+    policy: SchemaStagingPolicy,
 ) -> Result<SchemaStateRecovery> {
-    let pg_staging = schema_source_staging_uri(root_uri);
-    let ir_staging = schema_ir_staging_uri(root_uri);
-    let state_staging = schema_state_staging_uri(root_uri);
-
-    let pg_exists = storage.exists(&pg_staging).await?;
-    let ir_exists = storage.exists(&ir_staging).await?;
-    let state_exists = storage.exists(&state_staging).await?;
-
-    if !pg_exists && !ir_exists && !state_exists {
-        return Ok(SchemaStateRecovery::Noop);
-    }
-
-    // Schema-apply atomicity: when a SchemaApply sidecar is present,
-    // the writer reached Phase B (Lance HEADs advanced) but didn't
-    // complete Phase C (manifest publish + staging→final renames). The
-    // recovery sweep about to run will roll the table versions forward
-    // to the new Lance HEADs; we MUST also rename the staging files
-    // forward so the catalog matches. Without this, the disambiguation
-    // logic below sees actual_keys == live_keys (manifest didn't move)
-    // and deletes the staging files, leaving the graph with new-schema
-    // data on disk but the old `_schema.pg` live — corruption.
-    let schema_apply_sidecars = crate::db::manifest::list_sidecars(root_uri, storage.as_ref())
-        .await?
-        .into_iter()
-        .filter(|sidecar| {
-            matches!(
-                sidecar.writer_kind,
-                crate::db::manifest::SidecarKind::SchemaApply
-            )
-        })
-        .collect::<Vec<_>>();
-    if schema_apply_sidecars
-        .iter()
-        .any(|sidecar| sidecar.protocol_v7.is_some())
-    {
-        if schema_apply_sidecars
-            .iter()
-            .any(|sidecar| sidecar.protocol_v7.is_none())
-        {
-            return Err(schema_lock_conflict(
-                "found both legacy and exact SchemaApply recovery intents; refusing to choose a schema-staging direction",
-            ));
+    let thorough = policy == SchemaStagingPolicy::PromoteOrDiscard;
+    match inspect_staged_contract(root_uri, storage.as_ref(), thorough).await? {
+        StagedContract::None => Ok(SchemaStateRecovery::Noop),
+        StagedContract::Incomplete => {
+            if policy == SchemaStagingPolicy::PromoteOnly {
+                return Ok(SchemaStateRecovery::Noop);
+            }
+            warn!(
+                "schema apply crashed while staging its contract; removing the incomplete staging (manifest v{})",
+                snapshot.graph_manifest_version()
+            );
+            cleanup_staging_files(root_uri, storage.as_ref()).await?;
+            Ok(SchemaStateRecovery::Discarded)
         }
-        // Schema-v7 owns schema staging inside its exact state machine. An
-        // Armed intent rolls back; an EffectsConfirmed intent promotes only
-        // after its fixed manifest outcome is visible. The legacy eager
-        // promotion below would turn a partial v7 migration into live schema.
-        return Ok(SchemaStateRecovery::Noop);
-    }
-    if !schema_apply_sidecars.is_empty() {
-        warn!(
-            "recovery: SchemaApply sidecar present; completing schema-staging rename so the \
-             manifest-drift sweep's roll-forward sees the new catalog (manifest v{})",
+        // Every writer marks its staging with the publishing commit, so an
+        // unmarked one comes from a build that predates RFC 0067 or from
+        // manual edits; neither can be judged here.
+        StagedContract::Unmarked => Err(schema_lock_conflict(format!(
+            "found complete schema staging files without a publication marker; inspect _schema.pg.staging against _schema.pg and remove the staging files to keep the live schema (manifest v{})",
             snapshot.graph_manifest_version()
-        );
-        complete_staging_rename(root_uri, storage.as_ref()).await?;
-        return Ok(SchemaStateRecovery::CompletedStagingRename {
-            schema_apply_sidecar: true,
-        });
-    }
-
-    if !pg_exists {
-        // _schema.pg.staging is gone but at least one of the other staging
-        // files is still present. This is a partial-rename: the post-commit
-        // crash happened mid-rename (after _schema.pg was renamed in but
-        // before _schema.ir.json or __schema_state.json was). The live
-        // _schema.pg should already reflect the new schema; verify that
-        // and complete the remaining renames.
-        let live_source = storage.read_text(&schema_source_uri(root_uri)).await?;
-        let live_shape = compile_schema_source(&live_source)?;
-        let selected_ir_uri = if ir_exists {
-            ir_staging.clone()
-        } else {
-            schema_ir_uri(root_uri)
-        };
-        let selected_state_uri = if state_exists {
-            state_staging.clone()
-        } else {
-            schema_state_uri(root_uri)
-        };
-        let selected_ir = read_schema_ir_at(storage.as_ref(), &selected_ir_uri).await?;
-        let selected_state = read_schema_state_at(storage.as_ref(), &selected_state_uri).await?;
-        validate_persisted_schema_contract(&selected_ir, &selected_state)?;
-        validate_current_source_matches(&selected_state, &live_shape, &selected_ir)?;
-        warn!(
-            "completing partial schema-file rename (manifest v{})",
-            snapshot.graph_manifest_version()
-        );
-        complete_staging_rename(root_uri, storage.as_ref()).await?;
-        return Ok(SchemaStateRecovery::CompletedStagingRename {
-            schema_apply_sidecar: false,
-        });
-    }
-
-    let staging_source = storage.read_text(&pg_staging).await?;
-    let staging_shape = compile_schema_source(&staging_source)?;
-
-    let live_source = storage.read_text(&schema_source_uri(root_uri)).await?;
-    let live_shape = compile_schema_source(&live_source)?;
-
-    let live_ir = read_schema_ir_at(storage.as_ref(), &schema_ir_uri(root_uri)).await?;
-    validate_schema_ir(&live_ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
-    let system_columns = omnigraph_compiler::system_columns_for_features(&live_ir.features);
-    let staging_shape = staging_shape.canonicalized_for_system_columns(system_columns);
-    let live_shape = live_shape.canonicalized_for_system_columns(system_columns);
-    let staging_hash =
-        schema_shape_hash(&staging_shape).map_err(|err| schema_lock_conflict(err.to_string()))?;
-    let live_hash =
-        schema_shape_hash(&live_shape).map_err(|err| schema_lock_conflict(err.to_string()))?;
-
-    if staging_hash == live_hash {
-        warn!(
-            "removing leftover schema staging files matching the live schema (no-op apply that crashed)"
-        );
-        cleanup_staging_files(root_uri, storage.as_ref()).await?;
-        return Ok(SchemaStateRecovery::CleanedStaging);
-    }
-
-    let live_keys = expected_table_keys(&live_shape);
-    let staging_keys = expected_table_keys(&staging_shape);
-    let actual_keys: BTreeSet<String> = snapshot
-        .datasets()
-        .map(|entry| entry.type_key.clone())
-        .collect();
-
-    if live_keys == staging_keys {
-        return Err(schema_lock_conflict(format!(
-            "found schema staging files but cannot disambiguate pre- vs post-commit crash: live and staging schemas imply identical table sets (likely a property-only migration). Inspect _schema.pg.staging vs _schema.pg manually and either remove the staging files (to keep the live schema) or replace _schema.pg with the staging file (to apply the new schema). Manifest version: v{}",
-            snapshot.graph_manifest_version()
-        )));
-    }
-
-    if actual_keys == live_keys {
-        warn!(
-            "schema apply crashed before manifest commit; removing staging files and keeping live schema (manifest v{})",
-            snapshot.graph_manifest_version()
-        );
-        cleanup_staging_files(root_uri, storage.as_ref()).await?;
-        Ok(SchemaStateRecovery::CleanedStaging)
-    } else if actual_keys == staging_keys {
-        warn!(
-            "schema apply crashed after manifest commit; completing schema-file rename (manifest v{})",
-            snapshot.graph_manifest_version()
-        );
-        complete_staging_rename(root_uri, storage.as_ref()).await?;
-        Ok(SchemaStateRecovery::CompletedStagingRename {
-            schema_apply_sidecar: false,
-        })
-    } else {
-        Err(schema_lock_conflict(format!(
-            "found schema staging files but the manifest's table set ({:?}) matches neither the live schema ({:?}) nor the staging schema ({:?}); manual operator action required",
-            actual_keys, live_keys, staging_keys
-        )))
+        ))),
+        StagedContract::Marked { state, published } => {
+            if published {
+                warn!(
+                    "schema apply crashed after publishing graph commit {}; promoting its staged contract (manifest v{})",
+                    state
+                        .publication
+                        .as_ref()
+                        .map(|publication| publication.graph_commit_id.as_str())
+                        .unwrap_or("?"),
+                    snapshot.graph_manifest_version()
+                );
+                promote_exact_schema_staging(root_uri, storage.as_ref(), &state.schema_ir_hash)
+                    .await?;
+                return Ok(SchemaStateRecovery::Promoted);
+            }
+            if policy == SchemaStagingPolicy::PromoteOnly {
+                return Ok(SchemaStateRecovery::Noop);
+            }
+            warn!(
+                "schema apply crashed before publishing; removing its staged contract and keeping the live schema (manifest v{})",
+                snapshot.graph_manifest_version()
+            );
+            cleanup_staging_files(root_uri, storage.as_ref()).await?;
+            Ok(SchemaStateRecovery::Discarded)
+        }
     }
 }
 
@@ -861,7 +823,7 @@ pub(crate) async fn complete_staging_rename(
 /// Verify that every durable staging artifact belongs to one exact
 /// SchemaApply target. A partial promotion is accepted only when the live
 /// identity already equals that same target; mismatched files are never
-/// renamed or deleted on another intent's behalf.
+/// renamed or deleted on another apply's behalf.
 pub(crate) async fn validate_exact_schema_staging_target(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -939,106 +901,6 @@ pub(crate) async fn promote_exact_schema_staging(
     Ok(())
 }
 
-pub(crate) async fn discard_exact_schema_staging(
-    root_uri: &str,
-    storage: &dyn StorageAdapter,
-    accepted_schema_ir_hash: &str,
-    target_schema_ir_hash: &str,
-) -> Result<()> {
-    let live = read_schema_state_identity(root_uri, storage).await?;
-    if live.schema_ir_hash != accepted_schema_ir_hash {
-        return Err(schema_lock_conflict(format!(
-            "cannot discard exact SchemaApply staging: live schema identity '{}' differs from captured authority '{}'",
-            live.schema_ir_hash, accepted_schema_ir_hash
-        )));
-    }
-    let any_staging = storage.exists(&schema_source_staging_uri(root_uri)).await?
-        || storage.exists(&schema_ir_staging_uri(root_uri)).await?
-        || storage.exists(&schema_state_staging_uri(root_uri)).await?;
-    if any_staging {
-        validate_present_exact_schema_staging_artifacts(root_uri, storage, target_schema_ir_hash)
-            .await?;
-        cleanup_staging_files(root_uri, storage).await?;
-    }
-    Ok(())
-}
-
-async fn validate_present_exact_schema_staging_artifacts(
-    root_uri: &str,
-    storage: &dyn StorageAdapter,
-    target_schema_ir_hash: &str,
-) -> Result<()> {
-    let pg_staging = schema_source_staging_uri(root_uri);
-    let source_shape = if storage.exists(&pg_staging).await? {
-        let source = storage.read_text(&pg_staging).await?;
-        Some(compile_schema_source(&source)?)
-    } else {
-        None
-    };
-
-    let ir_staging = schema_ir_staging_uri(root_uri);
-    let staged_ir = if storage.exists(&ir_staging).await? {
-        let ir = read_schema_ir_at(storage, &ir_staging).await?;
-        validate_schema_ir(&ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
-        let hash = schema_ir_hash(&ir).map_err(|error| schema_lock_conflict(error.to_string()))?;
-        if hash != target_schema_ir_hash {
-            return Err(schema_lock_conflict(
-                "_schema.ir.json.staging does not belong to the exact SchemaApply intent",
-            ));
-        }
-        Some(ir)
-    } else {
-        None
-    };
-
-    let state_staging = schema_state_staging_uri(root_uri);
-    let staged_state = if storage.exists(&state_staging).await? {
-        let state = read_schema_state_at(storage, &state_staging).await?;
-        validate_schema_state_envelope(&state)?;
-        if state.schema_ir_hash != target_schema_ir_hash {
-            return Err(schema_lock_conflict(
-                "__schema_state.json.staging does not belong to the exact SchemaApply intent",
-            ));
-        }
-        Some(state)
-    } else {
-        None
-    };
-
-    if let (Some(ir), Some(state)) = (&staged_ir, &staged_state) {
-        validate_persisted_schema_contract(ir, state)?;
-    }
-    if let (Some(shape), Some(state)) = (&source_shape, &staged_state) {
-        if let Some(ir) = &staged_ir {
-            validate_current_source_matches(state, shape, ir)?;
-        } else {
-            let ir = read_schema_ir_at(storage, &schema_ir_uri(root_uri)).await?;
-            validate_persisted_schema_contract(&ir, state)?;
-            validate_current_source_matches(state, shape, &ir)?;
-        }
-    } else if let (Some(shape), Some(ir)) = (&source_shape, &staged_ir) {
-        let shape = shape.canonicalized_for_system_columns(
-            omnigraph_compiler::system_columns_for_features(&ir.features),
-        );
-        let source_hash =
-            schema_shape_hash(&shape).map_err(|error| schema_lock_conflict(error.to_string()))?;
-        let ir_shape_hash = schema_shape_hash_from_ir(ir)
-            .map_err(|error| schema_lock_conflict(error.to_string()))?;
-        if source_hash != ir_shape_hash {
-            return Err(schema_lock_conflict(
-                "_schema.pg.staging does not project to the exact staged SchemaApply IR",
-            ));
-        }
-    }
-
-    // A crash immediately after writing `_schema.pg.staging` can leave source
-    // without the identity-bearing IR/state files needed to prove its target
-    // hash. The exact sidecar plus the held root schema gate owns this global
-    // staging path, so rollback may delete a syntactically valid source-only
-    // artifact; roll-forward still requires the complete selected tuple above.
-    Ok(())
-}
-
 async fn rename_if_present(
     storage: &dyn StorageAdapter,
     from_uri: &str,
@@ -1048,15 +910,4 @@ async fn rename_if_present(
         storage.rename_text(from_uri, to_uri).await?;
     }
     Ok(())
-}
-
-fn expected_table_keys(shape: &SchemaShape) -> BTreeSet<String> {
-    let mut keys = BTreeSet::new();
-    for node in &shape.nodes {
-        keys.insert(format!("node:{}", node.name));
-    }
-    for edge in &shape.edges {
-        keys.insert(format!("edge:{}", edge.name));
-    }
-    keys
 }

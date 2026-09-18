@@ -39,15 +39,6 @@ fn promote_drops_to_hard(plan: &mut SchemaMigrationPlan, allow_data_loss: bool) 
     }
 }
 
-pub(super) fn pre_minted_schema_transaction(
-    read_version: u64,
-) -> crate::table_store::StagedTransactionIdentity {
-    crate::table_store::StagedTransactionIdentity {
-        read_version,
-        uuid: format!("omnigraph-schema-{}", crate::dst_ids::new_ulid()),
-    }
-}
-
 fn resolve_desired_schema_ir(
     accepted_ir: &SchemaIR,
     desired_schema_source: &str,
@@ -156,16 +147,22 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// After each exact SchemaApply table transaction commits, before the next
-    /// table effect or durable EffectsConfirmed transition.
+    /// After each SchemaApply table effect commits (a detached rewrite or a
+    /// new-table create), before the next table effect or the publication.
     pub static SCHEMA_APPLY_POST_TABLE_COMMIT = ("schema_apply.post_table_commit", Unreachable, [Fail]);
 }
 
 decide_seam! {
-    /// The schema-v7 ownership sidecar is durable, but no table transaction
-    /// has been staged or committed yet. Tests use this to install a genuinely
-    /// foreign first-touch dataset winner.
-    pub static SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT = ("schema_apply.post_sidecar_pre_effect", Unreachable, [Fail]);
+    /// Under the schema-apply sentinel and every gate, before the first
+    /// table effect; shared by schema apply and the RFC 0040 system-column
+    /// upgrade, neither of which arms a sidecar (RFC 0067).
+    pub static SCHEMA_APPLY_POST_LOCK_PRE_EFFECT = ("schema_apply.post_lock_pre_effect", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// The manifest published and the schema contract is installed; the
+    /// detached rewrites are not yet promoted onto their linear HEADs.
+    pub static SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION = ("schema_apply.post_publish_pre_promotion", Unreachable, [Fail]);
 }
 
 async fn plan_schema_for_apply_from_accepted(
@@ -259,13 +256,9 @@ where
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
 
-    // Converge any pending recovery sidecar before planning: a table
-    // rewrite over sidecar-covered drift would otherwise re-plan from
-    // the manifest pin and orphan the drifted Phase-B commit (silently
-    // dropping its rows) while the stale sidecar lingers to misclassify
-    // against the post-apply pins. Runs before the apply's own sidecar
-    // exists, so the heal can never observe it.
-    db.heal_pending_recovery_sidecars().await?;
+    // Install this handle's published-but-uninstalled schema contract, if any,
+    // before planning against the accepted contract.
+    db.settle_pending_schema_install().await?;
 
     // Process-local schema-control gate. RFC-022 mutation/load commit paths
     // acquire this before their branch/table gates and retain it through
@@ -280,6 +273,11 @@ where
     let result =
         apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
     let release_result = release_schema_apply_lock(db).await;
+    if release_result.is_err() {
+        // Liveness: the next write entry on this handle retries the release
+        // before the sentinel gate, so the failed delete never wedges it.
+        db.note_failed_sentinel_release();
+    }
     match (result, release_result) {
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(err)) => Err(err),
@@ -536,52 +534,12 @@ where
     let mut table_tombstones =
         BTreeMap::<crate::db::manifest::TableIdentity, (String, u64, Option<String>)>::new();
 
-    // Pre-mint every table transaction before recovery is armed. Existing
-    // rewrites are exact Overwrite transactions at their manifest pins;
-    // AddType targets are strict first-version Overwrites at read_version=0.
-    // A type rename is metadata-only: it preserves identity, path, version,
-    // and Lance history. When a rename also changes properties, only that
-    // property rewrite advances the existing dataset at the preserved path.
-    // Metadata/tombstone-only applies deliberately have no table effects but
-    // still arm recovery because schema staging is durable state.
-    let mut recovery_pins = Vec::new();
-    let mut recovery_effects = Vec::new();
-    let mut recovery_slots = Vec::new();
-    let mut planned_transactions = HashMap::<
-        crate::db::manifest::TableIdentity,
-        crate::table_store::StagedTransactionIdentity,
-    >::new();
-    for table_key in &added_tables {
-        let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
-        let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
-        let planned = pre_minted_schema_transaction(0);
-        recovery_pins.push(crate::db::manifest::SidecarTablePin {
-            table_fork_owner: None,
-            identity,
-            table_key: table_key.clone(),
-            table_path: db.storage().dataset_uri(&table_path),
-            expected_version: 0,
-            post_commit_pin: 1,
-            confirmed_version: None,
-            table_branch: None,
-        });
-        planned_transactions.insert(identity, planned.clone());
-        recovery_effects.push(crate::db::manifest::RecoverySchemaApplyEffect {
-            identity,
-            table_key: table_key.clone(),
-            kind: crate::db::manifest::RecoverySchemaApplyEffectKind::FirstTouchDataset {
-                planned_transaction: planned,
-                confirmed_transaction: None,
-            },
-        });
-        recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
-            identity,
-            table_key: table_key.clone(),
-            expected_version: 0,
-            table_branch: None,
-            confirmed: None,
-        });
-    }
+    // Preflight every existing-table participant against the captured
+    // snapshot. A rewrite advances the identity-owned dataset detached from
+    // its manifest pin (RFC 0067); a type rename is metadata-only and keeps
+    // identity, path, version and Lance history. Metadata/tombstone-only
+    // applies have no table effects: their only durable pre-publication state
+    // is the staged schema contract.
     for table_key in &rewritten_tables {
         if added_tables.contains(table_key) {
             continue;
@@ -589,7 +547,7 @@ where
         let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
         let entry = snapshot.dataset(source_table_key).ok_or_else(|| {
             OmniError::manifest(format!(
-                "missing source table '{}' for schema apply recovery plan targeting '{}'",
+                "missing source table '{}' for schema apply targeting '{}'",
                 source_table_key, table_key
             ))
         })?;
@@ -607,56 +565,11 @@ where
                 source_table_key, entry.identity, table_key, identity
             )));
         }
-        let planned = pre_minted_schema_transaction(entry.published_dataset_version);
-        recovery_pins.push(crate::db::manifest::SidecarTablePin {
-            table_fork_owner: None,
-            identity,
-            table_key: table_key.clone(),
-            table_path: db.storage().dataset_uri(&entry.dataset_path),
-            expected_version: entry.published_dataset_version,
-            post_commit_pin: entry.published_dataset_version + 1,
-            confirmed_version: None,
-            table_branch: None,
-        });
-        planned_transactions.insert(identity, planned.clone());
-        recovery_effects.push(crate::db::manifest::RecoverySchemaApplyEffect {
-            identity,
-            table_key: table_key.clone(),
-            kind: crate::db::manifest::RecoverySchemaApplyEffectKind::ExistingOverwrite {
-                planned_transaction: planned,
-                confirmed_transaction: None,
-            },
-        });
-        recovery_slots.push(crate::db::manifest::RecoveryTableUpdateSlot {
-            identity,
-            table_key: table_key.clone(),
-            expected_version: entry.published_dataset_version,
-            table_branch: None,
-            confirmed: None,
-        });
     }
-    // Capture registrations, metadata-only renames, and tombstones for the sidecar so
-    // recovery can publish them alongside the per-table updates. Without
-    // this, an added type's dataset is created in Phase B but the
-    // manifest never gains an entry for it after roll-forward — the
-    // live `_schema.pg` declares a type the manifest doesn't know about
-    // and reads through the engine report that the logical type does not exist
-    // at that snapshot.
-    let mut sidecar_registrations: Vec<crate::db::manifest::SidecarTableRegistration> = Vec::new();
-    for table_key in &added_tables {
-        let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
-        sidecar_registrations.push(crate::db::manifest::SidecarTableRegistration {
-            identity,
-            table_key: table_key.clone(),
-            table_path: crate::db::manifest::table_path_for_identity(table_key, identity)?,
-            table_branch: None,
-        });
-    }
-    let mut sidecar_renames = Vec::<crate::db::manifest::SidecarTableRename>::new();
     for (target_table_key, source_table_key) in &renamed_tables {
         let source_entry = snapshot.dataset(source_table_key).ok_or_else(|| {
             OmniError::manifest(format!(
-                "missing source table '{}' for schema rename when building recovery sidecar",
+                "missing source table '{}' for schema rename",
                 source_table_key
             ))
         })?;
@@ -679,34 +592,16 @@ where
                 canonical_target_path
             )));
         }
-        sidecar_renames.push(crate::db::manifest::SidecarTableRename {
-            identity: desired_identity,
-            expected_table_key: source_table_key.clone(),
-            expected_version: source_entry.published_dataset_version,
-            table_key: target_table_key.clone(),
-            table_path: source_entry.dataset_path.clone(),
-        });
     }
-    let mut sidecar_tombstones: Vec<crate::db::manifest::SidecarTombstone> = Vec::new();
-    // Soft DropType: mark each dropped table for tombstoning in the
-    // recovery sidecar AND in the live table_tombstones map. The
-    // mechanism mirrors rename's source-table tombstone — manifest
-    // entry removed at version+1, dataset files retained, time-travel
-    // reachable until cleanup. No Phase B write happens for these
-    // tables; the recovery sidecar is purely the manifest delta.
+    // Soft and hard DropType tombstone the table's manifest entry at
+    // version+1 with no per-table write. The dataset files stay reachable
+    // through older manifest versions until cleanup (hard drops reclaim their
+    // old versions right after publication).
     for dropped_table_key in &dropped_tables {
         let entry = snapshot.dataset(dropped_table_key).ok_or_else(|| {
-            OmniError::manifest(format!(
-                "missing table '{}' for soft drop when building recovery sidecar",
-                dropped_table_key
-            ))
+            OmniError::manifest(format!("missing table '{}' for drop", dropped_table_key))
         })?;
         let tombstone_version = entry.published_dataset_version.saturating_add(1);
-        sidecar_tombstones.push(crate::db::manifest::SidecarTombstone {
-            identity: entry.identity,
-            table_key: dropped_table_key.clone(),
-            tombstone_version,
-        });
         table_tombstones.insert(
             entry.identity,
             (
@@ -736,15 +631,9 @@ where
         .acquire_many(&schema_apply_queue_keys)
         .await;
 
-    // The entry heal ran before planning, but another writer can arm recovery
-    // while this apply waits for its effect gates. List again under the complete
-    // envelope before this writer claims any physical state.
-    db.ensure_no_pending_recovery_sidecars_under_gates(&[None], "schema_apply")
-        .await?;
-
     // The snapshot was captured before the branch/table waits. Revalidate the
     // complete authority token now, while those gates are held, so a stale
-    // plan never writes a sidecar. Physical-only __manifest compaction may
+    // plan never stages an effect. Physical-only __manifest compaction may
     // change its numeric version without changing this logical authority.
     db.refresh_coordinator_only().await?;
     let (current_branch_identifier, current_graph_head) = {
@@ -796,15 +685,18 @@ where
     }
 
     // Prove every existing physical ref is still exactly at its manifest pin
-    // before arming the exact SchemaApply sidecar. Retain the verified handles
-    // and reuse them below: reopening after this ownership check would create a
-    // needless second HEAD observation and blur the pre-arm boundary.
+    // before staging any effect, promoting a pending pin on the way. Retain
+    // the verified handles and reuse them below: reopening after this check
+    // would create a needless second HEAD observation.
     let mut existing_heads = HashMap::<String, SnapshotHandle>::new();
     for entry in snapshot.datasets() {
         let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
         let head = db
             .storage()
             .open_dataset_head(&dataset_uri, entry.native_dataset_branch.as_deref())
+            .await?;
+        let head = db
+            .promote_pending_pin(&entry.type_key, &dataset_uri, entry, head)
             .await?;
         db.ensure_existing_effect_baseline(
             &entry.type_key,
@@ -816,25 +708,32 @@ where
         existing_heads.insert(entry.type_key.clone(), head);
     }
 
-    // Only added types are first-touch paths. Rename targets deliberately reuse
-    // the existing identity-owned path and therefore must already exist.
+    // Only added types are first-touch paths; rename targets reuse the
+    // existing identity-owned path. An added type's path is a deterministic
+    // function of the accepted identity allocator, so an attempt that died
+    // after creating the dataset left it exactly where the retry creates it.
+    // Nothing references an unregistered incarnation path (identities are
+    // never reused and registration is this apply's own publication), so
+    // under the schema sentinel such a leftover is garbage: reclaim it before
+    // the strict version-one create.
     for table_key in &added_tables {
         let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
         let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
         if db.storage_adapter().exists(&dataset_uri).await? {
-            return Err(OmniError::manifest_conflict(format!(
-                "schema apply target table '{}' has an existing dataset at '{}' but no live manifest entry; refusing to claim unowned physical state — inspect and remove the orphaned dataset before retrying",
-                table_key, dataset_uri,
-            )));
+            tracing::warn!(
+                table_key,
+                dataset_uri,
+                "reclaiming an unregistered dataset left at the added type's path by an abandoned schema apply"
+            );
+            db.storage_adapter().delete_prefix(&dataset_uri).await?;
         }
     }
 
     // Lance's logical Blob rewrite input cannot represent an existing
     // external offset/length range. Discover that unsupported persisted state
-    // across the complete rewrite set before recovery is armed or any added /
-    // lexically earlier table can move. The builder repeats this check as a
-    // defensive invariant after arm.
+    // across the complete rewrite set before any added / lexically earlier
+    // table can move. The builder repeats this check as a defensive invariant.
     for table_key in &rewritten_tables {
         if added_tables.contains(table_key) {
             continue;
@@ -857,49 +756,20 @@ where
         .await?;
     }
 
-    // Every non-empty migration writes a sidecar, including table-effect-free
-    // index/enum/metadata changes. Their empty table-pin set is intentional:
-    // schema staging is the durable threshold that lets recovery deterministically
-    // roll back a pre-staging crash or roll forward a post-staging crash.
-    // `branch=None` because schema_apply publishes against main — the
-    // `__schema_apply_lock__` branch is purely a serialization sentinel.
-    let target_schema_ir_hash = omnigraph_compiler::schema_ir_hash(&desired_ir)
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-    let recovery_authority = crate::db::manifest::RecoveryAuthorityToken {
-        branch_identifier: base_branch_identifier.clone(),
-        graph_head: base_graph_head.clone(),
-        schema_identity_domain: accepted_ir.schema_identity_domain.as_str().to_string(),
-        schema_ir_hash: accepted_schema_state.schema_ir_hash.clone(),
-        schema_identity_version: accepted_schema_state.schema_identity_version,
-    };
-    let recovery_lineage = crate::db::manifest::RecoveryLineageIntent {
+    // The staged contract is bound to this apply's graph commit (RFC 0067):
+    // a read-write open installs it once that commit is in lineage and
+    // discards it otherwise.
+    let publication = crate::db::schema_state::SchemaPublication {
         graph_commit_id: lineage_intent.graph_commit_id.clone(),
-        branch: lineage_intent.branch.clone(),
-        actor_id: lineage_intent.actor_id.clone(),
-        merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
-        created_at: lineage_intent.created_at,
+        parent_commit_id: base_graph_head.clone(),
     };
-    let mut sidecar = crate::db::manifest::new_schema_apply_sidecar_v9(
-        actor.map(str::to_string),
-        recovery_pins,
-        recovery_authority,
-        recovery_lineage,
-        recovery_effects,
-        crate::db::manifest::RecoveryManifestDelta {
-            table_updates: recovery_slots,
-            registrations: sidecar_registrations,
-            renames: sidecar_renames,
-            tombstones: sidecar_tombstones,
-        },
-        target_schema_ir_hash,
-    )?;
-    let recovery_handle =
-        crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?;
-    let recovery_operation_id = recovery_handle.operation_id.clone();
 
-    let post_arm_result = async {
-        fail(&SCHEMA_APPLY_POST_SIDECAR_PRE_EFFECT)?;
-        let mut committed_transactions = HashMap::new();
+    let mut published_commit: Option<String> = None;
+    let effects = async {
+        fail(&SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
+        let mut expected_table_versions =
+            HashMap::<crate::db::manifest::TableIdentity, u64>::new();
+        let mut promotions = Vec::<crate::db::HeldPromotion>::new();
 
         for table_key in &added_tables {
             let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
@@ -908,30 +778,23 @@ where
             let dataset_uri = db.storage().dataset_uri(&table_path);
             let schema = schema_for_table_key(&desired_catalog, table_key)?;
             let batch = RecordBatch::new_empty(schema);
-            let mut staged = db.storage().stage_create(&dataset_uri, batch).await?;
-            let planned = planned_transactions.get(&identity).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "missing planned SchemaApply transaction for '{}'",
-                    table_key
-                ))
-            })?;
-            staged.bind_transaction_identity(planned)?;
+            let staged = db.storage().stage_create(&dataset_uri, batch).await?;
             let outcome = db
                 .storage()
                 .commit_staged_create_exact(&dataset_uri, staged)
                 .await?;
             if !outcome.is_exact() {
                 return Err(OmniError::manifest_internal(format!(
-                    "SchemaApply first-touch '{}' committed outside its exact version-one transaction plan",
+                    "SchemaApply first-touch '{}' committed outside its version-one create",
                     table_key
                 )));
             }
-            committed_transactions.insert(identity, outcome.committed_transaction().clone());
             let ds = outcome.into_snapshot();
             // Indexes for the new table are materialized off the critical path by
             // ensure_indices/optimize (iss-848); a 0-row table is never trainable
             // anyway. The @index intent is recorded in the persisted catalog/IR.
             let state = db.storage().table_state(&dataset_uri, &ds).await?;
+            expected_table_versions.insert(identity, 0);
             table_registrations.insert(table_key.clone(), (identity, table_path));
             table_updates.insert(
                 identity,
@@ -975,10 +838,9 @@ where
             )
             .await?;
             let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
-            // Reuse the handle that was opened and pin-checked before arming;
-            // reopening here would introduce a second HEAD observation.
-            let existing = source_ds;
-            let mut staged = db.storage().stage_overwrite(&existing, batch).await?;
+            // Reuse the handle that was opened and pin-checked before the
+            // effects; reopening here would introduce a second HEAD observation.
+            let staged = db.storage().stage_overwrite(&source_ds, batch).await?;
             let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
             if identity != entry.identity {
                 return Err(OmniError::manifest_internal(format!(
@@ -986,38 +848,44 @@ where
                     table_key, entry.identity, identity
                 )));
             }
-            let planned = planned_transactions.get(&identity).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "missing planned SchemaApply transaction for '{}'",
-                    table_key
-                ))
-            })?;
-            staged.bind_transaction_identity(planned)?;
-            let outcome = db
+            // RFC 0067: the rewrite lands as a detached version behind a pin
+            // one past the published version; promotion replays it onto the
+            // linear HEAD after the manifest publishes.
+            let base = source_ds.clone();
+            let (detached, transaction) = db
                 .storage()
-                .commit_staged_exact(existing, staged)
+                .commit_staged_detached(source_ds, staged)
                 .await?;
-            if !outcome.is_exact() {
-                return Err(OmniError::manifest_internal(format!(
-                    "SchemaApply rewrite '{}' committed outside its exact transaction/version plan",
-                    table_key
-                )));
-            }
-            committed_transactions.insert(identity, outcome.committed_transaction().clone());
-            let target_ds = outcome.into_snapshot();
             // The rewrite drops the table's existing index coverage; it is
             // restored off the critical path by optimize's optimize_indices /
             // ensure_indices (iss-848). Reads scan uncovered fragments meanwhile.
-            let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
+            let state = db.storage().table_state(&dataset_uri, &detached).await?;
+            let published_dataset_version = entry.published_dataset_version + 1;
+            let version_metadata = state
+                .version_metadata
+                .with_staged(state.version, transaction.uuid.clone());
+            promotions.push(crate::db::HeldPromotion {
+                table_key: table_key.clone(),
+                dataset_path: entry.dataset_path.clone(),
+                full_path: dataset_uri.clone(),
+                table_branch: None,
+                base,
+                chain: Vec::new(),
+                detached,
+                target: published_dataset_version,
+                uuid: transaction.uuid,
+                e_tag: version_metadata.e_tag().map(str::to_string),
+            });
+            expected_table_versions.insert(identity, entry.published_dataset_version);
             table_updates.insert(
                 identity,
                 crate::db::DatasetUpdate {
                     identity,
                     type_key: table_key.clone(),
-                    published_dataset_version: state.version,
+                    published_dataset_version,
                     native_dataset_branch: None,
                     entity_count: state.row_count,
-                    version_metadata: state.version_metadata,
+                    version_metadata,
                 },
             );
             fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
@@ -1027,8 +895,8 @@ where
         // metadata: the new `@index` intent is recorded in the desired catalog/IR
         // persisted below, and the physical index is materialized off the critical
         // path by `ensure_indices`/`optimize` (iss-848). Schema apply touches no
-        // table data for them, so there is no per-table loop here and no recovery
-        // pin (no Lance HEAD advances). Reads stay correct meanwhile via a scan.
+        // table data for them, so there is no per-table loop here and no pin.
+        // Reads stay correct meanwhile via a scan.
 
         let mut manifest_changes = Vec::new();
         let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
@@ -1073,11 +941,10 @@ where
                 },
             ));
         }
-        let confirmed_updates = table_updates.into_values().collect::<Vec<_>>();
-        for update in &confirmed_updates {
-            let expected = planned_transactions
+        for update in table_updates.into_values() {
+            let expected = expected_table_versions
                 .get(&update.identity)
-                .map(|transaction| transaction.read_version)
+                .copied()
                 .ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "missing SchemaApply expected version for '{}'",
@@ -1102,7 +969,7 @@ where
                     native_ref,
                 },
             );
-            manifest_changes.push(ManifestChange::Update(update.clone()));
+            manifest_changes.push(ManifestChange::Update(update));
         }
         for (identity, (table_key, tombstone_version, native_ref)) in table_tombstones {
             expected_versions.insert(
@@ -1120,41 +987,29 @@ where
             }));
         }
 
-        // Atomic schema apply: schema staging is part of the exact Phase-B
-        // confirmation. Armed always means rollback; EffectsConfirmed is eligible
-        // for the fixed exact-head manifest commit and subsequent promotion.
+        // Stage the schema contract bound to this apply's graph commit. The
+        // state file is written last, so a complete staging is exactly one
+        // whose state file exists; the install pass reads the marker from it.
         fail(&SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
-
-        let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
+        let (_, ir_json, state_json) = crate::db::schema_state::render_schema_contract(
+            &desired_ir,
+            Some(publication.clone()),
+        )?;
         db.storage
-            .write_text(&staging_pg_uri, desired_schema_source)
+            .write_text(&schema_source_staging_uri(&db.root_uri), desired_schema_source)
             .await?;
-        write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir).await?;
-        let target_hash = sidecar
-            .protocol_v7
-            .as_ref()
-            .expect("new SchemaApply sidecar is v7")
-            .target_schema_ir_hash
-            .clone();
-        crate::db::schema_state::validate_exact_schema_staging_target(
-            db.root_uri(),
-            db.storage_adapter(),
-            &target_hash,
-        )
-        .await?;
-
-        crate::db::manifest::confirm_schema_apply_sidecar_v9(
-            db.root_uri(),
-            db.storage_adapter(),
-            &mut sidecar,
-            &confirmed_updates,
-            &committed_transactions,
-        )
-        .await?;
-        // Preserve the existing failpoint contract: "after staging" is the
-        // recoverable roll-forward seam immediately before manifest publication.
-        // In v7 the exact physical identities and complete manifest delta must be
-        // durably confirmed before that seam is exposed.
+        db.storage
+            .write_text(
+                &crate::db::schema_state::schema_ir_staging_uri(&db.root_uri),
+                &ir_json,
+            )
+            .await?;
+        db.storage
+            .write_text(
+                &crate::db::schema_state::schema_state_staging_uri(&db.root_uri),
+                &state_json,
+            )
+            .await?;
         fail(&SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
 
         let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
@@ -1178,14 +1033,28 @@ where
                 &precondition,
             )
             .await?;
+        published_commit = Some(publication.graph_commit_id.clone());
 
         fail(&SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
-        crate::db::schema_state::promote_exact_schema_staging(
-            db.root_uri(),
-            db.storage_adapter(),
-            &target_hash,
+        // Install the contract from memory rather than by renaming the
+        // staging (another process's open may have discarded it), then retire
+        // the staging. Every write is idempotent; a crash here leaves the
+        // staged copy for the next open to install the same way.
+        db.storage
+            .write_text(&schema_source_uri(&db.root_uri), desired_schema_source)
+            .await?;
+        write_schema_contract(
+            &db.root_uri,
+            db.storage.as_ref(),
+            &SchemaContractText {
+                source: desired_schema_source.to_string(),
+                ir_json,
+                state_json,
+            },
         )
         .await?;
+        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref())
+            .await?;
 
         db.store_schema_view(
             desired_catalog,
@@ -1197,36 +1066,35 @@ where
         if changed_edge_tables {
             db.invalidate_graph_index().await;
         }
+        match fail(&SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION) {
+            Ok(()) => db.promote_held_all(promotions).await,
+            Err(error) => {
+                tracing::warn!(error = %error, "schema apply promotion interrupted; the next writer promotes")
+            }
+        }
         Ok::<u64, OmniError>(graph_manifest_version)
     }
     .await;
 
-    let manifest_version = match post_arm_result {
+    let manifest_version = match effects {
         Ok(manifest_version) => manifest_version,
         Err(error) => {
-            return Err(OmniError::recovery_required(
-                recovery_operation_id,
-                error.to_string(),
-            ));
+            // Before publication nothing referenced is durable: detached
+            // versions, a created dataset and the staged contract are garbage
+            // that the next open and cleanup retire. After publication the
+            // manifest is authoritative and only the contract installation
+            // is pending, which the next read-write open or this handle's next
+            // write entry completes from the staged copy.
+            return Err(match published_commit {
+                Some(graph_commit_id) => {
+                    db.pending_schema_install
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    OmniError::recovery_required(graph_commit_id, error.to_string())
+                }
+                None => error,
+            });
         }
     };
-
-    // Recovery sidecar lifecycle: delete after the manifest commit
-    // succeeded. Best-effort: if this delete fails, the sidecar persists
-    // and on next open the sweep sees every table at the post-publish
-    // manifest pin (NoMovement) and the sidecar is treated as a stale
-    // artifact (recovery is a no-op and the sidecar is cleaned up).
-    // Failing the schema_apply call would report failure for a migration
-    // that already succeeded.
-    if let Err(err) =
-        crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
-    {
-        tracing::warn!(
-            error = %err,
-            operation_id = recovery_handle.operation_id.as_str(),
-            "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-        );
-    }
 
     // Hard-drop cleanup: run cleanup_old_versions on each dataset
     // that had a Hard mode drop step. Best-effort — the schema apply
@@ -1323,7 +1191,18 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
         .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
-        let _ = release_schema_apply_lock(db).await;
+        // Best-effort release of the sentinel we just took; a failure arms the
+        // handle-local retry (liveness contract), so the next write entry on
+        // this handle releases it before the sentinel gate instead of staying
+        // wedged until a read-write open.
+        if let Err(release_error) = release_schema_apply_lock(db).await {
+            db.note_failed_sentinel_release();
+            tracing::warn!(
+                error = %release_error,
+                "failed to release the schema-apply sentinel after a mono-branch refusal; \
+                 the next write entry on this handle retries the release"
+            );
+        }
         return Err(OmniError::manifest_conflict(format!(
             "schema apply requires a graph with only main; found non-main branches: {}",
             blocking_branches.join(", ")
@@ -1334,16 +1213,18 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
 }
 
 pub(super) async fn release_schema_apply_lock(db: &Omnigraph) -> Result<()> {
-    db.coordinator
-        .write()
-        .await
-        .branch_delete(SCHEMA_APPLY_LOCK_BRANCH)
-        .await?;
-    // Use refresh_coordinator_only — the full Omnigraph::refresh would
-    // run roll-forward-only recovery, and on the failure path the
-    // in-flight schema_apply sidecar is still on disk; recovery would
-    // race the caller's own publish (or roll forward an aborted apply
-    // we want to leave for next-open).
+    // Idempotent: an open or a `refresh` that installed this apply's
+    // published staging may already have reclaimed the sentinel (RFC 0067).
+    let mut coordinator = db.coordinator.write().await;
+    if coordinator
+        .all_branches()
+        .await?
+        .iter()
+        .any(|branch| is_schema_apply_lock_branch(branch))
+    {
+        coordinator.branch_delete(SCHEMA_APPLY_LOCK_BRANCH).await?;
+    }
+    drop(coordinator);
     db.refresh_coordinator_only().await
 }
 
@@ -1451,7 +1332,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
     RecordBatch::try_new(target_schema, columns).map_err(OmniError::arrow_internal)
 }
 
-/// Descriptor-only pre-arm validation for external Blob cells that a schema
+/// Descriptor-only pre-effect validation for external Blob cells that a schema
 /// rewrite will carry. Project only the source Blob columns that survive in
 /// the target schema; this performs no external-object lookup or payload read.
 async fn validate_schema_rewrite_external_ranges(

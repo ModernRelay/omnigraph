@@ -26,10 +26,23 @@ omnigraph optimize ./graph.omni
 omnigraph optimize ./graph.omni --json
 ```
 
-Optimize rewrites small fragments into fewer larger fragments, refreshes scalar
-and vector coverage, and builds missing declared indexes that are ready to build. It does not
-delete old versions or collect unused table forks. Use `cleanup` for storage
-reclamation.
+Optimize rewrites small fragments into fewer larger fragments, rebuilds each
+scalar or vector index whose coverage lags behind appended rows, and builds
+missing declared indexes that are ready to build. It does not delete old
+versions or collect unused table forks. Use `cleanup` for storage reclamation.
+
+Each table's work is staged as detached Lance versions of the table's current
+pin and published in one graph commit, like any other write. A run
+that fails before that commit leaves the graph unchanged and no recovery
+state; a run interrupted after it leaves pins the next write on each table,
+or `cleanup`, promotes onto the table's linear history. Optimize runs beside
+live writers: a write that lands on a table while its compaction is staged
+fails the run with a read-set conflict, and the next run re-plans from the
+new state. An update or delete prepared before an optimize published reports
+the same conflict and is retried by its caller. Lance compacts neighbouring
+fragments only when the same indexes cover them, so a table whose index
+coverage was uneven before a run may coalesce fully only on the next run,
+after the rebuilt coverage is in place.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -50,9 +63,10 @@ commit or maintenance work.
 A vector index whose property has no usable vectors remains pending rather than
 failing the run. Run optimize again after loading or generating vectors.
 
-Optimize refuses unexplained drift or an unresolved interrupted write. Reopen
-the graph read-write (or restart its server) to finish ordinary recovery; use
-`repair` only for drift that remains unexplained.
+Optimize refuses a table whose published write is blocked by a foreign commit
+on its linear history (`repair` reports it as `blocked_promotion`) and
+unexplained drift on a table's linear history; use `repair` for drift that
+remains unexplained.
 
 ## Rebuild full-text indexes
 
@@ -109,6 +123,15 @@ but should be used only when an operator has independently established that the
 the new state of the backing dataset is correct. Repair publishes an existing state; it
 does not rewrite lost or corrupt data.
 
+A `blocked_promotion` classification names a table whose published write
+cannot land on the linear history because a foreign commit took its version.
+Reads, mutations, branch merge and index maintenance keep working through
+the pin; schema apply, the system-column upgrade, and optimize refuse that
+table until the block is
+resolved, and `cleanup` skips version GC for it because only the pin's
+detached version holds the acknowledged rows. Repair reports it and never
+adopts the foreign commit, with or without `--force`.
+
 If you cannot verify suspicious drift, restore or rebuild from a trusted export
 or backup.
 
@@ -137,7 +160,7 @@ At least one retention option is required:
 | Option | Meaning |
 |---|---|
 | `--keep N` | Request retention of the newest `N` versions per retained node or edge dataset |
-| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff |
+| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff; also reap detached manifests older than the threshold that no pending write protects |
 
 When both are present, a version must be outside both retention windows before
 it can be removed. Live branches and other storage references may keep
@@ -160,8 +183,8 @@ Before cleanup:
 4. resolve interrupted operations and any drift reported by `repair`;
 5. review the exact retention command and confirmation target.
 
-Cleanup fails closed if it cannot prove that pending recovery, live branches,
-or storage drift are safe. A failure to clean one backing dataset is reported in
+Cleanup fails closed if it cannot prove that live branches or storage drift
+are safe. A failure to clean one backing dataset is reported in
 the result; fix the cause and rerun cleanup to converge.
 
 ## Suggested cadence

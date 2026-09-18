@@ -1,17 +1,11 @@
 # issue: none
-# notes: An effect-free mutation failure leaves the same Omnigraph writable.
+# notes: A mutation that fails after its detached table effect and before publication leaves the same Omnigraph writable: nothing is graph-visible, nothing is armed, and the branch reads and writes as before (RFC 0067).
 --- runner
 timeout_ms: 10000
 environments:
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
     seeds: [0, 42]
-
---- known_failure
-step: 4
-match:
-  error: RecoveryRequired
-  reason: "pending Mutation recovery operation on branch 'work' blocks the synchronous write/control recovery barrier (datasets dataset for node type 'Person'); reopen the graph read-write before retrying"
 
 --- schema
 node Person {
@@ -23,14 +17,14 @@ node Person {
 branch create work
 --- expect ok
 --- seam
-at: mutation.post_sidecar_pre_fork
+at: mutation.post_table_commit
 occurrence: 1
 action: fail
 scope: next_step
 
 --- mutate branch: work
 query add() { insert Person { name: "bob" } }
---- expect error: injected failpoint triggered: mutation.post_sidecar_pre_fork
+--- expect error: injected failpoint triggered: mutation.post_table_commit
 --- query branch: work
 query unchanged() { match { $p: Person } return { $p.name } }
 --- expect unordered

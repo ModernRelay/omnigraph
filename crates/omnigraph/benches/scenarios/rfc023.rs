@@ -52,13 +52,16 @@ fn measured_settings() -> SessionSettings {
     }
 }
 
-/// Age is setup work for these two existing fixture families only.
+/// Age is setup work for these fixture families only.
 pub(super) fn validate_fixture_age(args: &Args) -> Result<(), String> {
     let supported = super::branch_control::is_scenario(&args.scenario)
-        || args.scenario == "general-merge-updates";
+        || args.scenario == "general-merge-updates"
+        || super::concurrent_writes::is_scenario(&args.scenario);
     if args.age_options_supplied && !supported {
         return Err(
-            "age/cache/layout controls require branch controls or general-merge-updates".into(),
+            "age/cache/layout controls require branch controls, general-merge-updates or \
+             concurrent-writes"
+                .into(),
         );
     }
     if args.history_commits > 256 || !args.history_commits.is_multiple_of(2) {
@@ -1062,15 +1065,12 @@ fn merge_phase_metrics(probes: &MergeWriteProbes) -> serde_json::Value {
         "proven_insert_plan_scan": probes.proven_insert_plan_scan_us(),
         "candidate_validation": probes.candidate_validation_us(),
         "final_revalidation": probes.final_revalidation_us(),
-        "recovery_arm": probes.recovery_arm_us(),
         "physical_publish": probes.physical_publish_us(),
         "keyed_stage_total": probes.keyed_stage_total_us(),
         "keyed_stage_max": probes.keyed_stage_max_us(),
         "keyed_commit_total": probes.keyed_commit_total_us(),
         "keyed_commit_max": probes.keyed_commit_max_us(),
-        "recovery_confirm": probes.recovery_confirm_us(),
         "manifest_publish": probes.manifest_publish_us(),
-        "recovery_cleanup": probes.recovery_cleanup_us(),
         "outer_restore_refresh": probes.outer_restore_refresh_us(),
     })
 }

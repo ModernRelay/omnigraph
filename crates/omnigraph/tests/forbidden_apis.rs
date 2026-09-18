@@ -136,11 +136,9 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "table_store/staged_tests.rs", // Unit tests for private staged primitives.
     "storage_layer.rs",            // The trait module.
     "db/graph_coordinator.rs",     // Drives the manifest publisher / branch coordinator.
-    "db/recovery_audit.rs",        // Maintains `_graph_commit_recoveries.lance`.
     "db/manifest/graph.rs",        // Bootstraps the manifest and commit datasets.
     "db/manifest/namespace.rs",    // Opens manifest datasets through the shared namespace.
     "db/manifest/publisher.rs",    // Lowest row-level manifest publish gateway.
-    "db/manifest/recovery.rs",     // Recovery executor; exactly inventoried below.
     "db/manifest/tests.rs",        // Out-of-line tests for the trusted gateways.
     "instrumentation.rs",          // The instrumented dataset opener.
     "db/manifest/upgrade.rs",
@@ -173,7 +171,6 @@ const SENTINEL: &str = "// forbidden-api-allow:";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteProtocol {
     Exact(&'static str),
-    Bounded(&'static str),
     Composed(&'static str),
     ManifestAdoption,
     NativeRefControl,
@@ -181,7 +178,7 @@ enum WriteProtocol {
     EphemeralScratch,
     TestOnly,
     Bootstrap,
-    RecoveryExecutor,
+    SchemaContractInstall,
     ReadOnlyAccess,
 }
 
@@ -189,7 +186,6 @@ impl WriteProtocol {
     fn label(self) -> String {
         match self {
             Self::Exact(name) => format!("exact adapter ({name})"),
-            Self::Bounded(name) => format!("bounded adapter ({name})"),
             Self::Composed(name) => format!("composed protocol ({name})"),
             Self::ManifestAdoption => "manifest adoption".into(),
             Self::NativeRefControl => "native ref control".into(),
@@ -197,7 +193,7 @@ impl WriteProtocol {
             Self::EphemeralScratch => "ephemeral scratch".into(),
             Self::TestOnly => "test/failpoint-only".into(),
             Self::Bootstrap => "bootstrap".into(),
-            Self::RecoveryExecutor => "recovery executor".into(),
+            Self::SchemaContractInstall => "staged schema contract installation (RFC 0067)".into(),
             Self::ReadOnlyAccess => "read-only raw snapshot access".into(),
         }
     }
@@ -207,10 +203,11 @@ const MUTATION_V9: WriteProtocol = WriteProtocol::Exact("Mutation v9");
 const LOAD_V9: WriteProtocol = WriteProtocol::Exact("Load v9");
 const SCHEMA_V9: WriteProtocol = WriteProtocol::Exact("SchemaApply v9");
 const SYSTEM_COLUMNS_V9: WriteProtocol =
-    WriteProtocol::Exact("SchemaApply v9 system-column upgrade (RFC 0040)");
+    WriteProtocol::Exact("system-column upgrade (RFC 0040, detached renames per RFC 0067)");
 const MERGE_V9: WriteProtocol = WriteProtocol::Exact("BranchMerge v9");
 const INDICES_V9: WriteProtocol = WriteProtocol::Exact("EnsureIndices v9");
-const OPTIMIZE_V9: WriteProtocol = WriteProtocol::Bounded("Optimize v9");
+const OPTIMIZE_V9: WriteProtocol =
+    WriteProtocol::Exact("Optimize (RFC 0067 detached rewrite and exact pin CAS)");
 
 #[derive(Debug, Clone, Copy)]
 struct WriteSurface {
@@ -229,7 +226,7 @@ macro_rules! write_surfaces {
 
 write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
-    "db/omnigraph.rs" => WriteProtocol::RecoveryExecutor => ["open", "open_with_storage", "refresh"],
+    "db/omnigraph.rs" => WriteProtocol::SchemaContractInstall => ["open", "open_with_storage", "refresh"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_as_with_receipt", "load_file_as", "load_file_as_with_receipt", "load_graph_batch_as", "load_graph_batch_as_with_receipt"],
@@ -308,13 +305,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "GraphCoordinator",
         "open_exact_genesis_with_storage",
     ),
-    ("db/graph_coordinator.rs", "GraphCoordinator", "open"),
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "open_with_session",
     ),
-    ("db/graph_coordinator.rs", "GraphCoordinator", "open_branch"),
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
@@ -586,8 +581,9 @@ gateway_surfaces! {
         "write_text_if_match", "delete_prefix",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
+        "transaction_identity",
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
-        "branch_identifier", "list_native_branches", "reopen_for_mutation",
+        "branch_identifier", "list_native_branches",
         "ensure_expected_version", "scan", "scan_with_row_id", "scan_batches",
         "scan_batches_for_rewrite", "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
@@ -601,7 +597,8 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
-        "stage_rename_columns", "stage_delete", "stage_create_indices",
+        "stage_rename_columns", "stage_delete", "stage_create_indices", "stage_compaction",
+        "stage_index_fold",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -618,11 +615,18 @@ gateway_surfaces! {
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("staged exact commit gateway")) => [
         "commit_staged_exact",
     ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
+        "commit_staged_detached",
+    ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 promotion replay gateway")) => [
+        "promote_detached",
+    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
+        "is_detached_version", "transaction_identity",
         "new", "root_uri", "dataset_uri", "open_snapshot_table", "open_at_entry",
         "open_at_entry_verified", "open_dataset_head", "list_native_branches",
         "named_fork_is_absent", "ensure_expected_version",
-        "reopen_for_mutation", "scan_batches", "scan_batches_for_rewrite",
+        "scan_batches", "scan_batches_for_rewrite",
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
@@ -642,11 +646,12 @@ gateway_surfaces! {
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache",
         "validate_full_text_scan", "is_full_text_index",
-        "can_fold_index", "has_foldable_unindexed_fragments",
+        "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_rename_columns", "renamed_schema", "stage_delete", "stage_create_indices",
+        "stage_compaction", "stage_index_fold",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Composed("first-touch native ref")) => [
         "fork_branch_from_state",
@@ -663,11 +668,17 @@ gateway_surfaces! {
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("staged exact commit gateway")) => [
         "commit_staged_exact",
     ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
+        "commit_staged_detached",
+    ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 promotion replay gateway")) => [
+        "promote_detached",
+    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
         "append_or_create_batch", "create_empty_dataset", "write_dataset",
     ],
     "db/manifest/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("manifest publisher gateway")) => [
-        "publish", "publish_with_precondition",
+        "publish_with_precondition",
     ],
     "db/manifest/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
         "new_with_session",
@@ -705,7 +716,7 @@ durable_calls! {
     // (A `table_version_management` config key is deliberately not written:
     // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/manifest/publisher.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -746,49 +757,35 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_create_exact(", 1, WriteProtocol::Exact("sealed TableStorage create forwarding")),
     ("storage_layer.rs", ".commit_staged(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".dataset()", 26, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".promote_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
+    ("db/omnigraph/promotion.rs", ".promote_detached(", 3, WriteProtocol::Exact("RFC 0067 promotion replay")),
+    ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/promotion.rs", ".into_dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/optimize.rs", ".delete(", 2, WriteProtocol::Composed("RFC 0067 reap of a promoted pin's detached manifest after promotion, and of aged surplus detached manifests under the cleanup age policy")),
+    ("storage_layer.rs", ".dataset()", 30, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::new(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
-    ("table_store.rs", "CommitBuilder::new(", 2, WriteProtocol::Composed("staged commit primitive")),
-    ("table_store.rs", ".create_index_builder(", 3, WriteProtocol::Composed("staged index primitive")),
-    ("table_store.rs", ".execute_uncommitted(", 8, WriteProtocol::Composed("staged physical primitive")),
-    ("exec/staging.rs", "write_sidecar(", 1, WriteProtocol::Exact("Mutation/Load v9")),
-    ("exec/merge.rs", "write_sidecar(", 1, MERGE_V9),
-    ("db/omnigraph/schema_apply.rs", "write_sidecar(", 1, SCHEMA_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "write_sidecar(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_exact(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", ".write_text(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "write_schema_contract_staging(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "confirm_schema_apply_sidecar_v9(", 1, SYSTEM_COLUMNS_V9),
+    ("table_store.rs", "CommitBuilder::new(", 4, WriteProtocol::Composed("staged commit primitive")),
+    ("table_store.rs", ".create_index_builder(", 5, WriteProtocol::Composed("staged index primitive and RFC 0067 whole-rebuild fold")),
+    ("table_store.rs", ".execute_uncommitted(", 10, WriteProtocol::Composed("staged physical primitive")),
+    ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached rename-only system-column effect")),
+    ("db/omnigraph/system_column_upgrade.rs", ".write_text(", 4, WriteProtocol::Exact("RFC 0067 staged and live schema contract source/IR/state")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_changes_with_intent_and_expected(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "promote_exact_schema_staging(", 1, SYSTEM_COLUMNS_V9),
-    ("db/omnigraph/system_column_upgrade.rs", "delete_sidecar(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".dataset()", 1, SYSTEM_COLUMNS_V9),
-    ("db/manifest/migrations.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("RFC 0040 stamp advance on main's __manifest under the system-column upgrade intent")),
-    ("db/omnigraph/table_ops.rs", "write_sidecar(", 1, INDICES_V9),
-    ("db/omnigraph/optimize.rs", "write_sidecar(", 1, OPTIMIZE_V9),
-    ("exec/staging.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("Mutation/Load v9")),
-    ("exec/merge.rs", ".commit_staged_exact(", 1, MERGE_V9),
+    ("exec/merge.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached merge chain")),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
-    ("db/omnigraph/schema_apply.rs", ".commit_staged_exact(", 1, SCHEMA_V9),
-    ("db/omnigraph/table_ops.rs", ".commit_staged_exact(", 1, INDICES_V9),
+    ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached schema rewrite")),
+    ("db/omnigraph/schema_apply.rs", ".delete_prefix(", 1, WriteProtocol::Exact("RFC 0067 reclaim of an unregistered add-type leftover under the schema sentinel")),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
+    ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("db/omnigraph/table_ops.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("adapter-owned first-touch data ref")),
-    ("exec/staging.rs", "confirm_occ_sidecar_v9(", 1, WriteProtocol::Exact("Mutation/Load v9")),
-    ("exec/merge.rs", "confirm_branch_merge_sidecar_v9(", 1, MERGE_V9),
-    ("db/omnigraph/schema_apply.rs", "confirm_schema_apply_sidecar_v9(", 1, SCHEMA_V9),
-    ("db/omnigraph/table_ops.rs", "confirm_ensure_indices_sidecar_v9(", 1, INDICES_V9),
-    ("exec/mutation.rs", "delete_sidecar_after_publish(", 1, MUTATION_V9),
-    ("loader/mod.rs", "delete_sidecar_after_publish(", 1, LOAD_V9),
-    ("exec/merge.rs", "delete_sidecar(", 1, MERGE_V9),
-    ("db/omnigraph/schema_apply.rs", "delete_sidecar(", 1, SCHEMA_V9),
-    ("db/omnigraph/table_ops.rs", "delete_sidecar(", 1, INDICES_V9),
-    ("db/omnigraph/optimize.rs", "delete_sidecar(", 1, OPTIMIZE_V9),
+    ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
     ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
     ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
@@ -797,7 +794,6 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
-    ("db/omnigraph/optimize.rs", ".commit_updates_with_actor_with_expected(", 1, OPTIMIZE_V9),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -805,33 +801,24 @@ durable_calls! {
     ("db/omnigraph.rs", ".write_text_if_absent(", 3, WriteProtocol::Composed("bootstrap init claim + strict `_schema.pg` defence + bind-time create-if-absent probe")),
     ("db/omnigraph.rs", ".write_text(", 1, WriteProtocol::Bootstrap),
     ("db/schema_state.rs", ".write_text(", 2, WriteProtocol::Composed("schema state publication")),
-    ("db/manifest/recovery.rs", ".write_text(", 7, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".commit_staged_exact(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "confirm_schema_apply_sidecar_v9(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "write_schema_contract_staging(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/schema_apply.rs", ".write_text(", 1, SCHEMA_V9),
+    ("db/omnigraph/schema_apply.rs", ".write_text(", 4, WriteProtocol::Exact("RFC 0067 staged and live schema contract source/IR/state")),
     ("db/omnigraph.rs", ".delete(", 3, WriteProtocol::Composed("bootstrap init cleanup + claim release + create-if-absent probe removal")),
     ("db/schema_state.rs", ".delete(", 3, WriteProtocol::Composed("schema staging cleanup")),
     ("db/schema_state.rs", ".rename_text(", 1, WriteProtocol::Composed("schema staging promotion")),
-    ("db/manifest/recovery.rs", ".delete(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".delete_prefix(", 2, WriteProtocol::RecoveryExecutor),
     ("db/omnigraph.rs", "GraphCoordinator::init_commit_with_session(", 1, WriteProtocol::Bootstrap),
-    ("db/omnigraph.rs", "recover_manifest_drift(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "heal_pending_sidecars_roll_forward(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph.rs", "recover_schema_state_files(", 2, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "recover_schema_state_files(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/omnigraph/optimize.rs", "compact_files(", 2, WriteProtocol::Composed("Optimize v9 data + physical manifest compaction")),
-    ("db/omnigraph/optimize.rs", ".optimize_indices(", 1, OPTIMIZE_V9),
+    ("db/omnigraph.rs", "recover_schema_state_files(", 3, WriteProtocol::SchemaContractInstall),
+    ("db/schema_state.rs", "promote_exact_schema_staging(", 1, WriteProtocol::SchemaContractInstall),
+    ("db/omnigraph/optimize.rs", "compact_files(", 1, WriteProtocol::PhysicalOnly),
+    ("db/omnigraph/optimize.rs", ".commit_staged_detached(", 3, WriteProtocol::Exact("RFC 0067 detached compaction rewrite, index fold and deferred index build")),
+    ("db/omnigraph/optimize.rs", "commit_updates_on_branch_with_expected(", 1, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", "cleanup_old_versions(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/schema_apply.rs", "cleanup_old_versions(", 1, WriteProtocol::Composed("SchemaApply hard-drop GC")),
-    ("db/omnigraph/schema_apply.rs", "write_schema_contract_staging(", 1, SCHEMA_V9),
-    ("db/omnigraph/schema_apply.rs", "promote_exact_schema_staging(", 1, SCHEMA_V9),
     ("db/omnigraph.rs", ".branch_create(", 2, WriteProtocol::NativeRefControl),
     ("db/omnigraph.rs", ".branch_delete_captured(", 1, WriteProtocol::NativeRefControl),
     ("db/omnigraph/schema_apply.rs", ".branch_create(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".branch_delete(", 1, SCHEMA_V9),
-    ("db/manifest/recovery.rs", ".branch_delete(", 1, WriteProtocol::RecoveryExecutor),
+    ("db/omnigraph.rs", ".branch_delete(", 2, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".create_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch_with_expected(", 1, WriteProtocol::NativeRefControl),
@@ -842,19 +829,6 @@ durable_calls! {
     ("branch_control.rs", ".replace_metadata(", 1, WriteProtocol::NativeRefControl),
     ("branch_control.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
     ("db/omnigraph/optimize.rs", ".force_delete_branch(", 1, WriteProtocol::PhysicalOnly),
-    ("db/manifest/recovery.rs", ".publish_with_precondition(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".publish(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".restore(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", ".append(RecoveryAuditRecord", 7, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "publish_recovery_commit(", 8, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "restore_table_to_version(", 3, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "record_audit(", 10, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_healed_sidecar(", 21, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "delete_sidecar(", 1, WriteProtocol::Composed("delete_sidecar_after_publish, the Mutation/Load v9 post-publish adapter tail behind the mutation.sidecar_post_publish_delete seam")),
-    ("db/recovery_audit.rs", ".raw_dataset_append(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/recovery_audit.rs", "Dataset::write(", 1, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "promote_exact_schema_staging(", 3, WriteProtocol::RecoveryExecutor),
-    ("db/manifest/recovery.rs", "discard_exact_schema_staging(", 2, WriteProtocol::RecoveryExecutor),
     ("exec/merge.rs", "TableStore::create_empty_dataset(", 1, WriteProtocol::EphemeralScratch),
     ("exec/merge.rs", "TableStore::append_or_create_batch(", 1, WriteProtocol::EphemeralScratch),
     // First-touch merge: enumerate native refs before arming recovery; no mutation.
@@ -878,14 +852,13 @@ durable_calls! {
     // pinned snapshot handles, plus the same-lineage path reading each
     // side's schema to resolve its system column spellings (RFC 0040
     // Historical reads). Read-only — the diff stages and publishes nothing.
-    ("changes/mod.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
+    ("changes/mod.rs", ".dataset()", 5, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 9, WriteProtocol::Composed("Optimize v9 planning + read-only coverage and native-fork inventory + physical cleanup")),
-    ("db/omnigraph/optimize.rs", ".into_dataset()", 2, OPTIMIZE_V9),
-    ("db/omnigraph/optimize.rs", "SnapshotHandle::new(", 1, OPTIMIZE_V9),
+    ("db/omnigraph/optimize.rs", ".dataset()", 8, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 5, MERGE_V9),
 }
 
@@ -900,6 +873,8 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     ".commit(",
     ".commit_staged_create_exact(",
     ".commit_staged_exact(",
+    ".commit_staged_detached(",
+    ".promote_detached(",
     ".commit_staged(",
     ".fork_branch_from_state(",
     "commit_updates_on_branch_with_expected(",
@@ -2321,7 +2296,7 @@ fn protocol_scan_exclusions_match_only_exact_test_files() {
     ));
     assert!(!is_protocol_scan_excluded(
         src,
-        Path::new("/engine/src/db/manifest/recovery.rs")
+        Path::new("/engine/src/db/manifest/migrations.rs")
     ));
     assert!(!is_protocol_scan_excluded(
         src,
@@ -2650,22 +2625,10 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         );
     }
 
-    for (function_name, capture_method, recovery_method) in [
-        (
-            "branch_create_as",
-            "capture_branch_control_source",
-            "ensure_no_pending_recovery_sidecars_under_gates",
-        ),
-        (
-            "branch_create_from_impl",
-            "capture_branch_control_source",
-            "ensure_no_pending_recovery_sidecars_under_gates",
-        ),
-        (
-            "branch_delete_as",
-            "open_coordinator_for_branch",
-            "ensure_branch_delete_recovery_safe_under_gates",
-        ),
+    for (function_name, capture_method) in [
+        ("branch_create_as", "capture_branch_control_source"),
+        ("branch_create_from_impl", "capture_branch_control_source"),
+        ("branch_delete_as", "open_coordinator_for_branch"),
     ] {
         let function = functions
             .get(function_name)
@@ -2691,13 +2654,11 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
             brace_token: function.block.brace_token,
             stmts: function.block.stmts[..capture_statement].to_vec(),
         };
-        for required in ["acquire_many", recovery_method] {
-            assert_eq!(
-                method_call_count(&before_capture, required),
-                1,
-                "Omnigraph::{function_name} must acquire table gates and finish recovery checks before capture"
-            );
-        }
+        assert_eq!(
+            method_call_count(&before_capture, "acquire_many"),
+            1,
+            "Omnigraph::{function_name} must acquire its table gates before capture"
+        );
     }
 
     let capture_helper = functions

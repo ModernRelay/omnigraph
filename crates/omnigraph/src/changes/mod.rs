@@ -236,7 +236,24 @@ pub(crate) async fn diff_snapshots(
             (Some(from), None) => diff_table_removed(table_store, from, is_edge, filter).await?,
             // Fast path: version-column diff
             (Some(from), Some(to)) if same_lineage(from_entry, to_entry) => {
-                diff_table_same_lineage(table_store, from, to, is_edge, filter).await?
+                match diff_table_same_lineage(table_store, from, to, is_edge, filter).await? {
+                    Some(changes) => changes,
+                    // RFC 0067: the `to` endpoint is a pending pin's detached
+                    // version. Rows staged on a detached predecessor carry
+                    // stamps outside the linear interval, so compare exactly.
+                    None => {
+                        diff_table_cross_branch(
+                            table_store,
+                            from,
+                            to,
+                            is_edge,
+                            filter,
+                            type_name,
+                            to_commit_id.as_deref().unwrap_or_default(),
+                        )
+                        .await?
+                    }
+                }
             }
             // Cross-branch path: streaming ID-based diff
             (Some(from), Some(to)) => {
@@ -321,11 +338,14 @@ async fn diff_table_same_lineage(
     to_entry: &DatasetEntry,
     is_edge: bool,
     filter: &ChangeFilter,
-) -> Result<Vec<EntityChange>> {
+) -> Result<Option<Vec<EntityChange>>> {
     let vf = from_entry.published_dataset_version;
     let vt = to_entry.published_dataset_version;
     let storage: &dyn TableStorage = table_store;
     let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
+    if TableStore::is_detached_version(to_ds.dataset().version().version) {
+        return Ok(None);
+    }
     let to_columns = system_columns_at_image(to_ds.dataset().schema(), &to_entry.type_key)?;
 
     let cols: Vec<&str> = if is_edge {
@@ -364,7 +384,7 @@ async fn diff_table_same_lineage(
         Vec::new()
     };
     if changed_rows.is_empty() && !wants_deletes {
-        return Ok(changes);
+        return Ok(Some(changes));
     }
     let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
     let from_columns = system_columns_at_image(from_ds.dataset().schema(), &from_entry.type_key)?;
@@ -392,7 +412,7 @@ async fn diff_table_same_lineage(
         );
     }
 
-    Ok(changes)
+    Ok(Some(changes))
 }
 
 // ─── Cross-branch path: streaming ID-based diff ────────────────────────────

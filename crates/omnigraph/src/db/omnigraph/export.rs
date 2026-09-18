@@ -105,7 +105,7 @@ impl Omnigraph {
             }
         })?;
 
-        self.heal_pending_recovery_sidecars_outcome().await?;
+        self.settle_pending_schema_install().await?;
         let (resolved, catalog) = self.capture_read_view(ReadTarget::branch(branch)).await?;
         let snapshot = resolved.snapshot;
         let selected_tables = export_type_keys(&snapshot, type_names)?;
@@ -275,7 +275,7 @@ async fn capture_baseline_parts(
         }
     })?;
     if heal {
-        db.heal_pending_recovery_sidecars_outcome().await?;
+        db.settle_pending_schema_install().await?;
     }
     let normalized_branch = Some(branch).filter(|branch| *branch != "main");
     let cut = db

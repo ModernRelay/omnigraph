@@ -34,10 +34,8 @@ use lance::dataset::optimize::{
     CompactionMetrics, CompactionOptions, compact_files, plan_compaction,
 };
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
-use lance_index::optimize::OptimizeOptions;
 
 use super::*;
-use crate::error::missing_graph_type_at_snapshot;
 use crate::seams::{decide_seam, fail};
 
 /// How many datasets to optimize/cleanup concurrently. Each has separate
@@ -72,7 +70,7 @@ pub struct CleanupPolicyOptions {
 #[non_exhaustive]
 pub enum SkipReason {
     /// The Lance dataset HEAD is ahead of the version recorded in
-    /// `__manifest`, and no recovery sidecar covers that movement. `optimize`
+    /// `__manifest`, and no pending pin explains that movement. `optimize`
     /// cannot infer whether the drift is benign maintenance or an external
     /// semantic write, so it leaves the dataset untouched and points operators at
     /// explicit `repair`.
@@ -128,7 +126,7 @@ pub struct DatasetOptimizeStats {
     pub lance_head_version: Option<u64>,
     /// Index work deferred this run, with the reason and remedy: a vector
     /// property without trainable vectors, or full-text coverage requiring an
-    /// explicit rebuild. Deferred work alone does not arm recovery or publish.
+    /// explicit rebuild. Deferred work alone does not stage or publish.
     pub pending_indexes: Vec<super::PendingIndex>,
 }
 
@@ -183,12 +181,14 @@ struct OptimizeTableTask {
     table_key: String,
     full_path: String,
     expected_version: u64,
+    entry: crate::db::manifest::DatasetEntry,
 }
 
 struct PreparedOptimizeTable {
     identity: crate::db::manifest::TableIdentity,
     table_key: String,
     full_path: String,
+    dataset_path: String,
     expected_version: u64,
     initial_snapshot: crate::storage_layer::SnapshotHandle,
 }
@@ -200,7 +200,15 @@ enum OptimizePreparation {
 
 struct OptimizeEffectOutcome {
     stat: DatasetOptimizeStats,
-    update: Option<crate::db::DatasetUpdate>,
+    effect: Option<OptimizeTableEffect>,
+}
+
+/// One table's staged maintenance: the pin update to publish, the version it
+/// was planned from, and the held promotion to run after publication.
+struct OptimizeTableEffect {
+    update: crate::db::DatasetUpdate,
+    expected_version: u64,
+    promotion: crate::db::HeldPromotion,
 }
 
 decide_seam! {
@@ -215,17 +223,10 @@ decide_seam! {
     pub static OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES = ("optimize.post_authority_capture_pre_gates", Unreachable, [Fail]);
 }
 
-decide_seam! {
-    /// After Optimize's broad recovery fast-path check, before the main-branch
-    /// writer gate is acquired. Tests arm a late recovery intent in this window
-    /// and prove the under-branch-gate check refuses to advance around it.
-    pub static OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE = ("optimize.post_recovery_check_pre_main_gate", Unreachable, [Fail]);
-}
-
 /// Run Lance maintenance across every node + edge dataset on `main` under one
 /// graph visibility envelope. Physical dataset work remains bounded-parallel,
-/// but every productive dataset shares one recovery sidecar and one monotonic
-/// manifest batch publish, so one public Optimize produces at most one graph
+/// but every productive dataset stages detached and the batch publishes once
+/// with an exact pin CAS, so one public Optimize produces at most one graph
 /// commit. The final physical `__manifest` compaction remains outside that
 /// graph-visible envelope because the system dataset is read directly at HEAD.
 pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
@@ -233,30 +234,10 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
 
-    // Refuse on an unrecovered graph. A pending recovery sidecar means a failed
-    // write left partial state that the open-time sweep must resolve (roll
-    // forward/back) first; compacting + publishing a table covered by such a
-    // sidecar could commit a partial write the sweep would roll back. Reopen the
-    // graph to run recovery, then re-run optimize.
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "optimize requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before optimizing",
-        ));
-    }
-    // Deterministic race seam: the broad fast-path probe above has completed,
-    // but main's branch-writer gate is not held yet. A writer may arm recovery
-    // in this window; the load-bearing check below runs only after Optimize owns
-    // the branch authority every sidecar-enrolled main writer must cross.
-    fail(&OPTIMIZE_POST_RECOVERY_CHECK_PRE_MAIN_GATE)?;
-
     // Capture complete graph authority before entering any writer gate, then
     // revalidate it after schema -> main -> table acquisition. A concurrent
-    // graph or schema publish therefore refuses this attempt before physical
-    // maintenance effects or recovery ownership.
+    // graph or schema publish therefore refuses this attempt before any
+    // physical maintenance effect.
     let authority_txn = db.open_write_txn(None).await?;
     fail(&OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES)?;
 
@@ -271,8 +252,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 
     // Optimize's one visibility point advances main's graph head, so its
     // authority is branch-wide even though physical effects are table-local.
-    // Retain main through the final physical-only __manifest compaction so a
-    // new main recovery intent cannot arm before raw manifest movement ends.
+    // Retain main through the final physical-only __manifest compaction.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
 
     let table_keys = all_table_keys(&catalog);
@@ -282,10 +262,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         .collect::<Vec<_>>();
     let table_guards = db.write_queue().acquire_many(&queue_keys).await;
 
-    // This relist is authoritative: every in-process writer that could have
-    // armed a main/global intent crosses one of the gates now held. The entry
-    // probe above is only a cheap fast-path/race seam.
-    ensure_no_pending_recovery_for_optimize_under_main_gate(db).await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
 
     // Whether this run advanced any edge table — consumed by the graph-index
@@ -301,6 +277,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
                 table_key,
                 full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
                 expected_version: entry.published_dataset_version,
+                entry: entry.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -329,32 +306,12 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     prepared.sort_by(|left, right| left.table_key.cmp(&right.table_key));
 
     if !prepared.is_empty() {
-        // Phase A: one durable bounded-v2 intent before the first table HEAD
-        // advance. Exact provenance is deferred until Lance has a stable public
-        // maintenance-transaction API and recovery has a distributed fence.
-        let pins = prepared
-            .iter()
-            .map(|work| crate::db::manifest::SidecarTablePin {
-                table_fork_owner: None,
-                identity: work.identity,
-                table_key: work.table_key.clone(),
-                table_path: work.full_path.clone(),
-                expected_version: work.expected_version,
-                // Lower bound: compact_files may reserve then rewrite, while
-                // reindex/config/index work can add more versions.
-                post_commit_pin: work.expected_version + 1,
-                confirmed_version: None,
-                table_branch: None,
-            })
-            .collect();
-        let sidecar = crate::db::manifest::new_optimize_sidecar_v9(pins)?;
-        let recovery_handle =
-            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
-                .await?;
-
-        // Phase B: settle every bounded-parallel task. Never early-cancel
-        // siblings: after the shared sidecar is armed, recovery needs the most
-        // knowable completed effect set possible.
+        // RFC 0067: every productive table stages its rewrite (and any
+        // deferred index build) as detached versions of its pin, the batch
+        // publishes once with an exact CAS on the pins it planned from, and
+        // the writer promotes the versions it holds. A failure before
+        // publication leaves garbage the reaper retires; one after it leaves
+        // pending pins the next writer or cleanup promotes.
         let effect_concurrency = maint_concurrency().min(prepared.len()).max(1);
         let effect_results: Vec<Result<OptimizeEffectOutcome>> = futures::stream::iter(prepared)
             .map(|work| {
@@ -364,56 +321,53 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             .buffer_unordered(effect_concurrency)
             .collect()
             .await;
-
         let mut outcomes = Vec::new();
-        let mut first_error = None;
         for result in effect_results {
-            match result {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+            outcomes.push(result?);
+        }
+        fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
+        let mut updates = Vec::new();
+        let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
+        let mut promotions = Vec::new();
+        for outcome in &mut outcomes {
+            if let Some(effect) = outcome.effect.take() {
+                expected_versions.insert(
+                    effect.update.identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key: effect.update.type_key.clone(),
+                        table_version: effect.expected_version,
+                        native_ref: crate::db::manifest::NativeRefPin::Exact(None),
+                    },
+                );
+                updates.push(effect.update);
+                promotions.push(effect.promotion);
             }
         }
-        if let Some(error) = first_error {
-            return Err(optimize_recovery_required(&recovery_handle, error));
-        }
-
-        // One graph-wide Phase-B -> Phase-C crash seam, after every physical
-        // effect and before the only graph visibility point.
-        if let Err(error) = fail(&OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT) {
-            return Err(optimize_recovery_required(&recovery_handle, error));
-        }
-
-        let updates = outcomes
+        let any_committed = !updates.is_empty();
+        let edge_committed = updates
             .iter()
-            .filter_map(|outcome| outcome.update.clone())
-            .collect::<Vec<_>>();
-        if let Err(error) = publish_optimize_batch_monotonic(db, &updates).await {
-            return Err(optimize_recovery_required(&recovery_handle, error));
+            .any(|update| update.type_key.starts_with("edge:"));
+        if any_committed {
+            let lineage = db.new_lineage_intent_for_branch(None, None).await?;
+            super::table_ops::commit_updates_on_branch_with_expected(
+                db,
+                None,
+                &updates,
+                &expected_versions,
+                None,
+                &authority_txn,
+                lineage,
+            )
+            .await?;
+            match fail(&OPTIMIZE_POST_PUBLISH_PRE_PROMOTION) {
+                Ok(()) => db.promote_held_all(promotions).await,
+                Err(error) => {
+                    tracing::warn!(error = %error, "optimize promotion interrupted; the next writer promotes")
+                }
+            }
         }
-
-        let any_committed = outcomes.iter().any(|outcome| outcome.stat.committed);
-        let edge_committed = outcomes
-            .iter()
-            .any(|outcome| outcome.stat.committed && outcome.stat.type_key.starts_with("edge:"));
         edge_tables_committed = edge_committed;
         stats.extend(outcomes.into_iter().map(|outcome| outcome.stat));
-
-        // Phase D: the graph-visible postcondition is durable. A failed delete
-        // is harmless; legacy recovery recognizes the manifest-aligned stale
-        // sidecar and records/cleans it on the next pass.
-        if let Err(err) =
-            crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
-        {
-            tracing::warn!(
-                error = %err,
-                operation_id = recovery_handle.operation_id.as_str(),
-                "graph-wide optimize recovery sidecar cleanup failed; next open will resolve it"
-            );
-        }
-
-        // Cache invalidation happens once, after the one visibility point. A
-        // partial Phase B is deliberately not exposed through runtime caches.
         if any_committed {
             db.runtime_cache.invalidate_all().await;
             if edge_committed {
@@ -421,18 +375,17 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             }
         }
     }
-
     stats.sort_by(|left, right| left.type_key.cmp(&right.type_key));
 
-    // Data-table recovery/publish is finished. Release the sorted table and
-    // schema gates before physical internal maintenance; retain main's branch
-    // gate through that maintenance to preserve the late-intent barrier.
+    // Data-table publish and promotion are finished. Release the sorted table
+    // and schema gates before physical internal maintenance; retain main's
+    // branch gate through that maintenance.
     drop(table_guards);
     drop(schema_guard);
 
     // Compact the internal system tables too (RFC-013 step 2). They are not
     // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
-    // compact in place, no manifest publish, no sidecar. Appended after the
+    // compact in place, no manifest publish. Appended after the
     // data-table stats so the data-table cache invalidation above is computed from
     // data-table stats only; each internal compaction does its own coordinator
     // refresh for cache coherence.
@@ -552,6 +505,12 @@ async fn prepare_optimize_table(
         .storage()
         .open_dataset_head(&task.full_path, None)
         .await?;
+    // Optimize is a graph-global writer: it promotes a pending pin before it
+    // plans, so the plan runs from the linear twin, and refuses a blocked one
+    // (RFC 0067).
+    let snapshot = db
+        .promote_pending_pin(&task.table_key, &task.full_path, &task.entry, snapshot)
+        .await?;
     let lance_head_version = snapshot.version();
     if lance_head_version < task.expected_version {
         return Err(OmniError::manifest_internal(format!(
@@ -606,6 +565,7 @@ async fn prepare_optimize_table(
         identity: task.identity,
         table_key: task.table_key,
         full_path: task.full_path,
+        dataset_path: task.entry.dataset_path.clone(),
         expected_version: task.expected_version,
         initial_snapshot: snapshot,
     }))
@@ -658,357 +618,135 @@ async fn append_deferred_full_text_indexes(
 }
 
 decide_seam! {
-    /// After compaction has committed (HEAD already ahead of the manifest from
-    /// our own work), before the reindex of the next attempt. A failure here is
-    /// the retryable reindex conflict that exercises own-HEAD drift
-    /// classification on the reopened attempt.
-    pub static OPTIMIZE_POST_COMPACT_PRE_REINDEX = ("optimize.post_compact_pre_reindex", Unreachable, [Fail]);
+    /// After one table's detached rewrite or index link committed, before the
+    /// next link or table (RFC 0067). Nothing is published yet.
+    pub static OPTIMIZE_POST_TABLE_EFFECT = ("optimize.post_table_effect", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// The batch published its pins; the held promotions have not run.
+    pub static OPTIMIZE_POST_PUBLISH_PRE_PROMOTION = ("optimize.post_publish_pre_promotion", Unreachable, [Fail]);
 }
 
 decide_seam! {
     pub static OPTIMIZE_BEFORE_COMPACT = ("optimize.before_compact", Unreachable, [Fail]);
 }
 
-/// Apply one productive dataset's physical maintenance work. This helper owns no
-/// locks, sidecar, or graph publish; those are graph-wide responsibilities of
-/// `optimize_all_datasets`.
+/// Stage one productive table's maintenance detached from its pin, as a
+/// chain of at most three links: the compaction rewrite, then a whole rebuild
+/// of every foldable index whose coverage lags the rewritten layout (Lance 11
+/// folds only through a linear commit, so `stage_index_fold` rebuilds instead
+/// of merging), then any declared-but-unbuilt index. The rewrite comes first
+/// so an index is rebuilt once, over the settled layout.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
 ) -> Result<OptimizeEffectOutcome> {
-    let identity = work.identity;
     let table_key = work.table_key;
     let full_path = work.full_path;
-    let mut initial_snapshot = Some(work.initial_snapshot);
-
-    // Tracks whether one of OUR Phase-B ops (auto-cleanup strip / compact / reindex)
-    // already committed and advanced Lance HEAD past the manifest in a prior attempt.
-    // Once true, a reopened `lance_head > manifest` is our own sidecar-covered work,
-    // NOT external drift — so the drift guard and the no-op early-return must not treat
-    // it as such (that would drop our committed work as uncovered drift).
-    let mut head_advanced = false;
-
-    // Outer loop: open → plan → Phase B, reopening + re-planning on a retryable
-    // Lance conflict. Breaks with the committed snapshot once Phase B succeeds.
-    let mut attempt: u32 = 0;
-    let (snapshot, metrics, pending_indexes, committed) = loop {
-        attempt += 1;
-
-        let selected = match initial_snapshot.take() {
-            Some(snapshot) => snapshot,
-            None => db.storage().open_dataset_head(&full_path, None).await?,
-        };
-
-        // CAS baseline: the table's current manifest version, re-read each attempt
-        // (a reopen means the manifest may have advanced).
-        let expected_version = db
-            .fresh_snapshot_for_branch(None)
-            .await?
-            .dataset(&table_key)
-            .map(|e| e.published_dataset_version)
-            .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-
-        let lance_head_version = selected.version();
-        if lance_head_version < expected_version {
-            return Err(OmniError::manifest_internal(format!(
-                "{} is at Lance HEAD version {}, behind published dataset version {}",
-                dataset_subject(&table_key),
-                lance_head_version,
-                expected_version
-            )));
-        }
-        if !head_advanced && lance_head_version > expected_version {
-            // Pre-existing EXTERNAL uncovered drift (we have not advanced HEAD yet) —
-            // go through explicit repair. Once `head_advanced` is set, a reopened
-            // `lance_head > manifest` is our own prior Phase-B commit (sidecar-covered)
-            // that the publish below fast-forwards, NOT external drift, so this guard is
-            // skipped on those retries.
-            return Err(OmniError::manifest_conflict(format!(
-                "optimize {} moved after the graph-wide recovery intent armed: \
-                 published dataset version {}, Lance HEAD version {}",
-                dataset_subject(&table_key),
-                expected_version,
-                lance_head_version
-            )));
-        }
-
-        // Precise "will it compact?" check — `plan_compaction` also accounts for
-        // deletion materialization (which can rewrite even a single fragment).
-        let options = CompactionOptions::default();
-        let plan = plan_compaction(selected.dataset(), &options)
-            .await
-            .map_err(OmniError::storage)?;
-        let will_compact = plan.num_tasks() > 0;
-        // Even with nothing to compact, the table may still have index work
-        // (needs_reindex: rows appended since the index was built; needs_index_create:
-        // a declared `@index` whose physical build schema apply deferred, iss-848).
-        // Any of the three enters the publish path. If NONE, this is a no-op and must
-        // NOT be pinned in a sidecar (a zero-commit pin classifies NoMovement on
-        // recovery and rolls back siblings).
-        let needs_reindex =
-            TableStore::has_foldable_unindexed_fragments(selected.dataset()).await?;
-        let index_work = super::table_ops::index_work_status_on_dataset_for_catalog(
-            db, catalog, &table_key, &selected,
-        )
-        .await?;
-        let needs_index_create = index_work.needs_commit;
-        if !will_compact && !needs_reindex && !needs_index_create {
-            if head_advanced {
-                // Nothing left to compact, but a prior attempt already advanced HEAD
-                // (e.g. the strip committed, then compaction conflicted, and the reopen
-                // is now already compacted). Publish that committed work instead of
-                // dropping it as uncovered drift.
-                break (
-                    selected,
-                    CompactionMetrics::default(),
-                    index_work.pending,
-                    true,
-                );
-            }
-            let mut stat = DatasetOptimizeStats::compacted(
-                table_key.clone(),
-                &CompactionMetrics::default(),
-                false,
-            );
-            stat.pending_indexes = index_work.pending;
-            append_deferred_full_text_indexes(&selected, &stat.type_key, &mut stat.pending_indexes)
-                .await?;
-            return Ok(OptimizeEffectOutcome { stat, update: None });
-        }
-
-        // Test seam: a concurrent (cross-process) writer can interleave here, before
-        // any Phase-B commit lands, to exercise the reopen+replan path.
-        fail(&OPTIMIZE_BEFORE_COMPACT)?;
-
-        // Phase B: scrub stale auto_cleanup (keeps optimize non-destructive on a
-        // graph upgraded from a pre-v7 binary whose `compact_files`/`optimize_indices`
-        // commits would otherwise fire Lance's auto-cleanup GC hook), compact,
-        // incremental reindex, then materialize declared-but-missing indexes. The
-        // maintenance APIs still commit inline; missing-index materialization uses a
-        // staged CreateIndex immediately committed under this bounded-v2 sidecar.
-        // A retryable Lance conflict
-        // here means a concurrent writer preempted an overlapping fragment → reopen at
-        // the new HEAD and re-plan. Baseline captured BEFORE the scrub so that if the
-        // scrub is the only commit, `committed` still triggers the Phase-C publish.
-        let mut ds = selected.into_dataset();
-        let version_before = ds.version().version;
-        match clear_stale_auto_cleanup_config(&mut ds).await {
-            // `true` ⇒ the strip committed and advanced HEAD past the manifest.
-            Ok(stripped) => head_advanced |= stripped,
-            Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
-                continue;
-            }
-            Err(e) => return Err(OmniError::storage(e)),
-        }
-        let metrics: CompactionMetrics = if will_compact {
-            match compact_files(&mut ds, options, None).await {
-                Ok(m) => {
-                    head_advanced = true;
-                    m
-                }
-                Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
-                    continue;
-                }
-                Err(e) => return Err(OmniError::storage(e)),
-            }
-        } else {
-            CompactionMetrics::default()
-        };
-        // Test seam: inject one retryable reindex conflict AFTER compaction has
-        // committed (so HEAD is already ahead of the manifest from our own work),
-        // exercising the own-HEAD (not external) drift classification on the next
-        // reopened attempt.
-        if fail(&OPTIMIZE_POST_COMPACT_PRE_REINDEX).is_err() && attempt < COMPACTION_RETRY_BUDGET {
-            continue;
-        }
-        // FTS folding merges existing postings into a new UUID without an
-        // uncommitted proof hook. Keep those immutable artifacts (stable-row-ID
-        // compaction preserves them), and scan uncovered rows until an explicit
-        // full rebuild. Never bless mixed old/new analyzer postings. RFC 0043.
-        let index_names = ds
-            .load_indices()
-            .await
-            .map_err(OmniError::storage)?
-            .iter()
-            .filter(|index| TableStore::can_fold_index(index))
-            .map(|index| index.name.clone())
-            .collect();
-        match ds
-            .optimize_indices(&OptimizeOptions::default().index_names(index_names))
-            .await
-        {
-            Ok(()) => {}
-            Err(e) if attempt < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
-                continue;
-            }
-            Err(e) => {
-                return Err(OmniError::storage_context(
-                    format!("optimize_indices on {table_key}"),
-                    e,
-                ));
-            }
-        }
-
-        let mut snapshot = crate::storage_layer::SnapshotHandle::new(ds);
-        let pending_indexes: Vec<super::PendingIndex> =
-            super::table_ops::build_indices_on_dataset_for_catalog(
-                db,
-                catalog,
-                &table_key,
-                &mut snapshot,
-            )
-            .await?;
-        // optimize_indices / index build may also have committed (folded fragments,
-        // built a deferred index). Any HEAD advance this attempt counts too.
-        let version_after = snapshot.version();
-        head_advanced |= version_after != version_before;
-
-        break (snapshot, metrics, pending_indexes, head_advanced);
-    };
-
-    let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, committed);
-    stat.pending_indexes = pending_indexes;
-    append_deferred_full_text_indexes(&snapshot, &stat.type_key, &mut stat.pending_indexes).await?;
-    let update = if committed {
-        let state = db.storage().table_state(&full_path, &snapshot).await?;
-        Some(crate::db::DatasetUpdate {
-            identity,
-            type_key: stat.type_key.clone(),
-            published_dataset_version: state.version,
-            native_dataset_branch: None,
-            entity_count: state.row_count,
-            version_metadata: state.version_metadata,
-        })
-    } else {
-        None
-    };
-    Ok(OptimizeEffectOutcome { stat, update })
-}
-
-/// Publish every still-needed table pointer in one manifest/lineage CAS. This
-/// is maintenance-class OCC, not logical read-set OCC: a current pointer at or
-/// beyond the achieved target is already converged and is omitted; remaining
-/// pointers use their freshly observed versions as row-level expectations.
-async fn publish_optimize_batch_monotonic(
-    db: &Omnigraph,
-    targets: &[crate::db::DatasetUpdate],
-) -> Result<()> {
-    if targets.is_empty() {
-        return Ok(());
+    let base = work.initial_snapshot;
+    fail(&OPTIMIZE_BEFORE_COMPACT)?;
+    let options = CompactionOptions::default();
+    let mut chain = Vec::new();
+    let mut tip = base.clone();
+    let mut tip_identity = None;
+    let mut metrics = CompactionMetrics::default();
+    if let Some((staged, compaction_metrics)) =
+        db.storage().stage_compaction(&base, &options).await?
+    {
+        let (rewrite, identity) = db.storage().commit_staged_detached(tip, staged).await?;
+        metrics = compaction_metrics;
+        tip = rewrite;
+        tip_identity = Some(identity);
+        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
     }
-
-    let mut last_conflict = None;
-    for _ in 0..COMPACTION_RETRY_BUDGET {
-        let current = db.fresh_snapshot_for_branch(None).await?;
-        let mut updates = Vec::with_capacity(targets.len());
-        let mut expected = std::collections::HashMap::with_capacity(targets.len());
-        for target in targets {
-            let entry = current.dataset(&target.type_key).ok_or_else(|| {
-                OmniError::manifest_conflict(format!(
-                    "optimize target '{}' disappeared before graph-wide publish",
-                    target.type_key
+    // Fold every index whose coverage lags (appended fragments, or a vector
+    // index that keeps row addresses and dropped the compacted fragments)
+    // as a detached rebuild chained on the rewrite.
+    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
+    if let Some(staged) = fold {
+        if tip_identity.is_some() {
+            chain.push(tip.clone());
+        }
+        let (folded, identity) = db.storage().commit_staged_detached(tip, staged).await?;
+        tip = folded;
+        tip_identity = Some(identity);
+        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
+    }
+    let mut index_work =
+        super::table_ops::plan_index_work_on_dataset_for_catalog(db, catalog, &table_key, &tip)
+            .await?;
+    for (column, reason) in skipped_folds {
+        index_work.pending.push(super::PendingIndex {
+            type_key: table_key.clone(),
+            property: column,
+            reason: format!(
+                "vector index coverage lags and the column cannot train an index: {reason}"
+            ),
+        });
+    }
+    if !index_work.specs.is_empty() {
+        let staged = db
+            .storage()
+            .stage_create_indices(&tip, &index_work.specs)
+            .await
+            .map_err(|error| {
+                error.with_context(format!(
+                    "stage index batch on {table_key} ({:?})",
+                    index_work.specs
                 ))
             })?;
-            if entry.identity != target.identity {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("dataset_identity:{}", target.type_key),
-                    Some(target.identity.to_string()),
-                    Some(entry.identity.to_string()),
-                ));
-            }
-            if entry.published_dataset_version < target.published_dataset_version {
-                expected.insert(
-                    entry.identity,
-                    crate::db::manifest::TableVersionExpectation {
-                        table_key: target.type_key.clone(),
-                        table_version: entry.published_dataset_version,
-                        native_ref: crate::db::manifest::NativeRefPin::Exact(
-                            entry.native_dataset_branch.clone(),
-                        ),
-                    },
-                );
-                updates.push(target.clone());
-            }
+        if tip_identity.is_some() {
+            chain.push(tip.clone());
         }
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        match db
-            .coordinator
-            .write()
-            .await
-            .commit_updates_with_actor_with_expected(&updates, &expected, None)
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) if is_retryable_manifest_conflict(&error) => last_conflict = Some(error),
-            Err(error) => return Err(error),
-        }
+        let (indexed, identity) = db.storage().commit_staged_detached(tip, staged).await?;
+        tip = indexed;
+        tip_identity = Some(identity);
+        fail(&OPTIMIZE_POST_TABLE_EFFECT)?;
     }
-
-    let current = db.fresh_snapshot_for_branch(None).await?;
-    if targets.iter().all(|target| {
-        current.dataset(&target.type_key).is_some_and(|entry| {
-            entry.identity == target.identity
-                && entry.published_dataset_version >= target.published_dataset_version
-        })
-    }) {
-        return Ok(());
-    }
-    Err(last_conflict.unwrap_or_else(|| {
-        OmniError::manifest_conflict(format!(
-            "graph-wide optimize publish exhausted {COMPACTION_RETRY_BUDGET} retries"
-        ))
-    }))
-}
-
-fn optimize_recovery_required(
-    handle: &crate::db::manifest::RecoverySidecarHandle,
-    error: OmniError,
-) -> OmniError {
-    OmniError::recovery_required(
-        handle.operation_id.clone(),
-        format!(
-            "graph-wide optimize failed after arming recovery; reopen read-write to converge it: {error}"
-        ),
-    )
-}
-
-/// Final recovery-ownership check for main-branch Optimize.
-///
-/// The caller must hold main's branch-writer gate and retain it through all data
-/// effects and graph-head publishes. The top-level probe stays deliberately
-/// conservative and refuses any pre-existing sidecar; this final check rejects
-/// every late main-target intent plus graph-global SchemaApply. Table-disjoint
-/// intents still overlap because each fixed recovery authority includes the
-/// shared `graph_head:main` that Optimize advances.
-///
-/// This is a process-local gate proof, matching the repository's documented
-/// single-writer-process boundary. Separate processes remain governed by Lance
-/// OCC and recovery classification; this helper is not a distributed lock.
-async fn ensure_no_pending_recovery_for_optimize_under_main_gate(db: &Omnigraph) -> Result<()> {
-    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
-    let blocking = sidecars.iter().find(|sidecar| {
-        sidecar.writer_kind == crate::db::manifest::SidecarKind::SchemaApply
-            || sidecar
-                .branch
-                .as_deref()
-                .filter(|branch| *branch != "main")
-                .is_none()
-    });
-    if let Some(sidecar) = blocking {
-        return Err(OmniError::recovery_required(
-            sidecar.operation_id.clone(),
-            format!(
-                "pending {:?} recovery operation on branch '{}' blocks optimize",
-                sidecar.writer_kind,
-                sidecar.branch.as_deref().unwrap_or("main"),
-            ),
-        ));
-    }
-    Ok(())
+    let Some(identity) = tip_identity else {
+        let mut stat = DatasetOptimizeStats::compacted(table_key, &metrics, false);
+        stat.pending_indexes = index_work.pending;
+        append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+        return Ok(OptimizeEffectOutcome { stat, effect: None });
+    };
+    let mut stat = DatasetOptimizeStats::compacted(table_key.clone(), &metrics, true);
+    stat.pending_indexes = index_work.pending;
+    append_deferred_full_text_indexes(&tip, &stat.type_key, &mut stat.pending_indexes).await?;
+    let state = db.storage().table_state(&full_path, &tip).await?;
+    let published_dataset_version = work.expected_version + 1 + chain.len() as u64;
+    let version_metadata = state
+        .version_metadata
+        .with_staged(state.version, identity.uuid.clone());
+    let promotion = crate::db::HeldPromotion {
+        table_key: table_key.clone(),
+        dataset_path: work.dataset_path,
+        full_path: full_path.clone(),
+        table_branch: None,
+        base,
+        chain,
+        detached: tip,
+        target: published_dataset_version,
+        uuid: identity.uuid,
+        e_tag: version_metadata.e_tag().map(str::to_string),
+    };
+    let update = crate::db::DatasetUpdate {
+        identity: work.identity,
+        type_key: table_key,
+        published_dataset_version,
+        native_dataset_branch: None,
+        entity_count: state.row_count,
+        version_metadata,
+    };
+    Ok(OptimizeEffectOutcome {
+        stat,
+        effect: Some(OptimizeTableEffect {
+            update,
+            expected_version: work.expected_version,
+            promotion,
+        }),
+    })
 }
 
 /// Bound on the app-level retry of an internal-table compaction against a
@@ -1034,22 +772,11 @@ fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
     )
 }
 
-/// A manifest publish conflict that optimize's monotonic Phase-C loop re-evaluates
-/// (re-read the current version, then no-op or fast-forward). Both shapes that reach
-/// here are `Conflict`-kind and mean "the manifest moved under us; reconsider," never
-/// a lost update: the typed `PublishedDatasetVersionMismatch` (a concurrent writer advanced
-/// the table) and the publisher's exhausted row-level CAS (`manifest_conflict`).
-fn is_retryable_manifest_conflict(err: &OmniError) -> bool {
-    matches!(
-        err,
-        OmniError::Manifest(m) if m.kind == crate::error::ManifestErrorKind::Conflict
-    )
-}
-
 /// Remove any stored `lance.auto_cleanup.*` config from a table so compaction
-/// stays **non-destructive by construction**. Used by both the internal-table
-/// path ([`compact_internal_table`]) and the data-table path
-/// ([`apply_optimize_table_effects`]).
+/// stays **non-destructive by construction**. Used by the internal-table path
+/// ([`compact_internal_table`]), whose `compact_files` commits linearly through
+/// Lance's own hook; data tables need no strip, since every engine commit and
+/// promotion of a detached rewrite skips auto-cleanup (RFC 0067).
 ///
 /// `compact_files` / `optimize_indices` commit with a default `CommitConfig`
 /// (`skip_auto_cleanup = false`) and `CompactionOptions` exposes no override, so on
@@ -1065,10 +792,9 @@ fn is_retryable_manifest_conflict(err: &OmniError) -> bool {
 /// new-graph posture. The `delete_config_keys` commit itself does not GC: the
 /// resulting manifest no longer has the `interval` key, so the post-commit hook is a
 /// no-op. Returns whether any config was cleared (it advances Lance HEAD iff so).
-/// Recovery coverage differs by caller: the data-table path runs this inside the
-/// Optimize sidecar window; the internal-table path needs none (it commits at HEAD
+/// The internal-table path needs no crash protocol for it: it commits at HEAD
 /// and is read at HEAD — the strip is a content-preserving config commit, so a crash
-/// leaves the table readable and content-identical, see [`compact_internal_table`]).
+/// leaves the table readable and content-identical, see [`compact_internal_table`].
 async fn clear_stale_auto_cleanup_config(
     ds: &mut lance::Dataset,
 ) -> std::result::Result<bool, lance::Error> {
@@ -1096,10 +822,10 @@ async fn clear_stale_auto_cleanup_config(
 /// their latest Lance HEAD, so compaction just advances that HEAD and the next
 /// reader transparently observes the compacted version. That makes this path much
 /// simpler than [`apply_optimize_table_effects`] — no manifest publish (nothing to publish
-/// to), and no recovery sidecar. The sidecar-free claim does NOT rest on
+/// to), and no detached staging. Crash safety does NOT rest on
 /// single-commit atomicity: `compact_files` can emit a `ReserveFragments` commit
 /// before the final `Rewrite` (and the config strip is a separate commit before
-/// both), so this advances HEAD over one or more commits. It needs no sidecar
+/// both), so this advances HEAD over one or more commits. That is safe
 /// because every one of those commits is content-preserving and the table is read
 /// at HEAD — a crash at any point leaves the table readable and content-identical,
 /// and the next `optimize` re-plans. Internal tables carry no Lance index (only
@@ -1187,9 +913,10 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// After cleanup's fast empty-sidecar probe, before it acquires the closed
-    /// schema/branch/table GC gate set and performs the authoritative recheck.
-    pub static CLEANUP_POST_RECOVERY_CHECK_PRE_GATES = ("cleanup.post_recovery_check_pre_gates", Unreachable, [Fail]);
+    /// After cleanup's entry checks, before it captures authority and
+    /// acquires its schema/branch/table GC gate set: the one window where a
+    /// failure aborts the whole run (per-table GC failures are isolated).
+    pub static CLEANUP_PRE_GATES = ("cleanup.pre_gates", Unreachable, [Fail]);
 }
 
 /// Run Lance `cleanup_old_versions` on every node + edge dataset on `main`,
@@ -1209,35 +936,17 @@ pub async fn cleanup_all_datasets(
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("cleanup").await?;
-
-    // Version GC must never run while recovery still needs exact Lance
-    // transaction/version history to prove effect ownership or resume an
-    // interrupted compensation. Refuse before orphan reconciliation or any
-    // per-table cleanup so this operation is all-or-nothing with respect to the
-    // recovery-history floor. A read-write reopen resolves the sidecar first.
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "cleanup requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before garbage-collecting versions",
-        ));
-    }
-    fail(&CLEANUP_POST_RECOVERY_CHECK_PRE_GATES)?;
+    fail(&CLEANUP_PRE_GATES)?;
 
     // GC must be bound to one accepted graph view. Capture before acquiring
     // writer gates, and revalidate after the complete schema/branch/table
     // envelope before deleting any version history.
     let authority_txn = db.open_write_txn(None).await?;
 
-    // Close the empty-check -> GC race. Mutation/load take schema then branch
-    // then table gates; current legacy sidecar writers take at least their table
-    // gates. Cleanup takes the conservative superset and holds it through every
-    // `cleanup_old_versions` call, then performs the authoritative sidecar check
-    // under those gates. Without this envelope a writer can arm+commit+fail after
-    // the fast check and GC can delete the exact transaction/version history
-    // Full recovery needs to prove ownership or Restore.
+    // Writers take schema, then branch, then table gates. Cleanup takes the
+    // conservative superset and holds it through every `cleanup_old_versions`
+    // call, so no in-process writer stages or promotes while versions are
+    // collected.
     let _cleanup_schema_guard = db
         .write_queue()
         .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
@@ -1261,15 +970,6 @@ pub async fn cleanup_all_datasets(
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
     let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
 
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(
-            "cleanup observed a recovery sidecar after acquiring its GC gates; reopen the graph \
-             read-write to recover before garbage-collecting versions",
-        ));
-    }
     db.revalidate_write_txn(&authority_txn).await?;
 
     // Lance protects versions referenced by its own per-dataset branches, but
@@ -1284,6 +984,14 @@ pub async fn cleanup_all_datasets(
     // Any branch snapshot read failure aborts before the first table GC: an
     // unknown live reference is never evidence that a version is disposable.
     let mut oldest_live_main_version_by_path = std::collections::HashMap::<String, u64>::new();
+    // RFC 0067: a table whose pin a foreign commit blocks keeps its
+    // acknowledged rows only in a detached version, which stock version GC
+    // does not protect. Skip GC on it, and protect every link of its chain
+    // from the detached-manifest reaper below.
+    let mut blocked_gc_paths = std::collections::HashSet::<String>::new();
+    let mut protected_detached =
+        std::collections::HashMap::<String, std::collections::HashSet<u64>>::new();
+    let mut table_locations = std::collections::BTreeSet::<(String, Option<String>)>::new();
     for branch_target in &graph_branches {
         if branch_target
             .as_deref()
@@ -1301,6 +1009,26 @@ pub async fn cleanup_all_datasets(
                 ))
             })?;
         for entry in branch_snapshot.datasets() {
+            // RFC 0067: a pending pin is promoted before any version is
+            // reclaimed, so stock Lance cleanup only ever sees linear history
+            // and the pin's detached manifest becomes surplus.
+            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
+            table_locations.insert((full_path.clone(), entry.native_dataset_branch.clone()));
+            if let (Some(staged), Some(uuid)) = (
+                entry.version_metadata.staged_version(),
+                entry.version_metadata.transaction_uuid(),
+            ) && let Some(chain) = settle_pin_before_cleanup(db, entry, staged, uuid).await?
+            {
+                blocked_gc_paths.insert(full_path.clone());
+                let location = super::promotion::table_location(
+                    &full_path,
+                    entry.native_dataset_branch.as_deref(),
+                );
+                protected_detached
+                    .entry(location)
+                    .or_default()
+                    .extend(chain);
+            }
             // Validate that the exact protected version is still openable
             // before GC starts. This catches pre-existing damage from an older
             // cleanup implementation and keeps the sweep fail-closed instead
@@ -1314,7 +1042,6 @@ pub async fn cleanup_all_datasets(
             if entry.native_dataset_branch.is_some() {
                 continue;
             }
-            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
             if branch_target.is_none() {
                 let head = db.storage().open_dataset_head(&full_path, None).await?;
                 if head.version() != entry.published_dataset_version {
@@ -1334,7 +1061,26 @@ pub async fn cleanup_all_datasets(
         }
     }
 
-    let before_timestamp = options.older_than.map(|d| crate::dst_clock::now_utc() - d);
+    let now = crate::dst_clock::now_utc();
+    let before_timestamp = options.older_than.map(|d| now - d);
+    // The detached-manifest reaper never reaps below a minimum age, even at
+    // `--older-than 0`: an unprotected manifest that recent may belong to a
+    // cross-process writer that has staged its detached commit but not yet
+    // published its pin (`protected_detached` covers published pins only), and
+    // reaping it before that writer publishes-then-promotes would brick the
+    // pin. The floor is the sole guard for that stage-but-unpublished window.
+    let detached_before_timestamp =
+        before_timestamp.map(|cutoff| cutoff.min(now - MIN_DETACHED_MANIFEST_RETENTION));
+    let reaped = reap_detached_manifests(
+        db,
+        &table_locations,
+        &protected_detached,
+        detached_before_timestamp,
+    )
+    .await?;
+    if reaped > 0 {
+        tracing::info!(reaped, "cleanup reaped aged surplus detached manifests");
+    }
     let reconciled = reconcile_orphaned_branches_under_control_gates(db, before_timestamp).await?;
     if !reconciled.reclaimed.is_empty() {
         tracing::info!(
@@ -1366,6 +1112,7 @@ pub async fn cleanup_all_datasets(
 
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
     let storage = db.storage();
+    let blocked_gc_paths = &blocked_gc_paths;
 
     // Fault-isolated per table: a single table's GC failure is recorded on its
     // stats row (`error: Some`) and logged, never aborting the healthy tables.
@@ -1375,6 +1122,13 @@ pub async fn cleanup_all_datasets(
         .map(|(table_key, full_path, live_main_floor)| async move {
             let outcome: Result<RemovalStats> = async {
                 fail(&CLEANUP_TABLE_GC)?;
+                if blocked_gc_paths.contains(&full_path) {
+                    return Err(OmniError::manifest_conflict(
+                        "a published write's promotion is blocked by a foreign commit at its \
+                         target version; version GC is skipped for this table until `omnigraph \
+                         repair` resolves the block",
+                    ));
+                }
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
                 // above for the same rationale. It only needs a raw read borrow.
@@ -1710,7 +1464,6 @@ async fn reconcile_orphaned_branches_under_control_gates(
     });
     let mut stats = BranchReconcileStats::default();
     let mut references = None;
-    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
     let storage = db.storage();
     for (identity, table_key, full_path) in table_targets {
         let inventory = async {
@@ -1775,12 +1528,6 @@ async fn reconcile_orphaned_branches_under_control_gates(
                     native.as_str() == "main"
                         || crate::db::is_internal_system_branch(native)
                         || references.contains_tree(identity, native)
-                        || sidecars.iter().any(|sidecar| {
-                            sidecar.tables.iter().any(|pin| {
-                                pin.identity == identity
-                                    && pin.table_branch.as_deref() == Some(native.as_str())
-                            })
-                        })
                 })
                 .cloned(),
         );
@@ -2007,4 +1754,132 @@ mod tests {
             "unreadable live-branch refs must be left for the next cleanup run"
         );
     }
+}
+
+decide_seam! {
+    /// In cleanup, after a pending pin was promoted and before its detached
+    /// manifest is deleted (RFC 0067). A failure here leaves a promoted pin
+    /// whose detached manifest the next cleanup reaps.
+    pub static CLEANUP_PRE_REAP = ("cleanup.pre_reap", Unreachable, [Fail]);
+}
+
+/// Promote one pending pin, then delete its detached manifest once the
+/// pin is linear (RFC 0067). Returns the detached versions of a blocked
+/// pin's chain, which cleanup must neither GC around nor reap.
+async fn settle_pin_before_cleanup(
+    db: &Omnigraph,
+    entry: &crate::db::manifest::DatasetEntry,
+    staged: u64,
+    uuid: &str,
+) -> Result<Option<Vec<u64>>> {
+    let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
+    let table_branch = entry.native_dataset_branch.as_deref();
+    let location = super::promotion::table_location(&full_path, table_branch);
+    let outcome = super::promotion::promote_pin(
+        db,
+        &entry.type_key,
+        &full_path,
+        table_branch,
+        entry.published_dataset_version,
+        staged,
+        uuid,
+    )
+    .await?;
+    match outcome {
+        super::promotion::Promotion::Promoted(_) | super::promotion::Promotion::AlreadyPromoted => {
+            let detached = super::promotion::detached_manifest_path(&location, staged);
+            fail(&CLEANUP_PRE_REAP)?;
+            if let Err(error) = db.storage_adapter().delete(&detached).await {
+                tracing::warn!(
+                    error = %error,
+                    detached,
+                    "could not delete a promoted pin's detached manifest; cleanup retries it"
+                );
+            }
+            Ok(None)
+        }
+        super::promotion::Promotion::Blocked(reason) => {
+            tracing::warn!(
+                table = entry.type_key.as_str(),
+                target = entry.published_dataset_version,
+                reason,
+                "cleanup found a blocked pin; version GC is skipped for its table"
+            );
+            let (_, chain) = super::promotion::walk_chain(db, &location, staged).await?;
+            Ok(Some(
+                chain.into_iter().map(|(version, _)| version).collect(),
+            ))
+        }
+    }
+}
+
+/// The minimum age a detached manifest must reach before cleanup may reap it,
+/// enforced even under `--older-than 0`. An unprotected manifest younger than
+/// this may belong to a cross-process writer that has staged its detached
+/// commit but not yet published its pin — so it is absent from
+/// `protected_detached`, which is built from published pins only — and reaping
+/// it before that writer publishes then promotes would leave the pin pointing
+/// at a reaped staged manifest with no twin, an unrecoverable table. The floor
+/// exceeds any single write's stage→publish window plus object-store clock
+/// skew, while still letting cleanup reclaim aged surplus manifests.
+const MIN_DETACHED_MANIFEST_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+
+/// Reap detached manifests that no pending pin protects and that are older
+/// than the cleanup age policy (RFC 0067): the manifests of promoted pins a
+/// later write superseded, the intermediate links of promoted chains, and
+/// attempts that never published. A pin promoted in this pass had its
+/// manifest deleted already; a recent manifest may belong to a write still
+/// in flight, so the age gate is required and no policy reaps nothing.
+async fn reap_detached_manifests(
+    db: &Omnigraph,
+    locations: &std::collections::BTreeSet<(String, Option<String>)>,
+    protected: &std::collections::HashMap<String, std::collections::HashSet<u64>>,
+    before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<u64> {
+    let Some(cutoff) = before_timestamp else {
+        return Ok(0);
+    };
+    let mut reaped = 0u64;
+    for (full_path, table_branch) in locations {
+        let handle = db
+            .storage()
+            .open_dataset_head(full_path, table_branch.as_deref())
+            .await?;
+        let dataset = handle.dataset();
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        let location = super::promotion::table_location(full_path, table_branch.as_deref());
+        let protected = protected.get(&location);
+        let mut files = store.read_dir_all(&dataset.versions_dir(), None);
+        while let Some(file) = files.next().await {
+            let file = file.map_err(OmniError::storage)?;
+            let Some(version) = file
+                .location
+                .filename()
+                .and_then(|name| name.strip_prefix('d'))
+                .and_then(|name| name.strip_suffix(".manifest"))
+                .and_then(|version| version.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if protected.is_some_and(|versions| versions.contains(&version))
+                || file.last_modified >= cutoff
+            {
+                continue;
+            }
+            let detached = super::promotion::detached_manifest_path(&location, version);
+            match db.storage_adapter().delete(&detached).await {
+                Ok(()) => reaped += 1,
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    detached,
+                    "could not reap a surplus detached manifest; cleanup retries it"
+                ),
+            }
+        }
+    }
+    Ok(reaped)
 }

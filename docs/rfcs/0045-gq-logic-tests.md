@@ -462,7 +462,7 @@ path (Execution semantics owns the default); a statement step traverses
 nothing and runs outside the pin.
 
 A file is: required `--- runner` (Explicit execution environments),
-optional `--- known_failure` (Known recovery failures), then `--- schema`, then
+then `--- schema`, then
 `--- seed`, then one or more steps, of
 which at least one is a query or mutate step; a file missing any of these
 three leading sections, ordering them differently, or carrying no query or
@@ -812,7 +812,7 @@ setup:
 
 ```text
 --- seam
-at: branch_merge.post_sidecar_pre_fork
+at: branch_merge.post_fork_pre_commit
 occurrence: 1
 action: fail
 scope: next_step
@@ -820,7 +820,7 @@ scope: next_step
 --- mutate
 branch merge source into target
 
---- expect error: injected failpoint triggered: branch_merge.post_sidecar_pre_fork
+--- expect error: injected failpoint triggered: branch_merge.post_fork_pre_commit
 
 --- mutate branch: target
 query unrelated_write() {
@@ -972,6 +972,14 @@ crashes, multi-connection interleavings, and randomized fault discovery
 remain outside this format extension.
 
 ### Known recovery failures
+
+> Removed with RFC 0067 rollout step 5. The marker existed to keep a known
+> recovery-sidecar defect in the corpus without going red. No writer arms a
+> recovery sidecar any more, the classifier that produced those typed
+> failures is deleted, and no case carried the marker, so the section
+> parser, the `known_failure` attempt field and status code, and the
+> `unexpected_pass` refusal are gone; a `--- known_failure` section is now
+> an ordinary invalid case. The text below records the retired contract.
 
 An optional `--- known_failure` section immediately after `--- runner` records one
 known recovery failure while keeping the healthy operation expectations.

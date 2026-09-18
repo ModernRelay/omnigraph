@@ -7,7 +7,7 @@ This is the ownership map for OmniGraph's tests. Read it before changing code: f
 1. Test at the boundary that owns the promise. Compiler behavior belongs in compiler tests; engine guarantees belong at the public engine API; HTTP and CLI behavior belongs at those transports.
 2. Prefer one new assertion, fixture row, or parameter over another `init_and_load` test. When the change fixes an issue, the `Fix Regression Gate` keys on `issue_N` in the test's name or the `.gqt` case's file name: extend an owner test by renaming it to carry `issue_N` in the same change, or add a row to the `issue_N_*.gqt` case (`docs/dev/ci.md`).
 3. Test logical results and durable state. Inspect Lance internals only for a compatibility fence, recovery fault, or physical-cost contract.
-4. Every failure path must prove what did *not* move: manifest head, table head, lineage, sidecar, or external I/O as appropriate.
+4. Every failure path must prove what did *not* move: manifest head, table head, lineage, schema staging, or external I/O as appropriate.
 5. Time and RSS measurements are decision instruments, not ordinary correctness gates. Deterministic operation counts may be CI contracts.
 
 The invariants behind these rules are in [invariants.md](invariants.md). Lance-dependent changes also require the upstream review and guards described in [lance.md](lance.md).
@@ -41,11 +41,11 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
-| Recovery and crash windows | `recovery.rs`, `failpoints.rs`, `failpoint_names_guard.rs`, in-source manifest/recovery tests |
+| Recovery and crash windows | `recovery.rs`, `failpoints.rs` (including the `live_handle_*` liveness owners: a live handle writes again once faults stop, without reopening), `detached_commit_matrix.rs` (the RFC 0067 writer × window × fault × recovery-actor matrix over the insert, multi-table, load, cleanup, ensure-indices, full-text-rebuild, merge, schema-apply, optimize and system-column-upgrade writers; the same-handle liveness actor runs by default and `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors), `failpoint_names_guard.rs`, in-source manifest/recovery tests |
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
-| Legacy-vintage graphs (`id`/`src`/`dst` spellings, stamp 8) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
-| System-column upgrade (RFC 0040 step 3: v8 → v9 in place) | `system_column_upgrade.rs` — check and execute, preflight refusals, every crash point rolled forward on reopen; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
+| Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
+| System-column upgrade (RFC 0040 step 3: respelling in place on a served graph, no stamp change since v10) | `system_column_upgrade.rs` — check and execute, preflight refusals, every window before the manifest commit leaving no residue, a post-commit failure finished by the next read-write open or the same handle's next write, pending pins after a skipped promotion, the control-object cost; needs `--features failpoints`. Route composition and the default target: `upgrade/tests.rs` |
 | Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and `benchmark_scenario_contract.rs` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`.
@@ -55,12 +55,13 @@ candidate scans, bounded page work, and caught-up versus backlog polling curves.
 
 ### Recovery and failpoints
 
-Recovery tests must cover the protocol layer, the writer, and the user-visible reopening behavior:
+Crash tests must cover the writer, the promotion that follows it, and the user-visible reopening behavior:
 
-- in-source tests own sidecar encoding, validation, classification, and exact publication rules;
-- `tests/recovery.rs` owns deterministic completed, partial, ambiguous, and foreign-effect outcomes;
-- `tests/failpoints.rs` owns crash windows around durable effects;
-- the writer's normal integration owner proves pre-arm failures leave no residue.
+- `tests/failpoints.rs` owns crash windows around durable effects: after a detached effect, before and after publication, between promotions, where the graph is unchanged or a pin stays pending;
+- `tests/detached_commit_matrix.rs` owns the writer × window × fault × recovery-actor matrix under one oracle;
+- `tests/recovery.rs` owns what is left of open-time recovery: a clean open creates nothing, a sidecar from an older build refuses a read-write open and not a read-only one, and a read-only open never touches schema staging;
+- `tests/lance_surface_guards.rs` owns the twin-replay rules promotion depends on;
+- the writer's normal integration owner proves pre-effect failures leave no residue.
 
 To add a seam: declare it beside the site it guards, above the item that
 crosses it, with
@@ -82,7 +83,7 @@ helper takes a seam declaring exactly its effect, that production code under
 it) arms it; a crossing never counts as arming. `scripts/seam_corpus.py`
 lists every seam with where it is declared and which cases cover it.
 
-When adding a new writer or sidecar field, update all three layers. See [recovery.md](recovery.md).
+When adding a new writer, update all of these layers. See [recovery.md](recovery.md).
 
 ### Blob behavior
 
@@ -103,7 +104,7 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage, stable row IDs, vector ordering fences, and Blob reads through compaction. If an upstream limitation disappears, remove the workaround and its guard together.
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and its guard together.
 
 ## Server and CLI ownership
 
@@ -111,26 +112,28 @@ Server suites are organized by public route: `auth_policy`, `data_routes`, `sche
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
-The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V9 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
+The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
 
 ```bash
-OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v9_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v9 -- --exact --nocapture
+OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
 ```
 
-The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v9 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, and RFC 0040's system columns stamp new graphs v9. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
+The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v10 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, RFC 0040's system columns stamped new graphs v9, and RFC 0067's detached table commits stamp every graph v10. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires genuine v0.9 and
-v0.10 local standalone journeys through the v6 → v7 → v8 route, pinned with
-`--to-format 8` because their fixtures carry a branch; the default route now
-ends at v9 (RFC 0040) and refuses a branched source before any effect, which
-the same journey asserts. It fails
+v0.10 local standalone journeys: the v6 → v7 → v8 route with `--to-format 8`
+first, then the default route to v10 on the same branched fixture, which the
+journey asserts keeps every branch and every table byte. It fails
 missing predecessor binaries, missing cases and skipped required cases. Engine
 storage-upgrade tests own direct v7 → v8 conversion, exact pending v6 → v7
 recovery before composition, explicit target 7, deferred check reporting,
-v8 no-op admission with retained retired refs, and the synthetic v6/v7 → v9
-composition (`storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v9`
-and its siblings; no genuine predecessor binary executes that step yet). Keep the normal-open
-format fences: explicit conversion does not grant serving support for v6/v7.
+v8 no-op admission with retained retired refs, the v8 and v9 → v10 stamp
+step (`storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10`,
+`storage_upgrade_default_route_takes_a_v9_graph_to_v10`) and the synthetic
+v6/v7 → v10 composition (`storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10`;
+no genuine predecessor binary executes that step yet). Keep the normal-open
+format fences: explicit conversion does not grant serving support for
+v6/v7/v8/v9.
 See the [support matrix](versioning.md#storage-upgrade-support-matrix).
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
@@ -205,10 +208,7 @@ from any directory inside the checkout; a build that overrides it (an env
 `RUSTFLAGS` without the cfg, as CI's refusal step does) explicitly refuses
 DST cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
 defines supported targets, hooks, replay observations, and limits. The configured
-CI owner enrolls the complete corpus. A strict `--- known_failure` marker admits only
-the recorded typed recovery failure at its declared step, with verified fault
-delivery and matching replay. Reports label it `known_failure`; changed failures
-and unexpected passes fail CI. The healthy assertion stays in the case.
+CI owner enrolls the complete corpus.
 
 ### OpenAPI
 

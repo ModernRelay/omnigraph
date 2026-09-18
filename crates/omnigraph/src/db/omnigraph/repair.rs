@@ -1,10 +1,11 @@
 //! Explicit repair for uncovered published-dataset/Lance-HEAD drift.
 //!
-//! Recovery sidecars handle deterministic crash residuals automatically. This
-//! module is for the different case: a dataset's Lance HEAD is ahead of the
-//! version recorded in `__manifest` and there is no sidecar encoding writer
-//! intent. `repair` classifies that uncovered drift from Lance transactions and
-//! only auto-publishes maintenance-only drift when the operator confirms.
+//! Pending pins converge automatically: the next writer or `cleanup` promotes
+//! them. This module is for the different case: a dataset's Lance HEAD is
+//! ahead of the version recorded in `__manifest` and no published pin explains
+//! the movement. `repair` classifies that uncovered drift from Lance
+//! transactions and only auto-publishes maintenance-only drift when the
+//! operator confirms.
 
 use lance::Dataset;
 use lance::dataset::transaction::Operation;
@@ -35,6 +36,10 @@ pub enum RepairClassification {
     Suspicious,
     /// A needed transaction could not be read, so the drift cannot be judged.
     Unverifiable,
+    /// The published pin's detached twin cannot land: a foreign linear commit
+    /// occupies its target version (RFC 0067). Reads resolve the pin and
+    /// mutations chain behind it; repair never adopts the foreign commit.
+    BlockedPromotion,
 }
 
 impl RepairClassification {
@@ -45,6 +50,7 @@ impl RepairClassification {
             Self::VerifiedMaintenance => "verified_maintenance",
             Self::Suspicious => "suspicious",
             Self::Unverifiable => "unverifiable",
+            Self::BlockedPromotion => "blocked_promotion",
         }
     }
 }
@@ -127,6 +133,7 @@ struct RepairTableTask {
     full_path: String,
     pinned_data_version: u64,
     pinned_native_ref: Option<String>,
+    entry: crate::db::manifest::DatasetEntry,
 }
 
 pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Result<RepairStats> {
@@ -136,7 +143,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
 
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("repair").await?;
-    ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
     // Repair may adopt physical HEADs into graph authority. Bind the entire
     // attempt to one accepted view and revalidate after schema -> main -> table
@@ -163,7 +169,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         .map(|table_key| (table_key.clone(), None))
         .collect::<Vec<_>>();
     let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
-    ensure_no_pending_recovery_sidecars(db, "repair").await?;
 
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
     let table_tasks = table_keys
@@ -176,6 +181,7 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
                 full_path: format!("{}/{}", db.root_uri, entry.dataset_path),
                 pinned_data_version: entry.published_dataset_version,
                 pinned_native_ref: entry.native_dataset_branch.clone(),
+                entry: entry.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -199,12 +205,35 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
             full_path,
             pinned_data_version,
             pinned_native_ref,
+            entry,
         } = task;
         // `classify_drift` inspects raw Lance transaction history
         // (`read_transaction_by_version`), a Lance-only maintenance read the
         // staged-write trait does not surface. The raw borrow is an enumerated,
         // read-only escape; repair never takes ownership or moves Lance HEAD.
         let handle = db.storage().open_dataset_head(&full_path, None).await?;
+        // A pending pin is promoted before drift is judged; a blocked one is
+        // reported, never adopted.
+        let handle = match super::promotion::promote_pin_at_head(
+            db, &table_key, &full_path, &entry, &handle,
+        )
+        .await?
+        {
+            super::promotion::PinAtHead::Carried => handle,
+            super::promotion::PinAtHead::Promoted(handle) => handle,
+            super::promotion::PinAtHead::Blocked(reason) => {
+                tables.push(DatasetRepairStats {
+                    type_key: table_key,
+                    published_dataset_version: pinned_data_version,
+                    lance_head_version: handle.version(),
+                    classification: RepairClassification::BlockedPromotion,
+                    action: RepairAction::Refused,
+                    operations: Vec::new(),
+                    error: Some(reason),
+                });
+                continue;
+            }
+        };
         let ds = handle.dataset();
         let lance_head_version = ds.version().version;
 
@@ -246,6 +275,8 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
                 RepairAction::Refused
             }
             (true, _, RepairClassification::NoDrift) => RepairAction::NoOp,
+            // Reported above, before drift is classified; never adopted.
+            (true, _, RepairClassification::BlockedPromotion) => RepairAction::Refused,
         };
 
         if matches!(action, RepairAction::Healed | RepairAction::Forced) {
@@ -310,19 +341,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         datasets: tables,
         graph_manifest_version: manifest_version,
     })
-}
-
-async fn ensure_no_pending_recovery_sidecars(db: &Omnigraph, operation: &str) -> Result<()> {
-    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
-        .await?
-        .is_empty()
-    {
-        return Err(OmniError::manifest_conflict(format!(
-            "{operation} requires a clean recovery state; reopen the graph to run the \
-             recovery sweep before repairing"
-        )));
-    }
-    Ok(())
 }
 
 async fn classify_drift(
