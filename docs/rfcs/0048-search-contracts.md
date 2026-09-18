@@ -304,6 +304,17 @@ description used as a Boolean predicate and introduces no rank or window.
 
 ### Clause composition and named stages
 
+**Kernel alignment (proposed 2026-09-18).** The
+[kernel](2026-09-18-gq-composition-and-language-evolution.md#kernel-one-stage-per-job)
+in the composition RFC keeps this section's `rank` block, `yield`, named
+arms and `metric()` unchanged and collapses the rest of this RFC's sketch:
+`select` becomes `order` + `limit`, `take` becomes `limit n of $x per { … }`,
+`score` becomes `let`, `collect`/`optional` blocks become `sub(…)`
+expressions under a reduction, scalar predicates leave `match` for
+`filter`, and stage tie keys are a `ties:` option on a source. The
+semantics below are unchanged by that proposal; the spellings in the
+examples are not yet rewritten to it.
+
 The current grammar has one `match`, followed by `return`, optional `order`,
 and optional `limit`. The proposed extension admits explicit rank boundaries
 between graph blocks. Each `match` retains graph-pattern semantics. Stage
@@ -1907,6 +1918,9 @@ still require prototypes; full production qualification belongs to its phase.
 
 ## Decision log
 
+- 2026-09-18 — recorded the composition RFC's kernel proposal as a pending
+  decision for this RFC's syntax (one spelling per operation; `select`,
+  `take`, `score`, `collect`, `optional` collapse; predicates leave `match`).
 - 2026-09-18 — split the lexical contract into
   [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md) and the language rules, capability matrix,
   C1–C4 and cross-type discovery into
