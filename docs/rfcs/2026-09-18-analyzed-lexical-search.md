@@ -691,10 +691,10 @@ later `main` revision.
 
 | Existing GQT owner | First observed failure | Required implementation and migration proof |
 |---|---|---|
-| [`fuzzy_query_bypasses_index_analyzer`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/fuzzy_query_bypasses_index_analyzer.gqt) | Step 2: capitalized `Introductio` returns no rows; `intro` is expected. | Phase C must apply the accepted field analyzer at every edit budget. Retain the lowercase and zero-edit controls and reach the later assertions. |
-| [`index_state_changes_text_matches`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/index_state_changes_text_matches.gqt) | Step 5, including the two mutation steps: `running` finds only the appended row and loses the indexed row. | Phase C must use one matching definition for indexed and uncovered rows. Complete the later `beto` assertion as well; passing the first repaired step is insufficient. |
-| [`search_on_traversal_target_is_dropped`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/search_on_traversal_target_is_dropped.gqt) | Step 2: traversal returns B, C and D where only B and D match. | Phase D must retain the target predicate and rank the traversal target. The later ranking assertion must return D, rather than fail for a missing score column. |
-| [`unindexed_search_is_case_sensitive`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/unindexed_search_is_case_sensitive.gqt) | Step 3: unindexed `deep` finds only the lowercase row; both rows are expected. | Phase C must preserve matching with and without an index. Migrate both field declarations to the intended accepted analyzer, and run both query-case controls. |
+| #748 [`fuzzy_query_bypasses_index_analyzer`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/fuzzy_query_bypasses_index_analyzer.gqt) | Step 2: capitalized `Introductio` returns no rows; `intro` is expected. | Phase C must apply the accepted field analyzer at every edit budget. Retain the lowercase and zero-edit controls and reach the later assertions. |
+| #749 [`index_state_changes_text_matches`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/index_state_changes_text_matches.gqt) | Step 5, including the two mutation steps: `running` finds only the appended row and loses the indexed row. | Phase C must use one matching definition for indexed and uncovered rows. Complete the later `beto` assertion as well; passing the first repaired step is insufficient. |
+| #750 [`search_on_traversal_target_is_dropped`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/search_on_traversal_target_is_dropped.gqt) | Step 2: traversal returns B, C and D where only B and D match. | Phase D must retain the target predicate and rank the traversal target. The later ranking assertion must return D, rather than fail for a missing score column. |
+| #747 [`unindexed_search_is_case_sensitive`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-gqt/cases/unindexed_search_is_case_sensitive.gqt) | Step 3: unindexed `deep` finds only the lowercase row; both rows are expected. | Phase C must preserve matching with and without an index. Migrate both field declarations to the intended accepted analyzer, and run both query-case controls. |
 
 These cases were added in `b1df2041` and remain active regressions. During the
 coordinated query migration, rewrite their legacy `search`, `fuzzy` and `bm25`
@@ -717,7 +717,7 @@ implementation above; later native probes do not close them.
 
 The four cases are held out of the corpus until each fix lands: a red case
 in `main` blocks unrelated work, and the fix regression gate keys on an
-`issue_N` name. Each will be filed as an issue and land as
+`issue_N` name. Each is filed (#747, #748, #749, #750) and lands as
 `issue_N_<name>.gqt` with the fix that turns it green.
 
 ### Qualification matrix
