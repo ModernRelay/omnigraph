@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-09
+updated: 2026-09-18
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
@@ -17,12 +17,10 @@ blocked_on:
 
 # RFC 0047: Search plan truth: projectable ranking, deterministic order, and loud search failures
 
-PR #606 reviews this correctness slice together with RFC 0048's final search
-contract. Start with its [maintainer briefing](0048-search-contracts.md#maintainer-briefing)
-for the combined design, migration tradeoffs and decisions still needed.
-The [implementation handoff](0048-search-contracts.md#implementation-handoff-and-validation-checkpoint)
-records the validated experiments and remaining gates; the interim mechanisms
-in this RFC do not require a separate public release.
+This is the correctness slice of the search work. [RFC 0048](0048-search-contracts.md)
+owns the staged retrieval language and [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md)
+owns the analyzer, matching and scoring contract. The interim mechanisms in
+this RFC do not require a separate public release.
 
 ## Summary
 
@@ -41,12 +39,18 @@ that silently do nothing become errors or warnings:
 4. Every ranked result has a total, deterministic order — including `rrf()`
    fusion (score, then trailing user keys applied inside score ties, then
    stable ids) and aggregated orderings.
-5. The canonical read envelope gains three additive arrays: `warnings`
-   (first use: full-text search on a column with no FTS index serves through
-   the case-sensitive flat fallback — now loud), `metrics` (descriptors for
-   projected rank columns), and `retrievals` (every executed source, with
-   known/unknown representation coverage for `@embed`-backed vector retrievals
-   over the prefiltered population, with exact counts when requested).
+5. Full-text search on a String property that the schema does not declare
+   `@index` is a stable `T27` compile diagnostic, and a declared index that
+   has not been built is a typed `FullTextIndexRequired` plan refusal, the
+   shape RFC 0043's `FullTextIndexRebuildRequired` already has. The
+   case-sensitive flat fallback that produced confident false negatives no
+   longer serves.
+6. The canonical read envelope gains three additive arrays: `warnings`
+   (first uses: `search_order_ignored_by_aggregation` and
+   `embedding_coverage_pending`), `metrics` (descriptors for projected rank
+   columns), and `retrievals` (every executed source, with known/unknown
+   representation coverage for `@embed`-backed vector retrievals over the
+   prefiltered population, with exact counts when requested).
 
 Boundaries that do not change: no schema surface or storage-format change, no
 change to BM25/vector scoring math, the deprecated `POST /read` envelope stays
@@ -55,11 +59,11 @@ were previously run-dependent).
 
 `fuzzy()` remains available in this slice. It has working exact and typo
 matches, but its analysis and matched set depend on index coverage. The
-single breaking replacement of `fuzzy`, `search`, and `match_text` with
-typed lexical matching and ranked retrieval belongs to
-[RFC 0048](0048-search-contracts.md#user-and-operational-behavior), where the
-schema-owned analyzer and exact lexical contract are defined. This RFC does
-not introduce a `T25` retirement stage.
+replacement of `fuzzy`, `search`, and `match_text` with typed lexical
+matching and ranked retrieval, through a deprecation release, belongs to
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md), where the schema-owned analyzer and exact
+lexical contract are defined. This RFC does not introduce a `T25` retirement
+stage.
 
 This is the initial correctness slice. RFC 0048 owns the final staged query
 language: explicit ranking targets, graph-defined source populations, named
@@ -120,6 +124,23 @@ once, coherently.
   This diagnostic protects the interim executor. RFC 0048 replaces the
   restriction for qualified graph-derived populations; unsupported shapes
   must continue to fail explicitly.
+- `T27`: a full-text predicate or rank expression (`search`, `match_text`,
+  `fuzzy`, `bm25`) targets a String property the schema does not declare
+  `@index`: "declare `@index` on the property and reconcile indexes."
+  Searchability is a schema fact resolved through the catalog; the check
+  never reads physical index state.
+
+**Unbuilt indexes.** A declared index whose physical segments are absent at
+the pinned snapshot refuses at plan time with the typed
+`FullTextIndexRequired` outcome, naming the property and the remediation
+(index reconciliation). This follows RFC 0043's `FullTextIndexRebuildRequired`,
+which already refuses an uncertified index before execution; the two can
+fire on one graph. Rows in the uncovered tail of an existing index keep
+today's behavior and are scanned with the index analyzer. Today both the
+undeclared and the unbuilt case silently plan the substrate's flat scan with
+a bare, case-sensitive tokenizer; neither serves after this change. The
+analyzer-equivalent scan that later lifts the plan-time refusal is the
+lexical RFC's exact baseline.
 
 **Metric projection.**
 
@@ -160,7 +181,7 @@ discovers the same candidates; RFC 0048 keeps stable ranked pagination separate.
 **Response envelope (canonical `/query` and stored-query reads; additive).**
 
 ```json
-"warnings":   [{ "code": "full_text_search_unindexed", "message": "…" }],
+"warnings":   [{ "code": "search_order_ignored_by_aggregation", "message": "…" }],
 "metrics":    [{ "column": "score", "kind": "score", "source": "bm25",
                  "variable": "d", "property": "body", "descending": true,
                  "recall": "exact" }],
@@ -171,8 +192,7 @@ discovers the same candidates; RFC 0048 keeps stable ranked pagination separate.
 ```
 
 - `warnings` never change rows, membership, or order. Human CLI formats print
-  them to stderr; full-JSON output carries them in-band. Initial codes:
-  `full_text_search_unindexed`, `search_order_ignored_by_aggregation`,
+  them to stderr; full-JSON output carries them in-band. Initial codes: `search_order_ignored_by_aggregation` and
   `embedding_coverage_pending`.
 - `recall` reports the source *contract*: an index-accelerated `nearest`
   reports `approximate` even when execution happened to be exact, so clients
@@ -191,9 +211,9 @@ discovers the same candidates; RFC 0048 keeps stable ranked pagination separate.
 - The deprecated `POST /read` envelope carries none of these fields, by
   construction.
 
-**Operators** see `tracing` warnings for the unindexed-column condition and
-remediate by declaring `@index` and running index reconciliation. No new
-maintenance surface is added.
+**Operators** see the `T27` diagnostic and the `FullTextIndexRequired`
+refusal in query errors and `tracing`, and remediate by declaring `@index`
+and running index reconciliation. No new maintenance surface is added.
 
 ## Design
 
@@ -211,6 +231,11 @@ maintenance surface is added.
   cannot drift. Negation scopes check their own roots. This implementation
   guard does not establish a permanent first-declared-target rule for the
   language; RFC 0048's stage target validation replaces it as shapes qualify.
+- **Searchability.** Typecheck resolves a full-text target through the
+  catalog and refuses an undeclared property (`T27`); the engine's scan
+  planner refuses an absent index for a declared property instead of falling
+  back to `default_text_tokenizer()`. Neither reads index *coverage*: a built
+  index with uncovered rows plans as today.
 - **Advisories.** Execution threads one explicit notice sink (deduplicating,
   so the bounded-bm25 retry and fusion's forked arms cannot double-report);
   results carry notices, metric descriptors, and retrieval descriptors as
@@ -234,18 +259,20 @@ maintenance surface is added.
 ## Invariants
 
 - **Loud integrity failures (8):** strengthened for dropped search shapes:
-  `T26` refuses a predicate or ranking that cannot be attached to its target.
-  Warnings expose the absent-index fallback; they do not repair its matched
-  set. Exact lexical behavior, including typo tolerance, is RFC 0048's scope.
+  `T26` refuses a predicate or ranking that cannot be attached to its target;
+  `T27` and `FullTextIndexRequired` refuse the absent-index fallback instead
+  of serving it. Exact lexical behavior, including typo tolerance, is the
+  lexical RFC's scope.
 - **Query semantics are typed structures (9):** strengthened — retrieval
   moves from execution-time re-inference into the typed lowered plan; rank
   becomes an ordinary projected column, closing the recorded rank-carry gap.
-- **Physical acceleration is derived (7):** the existing text-search
-  violation remains open in this slice: a warning does not make
-  index-dependent analysis correct. RFC 0048 closes it with schema-owned
-  analysis and exact evaluation across index states. This RFC's notices are
-  transitional visibility, not an exception to the invariant. Recall
-  reporting is contractual, not plan-derived.
+- **Physical acceleration is derived (7):** the bare-tokenizer fallback no
+  longer serves, so exact-token `search`/`match_text` no longer change their
+  answer with index presence; a declared-but-unbuilt index is a loud refusal
+  (RFC 0043's accepted fence shape), not a different answer. Fuzzy analysis
+  on uncovered rows remains open here and is closed by the lexical RFC's
+  schema-owned analysis and exact evaluation. Recall reporting is
+  contractual, not plan-derived.
 - **Bounded, observable resource use (11):** requested coverage counts stream;
   retries, complete tie handling, and exact coverage share explicit query budgets.
   Streaming and finite tie plateaus alone do not prove bounded work or a
@@ -262,10 +289,11 @@ maintenance surface is added.
   legacy `/read` envelope is untouched. OpenAPI regenerates with the new
   schemas.
 - **Language:** `T26` rejects queries whose search predicate or ranking was
-  previously dropped. Existing lexical spellings remain available until
-  RFC 0048 replaces them together at its breaking release boundary. No
-  compatibility alias or deprecation window is required for that lexical
-  replacement while the language is pre-stable.
+  previously dropped; `T27` rejects full-text search on undeclared
+  properties, and `FullTextIndexRequired` refuses declared-but-unbuilt
+  indexes; both previously served through the bare tokenizer. Existing
+  lexical spellings remain available until [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md)
+  replaces them through its deprecation release.
 - **Order:** observable order changes only where scores tie; those orders
   were run-dependent before, so nothing reproducible is broken.
 - **Reverting** requires no storage or format work: the response fields are
@@ -279,10 +307,12 @@ maintenance surface is added.
   repair requires an explicit analyzer and matching contract. RFC 0048
   replaces the lexical surface in one breaking change; a standalone
   retirement neither defines that contract nor supplies typo tolerance.
-- **Fail closed on unindexed text search** — deferred, not chosen now: the
-  flat fallback serves correct exact-token matches; warning preserves
-  service while removing silence. A future schema-owned analyzed-search
-  contract may revisit the posture.
+- **Warn and keep serving unindexed text search through the bare
+  tokenizer** — rejected (2026-09-18): a warning does not repair the matched
+  set, and rows that differ by index presence are the deny-list's silent
+  partial results. Refusing an undeclared target at compile time and an
+  unbuilt index at plan time removes the false-negative class now; the
+  lexical RFC's analyzer-equivalent scan later lifts the plan-time refusal.
 - **Silently NULL (or best-effort match) mismatched metric projections** —
   rejected: a NULL column invites misreading; structural identity keeps the
   projection an observation of the executed retrieval.
@@ -319,9 +349,14 @@ The prototype is historical evidence, not qualification of this revised
 proposal. The `fuzzy_does_not_match_under_default_tokenizer` characterization
 in [the existing search owner](../../crates/omnigraph/tests/search.rs) tests
 one capitalized query at one edit budget. The counterexamples in
-[RFC 0048's evidence](0048-search-contracts.md#evidence-and-tests) disprove
+[the lexical RFC's regression cases](2026-09-18-analyzed-lexical-search.md#regression-cases) disprove
 the universal-failure premise. That RFC owns the matching and index-lifecycle
 qualification required for the replacement.
+
+Regression cases for the refusals: a `.gqt` case with a String property
+without `@index` expecting `T27`, and a `search.rs` owner that drops the
+physical index of a declared property and expects `FullTextIndexRequired`
+(the PR #606 case `unindexed_search_is_case_sensitive` seeds both).
 
 Revalidation against the pinned Lance source also leaves a separate
 determinism gate: its plain FTS collector can drop equal-score boundary rows
@@ -354,8 +389,8 @@ against the revised scope:
 
 1. Substrate fences for the Lance 11 update→optimize stale-vector window
    (test-only; can land before acceptance as an ordinary change).
-2. Warning carrier + `full_text_search_unindexed` (engine → API → CLI →
-   OpenAPI).
+2. `T27`, the `FullTextIndexRequired` refusal and the warning carrier
+   (engine → API → CLI → OpenAPI).
 3. Characterization goldens, then the retrieval-IR refactor (behavior-
    equivalent by construction; goldens prove it).
 4. `T26` scan-rooted targets (compiler pass + engine backstops).
@@ -415,6 +450,11 @@ language release or duplicate execution path.
   blanket claim that all RRF arm windows follow the output limit: BM25 arms
   are uncapped; vector arms inherit that limit. Distinguished historical
   prototype results from current evidence and total ordering from ANN replay.
+- 2026-09-18 — replaced the `full_text_search_unindexed` warning with a
+  compile-time `T27` refusal of undeclared targets and a plan-time
+  `FullTextIndexRequired` refusal of unbuilt indexes (RFC 0043 precedent); a
+  warning left invariant 7 open. Linked the lexical RFC split out of
+  RFC 0048.
 - 2026-09-09 — aligned representation coverage with RFC 0048: known counts or
   explicit unknown by default, exact counts when explicitly requested. This
   keeps query completion separate from representation knowledge and avoids
@@ -442,7 +482,7 @@ the pin, not the GitHub tag; the two diverge).**
 - The motivating case-sensitivity mechanism: `full_text_search` on a column
   with no FTS segments silently plans a flat scan with
   `default_text_tokenizer()` (bare `SimpleTokenizer`, no lowercasing). The
-  warning detects per-column via `TableStore::has_fts_index_on`.
+  plan-time refusal detects per-column via `TableStore::has_fts_index_on`.
 - The plain Match FTS path still compares score alone and leaf merges drop
   equal-score boundary candidates by arrival order; the adapter's own
   `.id`-column tie-breaks make the returned subset total, but cannot establish

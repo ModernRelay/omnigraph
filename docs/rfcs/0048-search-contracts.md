@@ -7,15 +7,17 @@ implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-03
-updated: 2026-09-13
+updated: 2026-09-18
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "Phase 0 language/type/plan proofs for staged scope, C1–C4, identity, grouping and future unions; reconcile RFC 0047 without freezing its interim IR restrictions"
-  - "Phase 0 resolved-schema syntax/serialization prototype, default/reapplication fixtures, qualified encoder identity and format coordination with RFCs 0040/0043/0044"
-  - "Phase 0 vector/fusion numeric policies and independent oracles; bounded NFC, live-statistics and exact-tie route dispositions against pinned upstream code"
-  - "Phase 0 shared resource/read interfaces and discriminating admission, fingerprint, follow-up and refusal prototypes"
+  - "RFC 0047 plan-truth guarantees carried into named stages"
+  - "Analyzed lexical search RFC (2026-09-18) accepted for the `lexical` source and `terms` contract"
+  - "Phase 0 language/type/plan proofs for staged scope, identity, grouping and per-group selection in the production compiler; the shared expression rules, C1–C4 and unions are owned by the GQ composition RFC (2026-09-18)"
+  - "Phase 0 resolved-schema syntax/serialization prototype for embedding recipes and defaults; qualified encoder identity and format coordination with RFCs 0040/0043/0044"
+  - "Phase 0 vector/fusion numeric policies and independent oracles; exact-tie route dispositions against pinned upstream code"
+  - "Read options expressed as session settings (RFC 2026-09-16); whole-query resource admission owned by the engine version 2 memory/admission component named by RFC 0067 (PR #711)"
   - "Phase 0 minimal compiler/engine/GQT vertical slice with later-stage discovery and shared-resource refusal"
   - "Phase 0 fixed mixed-workload corpus, judgments, budgets and acceptance protocol; production qualification belongs to Phases 1–6"
 ---
@@ -24,10 +26,13 @@ blocked_on:
 
 ## Maintainer briefing
 
-This is the concise decision document. The companion
-[agent context](assets/0048-agent-context.md) preserves the full long-form
-rationale, experiments and handoff detail. Use this RFC for current decisions
-and the context document for the evidence behind them.
+This RFC decides the staged retrieval algebra: rank stages, named sources and
+metrics, vector retrieval, fusion, per-group selection, result metadata and
+coherent follow-up reads. Two sibling documents were split out on 2026-09-18.
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md) owns `@analyzed`, analyzer profiles, `terms`,
+`match_terms` and `bm25_v1`; [GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md)
+owns the shared expression rules, the capability matrix, the C1–C4
+composition examples and cross-type discovery. The pre-split text, the test-only staged compiler, the DataFusion composition probes, the selection cost instrument, the lexical oracle test and the archived integration patches are retained at commit [`ce5a3012`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/0048-search-contracts.md) on the `rfc-0047-search-plan-truth` branch; they are evidence, not part of the tree.
 
 OmniGraph needs search that composes with exact lookup, graph traversal,
 aggregation and projection in one typed query language. The immediate defects
@@ -56,13 +61,14 @@ agent-facing recipes.
 The initial release covers analyzed Boolean matching, exact/fuzzy lexical
 retrieval, exact `knn`, approximate `ann`, named fusion, graph-defined
 populations, per-group selection, terminal aggregates and coherent source
-reads. The [capability matrix](#query-capability-matrix) distinguishes this
+reads. The [capability matrix](2026-09-18-gq-composition-and-language-evolution.md#query-capability-matrix) distinguishes this
 scope from deferred operators. Cross-type, all-node and all-edge search are
 deferred; their typed union/projection and source contracts remain required
 language-evolution work, not an implied capability of same-type fusion.
 
 The pre-stable cutover deliberately breaks search queries and representation
-declarations, with one coordinated format rebuild. The
+declarations, with one coordinated format rebuild after a one-release
+deprecation window for the legacy spellings. The
 [migration table](#user-facing-changes-and-migration) owns those consequences.
 
 **Phase 0 is incomplete.** There are checked logical plans, native probes and
@@ -127,8 +133,8 @@ A later filter or reranker cannot recover a discarded candidate. Explicit
 stage boundaries expose this information loss and allow exhaustive analytics
 and bounded discovery to compose honestly.
 
-Schema-owned analysis and an exact baseline also fix the current index-state
-divergence: indexed `beto` can match `beta` while identical appended values
+Schema-owned analysis and an exact baseline ([Analyzed lexical search](2026-09-18-analyzed-lexical-search.md))
+also fix the current index-state divergence: indexed `beto` can match `beta` while identical appended values
 are missed; `running` can disappear when indexing stores `run`. Boolean
 matching and fuzzy retrieval therefore consume one typed lexical description.
 
@@ -150,12 +156,10 @@ graphs still cross the storage-format upgrade described below.
 
 | Existing usage or expectation | Proposed change | What users must do |
 |---|---|---|
-| `fuzzy`, `search`, or `match_text` | These spellings are removed without compatibility aliases. Boolean matching and ranked lexical retrieval consume the same typed `terms` query. | Choose `match_terms` for filtering or `lexical` for retrieval; set term combination and edit tolerance deliberately. |
-| `nearest`, retrieval expressions inside `order`, or positional RRF | Retrieval moves into explicit `rank` stages. Vector retrieval distinguishes exact `knn` from approximate `ann`; fusion names its inputs. | Rewrite inline and stored queries, choose exact versus approximate retrieval, and project named metrics instead of repeating retrieval expressions. |
+| `fuzzy`, `search`, `match_text`, and implicit searchability through `@index` | Owned by [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#migration): one deprecation release, then removal with the GQ language major bump. | Follow that RFC's mapping to `match_terms` and `lexical`. |
+| `nearest`, retrieval expressions inside `order`, or positional RRF | Retrieval moves into explicit `rank` stages. Vector retrieval distinguishes exact `knn` from approximate `ann`; fusion names its inputs. The old spellings compile to the staged IR with a deprecation diagnostic for one release before removal. | Rewrite inline and stored queries, choose exact versus approximate retrieval, and project named metrics instead of repeating retrieval expressions. |
 | Vector candidate depth inherited from final `limit`, while BM25 fusion arms scan uncapped | Each source and fusion stage has its own candidate window. Final `limit` counts output rows; graph fan-out can produce several rows per selected target. Stage comparators determine selection before final ordering. | Choose source/fusion windows explicitly and review tie keys and expected row counts. A migration cannot infer the intended recall/cost tradeoff from the old limit. |
-| `@index` or `@key` implicitly makes a String searchable by analyzed text | Analyzed matching requires `@analyzed`, which enables BM25 ranking by default. Exact key/index annotations keep their separate meaning. | Declare `@analyzed` on searchable text, choose another analyzer when needed, or explicitly opt out of ranking with `scorer="none"`. An exact-only slug does not need an analyzer. |
 | Implicit vector geometry or an unresolved `@embed` model | A field's encoding recipe and geometry must resolve at schema acceptance. The model may inherit a schema-owned default recipe; distance may inherit that recipe's declared default. Raw vectors require explicit distance. | Declare the source and dimensions, then resolve a compatible recipe and geometry. A new default cannot identify how old vectors were produced; unresolved legacy vectors still need operator resolution or regeneration. |
-| Existing search rows, scores, or ordering survive a spelling-only rewrite | `terms` defaults to all terms and zero edits. Analysis, complete fuzzy matching, and explicit selection boundaries can change results. Lexical ranking deduplicates query terms, groups fuzzy alternatives, and uses float64 scores with snapshot-visible field statistics independent of eligibility. | Review analyzer choices, fuzzy relevance, score thresholds, and tie fixtures. Repeating a query term no longer increases its weight. The rewrite does not promise equivalent results to legacy search. |
 | Queries relying on silently ignored search constructs or permissive parameter handling | Invalid shapes, incompatible representations, token-empty queries, and exhausted budgets produce typed failures. A successful partial candidate set cannot stand in for an exact result. | Handle the declared errors and size queries explicitly; do not interpret a failure as an empty successful search. |
 | Existing graph files open directly after the upgrade | The accepted-schema change requires an export/init/load rebuild. Compatible values and logical graph content are carried over; commit history, branches, and physical indexes are not preserved by that rebuild. | Plan the data upgrade even if no query uses search. Retain the predecessor graph if its history is needed, rebuild indexes explicitly, and obtain fresh snapshot references from the rebuilt graph. |
 
@@ -222,7 +226,7 @@ The release must include the schema/query migration diagnostics, updated
 examples, user guides, and release notes. Detailed semantics and remaining
 acceptance gates follow; the migration tools must not guess unresolved choices.
 
-### Schema and analyzers
+### Schema declarations and vector defaults
 
 The annotations below are proposed syntax. The representation identity
 requirements in Design also apply; a provider/model label alone is not a
@@ -239,6 +243,9 @@ node Organization {
 }
 ```
 
+`@analyzed`, its analyzer profiles and its scorer default are specified in
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#schema-the-analyzed-capability); the rows
+below are the vector side of the same resolution rule.
 #### Directive defaults and omission rules
 
 Defaults shorten the authored schema. They are resolved before acceptance
@@ -247,25 +254,12 @@ content write. Unknown arguments and unresolved required choices are errors.
 
 | Surface | Omitted value | Explicit choice or failure |
 |---|---|---|
-| `@analyzed` | No annotation means no analyzed capability; `@index` and `@key` do not supply it. | Exact predicates remain available without it. |
-| `@analyzed.analyzer` | `standard_v1` | A named immutable profile such as `standard_folded_v1` or `english_v1`. |
-| `@analyzed.scorer` | `bm25_v1` capability and default policy for exact or tolerant `terms` | `scorer="none"` permits analyzed filtering only; a lexical ranking source on that field is a typed error. |
 | `@embed` source | No default | The source property is mandatory and resolves to its stable identity. |
 | `Vector` dimensions | No default | A positive dimension is mandatory and must be compatible with the resolved encoding recipe when present. |
 | `@embed.model` | The schema's declared default embedding recipe | Without that default, require an explicit model that resolves to a complete qualified recipe. A model label alone is insufficient. |
 | `Vector.distance` on an `@embed` field | The selected recipe's declared default distance | An explicit field distance takes precedence. If neither provides one, schema acceptance fails. Persist and validate the resulting geometry. |
 | `Vector.distance` without `@embed` | No default | Require explicit `l2`, `cosine`, or `dot`; the graph's embedding default does not assign geometry to raw vectors. |
 | Embedding normalization and query/document roles | The selected recipe's resolved choices | There is no global normalization fallback. An incomplete recipe fails acceptance. |
-
-Thus bare `@analyzed` expands to
-`@analyzed(analyzer="standard_v1", scorer="bm25_v1")`.
-The initial scoring capability supplies one default policy, `bm25_v1`.
-`lexical` may omit `scoring`; spelling `scoring: bm25_v1` explicitly is
-equivalent. Exact and fuzzy search use that same policy, with edit tolerance
-specified once in `terms`. There is no separate `fuzzy_bm25_v1` selector.
-This default does not enable edit tolerance, execute ranking, create an
-index, or remove the need for the policy's qualification. An explicit
-`@analyzed(scorer="none")` retains the former matching-only use case.
 
 The graph schema may declare one default embedding recipe in its accepted
 metadata. The recipe identifies the model revision, compatible query/record
@@ -296,106 +290,17 @@ including previously inherited choices, so reinitialization does not require
 the old deployment's defaults. This rule requires accepted-state-aware schema
 resolution; parsing the desired source alone cannot implement it.
 
-#### Analyzer profiles
+### Lexical sources
 
-Initial immutable analyzer profiles resolve these settings explicitly;
-unspecified Lance defaults are never part of the schema contract:
-
-| Setting | `standard_v1` (default) | `standard_folded_v1` | `english_v1` |
-|---|---|---|---|
-| Document / base tokenizer | Text / `simple` | Text / `simple` | Text / `simple` |
-| Language setting | English (inactive) | English (inactive) | English |
-| Lowercase | Yes | Yes | Yes |
-| Stemming / stop words | Neither | Neither | English stemmer, then built-in English stop words |
-| ASCII folding | No | Yes | Yes, after stemming and stop words |
-| Token-length filter | Disabled (`max_token_length: None`) | Disabled | Disabled |
-| Unicode normalization | NFC before tokenization; no NFKC | Same | Same |
-
-All three profiles first apply NFC to lexical analysis input, then run the
-pinned `simple` tokenizer and Lance's filter order: lowercase, optional
-stemmer, optional stop words, optional ASCII folding. Scalar String fields use
-row document granularity; positions do not affect membership. These profiles
-use no custom stop words, external dictionaries, n-grams, or code-tokenizer flags.
-Posting positions and block layout remain derived index settings.
-
-NFC makes canonically equivalent spellings reach tokenization as the same
-string while retaining distinctions that compatibility normalization can
-erase. See the [Unicode normalization specification](https://www.unicode.org/reports/tr15/).
-This preprocessing is part of the proposed analyzer, not a claim about the
-unmodified Lance tokenizer. Query, scan, and index construction must use the
-same qualified pipeline, with normalization work charged to the query/build
-budget. A native path without that proof stays disabled. Stored String values
-and exact predicates are unchanged; embedding input preprocessing remains
-owned by its encoding recipe and does not inherit lexical normalization.
-
-Disabling the token-length filter is deliberate. Pinned Lance defaults to
-`Some(40)`, whose filter retains only tokens shorter than 40 **UTF-8 bytes**,
-before lowercasing or folding. Resource limits must reject excessive work,
-not silently erase a long name or query term. Thus `english_v1` retains
-the pinned linguistic filter choices but intentionally changes normalization
-and long-token matching at this breaking boundary.
-
-`simple` splits at non-alphanumeric Unicode scalar values. Lowercasing is
-not full case folding, and ASCII folding is distinct from Unicode
-normalization. NFC preprocessing makes composed `résumé` and its canonically
-equivalent decomposed spelling analyze identically. Accent removal is still
-opt-in: with `english_v1`, `résumé` and `resume` become `resume` and
-`resum`, respectively, because stemming precedes folding. These limitations
-are explicit profile behavior, not promises of language-independent typo
-equivalence. Once a profile is accepted, changing segmentation, normalization,
-or filter order requires a new profile. Fingerprints include the normalizer
-implementation and Unicode data identity as well as the Rust Unicode behavior
-used by `simple` and lowercase. These are revised, unshipped `v1` definitions;
-the earlier no-NFC probe does not qualify them. Adding a profile or scorer
-version requires an RFC; accepted identities are never mutated.
-Query-time analyzer or vector-distance overrides do not exist. A lexical
-source resolves a versioned scoring policy compatible with the field's
-declared capability, using its accepted default when omitted. That resolution
-does not change analysis. The first release defines only `bm25_v1`; additional
-policies need explicit semantics and qualification rather than runtime aliases.
-
-For spelling tolerance on names and titles, the non-stemming profiles keep
-edit distance close to the spelling the user supplied. Under `english_v1`,
-distance is measured after stemming; a one-character typo in the original
-word need not remain one edit after analysis. The field's declared profile
-decides this for every query and execution path.
-
-### One lexical query, two consumers
-
-A typed lexical query describes matching independently of its consumer.
-The initial variant is `Terms { text, mode, max_edits }`; the grammar sketch
-spells it `terms($q, mode: all, max_edits: 1)`. `mode` defaults to `all` and
-`max_edits` to zero in both consumers. Candidate-oriented stored queries
-usually choose `mode: any` explicitly. Phrase, prefix, and Boolean query
-composition are future typed variants, not embedded vendor query strings.
-
-`match_terms(field, terms(...))` is a Boolean predicate on a scalar String
-property with `@analyzed`. A `lexical` source consumes the same description
-to select and rank matches with a resolved scoring policy. The Boolean
-predicate introduces no score, ranking, candidate window, or implicit
-retrieval. Its contract is:
-
-| Aspect | Rule |
-|---|---|
-| Query text | A non-null String literal or query parameter, constant for one execution; row-dependent query text is rejected. |
-| Analysis | Apply the same resolved field analyzer to document and query text, at every edit budget including zero. |
-| Distance | Minimum insertions, deletions, and substitutions over analyzed Unicode scalar values; each costs one. An adjacent transposition costs two. There is no implicit prefix restriction or length-based automatic tolerance. |
-| `max_edits` | Optional integer literal or query parameter in `0..=2`, default `0`. Check literals at compile time and bound parameters before execution; reject negative, oversized, and non-integer values without narrowing casts. |
-| `mode` | `all` by default: every analyzed query term has a document term within the budget. `any`: at least one does. |
-| Term identity | Repeated query terms do not require repeated occurrences; a document term can satisfy multiple query terms. Reordering analyzed terms cannot change membership. Matching is neither phrase matching nor distance over the whole field value. |
-| Empty text | A query yielding no searchable terms is a typed error. A null or token-empty document does not match. |
-| Completeness | Every successful result satisfies the predicate exactly; an edit-tolerant predicate does not advertise approximate recall. |
-
-For a fixed schema, query, and document population, these are normative laws:
-
-```text
-matches(edits=0) ⊆ matches(edits=1) ⊆ matches(edits=2)
-matches(indexed) = matches(unindexed) = matches(partially indexed)
-```
-
-Adding an analyzed query term cannot widen `mode: all`. Appending unrelated
-documents cannot remove existing predicate matches. A resource failure is a
-typed query failure, not an empty or truncated successful matched set.
+A `lexical(field, terms(...), candidates: N)` source consumes the typed
+`terms` description that [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#one-lexical-query-two-consumers)
+defines, over a property declared `@analyzed`. Membership before the source's
+cut is the shared `Terms` relation; ranking uses the field's resolved scoring
+policy (`bm25_v1` by default) with the
+[field-corpus statistics](2026-09-18-analyzed-lexical-search.md#lexical-scoring-and-shared-matching-semantics)
+that RFC owns. A source cannot change analysis, edit budget or statistics
+scope; those are field and query facts. `match_terms` in `match` is the same
+description used as a Boolean predicate and introduces no rank or window.
 
 ### Clause composition and named stages
 
@@ -497,289 +402,20 @@ A source cannot silently rank another binding or interpret one query vector
 as a batch of per-row queries. Correlated per-target retrieval requires a
 separate bounded operator contract; it is not implicit in repeated `match`.
 
-Analyzed filtering alone remains an ordinary match predicate:
+Analyzed filtering alone remains an ordinary match predicate; the
+[`match_terms` example](2026-09-18-analyzed-lexical-search.md#analyzed-filtering-in-match) and the rule that
+no adjacent source inherits its edit budget are in the lexical RFC.
 
-```gq
-query organization_names($q: String) {
-  match {
-    $o: Organization
-    match_terms($o.name, terms($q, mode: all, max_edits: 1))
-  }
-  return { $o.slug, $o.name }
-  order { $o.slug asc }
-}
-```
+### Language evolution
 
-No adjacent source inherits that edit budget. `lexical` with exact terms
-continues to select only its own exact matches; fuzzy retrieval must consume
-an explicitly tolerant query. Both resolve the same default scoring policy.
-
-### Language evolution and compatibility
-
-Extend one typed stage sequence followed by `return`, optional final `order`
-and `limit`. Graph patterns remain declarative within `match`; source text
-does not prescribe a physical scan/join schedule. The production single-match
-grammar and test-only staged grammar are not the complete stable language.
-
-Use one expression model for properties, parameters, literals, aliases and
-metrics wherever their types/scopes permit them. Keep graph patterns and stages
-as dedicated nodes; a call-shaped retriever is not a scalar. Unknown
-constructors/options fail. Fix precedence, associativity, null rules, name
-resolution and positional/named arguments before stabilization. Scalar
-negation must not inherit correlated graph `not` semantics; score arithmetic
-retains explicit domain policies. The following Phase 0 expression decisions
-apply when the corresponding operators are implemented:
-
-| Boundary | Decision |
-|---|---|
-| Precedence | Parentheses/calls, then `*` and `/`, then `+` and `-`, then one comparison, then scalar `not(...)`, then `and`, then `or`. Arithmetic at one level associates left; chained comparisons fail. Graph `not { ... }` retains its separate scope. |
-| Numeric types | Arithmetic requires the same scalar numeric type; no implicit widening, integer/float mixing or conversion of metrics to numbers. Integer division remains unavailable until an explicit quotient/rounding contract; future casts must be named. |
-| Null values | Arithmetic/comparison with null yields null. Boolean composition uses three-valued logic: false dominates `and`, true dominates `or`, otherwise an unknown operand yields null; `not(null)` is null. `is_null` returns non-null Bool; filters and `count_if` accept only true. |
-| Numeric errors | Integer overflow/underflow is a typed failure, never wrapping, saturation or null. New floating arithmetic rejects non-finite operands/results and division by either signed zero. Null operands yield null without applying that arithmetic operation. These rules do not retroactively redefine stored scalar values or existing aggregate signatures. |
-| Evaluation | Operands have no promised left-to-right or short-circuit evaluation. Boolean guards cannot make an invalid arithmetic expression safe; future conditional/try expressions need explicit evaluation rules. Constant folding must use the same types, null and error rules as execution. |
-| Aliases | Sibling `let`/return expressions read the incoming scope; they cannot read an alias declared beside them. A later stage can read exported values. Final ordering can read output aliases. |
-
-The staged compiler checks precedence, same-type arithmetic and nullable
-results. The native `staged_composition_numeric_and_null_contracts` probe
-checks all nine Boolean pairs and exposes two adapter obligations:
-DataFusion 54's default integer `BinaryExpr` wraps; its explicit
-`with_fail_on_overflow(true)` path refuses the tested I64 overflows. That
-switch still permits floating infinity/NaN, so finite arithmetic needs a
-checked expression adapter. This is a physical-expression proof, not proof
-that logical optimization, aggregate accumulators or GQ lowering preserve
-these rules. Those remain qualification gates; a session default is
-insufficient. See the pinned [binary evaluator](https://docs.rs/crate/datafusion-physical-expr/54.0.0/source/src/expressions/binary.rs)
-and [Arrow arithmetic](https://docs.rs/crate/arrow-arith/58.3.0/source/src/numeric.rs).
-
-Every operator declares its scope and population effect:
-
-| Operation | Binding/identity rule |
-|---|---|
-| Predicate / ordinary projection | Preserve rows, duplicates, bindings and metric origins |
-| Traversal | Extend bindings with existing endpoint/edge-instance semantics; bounded reachability does not become path enumeration |
-| `rank` | Select distinct targets and retain their incoming binding rows |
-| `take` | Select target/group pairs; it does not create reusable group features |
-| Group/reduction | Export keys and reduced values, discard unreduced member bindings/metrics |
-| Future optional/branch/collection | Explicit imports/exports, nullability, multiplicity and local scope |
-
-Terminal aggregate-return shorthand retains its existing implicit grouping:
-adding a non-aggregate projection can change the groups. Future intermediate
-grouping uses the same equality/null/duplicate rules with explicit exports;
-ordinary intermediate projection must not acquire that implicit reduction.
-
-Each rank block ends with `yield <source>`, resolving a declaration in that
-block. Sources share the incoming population and explicit fusion dependencies.
-Adding an unused declaration cannot select a different output or comparator;
-every declaration is still validated and requested metrics consume resources.
-Earlier metrics retain their original scope; reusing earlier candidates needs
-explicit remapping/intersection.
-
-Keywords are contextual and token-bounded (`yield yield` can select an alias
-named `yield`). Preserve property, system and source namespaces:
-`$binding.property`, `$binding.@id` and explicit metric references.
-New nested scopes must not capture unrelated bindings implicitly. Future
-user-defined namespaces require collision rules.
-
-Admit count literals/parameters consistently while retaining their units:
-positive source-target windows, nonnegative group-pair quotas and final
-binding-row limits. Extending final-limit parameters is additive, not row-dependent
-query batching. Physical effort, memory, I/O and output bytes stay separate.
-
-After the coordinated cutover, additive syntax must preserve valid queries'
-parsing/name resolution, typing, populations, metric meaning and result schema
-under the same accepted identities. Exact results stay exact; ANN preserves
-its approximation/effort contract rather than a fixed candidate set.
-All-node expansion after a schema change follows its explicit scope contract.
-
-Changing an analyzer, scorer, missing-value rule, default window, encoding
-recipe or ANN mapping is a semantic change even if queries still parse.
-Version policies/accepted bindings and preserve resolved choices. Unavoidable
-future breaks require an explicit language/format boundary and migration.
-
-Before freezing syntax, qualify [C1–C4](#required-composition-examples) and a
-compatibility corpus covering contextual identifiers, mixed/null expressions,
-alias collisions, unused sources, projection/window independence, both sides
-of cuts and discarded group/union metrics. Deferred operators need coherent
-type/plan proofs now and executable GQT/resource tests when implemented.
-Stored queries describe supported combinations; they cannot replace missing
-language operators with unbounded client-side computation.
-
-### Query capability matrix
-
-This inventory covers the current public `.gq` surface, the initial release
-described by this RFC, and the general graph/query/retrieval extensions the
-grammar must leave room for. It separates language support from implementation
-evidence; parser acceptance and native substrate support alone are insufficient.
-It is a review checklist, not a promise to implement every conceivable query
-operator or every future row in the initial release.
-
-**Current** describes the production path in this PR's source baseline, not
-the test-only staged parser or the archived integration prototype. `Limited`
-means a narrower capability or a known correctness gap, described in the cell.
-The four [GQT search regressions](#ci-checkpoint-and-regression-disposition)
-remain open. **RFC release** uses these dispositions:
-
-- `Keep`: preserve the existing operation and its meaning.
-- `Deliver`: required for the coordinated release, subject to its stated gates.
-- `Replace`: an existing surface migrates to the new contract at the cutover.
-- `Foundation`: fix the shared grammar/type/scope rules now; the broader
-  user-facing operator remains deferred.
-- `Defer`: outside the initial implementation; preserve the stated extension.
-- `Separate`: an adjacent capability governed by its own contract, not a new
-  search feature.
-
-The last column states what can be added later and what the syntax must
-preserve. Examples such as `yield`, `group`, `collect` and nested object
-construction discussed during design are illustrative; this matrix does not
-accept their spelling, introduce a general scalar-variable declaration, or
-change the tested RFC query examples.
-
-#### Declarations, expressions and scope
-
-| Capability | Current | RFC release | Future extension / syntax constraint |
-|---|---|---|---|
-| Named queries; multiple query declarations per file | Yes | Keep | Query-body extensions retain the declaration and invocation model. |
-| Typed required and nullable parameters | Yes; scalar, list and vector forms; nullable omission accepted | Keep | Relation/object parameters would need separate type and transport contracts; a list is not implicit query batching. |
-| Stored-query tool metadata | Yes; `@description` and `@instruction` | Keep | Metadata describes the same query; it does not carry hidden execution semantics. |
-| Literals, parameters, property values, `date`, `datetime`, `now` | Yes, with current context restrictions | Keep | New expression variants preserve existing types, time semantics and literal parsing. |
-| One shared expression model across stages | Limited; fixed expression variants and context-specific handling | Foundation | Deliver shared parsing/typing for admitted expressions, including metrics; this does not deliver every scalar function below. |
-| Scalar comparison, exact String prefix/substring and list membership | Yes | Keep | Exact String behavior remains case-sensitive; `contains` on a list remains membership. |
-| General scalar Boolean composition and negation | Limited; match conditions conjoin and graph `not` tests pattern absence | Foundation | Add typed Boolean expressions with fixed precedence and null rules; graph absence keeps its correlation semantics. |
-| Explicit null tests/replacement, conditionals, arithmetic, casts and general scalar functions | No general surface | Foundation | Extend shared expressions through typed signatures; preserve overflow, null and score-domain rules. |
-| Intermediate named computations/projection | No | Foundation | Fix explicit value bindings and retained/exported scope through composition example C1; operator implementation remains deferred. |
-| Result aliases used in final ordering | Yes | Keep | Result aliases remain distinct from graph parameters/bindings and source aliases. |
-| Reusing an earlier result alias in another projection | No; production rejects `T36` | Foundation | Decide alias scope explicitly before relaxing this rule; shared expression parsing alone is not alias reuse. |
-| Nested scopes, reusable query branches and bounded subqueries | Limited; correlated graph negation only | Defer | Declare imports, exports, shadowing, snapshot and shared budgets; distinguish reuse from re-execution. |
-| User-defined functions or query-valued parameters | No | Separate | If justified later, define typed namespaces, versioning and execution limits; arbitrary evaluation is not an initial requirement. |
-
-#### Graph matching and identity
-
-| Capability | Current | RFC release | Future extension / syntax constraint |
-|---|---|---|---|
-| Concrete typed node scans and inline property constraints | Yes | Keep | New type selectors must not reinterpret an existing concrete type. |
-| Directed traversal and binding joins within `match` | Yes | Keep | Preserve endpoint-pair versus edge-instance multiplicity and graph eligibility. |
-| Undirected traversal | Yes, between the same endpoint type | Keep | Preserve orientation and duplicate rules when extending edge-pattern syntax. |
-| Single-hop edge bindings and edge-property access | Yes | Keep | Node and edge kinds remain distinct even when names or ids coincide. |
-| Bounded multi-hop reachability | Yes; shortest-distance semantics, no bound path/edge sequence | Keep | A future path value or path enumeration needs an explicit operator and bounds; it cannot redefine existing hop syntax. |
-| Anonymous bindings and repeated-binding constraints | Yes | Keep | Anonymous bindings cannot name reusable rank/take targets; existing bindings cannot change type through rebinding. |
-| Correlated pattern absence | Yes; `not { ... }` | Keep | Inner bindings do not escape; future scalar negation does not acquire this scope behavior. |
-| Positive existence without outer-row fan-out | No dedicated positive-existence construct | Defer | Add a correlated pattern predicate; ordinary traversal continues to expose its matches. |
-| Optional graph enrichment | No | Foundation | Example C4 must preserve unmatched inputs and nullable exports; distinguish inner predicates from later filters. Multiple matches may still fan out; implementation remains deferred. |
-| Graph matching before, between and after retrieval cuts | Limited; one `match` and terminal search ordering | Deliver | Repeated stages retain their input population; later filters cannot move before an earlier selection cut. |
-| Logical system identity projection and filtering | Limited; whole-node objects expose `id`, but `.id` is an ordinary declared property lookup | Deliver with RFC 0040 | Qualify `$binding.@id` and type/incarnation-aware follow-up; never expose native row IDs as graph identity. |
-| Explicit unions of typed graph bindings | No; interfaces do not provide polymorphic query scans | Foundation | Execution deferred. Preserve typed branches, explicit exports, bag/set semantics and original entity identity. |
-| All-node discovery, representation expansion and type narrowing | No | Foundation | Execution deferred. Resolve type scope separately from searchable representations at one snapshot; common fields and type-specific projections must typecheck. |
-| Global all-edge or mixed node/edge discovery | No; a concrete edge can be reached through traversal | Defer | Make entity kind and selected scope explicit; an all-node selector must not silently start including edges. |
-| Cross-graph federation | No combined `.gq` population; graph selection is external | Separate | Requires explicit authority, identity, snapshot and budget rules; global search in this RFC means one graph. |
-
-#### Projection and result shape
-
-| Capability | Current | RFC release | Future extension / syntax constraint |
-|---|---|---|---|
-| Flat projection of properties, parameters and literals | Yes | Keep | Ordinary projection preserves binding rows, duplicates and candidate windows. |
-| Explicit column aliases and unique output names | Yes; duplicate names rejected; some unaliased inferred/executed names still differ | Keep; qualify schema agreement | Freeze naming and result-schema agreement; extra syntax must not capture existing aliases. |
-| Whole-node object projection | Yes; id and properties except Blob/Vector | Keep | This remains schema-shaped shorthand; explicit fields provide stable compact results across schema additions. |
-| Bare edge object projection | No; project edge properties explicitly | Defer | Define an edge object/reference type and endpoints deliberately; do not assume node-object behavior. |
-| Existing list and vector property projection | Yes; each remains one column value | Keep | Projection does not unnest a list or execute vector retrieval. |
-| Blob values in ordinary read projection | No; dedicated Blob API | Separate | Preserve the Blob access/resource contract; object shorthand must not fetch Blob contents. |
-| Source score, distance, rank and fused-score projection | Limited; only a repeated leading `nearest`/`bm25` expression can expose its metric | Replace | Named `metric(source, field)` preserves domain, origin and missing membership through aliases and later stages. |
-| Selected nested object construction | No; whole-node objects are the only node-object shorthand | Foundation | Example C4 fixes typed row reshaping separately from traversal/grouping/collection; constructor implementation remains deferred. |
-| New list/object construction from expressions | Limited; list literals and existing list values | Defer | Define element/field types and nullability; constructing a value is separate from collecting rows. |
-| List unnesting, mapping or comprehensions | No general surface | Defer | Unnest is an explicit population-changing operation; local value mapping needs its own typed scope and bounds. |
-| Nested related-entity/evidence collections | No | Foundation | Example C4 fixes correlation, exports, duplicate and empty-result rules, local order, item limit and shared byte/work budgets; implementation remains deferred. |
-| Snippets, highlights and source ranges | No dedicated query construct | Defer | Preserve source property/version, offset unit and bounds; generated text must remain distinguishable from stored source. |
-| Token-budget result packing | No | Defer | Declare tokenizer, selection policy, attribution and completeness; row limits must not become token limits. |
-
-#### Aggregation, selection and ordering
-
-| Capability | Current | RFC release | Future extension / syntax constraint |
-|---|---|---|---|
-| Terminal `count`, `sum`, `avg`, `min`, `max` | Yes | Keep | Preserve admitted input types, null behavior and duplicates; `count($node)` counts binding rows. |
-| Implicit grouping by non-aggregate return values | Yes, with current type restrictions | Keep | Adding a group projection can change row count; do not give ordinary intermediate projection this implicit effect. |
-| Grouped metric projection and explicit metric reductions | No staged metrics; legacy search/aggregate combinations restricted | Deliver | Projected metrics can be group keys or explicit reductions; discarded source metrics cannot order a new group. |
-| Reusable intermediate grouping/reduction | No | Foundation | Examples C1–C2 export group keys/entities and reduced values; drop unreduced member bindings and active ranks. Group-stage implementation remains deferred. |
-| General distinct rows/entities and distinct aggregates | No dedicated syntax | Defer | Specify the identity/value tuple and duplicate equivalence; retrieval deduplication is not general `DISTINCT`. |
-| Distinct-target ranking with retained binding rows | Limited; legacy search exists without the new stage contract | Deliver | Each target gets one source rank; selecting it retains its associated binding rows. |
-| Quotas per explicit group, including ordinary non-search selection | No | Deliver through `take` | Select target/group pairs; use explicit reductions when order varies per pair; require local order without an active rank. |
-| Parent selection using reduced child metrics | Limited; terminal aggregates cannot feed a quota | Deliver through `take` reductions | Selection does not create reusable group features or implicit parent-source ranks. |
-| Top-N retrieval within every full group; row-dependent query inputs | No | Foundation | Examples C1/C4 require explicit correlation/partition scope, empty-group behavior and one total budget; implementation remains deferred. Global top-K plus `take` is different. |
-| Final ordering by properties/aliases and identity tie-breaks | Yes, with documented legacy search boundary-tie gaps | Keep; repair retrieval ties | Final ordering cannot change a previous source cutoff; each selection owns its complete comparator. |
-| Explicit `nulls first` / `nulls last` | No syntax; fixed ascending/descending defaults | Deliver | Apply consistently in local and final ordering; omission preserves existing defaults. |
-| Final row limit, including zero | Yes; integer literal | Keep | Counts output rows; it does not resize retrieval or bound all intermediate work. |
-| Parameterized final row limit | No | Foundation | An additive count-parameter extension remains possible; this matrix does not add it to the initial release. |
-| Parameterized source windows and group quotas | No corresponding stage syntax | Deliver | Admit integers before execution; positive source windows and nonnegative quotas have different units. |
-| General analytic windows, running aggregates and partition ranks | No public surface | Defer | Typed stage/expression rules must define partitions, frames and order; internal window use does not expose a language feature. |
-| Stable ranked cursors/pagination | No replayable ranked-execution contract | Defer | Preserve actual candidate order or qualify reproducibility, retention and policy; snapshot identity alone is insufficient. |
-
-#### Retrieval and ranking
-
-| Capability | Current | RFC release | Future extension / syntax constraint |
-|---|---|---|---|
-| Analyzed lexical membership | Limited; `search`/`match_text` have known execution-path inconsistencies | Replace | One typed `terms` description consumed by `match_terms`; filtering introduces no rank/window. |
-| Edit-tolerant lexical membership | Limited; `fuzzy` exists with analyzer/coverage defects | Replace | Shared analyzed edit semantics, explicit `mode` and `max_edits`, complete membership across index states. |
-| Exact-term lexical ranking | Limited; legacy `bm25` exists | Replace | Explicit bounded `lexical` source with qualified `bm25_v1` statistics, numeric rules and ties. |
-| Fuzzy lexical ranking | No unified ranked tolerant-query contract | Deliver | `lexical` consumes tolerant `terms`; no separate fuzzy scorer or inherited edit budget. |
-| Exact vector top-K as an explicit user choice | No exactness selector; some physical paths scan exactly | Deliver through `knn` | Exact top-K over eligible valid vectors; an index is an acceleration choice. |
-| Approximate vector top-K | Yes through legacy `nearest`, with implicit effort/window behavior | Replace with `ann` | Explicit approximation and bounded effort contract; exact rescoring does not imply complete recall. |
-| String or raw-vector retrieval inputs | Yes | Keep with resolved encoding | Validate dimensions and compatible encoders; inputs are constant per execution, not implicit per-row batches. |
-| Named sources, explicit candidate windows and explicit block output | No | Deliver | Sources share the incoming target population; select output independently of declaration order before freezing syntax. |
-| Weighted multi-source rank fusion | Limited; legacy RRF has two inline arms and asymmetric windows | Replace | Named 2–16-arm RRF, explicit weights/windows, checked arithmetic and one vote per target per arm. |
-| Search a traversal-introduced node or a bound edge | Limited; node search shapes have gaps and edge search is rejected | Deliver | Every source targets a property of the declared eligible binding; do not require a textual scan root. |
-| Search, traverse and search again | No explicit staged surface | Deliver | Each stage retains population and metric origin; earlier candidates cannot be reopened implicitly. |
-| Multiple fields on the same target as separate sources | Limited by legacy inline source forms | Deliver | Named sources may select different compatible field capabilities; fusion remains explicit. |
-| One logical multi-field/cross-type lexical corpus | No unified contract | Defer | Specify field reduction and shared live statistics before candidate cuts; per-table BM25 values are not globally comparable by default. Multiple named fields of one target type can still use explicit fusion. |
-| Phrase, token-prefix, proximity and Boolean lexical queries | No portable typed contract | Defer | Add `LexicalQuery` variants shared by matching/ranking consumers; avoid a vendor query-string sublanguage. |
-| Geometric range retrieval and exact distance predicates | No dedicated public contract | Defer | Distinguish a complete eligible-population range query from a filter on ANN candidates. |
-| Candidate rescoring, learned reranking and general feature combination | No general stage | Foundation | Example C3 fixes membership-preserving scoring, domains, statistics/normalization populations and resource behavior. Scoring/model/formula operators remain deferred. |
-| General cross-identity fusion, such as passages with parent sources | No | Defer | Require graph mapping, reduction and fresh target ranks; matching id strings do not establish compatibility. |
-| Semantic diversification / complementary evidence selection | No | Defer | Add a set-selection objective and qualification; per-group quotas alone do not supply it. |
-
-#### Representation and execution contracts
-
-These rows are part of a query's meaning or execution interface, even when
-their authored syntax belongs to `.pg` or request options rather than `.gq`.
-
-| Capability | Current | RFC release | Future extension / syntax constraint |
-|---|---|---|---|
-| Analyzed String capability with immutable analyzer/scorer defaults | Limited; legacy FTS/index configuration and compatibility proofs | Deliver | Resolve `@analyzed` independently of `@index`; accepted semantics cannot follow mutable runtime defaults. |
-| Dense vector fields and embedding-source declarations | Yes; existing `Vector`/`@embed` | Replace unresolved semantics | Resolve dimension, geometry, source mapping and compatible immutable encoding recipes; qualify providers. |
-| Schema-owned default embedding recipe and reproducible exports | No complete resolved-default contract | Deliver | Final declaration spelling remains open; omission, explicit override and migration preserve accepted field bindings. |
-| Sparse vectors, multivectors/late interaction and named analyzed views | No retrieval surface | Defer | Extend typed representation/capability variants; do not define every retriever input permanently as one dense vector. |
-| Additional modalities or external retrieval sources | No general query source | Separate | Any later source needs explicit typing, authority, coherence and budget guarantees; no universal content object is introduced. |
-| Coherent branch/snapshot reads | Yes through existing execution interfaces | Keep | Use the graph's accepted snapshot and existing authority; stage syntax must not reopen a fresh view. |
-| Snapshot-coherent identity follow-up through all read transports | Limited; snapshot fields exist, system-id lookup and output paths have gaps | Deliver | Complete RFC 0040 lookup and JSON/JSONL continuation; unavailable/expired identity is explicit. |
-| Inline/stored query invocation and typed result descriptors | Yes; result-schema agreement has known gaps | Keep and qualify staged reads | Derive reads, result shape and fingerprints from every stage; aliases and hidden demand must agree with execution. |
-| Inspectable staged plans, metric origins and selection descriptors | No complete staged contract | Deliver | Expose resolved sources, inputs and semantics through the existing query interface; keep transport naming separate from graph properties. |
-| Representation coverage, including explicitly requested exact counts | No complete source-level contract | Deliver | Known/unknown readiness differs from completion and index coverage; exact counts share the query budget. |
-| Whole-query resource admission, cancellation and output accounting | Limited; existing local bounds do not establish the RFC guarantee | Deliver | All stages, encoders, fallbacks, nested work and projection share one execution context; no silent truncation. |
-| Graph/branch and stored-query authorization | Yes | Keep | All source reads and graph expansions obey existing gates; a snapshot is not a retained-access capability. |
-| Row/field-level security predicates | No policy engine for this scope | Separate | If added, constrain eligibility, statistics and metadata before selection; post-top-K filtering is insufficient. |
-
-#### Adjacent `.gq` operations
-
-| Capability | Current | RFC release | Future extension / syntax constraint |
-|---|---|---|---|
-| Named insert/update/delete query bodies | Yes, with current target and constructive/destructive restrictions | Keep | Read stages remain separate from mutation bodies; no implicit search-to-write pipeline. |
-| Several mutation statements in one graph publication | Yes within admitted mutation forms | Keep | A future write extension must preserve the single publication and recovery contracts. |
-| Standalone branch create/delete/merge/list statements | Yes; one per file, not beside query declarations | Keep | These control operations do not become data-query stages or typed unions. |
-| Conditional writes after a coherent read | Yes through the execution interface | Keep | Preserve the returned graph commit precondition; do not infer a new transaction from projection syntax. |
-
-#### Syntax decisions needed now
-
-Every `Deliver`/`Replace` row needs accepted syntax and typing/lowering.
-`Foundation` requires C1–C4 and global-extension design proofs now while its
-broader implementation stays deferred.
-All extensions follow the [language rules](#language-evolution-and-compatibility).
-
-Current-state evidence is the production
-[grammar](../../crates/omnigraph-compiler/src/query/query.pest),
-[typechecker](../../crates/omnigraph-compiler/src/query/typecheck.rs) and
-[projection executor](../../crates/omnigraph/src/exec/projection.rs).
-The query guide's earlier-alias-reuse claim is stale: `T36` and the
-[score-projection case](../../crates/omnigraph-gqt/cases/issue_640_search_score_projection.gqt)
-refuse it. `executed_column_name` also records unaliased inferred/executed
-name drift. The [staged parser](../../crates/omnigraph-compiler/src/query/staged_probe.pest)
-qualifies only its documented prototype subset.
+The shared expression model, precedence, null and numeric rules, contextual
+keywords, scope transitions, the
+[query capability matrix](2026-09-18-gq-composition-and-language-evolution.md#query-capability-matrix) and the C1–C4
+composition examples are owned by
+[GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md). This RFC's syntax must
+satisfy those rules; the matrix's `Deliver` and `Replace` rows are this RFC's
+initial release, and its `Foundation` rows are proofs due before the syntax
+here stabilizes.
 
 ### Vector behavior and agent recipes
 
@@ -863,6 +499,12 @@ All search-language replacements ship together. Diagnostics point callers
 from `fuzzy`, `search`, and `match_text` to typed lexical matching or retrieval;
 from retrieval in `order` and `nearest` to explicit rank stages and `knn`/`ann`;
 and from positional RRF to named inputs with declared candidate windows.
+The legacy spellings are not removed in the same release: they compile to
+the new typed IR with a deprecation diagnostic for one release and are
+removed in the next, with the GQ language major bump the
+[compatibility surfaces](2026-09-14-compatibility-surfaces.md) RFC defines.
+The lexical RFC fixes the mapping for its spellings; Phase 6 fixes the
+`nearest`, `order` and positional-`rrf` mapping.
 Rewritten application/stored queries and examples ship with the implementation.
 A rewrite must ask the caller to choose exact versus approximate retrieval
 and semantic windows when the old query never specified them.
@@ -995,224 +637,14 @@ with an equivalence proof that preserves these populations, duplicate/null
 semantics and metric origins. Cost optimization cannot change which question
 the aggregate answers.
 
-### Required composition examples
+### Composition examples
 
-C1–C4 are grammar-evolution acceptance cases. The test-only compiler parses and
-checks these examples; the production parser rejects them. Their logical plans
-and native probes are design evidence. Deferred operators require integrated
-GQT/resource qualification when implemented.
-
-**C1 — Aggregate, select entities, then retrieve evidence.** A has prior/current
-incident counts 2/8; B has 6/7. Select A's increase of six, irrespective of B's
-report relevance. Missing periods count zero; incident-rooted input does not
-invent services with no incidents. Including those needs a service population
-and enrichment.
-
-```gq
-query composition_c1($q: String) {
-  match {
-    $i: Incident
-    $s hasIncident $i
-    $i.period = "prior" or $i.period = "current"
-  }
-  group {
-    per { $s }
-    reduce {
-      count_if($i.period = "prior") as prior_count,
-      count_if($i.period = "current") as current_count
-    }
-  }
-  let { current_count - prior_count as increase }
-  select { order { increase desc, $s.@id asc } limit 1 }
-  match { $s hasReport $p }
-  rank $p {
-    lexical($p.text, terms($q), candidates: 2) as reports
-    yield reports
-  }
-  return {
-    $s as service, prior_count as prior_count, current_count as current_count,
-    increase as increase, $p.@id as report_id, $p.text as report_text
-  }
-}
-```
-
-`group` exports entity keys under their binding names and named reductions,
-discarding incident bindings. `let` adds row values whose sibling expressions
-read the incoming scope; numeric results do not become identities. `select`
-cuts rows, while `take` selects target/group pairs. Retain computed facts
-through the service cut and later report reads. Multiple selected services
-require C4's explicit correlation, not repeated global top-K plus `take`.
-
-**C2 — Retrieve, traverse, then aggregate the selected population.** Selected
-p1/p2 have three bindings to project P (two from p1); eligible p3 falls outside
-the cut. P must report three binding rows and two distinct passages.
-
-```gq
-query composition_c2($q: String) {
-  match { $p: Passage }
-  rank $p {
-    lexical($p.text, terms($q), candidates: 2) as candidates
-    yield candidates
-  }
-  match { $p $membership:inProject $project }
-  group {
-    per { $project }
-    reduce {
-      count($p) as binding_rows,
-      count_distinct($p.@id) as passages,
-      min(metric(candidates, rank)) as best_rank
-    }
-  }
-  return {
-    $project as project, binding_rows as binding_rows,
-    passages as passages, best_rank as best_rank
-  }
-  order { $project.@id asc }
-}
-```
-
-Group exports project identity/counts and explicitly reduced metrics; member
-bindings and active rank disappear. In terminal aggregate shorthand, an
-unreduced projected metric instead adds a grouping key and changes the question.
-Keep the candidate barrier before traversal/aggregation. General distinct/
-intermediate grouping is deferred; the initial path must qualify terminal
-binding counts and metric reductions.
-
-**C3 — Score existing candidates without changing membership.** Dense retrieval
-selects d1/d2, both lexical matches, while the lexical arm's window contains only
-d1. A fresh feature scores both without manufacturing lexical-arm membership.
-
-```gq
-query composition_c3($q: String, $vector: Vector(3)) {
-  match { $p: Passage }
-  rank $p {
-    lexical($p.text, terms($q), candidates: 1) as words
-    knn($p.embedding, $vector, candidates: 2) as dense
-    yield dense
-  }
-  score $p {
-    lexical($p.text, terms($q), scoring: bm25_v1) as words_feature
-  }
-  return {
-    $p.@id as passage_id, metric(words, rank) as lexical_rank,
-    metric(words, score) as lexical_score, feature(words_feature) as lexical_feature
-  }
-}
-```
-
-`score` preserves targets, bindings and comparator; it has no candidate window,
-output selector, rank or fusion vote. `feature` names a scorer; `metric`
-names retrieval membership. Reordering/cutting requires an explicit operation.
-A hidden lexical top-K followed by a join can drop d2 and is invalid.
-Scoring uses accepted corpus statistics and charges their work even for a
-small target set.
-
-**Decision:** scoring evaluates the term contributions independently of
-`all`/`any` membership. A partial `all` match can have a positive feature;
-a present value with no matching terms, including a token-empty value, has
-zero; a null field has a null feature. The
-[lexical contract](#lexical-scoring-and-shared-matching-semantics) owns the
-complete rules and numerical oracle. The native composition fixture still
-uses precomputed features: it proves preservation, not their production.
-
-**C4 — Computed facts, optional graph facts and bounded evidence.** A has one
-owner and three reports; B has neither. Both survive with their original
-counts; A gets the first two reports under the local comparator and B gets a
-null owner and empty typed list.
-
-```gq
-query composition_c4($q: String) {
-  match {
-    $i: Incident
-    $s hasIncident $i
-    $i.period = "prior" or $i.period = "current"
-  }
-  group {
-    per { $s }
-    reduce {
-      count_if($i.period = "prior") as prior_count,
-      count_if($i.period = "current") as current_count
-    }
-  }
-  let { current_count - prior_count as increase }
-  select { order { increase desc, $s.@id asc } limit 2 }
-  optional ($s) as owner {
-    match { $s ownedBy $person }
-    return { $person as person }
-  }
-  collect ($s) as reports {
-    match { $s hasReport $p }
-    rank $p {
-      lexical($p.text, terms($q), candidates: 2) as relevant
-      yield relevant
-    }
-    return { $p.@id as id, $p.text as text }
-    order { metric(relevant, rank) asc, $p.@id asc }
-    limit 2
-  }
-  return {
-    $s as service, prior_count as prior_count, current_count as current_count,
-    increase as increase, owner as owner, reports as reports
-  }
-}
-```
-
-Imports explicitly distinguish `$entity` from computed row values; query
-parameters stay available. Child bindings/sources do not escape. `optional`
-returns a nullable object: zero rows produce null, one produces an object,
-and more than one requires explicit selection/collection or a cardinality
-error. `OwnedBy` is zero-or-one in this example.
-
-`collect` consumes ordered binding rows and requires a local comparator and
-output limit. Unique reports need an explicit identity reduction; source
-windows do not bound later fan-out or cumulative parent work. Both children
-preserve the parent row, accepted snapshot and one whole-query budget.
-
-Correlation is per parent **row**, not merely entity ID: repeated service
-bindings can carry different facts. Compiled source ID alone does not identify
-all runtime per-parent rankings. Reuse requires equivalent imports, parameters,
-representation and snapshot, preserving every parent row and charging actual
-shared work. Edge imports/group exports, total row ties, nested-field access,
-cardinality/resource enforcement and safe decorrelation remain unqualified.
-
-**Evidence and open boundaries.** The
-[compiler](../../crates/omnigraph-compiler/src/query/staged_probe.rs) reads the
-four examples directly. Its [derived logical views](../../crates/omnigraph-compiler/src/query/staged_probe/plan.rs)
-retain relations, barriers, sources, group populations, projection types and
-imports. They are neither executable IR nor a public serialization; their
-snapshot/budget/statistics statements are requirements, not measured behavior.
-Symbolic bindings and omitted options do not freeze defaults/fingerprints.
-
-| Example / checked logical plan | Prototype evidence | Still unproved / required falsifier |
-|---|---|---|
-| [C1](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c1.json) | Group retains `$s`, exports counts and drops `$i`; selection precedes report retrieval. Native filtered counts produce A=2/8, B=6/7, C=1/0, selecting A. A report-driven prefilter selects B instead; `count(Boolean)` counts false; a duplicate path changes A's count. | Actual GQ lowering and optimized population barriers, entity rehydration, enforcement of the decided arithmetic/null/overflow rules and resource ownership. The native probe models the report filter; it does not retrieve reports. |
-| [C2](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c2.json) | Group retains project identity and reduced metric origin while dropping member bindings/order. Native selection of p1/p2 yields three binding rows and two distinct passages; removing the cut admits p3 and changes both counts. | Graph target-ID mapping, GQ aggregate lowering, general equality/null semantics, distinct-state memory and the complete optimized graph/retrieval plan. |
-| [C3](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c3.json) | The scorer creates a separate feature with no candidate window or rank; dense output remains the comparator. A native fixture preserves p2 with absent lexical-arm rank and a positive feature; filtering on lexical membership incorrectly drops it. Zero/null feature inputs also survive. The Decimal oracle separately checks partial/zero/null feature values. | Production scorer and enforcement of the decided nonmatch/empty/missing-field policy, fixed live statistics and numeric parity. Precomputed native features prove neither BM25 values nor scorer cost. |
-| [C4](../../crates/omnigraph-compiler/src/query/staged_probe/composition_c4.json) | Checked imports/exports and separate child source IDs. Native ordered object lists preserve two rows for A and an empty B; presence markers distinguish absent objects from present null payloads. Duplicate paths consume collection rows, and fan-out exceeds the source window. An aggregate detects multiple owners. | Correlated GQ lowering, generation/preservation of parent-row identity, actual typed cardinality refusal, full entity-object projection, total row ties and shared budget/cancellation under many parents. Detection of ambiguous owners is not the query refusal path. |
-
-The [native probe](../../crates/omnigraph/tests/rrf_prefilter_gate/composition.rs)
-uses DataFusion 54.0.0 / Arrow 58.3.0, memory inputs, one/four partitions,
-forward/reversed one-row batches and two zero hash-join thresholds. It does
-not qualify Lance providers, arbitrary optimizer configurations, snapshot
-pinning, cancellation or allocations. See the
-[checkpoint](#composition-plan-and-primitive-checkpoint) for reproduction;
-GQT takes ownership when these operators become executable.
-
-C1/C2 use typed
-[aggregation](https://docs.rs/crate/datafusion-expr/54.0.0/source/src/logical_plan/builder.rs),
-[filtered expressions](https://docs.rs/crate/datafusion-expr/54.0.0/source/src/expr_fn.rs)
-and [distinct count](https://docs.rs/crate/datafusion-functions-aggregate/54.0.0/source/src/count.rs).
-Count matching rows: `count(predicate)` also counts false. Entity rehydration
-and preservation of cuts remain OmniGraph lowering responsibilities.
-
-C4 must bridge [ArrayAgg's empty-input null](https://docs.rs/crate/datafusion-functions-aggregate/54.0.0/source/src/array_agg.rs)
-to a typed empty list. Aggregate actual child rows by parent-row identity with
-explicit order, then left-join to parents and construct empty lists for absent
-groups. A left join before aggregation can create phantom `[null]` or `[{}]`.
-Optional objects need a presence marker: null properties do not mean no row.
-The native object-list probe exercises this distinction; the current JSON
-writer omits null fields. These tests do not decide a new wire contract or
-prove bounded nested execution.
+C1–C4, the grammar-evolution acceptance cases, are in
+[GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md#required-composition-examples).
+Of them only C2's terminal subset is in this release: retrieve, traverse,
+then terminally aggregate the selected population, with the candidate barrier
+kept before traversal and aggregation. Intermediate grouping, `let`,
+`select`, `score`, `optional` and `collect` are deferred there.
 
 ### Target identity, fan-out, grouping, and metrics
 
@@ -1372,197 +804,13 @@ selection relative to already known information are extension requirements
 and evaluation concerns. Agent-side exclusions and follow-up queries remain
 ordinary graph operations.
 
-### Lexical scoring and shared matching semantics
+### Lexical scoring
 
-Lower both lexical consumers through `LexicalQueryIR`, bound to the
-rename-stable property identity and accepted analyzer fingerprint. Resolve
-parameters and analyze once per compatible field/query instance per execution,
-including on empty populations. Reuse resolved matching state across scan and
-indexed paths. The consumers differ in role: matching returns a Boolean;
-retrieval selects matches and computes ranking under its declared policy.
-Removed spellings have no separate IR variants or compatibility evaluators.
-
-`bm25_v1` is one versioned term scorer for both exact and tolerant queries.
-Zero edits reduces to BM25 with unit weight per distinct analyzed query term;
-nonzero edits adds alternatives and an edit penalty within the same formula.
-Candidate membership is always the shared `Terms` relation, evaluated before
-the ranking cutoff. A score is not a second membership predicate. This removes
-the earlier requirement to coordinate `terms.max_edits` with a separate exact
-or fuzzy scorer selector. Query-term repetition and order carry no extra
-weight; intentional source weighting belongs to explicit fusion or a separately
-specified future scoring operator.
-
-The deferred membership-preserving `score` operator uses this same kernel
-over its incoming targets, including targets that fail `Terms` membership:
-
-| Field/query outcome | Retrieval membership before its cut | Lexical feature |
-|---|---|---|
-| At least one matching term group, but not every group of an `all` query | False | Positive sum of the matching contributions |
-| Nonempty field with no matching group | False | `0.0` |
-| Present field with zero analyzed tokens | False | `0.0` |
-| Null field | False | Null: no field value to score |
-| Full query match | True | Same finite positive value as retrieval scoring |
-
-`mode` controls the Boolean consumer; it never masks term contributions.
-Changing `all` to `any` alone cannot change a feature value. Changing the terms,
-edit budget, analyzer or statistics can. A score of zero is observed absence
-of term evidence; null remains missing representation. Neither adds a source
-rank or fusion vote. Feature nullability follows field nullability, while a
-retrieval metric can also be absent because its target missed that source's
-window. A future explicit conditional can gate features by membership; no
-second implicitly gated BM25 formula is introduced.
-
-An empty analyzed **query** is an error before any target evaluation, even for
-an empty population or all-null fields. An empty corpus has no positive
-contributions: return zero for present token-empty fields and null for null
-fields without dividing by corpus length. Invalid representations/statistics,
-non-finite arithmetic and resource failures remain errors. Scoring never
-turns them into zero, null or dropped targets.
-
-The statistics population is part of source identity, independently of its
-eligible population and candidate window. The initial contract uses the
-snapshot-visible field corpus: distinct, policy-visible targets owning that
-accepted type/property identity with nonempty analyzed values, before ordinary
-graph or property filters and the source's lexical query. Null and token-empty
-values contribute neither a document nor tokens. Graph fan-out contributes one
-target, not repeated field values. A physical dataset, index segment, or shard
-cannot choose a different logical corpus. Polymorphic fields must resolve
-their corpus identities explicitly before that source shape is supported.
-
-At one snapshot, with the same query, analyzer, and scoring policy, narrowing
-eligibility therefore leaves a surviving target's lexical score unchanged.
-This makes scoring compose with graph filters and keeps it independent of
-candidate windows. Selection still depends on eligibility: filtering before
-top-k and filtering after top-k are different operations. Scores may change
-across snapshots or policy-visible corpora; this is not a globally calibrated
-score or a reason to compare unrelated source instances.
-
-The existing `fts_prefilter_does_not_change_covered_fragment_scores` guard
-confirms that a native prefilter does not rescope covered-index statistics.
-The new `fts_statistics_scope_can_reverse_ranking` probe goes further: with
-the same four eligible targets, an alpha/beta query ranks an alpha target
-first using the full ten-target corpus, but the beta target first using an
-index containing only those four eligible targets. Eligibility and statistics
-must remain separate typed plan facts. Implicitly recomputing statistics for
-each match block would change score meaning with graph scope. An explicit
-alternative corpus could be a future contract; it is not an initial query
-option.
-
-This choice does not qualify native BM25 or make field statistics free.
-Deleted/updated rows, unindexed tails, null/token-empty handling, arithmetic,
-and complete boundary ties still require a checked-in score oracle and
-scan/index parity. Reusable statistics must be derived from the accepted
-snapshot and representation; a stale aggregate is not authority. Exact
-statistics work consumes the query budget and may require a corpus scan.
-The prefilter probe proves neither live-row statistics parity nor a cost
-advantage for every query. Policy constrains the corpus before statistics;
-ordinary query filters do not replace the access-control boundary.
-
-For each distinct analyzed query term `q`, treat all stored terms within the
-declared edit budget as alternatives for that term. Let `N` be the number of
-documents in the field corpus, `df_q` the number containing at least one such
-alternative, `len_d` the total analyzed token count of document `d`, `avg_len`
-the corpus mean length, and `tf(t,d)` the occurrence count of stored term `t`.
-All analyzed occurrences contribute to length, including repetitions and
-terms unrelated to the query. A field value is the document unit; graph paths
-and index segments never multiply its frequency.
-
-The mathematical definition is:
-
-```text
-idf(q)       = log1p((N - df_q + 0.5) / (df_q + 0.5))
-norm(d)      = 1.2 * (0.25 + 0.75 * len_d / avg_len)
-weight(t,d)  = 2.2 * tf(t,d) / (tf(t,d) + norm(d))
-part(q,d)    = idf(q) * max [ 2^(-edit(q,t)) * weight(t,d) ]
-                       over stored terms t within the edit budget
-score(d)     = sum part(q,d) over distinct query terms q
-```
-
-An empty maximum contributes zero. `df_q` counts a document once even when
-several alternatives occur, before the full query's `all`/`any` membership
-test and ordinary eligibility filters. Alternative-specific rarity cannot
-give a misspelling extra weight: all alternatives share the term group's IDF.
-Using the maximum or sum of individual term document frequencies would not
-count the group's matched population: maximum misses disjoint occurrences,
-while sum double-counts documents containing several alternatives. Union DF
-also stays unchanged when spellings redistribute without changing which
-documents match the group. This semantic benefit has a cost: native per-term
-frequency metadata alone generally cannot produce it.
-Within a document, maximum contribution prevents adding different spellings
-from summing several pieces of evidence for one query term. Repeated occurrences
-of a single stored term still affect its BM25 term frequency. A stored term
-may contribute to several distinct query terms, matching the existing `Terms`
-membership rule; the score is not a count of independent facts.
-
-Edit weights are `1`, `1/2`, and `1/4` for zero, one, and two edits. These are
-versioned design choices, not values inferred from a backend or established
-as globally optimal. Exact preference is a contribution boost at equal term
-frequency and length, not a strict ordering tier above every fuzzy document.
-Length, term frequency, and other query terms can still change the winner.
-Changing `max_edits` may change group IDF and ranking, while membership retains
-the declared monotonicity. At zero edits each group contains only the exact
-term, so the same kernel supplies the exact-scorer reduction.
-
-The numeric profile uses float64 and `libm 0.2.16`'s scalar `log1p`
-implementation, with its dependency identity recorded in the scorer
-fingerprint. It does not delegate to the platform's logarithm. Count documents,
-tokens, and frequencies with checked `u64` arithmetic; compute `N - df_q`
-before conversion, reject inconsistent statistics,
-and handle an empty corpus before division. Convert counts to float64 for
-scoring, evaluate the parenthesized expressions above without algebraic
-reassociation or fused operations, and sum contributions in ascending UTF-8
-query-term order. Zero-contribution terms add zero; matching rows must produce
-a finite positive score or a typed numeric failure. Final ties use the source's
-stable target comparator. One canonical numeric implementation must serve all
-qualified paths; testing that pinned kernel across supported targets is
-required before acceptance. The Decimal oracle verifies mathematical values
-within its stated tolerance, not cross-platform bit identity. A future kernel
-change needs a new scorer identity unless score/order equivalence is proved.
-
-Native Lance BM25 does not supply this contract. The
-`native_fuzzy_bm25_rewards_a_rare_expansion` probe gives `beto` about 38 times
-the score of exact `beta` in a 100-document fixture and doubles scores for a
-repeated query term. The public float32 scorer also rounds a common term's
-positive IDF to zero at `N = 2^24`; the
-`native_bm25_idf_can_round_a_common_term_to_zero` guard reproduces this without
-allocating that corpus. Native scores or top-k cuts require new qualification;
-rescoring an incomplete native candidate set cannot establish exact winners.
-
-The [numerical fixtures](../../crates/omnigraph/tests/fixtures/lexical_scoring_v1.json)
-and `lexical_scoring_v1_reference_oracle` in the existing search test owner
-cover the chosen formula, zero-edit behavior, repeated/reordered terms,
-alternative aggregation, overlapping groups, `all`/`any`, null/token-empty
-values, and two-edit membership. They are design oracles over already-analyzed
-terms, not a production evaluator or relevance benchmark. The initial complete
-path must implement fuzzy ranking against these oracles; leaving it to a later
-release is not completion. Scan-based correctness may ship before native
-acceleration, with bounded failure when the work cannot complete.
-
-The same oracle now checks separate feature expectations, including partial
-`all` matches, all-null/token-empty corpora, unchanged features under `all`/`any`
-and eligibility changes, and identical retrieval/feature values for matches.
-These settle C3's numeric meaning; they do not deliver the deferred scorer
-operator or qualify analysis, live-row accounting and execution bounds.
-
-An exact physical baseline can compute field statistics in one snapshot-pinned
-pass, then score eligible values in a second pass. For each query term, count
-at most one family occurrence per document in the first pass; the second uses
-that document's term frequencies and the same edit relation for its maximum.
-Keep query-term statistics and bounded per-document state, not a retained
-corpus or persistent expansion dictionary. N/mean-length metadata may be reused
-when snapshot and analyzer identity qualify it; fuzzy family DF generally
-depends on the query and edit budget. Both passes, normalization, matching,
-and top-k selection share the execution budget.
-
-This is an implementation route to qualify, not a claim that two full scans
-meet production latency goals. Indexed acceleration must supply complete
-membership, live-row counts, term frequencies and group reductions, or prove
-conservative bounds for every pruned candidate. Lance's public scorer trait
-returns float32 additive term weights; merely substituting a scorer cannot
-provide the group's maximum reduction or this float64 contract. Reuse Lance
-postings through qualified upstream/adapter work and DataFusion group operators
-where appropriate; do not introduce another stored index. A numeric or quota
-post-pass over native top-k cannot restore discarded winners.
+The `bm25_v1` definition, the unified exact/fuzzy formula, the field-corpus
+statistics decision and the feature table for the deferred `score` operator
+are owned by
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#lexical-scoring-and-shared-matching-semantics).
+Metrics produced by a `lexical` source carry the domain `Score<bm25_v1>`.
 
 ### Explicit ranking features and distance predicates
 
@@ -1592,127 +840,15 @@ never be presented as a probability that an answer is correct.
 ### Graph-wide discovery across entity types
 
 **Phase 0 disposition:** defer cross-type union execution, all-node search,
-all-edge search and mixed-kind search from the initial release. Concrete
-node targets, and concrete edge targets reached through graph traversal,
-retain their specified scope. A loop of independent client queries is not
-the promised one-snapshot global query. This decision keeps the coordinated
-release focused on the existing search correctness failures while the common
-language acquires the union, narrowing and heterogeneous result machinery.
-
-Before stabilizing the initial grammar/IR, preserve these extension boundaries:
-target identity carries entity kind and accepted type/incarnation as well as
-entity ID; a logical source/window is independent of physical table count;
-type scope and representation selection are separate typed plan facts.
-Common-property projection requires compatible property types in every union
-arm, with nullability widened when necessary. A property absent from an arm
-requires explicit type narrowing or branch projection, never implicit null
-or stringification. Union construction preserves binding rows; deduplication
-and target selection remain explicit. An all-node expansion is the union of
-the snapshot's concrete node scans, with each node identity once before any
-graph fan-out. No wildcard or union punctuation is accepted by this decision;
-its parser/type/plan compatibility proof remains a Phase 0 gate.
-
-Here, global search means discovery across eligible entity types in one
-logical graph at one accepted snapshot. Its scope includes the target types,
-searchable properties, representation policies and authorization rules. A
-convenience stored query can own that scope; schema-driven expansion must
-resolve it against the accepted catalog and include the resolved scope in its
-query identity. Adding a searchable type can then change that explicitly
-defined population. Ordinary unindexed or non-searchable fields do not acquire
-an implicit text conversion or embedding recipe.
-
-An all-node selector must expand to every accepted node type without requiring
-applications to enumerate the alternatives. Keep this type scope separate from
-the representation selector: the latter resolves analyzed properties, field
-reductions and compatible embedding spaces. A node type with no selected usable
-representation remains in the declared scope but cannot contribute a ranked
-hit. Coverage must distinguish this absence from an evaluated non-match;
-unknown counts remain explicit unless exact coverage was requested. An index
-is not what makes a property searchable, and missing indexes must not remove a
-type from the logical scope. All-edge scope is a separate explicit choice.
-
-Resolve both selectors against the query's accepted snapshot and include their
-expanded identities in execution identity. A newly added node type is therefore
-included in a subsequent all-node query, while a read pinned to an older snapshot
-retains that snapshot's type and representation scope. This automatic scope
-expansion does not authorize implicit stringification, mixing vector spaces, or
-resetting resource allowances per type. The wildcard spelling and typed
-representation-selector grammar remain part of the general query-language
-extension; a wildcard alone does not make `$hit.title` valid on every type.
-
-The current compiler binds a variable to one concrete node type. Schema
-interfaces provide declarations and inheritance, but the query binder does
-not yet execute polymorphic scans or a heterogeneous union. The initial
-same-binding fusion contract alone therefore does not provide a single
-cross-type global search query. This is an expressiveness gap to resolve
-before advertising that capability.
-
-The preferred extension is a general typed union of graph bindings. Each
-branch preserves the entity kind, accepted type/incarnation identity and
-entity id; a hit remains its original node or edge. Common projections and
-type-specific property access need ordinary query-language typing and type
-narrowing. No synthetic stored `Document` entity or separate search registry
-is needed. Source metrics and matched-property attribution remain attached to
-their producing source. Two types with equal id strings are still different
-targets. Passage-to-owner mapping remains the separate explicit graph mapping
-and reduction problem described above.
-
-Ranking this union requires a declared cross-type policy:
-
-- A lexical source over a common logical text representation needs compatible
-  analysis, a defined treatment of multiple fields per target, and statistics
-  over that logical corpus. Per-table BM25 scores cannot be merged as if each
-  table had used those shared statistics. Multiple property hits must not
-  accidentally duplicate a target or let traversal fan-out add relevance.
-- Compatible vector representations can share a distance comparator when
-  space/revision, query encoding, dimensions, metric and numeric rules agree.
-  Different spaces remain separate named sources, with their query encoding
-  calls included in the shared execution budget.
-- Fusion can combine sources that now name this same typed target universe.
-  RRF over disjoint per-type lists is also a possible explicit policy, but it
-  gives each equally weighted type's first result the same contribution. It
-  is a source-balancing choice, not proof of comparable relevance. A common
-  scorer or qualified reranker is needed when the product requires a single
-  relevance ordering that those source ranks do not supply.
-
-Logical source count and physical table count are separate. Compatible tables
-can be partitions of one logical source with one global candidate window.
-Creating an independent fusion vote for every table would let physical schema
-layout influence relevance. All partition scans and merges still consume the
-same query budget; a small logical source count does not bound physical work.
-
-Physically, Lance remains responsible for each version-pinned dataset and
-qualified index/scan path. DataFusion can union narrow candidate relations,
-group by the full typed identity, rank/fuse and apply the global cut; hydrate
-payloads from the corresponding pinned datasets after selection. For an exact
-source split into disjoint physical partitions, local top-k followed by a
-global top-k is valid only when every partition uses the same score and total
-comparator as the global source. A partition cannot substitute local corpus
-statistics or a different tie rule. Complete per-target field reduction and
-deduplication before such a cut. If a target's score still depends on
-contributions from several partitions, pruning those contributions requires a
-valid global-score bound; ordinary local top-k is insufficient. ANN remains
-explicitly approximate.
-
-Rescoring a shortlist selected with table-local BM25 statistics cannot repair
-this error: the global winner may already have been discarded. Lance 11's
-public `InvertedIndex::bm25_stats_for_terms` and `bm25_search` with a supplied
-`MemBM25Scorer` provide a lower-level shared-statistics path to investigate.
-They do not establish the complete contract: the scorer is native float32,
-the RFC requires different fuzzy-group scoring, and immutable index statistics
-can still count deleted rows. Reconcile live corpus statistics, uncovered
-rows and invalidated coverage before using them for a global candidate cut.
-Any cache remains derived from the accepted snapshot and representation
-identities. Native index statistics alone are not a new source of truth.
-
-Before enabling that extension, qualification must cover two unrelated node
-types, an explicitly selected edge type, equal id strings across types, multiple searchable fields,
-incompatible vector spaces, empty/unavailable sources, snapshot changes,
-policy and shared-resource refusal. Compare the physical fan-out plan with an
-independent evaluator over the full logical union. Include disjoint-source
-RRF behavior in the retrieval-task evaluation. The grammar, typed result and
-global-corpus rules require an explicit extension; this section records its
-design direction and does not claim implemented support.
+all-edge search and mixed-kind search from the initial release. Concrete node
+targets, and concrete edge targets reached through graph traversal, retain
+their specified scope. Before stabilizing the initial grammar and IR, this
+RFC preserves three boundaries: target identity carries entity kind and
+accepted type/incarnation as well as entity id; a logical source and its
+window are independent of physical table count; type scope and
+representation selection are separate typed plan facts. The design direction,
+the ranking policy for a typed union and the qualification list are in
+[GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md#graph-wide-discovery-across-entity-types).
 
 ### Representation identity and source attribution
 
@@ -1819,15 +955,22 @@ wire types and namespace choices must be checked before implementation:
 | Attribution | Graph snapshot context, graph binding identities, and selected properties; application-defined source relationships remain ordinary data |
 | Follow-up | A supported way to read/expand those bindings at that snapshot, or an explicit expired/unavailable outcome |
 
-**Interface decision:** add one typed `execution` option to canonical inline
-and stored-query requests, with the same options on the embedded entry point:
-`coverage: report | exact` (default `report`), `require_replay: Bool` (default
-false), and optional `limits`. This is request admission/metadata policy;
-retrieval sources, windows and effort remain in the typed query. Unknown keys,
-invalid units and unsupported requirements fail before query work. An omitted
-limit inherits a finite operator-configured default; an explicit request may
-tighten that cap; a value above the cap is an admission error. Zero means no
-allowance for a counted resource, never unlimited. A deadline must be positive.
+**Interface decision:** the read options are session settings, not a new
+request field. [Session settings](2026-09-16-session-settings.md) and its
+first implementation (#742) give every operation an explicit, typed
+`SessionSettings` value with a declared scope: `Omnigraph::session(settings,
+sources)` carries it into `query` and `query_with_head`, a GQ `set` prefix
+applies to one statement, stored sources reject settings prefixes, and a
+request-scoped value cannot widen an operator's cap. This RFC adds
+request-scoped settings `coverage` (`report` | `exact`, default `report`),
+`require_replay` (Bool, default false) and the resource limits named below,
+each with a finite operator-configured default that an explicit value may
+tighten but not exceed; the settings RFC decides whether they take a
+`search.` namespace. Unknown names, invalid units and unsupported requirements
+fail at settings validation before query work, as `ann_nprobes` already
+does. Zero means no allowance for a counted resource, never unlimited; a
+deadline must be positive. Retrieval sources, windows and effort remain in
+the typed query.
 
 Retain `ReadOutput.graph_commit_id` as the replay identifier and `target` as
 the requested target. Add an `execution` result descriptor with its format
@@ -1845,9 +988,10 @@ renderer/client fixtures must prove these additions; naming them here does
 not make them accepted request fields today.
 The current owners are [API types](../../crates/omnigraph-api-types/src/lib.rs),
 [engine query admission](../../crates/omnigraph/src/exec/query.rs) and
-[CLI renderers](../../crates/omnigraph-cli/src/read_format.rs). The engine
-currently captures its view before compiling and has no such shared execution
-argument; implementing this decision requires changing that entry sequence.
+[CLI renderers](../../crates/omnigraph-cli/src/read_format.rs). Since #742
+the engine's query entry points receive effective `SessionSettings`
+explicitly through `Session`; the read options extend that table rather than
+adding a parallel execution argument.
 
 Coverage knowledge is separate from query completion. By default, report exact
 counts only when required retrieval work or qualified snapshot-bound metadata
@@ -1949,6 +1093,14 @@ Compact discovery and selective property reads support context control;
 token-budget packing and source snippets remain deferred, with their
 encoding/source attribution requirements retained.
 
+#### Requirements handed to engine version 2
+
+RFC 0067 (PR #711) names memory management and admission control as an
+engine version 2 component with no owning RFC yet. This RFC does not decide
+that mechanism. The interface decision and limit units below are the
+requirements search execution places on it, retained here until the
+component RFC exists; they are not this RFC's acceptance surface.
+
 **Resource interface decision:** create one request-owned execution context
 before snapshot capture/compilation and retain it through serialization. It
 owns the accepted view once resolved, cancellation/deadline, resource ledger
@@ -1997,103 +1149,20 @@ or boundedly spools the result before success; transport interruption still
 means the client did not receive a complete result. A future streaming-success
 protocol needs an explicit terminal completion record, not silent partial rows.
 
-### Exact lexical execution and qualified acceleration
+### Exact lexical execution
 
-**Analyzer parity without index coupling.** Instantiate the analyzer from
-accepted SchemaIR, even when no FTS artifact exists. Eager empty indexes are
-not the analyzer carrier: overwrite, index removal, or an incomplete rebuild
-must not erase logical semantics. Use the pinned substrate tokenizer
-implementation through one analyzer binding that includes the declared NFC
-preprocessing step. Do not reimplement its filters or pass already analyzed
-tokens into another path that analyzes them again. Normalization must precede
-tokenization consistently in the query, scan, and index-builder paths;
-normalizing only a query does not qualify an index built from raw spellings.
-Creating or changing an analyzer profile continues to require the existing
-schema publication and compatibility protocol; ordinary content writes do
-not build indexes inline.
-
-**Exact scan baseline.** Evaluate the typed predicate over streamed document
-tokens using that analyzer and the declared edit relation. Build bounded
-query matching state once; honor cancellation and the query's execution
-budgets while processing batches. This path is the correctness oracle and
-remains available with full, partial, or absent index coverage. It composes
-with typed graph/property filters at their declared stage. The first-declared
-scan restriction is transitional; supported graph-derived populations must
-retain their predicates. Unsupported placement fails validation rather than
-losing the predicate.
-
-This is a new typed Boolean evaluator, not a wrapper around Lance's flat
-BM25 scanner. `InvertedIndexParams::build()` already exposes the analyzer
-without a dataset or index; its Text tokenizer shares query/document
-tokenization. That construction alone does not supply the newly specified NFC
-pipeline; its integration is an explicit qualification gate. Lance's flat
-BM25 helper accepts a tokenizer but collects per-row scoring counts, does not
-implement edit matching, and its fuzzy post-filter path rejects execution.
-Reuse the public analyzer in a typed
-engine/DataFusion filter over the sealed scan stream. Native index
-acceleration additionally needs an analyzer-consistent query path and a
-complete-expansion outcome; those scanner capabilities are not supplied by
-the pin. Boolean evaluation introduces no dictionary or posting storage.
-
-The implementation must bound query bytes, distinct terms, individual
-materialized values, matching state, and execution work. Enforce admission
-before allocations that can exceed the budget, including Unicode normalization
-and token construction. NFC can expand UTF-8 bytes: the pinned normalizer turns
-the two-byte U+0344 into four bytes. It can also consume a long combining-mark
-sequence before yielding its first output scalar. Bound source consumption,
-internal normalization buffers/work, and output capacity; an input-byte limit
-or cancellation checks only between emitted characters or tokens are
-insufficient. A bounded implementation must enforce these limits at the
-normalizer's input and internal work boundaries.
-Use a bounded exact edit matcher, with cancellation checkpoints inside large
-comparisons and across successive small comparisons. A work quantum that
-resets for every token pair does not bound uninterrupted aggregate work.
-Executor cooperation, cancellation propagation from the request boundary,
-and cleanup of native tasks are separate qualification obligations. Marking a
-function async or adding a yield does not establish end-to-end cancellation.
-The pinned `fst` Levenshtein automaton agrees with the declared scalar-value distance,
-but construction can consume substantial memory and hit its state limit.
-Its default per-automaton cap is not a whole-query resource protocol. Numeric
-limits, accounting units, and fallback charging must be specified and
-qualified before shipping this evaluator.
-
-**Qualified index acceleration.** Lance continues to own dictionaries,
-postings, and physical index state. A native path is eligible only when its
-artifact passes RFC 0043's proof checks against the accepted profile and its
-complete normalization/tokenization/filter pipeline is qualified for the
-requested mode and edit budget.
-Covered rows use complete term expansion and posting evaluation; uncovered
-or rewritten rows use the same exact predicate on their accepted values.
-Combine them at one snapshot with the existing visibility and row-identity
-rules. Final limits and retrieval arm windows cannot change which terms or
-rows satisfy the predicate; ordinary early termination is allowed when the
-query plan proves the requested result complete. Post-verifying a truncated
-candidate set cannot repair omitted matches.
-
-An indexed expansion must distinguish **complete** from **overflow**. The
-current substrate shares a default budget of 50 expansions across query
-terms within each segment, selecting lexically across that segment's
-partitions. It returns tokens without a completeness flag. Earlier terms
-can exhaust the budget before later terms are considered; changing the
-vocabulary or segment layout can change the selected terms. This is not an
-exact membership contract, and increasing the cap is not a completeness proof.
-When complete acceleration cannot be established, use the exact scan within
-the remaining query budget. If that budget is exhausted, fail the whole
-query with a typed resource outcome; do not return partial success. Bound
-token/automaton construction, memory, and execution work without silently
-discarding analyzed terms or increasing budgets on fallback. This introduces
-no query-level `max_expansions` knob or separate approximate predicate.
-
-The pinned Lance fuzzy scanner does not yet satisfy these requirements.
-Until an upstream implementation and adapter pass the qualification matrix,
-use the exact baseline for the affected shapes even when an index exists.
-Keep native matching changes upstream where possible; do not build a second
-index subsystem or a persistent shadow vocabulary in OmniGraph. BM25's
-separate analyzer and corpus-statistics parity gate remains required; a
-membership matcher alone does not qualify ranked scores.
+The exact scan baseline, analyzer parity without index coupling and the
+qualified-acceleration rules for `Terms` are owned by
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#exact-lexical-execution-and-qualified-acceleration).
+A `lexical` source uses that path for membership and statistics; this RFC
+adds only the candidate window and the source's total comparator.
 
 ### Lance, DataFusion, and graph execution
 
+Planner and execution-engine mechanisms belong to the engine version 2
+component RFCs that RFC 0067 (PR #711) names. This section records what
+staged retrieval needs from them and the substrate facts established so far;
+it decides no planner.
 The audited pin is Lance 11.0.0, DataFusion 54.0.0 and Arrow 58.3.0. Current
 graph execution uses Arrow batches and engine-owned fusion/aggregation; this
 proposal does not assume a complete DataFusion logical plan already exists.
@@ -2139,10 +1208,10 @@ tie key from `dense_rank` can exceed the quota. Reattaching selected pairs
 directly to incoming bindings can avoid repeating an already implied cutoff.
 These are qualified rewrite candidates, not a universal planner choice.
 
-The existing
-[selection owner](../../crates/omnigraph/tests/rrf_prefilter_gate.rs) and
-[independent scenario oracle](../../crates/omnigraph/benches/scenarios/search_selection.rs)
-cover duplicate paths, multiple memberships, null/composite keys, filter/cut
+The retained
+[selection probe](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/rrf_prefilter_gate.rs) and
+[independent scenario oracle](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/benches/scenarios/search_selection.rs)
+on the evidence branch cover duplicate paths, multiple memberships, null/composite keys, filter/cut
 placement, memory and persisted Lance sources, input reversal and partition
 changes. Retain two native compatibility fences:
 
@@ -2161,10 +1230,11 @@ checks payloads and final binding order, and retains both dense and distinct-pai
 routes because their costs differ with fan-out and payload width. Downstream
 reliance on Take's ordering metadata remains unqualified.
 
-The [historical physical experiments](assets/0048-agent-context.md#lance-datafusion-and-graph-execution)
+The [historical physical experiments](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-agent-context.md#lance-datafusion-and-graph-execution)
 record configurations, timing/I/O/spill tables and controls. They support these
 implementation candidates, not production latency or a universal winner.
-Reproduce through the existing instrument:
+Reproduce through the instrument on the evidence branch (it returns to the
+tree with Phase 3):
 
 ```sh
 cargo bench -p omnigraph-engine --bench scenarios -- \
@@ -2244,18 +1314,6 @@ requires another explicit rebuild.
 - **Built-in document/evidence entities.** Applications already define nodes,
   properties, and relationships. Preserve graph identity and source version
   without imposing a second data model.
-- **Fuzzy filtering as the complete typo-search feature.** An exact lexical
-  source can discard admitted typo matches. Shared lexical descriptions and
-  explicit fuzzy scoring close the ranked path.
-- **Native fuzzy defaults or truncated expansion as exact semantics.** They
-  change results with analyzer/index/segment state. Complete evaluation or
-  typed failure is required; a larger cap is not a completeness proof.
-- **Empty indexes as analyzer authority.** Artifact removal cannot erase
-  logical matching semantics. Accepted SchemaIR owns the analyzer.
-- **Implicitly rescope lexical statistics with every graph filter.** This can
-  reverse the ordering of the same eligible targets and couples score meaning
-  to match-block placement. A snapshot-visible field corpus gives filtering
-  and scoring separate meanings; qualified statistics still have a cost.
 - **Implicit score blending or a blanket ban on all feature combination.**
   Named domains prevent accidental mixing while explicit normalized/model
   stages can define valid combinations. Geometric range predicates remain
@@ -2282,7 +1340,7 @@ whole-query resource bounds.
 
 The [upstream receipt](assets/0048-upstream-contract-checkpoint.json) records
 checksum-matched crate sources and probe results. The
-[agent context](assets/0048-agent-context.md#evidence-and-tests)
+[pre-split text](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-agent-context.md#evidence-and-tests)
 retains the detailed validation history. The current obligations are summarized
 below; historical pass counts must not be reported as fresh evidence.
 
@@ -2308,9 +1366,6 @@ determine what this pin can promise.
 
 | Search promise | Pinned interface and limit | Decision | Minimal falsifier and disposition |
 |---|---|---|---|
-| Accepted analyzer, including fuzzy input | `InvertedIndexParams::build`; native fuzzy and flat paths choose different analysis/expansion behavior; NFC needs preprocessing. | Reuse tokenizer; adapter plus bounded fallback for complete membership. | Same composed/decomposed or capitalized typo before/after indexing must have identical membership. Native Unicode/analyzer guards expose the limits; the four current GQT regressions remain open. |
-| One exact/fuzzy lexical score | `InvertedIndex::bm25_stats_for_terms`, `MemBM25Scorer`; native float32 BM25 does not implement the proposed grouped fuzzy formula or numeric policy. | Bounded exact scorer first; native acceleration only after parity qualification. | Rare expansion, repeated terms, common-term IDF and deletion change native scores. Existing native and independent Decimal fixtures exercise these counterexamples; full indexed parity remains open. |
-| Cross-table lexical ranking | Public shared scorer can be supplied before native per-table cuts; immutable index statistics can include deleted rows. | Adapter owns live corpus aggregation, scoring policy and complete cut boundaries. | Two local top-1 cuts lose the global winner; the shared-statistics probe recovers its score band. Canonical ties and live multi-type statistics remain open. |
 | Exact `knn` and declared `ann` effort | `Scanner::nearest`, `use_index(false)`, metric/refinement controls and `scan_stats_callback`; refinement scores only retrieved candidates. | Reuse qualified scanner paths; adapter owns geometry, coverage, ties and effort. | ANN omits a true neighbor or returns an unreached `+inf` row. Existing vector guards fence the latter; family-specific recall, arithmetic and complete-tie qualification remain required. |
 | Graph-scoped candidate population | `Scanner::with_row_addr_prefilter` consumes the selected dataset's native `_rowid` domain. | Adapter resolves accepted graph identity to pinned native identity. | Delete/compact a target, then search an older snapshot with a graph mask. Native identity guards exist; the full graph-mask retriever remains open. |
 | Independent candidate windows and final output size | Scanner limits and FTS collectors can cut before OmniGraph sees candidates. Native row-ID or score-only ties are not the declared entity comparator. | Adapter owns every semantic cut; bounded fallback for an unqualified boundary. | More tied targets than the native window, with reversed graph/native identity order. Sorting a truncated subset cannot pass this gate; production qualification remains open. |
@@ -2366,9 +1421,12 @@ Reproduce these native checks from the repository root:
 
 ```sh
 cargo test -p omnigraph-engine --test lance_surface_guards --locked
-cargo test -p omnigraph-engine --test rrf_prefilter_gate --locked
 python3 docs/rfcs/assets/0048-arrow-pool-probe.py
 ```
+
+The six guard probes cited above are proposed in a separate test-only pull
+request; the DataFusion selection probes run on the evidence branch
+(`cargo test -p omnigraph-engine --test rrf_prefilter_gate --locked` there).
 
 The Arrow runner creates an isolated temporary crate, checks all resolved
 registry versions/checksums against the workspace lockfile, and enables only
@@ -2378,140 +1436,45 @@ These deterministic mechanism checks do not add latency, peak-memory or
 retrieval-quality claims. They supplement the frozen integrated prototype and
 agent evaluation rather than changing their inputs or results.
 
-The recorded focused run reports 43 Lance surface guards, 13 RRF/prefilter tests and
+At `ce5a3012` the recorded focused run reports 43 Lance surface guards, 13 RRF/prefilter tests and
 11 benchmark contracts passing, plus the isolated Arrow assertions. The S3
 same-version guard returns early without configured storage credentials, so
 its passing libtest entry is not remote-storage evidence. Both workspace
 Clippy feature graphs pass. The four previously recorded GQT failures remain
 open; these native checks neither repair them nor replace release validation.
-
 ### Assumption audit
 
-The pinned tokenizer/edit-distance probe passed 73,008 comparisons against an
-independent Unicode-scalar evaluator at budgets zero through two. This covers
-the primitive, not the revised NFC pipeline, indexed completeness or budgets.
+The tokenizer/edit-distance probe and the Decimal scoring oracle are owned by
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#assumption-audit). The native matrix above
+and the [composition evidence](2026-09-18-gq-composition-and-language-evolution.md#required-composition-examples) own the
+remaining assumptions and falsifiers.
 
-The [Decimal oracle](../../crates/omnigraph/tests/fixtures/lexical_scoring_v1.py)
-generates thirteen 80-digit reference cases. The float64 evaluator uses pinned
-`libm 0.2.16`, tolerance `2e-14 * max(1, expected)`, exact fixture order,
-repeated-term invariance, eligibility-independent scores/features, all/any
-feature invariance and edit-budget inclusion. Inputs already represent
-analyzed tokens. Native/indexed numeric parity, complete ties and relevance
-defaults remain unqualified.
+#### Regression disposition
 
-The [native matrix](#contract-to-code-qualification) and
-[composition evidence](#required-composition-examples) own the remaining
-assumptions and falsifiers; avoid duplicating their status here.
-
-#### CI checkpoint and regression disposition
-
-The 2026-09-09 GitHub Actions runs for PR head
-`bf5a77e55bc1dcd8415f28d5900d0a9cd218d78e` confirm the same four failures in
-both [GQ Logic Tests](https://github.com/ModernRelay/omnigraph/actions/runs/34371510788/job/102533700021)
-and [Test Workspace](https://github.com/ModernRelay/omnigraph/actions/runs/34371511424/job/102534255348):
-67 of 71 cases pass, and all 127 runner self-tests pass. The workspace job
-tests GitHub's merge candidate `f4ce7e895eb5c29b34c70cb1dbfbf95fba2f8a27`,
-which combines that PR head with base `ed3ea5006f55ef703a3331f29ac45a2262f13300`.
-This identifies the tested source; it does not claim validation against a
-later `main` revision.
-
-| Existing GQT owner | First observed failure | Required implementation and migration proof |
-|---|---|---|
-| [`fuzzy_query_bypasses_index_analyzer`](../../crates/omnigraph-gqt/cases/fuzzy_query_bypasses_index_analyzer.gqt) | Step 2: capitalized `Introductio` returns no rows; `intro` is expected. | Phase 2 must apply the accepted field analyzer at every edit budget. Retain the lowercase and zero-edit controls and reach the later assertions. |
-| [`index_state_changes_text_matches`](../../crates/omnigraph-gqt/cases/index_state_changes_text_matches.gqt) | Step 5, including the two mutation steps: `running` finds only the appended row and loses the indexed row. | Phase 2 must use one matching definition for indexed and uncovered rows. Complete the later `beto` assertion as well; passing the first repaired step is insufficient. |
-| [`search_on_traversal_target_is_dropped`](../../crates/omnigraph-gqt/cases/search_on_traversal_target_is_dropped.gqt) | Step 2: traversal returns B, C and D where only B and D match. | Phase 3 must retain the target predicate and rank the traversal target. The later ranking assertion must return D, rather than fail for a missing score column. |
-| [`unindexed_search_is_case_sensitive`](../../crates/omnigraph-gqt/cases/unindexed_search_is_case_sensitive.gqt) | Step 3: unindexed `deep` finds only the lowercase row; both rows are expected. | Phase 2 must preserve matching with and without an index. Migrate both field declarations to the intended accepted analyzer, and run both query-case controls. |
-
-These cases were added in `b1df2041` and remain active regressions. During the
-coordinated query migration, rewrite their legacy `search`, `fuzzy` and `bm25`
-forms through the new typed terms and ranking constructs while preserving
-their expected membership and ordering. Declare analyzer intent in the schema;
-index presence cannot provide it. Removing the old syntax, blessing the
-incorrect rows, or running only the isolated staged case does not close these
-regressions. A passing implementation needs every step and the full corpus to
-run through the production parser and engine.
-
-The same workspace run passes 361 compiler tests, 42 Lance surface guards,
-56 search tests, 13 RRF/prefilter tests, 88 CLI data tests and 23 CLI parity
-tests before failing at GQT. These counts describe the PR's checked-in code;
-the archived integration experiment has different test counts and is outside
-this CI build. Environment-specific skips inside native guards retain their
-existing limitations. The workspace process stops on the GQT failure, so
-later workspace test targets are not established by this run. Format and
-Clippy checks pass independently. These historical CI failures require the
-implementation above; later native probes do not close them.
+The four GQT regressions recorded on PR #606 and their required
+implementation proof are in
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#regression-cases); they are held out of the
+corpus until each fix lands under an `issue_N` name.
 
 ### Implementation handoff and validation checkpoint
 
-Use the existing owners and archived experiments below. The checked-in staged
-compiler is test-only; the production parser does not accept these examples.
-Its shared expression root, precedence, contextual names, argument/refusal
-rules, scope transitions and metric identities are partial design evidence.
-Numeric/null evaluation, all result types, resolved identities and integrated
-lowering still need qualification.
+The experiments below ran on the PR #606 branch and are retained there; none
+of them is in the tree. Their shared expression root, precedence, contextual
+names, argument/refusal rules, scope transitions and metric identities are
+partial design evidence. Numeric/null evaluation, all result types, resolved
+identities and integrated lowering still need qualification.
 
-#### Explicit-output integration checkpoint
+#### Retained experiments
 
-The [updated patch](assets/0048-phase0-integration.patch) applies directly at
-`b87068cb452ac4c2af0c4056ed3a5cde0b678604`; its
-[receipt](assets/0048-phase0-integration-checkpoint.json) records exact inputs,
-commands, results and limitations. Do not apply the older patch first.
-
-This isolated experiment carries explicit `yield` through the real compiler,
-IR, engine and GQT for multiple scalar-String lexical sources. It tests
-independent windows, declaration reorder, unused sources, output choice,
-inherited order and nullable missing metrics. Read descriptors, column demand
-and GQT detection see later stages. Invalid parameters fail before scanning;
-a suffix with 100,200 bindings refuses despite final `limit 1`.
-
-The pinned Rust 1.97.1 checks pass 368 compiler, 127 GQT unit, one staged GQT,
-ten column-demand and four staged resource/scoring tests, plus the extended
-admission owner; one diagnostic instrument remains ignored. The full 57-test
-search owner predates the final admission assertions, whose owner was rerun.
-Historical CLI/server counts do not qualify this patch revision.
-
-Limits remain explicit: alias-wrapper source IDs, experimental admission caps,
-post-decode accounting and incomplete ownership of analyzed state, I/O and
-output. Boolean matching, vector/fusion execution, full expressions, C1–C4,
-global search, schema/default persistence and read/error contracts are not
-implemented by this patch.
-
-#### Composition plan and primitive checkpoint
-
-Starting from `1fb0423d`, the checked-in C1–C4 extension passes 367 compiler
-tests and adds four golden assertions to existing tests. One native composition
-test passes four memory/partition/order configurations under Rust 1.97.1,
-DataFusion 54.0.0 and Arrow 58.3.0. Focused Clippy, formatting and docs checks
-pass. [C1–C4](#required-composition-examples) links the plans, probe and per-case
-limits; those are the evidence authority.
-
-The logical goldens and hand-built native plans are separate. Materialized
-ranks/features and fixture parent IDs do not prove retrieval, scoring,
-correlation or generated identity. Ambiguity detection does not implement
-typed cardinality refusal. This checkpoint neither completes Phase 0 nor
-repairs the four GQT regressions.
-
-```bash
-cargo +1.97.1 test --locked -p omnigraph-compiler
-cargo +1.97.1 test --locked -p omnigraph-engine --test rrf_prefilter_gate staged_composition
-```
-
-#### Historical integration and diagnostic pilot
-
-The [historical patch](assets/0048-staged-integration.patch) applies at
-`b1df2041c93e03aa13cee8308a0a574689baf210`. Its
-[validation inventory](assets/0048-validation-checkpoint.json) records the
-frozen sources and tested compiler, engine, GQT, stored-query and CLI boundaries.
-It uses one lexical source per rank block and is outside this PR's production
-build. Inspect it in an isolated checkout; prefer the later explicit-output
-patch for ongoing integration work.
-
-Its evidence includes forty generated graph comparisons against an independent
-evaluator, twelve Decimal/lifecycle fixtures, snapshot/current-read controls,
-authorization refusals and resource counterexamples. These are finite
-experimental proofs, not complete language, transport or resource qualification.
-The [original checkpoint](assets/0048-agent-context.md#historical-integration-and-diagnostic-pilot)
-retains exact commands and the distinction between fresh and earlier runs.
+| Experiment | Where | What it established | Limits |
+|---|---|---|---|
+| Explicit-output integration patch and receipt | [`0048-phase0-integration.patch`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-phase0-integration.patch), [receipt](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-phase0-integration-checkpoint.json), applies at `b87068cb` | Explicit `yield` through the real compiler, IR, engine and GQT for multiple scalar-String lexical sources: independent windows, declaration reorder, unused sources, output choice, inherited order, nullable missing metrics; read descriptors, column demand and GQT detection see later stages; invalid parameters fail before scanning; a suffix with 100,200 bindings refuses despite final `limit 1`. | Alias-wrapper source IDs, experimental admission caps, post-decode accounting, incomplete ownership of analyzed state, I/O and output. Boolean matching, vector/fusion execution, full expressions, C1–C4, global search, schema/default persistence and read/error contracts are not implemented. |
+| Historical integration patch and validation inventory | [`0048-staged-integration.patch`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-staged-integration.patch), [inventory](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-validation-checkpoint.json), applies at `b1df2041` | One lexical source per rank block through compiler, engine, GQT, stored queries and CLI: forty generated graph comparisons against an independent evaluator, twelve Decimal/lifecycle fixtures, snapshot/current-read controls, authorization refusals and resource counterexamples. | Finite experimental proofs, not language, transport or resource qualification; superseded by the explicit-output patch for ongoing work. |
+| Test-only staged compiler and C1–C4 goldens | [`staged_probe.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-compiler/src/query/staged_probe.rs) | See the [composition checkpoint](2026-09-18-gq-composition-and-language-evolution.md#composition-plan-and-primitive-checkpoint). | A second parser over compiler internals; deleted from the tree so that it is never maintained beside the production compiler. |
+| DataFusion selection and composition probes | [`rrf_prefilter_gate.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/rrf_prefilter_gate.rs), [`composition.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/rrf_prefilter_gate/composition.rs) | Distinct-target windows, null-safe pair quotas, the nullable dynamic-filter defect (20 bindings become 18), C1–C4 population and collection contracts on memory tables and `LanceTableProvider::scan`. | Public DataFusion operators only; no GQ lowering, native retrieval or resource bounds. |
+| Selection cost instrument | [`search_selection.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/benches/scenarios/search_selection.rs) | Dense versus distinct-pair group selection, late payload hydration, partition and memory variation against a scalar oracle. | Persisted binding relation, not a graph traversal; returns with Phase 3. |
+| Lexical scoring oracle test | [`search.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph/tests/search.rs) | Thirteen Decimal reference cases against a float64 evaluator with pinned `libm` `log1p`. | The evaluator lives in the test; returns with the Phase 2 scorer. Fixtures are in `assets/`. |
+| Document-search agent pilot | [`0048-agent-pilot-results.json`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-agent-pilot-results.json) | 44 trials over 1,439 passages under four recipes; recipe semantics and source revision/status must be exposed to the agent. | Judged by the assistant without independent adjudication; establishes no modality winner, defaults or engine confidence. |
 
 #### Lessons the implementation must retain
 
@@ -2530,39 +1493,6 @@ Refresh SchemaIR version ownership before assigning a format; the audited
 baseline recognizes versions 2 and 4 and burns 3. Export/reapplication must
 preserve resolved recipes. Keyed follow-up does not qualify general system-ID
 lookup; archived JSONL metadata changes need their actual transport owner.
-
-#### Completed agent pilot and interpretation
-
-The frozen pilot uses 109 repository Markdown documents at
-`bf1e5ca15868c9ce2444062e9d9d02b539d786e3`, split into 1,439 passages, with one
-development question and eleven held-out questions across four recipes.
-The [final record](assets/0048-agent-pilot-results.json) preserves all 44 trials,
-model/configuration identities, answers, source reviews, refusals and failures.
-
-| Frozen recipe | Trials | Final answers, including abstentions | Answers with citations, all read | Strict supported tasks |
-|---|---:|---:|---:|---:|
-| Exact lexical, all terms | 11 | 11 | 4 | 3 |
-| One-edit lexical, all terms | 11 | 10 | 5 | 3 |
-| Dense | 11 | 11 | 11 | 8 |
-| Exact lexical + dense, application RRF | 11 | 9 | 9 | 8 |
-
-Review was by the assistant, without independent human adjudication. Strict
-success required complete supported claims, no draft mistaken for current
-behavior, and full reads of citations; failures stayed in the denominator.
-Independent arithmetic agreed on all 23 completed dense top-20 lists and ten
-hybrid top-10 lists, but does not qualify near ties or ANN.
-
-The lexical recipes used `mode: all`, whose conjunction was not explained in
-the shared tool description. Hybrid used application RRF over two engine
-queries, not staged fusion or one shared native budget. Host/API variability
-and timeout/cleanup overhead preclude production latency or hard-deadline
-claims. The [full protocol and interpretation](assets/0048-agent-context.md#completed-agent-pilot-and-interpretation)
-preserve these controls.
-
-The actionable lesson is to expose recipe semantics and source revision/status
-context. Reading a real citation did not prevent unsupported conclusions.
-This document-only pilot establishes neither a modality winner nor broader
-analytical task quality, retrieval defaults or engine-defined confidence.
 
 ### Research context and required qualification
 
@@ -2654,76 +1584,18 @@ where needed for a logical case; keep native index lifecycle, arithmetic near
 ties, and execution-cost assertions in their existing Rust owners. Compiler
 goldens and API/CLI contract tests still cover boundaries GQT does not invoke.
 
-The test-only [staged compiler prototype](../../crates/omnigraph-compiler/src/query/staged_probe.rs)
-adds a separate Pest root using the existing grammar's tokens, graph patterns,
-and scalar expressions. The extra grammar and checker are compiled only for
-compiler unit tests; the production query root remains unchanged. Typed AST
-prefixes reuse the real graph typechecker to validate bindings at each stage,
-while the experimental plan retains the separate stages and incoming
-population references. It exercises the GQ examples in this RFC, multi-stage
-node and edge targets, non-leaking negation scopes, alias namespaces, metric
-domains/origins, aggregate output identity, final order/window separation,
-and rejection cases for inputs, bounds and references. Its `take` plan retains
-the incoming stage, target, typed key tuple, comparator/reduction, quota bound
-and proven binding dependencies. Tests cover composite and nullable keys,
-non-null uniqueness, directed one-hop cardinality, explicit null ordering,
-graph-only selection, zero quotas, and metric/order preservation.
+The test-only staged compiler prototype that exercised the GQ examples in
+this RFC, multi-stage node and edge targets, non-leaking negation scopes,
+alias namespaces, metric domains and origins, aggregate output identity,
+final order/window separation, `take` key and comparator rules and the
+rejection cases is retained on the evidence branch
+([`staged_probe.rs`](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/crates/omnigraph-compiler/src/query/staged_probe.rs)).
+It is partial compiler evidence, not a staged AST/IR or execution, and it is
+deliberately not in the tree: the production compiler owns these constructs
+when Phase 1 lands, and `.gqt` cases own their behaviour.
 
-This is partial compiler evidence, not completed staged AST/IR or execution.
-It does not qualify complete result-shape/metric-nullability inference,
-every key type or comparator dependency, resolved analyzer/encoding identities,
-runtime parameter admission, resource bounds, or graph/Lance lowering.
-Its aggregate-order prototype uses
-explicit projected aliases; the final compiler must also preserve valid
-ordinary grouping-key expressions. Migrate or remove the experiment when the
-production compiler owns these constructs; do not maintain a second compiler
-or claim these fixtures replace executable `.gqt` cases.
-
-Default resolution requires its own compiler/schema and query fixtures:
-
-- Bare `@analyzed` and its explicit expansion resolve to the same field
-  fingerprint and permit matching and ranking. `scorer="none"` permits matching
-  while refusing a lexical ranking source.
-- Missing source/dimension, omitted model without a default, unresolved explicit model,
-  incompatible dimensions, and distance omitted without a supplying recipe
-  all fail before publication. Explicit model overrides select a whole recipe;
-  explicit distance overrides take precedence and remain validated. A qualified
-  explicit model works without any schema default.
-- Export/reload and no-op reapplication preserve resolved field bindings across
-  deployments and runtime provider/default changes. Changed schema defaults
-  expose affected field rebindings and required rebuilds in `schema plan`;
-  shorthand does not bypass existing migration refusals or rename identity.
-
-The exact lexical qualification matrix retains all preceding requirements:
-
-- Positive and negative matches; `all`/`any`; repeated/reordered terms;
-  null/token-empty values; empty and stop-word-only queries; validation even
-  on empty populations. Edit budgets reject negative, non-integer, oversized,
-  and narrowing-overflow inputs before execution.
-- Case, stemming, folding, composed/decomposed text, multibyte characters,
-  and lengths around 40 UTF-8 bytes. Zero-edit equivalence, inclusion at
-  budgets 0/1/2, and transpositions costing two.
-- NFC conformance for the pinned normalizer/Unicode version; canonically
-  equivalent inputs on both sides of matching and ranking through scan/index
-  paths; and long combining-mark sequences under bounded cancellation.
-  Preserve original stored values and exact String predicate behavior.
-  Reject or bypass artifacts that lack proof of the revised pipeline.
-- Absent, empty, complete, partial, removed, and rebuilt indexes through
-  append/update/delete/overwrite/compaction. Identical values must match
-  identically under graph filters and supported negation.
-- More than 50 expansion terms, vocabulary/segment changes, an exact term
-  crowded out by expansions, and one term consuming the budget before another.
-  Native overflow must fall back completely within the remaining budget or
-  fail; post-verifying a truncated set is insufficient.
-- One huge token, automaton state failure, cancellation, and exhausted shared
-  budgets must produce typed failure without successful partial results.
-- The same tolerant query through Boolean matching and fuzzy retrieval must
-  agree on membership before the ranking cutoff. Adding a predicate cannot
-  rewrite a neighboring exact source. Fuzzy/exact score and order parity need
-  independent fixtures, including corpus deletion/update and repeated terms.
-- More tied targets than each native window, reversed stable-ID order, and
-  different physical partitions must preserve declared exact winners or fail
-  explicitly. Sorting an already truncated subset is not the assertion.
+The default-resolution fixtures and the exact lexical qualification matrix
+are in [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#qualification-matrix).
 
 Correctness and usefulness are separate evaluations. A fixed, checked-in
 corpus should include names with typos, rare identifiers, semantic questions,
@@ -2811,6 +1683,7 @@ and both `staged_composition` native tests. This settles the stated policies;
 it does not complete any production evaluator or the phase's remaining gates.
 
 ```bash
+# on the evidence branch at dd6959c8
 cargo +1.97.1 test --locked -p omnigraph-compiler
 cargo +1.97.1 test --locked -p omnigraph-engine --test search lexical_scoring_v1_reference_oracle -- --exact
 cargo +1.97.1 test --locked -p omnigraph-engine --test rrf_prefilter_gate staged_composition
@@ -2818,8 +1691,8 @@ cargo +1.97.1 test --locked -p omnigraph-engine --test rrf_prefilter_gate staged
 
 | Decision package | Required disposition and proof |
 |---|---|
-| [Language](#language-evolution-and-compatibility) | Shared expressions, explicit output, namespaces, precedence, parameters and scope; parser/type/plan fixtures |
-| [Composition](#required-composition-examples) | C1–C4 syntax, type derivation, golden plans, physical feasibility and invalid-rewrite counterexamples |
+| [Language](2026-09-18-gq-composition-and-language-evolution.md#language-evolution-and-compatibility) | Shared expressions, explicit output, namespaces, precedence, parameters and scope; parser/type/plan fixtures |
+| [Composition](2026-09-18-gq-composition-and-language-evolution.md#required-composition-examples) | C1–C4 syntax, type derivation, golden plans, physical feasibility and invalid-rewrite counterexamples |
 | [Selection/scoring](#target-identity-fan-out-grouping-and-metrics) | Target/binding/group multiplicity, total ties, live statistics, lexical/vector numeric policy and checked fusion arithmetic |
 | [Representations](#representation-identity-and-source-attribution) | Schema defaults and overrides, resolved encoder/Unicode/analyzer identity, export/reapplication and format coordination with RFCs 0040/0043/0044 |
 | [Global search](#graph-wide-discovery-across-entity-types) | Execution deferred by explicit decision; prove typed identity/source/table separation and future union/narrowing/projection compatibility before stabilization |
@@ -2866,23 +1739,23 @@ cleanup. Typed extension points do not make deferred public operators available.
 
 **Input:** Phase 1 representations/resources and Phase 0 numeric oracles.
 
-Build bounded NFC/analysis, complete `Terms` matching, unified exact/fuzzy
-scoring, exhaustive `knn` and declared `ann` with qualified fallback.
-Charge statistics, coverage, scoring and selection to the shared context.
-Extend search/substrate owners and the
-[lexical qualification matrix](#test-harness-integration); observable rows,
-shapes and errors belong in GQT.
+The lexical half of this phase (bounded NFC analysis, complete `Terms`
+matching, unified exact/fuzzy scoring and qualified index acceleration) is
+owned by [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#rollout). This RFC's half builds
+exhaustive `knn` and declared `ann` with qualified fallback, charges
+statistics, coverage, scoring and selection to the shared context, and
+extends the search and substrate owners. Observable rows, shapes and errors
+belong in GQT.
 
 **Exit:** predicate/retriever membership agreement before cuts, independent
 score and vector fixtures, total ties, all index/lifecycle states, and typed
 budget/cancellation failures. Assert that intended index/compaction states
 were reached; distinguish current from pinned answers and reopen snapshots.
 
-**Open:** native fuzzy analysis, float32 BM25, stale statistics and native cuts
-are not substitutes for the accepted exact contract. Reproduce their
-counterexamples before reuse. Numerical parity does not establish relevance
-quality. Candidate-scoring/model operators and richer representations remain
-deferred; Phase 5 chooses measured defaults.
+**Open:** native cuts are not substitutes for the accepted exact contract.
+Numerical parity does not establish relevance quality. Candidate-scoring
+operators and richer representations remain deferred; Phase 5 chooses
+measured defaults.
 
 #### Phase 3: compose graph scope, fusion, and selection
 
@@ -2988,7 +1861,7 @@ tests do not count as completion of a new phase.
 
 ### Extensions after the initial release
 
-The [query capability matrix](#query-capability-matrix) owns the extension
+The [query capability matrix](2026-09-18-gq-composition-and-language-evolution.md#query-capability-matrix) owns the extension
 inventory, including projection, grouping, optional matching, typed unions,
 advanced retrieval and representation forms. Its deferred rows do not claim
 support or require implementation for the initial release.
@@ -2996,31 +1869,10 @@ Every later extension retains the stated semantic and qualification boundary.
 `Foundation` rows require their grammar/type/composition proofs before syntax
 stabilization while their broader operators remain deferred. These design
 proofs do not enlarge the advertised initial-release feature set.
-
 ### Next delivery milestone: composed analytical answers
 
-After the initial release, implement C1, C4 and C2's general distinct/intermediate
-group extensions using the accepted common grammar, IR and execution context.
-C3 remains a separate scorer extension. Global search is also deferred; its
-union, representation expansion and cross-type ranking require their own
-implementation milestone after the compatibility proof.
-
-Build reusable computation/grouping first, then local selection and correlated
-retrieval, then optional facts and typed collections. Preserve group identities,
-computed facts, import/export scopes, empty results and one cumulative budget.
-Extend existing compiler, traversal/projection/aggregation, GQT and transport
-owners; retain compatibility with the initial release.
-
-**Exit:** full C1/C2/C4 journeys through public reads, with inferred/executed
-types, deterministic selection, snapshot-bound follow-up and shared-budget
-refusal. C1 selects A's increase of six over B's one; C2 counts three paths and
-two distinct passages; C4 preserves B with a null owner and empty reports.
-
-**Open:** inspect integrated and optimized plans against independent
-empty-group, duplicate-binding, null, wrong-group and skewed-fan-out controls.
-API availability and the Phase 0 design argument do not prove safe correlation,
-reuse or bounded materialization. Prove preservation of outer rows and budgets
-before optimizing batching, and measure per-group rescan cost.
+Owned by [GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md#next-delivery-milestone-composed-analytical-answers):
+C1, C4 and C2's general grouping extensions after this RFC's initial release.
 
 ## Unresolved questions
 
@@ -3028,44 +1880,44 @@ The [acceptance/release matrix](#phase-0-acceptance-versus-release-qualification
 assigns the completion point for each proof. In particular, decided interfaces
 still require prototypes; full production qualification belongs to its phase.
 
-1. Complete Phase 0 grammar/type/plan qualification for the stated stage
-   and metric scopes, per-group key types and tuple ordering, and any
-   user-defined selection tie keys. The partial compiler
-   prototype does not close the full result-schema and aggregation contract.
-   Null-bucket and multiple-membership semantics are specified above; prove
-   their lowering and retain RFC 0040 namespace coordination. Complete the
-   C1–C4 syntax/type/plan proofs, including the analytical population and
-   deferred correlation/scoring boundaries, before syntax stabilization.
-2. Close the Phase 0 numeric policies/oracles and native route dispositions.
-   Phases 2/5 must qualify BM25 across supported targets, exact live-row
-   statistics and native/fallback score/winner parity. Polymorphic field-corpus
-   execution is deferred. Validate edit weights and maximum reduction on the
-   owned task corpus before release; numerical fixtures alone do not establish
-   a good relevance default.
-3. Resolved representation serialization and immutable encoding revisions,
-   schema-wide default declaration syntax and migration integration,
-   normalizer/Unicode identity and analyzer/artifact fingerprint mapping, and
-   shared SchemaIR version assignment with RFCs 0040/0043/0044. Omission and
-   override semantics are specified above; their implementation must prove
-   that accepted bindings cannot drift with deployment defaults.
-4. Prototype the decided resource units and shared reservation interfaces;
-   resolve native allocation/dispatch gaps for graph masks, scoring, coverage,
-   sort/spill and output. Actual default limits, complete enforcement and
-   cancellation qualification belong to Phases 1/4/5.
-5. Prototype the decided read options, envelope, retention/refusal boundaries
+1. Complete Phase 0 grammar/type/plan qualification for the stated stage and
+   metric scopes, per-group key types and tuple ordering, and any
+   user-defined selection tie keys, in the production compiler. Null-bucket
+   and multiple-membership semantics are specified above; prove their
+   lowering and retain RFC 0040 namespace coordination. The shared expression
+   rules and C1–C4 proofs are the [composition RFC](2026-09-18-gq-composition-and-language-evolution.md)'s questions.
+2. Resolved representation serialization and immutable encoding revisions,
+   the schema-wide default embedding declaration syntax and its migration
+   integration, and the SchemaIR version assignment shared with RFCs 0040,
+   0043 and 0044. Omission and override semantics are specified above; their
+   implementation must prove that accepted bindings cannot drift with
+   deployment defaults.
+3. Prototype the read options as session settings and the requirements
+   handed to the engine version 2 memory/admission component; resolve native
+   allocation and dispatch gaps for graph masks, scoring, coverage,
+   sort/spill and output there. Actual default limits, complete enforcement
+   and cancellation qualification belong to Phases 1/4/5.
+4. Prototype the decided read options, envelope, retention/refusal boundaries
    and canonical definition/semantic/execution identities. Phase 4 qualifies
    all transports and authorization paths. Stable ranked cursors remain deferred.
-6. Freeze the mixed-workload corpus, judgments and acceptance protocol in
+5. Freeze the mixed-workload corpus, judgments and acceptance protocol in
    Phase 0. Phase 5 chooses ANN effort mappings and agent recipe defaults from
    the resulting evaluation. The document pilot alone is insufficient. Further
    multilingual profiles require matched-set evidence and versioned identities.
-7. General all-node/type-union grammar, compatible representation expansion,
-   type narrowing and heterogeneous projection. Execution is explicitly
-   deferred; the compatibility proof remains due in Phase 0. The initial
-   same-binding fusion implementation cannot satisfy cross-type discovery.
 
 ## Decision log
 
+- 2026-09-18 — split the lexical contract into
+  [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md) and the language rules, capability matrix,
+  C1–C4 and cross-type discovery into
+  [GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md); no semantic decision
+  changed. Replaced the hard removal of legacy spellings with a one-release
+  deprecation window (compatibility-surfaces RFC). Re-expressed the read
+  options as session settings after #742 landed `Session`. Marked the
+  resource-ledger and DataFusion sections as requirements handed to the
+  engine version 2 components named by RFC 0067. Removed the agent-context
+  copy, the archived patches, the pilot record and the prototypes from the
+  tree; all are retained on the evidence branch.
 - 2026-09-13 — separated Phase 0 acceptance from production release gates.
   Decided default-binding lifetime, space versus field identity, read options
   and replay/fingerprint boundaries, and shared resource units/reservations.
@@ -3077,7 +1929,7 @@ still require prototypes; full production qualification belongs to its phase.
   Decimal, compiler and DataFusion probes; default native arithmetic is not
   sufficient for the new numeric contract. Phase 0 remains incomplete.
 - 2026-09-13 — retained the full long-form version as an
-  [agent context document](assets/0048-agent-context.md) alongside this concise
+  [agent context document](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-agent-context.md) alongside this concise
   RFC. The context records its original revision; this RFC owns current decisions.
 - 2026-09-13 — condensed the RFC around contracts, scope, evidence limits and
   phase handoffs. Detailed experimental chronology remains in the linked
@@ -3098,7 +1950,7 @@ still require prototypes; full production qualification belongs to its phase.
 - 2026-09-03 — published this draft alongside RFC 0047 after separating
   plan-truth work from representation/search contracts.
 
-The [full prior decision log](assets/0048-agent-context.md#decision-log)
+The [full prior decision log](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-agent-context.md#decision-log)
 preserves the earlier revisions and their superseded proposals.
 
 ## Appendix: implementation evidence (non-normative)
@@ -3108,7 +1960,7 @@ The [upstream receipt](assets/0048-upstream-contract-checkpoint.json) and
 to Lance 11.0.0, DataFusion 54.0.0 and Arrow 58.3.0. The recorded Lance commit
 is `ab6b5bbe46009ed78746b444df8db59a8bc5d842`; later dependencies require
 renewed qualification. The
-[original source appendix](assets/0048-agent-context.md#appendix-implementation-evidence-non-normative)
+[original source appendix](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-agent-context.md#appendix-implementation-evidence-non-normative)
 retains exact implementation links for analyzer drift, fuzzy expansion,
 flat scans, vector rescoring, lexical ties and native BM25.
 
@@ -3119,3 +1971,8 @@ flat scans, vector rescoring, lexical ties and native BM25.
 | 0040 | Use its system-identity and reserved `__` namespace; native `_score`/`_distance` are not public metric identities |
 | 0044 | Coordinate accepted SchemaIR version assignment |
 | 0046 | Reuse read-only index-status capabilities and its open `degraded` reasons rather than parallel status machinery |
+| [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md) | Owns `@analyzed`, `terms`, `match_terms`, `bm25_v1`, the exact lexical baseline and the lexical deprecation window; this RFC consumes them through `lexical` sources |
+| [GQ composition and language evolution](2026-09-18-gq-composition-and-language-evolution.md) | Owns shared expression rules, the capability matrix, C1–C4 and cross-type discovery; this RFC's syntax must satisfy them |
+| [Session settings](2026-09-16-session-settings.md) | Carries the read options (`coverage`, `require_replay`, limits) as request-scoped settings |
+| [Compatibility surfaces](2026-09-14-compatibility-surfaces.md) | Versions the GQ grammar; removals follow a deprecation release and a major bump |
+| Engine version 2 (RFC 0067, PR #711) | Owns the planner, execution engine and memory/admission mechanisms this RFC states requirements on |

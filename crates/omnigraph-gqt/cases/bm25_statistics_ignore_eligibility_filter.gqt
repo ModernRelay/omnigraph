@@ -3,8 +3,9 @@
 # notes: group "o"; `Four` holds only the four group-"e" rows. The query "alpha beta" filtered to
 # notes: group "e" ranks an alpha row first: the filter is a prefilter and BM25 statistics come from
 # notes: the whole field (alpha is rare in ten). The same four rows as their own type rank the beta
-# notes: row first (beta is rare in four). Same eligible rows, different winner; RFC 0048 chooses
-# notes: the field corpus, so this pins the current answer as the contract.
+# notes: row first (beta is rare in four). Same eligible rows, different winner; the analyzed
+# notes: lexical search RFC (docs/rfcs/2026-09-18-analyzed-lexical-search.md) chooses the field
+# notes: corpus, so this pins the current answer as the contract.
 
 --- runner
 timeout_ms: 10000
