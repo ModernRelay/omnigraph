@@ -142,7 +142,7 @@ def compute_truth(tasks: list[dict], graph: Graph) -> dict[str, object]:
 
 SYSTEM_TEMPLATE = """You answer questions about a property graph by writing GQ queries and running them with the `run_gq` tool. Read the card and the schema; both are complete. Every query runs against one pinned snapshot, so results are stable within this task.
 
-When you have the answer, call `submit` exactly once. For a count, submit the number. For "which X" questions, submit the list of slugs (or the requested values). For a table, submit a list of objects with the requested keys. Prefer one query that answers the question over several; use parameters for values.
+When you have the answer, call `submit` exactly once with `answer_json`, a JSON value as a string. For a count, submit the number (`"72"`). For "which X" questions, submit a JSON list of slugs or the requested values. For a table, submit a JSON list of objects with the requested keys. Prefer one query that answers the question over several; pass values through `params_json` rather than inlining them.
 
 <card>
 {card}
@@ -162,9 +162,9 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "A complete GQ source with exactly one query declaration."},
-                "params": {"type": "object", "description": "JSON parameters for the query's $parameters; {} when none.", "additionalProperties": True},
+                "params_json": {"type": "string", "description": "A JSON object with the query's $parameters, as a string; \"{}\" when none."},
             },
-            "required": ["query", "params"],
+            "required": ["query", "params_json"],
             "additionalProperties": False,
         },
     },
@@ -174,8 +174,8 @@ TOOLS = [
         "strict": True,
         "input_schema": {
             "type": "object",
-            "properties": {"answer": {"description": "The answer: a number, a string, or a list.", "type": ["number", "string", "array", "object", "boolean", "null"]}},
-            "required": ["answer"],
+            "properties": {"answer_json": {"type": "string", "description": "The answer as a JSON value in a string: a number, a string, or a list (of values or objects)."}},
+            "required": ["answer_json"],
             "additionalProperties": False,
         },
     },
@@ -230,14 +230,20 @@ def run_task(client, model: str, effort: str, system: list, task: dict, truth: o
         done = False
         for block in tool_uses:
             if block.name == "submit":
-                trial.submitted = block.input.get("answer")
+                try:
+                    trial.submitted = json.loads(block.input.get("answer_json", "null"))
+                except json.JSONDecodeError:
+                    trial.submitted = block.input.get("answer_json")
                 trial.success = equal(task["kind"], normalize_answer(task["kind"], trial.submitted), truth)
                 trial.stop = "submit"
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": "recorded"})
                 done = True
                 continue
             source = block.input.get("query", "")
-            params = block.input.get("params") or {}
+            try:
+                params = json.loads(block.input.get("params_json") or "{}")
+            except json.JSONDecodeError:
+                params = {}
             ok, payload = graph.query(source, params)
             record = {"turn": turn + 1, "query": source, "params": params, "ok": ok}
             if ok:
