@@ -142,6 +142,24 @@ a bare, case-sensitive tokenizer; neither serves after this change. The
 analyzer-equivalent scan that later lifts the plan-time refusal is the
 lexical RFC's exact baseline.
 
+**Diagnostics contract.** Every compile diagnostic (`T…` code) and every
+typed execution failure a read can produce carries four fields: a stable
+code; a source position, or the stage and expression when the failure is
+post-parse; what was expected or violated; and one concrete fix. The fix
+names the construct to use, not the rule that was broken: "`search` requires
+`@index` on `Doc.title`; declare it and run index reconciliation";
+"`binding_rows` exhausted at stage 3 (`match`); narrow the population before
+`rank` or raise the limit". A failure with no fix names the decision instead
+("a retry will not help; the snapshot is unavailable"). An unknown name
+enumerates the set it failed against: functions, sources, metric fields,
+settings, or the properties of the bound type. The reader is an agent that
+treats an error as the documentation it acts on and a retry as its default
+response; the contract makes one repair turn the norm and a blind retry the
+exception. The human CLI prints the same four fields. The contract does not
+depend on recognizing other languages' idioms and no catalogue of them is
+maintained; a reader that generalizes from the schema and the card is what
+the design leans on.
+
 **Metric projection.**
 
 ```gq
@@ -450,6 +468,9 @@ language release or duplicate execution path.
   blanket claim that all RRF arm windows follow the output limit: BM25 arms
   are uncapped; vector arms inherit that limit. Distinguished historical
   prototype results from current evidence and total ordering from ANN replay.
+- 2026-09-18 — added the diagnostics contract (code, position or stage,
+  expectation, one fix; unknown names enumerate their set) for every
+  compile diagnostic and typed read failure.
 - 2026-09-18 — replaced the `full_text_search_unindexed` warning with a
   compile-time `T27` refusal of undeclared targets and a plan-time
   `FullTextIndexRequired` refusal of unbuilt indexes (RFC 0043 precedent); a

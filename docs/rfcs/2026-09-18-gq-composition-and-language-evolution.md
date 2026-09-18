@@ -677,6 +677,17 @@ the typechecker resolves — pattern items, expression functions and retrieval
 sources — never from new clause shapes, so a new retriever, scoring feature,
 path selector or subquery reduction adds no grammar rule.
 
+**Designing for an in-context consumer.** The caller is a general agent
+that learned tool use elsewhere and meets this language through a schema, a
+one-page card and its own errors. The kernel is therefore judged by three
+measurable properties: it fits on the card (eight stage kinds, three open
+sets); it is regular (one shape per stage, atomic case-insensitive keywords,
+no contextual spellings); and its diagnostics repair in one turn (RFC 0047's
+contract). Proximity to any particular existing language is not a goal.
+Where two spellings are otherwise equal, the one a fresh reader guesses
+right more often wins, and that is measured, not argued (see
+[in-context competence](#in-context-competence)).
+
 **Stages.** A query is `match` followed by any sequence of stages, then
 `return`; `order` and `limit` may also follow `return`, where they read the
 projected aliases (the GQL result-statement convention). Every stage is a
@@ -779,7 +790,10 @@ treats control statements: `match`, `filter`, `let`, `rank`, `group`,
 `sub`, reductions, aggregates — is an identifier the typechecker resolves as a
 function, so adding one never touches the grammar and never collides with a
 property name. This replaces the contextual, token-bounded keyword rule
-proposed above and is the one rule for RFCs 0055, 0056 and 0048.
+proposed above and is the one rule for RFCs 0055, 0056 and 0048. Keywords
+are case-insensitive (`MATCH` and `match` are one token): letter case
+carries no meaning, so accepting both removes an error class without adding
+a spelling. Identifiers, property names and string literals keep their case.
 
 **Cypher and GQL constructs on the kernel.**
 
@@ -953,6 +967,20 @@ live on the evidence branch; when the production compiler owns these
 constructs, `.gqt` cases own their observable behaviour and the prototype is
 deleted, never maintained beside the compiler.
 
+### In-context competence
+
+Because the consumer is fixed and available, syntax choices are decided
+empirically. The instrument is a schema with descriptions, the one-page
+card, and a task set whose ground truth is computed by exact queries at a
+pinned snapshot: the graph is its own verifier. For each candidate spelling
+and each model under test, record first-try parse validity, turns to the
+first correct query, task success, tokens consumed, and the diagnostic code
+behind each repair. A spelling wins on those numbers, not on analogy. The
+same instrument is the acceptance gate for a new stage or source and feeds
+RFC 0048's [mixed workload qualification](0048-search-contracts.md#mixed-workload-qualification).
+Hold the model, card, schema and snapshot fixed within a comparison and
+retain failed trajectories; a model revision reopens the measurement.
+
 ## Rollout
 
 No production work starts from this document. Its rules gate RFC 0048's
@@ -1016,6 +1044,9 @@ before optimizing batching, and measure per-group rescan cost.
   collapses `select`, `take`, `score`, `collect` and `optional` and moves
   scalar predicates out of `match`. Recorded as a decision RFC 0048 must
   take before its syntax stabilizes; the moved-in text above is unchanged.
+- 2026-09-18 — made the in-context consumer the design target: card-sized
+  kernel, case-insensitive atomic keywords, spellings decided by measured
+  first-try validity rather than analogy to any prior language.
 - 2026-09-18 — fixed the pattern/predicate rule as SQL's `ON`/`WHERE` rule:
   predicates inside a pattern block only within `optional { }` and
   `not { }`, inline constraints as pattern properties, `filter` everywhere
