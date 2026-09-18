@@ -1,0 +1,28 @@
+# Example task file against a graph with `Person`, `Organization` and a
+# `WorksAt: Person -> Organization` edge (the query guide's example schema).
+# Real task files that name real people stay outside the repository.
+tasks:
+  - id: count_people
+    kind: scalar
+    question: How many people are in the graph?
+    truth_query: |
+      query t() { match { $p: Person } return { count($p) as n } }
+
+  - id: people_at_org
+    kind: set
+    question: Which people work at the organization with slug acme? Return their slugs.
+    truth_query: |
+      query t($s: String) { match { $p: Person  $p worksAt $o  $o: Organization { slug: $s } } return { $p.slug } }
+    truth_params: { s: acme }
+
+  - id: largest_orgs
+    kind: list
+    question: Which three organizations have the most people working at them? Return slug and count, largest first, ties by slug ascending.
+    truth_query: |
+      query t() { match { $p: Person  $p worksAt $o } return { $o.slug, count($p) as n } order { n desc, $o.slug asc } limit 3 }
+
+  - id: no_employer
+    kind: scalar
+    question: How many people have no worksAt edge?
+    truth_query: |
+      query t() { match { $p: Person  not { $p worksAt $_ } } return { count($p) as n } }
