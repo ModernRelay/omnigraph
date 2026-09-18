@@ -185,8 +185,11 @@ writers round-robin over `B` forks instead of `main`. Setup, warm-up,
 verification and teardown sit outside the measured window. After every
 counter and clock is read, a fresh handle verifies exact per-branch row
 counts (seeded rows plus this run's acknowledgements) and reads sampled
-acknowledged keys back; any worker error, any key conflict, or a
-verification mismatch fails the run rather than emitting a green record.
+acknowledged keys back. A typed read-set conflict (the graph head moved
+under a concurrent writer) is retried by the driver like a real client,
+inside the same op's service time, and counted as `authority_conflicts`;
+any other worker error, any key conflict, or a verification mismatch fails
+the run rather than emitting a green record.
 
 Op counting rides the ungated instrumentation surface: Lance manifest- and
 table-plane logical calls through per-run `IOTracker` wrappers installed on
