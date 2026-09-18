@@ -1186,7 +1186,17 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
         .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
-        let _ = release_schema_apply_lock(db).await;
+        // Best-effort release of the sentinel we just took, but never swallow
+        // its failure: a leaked sentinel wedges every writer until the next
+        // read-write open reclaims it, which is a louder problem than the
+        // mono-branch refusal we return, so make the leak observable.
+        if let Err(release_error) = release_schema_apply_lock(db).await {
+            tracing::warn!(
+                error = %release_error,
+                "failed to release the schema-apply sentinel after a mono-branch refusal; \
+                 writes are blocked until the next read-write open reclaims it"
+            );
+        }
         return Err(OmniError::manifest_conflict(format!(
             "schema apply requires a graph with only main; found non-main branches: {}",
             blocking_branches.join(", ")

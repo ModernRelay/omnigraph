@@ -126,7 +126,8 @@ does not rewrite lost or corrupt data.
 A `blocked_promotion` classification names a table whose published write
 cannot land on the linear history because a foreign commit took its version.
 Reads, mutations, branch merge and index maintenance keep working through
-the pin; schema apply and optimize refuse that table until the block is
+the pin; schema apply, the system-column upgrade, and optimize refuse that
+table until the block is
 resolved, and `cleanup` skips version GC for it because only the pin's
 detached version holds the acknowledged rows. Repair reports it and never
 adopts the foreign commit, with or without `--force`.

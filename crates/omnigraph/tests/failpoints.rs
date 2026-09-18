@@ -7535,6 +7535,138 @@ async fn rfc_0067_cleanup_reaps_aged_surplus_detached_manifests() {
     );
 }
 
+/// RFC 0067 retention floor: a *fresh, unpublished* detached manifest — the
+/// residue of a cross-process writer that has staged its detached commit but
+/// not yet published its pin — must survive `cleanup(older_than: ZERO)`. Such a
+/// manifest is absent from `protected_detached` (built from published pins
+/// only), so the age floor is its sole guard; reaping it and then having that
+/// writer publish-then-crash would leave a pin pointing at a reaped staged
+/// manifest with no twin, an unrecoverable table. The second half proves the
+/// floor is what protects it: once backdated, the same manifest IS reaped.
+#[tokio::test]
+#[serial]
+async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let versions_dir = std::path::Path::new(&person_uri).join("_versions");
+    let detached_files = || -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(&versions_dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                (name.starts_with('d') && name.ends_with(".manifest")).then_some(name)
+            })
+            .collect()
+    };
+
+    let pre = detached_files();
+    // Strand an unpublished detached manifest: the insert stages its detached
+    // Person commit, then dies at the post-table-commit window before it can
+    // publish a pin — exactly a parked writer's residue.
+    let stranded = {
+        let _fp = catalog::MUTATION_POST_TABLE_COMMIT.fail_once_at(1);
+        let outcome = mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "parked")], &[("$age", 41)]),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the seam must fail the write before publish"
+        );
+        let post = detached_files();
+        &post - &pre
+    };
+    assert!(
+        !stranded.is_empty(),
+        "the interrupted write must strand at least one detached manifest"
+    );
+
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    let after = detached_files();
+    assert!(
+        stranded.is_subset(&after),
+        "zero-age cleanup reaped a fresh unpublished detached manifest; stranded={stranded:?} after={after:?}"
+    );
+
+    // Backdate the stranded manifests past the floor: now they ARE reaped,
+    // proving the floor — not permanence — protected them above.
+    for name in &stranded {
+        std::fs::File::open(versions_dir.join(name))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+    }
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    let aged = detached_files();
+    assert!(
+        stranded.is_disjoint(&aged),
+        "an aged unpublished detached manifest must be reaped; stranded={stranded:?} still={aged:?}"
+    );
+}
+
+/// RFC 0067 ambiguity read-back: when the `__manifest` merge-insert commits
+/// durably but its acknowledgement is lost, the write is already graph-visible,
+/// so the publisher must recognize it as success rather than returning an
+/// opaque failure (which a non-idempotent retry would double-apply). The
+/// `publish.post_merge_pre_ack` seam models the lost ack of a durable commit;
+/// the insert must succeed and its row must be visible and durable.
+#[tokio::test]
+#[serial]
+async fn rfc_0067_lost_ack_of_a_durable_publish_reads_back_as_success() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = count_rows(&db, "node:Person").await;
+
+    let outcome = {
+        let _fp = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "ackloss")], &[("$age", 42)]),
+        )
+        .await
+    };
+    assert!(
+        outcome.is_ok(),
+        "a durable commit whose ack was lost must read back as success, got: {outcome:?}"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        before + 1,
+        "the acknowledged-then-lost row must be visible on the writer's handle"
+    );
+
+    // Durable across a fresh open, and no residue was left behind.
+    let reopened = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    assert_eq!(
+        count_rows(&reopened, "node:Person").await,
+        before + 1,
+        "the row must survive a fresh open"
+    );
+    let names = collect_column_strings(&read_table(&reopened, "node:Person").await, "name");
+    assert!(
+        names.iter().any(|name| name == "ackloss"),
+        "the read-back-confirmed row must be present by name"
+    );
+}
+
 mod rfc_0067_resolution_race {
     use super::*;
     use async_trait::async_trait;

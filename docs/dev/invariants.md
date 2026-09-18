@@ -132,9 +132,16 @@ different:
   running retain a one-mutation-process boundary: a read-write open discards
   an unpublished staged schema contract and reclaims a schema-apply sentinel,
   fenced only by process-local gates. A live apply in another process loses
-  its staging and then installs its contract from memory, so the graph does
-  not tear, but its sentinel no longer excludes other writers. Table effects
-  carry no such boundary: a detached commit needs no takeover.
+  its staging and then installs its contract from memory, so within that
+  boundary the graph does not tear, and its sentinel no longer excludes other
+  writers. The residual the boundary carries: if a concurrent read-write open
+  discards a live apply's staging and that apply then lands its manifest commit
+  but dies before installing from memory, the published outcome is paired with
+  the old contract with no staging left to promote it — a same-identity
+  contract change can serve stale until the next apply. Add/drop and
+  identity-changing shapes still fail loudly; only a same-identity rewrite is
+  silent, and only outside the single-process boundary. Table effects carry no
+  such boundary: a detached commit needs no takeover.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 

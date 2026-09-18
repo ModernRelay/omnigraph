@@ -1061,10 +1061,23 @@ pub async fn cleanup_all_datasets(
         }
     }
 
-    let before_timestamp = options.older_than.map(|d| crate::dst_clock::now_utc() - d);
-    let reaped =
-        reap_detached_manifests(db, &table_locations, &protected_detached, before_timestamp)
-            .await?;
+    let now = crate::dst_clock::now_utc();
+    let before_timestamp = options.older_than.map(|d| now - d);
+    // The detached-manifest reaper never reaps below a minimum age, even at
+    // `--older-than 0`: an unprotected manifest that recent may belong to a
+    // cross-process writer that has staged its detached commit but not yet
+    // published its pin (`protected_detached` covers published pins only), and
+    // reaping it before that writer publishes-then-promotes would brick the
+    // pin. The floor is the sole guard for that stage-but-unpublished window.
+    let detached_before_timestamp =
+        before_timestamp.map(|cutoff| cutoff.min(now - MIN_DETACHED_MANIFEST_RETENTION));
+    let reaped = reap_detached_manifests(
+        db,
+        &table_locations,
+        &protected_detached,
+        detached_before_timestamp,
+    )
+    .await?;
     if reaped > 0 {
         tracing::info!(reaped, "cleanup reaped aged surplus detached manifests");
     }
@@ -1799,6 +1812,18 @@ async fn settle_pin_before_cleanup(
         }
     }
 }
+
+/// The minimum age a detached manifest must reach before cleanup may reap it,
+/// enforced even under `--older-than 0`. An unprotected manifest younger than
+/// this may belong to a cross-process writer that has staged its detached
+/// commit but not yet published its pin — so it is absent from
+/// `protected_detached`, which is built from published pins only — and reaping
+/// it before that writer publishes then promotes would leave the pin pointing
+/// at a reaped staged manifest with no twin, an unrecoverable table. The floor
+/// exceeds any single write's stage→publish window plus object-store clock
+/// skew, while still letting cleanup reclaim aged surplus manifests.
+const MIN_DETACHED_MANIFEST_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
 
 /// Reap detached manifests that no pending pin protects and that are older
 /// than the cleanup age policy (RFC 0067): the manifests of promoted pins a

@@ -45,7 +45,7 @@ SessionDifferential
 OpArbitration
   sources: Store(Query), Store(Physical)
   anchor:  harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break)
-  doc:     after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects; a keep-serving resolution instead matches against every composition and order of the deferred and interrupting ops
+  doc:     after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects
 MergePrediction
   sources: Store(Claim)
   anchor:  harness.rs::predict_merge + the accept/conflict asserts around branch_merge

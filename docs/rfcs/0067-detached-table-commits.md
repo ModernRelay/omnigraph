@@ -2,12 +2,12 @@
 rfc: "0067"
 title: "Detached table commits"
 track: maintainer
-status: draft
-implementation: not-started
+status: accepted
+implementation: complete
 authors:
   - ragnorc
 created: 2026-09-14
-updated: 2026-09-15
+updated: 2026-09-18
 discussion: null
 supersedes: []
 superseded_by: []

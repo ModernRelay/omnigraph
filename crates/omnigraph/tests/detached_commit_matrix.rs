@@ -45,7 +45,9 @@ const NAME_ENV: &str = "OMNIGRAPH_RFC0067_NAME";
 const PARK_ENV: &str = "OMNIGRAPH_RFC0067_PARK";
 /// Park on the n-th crossing of that seam (1-based).
 const PARK_HIT_ENV: &str = "OMNIGRAPH_RFC0067_PARK_HIT";
-/// What the child runs: `insert`, `insert_and_friend` or `cleanup`.
+/// What the child runs: one of the `Writer::child_op` strings (`insert`,
+/// `insert_and_friend`, `cleanup`, `ensure_indices`, `merge`, `schema_apply`,
+/// `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`).
 const OP_ENV: &str = "OMNIGRAPH_RFC0067_OP";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -750,12 +752,23 @@ async fn run_cell(
         // leaves every pin promoted; a second rebuild is equally fine.
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         for run in 1..=2 {
-            fresh
+            let rebuilt = fresh
                 .rebuild_full_text_indices_on("main")
                 .await
                 .unwrap_or_else(|error| {
                     panic!("{cell}: full-text rebuild run {run} after recovery failed: {error}")
                 });
+            // The rebuild must actually name the full-text index it replaced,
+            // not silently publish an empty batch: an empty CreateIndex would
+            // pass every promotion/row assertion while leaving search broken.
+            assert!(
+                rebuilt
+                    .rebuilt_indexes
+                    .iter()
+                    .any(|index| index.type_key == "node:Person" && index.property == "city"),
+                "{cell}: rebuild run {run} named no Person/city full-text index: {:?}",
+                rebuilt.rebuilt_indexes
+            );
             assert_eq!(
                 linear_head(&person_uri).await,
                 table_pin(&fresh, "node:Person").await,

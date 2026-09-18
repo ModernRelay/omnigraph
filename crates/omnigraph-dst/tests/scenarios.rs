@@ -1430,6 +1430,16 @@ fn dst_lance_realm_ack_loss_bites_and_oracles_hold() {
         "lance-realm acknowledgements should actually be lost (lance_acks_lost={})",
         r.lance_acks_lost
     );
+    // The client-retry path must actually be exercised, not merely enabled: a
+    // lost ack of a staging (data/txn) write fails its op and the harness
+    // replays it against its own durable success, which must converge. (Lost
+    // acks of the `__manifest` commit itself instead read back as success in
+    // the engine and never reach a retry — the publisher's ambiguity arm.)
+    assert!(
+        r.client_retries > 0,
+        "the client-retry path should actually fire (client_retries={})",
+        r.client_retries
+    );
     assert!(r.verified > 0);
 }
 
@@ -1679,10 +1689,14 @@ fn dst_schema_weather_persisted_lies_detected_or_harmless() {
             let ma = omnigraph_dst::harness::panic_message(a.as_ref());
             let mb = omnigraph_dst::harness::panic_message(b.as_ref());
             for message in [&ma, &mb] {
+                // Require the engine's exact control-plane refusal string. A
+                // looser `contains("schema")` would also pass on a genuine
+                // DET_LEGAL_CLAIM oracle violation (whose text names "schema
+                // apply"), masking a real red as the intended refusal arm.
                 assert!(
-                    message.contains("does not match the recorded schema state")
-                        || message.contains("schema"),
-                    "the death must be the engine's typed control-plane refusal, got: {message}"
+                    message.contains("does not match the recorded schema state"),
+                    "the death must be the engine's typed control-plane refusal, \
+                     not an oracle violation, got: {message}"
                 );
             }
             assert_eq!(ma, mb, "the refusal arm must be deterministic");

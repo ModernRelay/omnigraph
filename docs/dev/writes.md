@@ -95,7 +95,7 @@ physical-effect proofs:
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
 | SchemaApply | Exact existing-table rewrites plus owned first-touch table creation and the complete schema/manifest delta | One main-branch graph commit |
 | BranchMerge | Pointer adoption, or a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (RFC 0067) | One target-branch graph commit |
-| EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph commit | | One graph publication when work lands |
+| EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | One detached compaction `Rewrite` per productive table, chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is

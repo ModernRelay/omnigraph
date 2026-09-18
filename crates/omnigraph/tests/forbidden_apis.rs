@@ -716,7 +716,7 @@ durable_calls! {
     // (A `table_version_management` config key is deliberately not written:
     // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/manifest/publisher.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),

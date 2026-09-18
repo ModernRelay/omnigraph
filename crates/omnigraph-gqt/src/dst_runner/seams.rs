@@ -63,8 +63,6 @@ pub(crate) enum Admitted {
     ),
 }
 
-impl Admitted {}
-
 /// Resolve `at` by exact name, the engine catalog first and `STORE_PLACES`
 /// second, and check the action against what the entry or row declares.
 /// The step check is `admit_seam`'s; the known-failure classifier resolves

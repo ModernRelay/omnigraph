@@ -1412,11 +1412,25 @@ pub(crate) async fn open_pinned_dataset(
                 .version()
                 .version;
             if latest < target_version {
-                return open_dataset(uri, VersionResolution::At(staged), session, wrapper).await;
+                // The twin is not promoted yet, so serve the staged version —
+                // but a concurrent cleanup can promote this pin and reap its
+                // staged tip between the Latest probe above and this open. If
+                // the staged version is gone, fall through to the target
+                // re-check below rather than reporting reclaimed history, the
+                // same recovery the `latest >= target` arm performs.
+                match open_dataset(uri, VersionResolution::At(staged), session, wrapper.clone())
+                    .await
+                {
+                    Ok(dataset) => return Ok(dataset),
+                    Err(OmniError::HistoricalVersionReclaimed { .. }) => {}
+                    Err(other) => return Err(other),
+                }
             }
-            // HEAD reached the target between the two reads, so a promotion
-            // may have landed the twin after the first probe missed it. Read
-            // the exact target once more before reporting reclaimed history.
+            // HEAD reached the target between the two reads (or a racing
+            // promotion landed the twin and reaped the staged tip), so a
+            // promotion may have landed the twin after the first probe missed
+            // it. Read the exact target once more before reporting reclaimed
+            // history.
             match open_dataset(
                 uri,
                 VersionResolution::At(target_version),

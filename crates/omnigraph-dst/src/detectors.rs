@@ -151,7 +151,7 @@ oracles! {
     OpArbitration, "prediction",
         &[Store(Query), Store(Physical)],
         "harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break)",
-        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects; a keep-serving resolution instead matches against every composition and order of the deferred and interrupting ops";
+        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects";
     MergePrediction, "prediction",
         &[Store(Claim)],
         "harness.rs::predict_merge + the accept/conflict asserts around branch_merge",

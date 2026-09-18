@@ -462,7 +462,7 @@ path (Execution semantics owns the default); a statement step traverses
 nothing and runs outside the pin.
 
 A file is: required `--- runner` (Explicit execution environments),
-optional `--- known_failure` (Known recovery failures), then `--- schema`, then
+then `--- schema`, then
 `--- seed`, then one or more steps, of
 which at least one is a query or mutate step; a file missing any of these
 three leading sections, ordering them differently, or carrying no query or

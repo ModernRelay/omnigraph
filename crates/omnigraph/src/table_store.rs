@@ -3971,10 +3971,27 @@ impl TableStore {
                 ));
             }
         };
-        if matches!(transaction.operation, Operation::Append { .. }) {
-            return Ok(PromotionCommit::Unsafe(
-                "a bare Append is not replay-safe; the engine never stages one".to_string(),
-            ));
+        // Refuse the operation kinds whose replay would rebase over an
+        // existing twin (landing a stray duplicate commit) instead of
+        // conflicting with it, plus the kinds that must never be replayed onto
+        // linear history at all. The engine stages none of these detached
+        // (merge-insert/keyed writes are `Update`, deletes `Delete`, index
+        // builds `CreateIndex`, compaction `Rewrite`, first-touch `Overwrite`,
+        // renames `Project` — every one self-conflicts with its twin). Rejecting
+        // them BEFORE the commit executes keeps a corrupt or hand-crafted pin
+        // from landing a stray effect that the post-commit landed==target
+        // backstop would only catch after the fact.
+        if let Some(kind) = match transaction.operation {
+            Operation::Append { .. } => Some("Append"),
+            Operation::ReserveFragments { .. } => Some("ReserveFragments"),
+            Operation::UpdateConfig { .. } => Some("UpdateConfig"),
+            Operation::Restore { .. } => Some("Restore"),
+            Operation::Clone { .. } => Some("Clone"),
+            _ => None,
+        } {
+            return Ok(PromotionCommit::Unsafe(format!(
+                "operation {kind} is not replay-safe; the engine never stages one detached"
+            )));
         }
         if base.version().version + 1 != target {
             return Ok(PromotionCommit::Unsafe(format!(

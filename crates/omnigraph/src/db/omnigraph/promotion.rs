@@ -89,6 +89,13 @@ async fn target_state(
     }))
 }
 
+/// A genuine detached chain is at most one branch merge's worth of links
+/// (`MAX_BRANCH_MERGE_DATA_TRANSACTIONS` = 1024); this bound sits far above
+/// that so a longer walk means a corrupt manifest whose read-version links
+/// cycle. The walk then fails loud instead of looping forever (invariant 11:
+/// bounded I/O even on corrupt input).
+const MAX_PROMOTION_CHAIN_LINKS: usize = 1 << 16;
+
 /// Follow a detached tip's read-version links back to the linear base it was
 /// staged from. Returns the base, or `None` when the walk met a predecessor
 /// whose detached manifest is already reaped, and the chain tip first as
@@ -101,6 +108,12 @@ pub(crate) async fn walk_chain(
     let mut chain = Vec::new();
     let mut version = tip;
     loop {
+        if chain.len() >= MAX_PROMOTION_CHAIN_LINKS {
+            return Err(OmniError::manifest_internal(format!(
+                "detached chain from version {tip} exceeds {MAX_PROMOTION_CHAIN_LINKS} links; \
+                 the manifest's read-version links are corrupt or cyclic"
+            )));
+        }
         let Some(handle) = open_at(db, location, version).await? else {
             if chain.is_empty() {
                 return Err(OmniError::HistoricalVersionReclaimed {

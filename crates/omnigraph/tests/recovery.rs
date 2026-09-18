@@ -86,18 +86,13 @@ async fn legacy_sidecar_refuses_a_read_write_open_and_not_a_read_only_one() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, rows);
 }
 
-/// `ensure_indices_for_branch` must only pin tables that actually need
-/// new index work. If it pinned every catalog table and only one needed
-/// new indices, the others would classify as `NoMovement` on recovery,
-/// triggering the all-or-nothing decision rule to roll BACK the table
-/// that did get index work — destroying legitimate Phase B output.
-///
-/// Steady-state case: when nothing needs indexing, no sidecar should
-/// be written. The sibling test `recovery_ensure_indices_handles_empty_tables`
-/// covers the more nuanced empty-table case where the existing
-/// ensure_indices loop has `if row_count > 0 { build_indices(...) }` —
-/// empty tables produce zero commits and would otherwise force
-/// NoMovement → rollback.
+/// `ensure_indices` must only touch tables that actually need new index
+/// work. Steady state: when nothing needs indexing, the pass is a pure
+/// no-op — it publishes no graph commit, republishes no table pin, and
+/// (RFC 0067) leaves no `__recovery/` residue. The sibling test
+/// `recovery_ensure_indices_handles_empty_tables` covers the empty-table
+/// case, where the `if row_count > 0 { build_indices(...) }` guard means
+/// empty tables produce zero commits.
 #[tokio::test]
 async fn recovery_ensure_indices_steady_state_no_sidecar() {
     use omnigraph::loader::LoadMode;
