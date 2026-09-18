@@ -12,10 +12,13 @@
 //! backwards, every pin linear once a recovery actor ran, no recovery
 //! sidecar, and a fresh handle agreeing with the writer's.
 //!
-//! The default run covers every writer × window × fault with the fresh-handle
-//! and read-only actors; `OMNIGRAPH_MATRIX=full` adds the same-handle,
-//! other-process and cleanup actors, and `OMNIGRAPH_MATRIX_WRITERS=Insert,…`
-//! narrows the writers. Seams are process-global, so the matrix is serial.
+//! The default run covers every writer × window × fault with the
+//! fresh-handle, read-only, and same-handle actors — same-handle is the
+//! generalized liveness check: after a failed write the writer's own live
+//! handle writes again once the fault stops, without reopening.
+//! `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors, and
+//! `OMNIGRAPH_MATRIX_WRITERS=Insert,…` narrows the writers. Seams are
+//! process-global, so the matrix is serial.
 #![cfg(feature = "failpoints")]
 
 mod helpers;
@@ -846,6 +849,10 @@ fn rfc_0067_failure_window_matrix() {
 async fn run_matrix() {
     let _scenario = FailScenario::setup();
     let full = std::env::var("OMNIGRAPH_MATRIX").is_ok_and(|value| value == "full");
+    // SameHandle is a DEFAULT actor: it is the generalized liveness check —
+    // the writer's own live handle must write again after the fault, without
+    // reopening. (It applies to Return cells only; after Kill/Race the
+    // parent's handle never ran the writer.)
     let recoveries: Vec<Recovery> = if full {
         vec![
             Recovery::FreshHandle,
@@ -855,7 +862,11 @@ async fn run_matrix() {
             Recovery::Cleanup,
         ]
     } else {
-        vec![Recovery::FreshHandle, Recovery::ReadOnly]
+        vec![
+            Recovery::FreshHandle,
+            Recovery::ReadOnly,
+            Recovery::SameHandle,
+        ]
     };
     let writers = [
         Writer::Insert,

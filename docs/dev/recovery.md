@@ -85,6 +85,23 @@ as current authority, and an installed contract invalidates derived handles
 before later operations continue. A retried write is a new attempt with a new
 lineage commit; nothing is replayed on the caller's behalf.
 
+## Liveness
+
+A failed operation never wedges its own live handle: once the fault source
+stops, the same `Omnigraph` instance's next ordinary write succeeds without
+reopening. Failed attempts leave no handle-local poison — a pending pin is
+promoted by the next write, a published-but-uninstalled contract is installed
+by `settle_pending_schema_install` at the next write entry, and a
+schema-apply sentinel this handle failed to release is retried there too
+(`note_failed_sentinel_release`). This generalizes the retired
+`RecoveryRequired`-specific check: the wedge class it watched is gone, but
+the contract it enforced holds for every failure kind. Owners: the
+failure-window matrix's default same-handle actor, the `live_handle_*`
+liveness tests in `failpoints.rs` (persistent faults, persistent lost
+acknowledgements, and the write-family seam sweep), and DST's
+`Scenario::keep_handle` mode, which runs an entire fault storm on one
+never-reopened handle (`dst_fault_storm_on_one_live_handle_keeps_writing`).
+
 ## Initialization ownership
 
 Fresh-graph initialization uses a separate root-scoped

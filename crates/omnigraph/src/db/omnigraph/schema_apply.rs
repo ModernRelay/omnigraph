@@ -273,6 +273,11 @@ where
     let result =
         apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
     let release_result = release_schema_apply_lock(db).await;
+    if release_result.is_err() {
+        // Liveness: the next write entry on this handle retries the release
+        // before the sentinel gate, so the failed delete never wedges it.
+        db.note_failed_sentinel_release();
+    }
     match (result, release_result) {
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(err)) => Err(err),
@@ -1186,15 +1191,16 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
         .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
-        // Best-effort release of the sentinel we just took, but never swallow
-        // its failure: a leaked sentinel wedges every writer until the next
-        // read-write open reclaims it, which is a louder problem than the
-        // mono-branch refusal we return, so make the leak observable.
+        // Best-effort release of the sentinel we just took; a failure arms the
+        // handle-local retry (liveness contract), so the next write entry on
+        // this handle releases it before the sentinel gate instead of staying
+        // wedged until a read-write open.
         if let Err(release_error) = release_schema_apply_lock(db).await {
+            db.note_failed_sentinel_release();
             tracing::warn!(
                 error = %release_error,
                 "failed to release the schema-apply sentinel after a mono-branch refusal; \
-                 writes are blocked until the next read-write open reclaims it"
+                 the next write entry on this handle retries the release"
             );
         }
         return Err(OmniError::manifest_conflict(format!(

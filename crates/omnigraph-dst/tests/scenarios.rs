@@ -1443,6 +1443,55 @@ fn dst_lance_realm_ack_loss_bites_and_oracles_hold() {
     assert!(r.verified > 0);
 }
 
+/// GENERALIZED LIVENESS (the successor of the retired RecoveryRequired-
+/// specific keep-serving checks): one live handle rides out an entire
+/// adapter-realm fault storm — clean errors, lost acknowledgements, client
+/// retries — and is NEVER reopened (`keep_handle`; `reopens == 0` is the
+/// proof). Every failed op's aftermath is judged through the same handle a
+/// real client would keep, ops keep landing between faults, and the full
+/// oracle stack holds. Adapter realm only ⇒ strict replay identity.
+#[test]
+#[serial]
+fn dst_fault_storm_on_one_live_handle_keeps_writing() {
+    let sc = Scenario {
+        seed: 103,
+        ops: 30,
+        keep_handle: true,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: 10300,
+            error_pct: 12,
+            read_error_pct: 6,
+            latency_pct: 10,
+            max_latency_ms: 3,
+            ack_loss_pct: 12,
+            client_retry: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-live-handle-a", &sc);
+    let b = run_universe("shared-memory://dst-live-handle-b", &sc);
+    println!(
+        "dst live handle: {} reopens, {} legal rejections, {} acks lost, {} client retries, {} checks",
+        a.reopens, a.legal_rejections, a.acks_lost, a.client_retries, a.verified
+    );
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &b,
+        "live-handle universes must replay identically",
+    );
+    assert_eq!(
+        a.reopens, 0,
+        "the whole storm must run on one never-reopened handle"
+    );
+    assert!(
+        a.legal_rejections > 0,
+        "the storm should actually fail ops on the live handle (legal_rejections={})",
+        a.legal_rejections
+    );
+    assert!(a.verified > 0);
+}
+
 /// CORRUPTION AXIS (read tier): the store LIES (read-time bit rot,
 /// truncated reads) and grows LATENT SECTOR ERRORS (persistent,
 /// location-indexed poison), adapter realm, moderate weather. Contract:

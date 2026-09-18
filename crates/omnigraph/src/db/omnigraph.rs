@@ -215,6 +215,13 @@ pub struct Omnigraph {
     /// this handle installs it from the staged copy; other handles and
     /// processes converge at their next read-write open.
     pending_schema_install: std::sync::atomic::AtomicBool,
+    /// This handle acquired the schema-apply sentinel and then failed to
+    /// release it (liveness contract): the next write entry retries the
+    /// release before the sentinel gate, so a transient release fault never
+    /// wedges the handle until reopen. Only ever set after OUR acquire, so
+    /// the retry can never delete another process's live sentinel — a
+    /// foreign acquire is impossible while ours still stands.
+    pending_sentinel_release: std::sync::atomic::AtomicBool,
     /// Warm change-feed cut for this handle's bound branch. A cut (head,
     /// witness, genesis, lineage projection, forward child index) is a PURE
     /// projection of `__manifest`, so it is exactly valid while the manifest
@@ -669,6 +676,7 @@ impl Omnigraph {
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
             pending_schema_install: std::sync::atomic::AtomicBool::new(false),
+            pending_sentinel_release: std::sync::atomic::AtomicBool::new(false),
             feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
@@ -886,6 +894,7 @@ impl Omnigraph {
             table_store: TableStore::new(&root, session),
             runtime_cache: RuntimeCache::default(),
             pending_schema_install: std::sync::atomic::AtomicBool::new(false),
+            pending_sentinel_release: std::sync::atomic::AtomicBool::new(false),
             feed_cut_cache: tokio::sync::RwLock::new(None),
             read_caches,
             schema_view: Arc::new(ArcSwap::from_pointee(HandleSchemaView {
@@ -2048,14 +2057,39 @@ impl Omnigraph {
         Ok(())
     }
 
+    /// Record that this handle acquired the schema-apply sentinel and could
+    /// not release it. The next write entry retries the release (liveness
+    /// contract: a live handle writes again once faults stop, without
+    /// reopening).
+    pub(crate) fn note_failed_sentinel_release(&self) {
+        self.pending_sentinel_release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Finish this handle's own published-but-uninstalled schema contract
     /// before a write plans against the manifest (RFC 0067). A schema apply or
     /// system-column upgrade whose manifest commit landed but whose contract
     /// installation failed sets `pending_schema_install`; every write entry
-    /// calls this, and the flag keeps the common path free of any storage
+    /// calls this, and the flags keep the common path free of any storage
     /// probe. Other handles and processes converge at their next read-write
     /// open or `refresh`.
+    ///
+    /// The same entry also retries a sentinel release this handle failed
+    /// (`note_failed_sentinel_release`), before the sentinel gate every write
+    /// takes, so a transient release fault never wedges the handle.
     pub(crate) async fn settle_pending_schema_install(&self) -> Result<()> {
+        if self
+            .pending_sentinel_release
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            && let Err(error) = schema_apply::release_schema_apply_lock(self).await
+        {
+            // Restore the flag so the retry is not lost, and fail loud: the
+            // sentinel this handle owns still stands, so the write would be
+            // refused at the gate anyway — with a less actionable message.
+            self.pending_sentinel_release
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(error);
+        }
         if !self
             .pending_schema_install
             .swap(false, std::sync::atomic::Ordering::SeqCst)

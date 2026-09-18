@@ -668,6 +668,13 @@ pub struct Scenario {
     /// quarantine deferred. Gated like `wide` so every pre-existing pinned
     /// seed keeps its exact op stream; composes with either die.
     pub schema_ops: bool,
+    /// LIVENESS mode: judge every failed op's aftermath on the SAME live
+    /// handle instead of reopening — the whole universe runs on one handle,
+    /// like a real client under a fault storm, and the report's `reopens`
+    /// stays zero. Incompatible with the crash knobs (`crash_at`,
+    /// `crash_on_match`, `die_at_write`, `recovery_crash`): a dead process
+    /// has no handle to keep.
+    pub keep_handle: bool,
     /// Kill-at-kth-write: die at durable write #k (1-based). `usize::MAX`
     /// = count-only probe (learns W, never dies). Mechanism: `KillState`.
     pub die_at_write: Option<usize>,
@@ -1085,6 +1092,10 @@ pub struct UniverseReport {
     /// successes) — evidence the `schema_ops` workload reached the
     /// schema_apply/schema_reload families (0 without `Scenario::schema_ops`).
     pub schema_applies: usize,
+    /// write-handle reopens performed while judging failures (reconcile and
+    /// crash recovery). A `Scenario::keep_handle` universe must report zero:
+    /// the whole storm ran on one live handle.
+    pub reopens: usize,
     /// Client retries performed after ack-lost ops
     /// (0 without `client_retry`).
     pub client_retries: usize,
@@ -4033,6 +4044,10 @@ struct Arbitration<'a> {
     retry: RetryEffect,
     recovery_crash: Option<&'static str>,
     heads_before: &'a [(String, String)],
+    /// Liveness mode (`Scenario::keep_handle`): judge the aftermath on the
+    /// SAME live handle instead of reopening — a real client's view. Crash
+    /// universes never set it (a dead process has no handle to keep).
+    keep_handle: bool,
 }
 
 /// Judge the failed op and its optional retry, then reopen and enforce
@@ -4051,6 +4066,7 @@ async fn reconcile_after_failure(
         retry,
         recovery_crash,
         heads_before,
+        keep_handle,
     } = arbitration;
     // A dead-target op has exactly one legal outcome — NotApplied — enforced
     // below at the outcome derivation and the tie-break gate, not just the
@@ -4110,12 +4126,19 @@ async fn reconcile_after_failure(
     let committed = visible == as_with;
     let fork_was_visible = as_fork_only.as_ref() == Some(&visible);
 
-    let settings = db.settings().clone();
-    drop(db);
-    let db = Session::from_defaults(
-        Arc::new(reopen_under_storm(&storage, root, label, at_op, recovery_crash).await),
-        settings,
-    );
+    let db = if keep_handle {
+        // Liveness contract: the same live handle keeps serving and, once
+        // faults pass, writing — the aftermath is judged through it with no
+        // reopen anywhere in the universe.
+        db
+    } else {
+        let settings = db.settings().clone();
+        drop(db);
+        Session::from_defaults(
+            Arc::new(reopen_under_storm(&storage, root, label, at_op, recovery_crash).await),
+            settings,
+        )
+    };
     let after = observe_world(&db).await;
     if !legal(&after) {
         detectors::violation(
@@ -4549,6 +4572,7 @@ async fn crash_op(
             retry: RetryEffect::None,
             recovery_crash,
             heads_before,
+            keep_handle: false,
         },
     ))
     .await;
@@ -4997,6 +5021,14 @@ pub fn run_universe(root: &str, scenario: &Scenario) -> UniverseReport {
 
 /// Retain detector panic payloads while the shared executor finalizes resources.
 pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<UniverseReport> {
+    assert!(
+        !(sc.keep_handle
+            && (sc.crash_at.is_some()
+                || sc.crash_on_match.is_some()
+                || sc.die_at_write.is_some()
+                || sc.recovery_crash.is_some())),
+        "keep_handle is a live-handle liveness mode; a crash universe has no handle to keep"
+    );
     println!(
         "dst universe [root={root} seed={} ops={} crash={:?} crash_on_match={:?} faults={} kill={:?}]",
         sc.seed,
@@ -5126,6 +5158,9 @@ impl UniverseScenario<RustResources> for Scenario {
         let mut crashes = 0usize;
         let mut verified = 0usize;
         let mut legal_rejections = 0usize;
+        // Reopens performed while judging failures (reconcile / crash
+        // recovery). A `keep_handle` universe must end with zero.
+        let mut reopens = 0usize;
         let mut client_retries = 0usize;
         let mut maintenance_reruns = 0usize;
         let mut schema_applies = 0usize;
@@ -5278,6 +5313,7 @@ impl UniverseScenario<RustResources> for Scenario {
                     CrashOutcome::OpSucceeded => apply_world(&mut world, &wop),
                     CrashOutcome::LegalRejection => legal_rejections += 1,
                     CrashOutcome::Crashed { outcome, channel } => {
+                        reopens += 1;
                         crashes += 1;
                         reconcile_verdicts.push((
                             format!("crash:{failpoint}@op{i}"),
@@ -5406,10 +5442,12 @@ impl UniverseScenario<RustResources> for Scenario {
                             retry: RetryEffect::None,
                             recovery_crash: None,
                             heads_before: &heads_before,
+                            keep_handle: false,
                         },
                     ))
                     .await;
                     db = new_db;
+                    reopens += 1;
                     if let Some(f) = &failing {
                         f.resume();
                     }
@@ -5579,10 +5617,14 @@ impl UniverseScenario<RustResources> for Scenario {
                                         retry: retry_effect,
                                         recovery_crash: None,
                                         heads_before: &heads_before,
+                                        keep_handle: sc.keep_handle,
                                     },
                                 ))
                                 .await;
                                 db = new_db;
+                                if !sc.keep_handle {
+                                    reopens += 1;
+                                }
                                 if let Some(f) = &failing {
                                     f.resume();
                                 }
@@ -5994,6 +6036,7 @@ impl UniverseScenario<RustResources> for Scenario {
             acks_lost,
             lance_acks_lost,
             schema_applies,
+            reopens,
             client_retries,
             maintenance_reruns,
             reads_corrupted,

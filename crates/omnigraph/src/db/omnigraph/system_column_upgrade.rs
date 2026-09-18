@@ -203,6 +203,11 @@ pub(super) async fn upgrade_system_columns(
     super::schema_apply::acquire_schema_apply_lock(db).await?;
     let result = execute_with_lock(db, actor, &accepted_ir, &accepted_schema_state).await;
     let release_result = super::schema_apply::release_schema_apply_lock(db).await;
+    if release_result.is_err() {
+        // Liveness: the next write entry on this handle retries the release
+        // before the sentinel gate, so the failed delete never wedges it.
+        db.note_failed_sentinel_release();
+    }
     let graph_manifest_version = match (result, release_result) {
         (Ok(version), Ok(())) => version,
         (Ok(_), Err(err)) | (Err(err), _) => return Err(err),

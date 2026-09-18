@@ -7667,6 +7667,409 @@ async fn rfc_0067_lost_ack_of_a_durable_publish_reads_back_as_success() {
     );
 }
 
+/// GENERALIZED LIVENESS, persistent pre-publish faults: the same live handle
+/// keeps writing once faults stop, without reopening. A persistent seam
+/// failure before the effect gates fails every write with nothing durable;
+/// dropping the guard models the fault source stopping, and the very next
+/// write on the SAME handle must succeed. This replaces the old
+/// RecoveryRequired-specific check: the wedge class it watched is gone, but
+/// the liveness contract it enforced is general.
+#[tokio::test]
+#[serial]
+async fn live_handle_keeps_writing_after_persistent_prepublish_faults_stop() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = count_rows(&db, "node:Person").await;
+
+    {
+        let _fault = catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE.fire_always();
+        for attempt in 0..2 {
+            let outcome = mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(
+                    &[("$name", format!("dead{attempt}").as_str())],
+                    &[("$age", 20)],
+                ),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "attempt {attempt} must fail under the fault"
+            );
+        }
+    }
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        before,
+        "pre-publish failures leave nothing visible"
+    );
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "revive")], &[("$age", 21)]),
+    )
+    .await
+    .expect("the same handle must write again once faults stop, without reopening");
+    assert_eq!(count_rows(&db, "node:Person").await, before + 1);
+
+    let fresh = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    assert_eq!(
+        count_rows(&fresh, "node:Person").await,
+        before + 1,
+        "a fresh handle agrees with the never-reopened one"
+    );
+}
+
+/// GENERALIZED LIVENESS, persistent lost acknowledgements: every write's
+/// manifest commit lands durably but the caller sees an error (the seam sits
+/// above the publisher's read-back, modeling a coordinator-level ack loss).
+/// Repeated ack-lost writes leave pending pins; once the faults stop the
+/// SAME handle's next write promotes them and succeeds, and every
+/// acknowledged-then-denied row is present — never lost, never doubled.
+#[tokio::test]
+#[serial]
+async fn live_handle_keeps_writing_after_persistent_ack_loss_stops() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = count_rows(&db, "node:Person").await;
+
+    {
+        let _fault = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_always();
+        for attempt in 0..2 {
+            let outcome = mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(
+                    &[("$name", format!("denied{attempt}").as_str())],
+                    &[("$age", 30)],
+                ),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "attempt {attempt} must report the lost acknowledgement"
+            );
+        }
+    }
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "revive_ack")], &[("$age", 31)]),
+    )
+    .await
+    .expect("the same handle must write again once faults stop, without reopening");
+
+    // Both denied writes were durably published (an acknowledged write is
+    // never lost) and nothing double-applied.
+    let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    for expected in ["denied0", "denied1", "revive_ack"] {
+        assert_eq!(
+            names.iter().filter(|name| *name == expected).count(),
+            1,
+            "{expected} must be present exactly once"
+        );
+    }
+    assert_eq!(count_rows(&db, "node:Person").await, before + 3);
+    let fresh = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    assert_eq!(
+        count_rows(&fresh, "node:Person").await,
+        before + 3,
+        "a fresh handle agrees with the never-reopened one"
+    );
+}
+
+/// GENERALIZED LIVENESS, the write-family sweep: for every write-path seam
+/// family the failure-window matrix does not already cover with its
+/// same-handle actor, fail the family's driver once at the seam on a live
+/// handle, then prove the SAME handle's next ordinary write succeeds —
+/// without reopening. The driver's own outcome is recorded, not asserted
+/// (some seams absorb, some drivers may not reach an armed seam); the
+/// liveness insert is the contract.
+#[tokio::test]
+#[serial]
+async fn live_handle_writes_after_every_write_family_seam_failure() {
+    #[derive(Clone, Copy, Debug)]
+    enum Driver {
+        Insert,
+        DeletePerson,
+        NoEffectUpdate,
+        BranchCreate,
+        BranchDelete,
+        BranchMutate,
+        LoadFork,
+        LoadTwoTables,
+        Merge,
+        SchemaApply,
+        EnsureIndices,
+        Optimize,
+        Cleanup,
+        Refresh,
+    }
+    // Matrix-covered families (mutation/load/merge/schema/optimize/indices
+    // windows of the ten writers) are deliberately absent; these are the
+    // remaining write-path seams. init.*/open.* have no live handle by
+    // definition; blob/change-feed read seams cannot arm write state.
+    let cells: &[(&str, Driver)] = &[
+        ("branch_control.pre_gates", Driver::BranchCreate),
+        ("branch_create.post_native", Driver::BranchCreate),
+        ("branch_delete.post_table_gates", Driver::BranchDelete),
+        ("branch_delete.post_native", Driver::BranchDelete),
+        ("load.post_branch_create_pre_stage", Driver::LoadFork),
+        ("load.between_table_stages", Driver::LoadTwoTables),
+        ("mutation.post_fork_pre_commit", Driver::BranchMutate),
+        ("fork.before_classify", Driver::BranchMutate),
+        ("fork.post_create_pre_open", Driver::BranchMutate),
+        ("classify.fresh_read", Driver::BranchMutate),
+        (
+            "mutation.delete_node_pre_primary_delete",
+            Driver::DeletePerson,
+        ),
+        ("mutation.post_no_effect_pre_gate", Driver::NoEffectUpdate),
+        ("graph_publish.before_commit_append", Driver::Insert),
+        ("graph_publish.after_manifest_commit", Driver::Insert),
+        ("publish.post_merge_pre_ack", Driver::Insert),
+        ("read.refresh_post_state_pre_lineage", Driver::Refresh),
+        ("optimize.before_compact", Driver::Optimize),
+        (
+            "optimize.post_authority_capture_pre_gates",
+            Driver::Optimize,
+        ),
+        ("cleanup.pre_gates", Driver::Cleanup),
+        ("cleanup.resolve_branch_snapshot", Driver::Cleanup),
+        ("cleanup.reconcile_fork", Driver::Cleanup),
+        ("cleanup.table_gc", Driver::Cleanup),
+        ("branch_merge.post_authority_capture", Driver::Merge),
+        ("branch_merge.post_candidate_validation", Driver::Merge),
+        ("schema_apply.post_lock_pre_effect", Driver::SchemaApply),
+        ("schema_apply.before_staging_write", Driver::SchemaApply),
+        ("schema_apply.after_manifest_commit", Driver::SchemaApply),
+        (
+            "ensure_indices.post_stage_pre_commit_btree",
+            Driver::EnsureIndices,
+        ),
+    ];
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // Cumulative schema state: apply rows only ever add optional properties
+    // (and the one @index the ensure row needs), so every apply is additive
+    // over the last.
+    let mut schema_props: Vec<String> = Vec::new();
+    let mut age_indexed = false;
+    let render_schema = |props: &[String], indexed: bool| {
+        let age = if indexed {
+            "age: I32? @index"
+        } else {
+            "age: I32?"
+        };
+        let mut schema = helpers::TEST_SCHEMA.replace("age: I32?", age);
+        if !props.is_empty() {
+            schema = schema.replace(
+                "    age: I32?",
+                &format!("    age: I32?\n    {}", props.join("\n    ")),
+            );
+        }
+        schema
+    };
+
+    for (index, (seam, driver)) in cells.iter().enumerate() {
+        // Schema rows need the engine's mono-branch restriction satisfied:
+        // earlier rows deliberately leave branches behind (including a failed
+        // load's surviving fork), so clear every non-main branch first, on
+        // the same live handle, before arming.
+        if matches!(driver, Driver::SchemaApply | Driver::EnsureIndices) {
+            for branch in db.branch_list().await.expect("sweep branch listing") {
+                if branch != "main" {
+                    db.branch_delete(&branch)
+                        .await
+                        .unwrap_or_else(|error| panic!("sweep delete of {branch}: {error}"));
+                }
+            }
+        }
+        let armed = catalog::decide(seam)
+            .unwrap_or_else(|| panic!("sweep names unknown seam {seam}"))
+            .fail_once_at(1);
+        let outcome: std::result::Result<(), String> = match driver {
+            Driver::Insert => mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", format!("drv{index}").as_str())], &[("$age", 40)]),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+            Driver::DeletePerson => mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "remove_person",
+                &params(&[("$name", "live_0")]),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+            Driver::NoEffectUpdate => mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "nobody-here")], &[("$age", 1)]),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+            Driver::BranchCreate => db
+                .branch_create(&format!("lv_b{index}"))
+                .await
+                .map_err(|error| error.to_string()),
+            Driver::BranchDelete => {
+                let name = format!("lv_d{index}");
+                db.branch_create(&name).await.expect("delete-row setup");
+                db.branch_delete(&name)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            Driver::BranchMutate => {
+                let name = format!("lv_m{index}");
+                db.branch_create(&name).await.expect("mutate-row setup");
+                db.mutate(
+                    &name,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(
+                        &[("$name", format!("br{index}").as_str())],
+                        &[("$age", 41)],
+                    ),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            }
+            Driver::LoadFork => db
+                .load_as(
+                    &format!("lv_l{index}"),
+                    Some("main"),
+                    &format!(
+                        "{{\"type\": \"Person\", \"data\": {{\"name\": \"lf{index}\", \"age\": 42}}}}"
+                    ),
+                    LoadMode::Merge,
+                    None,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Driver::LoadTwoTables => db
+                .load_jsonl(
+                    &format!(
+                        "{{\"type\": \"Person\", \"data\": {{\"name\": \"lt{index}\", \"age\": 43}}}}\n\
+                         {{\"type\": \"Company\", \"data\": {{\"name\": \"lc{index}\"}}}}"
+                    ),
+                    LoadMode::Merge,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Driver::Merge => {
+                let name = format!("lv_s{index}");
+                db.branch_create(&name).await.expect("merge-row setup");
+                db.mutate(
+                    &name,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(
+                        &[("$name", format!("mg{index}").as_str())],
+                        &[("$age", 44)],
+                    ),
+                )
+                .await
+                .expect("merge-row source write");
+                Box::pin(db.branch_merge(&name, "main"))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            Driver::SchemaApply => {
+                schema_props.push(format!("liveprop{index}: I64?"));
+                db.apply_schema(&render_schema(&schema_props, age_indexed))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            Driver::EnsureIndices => {
+                age_indexed = true;
+                db.apply_schema(&render_schema(&schema_props, age_indexed))
+                    .await
+                    .expect("ensure-row schema setup");
+                db.ensure_indices()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            Driver::Optimize => db
+                .optimize()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Driver::Cleanup => Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            }))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+            Driver::Refresh => db.refresh().await.map_err(|error| error.to_string()),
+        };
+        drop(armed);
+        println!(
+            "liveness sweep [{seam} driver={driver:?}]: {}",
+            match &outcome {
+                Ok(()) => "driver absorbed or seam unreached".to_string(),
+                Err(error) => format!("driver failed: {}", error.lines().next().unwrap_or("")),
+            }
+        );
+
+        // The contract: whatever the fault did, the same live handle's next
+        // ordinary write succeeds without reopening.
+        let live = format!("live_{index}");
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", live.as_str())], &[("$age", 45)]),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("liveness violated after {seam} ({driver:?}): {error}"));
+        let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+        assert!(
+            names.contains(&live),
+            "liveness write after {seam} must be visible on the same handle"
+        );
+    }
+
+    // A fresh handle agrees with the never-reopened one about main.
+    let fresh = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    let mut same: Vec<String> =
+        collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    let mut other: Vec<String> =
+        collect_column_strings(&read_table(&fresh, "node:Person").await, "name");
+    same.sort();
+    other.sort();
+    assert_eq!(
+        same, other,
+        "fresh-handle view diverged from the live handle"
+    );
+}
+
 mod rfc_0067_resolution_race {
     use super::*;
     use async_trait::async_trait;
