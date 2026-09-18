@@ -160,6 +160,15 @@ depend on recognizing other languages' idioms and no catalogue of them is
 maintained; a reader that generalizes from the schema and the card is what
 the design leans on.
 
+The measured motivating case: in the composition RFC's first in-context run,
+every first-try failure was `query name {` without `()`, refused with
+`parse error --> 1:1 … expected query_file` wrapped in terminal colour codes
+and a Rust backtrace footer. Under this contract the same input reports a
+`Q…` code at the name's end, "expected `(`: a query declares its parameters
+even when it has none", the fix `query name()`, and nothing else; the CLI's
+machine formats (`--json`, `jsonl`) carry the four fields without colour or
+backtrace text.
+
 **Metric projection.**
 
 ```gq
@@ -469,7 +478,8 @@ language release or duplicate execution path.
 - 2026-09-18 — became Phase A of RFC 0048's rollout.
 - 2026-09-18 — added the diagnostics contract (code, position or stage,
   expectation, one fix; unknown names enumerate their set) for every
-  compile diagnostic and typed read failure.
+  compile diagnostic and typed read failure; recorded the measured
+  `query name {` case as its motivating example.
 - 2026-09-18 — replaced the `full_text_search_unindexed` warning with a
   compile-time `T27` refusal of undeclared targets and a plan-time
   `FullTextIndexRequired` refusal of unbuilt indexes (RFC 0043 precedent); a

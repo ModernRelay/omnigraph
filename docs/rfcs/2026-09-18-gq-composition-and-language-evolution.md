@@ -978,6 +978,21 @@ RFC 0048's [mixed workload qualification](0048-search-contracts.md#mixed-workloa
 Hold the model, card, schema and snapshot fixed within a comparison and
 retain failed trajectories; a model revision reopens the measurement.
 
+**First measurement (2026-09-18, today's grammar).** Claude Opus 5 at effort
+`high`, a one-page card, the personal graph's schema (about 90k tokens,
+served from the prompt cache), fifteen private tasks (counts, filters, one-
+and two-hop traversals, negation, a date range, an ordered aggregate,
+full-text `search`) at one pinned commit, three repeats each: 45/45 tasks
+correct, 37/45 first queries valid, 1.18 queries per task, about 11 s per
+task. Every first-try failure was the same construct: a parameterless
+query written `query name {` without `()`, refused with
+`parse error --> 1:1 … expected query_file`, a grammar-rule name at column
+one with no fix; every model repaired it from the card on the next turn.
+The baseline says two things: today's grammar is already learnable in
+context by a current model, so the kernel must not regress that; and the
+first diagnostic a caller meets is the worst one in the language. The
+instrument's private task set and results live outside the repository.
+
 ## Rollout
 
 No production work starts from this document. Its rules gate RFC 0048's
@@ -1049,6 +1064,8 @@ before optimizing batching, and measure per-group rescan cost.
 - 2026-09-18 — added programmability: transparent `define`, a typed plan
   input surface, multi-statement requests at one snapshot; procedural
   control flow, opaque functions and free inference calls excluded.
+- 2026-09-18 — recorded the first in-context measurement on today's grammar
+  (45/45 correct, 37/45 first-try valid, one error class: the missing `()`).
 - 2026-09-18 — made the in-context consumer the design target: card-sized
   kernel, case-insensitive atomic keywords, spellings decided by measured
   first-try validity rather than analogy to any prior language.
