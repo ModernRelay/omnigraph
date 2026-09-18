@@ -497,6 +497,38 @@ fact verification uses ordinary predicates, negation, and aggregates over
 the intended population. A completed search with no hits cannot prove that
 population contains no relevant fact.
 
+### Agent-facing surface
+
+The primary caller is a general agent that learned tool use elsewhere and
+meets this language in context, through a schema, a one-page card and its
+own errors; it is not a model trained on the language. That fixes three
+priorities.
+
+- **Stored queries are the door; the language is the authoring surface.** A
+  stored query is a typed tool: name, parameters, `@description` and
+  `@instruction`. Its description states the population it searches, what it
+  returns and the one trade-off the caller can turn ("`candidates` trades
+  recall for cost; raise it when the answer must be exhaustive"). Recipes
+  bake in windows, modes and edit budgets; the raw language exposes them for
+  the long tail and for authoring.
+- **The schema is the prompt.** Node, edge and property declarations in
+  `.pg` accept `@description("…")`, and `schema show` prints it beside the
+  resolved analyzer, scorer and embedding recipe, so a caller grounds a query
+  in one read. The annotation is metadata: it changes no accepted semantics
+  and no field binding, and it is a PG-language surface change under the
+  [compatibility surfaces](2026-09-14-compatibility-surfaces.md) RFC.
+- **Defaults carry the common case.** Every knob has a default the
+  description names; a caller that never touches `candidates`, `oversample`
+  or `max_edits` gets a sound query, not a surprising one.
+
+The language is designed for that use: the
+[kernel](2026-09-18-gq-composition-and-language-evolution.md#kernel-one-stage-per-job) fits on a card, every stage has
+one shape, keywords are atomic and case-insensitive, and diagnostics follow
+RFC 0047's contract so that one repair turn is the norm. None of it assumes
+a particular prior language; the caller's ability to generalize from a card
+and a schema is what the design leans on, and that ability improves faster
+than any catalogue of foreign idioms could be maintained.
+
 ### Errors and operational changes
 
 Typed errors include missing analyzed capability, disabled or incompatible
@@ -505,6 +537,13 @@ incompatible encoding spaces, invalid stage references, ambiguous target
 mappings or inherited metrics, and exhausted resources. Unsupported plan shapes are refused before
 results are presented as complete. Ordinary absence of a hit in one fusion
 arm is represented as missing membership, not a query failure.
+
+Every such failure follows [RFC 0047's diagnostics contract](0047-search-plan-truth.md#user-and-operational-behavior):
+a stable code, a position or stage, the expectation, and one fix. An unknown
+source kind, function, metric field or setting enumerates the admitted set;
+a resource failure names the stage and the remedy (narrow the population,
+lower a window, raise a limit) so that a retry without change is never the
+implied response.
 
 All search-language replacements ship together. Diagnostics point callers
 from `fuzzy`, `search`, and `match_text` to typed lexical matching or retrieval;
@@ -965,6 +1004,17 @@ wire types and namespace choices must be checked before implementation:
 | Metric origin | Named source instance, target, domain, scoring/encoding fingerprints, and missing-arm membership |
 | Attribution | Graph snapshot context, graph binding identities, and selected properties; application-defined source relationships remain ordinary data |
 | Follow-up | A supported way to read/expand those bindings at that snapshot, or an explicit expired/unavailable outcome |
+
+**Reader decision rule.** Every descriptor is in the response body — JSON,
+the JSONL metadata record and Arrow response metadata alike, never only a
+transport header — and is phrased for the decision its reader takes next.
+Completion answers "trust or fail"; coverage answers "rephrase, narrow, or
+stop" (no match over a fully represented population is a different fact
+from an unrepresented one, and the reader must not learn to rephrase on
+both); selection answers "widen the window or not"; usage answers "can I
+afford another call". Usage — elapsed time, rows produced, storage reads,
+provider calls, output bytes — is part of the read contract, not optional
+diagnostics, because the reader budgets its next call from it.
 
 **Interface decision:** the read options are session settings, not a new
 request field. [Session settings](2026-09-16-session-settings.md) and its
@@ -1567,7 +1617,11 @@ owners and extend their independent oracles at the boundary being tested.
 
 For runnable families, record supported task correctness, query parse/type
 failures and repair attempts, wrong-population answers, tool round trips,
-latency, returned/context bytes and measured execution work. Preserve refusals,
+latency, returned/context bytes and measured execution work. Record
+in-context competence per model with the composition RFC's
+[instrument](2026-09-18-gq-composition-and-language-evolution.md#in-context-competence): first-try parse validity, turns
+to the first correct query and repairs by diagnostic code, beside task
+correctness. Preserve refusals,
 timeouts, provider failures and unsupported requests in the report with
 distinct dispositions; successful completed queries alone are not the task
 denominator. Separate deterministic result oracles from judged relevance and
@@ -1918,6 +1972,10 @@ still require prototypes; full production qualification belongs to its phase.
 
 ## Decision log
 
+- 2026-09-18 — added the agent-facing surface (stored queries as the door,
+  `@description` on schema declarations, named defaults), the reader
+  decision rule for result descriptors with usage as contract, and the
+  in-context competence metric in the mixed-workload qualification.
 - 2026-09-18 — recorded the composition RFC's kernel proposal as a pending
   decision for this RFC's syntax (one spelling per operation; `select`,
   `take`, `score`, `collect`, `optional` collapse; predicates leave `match`).
