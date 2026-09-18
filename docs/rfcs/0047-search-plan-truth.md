@@ -374,7 +374,8 @@ qualification required for the replacement.
 Regression cases for the refusals: a `.gqt` case with a String property
 without `@index` expecting `T27`, and a `search.rs` owner that drops the
 physical index of a declared property and expects `FullTextIndexRequired`
-(the PR #606 case `unindexed_search_is_case_sensitive` seeds both).
+(#747's case `unindexed_search_is_case_sensitive` seeds both; #750 owns
+the traversal-target shape).
 
 Revalidation against the pinned Lance source also leaves a separate
 determinism gate: its plain FTS collector can drop equal-score boundary rows

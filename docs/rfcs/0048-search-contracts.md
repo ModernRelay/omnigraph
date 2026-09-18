@@ -1609,8 +1609,9 @@ remaining assumptions and falsifiers.
 
 The four GQT regressions recorded on PR #606 and their required
 implementation proof are in
-[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#regression-cases); they are held out of the
-corpus until each fix lands under an `issue_N` name.
+[Analyzed lexical search](2026-09-18-analyzed-lexical-search.md#regression-cases); they are filed as #747,
+#748, #749 and #750 and held out of the corpus until each fix lands under
+its `issue_N` name.
 
 ### Implementation handoff and validation checkpoint
 
