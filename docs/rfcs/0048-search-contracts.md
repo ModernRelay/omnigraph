@@ -877,6 +877,65 @@ changing it can legitimately change scores. It must not silently normalize
 against the entire corpus. Learned model execution and general feature
 combination syntax are deferred until these contracts are qualified.
 
+**Decision (2026-09-18): combination is an expression, retrieval is named.**
+The asymmetry the algebra needs is between retrievers and scorers. A
+retriever produces candidates and needs a qualified physical path (index
+parity, coverage, budgets), so retrievers are a closed, named set. A scorer
+or combiner runs in-engine over candidates that are already bounded, so it
+can be any expression of the kernel's expression grammar: pure, total,
+typed, linear in its inputs. The general fusion source is therefore
+
+```gq
+fuse(<expression over metric(arm, field) values>, candidates: N) as alias
+```
+
+evaluated over the union of the named arms' candidate sets, ordered by the
+expression's value with stable identity as the final key, cut at
+`candidates`. `rrf(arm(a), arm(b, weight: w), k: 60, candidates: N)` is the
+named policy `rrf_v1` of that form: qualified, accelerable and fingerprinted
+as a policy, and defined as the `fuse` expression `sum over arms of
+weight / (k + metric(arm, rank))` with a missing arm contributing zero. The
+initial release ships `rrf`; `fuse` is the extension whose semantics are
+fixed here so that `rrf` is an instance of it rather than a special case,
+and so that a caller can write a fusion formula on the fly without a new
+operator.
+
+Rules that make an open expression safe in that position:
+
+- *Explicit mixing only.* `metric(a, score)` and `metric(b, distance)` carry
+  their domains; an arithmetic expression over metrics yields a plain `F64`
+  by the author's act of writing it. The typed domains exist to refuse
+  *implicit* mixing: `order { metric(a, score) desc, metric(b, distance) asc }`
+  is two orderings, not one combined score.
+- *Missing arms are explicit.* A target absent from an arm has a null metric
+  there; an expression that can be null is refused as a `fuse` argument or
+  an `order` key unless wrapped in `coalesce` or the ordering states `nulls
+  first`/`nulls last`. A missing arm can never silently drop or demote a
+  target.
+- *Identity is structural.* The fingerprint of an inline expression is the
+  hash of its normalized typed AST, so `explain`, replay descriptors and the
+  semantic digest treat an on-the-fly formula exactly as a named policy; a
+  named policy additionally records its qualification.
+- *Bounded by construction.* No recursion, no loops, total functions under
+  the [numeric rules](2026-09-18-gq-composition-and-language-evolution.md#language-evolution-and-compatibility): checked
+  integer arithmetic, non-finite results as typed failures. Cost is the
+  candidate union times the expression size, charged to the stage.
+- *Models are sources, not calls.* A learned reranker enters as a source
+  (`rerank(arm(x), model: …, candidates: N)`) with a declared model identity,
+  a budget and a window, never as a free function inside an expression; the
+  same holds for any inference feature. Nondeterministic and remote work is
+  retrieval-side work under retrieval-side contracts.
+
+Control flow stays outside the query. "Widen and retry when recall looks
+low" is the caller's decision; the engine's part is to make each step cheap,
+coherent and replayable: pinned snapshots, usage and coverage in every
+result, and a multi-statement request at one snapshot so that adapting costs
+one round trip. A loop inside a query would break the one-snapshot,
+one-budget, one-publication contract that makes those steps safe. Reuse
+comes from transparent definitions
+([`define`](2026-09-18-gq-composition-and-language-evolution.md#kernel-one-stage-per-job)), not from opaque user-defined
+functions.
+
 A threshold on a declared geometric distance is legitimate and need not be
 called confidence. An exact range query evaluates the distance predicate over
 the specified eligible population under defined inclusive/exclusive bounds.
@@ -1335,6 +1394,39 @@ bounded shutdown. The standard/lite scheduler difference is a compatibility
 fence, not justification to switch every backend. Materializing everything in
 a `MemTable` or replacing graph traversal with eager cross products does not
 satisfy these resource obligations.
+
+#### Rewrite catalogue and `explain` contract
+
+The composition laws are the planner's specification. They are handed to
+the engine version 2 planner component as a rewrite catalogue: each rewrite
+with the precondition that proves equivalence, each cost-based choice with a
+differential oracle. Nothing here decides a planner.
+
+| Class | Rewrites | Precondition |
+|---|---|---|
+| Always legal | Predicate pushdown through pattern joins; predicate pushdown into a retriever as a prefilter; projection pruning; join order and traversal direction inside one `match`; fusing adjacent `filter`/`let`; top-k pushdown of `order` + `limit` over one scan | The predicate precedes the `rank` it is pushed into; pruning retains hidden metric and identity columns; the scan's order is known and the cut unit is rows |
+| Barriers | None across `rank`, `group`, `limit` | A rewrite that crosses one changes the question; it is refused, and `explain` names the law that refused it |
+| Cost-based | Prefilter versus postfilter for a graph-scoped `rank` (the #587 gate; `rrf_plan` overrides); index versus exact scan; qualified fallback; late payload hydration; dense versus distinct-pair group selection | Statistics are visible, derived, explicitly maintained state (row counts, index coverage, selectivity estimates), never hidden; every route pair has a checked-in differential oracle proving identical results, `rrf_prefilter_gate.rs` being the pattern |
+| Approximation | Recall may be traded inside `ann` only, through the `oversample` mapping | That is the declared contract; `knn`, `lexical` and every exact operator admit no recall trade |
+| Adaptive, in-attempt | Probe-widening ladders, the bounded-BM25 retry, spill | Bounded, charged to the budget, one snapshot; re-planning across snapshots is a new attempt |
+| Cache | Compiled plans keyed by the semantic fingerprint; parameters bind at execution | Derived state under invariant 12, never commit authority |
+
+`explain` is a contract, not a debugging aid. It prints the kernel program
+(the logical stages after desugaring), the physical route chosen for each
+cost-based class with the statistics that chose it, estimated usage in the
+same units the result's usage descriptor reports, and every refused rewrite
+with the law that refused it. A caller rewrites queries too, and its
+rewrites change meaning when they move a stage; `explain` keeps the
+engine's meaning-preserving rewrites and the caller's meaning-changing ones
+distinguishable.
+
+One measurement outranks the catalogue. For the agent workload of many
+small calls, the fixed per-request cost of reloading version-pinned control
+state (on a fragmented graph, measured in hundreds of object-store reads
+per request for the manifest alone) dwarfs any plan choice. Session-scoped
+caching of immutable version-pinned state and multi-statement requests at
+one snapshot are worth more than every rewrite above, and both are
+invariant-12-clean because the cached state is immutable.
 
 ## Invariants
 
@@ -1972,6 +2064,12 @@ still require prototypes; full production qualification belongs to its phase.
 
 ## Decision log
 
+- 2026-09-18 — decided that combination is an expression and retrieval is
+  named: `fuse(expr)` as the general fusion source with `rrf_v1` as its named
+  policy, explicit-mixing and missing-arm rules, structural identity,
+  models as sources; control flow stays outside the query. Added the
+  rewrite catalogue and `explain` contract handed to the engine version 2
+  planner.
 - 2026-09-18 — added the agent-facing surface (stored queries as the door,
   `@description` on schema declarations, named defaults), the reader
   decision rule for result descriptors with usage as contract, and the

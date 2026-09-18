@@ -773,10 +773,39 @@ the planner cannot tell a shape from a selection.
 - *Expression functions*: scalar functions and casts, aggregates, subquery
   reductions, scoring features, `metric(alias, rank | score | distance)`.
 - *Retrieval sources*: `lexical`, `knn`, `ann`, `rrf`; later `rerank(arm(x),
-  model: …)`, sparse and multivector representations, geometric range. All
-  share the shape `kind(args, option: value, …) as alias`.
+  model: …)`, sparse and multivector representations, geometric range, and
+  `fuse(expr)` as the general combiner of which `rrf` is a named policy
+  ([RFC 0048](0048-search-contracts.md#explicit-ranking-features-and-distance-predicates)).
+  All share the shape `kind(args, option: value, …) as alias`.
 - *Value types*: lists, nullable objects, paths. Projection and typing rules
   for each are the extension's obligation.
+
+**Programmability.** Three constructs give a caller that writes code a
+place to put it without making the query procedural:
+
+- `define`: a transparent, content-hashed definition —
+  `define scorer my_fuse(a, b) = 1.0 / (60 + metric(a, rank)) + 1.5 / (60 + coalesce(metric(b, rank), 1000))`,
+  `define pattern churned($p) = $p: Person  not { $p placed $o }` — stored
+  beside stored queries and inlined at compile time. It is a SQL-language
+  macro, not a UDF: the optimizer sees through it, its identity is its hash,
+  and it can introduce neither recursion nor side effects. Datalog's named
+  rules and Vespa's rank profiles are the precedents.
+- A typed plan surface: the kernel program as a JSON document compiled to
+  the same IR as `.gq` text, so that caller-written code constructs queries
+  structurally and constrained decoding can target it. Query semantics are
+  already typed structures; this exposes them as an input.
+- A multi-statement request at one snapshot: several queries in one call,
+  sharing the snapshot and the budget, with no control flow between them.
+  Adaptation ("widen, then verify") is the caller's loop over cheap coherent
+  calls, not a loop inside the language.
+
+Excluded, and why: procedural loops and branches inside a query (unbounded
+work and hidden re-planning); opaque functions (they block every rewrite and
+hide cost); inference as a free expression (nondeterministic and remote; it
+enters as a budgeted source). As models get better at code they write
+orchestration in their own sandbox and compile intent into declarative
+queries; the language's value is the guarantees code cannot give itself, so
+it grows more inspectable and more programmable, not more procedural.
 
 Reserved extension slots that are stage kinds, not open-set members, and are
 therefore future RFCs: `unnest { list as $item }` (Cypher `UNWIND`),
@@ -1044,6 +1073,9 @@ before optimizing batching, and measure per-group rescan cost.
   collapses `select`, `take`, `score`, `collect` and `optional` and moves
   scalar predicates out of `match`. Recorded as a decision RFC 0048 must
   take before its syntax stabilizes; the moved-in text above is unchanged.
+- 2026-09-18 — added programmability: transparent `define`, a typed plan
+  input surface, multi-statement requests at one snapshot; procedural
+  control flow, opaque functions and free inference calls excluded.
 - 2026-09-18 — made the in-context consumer the design target: card-sized
   kernel, case-insensitive atomic keywords, spellings decided by measured
   first-try validity rather than analogy to any prior language.
