@@ -27,7 +27,10 @@ records four composition examples (C1–C4) whose logical plans the grammar must
 leave room for. It also records the design direction for graph-wide discovery
 across entity types, which is explicitly deferred.
 
-It decides no search semantics: [RFC 0048](0048-search-contracts.md) owns rank stages, sources,
+The [kernel](#kernel-one-stage-per-job) section proposes the closed set of
+stage kinds every query composes from, the open sets extension flows
+through, and the spellings in RFC 0048's sketch it collapses so that each
+operation has one form. It decides no search semantics: [RFC 0048](0048-search-contracts.md) owns rank stages, sources,
 fusion, selection and result metadata, and [Analyzed lexical search](2026-09-18-analyzed-lexical-search.md)
 owns analyzers, matching and scoring. It was split out of RFC 0048 on
 2026-09-18 so that search decisions are not blocked on language decisions
@@ -662,6 +665,207 @@ RRF behavior in the retrieval-task evaluation. The grammar, typed result and
 global-corpus rules require an explicit extension; this section records its
 design direction and does not claim implemented support.
 
+### Kernel: one stage per job
+
+**Principle.** The language is a small kernel of stage kinds over binding
+tables plus one expression grammar. Each kernel stage has one job and one
+spelling. A convenience spelling is admitted only when it desugars to exactly
+one kernel form, `explain` shows that form, and the RFC that adds the spelling
+names the desugaring. A construct that cannot be desugared is a new kernel
+stage and needs its own RFC. Extensibility comes from three open sets that
+the typechecker resolves — pattern items, expression functions and retrieval
+sources — never from new clause shapes, so a new retriever, scoring feature,
+path selector or subquery reduction adds no grammar rule.
+
+**Stages.** A query is `match` followed by any sequence of stages, then
+`return`; `order` and `limit` may also follow `return`, where they read the
+projected aliases (the GQL result-statement convention). Every stage is a
+function from a working table to a working table under one accepted snapshot
+and one budget.
+
+| Stage | Job | Rows in → out | Rule |
+|---|---|---|---|
+| `match { pattern }` | Extend bindings by a graph pattern | Join; may fan out | Pattern items only: typed bindings with inline constraints (`{ name: "x" }`, `{ @id: $id }`), traversals and paths, `not { }`, `optional { }`. No scalar predicates. |
+| `filter { predicate }` | Keep rows | Subset | The only home for scalar predicates, `match_terms` included. A `filter` after a cut is the "different question" the composition laws describe. |
+| `let { expr as name, … }` | Add columns | Same rows | Scalar expressions, subquery reductions and membership-preserving scoring features (`lexical_score($p.text, terms($q))`), which replaces RFC 0048's `score` stage. Siblings read the incoming scope. |
+| `rank $x { source … yield s }` | Select and order distinct targets | Ranked rows; losing targets drop | Sources are an open set; `candidates:` is the retriever's window; `ties: [key, …]` extends the stage comparator before stable identity; `yield` names the output. One form even for one source. |
+| `group { per { … } reduce { … } }` | Aggregate | Group rows | The only aggregation. Exports keys and reductions; drops member bindings and the active order. |
+| `order { key [asc\|desc] [nulls first\|last], … }` | Order rows | Same rows | Usable at any position; replaces the inner order of RFC 0048's `select`. |
+| `limit n [of $x] [per { key, … }]` | Cut | Subset | The only cut. Unit is rows, or with `of` the distinct targets of `$x`, whose winning targets keep every binding row; `per` partitions by keys with the target/group-pair semantics RFC 0048 specifies for `take`. `of` and `per` require an active order (the latest `rank`, or a preceding `order`). Replaces `select`, `take` and the terminal `limit`. |
+| `return { expr as name, … }` | Project | Result rows | Pure projection. Aggregates inside `return` are sugar for `group` with the non-aggregate projections as keys followed by `return`; `explain` shows the `group`. This is the one admitted sugar, kept because it is the Cypher/GQL convention agents already know. |
+
+**Cuts.** There are exactly two. A retrieval window (`candidates:` on a
+source or a fusion) defines a candidate set inside `rank`; `limit` cuts a
+working table. Nothing else discards rows, and neither knows about the other:
+a small `limit` never resizes a window, a window never bounds output rows.
+
+**Subqueries are expressions.** `sub($import, …) { stages … return { … } }`
+is a correlated subquery evaluated once per incoming row over the imported
+bindings and the query parameters; its own bindings never escape. It is not a
+value by itself and appears only under a reduction in `let` or `return`:
+`collect(sub …)` gives a typed list (empty for no rows), `one(sub …)` a
+nullable object (a cardinality error above one row), `exists(sub …)` a Bool
+and `count(sub …)` an integer. Local `order` and `limit` inside the subquery
+bound its rows. This one construct replaces RFC 0048's `collect (…) as …`
+and `optional (…) as …` blocks and maps Cypher's `CALL { }`, `EXISTS { }`,
+`COUNT { }` and `COLLECT { }` subqueries. `match optional { }` remains the
+row-producing outer join (Cypher `OPTIONAL MATCH`), which fans out; the two
+are different operations, not two spellings.
+
+**Spellings this removes from RFC 0048's sketch.**
+
+| RFC 0048 sketch | Kernel form |
+|---|---|
+| `select { order { … } limit n }` | `order { … }` then `limit n` |
+| `take $i { per { $o.slug } order { … } limit 2 }` | `order { … }` (or the active rank) then `limit 2 of $i per { $o.slug }` |
+| `score $p { lexical(…) as f }` | `let { lexical_score(…) as f }` |
+| `collect ($s) as reports { … }` / `optional ($s) as owner { … }` | `let { collect(sub($s) { … }) as reports, one(sub($s) { … }) as owner }` |
+| scalar predicates inside `match { }` | `filter { … }` after the `match` |
+| `nearest`, `bm25` or `rrf` inside `order` | `rank` with one source; no sugar |
+| a stage's own tie keys expressed as a later `order` | `ties:` on the source or fusion |
+
+Mixing predicates into `match` is not only a second spelling: it is the
+mechanism behind the dropped traversal-target predicate that RFC 0047's `T26`
+refuses. Separating pattern from predicate removes the class.
+
+**Open sets.**
+
+- *Pattern items*: typed bindings, including a type union (`$x: Person |
+  Organization`) whose common properties are accessible and whose arms are
+  narrowed by an `is` predicate; inline property and `@id` constraints;
+  directed and undirected traversals with edge bindings; paths with a
+  quantifier and a named selector (`shortest k`, `all`, with acyclic/trail
+  modes) bound to a path variable. Today's `{n,m}` bound with its implicit
+  shortest-distance semantics becomes the explicit `shortest` selector so the
+  semantics is named. A type union in a binding is also the union machinery
+  for graph-wide search: `rank $x { … }` over a union target ranks every arm
+  under the [cross-type rules](#graph-wide-discovery-across-entity-types),
+  and no query-level `union` statement is needed for it.
+- *Expression functions*: scalar functions and casts, aggregates, subquery
+  reductions, scoring features, `metric(alias, rank | score | distance)`.
+- *Retrieval sources*: `lexical`, `knn`, `ann`, `rrf`; later `rerank(arm(x),
+  model: …)`, sparse and multivector representations, geometric range. All
+  share the shape `kind(args, option: value, …) as alias`.
+- *Value types*: lists, nullable objects, paths. Projection and typing rules
+  for each are the extension's obligation.
+
+Reserved extension slots that are stage kinds, not open-set members, and are
+therefore future RFCs: `unnest { list as $item }` (Cypher `UNWIND`),
+`distinct { keys }` (or `group` with keys only), a query-level `union`, and
+`offset` on `limit` (Cypher `SKIP`). Each is one new row in the stage table.
+
+**Keyword rule.** Stage keywords are atomic and positional, as RFC 0056
+treats control statements: `match`, `filter`, `let`, `rank`, `group`,
+`order`, `limit`, `return`, `yield` (inside `rank`), `per`, `reduce`, `of`,
+`not`, `optional`. Everything else — source kinds, `terms`, `arm`, `metric`,
+`sub`, reductions, aggregates — is an identifier the typechecker resolves as a
+function, so adding one never touches the grammar and never collides with a
+property name. This replaces the contextual, token-bounded keyword rule
+proposed above and is the one rule for RFCs 0055, 0056 and 0048.
+
+**Cypher and GQL constructs on the kernel.**
+
+| Construct | Kernel |
+|---|---|
+| `MATCH` / `OPTIONAL MATCH` | `match { }` / `match optional { }` |
+| `WHERE` | `filter { }` |
+| `WITH` projection / aggregation / `ORDER BY … LIMIT` | `let` / `group` / `order`, `limit` — `WITH` is three jobs, spelled as three stages |
+| `RETURN DISTINCT` | `distinct` extension slot, or `group` with keys only |
+| `UNWIND` | `unnest` extension slot |
+| `CALL { }`, `EXISTS { }`, `COUNT { }`, `COLLECT { }` subqueries | `sub(…)` under `one`/`exists`/`count`/`collect` |
+| Path patterns, quantifiers, `SHORTEST`, path variables, path modes | Pattern items |
+| Label disjunction, multiple labels | Type union in a binding, `is` narrowing |
+| `CASE`, `coalesce`, functions | Expression grammar |
+| `UNION` | Query-level `union` extension slot |
+| `SKIP` | `offset` extension of `limit` |
+| `CREATE` / `MERGE` / `SET` / `DELETE` | Mutation bodies; unchanged |
+| `LOAD CSV`, procedures | RFC 0056 control statements |
+
+**Agent retrieval semantics on the kernel.**
+
+| Need | Kernel |
+|---|---|
+| Vector, lexical, typo-tolerant retrieval | `rank` with `knn`/`ann`/`lexical` |
+| Hybrid retrieval | `rank` with named arms and `rrf` |
+| Reranking | A `rerank` source consuming an arm |
+| Typo-tolerant eligibility without ranking | `filter { match_terms(…) }` |
+| A relevance feature on already selected rows | `let { lexical_score(…) as f }` |
+| Graph-scoped candidates | `match`/`filter` before `rank` |
+| Search, expand, search again | `rank`, `match`, `rank` |
+| Diversity across owners | `limit n of $x per { … }` |
+| Global search across types | Type-union binding as the rank target |
+| Neighbourhood, connection explanation | Traversal bounds; path variables with `shortest` |
+| Identity follow-up at a snapshot | `match { $x: Person { @id: $id } }` under the session's snapshot setting |
+| Exhaustive verification beside a bounded search | `group`/`filter` over the eligible population in the same query |
+| Budgets, coverage, replay | Session settings, outside the body |
+
+**The RFC examples in kernel form.**
+
+```gq
+query find_organizations($q: String) {
+  match { $o: Organization }
+  rank $o {
+    lexical($o.name, terms($q, mode: any, max_edits: 1), candidates: 100) as words
+    ann($o.embedding, $q, oversample: 4, candidates: 100) as meaning
+    rrf(arm(words), arm(meaning, weight: 1.5), k: 60, candidates: 20) as combined
+    yield combined
+  }
+  return { $o.slug, $o.name, metric(combined, score) as score }
+  order { score desc, $o.@id asc }
+  limit 8
+}
+
+query incidents_per_organization($q: String) {
+  match { $o: Organization  $o hasIncident $i }
+  rank $i {
+    lexical($i.title, terms($q), candidates: 100, ties: [$i.opened_at desc]) as incidents
+    yield incidents
+  }
+  limit 2 of $i per { $o.slug }
+  return { $o.slug, $i.slug, metric(incidents, rank) as rank }
+  order { $o.slug asc, rank asc, $i.@id asc }
+  limit 20
+}
+
+query composition_c4($q: String) {
+  match { $i: Incident  $s hasIncident $i }
+  filter { $i.period = "prior" or $i.period = "current" }
+  group {
+    per { $s }
+    reduce {
+      count_if($i.period = "prior") as prior_count,
+      count_if($i.period = "current") as current_count
+    }
+  }
+  let { current_count - prior_count as increase }
+  order { increase desc, $s.@id asc }
+  limit 2
+  let {
+    one(sub($s) { match { $s ownedBy $person } return { $person as person } }) as owner,
+    collect(sub($s, $q) {
+      match { $s hasReport $p }
+      rank $p { lexical($p.text, terms($q), candidates: 2) as relevant  yield relevant }
+      return { $p.@id as id, $p.text as text }
+      order { metric(relevant, rank) asc, $p.@id asc }
+      limit 2
+    }) as reports
+  }
+  return {
+    $s as service, prior_count, current_count, increase, owner, reports
+  }
+}
+```
+
+Each example has one spelling per operation; the second no longer needs a
+`take` block, and the third no longer needs `select`, `optional` or
+`collect` stages. The semantics RFC 0048 specifies for pair selection,
+missing arms and nested budgets are unchanged; only the spellings moved.
+
+**Decision needed.** Adopt the kernel as the grammar RFC 0048's Phase 0
+stabilizes against, and rewrite its sketch and the `take`/`score`/`select`
+sections accordingly, or keep the separate stage kinds and record why each
+extra spelling earns its place.
+
 ## Invariants
 
 - **Query semantics are typed structures (9):** every rule here is a
@@ -776,14 +980,24 @@ before optimizing batching, and measure per-group rescan cost.
    type narrowing and heterogeneous projection. Execution is explicitly
    deferred; the compatibility proof remains due in Phase 0. The initial
    same-binding fusion implementation cannot satisfy cross-type discovery.
-3. The keyword rule shared with RFC 0055 and RFC 0056 (atomic versus
-   contextual), and where the shared expression grammar lives so that
-   control statements and query bodies parse scalars identically.
+3. Whether the kernel's atomic-positional keyword rule (which also settles
+   the RFC 0056 tension) is adopted, and where the shared expression
+   grammar lives so that control statements and query bodies parse
+   scalars identically.
+4. Whether `return` keeps its aggregate sugar as the one admitted
+   convenience form, and which of the reserved extension slots
+   (`unnest`, `distinct`, `union`, `offset`) the initial release must
+   already parse-and-refuse so that later additions are non-breaking.
 
 ## Decision log
 
 - 2026-09-18 — split out of RFC 0048 at its 2026-09-13 revision; text moved
   verbatim, links repointed, no rule changed.
+- 2026-09-18 — proposed the kernel: eight stage kinds, two cuts, subqueries
+  as reduced expressions, three open sets, atomic-positional keywords; it
+  collapses `select`, `take`, `score`, `collect` and `optional` and moves
+  scalar predicates out of `match`. Recorded as a decision RFC 0048 must
+  take before its syntax stabilizes; the moved-in text above is unchanged.
 - 2026-09-11/12 — added explicit `yield` integration, C1–C4 logical plans and
   native population/collection counterexamples. Phase 0 remains incomplete.
 - 2026-09-10 — made mixed analytical/graph/retrieval tasks the agent objective;
