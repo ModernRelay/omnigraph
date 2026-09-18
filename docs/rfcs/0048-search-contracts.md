@@ -1577,7 +1577,7 @@ Reproduce these native checks from the repository root:
 
 ```sh
 cargo test -p omnigraph-engine --test lance_surface_guards --locked
-python3 docs/rfcs/assets/0048-arrow-pool-probe.py
+python3 docs/rfcs/assets/0048-arrow-pool-probe.py   # on the evidence branch
 ```
 
 The six guard probes cited above are proposed in a separate test-only pull
@@ -1586,7 +1586,7 @@ request; the DataFusion selection probes run on the evidence branch
 
 The Arrow runner creates an isolated temporary crate, checks all resolved
 registry versions/checksums against the workspace lockfile, and enables only
-there the optional Arrow pool features. Its [Rust probe](assets/0048-arrow-pool-probe.rs)
+there the optional Arrow pool features. Its [Rust probe](https://github.com/ModernRelay/omnigraph/blob/ce5a3012d655f5a47c4475ada6ac5b8d4e488fbd/docs/rfcs/assets/0048-arrow-pool-probe.rs)
 and result receipt are reviewable; production dependency features are unchanged.
 These deterministic mechanism checks do not add latency, peak-memory or
 retrieval-quality claims. They supplement the frozen integrated prototype and
