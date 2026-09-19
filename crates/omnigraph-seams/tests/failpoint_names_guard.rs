@@ -50,29 +50,81 @@ fn line_of(contents: &str, byte_off: usize) -> usize {
     contents[..byte_off].bytes().filter(|&b| b == b'\n').count() + 1
 }
 
-fn manifest_dir() -> PathBuf {
+/// The seams crate, where this guard lives: a source walk that links only
+/// the crate whose contract it enforces, so it costs a minute wherever it
+/// runs and never resolves the engine's feature graph.
+fn seams_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// As an engine integration test this guard resolved the
+/// engine's feature graph (its dev-dependencies, no `dst`/`failpoints`),
+/// a second substrate build in the GQT job that overran its budget. The
+/// fix is structural: the crate that hosts the guard names no workspace
+/// crate in any dependency table, so no `cargo test` of it can pull the
+/// engine in. The manifest is read as text on purpose; a TOML decoder would
+/// itself be a dependency this test has to account for.
+#[test]
+fn guard_host_crate_depends_on_no_workspace_crate_issue_755() {
+    let manifest = seams_dir().join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("{} is unreadable: {e}", manifest.display()));
+    let mut table = String::new();
+    let mut offending = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            table = line.trim_matches(|c| c == '[' || c == ']').to_string();
+            continue;
+        }
+        let is_dependency_table = table == "dependencies"
+            || table == "dev-dependencies"
+            || table == "build-dependencies"
+            || table.starts_with("target.");
+        let names_workspace_crate = line.starts_with("omnigraph")
+            || line.contains("path = \"../")
+            || line.contains("package = \"omnigraph");
+        if is_dependency_table && (names_workspace_crate || table == "dependencies") {
+            offending.push(format!("{}:{}: {raw}", manifest.display(), index + 1));
+        }
+    }
+    assert!(
+        offending.is_empty(),
+        "the seams crate hosts the seam guard so that the guard links nothing but this crate; \
+         a workspace crate in its dependency tables, or any regular dependency at all, hands \
+         the guard that crate's feature graph back:\n{}",
+        offending.join("\n")
+    );
+}
+
+fn engine_dir() -> PathBuf {
+    seams_dir().join("../omnigraph")
+}
+
 fn cluster_dir() -> PathBuf {
-    manifest_dir().join("../omnigraph-cluster")
+    seams_dir().join("../omnigraph-cluster")
 }
 
 fn dst_dir() -> PathBuf {
-    manifest_dir().join("../omnigraph-dst")
+    seams_dir().join("../omnigraph-dst")
 }
 
 fn gqt_cases_dir() -> PathBuf {
-    manifest_dir().join("../omnigraph-gqt/cases")
+    seams_dir().join("../omnigraph-gqt/cases")
 }
 
 /// Production and test call sites of both crates. This guard file is
-/// deliberately not in the set (it names the patterns as literals itself).
+/// deliberately not in the set (it names the patterns as literals itself);
+/// the seams crate's own sources are the helpers' definitions, not call
+/// sites, and are not walked either.
 fn files_to_scan() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in [
-        manifest_dir().join("src"),
-        manifest_dir().join("tests"),
+        engine_dir().join("src"),
+        engine_dir().join("tests"),
         cluster_dir().join("src"),
         cluster_dir().join("tests"),
     ] {
@@ -147,7 +199,7 @@ fn seam_decisions_use_the_compile_checked_catalog() {
 }
 
 fn engine_failpoints_test() -> PathBuf {
-    manifest_dir().join("tests/failpoints.rs")
+    engine_dir().join("tests/failpoints.rs")
 }
 
 /// One declared seam static and the file it lives in.
@@ -966,11 +1018,11 @@ fn check_helper_pairing(catalogs: &[&Catalog], files: &[PathBuf], violations: &m
 fn engine_arming_roots() -> ArmingRoots {
     ArmingRoots {
         harness: vec![
-            manifest_dir().join("tests"),
+            engine_dir().join("tests"),
             dst_dir().join("src"),
             dst_dir().join("tests"),
         ],
-        src: vec![manifest_dir().join("src")],
+        src: vec![engine_dir().join("src")],
     }
 }
 
@@ -982,7 +1034,7 @@ fn cluster_arming_roots() -> ArmingRoots {
 }
 
 fn engine_catalog_path() -> PathBuf {
-    manifest_dir().join("src/seams/catalog.rs")
+    engine_dir().join("src/seams/catalog.rs")
 }
 
 fn cluster_catalog_path() -> PathBuf {
@@ -992,7 +1044,7 @@ fn cluster_catalog_path() -> PathBuf {
 /// The seams crate's decision installers, `.name(` for every `pub fn` taking
 /// `&'static self`; only arming text may call one.
 fn arming_calls() -> Vec<String> {
-    let lib = manifest_dir().join("../omnigraph-seams/src/lib.rs");
+    let lib = seams_dir().join("src/lib.rs");
     let text = std::fs::read_to_string(&lib)
         .unwrap_or_else(|e| panic!("seams crate {} is unreadable: {e}", lib.display()));
     let mut calls = Vec::new();
@@ -1019,7 +1071,7 @@ fn catalogs_are_complete_unique_and_used() {
 
     let engine = parse_catalog(
         &engine_catalog_path,
-        &manifest_dir().join("src"),
+        &engine_dir().join("src"),
         "omnigraph::seams::catalog",
     );
     let cluster = parse_catalog(
@@ -1031,7 +1083,7 @@ fn catalogs_are_complete_unique_and_used() {
     let engine_armers = armers(&engine_arming_roots(), Some(&gqt_cases_dir()));
     let cluster_armers = armers(&cluster_arming_roots(), None);
 
-    let engine_src = production_names(&manifest_dir().join("src"), &engine_catalog_path);
+    let engine_src = production_names(&engine_dir().join("src"), &engine_catalog_path);
     let cluster_src = production_names(&cluster_dir().join("src"), &cluster_catalog_path);
 
     let mut violations = Vec::new();
@@ -1040,7 +1092,7 @@ fn catalogs_are_complete_unique_and_used() {
     check_declaration_placement(
         &engine,
         &engine_catalog_path,
-        &manifest_dir().join("src"),
+        &engine_dir().join("src"),
         &mut violations,
     );
     check_declaration_placement(
@@ -1062,7 +1114,7 @@ fn catalogs_are_complete_unique_and_used() {
 
 #[test]
 fn arming_files_never_cross() {
-    let engine_src = manifest_dir().join("src");
+    let engine_src = engine_dir().join("src");
     let cluster_src = cluster_dir().join("src");
     let crossing: BTreeSet<PathBuf> = crossing_files(&engine_src, &engine_catalog_path())
         .into_iter()

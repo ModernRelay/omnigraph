@@ -84,9 +84,8 @@ lance-namespace-impls = { workspace = true }
 lance-io = { version = "11.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
+# tests/forbidden_apis.rs walks the engine's sources.
 syn = { version = "2", features = ["full", "visit"] }
-# tests/failpoint_names_guard.rs decodes `--- seam` bodies the way the GQT runner does.
-serde_yaml = { workspace = true }
 toml = "0.9"
 # benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.
 libc = "0.2"
