@@ -67,8 +67,9 @@ deferred; their typed union/projection and source contracts remain required
 language-evolution work, not an implied capability of same-type fusion.
 
 The pre-stable cutover deliberately breaks search queries and representation
-declarations, with one coordinated format rebuild after a one-release
-deprecation window for the legacy spellings. The
+declarations, after a one-release deprecation window for the legacy
+spellings and without a whole-graph rebuild: representation changes are
+adopted per field. The
 [migration table](#user-facing-changes-and-migration) owns those consequences.
 
 **Phase 0 is incomplete.** There are checked logical plans, native probes and
@@ -173,7 +174,7 @@ graphs still cross the storage-format upgrade described below.
 | Vector candidate depth inherited from final `limit`, while BM25 fusion arms scan uncapped | Each source and fusion stage has its own candidate window. Final `limit` counts output rows; graph fan-out can produce several rows per selected target. Stage comparators determine selection before final ordering. | Choose source/fusion windows explicitly and review tie keys and expected row counts. A migration cannot infer the intended recall/cost tradeoff from the old limit. |
 | Implicit vector geometry or an unresolved `@embed` model | A field's encoding recipe and geometry must resolve at schema acceptance. The model may inherit a schema-owned default recipe; distance may inherit that recipe's declared default. Raw vectors require explicit distance. | Declare the source and dimensions, then resolve a compatible recipe and geometry. A new default cannot identify how old vectors were produced; unresolved legacy vectors still need operator resolution or regeneration. |
 | Queries relying on silently ignored search constructs or permissive parameter handling | Invalid shapes, incompatible representations, token-empty queries, and exhausted budgets produce typed failures. A successful partial candidate set cannot stand in for an exact result. | Handle the declared errors and size queries explicitly; do not interpret a failure as an empty successful search. |
-| Existing graph files open directly after the upgrade | The accepted-schema change requires an export/init/load rebuild. Compatible values and logical graph content are carried over; commit history, branches, and physical indexes are not preserved by that rebuild. | Plan the data upgrade even if no query uses search. Retain the predecessor graph if its history is needed, rebuild indexes explicitly, and obtain fresh snapshot references from the rebuilt graph. |
+| Existing graph files open directly after the upgrade | Yes. `@analyzed` and resolved embedding recipes are additive schema features applied in place, in the class of an `@index` addition; a graph that adopts neither is unchanged, and commit history, branches and existing indexes are preserved. A field that adopts `@analyzed` needs its full-text index rebuilt for the NFC certificate; a field whose embedding recipe changes needs its vectors regenerated. | Plan per field, not per graph: apply the schema, rebuild the affected fields' indexes explicitly, regenerate vectors only where the recipe changed. No export/init/load is required by this change. |
 
 #### Additive capabilities
 
@@ -209,8 +210,9 @@ queries to adopt ranking. Existing search queries still need the rewrites above.
   mechanisms. Stored-query bodies that use removed search constructs must be
   updated, even though the invocation mechanism is retained.
 - Graph commits, branches, coherent reads, and existing authorization retain
-  their contracts. Index maintenance remains explicit. These guarantees do not
-  imply preservation of old branches or snapshots across the format rebuild.
+  their contracts. Index maintenance remains explicit. Branches and snapshots
+  survive the upgrade; only the explicitly rebuilt indexes and regenerated
+  vectors of adopting fields change.
 
 #### HTTP, CLI, and SDK compatibility still to confirm
 
@@ -226,13 +228,13 @@ claim that existing HTTP/SDK clients work unchanged.
 #### Migration sequence
 
 1. Review the schema and resolve analyzer, scoring, vector geometry, and
-   encoding choices before rebuilding data.
+   encoding choices before applying it.
 2. Rewrite application and stored queries against that schema, choosing
    matching modes, exact/approximate retrieval, and candidate windows.
-3. Use the existing export/init/load upgrade path, regenerate incompatible
-   representations, and reconcile indexes explicitly.
+3. Apply the schema in place, regenerate the representations whose recipe
+   changed, and rebuild the affected fields' indexes explicitly.
 4. Validate rewritten queries, expected results, client response/error handling,
-   and snapshot follow-up before switching applications to the rebuilt graph.
+   and snapshot follow-up before switching applications to the upgraded graph.
 
 The release must include the schema/query migration diagnostics, updated
 examples, user guides, and release notes. Detailed semantics and remaining
@@ -571,13 +573,13 @@ Rewritten application/stored queries and examples ship with the implementation.
 A rewrite must ask the caller to choose exact versus approximate retrieval
 and semantic windows when the old query never specified them.
 
-The accepted-schema boundary uses the existing export/init/load rebuild.
-An offline rewrite makes implicit analyzer and L2 choices explicit and
-preserves exact key/index annotations. Legacy embeddings without recoverable
+The accepted-schema boundary is an in-place apply of additive features; no
+export/init/load is required. A schema rewrite tool makes implicit analyzer
+and L2 choices explicit and preserves exact key/index annotations. Legacy embeddings without recoverable
 revision/recipe identity require operator resolution; a newly declared default
 cannot establish historical coordinate spaces. For new or regenerated values,
 `@embed("source")` may omit its model when the schema default resolves it.
-The generated schema and every expanded default are reviewed before init.
+The generated schema and every expanded default are reviewed before apply.
 Rebuilt vectors are needed when the chosen encoding recipe differs from that
 which produced existing values. The NFC/profile change also requires index
 rebuild or proven parity; an old certificate does not establish new analysis.
@@ -922,11 +924,15 @@ Rules that make an open expression safe in that position:
   by the author's act of writing it. The typed domains exist to refuse
   *implicit* mixing: `order { metric(a, score) desc, metric(b, distance) asc }`
   is two orderings, not one combined score.
-- *Missing arms are explicit.* A target absent from an arm has a null metric
-  there; an expression that can be null is refused as a `fuse` argument or
-  an `order` key unless wrapped in `coalesce` or the ordering states `nulls
-  first`/`nulls last`. A missing arm can never silently drop or demote a
-  target.
+- *Missing arms are explicit in `fuse`.* A target absent from an arm has a
+  null metric there. A `fuse` expression that can be null is refused unless
+  the null is handled (`coalesce`), because a null is not a score and would
+  silently demote the target one arm missed. An `order` key may be nullable:
+  it takes the documented placement (ascending nulls first, descending nulls
+  last) or an explicit `nulls first`/`nulls last`, and a missing-arm metric
+  sorts as a null does. That is the one rule for both positions; the
+  [selection section](#target-identity-fan-out-grouping-and-metrics) states
+  the `order` half.
 - *Identity is structural.* The fingerprint of an inline expression is the
   hash of its normalized typed AST, so `explain`, replay descriptors and the
   semantic digest treat an on-the-fly formula exactly as a named policy; a
@@ -1419,7 +1425,7 @@ differential oracle. Nothing here decides a planner.
 
 | Class | Rewrites | Precondition |
 |---|---|---|
-| Always legal | Predicate pushdown through pattern joins; predicate pushdown into a retriever as a prefilter; projection pruning; join order and traversal direction inside one `match`; fusing adjacent `filter`/`let`; top-k pushdown of `order` + `limit` over one scan | The predicate precedes the `rank` it is pushed into; pruning retains hidden metric and identity columns; the scan's order is known and the cut unit is rows |
+| Always legal | Predicate pushdown through inner pattern joins; predicate pushdown into a retriever as a prefilter; projection pruning; join order and traversal direction inside one `match`; fusing adjacent `filter`/`let`; top-k pushdown of `order` + `limit` over one scan | The join is an inner pattern join: a predicate never crosses an `optional { }` or `not { }` boundary in either direction, since inside such a block it is part of the join condition and outside it filters the joined rows (SQL's `ON` versus `WHERE`; pushing `owner.name IS NULL` into an optional match manufactures the unmatched row it should reject); the predicate precedes the `rank` it is pushed into; pruning retains hidden metric and identity columns; the scan's order is known and the cut unit is rows |
 | Barriers | None across `rank`, `group`, `limit` | A rewrite that crosses one changes the question; it is refused, and `explain` names the law that refused it |
 | Cost-based | Prefilter versus postfilter for a graph-scoped `rank` (the #587 gate; `rrf_plan` overrides); index versus exact scan; qualified fallback; late payload hydration; dense versus distinct-pair group selection | Statistics are visible, derived, explicitly maintained state (row counts, index coverage, selectivity estimates), never hidden; every route pair has a checked-in differential oracle proving identical results, `rrf_prefilter_gate.rs` being the pattern |
 | Approximation | Recall may be traded inside `ann` only, through the `oversample` mapping | That is the declared contract; `knn`, `lexical` and every exact operator admit no recall trade |
@@ -1701,7 +1707,7 @@ Extend existing test owners rather than creating a parallel search harness:
 | Boundary | Required evidence and owner |
 |---|---|
 | Grammar / types / lowering | Compiler parser/typecheck/IR fixtures for schema default declarations and resolution, rank blocks, typed lexical queries, named metrics, invalid references, parameter bounds, removed syntax, and aggregate scope |
-| Query semantics | `.gqt` cases for filter-before/after-rank, traversal-introduced targets, target/pair/binding-row counts, per-group multi-membership and null buckets, final limit independence, and exact verification |
+| Query semantics | `.gqt` cases for filter-before/after-rank, traversal-introduced targets, target/pair/binding-row counts, per-group multi-membership and null buckets, final limit independence, and exact verification; a predicate inside versus after `optional { }` and `not { }`; ordering by a missing-arm metric under default and explicit placement, and `fuse` over a nullable expression refused without `coalesce` |
 | Search mechanisms | `search.rs`, `rrf_prefilter_gate.rs`, `ordering.rs`, `aggregation.rs`, and traversal owners for arm ranks through fan-out, missing arm versus rescore, common-identity deduplication, and graph populations |
 | Substrate qualification | `lance_surface_guards.rs` and search owners for NFC/analyzer/index parity, native row-mask mapping, score statistics, vector metric/precision, tail coverage, complete boundaries and different partition layouts |
 | Snapshot / policy / transport | `point_in_time.rs`, policy owners, server `data_routes`/`stored_queries`/`openapi`, and CLI parity for coherent follow-up, expiry/refusal, metadata, policy-safe counts and resolved query identity |
@@ -1848,8 +1854,8 @@ mechanism, not weakening the promised result.
 |---|---|---|---|---|
 | A — Truth first | Refusals (`T26`, `T27`, `FullTextIndexRequired`); retrieval as typed IR; projectable metrics; deterministic ties; `warnings`/`metrics`/`retrievals`/usage descriptors; the diagnostics contract; `explain` v0 (logical plan); coarse budgets through the existing `ResourceLimitExceeded` owner; attribution of the served read floor through the usage descriptor | Low: no syntax or format change; refusals and additive fields | RFC 0047 | Characterization goldens; the traversal-target and unindexed regression cases green; the served read floor attributed (#752) |
 | B — The agent door | Stored queries as typed tools; `@description` on `.pg` declarations and in `schema show`; the one-page card; the in-context competence instrument with graph-computed ground truth; baseline measurements on today's language | None: the PG annotation is metadata | This RFC (agent-facing surface); composition RFC (instrument) | Instrument runs end to end; baseline recorded |
-| C — Representations, opt-in per field | `@analyzed` and analyzer profiles as an additive SchemaIR feature (unchanged graphs need no rebuild); resolved embedding recipes and defaults; `terms`/`match_terms` as a predicate; the exact scan baseline across index states; `bm25_v1` against the Decimal oracle; zero-edit membership through the existing FTS index, fuzzy through a budgeted scan | Medium: the format commitment is opt-in | Lexical RFC; this RFC (representation identity) | Membership laws across absent/partial/full/rebuilt indexes; oracle parity; the fuzzy and index-state regression cases green |
-| D — Kernel stages, additive, behind a setting | `filter`, `let`, `rank` (`lexical`, `knn`, `ann`, `rrf`, `ties:`), `group`, `order`/`limit` at any position with `of`/`per`, pure `return` with the aggregate sugar, `metric()`; typed stage IR with metric origin and fingerprints; coherent follow-up reads; exact physical paths only; the old grammar still parses and a session setting selects the kernel | Medium: additive syntax, no format; reversible | This RFC | Instrument A/B (first-try validity, turns) kernel versus current grammar; C2's terminal subset; barrier cost measured |
+| C — Representations, opt-in per field | `@analyzed` and analyzer profiles as an additive SchemaIR feature (unchanged graphs need no rebuild); resolved embedding recipes and defaults; `filter` as the first kernel stage, with the pattern/predicate rule that admits predicates inside `not { }`; `terms`/`match_terms` as a predicate in it; the exact scan baseline across index states; `bm25_v1` against the Decimal oracle; zero-edit membership through the existing FTS index, fuzzy through a budgeted scan | Medium: the format commitment is opt-in | Lexical RFC; this RFC (representation identity) | Membership laws across absent/partial/full/rebuilt indexes; oracle parity; the fuzzy and index-state regression cases green |
+| D — Kernel stages, additive, behind a setting | `let`, `rank` (`lexical`, `knn`, `ann`, `rrf`, `ties:`), `group`, `order`/`limit` at any position with `of`/`per`, pure `return` with the aggregate sugar, `metric()`; typed stage IR with metric origin and fingerprints; coherent follow-up reads; exact physical paths only; the old grammar still parses and a session setting selects the kernel | Medium: additive syntax, no format; reversible | This RFC | Instrument A/B (first-try validity, turns) kernel versus current grammar; C2's terminal subset; barrier cost measured |
 | E — Cutover | Release N: legacy spellings compile to the kernel with deprecation diagnostics and a rewrite tool for stored queries; GQ minor bump. Release N+1: removal and major bump under the compatibility-surfaces RFC | User-facing, bounded by the window; reversible until N+1 | This RFC and the lexical RFC (mappings) | Kernel not worse than the old grammar on the instrument; no un-migrated stored query |
 | F — Acceleration and qualification | Native lexical routes with parity oracles; ANN families qualified for recall against `knn`; statistics-driven prefilter/postfilter and route choice with differential oracles; late hydration; plan cache; engine version 2 planner integration through the rewrite catalogue | Performance only; every route behind a parity gate; piecemeal | This RFC with the engine version 2 planner RFC | Each route: oracle identical, cost measured; defaults chosen inside the evaluation envelope |
 | G — Programmability and composition | `fuse(expr)`, `define`, the typed plan surface, multi-statement requests, `sub()` reductions, type-union targets, path selectors, each its own increment | Additive, one at a time | Composition RFC | Each gated by the instrument and its own oracle |
@@ -1905,9 +1911,15 @@ declares neither is unchanged and needs no rebuild; a field that adopts
 Build bounded NFC/analysis, complete `Terms` matching, unified exact/fuzzy
 scoring against the Decimal oracle, and the exact scan baseline that holds
 across every index state, with zero-edit membership served by the existing
-FTS index and fuzzy membership by a budgeted scan. Extend search/substrate
-owners and the lexical RFC's qualification matrix; observable rows, shapes
-and errors belong in GQT.
+FTS index and fuzzy membership by a budgeted scan. Ship `filter` here as
+the first kernel stage, an additive stage keyword plus the pattern/predicate
+rule that admits a predicate inside `not { }`, so that `match_terms` has
+its kernel position and its membership gates run through the production
+parser instead of through the spelling it replaces; `rank` and `lexical`
+wait for D, and so does the gate that needs them (predicate and retriever
+membership agreeing before a cut). Extend search/substrate owners and the
+lexical RFC's qualification matrix; observable rows, shapes and errors
+belong in GQT.
 
 **Exit:** the [lexical RFC's phase](2026-09-18-analyzed-lexical-search.md#rollout) exit; export/reapplication,
 rename versus drop/re-add, default/override and no-drift fixtures for both
@@ -1922,8 +1934,9 @@ provider label is not an immutable encoder; unverifiable aliases are refused.
 **Input:** Phase C representations, Phase B's baseline, Phase 0's kernel
 decision.
 
-Add the kernel stages to the production grammar without removing anything:
-`filter`, `let`, `rank` with `lexical`/`knn`/`ann`/`rrf` and `ties:`,
+Add the remaining kernel stages to the production grammar without removing
+anything (`filter` landed in C): `let`, `rank` with `lexical`/`knn`/`ann`/`rrf`
+and `ties:`,
 `group`, `order`/`limit` at any position with `of`/`per`, pure `return` with
 the aggregate sugar, `metric()`. Lower them through typed stage IR carrying
 metric origin and fingerprints; preserve distinct target identity,
@@ -1933,9 +1946,14 @@ coherent follow-up read path: `@id` lookup at a pinned snapshot and replay
 identity through every renderer. A session setting selects the kernel while
 both grammars parse, so the instrument compares them on the same tasks.
 
-**Exit:** executable counterexamples distinguish filter-before/after-cut,
-source windows from final limits, target counts from path counts, and
-missing membership from a new feature; C2's terminal subset returns three
+**Exit:** predicate and retriever membership agree before any cut (the
+lexical gate that needs `lexical`); executable counterexamples distinguish
+filter-before/after-cut, a predicate inside versus after an `optional { }`
+(the `IS NULL` shape) and inside versus after a `not { }`, source windows
+from final limits, target counts from path counts, and missing membership
+from a new feature; ordering by a missing-arm metric with default and
+explicit placement, and a `fuse` over a nullable expression refused without
+`coalesce`; C2's terminal subset returns three
 binding rows from p1/p2 and excludes p3; null and multiple group membership,
 metric reductions and inherited order tested; the instrument shows the kernel
 at least as good as the old grammar on first-try validity and turns; barrier
@@ -2083,6 +2101,12 @@ still require prototypes; full production qualification belongs to its phase.
 
 ## Decision log
 
+- 2026-09-19 — review fixes: no whole-graph rebuild anywhere (in-place
+  per-field adoption, matching Phase C); pushdown never crosses an
+  `optional { }`/`not { }` boundary; `filter` ships in Phase C so
+  `match_terms` has a callable kernel position and C's ranking gate moves to
+  D; one nullable-metric rule (`order` takes the documented placement, `fuse`
+  requires `coalesce`); fixtures for each added to Phase D's exit.
 - 2026-09-18 — stated the contract / physical realization / distribution of
   work split in the terms of `docs/dev/systems.md` (#745).
 - 2026-09-18 — corrected Phase A's performance item after measuring the

@@ -754,8 +754,11 @@ pattern `WHERE` versus its `FILTER` statement, SQL/PGQ's `GRAPH_TABLE`
 rule here is the SQL `ON`/`WHERE` rule: a predicate may sit inside a pattern
 block only in the sub-patterns where moving it outside would change the
 answer, `optional { }` and `not { }`; inline constraints remain pattern
-properties; every other predicate is a `filter` stage. Gremlin, which makes
-no distinction and lets step order carry the meaning, is the counterexample:
+properties; every other predicate is a `filter` stage. The same boundary
+binds the optimizer: a predicate never crosses an `optional { }` or
+`not { }` boundary in either direction (RFC 0048's rewrite catalogue), which
+is the `IS NULL` counterexample stated as a rule. Gremlin, which makes no
+distinction and lets step order carry the meaning, is the counterexample:
 the planner cannot tell a shape from a selection.
 
 **Open sets.**
@@ -1062,6 +1065,8 @@ before optimizing batching, and measure per-group rescan cost.
   collapses `select`, `take`, `score`, `collect` and `optional` and moves
   scalar predicates out of `match`. Recorded as a decision RFC 0048 must
   take before its syntax stabilizes; the moved-in text above is unchanged.
+- 2026-09-19 — review fix: the pattern/predicate boundary is also the
+  optimizer's pushdown boundary.
 - 2026-09-18 — stated the kernel as operations-before-interface in the terms
   of `docs/dev/systems.md` (#745).
 - 2026-09-18 — kernel adopted; C1–C4 rewritten to `filter`, `order` +
