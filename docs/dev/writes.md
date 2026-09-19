@@ -21,7 +21,7 @@ prepare logical change and validate it
         ↓
 stage exact Lance transactions (no HEAD movement)
         ↓
-acquire schema → branch → sorted-table gates, recheck the complete authority
+acquire shared schema permit → branch → sorted-table gates, recheck the complete authority
         ↓
 commit each participant as a detached version of its pin
         ↓
@@ -99,12 +99,18 @@ history for collision, expected-version, and lineage validation.
 
 Finalization acquires the root-shared gate order:
 
-1. schema;
+1. the schema gate — a shared permit for ordinary writers (only a
+   contract-lifecycle pass such as schema apply or the system-column
+   upgrade takes it exclusively, so cross-branch writers do not serialize
+   on it; see
+   [RFC 2026-09-18-shared-schema-gate](../rfcs/2026-09-18-shared-schema-gate.md));
 2. target branch;
 3. touched `(table identity, physical branch)` entries in deterministic order;
 4. coordinator publication.
 
-These gates order work inside one process. Correctness still depends on the
+Promotion runs after the mutation, load, and ensure-indices writers release
+this envelope; it needs no gate for correctness. These gates order work
+inside one process. Correctness still depends on the
 persisted manifest precondition and the exact Lance transaction identity each
 pin records. A retryable pre-effect attempt discards all staged work, captures a new
 `WriteTxn`, and repeats boundedly; it never reuses batches against a new base.

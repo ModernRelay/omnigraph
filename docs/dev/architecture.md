@@ -127,7 +127,9 @@ gates for single-writer ownership.
 
 ## Concurrency and support boundary
 
-- Reads are snapshot-isolated and do not take write gates.
+- Reads are snapshot-isolated. A read-view capture takes a shared schema
+  permit (so it cannot observe a contract mid-swap) and no branch or table
+  gate; it does not wait for writers.
 - Write preparation may overlap. Durable effects are ordered by the shared
   schema, branch, and sorted-table gates, then fenced again by persisted
   authority and Lance transaction identity.

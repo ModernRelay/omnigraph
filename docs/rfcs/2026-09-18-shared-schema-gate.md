@@ -2,12 +2,12 @@
 rfc: "2026-09-18-shared-schema-gate"
 title: "Shared schema gate and the write critical section"
 track: maintainer
-status: draft
-implementation: not-started
+status: accepted
+implementation: complete
 authors:
   - ragnorc
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-09-19
 discussion: null
 supersedes: []
 superseded_by: []
@@ -259,13 +259,17 @@ one-commit revert.
 - Group commit (RFC 0067 path step 3) restructures the same critical section
   at the publisher; it composes with this change (it needs concurrent
   arrivals, which this change creates) and is a separate proposal.
-- Whether optimize and cleanup should take the exclusive side out of caution
-  rather than the shared side. They hold every table gate they touch, so
-  they already serialize with writers at table grain; this RFC proposes
-  shared and records the question for review.
 
 ## Decision log
 
 - 2026-09-18 — Drafted against the detached-commit engine, with the
   concurrent-writes instrument's sequential cross-engine baselines as the
   motivating evidence. Blocked on RFC 0067 merging.
+- 2026-09-19 — Implemented. Optimize and cleanup take the shared side (they
+  hold every table gate they touch, so they already serialize with writers
+  at table grain); read-only open and reload stay exclusive as recorded
+  conservatism. The mis-classification tripwire is
+  `parked_writer_blocks_schema_apply`; the plain-mode fairness pin is
+  `queued_schema_exclusive_blocks_later_shared`; the DST concurrent
+  universe gained the schema-apply-racing-writers arm with strict replay
+  asserted (`sched_escapes == 0`).
