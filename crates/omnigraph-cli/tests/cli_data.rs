@@ -2246,7 +2246,7 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
 }
 
 #[test]
-fn remote_json_errors_preserve_server_codes_and_details() {
+fn remote_json_errors_preserve_server_codes_and_details_issue_466() {
     use support::managed_http::{IntentApiFixture, IntentReply};
 
     for (arguments, status, body, exit) in [
@@ -2306,19 +2306,208 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 Some(exit),
                 "{arguments:?} {format:?}: {output:?}"
             );
-            assert_eq!(
-                serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
-                    panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
-                }),
-                body,
-                "{arguments:?} {format:?} must preserve the server's complete error contract"
-            );
+            let mut actual = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+                panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
+            });
+            if arguments[0] == "mutate" && exit != 4 {
+                assert_eq!(actual["command_outcome"]["action"], "reconcile");
+                actual.as_object_mut().unwrap().remove("command_outcome");
+            }
+            assert_eq!(actual, body, "all original structured details must survive");
             assert!(
                 output.stderr.is_empty(),
                 "{arguments:?} {format:?}: {output:?}"
             );
             server.assert_complete();
         }
+    }
+}
+
+#[test]
+fn data_write_outcomes_and_uncertain_responses_issue_466() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    let recovery = serde_json::json!({
+        "error":"outcome requires recovery", "code":"conflict",
+        "recovery_required":{"operation_id":"original-operation"},
+        "read_set_conflict":{"member":"head","expected":"a","actual":"b"}
+    });
+    for (status, body, exit, execution, action) in [
+        (
+            429,
+            serde_json::json!({"error":"admission full","code":"too_many_requests"}),
+            75,
+            "not_started",
+            "retry",
+        ),
+        (
+            429,
+            serde_json::json!({"error":"new server detail","code":"too_many_requests","future_detail":{"possibly_committed":true}}),
+            1,
+            "returned",
+            "reconcile",
+        ),
+        (
+            503,
+            serde_json::json!({"error":"unavailable","code":"too_many_requests"}),
+            1,
+            "returned",
+            "reconcile",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"conflict","code":"conflict"}),
+            1,
+            "returned",
+            "reconcile",
+        ),
+        (503, recovery.clone(), 1, "returned", "recover"),
+        (
+            429,
+            serde_json::json!({"error":"uncertain","code":"too_many_requests","recovery_required":{"operation_id":"original-operation"}}),
+            1,
+            "returned",
+            "recover",
+        ),
+        (
+            412,
+            serde_json::json!({"error":"inconsistent response","precondition_failure":{"expected":"a","actual":"b"},"recovery_required":{"operation_id":"original-operation"}}),
+            1,
+            "returned",
+            "recover",
+        ),
+    ] {
+        let server = IntentApiFixture::new(vec![IntentReply::json(status, body.clone())]);
+        let output = cli()
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "mutate",
+                "write",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        let mut actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(actual["command_outcome"]["execution"], execution);
+        assert_eq!(actual["command_outcome"]["action"], action);
+        assert_eq!(
+            actual["command_outcome"]["effects"],
+            if exit == 75 { "none" } else { "unknown" }
+        );
+        actual.as_object_mut().unwrap().remove("command_outcome");
+        let mut known_details = body;
+        // Unknown future details are not projected, but must prevent a retry
+        // even when the known part looks like an admission refusal.
+        known_details
+            .as_object_mut()
+            .unwrap()
+            .remove("future_detail");
+        assert_eq!(actual, known_details);
+        server.assert_complete(); // No implicit second request, including a retry.
+    }
+
+    for reply in [
+        IntentReply {
+            status: 504,
+            headers: vec![],
+            body: b"proxy timeout".to_vec(),
+        },
+        IntentReply::json(200, serde_json::json!({"unexpected":"response"})),
+        IntentReply {
+            status: 200,
+            headers: vec![("Content-Length".into(), "4096".into())],
+            body: br#"{"commit":{"graph_commit_id":"possibly-committed"}"#.to_vec(),
+        },
+    ] {
+        let server = IntentApiFixture::new(vec![reply]);
+        let output = cli()
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "mutate",
+                "write",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            actual["command_outcome"],
+            serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
+        );
+        server.assert_complete();
+    }
+
+    let server = IntentApiFixture::with_origin(|origin| {
+        vec![IntentReply {
+            status: 307,
+            headers: vec![(
+                "Location".into(),
+                format!("{origin}/graphs/knowledge/queries/write"),
+            )],
+            body: vec![],
+        }]
+    });
+    let output = cli()
+        .env_remove("OMNIGRAPH_BEARER_TOKEN")
+        .args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "mutate",
+            "write",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual["command_outcome"]["action"], "reconcile");
+    server.assert_complete(); // Redirects must not dispatch the mutation again.
+}
+
+#[test]
+fn compound_load_refusals_never_authorize_replay_issue_466() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("load.jsonl");
+    fs::write(&data, "").unwrap();
+    for body in [
+        serde_json::json!({"error":"admission full","code":"too_many_requests"}),
+        serde_json::json!({"error":"changed after branch creation","read_set_conflict":{"member":"head","expected":"a","actual":"b"}}),
+    ] {
+        let server = IntentApiFixture::new(vec![IntentReply::json(429, body.clone())]);
+        let output = cli()
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "load",
+                "--data",
+            ])
+            .arg(&data)
+            .args([
+                "--mode", "merge", "--branch", "review", "--from", "main", "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(actual["command_outcome"]["effects"], "unknown");
+        assert_eq!(actual["command_outcome"]["action"], "reconcile");
+        server.assert_complete();
     }
 }
 
@@ -2931,6 +3120,16 @@ fn branch_merge_defaults_target_to_main() {
     assert_eq!(merge_payload["source"], "feature");
     assert_eq!(merge_payload["target"], "main");
     assert_eq!(merge_payload["outcome"], "fast_forward");
+    assert!(merge_payload["commit"]["graph_commit_id"].is_string());
+    assert!(merge_payload["commit"]["parent_commit_id"].is_string());
+    assert!(merge_payload["commit"]["merged_parent_commit_id"].is_string());
+    assert_eq!(merge_payload["commit"]["graph_branch"], Value::Null);
+    let commits = parse_stdout_json(&output_success(
+        cli().arg("commit").arg("list").arg(&graph).arg("--json"),
+    ));
+    assert_eq!(merge_payload["commit"], commits["commits"][0]);
+    assert!(merge_payload.get("branch_deleted").is_none());
+    assert!(merge_payload.get("branch_delete_error_details").is_none());
 
     let snapshot_output = output_success(
         cli()
@@ -2941,6 +3140,10 @@ fn branch_merge_defaults_target_to_main() {
             .arg("--json"),
     );
     let snapshot: Value = serde_json::from_slice(&snapshot_output.stdout).unwrap();
+    assert_eq!(
+        merge_payload["commit"]["graph_manifest_version"],
+        snapshot["graph_manifest_version"]
+    );
     let person_entity_count = snapshot["datasets"]
         .as_array()
         .unwrap()
@@ -3011,6 +3214,17 @@ fn branch_merge_supports_explicit_target() {
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["target"], "experiment");
     assert_eq!(merge_payload["outcome"], "fast_forward");
+    assert_eq!(merge_payload["commit"]["graph_branch"], "experiment");
+    let commits = parse_stdout_json(&output_success(
+        cli()
+            .arg("commit")
+            .arg("list")
+            .arg(&graph)
+            .arg("--branch")
+            .arg("experiment")
+            .arg("--json"),
+    ));
+    assert_eq!(merge_payload["commit"], commits["commits"][0]);
 }
 
 #[test]
@@ -3072,6 +3286,14 @@ fn branch_merge_delete_branch_retires_parent_with_live_child() {
     assert_eq!(merge_payload["outcome"], "fast_forward");
     assert_eq!(merge_payload["branch_deleted"], true);
     assert!(merge_payload["branch_delete_error"].is_null());
+    assert!(merge_payload.get("branch_delete_error_details").is_none());
+    let commits = parse_stdout_json(&output_success(
+        cli().arg("commit").arg("list").arg(&graph).arg("--json"),
+    ));
+    assert_eq!(
+        merge_payload["commit"], commits["commits"][0],
+        "retiring the source must retain the published merge receipt"
+    );
 
     let list_output = output_success(
         cli()
@@ -3120,6 +3342,7 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
     );
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["outcome"], "already_up_to_date");
+    assert_eq!(merge_payload.get("commit"), Some(&Value::Null));
     assert_eq!(merge_payload["branch_deleted"], false);
     assert!(
         merge_payload["branch_delete_error"]
@@ -3127,8 +3350,67 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
             .unwrap()
             .contains("cannot delete branch 'main'")
     );
+    assert_eq!(
+        merge_payload["branch_delete_error_details"]["error"],
+        merge_payload["branch_delete_error"]
+    );
+    assert_eq!(
+        merge_payload["branch_delete_error_details"]["code"],
+        "bad_request"
+    );
     let stderr = String::from_utf8_lossy(&merge_output.stderr);
     assert!(stderr.contains("could not delete branch 'main'"));
+
+    // Keep the published merge receipt when optional source deletion fails.
+    output_success(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg("query add_person() { insert Person { name: \"Holly\", age: 30 } }")
+            .arg("--json"),
+    );
+    let merge_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("main")
+            .arg("--into")
+            .arg("feature")
+            .arg("--delete-branch")
+            .arg("--json"),
+    );
+    let merge_payload = parse_stdout_json(&merge_output);
+    assert_eq!(merge_payload["outcome"], "fast_forward");
+    assert_eq!(merge_payload["branch_deleted"], false);
+    assert_eq!(merge_payload["commit"]["graph_branch"], "feature");
+    assert_eq!(
+        merge_payload["branch_delete_error_details"]["error"],
+        merge_payload["branch_delete_error"]
+    );
+    assert_eq!(
+        merge_payload["branch_delete_error_details"]["code"],
+        "bad_request"
+    );
+    assert!(merge_payload.get("command_outcome").is_none());
+    let stderr = String::from_utf8_lossy(&merge_output.stderr);
+    assert!(stderr.contains("could not delete branch 'main'"));
+    let commits = parse_stdout_json(&output_success(
+        cli()
+            .arg("commit")
+            .arg("list")
+            .arg(&graph)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--json"),
+    ));
+    assert_eq!(
+        merge_payload["commit"], commits["commits"][0],
+        "a source-deletion refusal must retain the published merge receipt"
+    );
 
     let list_output = output_success(
         cli()

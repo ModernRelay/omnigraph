@@ -305,16 +305,27 @@ pub struct BranchMergeOutput {
     pub target: String,
     pub outcome: BranchMergeOutcome,
     pub actor_id: Option<String>,
+    /// The exact graph commit this merge published. `null` for
+    /// `already_up_to_date`, which publishes nothing. Older servers may omit
+    /// this field; a missing receipt is not evidence that a merge had no effect.
+    #[serde(default)]
+    pub commit: Option<CommitOutput>,
     /// Result of the requested post-merge source-branch deletion. Absent when
     /// `delete_branch` was not requested; `true` when the source branch was
-    /// deleted; `false` when the deletion was refused or failed (the merge
-    /// itself still succeeded — see `branch_delete_error`).
+    /// deleted; `false` when the deletion was refused or failed. A failure
+    /// does not prove that deletion had no effect; inspect the error details.
+    /// The merge itself still succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_deleted: Option<bool>,
-    /// Why the requested source-branch deletion did not happen. Present iff
+    /// Why the requested source-branch deletion did not report success. Present iff
     /// `branch_deleted` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_delete_error: Option<String>,
+    /// Structured details of the source-deletion refusal or failure. This
+    /// describes only the deletion; `outcome` and `commit` retain the successful
+    /// merge result. Older servers may provide only `branch_delete_error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_delete_error_details: Option<ErrorOutput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -463,11 +474,9 @@ pub struct ChangeOutput {
     /// Edges the mutation touched, under the `affected_nodes` rule.
     pub affected_edges: usize,
     pub actor_id: Option<String>,
-    /// The commit this write published, if any. For a branch statement: the
-    /// target's head, read after the merge released its gates, so under a
-    /// concurrent writer it may name a later commit than the merge published.
+    /// The exact commit this write published, if any, including branch merges.
     /// `null` for `created`, `deleted`, and `already_up_to_date`, which publish
-    /// nothing, and `null` when that head read fails.
+    /// nothing.
     pub commit: Option<CommitOutput>,
     /// Present only when the request was a branch statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1355,8 +1364,9 @@ pub struct KeyConflictOutput {
     pub entity_id: Option<String>,
 }
 
-/// A write rejected before durable recovery ownership because its bounded
-/// physical plan exceeded an explicit entity, byte, or transaction-chain ceiling.
+/// An explicit entity, byte, or transaction-chain ceiling was exceeded.
+/// The condition alone does not prove that a write had no effects or authorize
+/// retry; those facts depend on the enclosing operation's outcome.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResourceLimitOutput {
     pub resource: String,
@@ -1470,8 +1480,8 @@ pub struct ErrorOutput {
     /// the same strict operation will not convert it into an upsert.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_conflict: Option<KeyConflictOutput>,
-    /// Set when the request must be split into smaller graph commits. The
-    /// rejected attempt has no durable sidecar and no dataset effect.
+    /// Set when an explicit resource ceiling was exceeded. This condition
+    /// alone does not establish the operation's effects or authorize retry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<ResourceLimitOutput>,
     /// Set with HTTP 416 for a valid but unsatisfiable managed Blob byte range.
@@ -1943,6 +1953,56 @@ mod tests {
     use super::*;
     use omnigraph_compiler::settings::SettingScope;
     use serde_json::json;
+
+    #[test]
+    fn branch_merge_receipt_and_delete_details_are_additive() {
+        let legacy = json!({
+            "source": "feature",
+            "target": "main",
+            "outcome": "merged",
+            "actor_id": null,
+            "branch_deleted": false,
+            "branch_delete_error": "source deletion requires recovery"
+        });
+        let mut output: BranchMergeOutput = serde_json::from_value(legacy).unwrap();
+        assert_eq!(output.outcome, BranchMergeOutcome::Merged);
+        assert!(output.commit.is_none(), "older servers omitted receipts");
+        assert!(output.branch_delete_error_details.is_none());
+        output.commit = Some(CommitOutput {
+            graph_commit_id: "merge-commit".into(),
+            graph_branch: Some("main".into()),
+            graph_manifest_version: 7,
+            parent_commit_id: Some("target-parent".into()),
+            merged_parent_commit_id: Some("source-parent".into()),
+            actor_id: None,
+            created_at: 123,
+        });
+        output.branch_delete_error_details = Some(
+            serde_json::from_value(json!({
+                "error": "source deletion requires recovery",
+                "recovery_required": {"operation_id": "delete-operation"}
+            }))
+            .unwrap(),
+        );
+        let encoded = serde_json::to_value(&output).unwrap();
+        assert_eq!(encoded["commit"]["graph_commit_id"], "merge-commit");
+        assert_eq!(encoded["branch_deleted"], false);
+        assert_eq!(
+            encoded["branch_delete_error_details"]["recovery_required"]["operation_id"],
+            "delete-operation"
+        );
+        let decoded: BranchMergeOutput = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.commit.unwrap().graph_commit_id, "merge-commit");
+        assert_eq!(
+            decoded
+                .branch_delete_error_details
+                .unwrap()
+                .recovery_required
+                .unwrap()
+                .operation_id,
+            "delete-operation"
+        );
+    }
 
     /// `SettingsRequest` has one field per `request` row of the definition,
     /// in definition order, spelled as the row's name; a `process` row has

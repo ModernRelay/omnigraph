@@ -29,6 +29,7 @@ deployment.
 
 - [CLI guide](cli/index.md)
 - [CLI reference](cli/reference.md)
+- [Data-write outcomes and retries](cli/outcomes.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [HTTP server](operations/server.md)

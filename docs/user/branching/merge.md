@@ -21,7 +21,10 @@ branch merge "review/2026-04-25" into main
 identifier such as `main` is not. The answer is a `ChangeOutput` with
 `outcome.kind = "merged"` and `outcome.merge` one of `already_up_to_date`,
 `fast_forward`, or `merged`; after a `fast_forward` or `merged` result,
-`commit` is the target's newest commit. The statement has no `--delete-branch`
+`commit` is the exact commit this merge published, even if another writer has
+since advanced the target. An already-up-to-date merge returns `commit: null`.
+The branch HTTP route and `branch merge --json` carry the same receipt.
+The statement has no `--delete-branch`
 composition: follow it with `branch delete <source>`. A merge statement takes
 no commit precondition -- `POST /mutate/if-graph-commit` and `--if-commit`
 refuse one beside it -- and no front offers a conditional merge today.
@@ -61,9 +64,12 @@ omnigraph branch merge review/2026-04-25 --into main --delete-branch \
 ```
 
 Deletion happens after a successful merge and has its own authorization check.
-If deletion is denied or the source still has descendants, the merge remains
-successful and durable; the CLI prints a warning and the HTTP response reports
-the deletion failure. You can delete the branch later.
+If deletion is refused or fails, the merge remains successful and durable;
+the CLI retains exit 0 and prints a warning. The response preserves the merge
+receipt alongside `branch_deleted: false`, the legacy `branch_delete_error`
+message and structured `branch_delete_error_details`. A deletion error may
+have an uncertain outcome: inspect the source before retrying deletion, and
+do not replay the completed merge to retry its optional cleanup.
 
 Deleting a branch is irreversible and may make branch-only commits unavailable.
 It also releases old history for a later cleanup.

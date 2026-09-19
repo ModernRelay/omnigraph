@@ -4,9 +4,8 @@
 
 use super::*;
 use futures::StreamExt;
-use omnigraph::Session;
-use omnigraph::db::MergeOutcome;
 use omnigraph::settings::{SettingId, SettingValue};
+use omnigraph::{MergeReceipt, Session};
 use omnigraph_compiler::query::ast::{BranchStmt, EmptyFile, FileBody, QueryDecl, QueryFile};
 
 mod dispatch;
@@ -2525,7 +2524,9 @@ async fn branch_delete_body(
 /// With `delete_branch: true` the source branch is deleted after a successful
 /// merge, under its own `branch_delete` policy check. The merge is durable by
 /// then, so a deletion refusal or failure never fails the request; it is
-/// reported via `branch_deleted: false` + `branch_delete_error`.
+/// reported via `branch_deleted: false`, `branch_delete_error` and structured
+/// `branch_delete_error_details`. `commit` always identifies this merge's exact
+/// publication, even if a later writer advances the target before delivery.
 ///
 /// The GQ statement `branch merge` on `POST /mutate` runs the same body
 /// (without the deletion composition) and answers the same 409 on conflict.
@@ -2540,7 +2541,7 @@ pub(crate) async fn server_branch_merge(
     let target = request.target.unwrap_or_else(|| "main".to_string());
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     let session = state.session(&handle, request.settings.as_ref())?;
-    let outcome = branch_merge_body(
+    let receipt = branch_merge_body(
         &state,
         &handle,
         &session,
@@ -2549,21 +2550,27 @@ pub(crate) async fn server_branch_merge(
         &target,
     )
     .await?;
-    let (branch_deleted, branch_delete_error) = if request.delete_branch {
-        match delete_merged_source_branch(&handle, actor_ref, &request.source).await {
-            Ok(()) => (Some(true), None),
-            Err(message) => (Some(false), Some(message)),
-        }
-    } else {
-        (None, None)
-    };
+    let (branch_deleted, branch_delete_error, branch_delete_error_details) =
+        if request.delete_branch {
+            match delete_merged_source_branch(&handle, actor_ref, &request.source).await {
+                Ok(()) => (Some(true), None, None),
+                Err(error) => {
+                    let details = error.into_output();
+                    (Some(false), Some(details.error.clone()), Some(details))
+                }
+            }
+        } else {
+            (None, None, None)
+        };
     Ok(Json(BranchMergeOutput {
         source: request.source,
         target,
-        outcome: outcome.into(),
+        outcome: receipt.outcome.into(),
         actor_id: actor_ref.map(|actor| actor.actor_id.as_ref().to_string()),
+        commit: receipt.commit.as_ref().map(api::commit_output),
         branch_deleted,
         branch_delete_error,
+        branch_delete_error_details,
     }))
 }
 
@@ -2577,7 +2584,7 @@ async fn branch_merge_body(
     actor: Option<&AuthenticatedActor>,
     source: &str,
     target: &str,
-) -> std::result::Result<MergeOutcome, ApiError> {
+) -> std::result::Result<MergeReceipt, ApiError> {
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
@@ -2598,22 +2605,21 @@ async fn branch_merge_body(
         .try_admit(&actor_arc, 256)
         .map_err(ApiError::from_workload_reject)?;
     session
-        .branch_merge_as(source, target, actor.map(|actor| actor.actor_id.as_ref()))
+        .branch_merge_with_receipt_as(source, target, actor.map(|actor| actor.actor_id.as_ref()))
         .await
         .map_err(ApiError::from_omni)
 }
 
 /// Delete the source branch of a just-landed merge, mirroring
 /// `server_branch_delete`'s authorization (same action and target scope) but
-/// converting every failure — policy denial, dependent-branch refusal,
-/// operational error — into a message instead of an error status: the merge is
-/// already durable, so the request must not report failure for it.
+/// retaining a deletion's typed error separately from the successful merge.
+/// The caller embeds it in the compound response, preserving the merge receipt.
 async fn delete_merged_source_branch(
     handle: &GraphHandle,
     actor: Option<&AuthenticatedActor>,
     source: &str,
-) -> std::result::Result<(), String> {
-    match authorize(
+) -> std::result::Result<(), ApiError> {
+    authorize_request(
         actor,
         handle.policy.as_deref(),
         PolicyRequest {
@@ -2621,17 +2627,13 @@ async fn delete_merged_source_branch(
             branch: None,
             target_branch: Some(source.to_string()),
         },
-    ) {
-        Ok(Authz::Allowed) => {}
-        Ok(Authz::Denied(message)) => return Err(message),
-        Err(err) => return Err(err.message.into()),
-    }
+    )?;
     let actor_id = actor.map(|actor| actor.actor_id.as_ref());
     handle
         .engine
         .branch_delete_as(source, actor_id)
         .await
-        .map_err(|err| err.to_string())
+        .map_err(ApiError::from_omni)
 }
 
 #[utoipa::path(

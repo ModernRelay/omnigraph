@@ -1,4 +1,5 @@
 use super::*;
+use crate::MergeReceipt;
 use crate::changes::row_compare::{RawRow, rows_equal};
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
@@ -5319,6 +5320,30 @@ impl Session {
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
+        self.branch_merge_with_receipt_as(source, target, actor_id)
+            .await
+            .map(|receipt| receipt.outcome)
+    }
+
+    /// Merge two branches and return the exact graph commit published by this merge.
+    /// An already-up-to-date target returns a receipt without a commit.
+    pub async fn branch_merge_with_receipt(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<MergeReceipt> {
+        self.branch_merge_with_receipt_as(source, target, None)
+            .await
+    }
+
+    /// Merge as `actor_id` and return this merge's exact publication receipt.
+    /// The commit is captured by the publisher, so later target writes cannot replace it.
+    pub async fn branch_merge_with_receipt_as(
+        &self,
+        source: &str,
+        target: &str,
+        actor_id: Option<&str>,
+    ) -> Result<MergeReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `BranchTransition { source, target }` — matches the HTTP-layer
         // convention at `server_branch_merge` (branch=Some(source),
@@ -5439,7 +5464,7 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
         lineage: MergeLineage,
-    ) -> Result<MergeOutcome> {
+    ) -> Result<MergeReceipt> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
         );
@@ -5505,7 +5530,10 @@ impl Omnigraph {
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id
         {
-            return Ok(MergeOutcome::AlreadyUpToDate);
+            return Ok(MergeReceipt {
+                outcome: MergeOutcome::AlreadyUpToDate,
+                commit: None,
+            });
         }
         let is_fast_forward = base_commit.graph_commit_id == target_head_commit_id;
 
@@ -5585,7 +5613,7 @@ impl Omnigraph {
         is_fast_forward: bool,
         actor_id: Option<&str>,
         lineage: MergeLineage,
-    ) -> Result<MergeOutcome> {
+    ) -> Result<MergeReceipt> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
         let catalog = target_txn.catalog.as_ref();
@@ -6487,7 +6515,7 @@ impl Omnigraph {
             // physical planner. Erase that substrate-heavy future at the graph
             // publication boundary instead of making this recovery envelope's
             // generated state carry it inline.
-            Box::pin(self.commit_updates_on_branch_with_expected(
+            let commit = Box::pin(self.commit_updates_on_branch_with_expected(
                 target_branch,
                 &updates,
                 &expected_versions,
@@ -6498,10 +6526,10 @@ impl Omnigraph {
             .await?;
             manifest_publish_timing.finish();
 
-            Ok::<_, OmniError>((updates, changed_edge_tables))
+            Ok::<_, OmniError>((commit, changed_edge_tables))
         })
         .await;
-        let (_updates, changed_edge_tables) = match post_arm_result {
+        let (commit, changed_edge_tables) = match post_arm_result {
             Ok(result) => result,
             Err(error) => {
                 if let Some((sidecar, _)) = &recovery {
@@ -6551,10 +6579,13 @@ impl Omnigraph {
             self.invalidate_graph_index().await;
         }
 
-        Ok(if is_fast_forward {
-            MergeOutcome::FastForward
-        } else {
-            MergeOutcome::Merged
+        Ok(MergeReceipt {
+            outcome: if is_fast_forward {
+                MergeOutcome::FastForward
+            } else {
+                MergeOutcome::Merged
+            },
+            commit: Some(commit),
         })
     }
 }

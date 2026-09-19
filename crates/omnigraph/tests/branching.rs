@@ -2403,8 +2403,14 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
         .unwrap()
         .unwrap();
 
-    let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    let receipt = main
+        .branch_merge_with_receipt("feature", "main")
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcome, MergeOutcome::FastForward);
+    let published = receipt
+        .commit
+        .expect("fast-forward merge publishes a commit");
 
     let commit_graph = CommitGraph::open(uri).await.unwrap();
     let head = commit_graph.head_commit().await.unwrap().unwrap();
@@ -2421,13 +2427,63 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
 
     assert_eq!(latest_commits.len(), 1);
     assert_eq!(head.graph_manifest_version, latest_manifest_version);
+    assert_eq!(published.graph_commit_id, head.graph_commit_id);
+    assert_eq!(published.graph_manifest_version, latest_manifest_version);
+    assert_eq!(published.graph_branch, None);
+    assert_eq!(published.actor_id, None);
+    assert_eq!(published.created_at, head.created_at);
     assert_eq!(
-        head.parent_commit_id.as_deref(),
+        published.parent_commit_id.as_deref(),
         Some(target_head_before.graph_commit_id.as_str())
     );
     assert_eq!(
-        head.merged_parent_commit_id.as_deref(),
+        published.merged_parent_commit_id.as_deref(),
         Some(source_head_before.graph_commit_id.as_str())
+    );
+
+    // A different handle may advance the target before the caller uses its
+    // receipt. The receipt still identifies this merge, never that later HEAD.
+    let later = feature
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 23)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    assert_ne!(published.graph_commit_id, later.graph_commit_id);
+    assert_eq!(
+        later.parent_commit_id.as_deref(),
+        Some(published.graph_commit_id.as_str())
+    );
+    let commits_after = main.list_commits(None).await.unwrap();
+    assert_eq!(commits_after[0].graph_commit_id, later.graph_commit_id);
+    let recorded = commits_after
+        .iter()
+        .find(|commit| commit.graph_commit_id == published.graph_commit_id)
+        .unwrap();
+    assert_eq!(
+        published.graph_manifest_version,
+        recorded.graph_manifest_version
+    );
+    assert_eq!(published.parent_commit_id, recorded.parent_commit_id);
+    assert_eq!(
+        published.merged_parent_commit_id,
+        recorded.merged_parent_commit_id
+    );
+
+    let no_op = main
+        .branch_merge_with_receipt("feature", "main")
+        .await
+        .unwrap();
+    assert_eq!(no_op.outcome, MergeOutcome::AlreadyUpToDate);
+    assert!(no_op.commit.is_none());
+    assert_eq!(
+        main.list_commits(None).await.unwrap()[0].graph_commit_id,
+        later.graph_commit_id
     );
 }
 
@@ -2632,11 +2688,12 @@ async fn branch_merge_records_actor_on_latest_commit() {
     .await
     .unwrap();
 
-    let outcome = main
-        .branch_merge_as("feature", "main", Some("act-ragnor"))
+    let receipt = main
+        .branch_merge_with_receipt_as("feature", "main", Some("act-ragnor"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(receipt.outcome, MergeOutcome::FastForward);
+    let published = receipt.commit.unwrap();
 
     let head = CommitGraph::open(uri)
         .await
@@ -2646,6 +2703,8 @@ async fn branch_merge_records_actor_on_latest_commit() {
         .unwrap()
         .unwrap();
     assert_eq!(head.actor_id.as_deref(), Some("act-ragnor"));
+    assert_eq!(published.actor_id, head.actor_id);
+    assert_eq!(published.graph_commit_id, head.graph_commit_id);
 }
 
 #[tokio::test]
@@ -2674,8 +2733,12 @@ async fn already_up_to_date_branch_merge_returns_without_new_commit() {
         target_head_before.graph_manifest_version
     );
 
-    let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::AlreadyUpToDate);
+    let receipt = main
+        .branch_merge_with_receipt("feature", "main")
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcome, MergeOutcome::AlreadyUpToDate);
+    assert!(receipt.commit.is_none());
 
     let commit_graph = CommitGraph::open(uri).await.unwrap();
     let head = commit_graph.head_commit().await.unwrap().unwrap();
@@ -2716,8 +2779,23 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     .await
     .unwrap();
 
-    let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    let receipt = main
+        .branch_merge_with_receipt("feature", "main")
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcome, MergeOutcome::Merged);
+    let published = receipt.commit.expect("three-way merge publishes a commit");
+    let head = main.list_commits(None).await.unwrap().remove(0);
+    assert_eq!(published.graph_commit_id, head.graph_commit_id);
+    assert_eq!(
+        published.graph_manifest_version,
+        head.graph_manifest_version
+    );
+    assert_eq!(published.parent_commit_id, head.parent_commit_id);
+    assert_eq!(
+        published.merged_parent_commit_id,
+        head.merged_parent_commit_id
+    );
 
     let bob = query_main(
         &main,
@@ -3233,8 +3311,17 @@ async fn branch_merge_into_non_main_target_works() {
         .collect::<Vec<_>>();
     let source_before = snapshot_branch(&feature, "feature").await.unwrap();
     let source_entry = source_before.dataset("node:Person").unwrap();
-    let outcome = main.branch_merge("feature", "experiment").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    let receipt = main
+        .branch_merge_with_receipt("feature", "experiment")
+        .await
+        .unwrap();
+    assert_eq!(receipt.outcome, MergeOutcome::FastForward);
+    let published = receipt.commit.unwrap();
+    assert_eq!(published.graph_branch.as_deref(), Some("experiment"));
+    assert_eq!(
+        published.graph_commit_id,
+        main.list_commits(Some("experiment")).await.unwrap()[0].graph_commit_id
+    );
     assert_eq!(
         main.list_commits(None)
             .await

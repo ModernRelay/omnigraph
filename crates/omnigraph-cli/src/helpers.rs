@@ -415,7 +415,12 @@ pub(crate) fn apply_server_flag(
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::new())
+    // A final response must describe our sole dispatch. Replaying or
+    // redirecting a write can hide an earlier unknown outcome.
+    Ok(reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 /// Blob delivery never follows the server's external-descriptor redirect.
@@ -461,6 +466,9 @@ impl std::error::Error for PreconditionFailedCli {}
 #[derive(Debug)]
 pub(crate) struct RemoteErrorCli {
     pub(crate) output: ErrorOutput,
+    pub(crate) status: reqwest::StatusCode,
+    /// Qualify against the raw body, before serde can discard future details.
+    pub(crate) plain_admission_refusal: bool,
 }
 
 impl std::fmt::Display for RemoteErrorCli {
@@ -597,10 +605,24 @@ pub(crate) async fn remote_response_json_bounded<T: DeserializeOwned>(
             _ => text,
         };
         if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-            if error.precondition_failure.is_some() {
+            let fields: serde_json::Value = serde_json::from_str(&text)?;
+            let only_fields = |allowed: &[&str]| {
+                fields
+                    .as_object()
+                    .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+            };
+            if status == reqwest::StatusCode::PRECONDITION_FAILED
+                && crate::data_outcome::only_precondition_detail(&error)
+                && only_fields(&["error", "code", "precondition_failure"])
+            {
                 return Err(PreconditionFailedCli { output: error }.into());
             }
-            return Err(RemoteErrorCli { output: error }.into());
+            return Err(RemoteErrorCli {
+                output: error,
+                status,
+                plain_admission_refusal: only_fields(&["error", "code"]),
+            }
+            .into());
         }
         bail!("server returned {}: {}", status, text);
     }

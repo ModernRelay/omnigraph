@@ -1195,7 +1195,8 @@ impl ApiError {
         }
     }
 
-    fn from_omni(err: OmniError) -> Self {
+    /// Project an engine error into the shared HTTP and CLI error contract.
+    pub fn from_omni(err: OmniError) -> Self {
         match err {
             OmniError::Compiler(err) => Self::bad_request(err.to_string()),
             OmniError::DataFusion(message) => Self::bad_request(format!("query: {message}")),
@@ -1445,6 +1446,7 @@ const RETRY_AFTER_SECONDS: &str = "60";
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let status = self.status;
         let mut headers = axum::http::HeaderMap::new();
         if matches!(self.code, Some(ErrorCode::TooManyRequests)) {
             headers.insert(
@@ -1452,6 +1454,14 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
+        (status, headers, Json(self.into_output())).into_response()
+    }
+}
+
+impl ApiError {
+    /// Preserve the complete typed error without attaching an HTTP status.
+    /// Compound results use this for a failed sub-operation's details.
+    pub fn into_output(self) -> ErrorOutput {
         let mut output = ErrorOutput {
             error: self.message.into(),
             code: self.code,
@@ -1494,7 +1504,7 @@ impl IntoResponse for ApiError {
                 }
             }
         }
-        (self.status, headers, Json(output)).into_response()
+        output
     }
 }
 
