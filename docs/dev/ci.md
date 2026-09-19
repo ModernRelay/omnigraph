@@ -21,8 +21,8 @@ outside every class is engine input and runs every job. The `.gqt` corpus is
 read by the `omnigraph-gqt` crate (its `include_str!` cases and its harness,
 all under `GQ Logic Tests`, whose `dst-clippy` job compiles the crate so
 `Lint (clippy)` owes it nothing), by `scripts/check-fix-regression.py`
-(`Fix Regression Gate`, always on), and by the engine's seam guard
-`crates/omnigraph/tests/failpoint_names_guard.rs`, which counts a case's
+(`Fix Regression Gate`, always on), and by the seam guard
+`crates/omnigraph-seams/tests/failpoint_names_guard.rs`, which counts a case's
 `at:` name as arming a seam: `Test Workspace` runs it on engine input and
 `GQT (ordinary)` runs it on `run_gqt`, so a cases-only PR that drops the last
 case arming a seam turns the guard red where the PR can see it. No crate
@@ -74,11 +74,18 @@ Branch protection currently requires these reporting contexts:
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
-unit tests and unavailable-DST refusal from the workspace root. `GQT (dst)`
-runs the whole package, while `GQT (dst-clippy)` checks all package targets
-with Clippy. Both run from `crates/omnigraph-gqt`, whose Cargo configuration
-enables the seeded Tokio runtime. Each job has its own
-45-minute budget and cache key. Matrix fail-fast cancels the remaining jobs
+unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
+the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
+the same flagless shape; the guard is a source walk that links only the
+seams crate, so it adds about a minute rather than a second engine build.
+`GQT (dst)` runs the whole package, while `GQT (dst-clippy)` checks all
+package targets with Clippy. All three run from the repository root under
+the workspace Cargo configuration, which enables the seeded Tokio runtime.
+Each job has its own 60-minute budget and cache key; the budget covers a
+cold build with margin (at least twice the slowest observed cold build, 27
+minutes for `ordinary`), because a job that needs its cache to finish in
+time cannot re-seed that cache once it is evicted (see the cache rule under
+[Full correctness graphs](#full-correctness-graphs)). Matrix fail-fast cancels the remaining jobs
 when one fails; Cargo retains its default fail-fast between test targets.
 The required context fails if classification or any qualification fails,
 is cancelled, or is skipped. A successful run still requires all three jobs
@@ -235,6 +242,18 @@ jobs also save when red (`cache-on-failure`): dependency artifacts are valid
 whatever the test verdict, and a red seed run would otherwise leave every
 pull request cold until `main` is green again.
 
+A cache is derived state, and no job may need one to fit its budget. The
+repository's caches exceed GitHub's cap, so every save evicts the least
+recently used entries: within one `main` run, the jobs that finish first are
+evicted first by the saves of the jobs that finish last. A run cancelled by
+its timeout cannot re-seed a cache either, because the compiler is still
+writing `target` when rust-cache's post-step archives it. Every budget
+therefore covers a cold build with margin, and a job runs one feature graph:
+two `cargo` invocations in one job select the same packages, or the second
+rebuilds every crate whose features differ (issue #755 was `GQT (ordinary)`
+running the seam guard as an engine integration test, whose
+dev-dependencies resolve a second graph, 49 minutes cold against 45).
+
 Every Rust job in those three workflows installs the `rust-toolchain.toml`
 pin with a bare `rustup toolchain install`; the rustc version is part of
 every cache key, so the pin is what keeps caches warm across Rust releases.
@@ -286,7 +305,8 @@ list):
 
 `gq-logic-tests.yml` separately owns authored GQT execution through DST. Every
 step runs from the repo root under the workspace Cargo configuration; the
-refusal step clears `RUSTFLAGS` to build the one flagless shape. An
+refusal step clears `RUSTFLAGS` to build the one flagless shape, and the seam
+guard step runs under the same empty `RUSTFLAGS` to share its artifacts. An
 unavailable-runtime refusal test does not replace executing the DST cases.
 
 ## Local pre-push checks
@@ -302,6 +322,7 @@ cargo clippy --workspace --all-targets --locked \
 cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
+cargo test -p omnigraph-seams --locked --test failpoint_names_guard
 ```
 
 From `crates/omnigraph-gqt`, also run the complete configured package:

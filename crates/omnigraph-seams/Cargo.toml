@@ -19,5 +19,12 @@ decide = ["install"]
 
 [dependencies]
 
+# tests/failpoint_names_guard.rs: the source walk over the engine, cluster
+# and DST crates and the `.gqt` corpus (it decodes `--- seam` bodies the way
+# the GQT runner does).
+[dev-dependencies]
+serde_yaml = { workspace = true }
+syn = { workspace = true }
+
 [lints]
 workspace = true
