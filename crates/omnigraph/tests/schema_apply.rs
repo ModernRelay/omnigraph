@@ -370,8 +370,10 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
 
     mutation_rv.release();
     // Give the already-runnable mutation repeated scheduler turns. It must stay
-    // pending on the schema gate; completing here means it either advanced under
-    // an in-flight migration or returned a spurious post-prepare failure.
+    // pending on the schema gate — its SHARED permit parks behind the apply's
+    // held EXCLUSIVE permit (RFC 2026-09-18-shared-schema-gate); completing
+    // here means it either advanced under an in-flight migration or returned
+    // a spurious post-prepare failure.
     for _ in 0..128 {
         tokio::task::yield_now().await;
         if mutation_task.is_finished() {
@@ -390,6 +392,64 @@ async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
         .unwrap()
         .expect("insert-only mutation must reprepare under the promoted schema");
     assert_eq!(result.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Person").await, 5);
+}
+
+/// The reverse-direction pin for the shared/exclusive schema gate — the test
+/// that catches a mis-classified writer: a writer holding its SHARED permit
+/// (parked inside its envelope after detached commits, before publish) must
+/// block a schema apply's EXCLUSIVE acquisition entirely, before the apply
+/// creates its sentinel or touches any file. If a writer site were wrongly
+/// left off the gate, the apply would proceed mid-write and this test reds.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn parked_writer_blocks_schema_apply() {
+    use omnigraph::seams::catalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(init_and_load(&dir).await);
+    let desired = TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    motto: String?\n}");
+
+    let in_envelope =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER);
+    let writer_db = Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "gate-holder")], &[("$age", 27)]),
+            )
+            .await
+    });
+    in_envelope.wait_until_reached().await;
+
+    let schema_db = Arc::clone(&db);
+    let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
+    // The apply must park on the exclusive side behind the writer's shared
+    // permit: repeated scheduler turns, never finished.
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+        if schema_task.is_finished() {
+            break;
+        }
+    }
+    assert!(
+        !schema_task.is_finished(),
+        "schema apply must wait behind a writer's held shared schema permit",
+    );
+
+    in_envelope.release();
+    writer
+        .await
+        .unwrap()
+        .expect("the parked writer must publish after release");
+    schema_task
+        .await
+        .unwrap()
+        .expect("schema apply must complete once the writer's envelope releases");
     assert_eq!(count_rows(&db, "node:Person").await, 5);
 }
 
