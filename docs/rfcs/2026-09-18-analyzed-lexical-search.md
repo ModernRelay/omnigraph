@@ -208,8 +208,9 @@ typed query failure, not an empty or truncated successful matched set.
 
 ### Analyzed filtering with `filter`
 
-Analyzed filtering alone is an ordinary predicate in a `filter` stage; it
-never sits inside the pattern block (the composition RFC's
+Analyzed filtering alone is an ordinary predicate in a `filter` stage; inside
+the pattern block it appears only within `not { }` or `optional { }`, where
+its placement changes the answer (the composition RFC's
 [pattern/predicate rule](2026-09-18-gq-composition-and-language-evolution.md#kernel-one-stage-per-job)):
 
 ```gq
@@ -229,8 +230,9 @@ an explicitly tolerant query. Both resolve the same default scoring policy.
 
 These rows are the lexical part of RFC 0048's
 [migration table](0048-search-contracts.md#user-facing-changes-and-migration); the coordinated
-release, the format rebuild and the `nearest`/`order`/positional-`rrf`
-rewrites stay there.
+release and the `nearest`/`order`/positional-`rrf` rewrites stay there. No
+graph is rebuilt: `@analyzed` applies in place and only an adopting field's
+full-text index is rebuilt.
 
 | Existing usage or expectation | Proposed change | What users must do |
 |---|---|---|
@@ -241,8 +243,12 @@ rewrites stay there.
 The deprecation mapping is fixed here: `search(f, q)` and `match_text(f, q)`
 become `match_terms(f, terms(q))` (all terms, zero edits) and
 `fuzzy(f, q, n)` becomes `match_terms(f, terms(q, mode: all, max_edits: n))`
-with `n` clamped to the admitted range or refused; the predicate moves from
-the `match` block to a `filter` stage after it. The mapping changes
+with `n` clamped to the admitted range or refused. The rewrite is
+scope-preserving: a predicate at the top level of `match` moves to a
+`filter` stage after it, and a predicate inside `not { … }` stays inside
+that block as `match_terms`, because the kernel admits predicates there and
+hoisting it would either change the excluded population or leave its inner
+binding unbound. The mapping changes
 membership where today's answer depended on index state; the diagnostic says
 so. The legacy spellings never gain new semantics during the window.
 
@@ -594,8 +600,9 @@ results.
   with a diagnostic; the removal release bumps the GQ language major per the
   compatibility-surfaces RFC. Stored queries and `cluster.yaml` inline
   queries must be rewritten inside the window.
-- **Schema and format:** `@analyzed` is a SchemaIR feature; incompatible
-  binaries refuse rather than reinterpret. The NFC profiles invalidate
+- **Schema and format:** `@analyzed` is an additive SchemaIR feature applied
+  in place; graphs that do not adopt it are unchanged and no graph is
+  rebuilt; incompatible binaries refuse rather than reinterpret. The NFC profiles invalidate
   existing full-text certificates; RFC 0043's rebuild procedure applies.
 - **Results:** analyzed matching can change rows where the old answer
   depended on index state. That is the correction this RFC exists for; it is
@@ -742,6 +749,9 @@ Default resolution requires its own compiler/schema and query fixtures:
 
 The exact lexical qualification matrix retains all preceding requirements:
 
+- A search inside `not { }` migrates to `match_terms` in place and keeps the
+  excluded population; the same search hoisted to a `filter` is the
+  counterexample.
 - Positive and negative matches; `all`/`any`; repeated/reordered terms;
   null/token-empty values; empty and stop-word-only queries; validation even
   on empty populations. Edit budgets reject negative, non-integer, oversized,
@@ -783,9 +793,14 @@ lexical spellings.
 `@analyzed` and its analyzer profiles ship as an additive SchemaIR feature
 that a graph adopts field by field: a graph that declares no `@analyzed`
 field is unchanged and needs no rebuild; a field that adopts it takes the NFC
-certificate and an index rebuild for that field. Build bounded NFC/analysis,
-complete `Terms` matching, `match_terms` as a predicate, and unified
-exact/fuzzy scoring against the Decimal oracle. The exact scan is the
+certificate and an index rebuild for that field. `filter` ships in this
+phase as the first kernel stage, with the pattern/predicate rule that admits
+a predicate inside `not { }`, so `match_terms` has its kernel position and
+its gates run through the production parser. Build bounded NFC/analysis,
+complete `Terms` matching, `match_terms` as a predicate in `filter` and
+inside `not { }`, and unified exact/fuzzy scoring against the Decimal
+oracle; the `lexical` ranking source and the gate that needs it (predicate
+and retriever membership agreeing before a cut) belong to Phase D. The exact scan is the
 baseline at every index state; zero-edit membership is served through the
 existing FTS index and fuzzy membership through a budgeted scan until Phase F
 qualifies a native route. Charge statistics, coverage and scoring to the
@@ -793,8 +808,9 @@ shared context. Extend search/substrate owners and the
 [qualification matrix](#qualification-matrix); observable rows, shapes and
 errors belong in GQT.
 
-**Exit:** predicate and retriever membership agree before any cut; the
-membership laws hold across absent, partial, full and rebuilt indexes; oracle
+**Exit:** the membership laws hold across absent, partial, full and rebuilt
+indexes, through `filter` and inside `not { }`; a nested-negation search
+migrates in place; oracle
 parity for scores; total ties; typed budget failures; export and
 reapplication preserve the resolved profile; the fuzzy and index-state
 regression cases green under `issue_N` names.
@@ -820,6 +836,10 @@ relevance quality; Phase F chooses measured defaults.
 
 ## Decision log
 
+- 2026-09-19 — review fixes: the migration mapping is scope-preserving (a
+  search inside `not { }` stays there); `filter` ships in Phase C so
+  `match_terms` is callable; the ranking gate moves to Phase D; no graph is
+  rebuilt for adoption.
 - 2026-09-18 — named the membership laws as the operation's contract and the
   index as physical realization, in the terms of `docs/dev/systems.md`.
 - 2026-09-18 — `match_terms` moved from the `match` block to a `filter`
