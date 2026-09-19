@@ -50,6 +50,7 @@ use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 mod blob_cli;
 mod cli;
 mod client;
+mod data_outcome;
 mod helpers;
 mod managed;
 #[cfg(test)]
@@ -170,6 +171,18 @@ async fn main() -> Result<()> {
         (Cli::from_arg_matches(&matches)?, json)
     };
     match run(cli).await {
+        Err(error) if error.is::<data_outcome::DataCommandFailure>() => {
+            let failure = error
+                .downcast_ref::<data_outcome::DataCommandFailure>()
+                .unwrap();
+            if json {
+                print_json(failure)?;
+            } else {
+                eprintln!("{failure}");
+            }
+            std::io::stdout().flush()?;
+            std::process::exit(failure.exit_code());
+        }
         Err(error) if json => {
             if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
                 print_json(&remote.output)?;

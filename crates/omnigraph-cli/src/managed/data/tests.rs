@@ -1206,19 +1206,44 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
             .await
             .unwrap_err(), };
         let rendered = if status == 412 {
+            assert!(error.downcast_ref::<crate::data_outcome::DataCommandFailure>().is_none(),
+                "preconditions must retain their existing typed exit contract");
             serde_json::to_string(
                 &error.downcast_ref::<crate::helpers::PreconditionFailedCli>().unwrap().output,
             )
             .unwrap()
+        } else if matches!(operation, "mutate" | "load") {
+            let failure = error.downcast_ref::<crate::data_outcome::DataCommandFailure>()
+                .expect("data writes must retain their command-level outcome");
+            assert_eq!(failure.exit_code(), 1);
+            let payload = serde_json::to_value(failure).unwrap();
+            assert_eq!(payload["command_outcome"], json!({
+                "execution": if status == 401 { "returned" } else { "unknown" },
+                "effects": "unknown",
+                "action": "reconcile"
+            }));
+            if status == 200 {
+                assert_eq!(payload["error"], "invalid managed data response");
+            } else if status == 401 {
+                let remote = error.downcast_ref::<crate::helpers::RemoteErrorCli>()
+                    .expect("outcome context must preserve the typed server error");
+                assert_eq!(payload["error"], remote.output.error);
+            }
+            serde_json::to_string(&payload).unwrap()
         } else if let Some(remote) = error.downcast_ref::<crate::helpers::RemoteErrorCli>() {
+            assert!(error.downcast_ref::<crate::data_outcome::DataCommandFailure>().is_none());
             serde_json::to_string(&remote.output).unwrap()
         } else {
+            assert!(error.downcast_ref::<crate::data_outcome::DataCommandFailure>().is_none());
             error.to_string()
         };
-        assert!(!rendered.contains(DATA_TOKEN), "credential leaked: {status}");
-        if status == 200 {
+        for diagnostic in [&rendered, &error.to_string(), &format!("{error:#}"), &format!("{error:?}")] {
+            assert!(!diagnostic.contains(DATA_TOKEN), "credential leaked: {status} {operation}");
+            assert!(!diagnostic.contains(&encoded), "encoded credential leaked: {status} {operation}");
+        }
+        if status == 200 && !matches!(operation, "mutate" | "load") {
             assert_eq!(rendered, "invalid managed data response");
-        } else {
+        } else if status != 200 {
             assert!(rendered.contains("[redacted]"), "{rendered}");
         }
         server.assert_complete();

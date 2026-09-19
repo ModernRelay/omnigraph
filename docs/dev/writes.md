@@ -55,6 +55,14 @@ drops it. Commit IDs and timestamps are minted for the captured branch without
 reloading manifest history. The existing schema and branch gates still serialize
 conflicting control operations.
 
+The merge receipt carries the publisher's exact `GraphCommit` through the
+engine, HTTP and CLI. An already-up-to-date result has no new commit. No
+transport samples current history to reconstruct a receipt, and optional
+source deletion retains the merge result alongside its own error details.
+CLI retry guidance classifies the complete command: a preparation conflict
+does not prove a compound load or writable open had no earlier effects.
+See [data-write outcomes](../user/cli/outcomes.md) for the caller contract.
+
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates and recovery checks. Reuse
 requires a fresh match of the complete manifest incarnation, including the

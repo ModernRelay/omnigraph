@@ -1526,6 +1526,22 @@ fn branch_merge_outcome_schema_has_three_variants() {
     assert!(values.contains("already_up_to_date"));
     assert!(values.contains("fast_forward"));
     assert!(values.contains("merged"));
+
+    assert_optional_commit_field(&doc, "BranchMergeOutput");
+    let output = &doc["components"]["schemas"]["BranchMergeOutput"];
+    let details = &output["properties"]["branch_delete_error_details"];
+    let details_ref = details["oneOf"]
+        .as_array()
+        .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()));
+    assert_eq!(details_ref, Some("#/components/schemas/ErrorOutput"));
+    assert!(
+        output["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|field| { field.as_str() != Some("branch_delete_error_details") }),
+        "structured deletion errors must remain additive for older responses"
+    );
 }
 
 #[test]

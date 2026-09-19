@@ -57,6 +57,14 @@ pub struct MutationReceipt {
     pub commit: Option<db::GraphCommit>,
 }
 
+/// Result of one branch merge together with the exact commit published by it.
+/// `commit` is absent when the target was already up to date and nothing was published.
+#[derive(Debug, Clone)]
+pub struct MergeReceipt {
+    pub outcome: db::MergeOutcome,
+    pub commit: Option<db::GraphCommit>,
+}
+
 // DST seam: registry access for the harness's Lance-realm fault injector.
 // Mutable process-wide authority, so it exists only under the `dst`
 // feature — and doc(hidden), unlike the documented dst_* seam modules:

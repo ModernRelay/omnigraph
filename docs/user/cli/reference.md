@@ -101,16 +101,16 @@ envelope pretty and the `rows` array compact, verbatim.
 head. The id and rows share one pinned snapshot; use that id for a later
 conditional mutation.
 
-Successful `mutate --json`, `load --json`, and compatibility
+Successful `mutate --json`, `load --json`, `branch merge --json`, and compatibility
 `ingest --json` responses include `commit`, the exact commit published by
-that attempt. It contains `graph_commit_id`, optional `graph_branch`,
-`graph_manifest_version`, optional parent and merged-parent ids, optional
-`actor_id`, and `created_at` in Unix microseconds. A successful mutation
-that changes no entities returns `"commit": null`.
+that attempt. A mutation that changes no entities, or a merge already up to
+date, returns `"commit": null`. See [write outcomes](outcomes.md) for receipt fields.
 
 `--json` and read commands' `--format json` preserve a graph server's complete
 structured error on stdout (for example, `"code": "forbidden"`) and exit 1.
-Malformed responses remain diagnostics. Conditional mismatches retain exit 4.
+Data-write failures additionally report execution, effects and caller action.
+See [data-write outcomes and retries](outcomes.md) for exit 75, uncertain
+responses and compound operations. Conditional mismatches retain exit 4.
 
 ### Conditional mutations
 

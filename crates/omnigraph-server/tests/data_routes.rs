@@ -3275,6 +3275,18 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(merge_body["source"], "feature");
     assert_eq!(merge_body["target"], "main");
     assert_eq!(merge_body["outcome"], "fast_forward");
+    assert_receipt_commit_matches_get(&app, &merge_body).await;
+    assert!(merge_body.get("branch_deleted").is_none());
+    assert!(merge_body.get("branch_delete_error_details").is_none());
+
+    let (repeat_status, repeat_body) = json_response(
+        &app,
+        json_post("/branches/merge", &serde_json::to_value(&merge).unwrap()),
+    )
+    .await;
+    assert_eq!(repeat_status, StatusCode::OK);
+    assert_eq!(repeat_body["outcome"], "already_up_to_date");
+    assert_eq!(repeat_body["commit"], Value::Null);
 
     let read_main_after = ReadRequest {
         query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -3419,6 +3431,8 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
     assert_eq!(merge_body["outcome"], "fast_forward");
     assert_eq!(merge_body["branch_deleted"], true);
     assert!(merge_body["branch_delete_error"].is_null());
+    assert!(merge_body.get("branch_delete_error_details").is_none());
+    assert_receipt_commit_matches_get(&app, &merge_body).await;
 
     let (list_status, list_body) = json_response(
         &app,
@@ -3471,6 +3485,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
     .await;
     assert_eq!(merge_status, StatusCode::OK);
     assert_eq!(merge_body["outcome"], "already_up_to_date");
+    assert_eq!(merge_body["commit"], Value::Null);
     assert_eq!(merge_body["branch_deleted"], false);
     assert!(
         merge_body["branch_delete_error"]
@@ -3478,6 +3493,54 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
             .unwrap()
             .contains("cannot delete branch 'main'")
     );
+    assert_eq!(
+        merge_body["branch_delete_error_details"]["error"],
+        merge_body["branch_delete_error"]
+    );
+    assert_eq!(
+        merge_body["branch_delete_error_details"]["code"],
+        "bad_request"
+    );
+
+    // A published merge is retained just as explicitly as the no-op above
+    // when the separately authorized source deletion fails.
+    let (change_status, change_body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "insert_person",
+                "params": {"name": "Zoe", "age": 33},
+                "branch": "main"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(change_status, StatusCode::OK, "{change_body}");
+    let (merge_status, merge_body) = json_response(
+        &app,
+        json_post("/branches/merge", &serde_json::to_value(&merge).unwrap()),
+    )
+    .await;
+    assert_eq!(merge_status, StatusCode::OK, "{merge_body}");
+    assert_eq!(merge_body["outcome"], "fast_forward");
+    assert_eq!(merge_body["branch_deleted"], false);
+    assert_eq!(
+        merge_body["branch_delete_error_details"]["code"],
+        "bad_request"
+    );
+    assert_receipt_commit_matches_get(&app, &merge_body).await;
+    let (read_status, read_body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": FIND_PERSON_GQ, "params": {"name": "Zoe"}, "branch": "feature"}),
+        ),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK, "{read_body}");
+    assert_eq!(read_body["row_count"], 1);
 
     let (list_status, list_body) = json_response(
         &app,

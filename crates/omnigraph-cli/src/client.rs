@@ -53,6 +53,7 @@ use crate::blob_cli::{
     managed_response_headers, map_embedded_blob_error, remote_blob_error, whole_external_uri,
 };
 use crate::cli::CliLoadMode;
+use crate::data_outcome::{DataCommandFailure, WriteContext};
 use crate::helpers::{
     RemoteErrorCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, build_blob_http_client, build_http_client, is_remote_uri,
@@ -395,8 +396,30 @@ impl GraphClient {
     /// environment's defaults and the `--set` values, every setting accepted;
     /// the source's own `set` lines apply per call, on top.
     async fn open_session(uri: &str, settings: &[(SettingId, SettingValue)]) -> Result<Session> {
+        Self::open_session_for_command(uri, settings, false).await
+    }
+
+    async fn open_write_session(
+        uri: &str,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<Session> {
+        Self::open_session_for_command(uri, settings, true).await
+    }
+
+    async fn open_session_for_command(
+        uri: &str,
+        settings: &[(SettingId, SettingValue)],
+        write: bool,
+    ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
-        let mut session = Arc::new(Omnigraph::open(uri).await?).session(defaults, sources);
+        let engine = Omnigraph::open(uri).await.map_err(|error| {
+            if write {
+                DataCommandFailure::opening(error)
+            } else {
+                color_eyre::eyre::Report::from(error)
+            }
+        })?;
+        let mut session = Arc::new(engine).session(defaults, sources);
         for (id, value) in settings {
             session.set(*id, value, Source::Request)?;
         }
@@ -768,7 +791,12 @@ impl GraphClient {
                 if !status.is_success() {
                     let text = response.text().await?;
                     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        return Err(RemoteErrorCli { output: error }.into());
+                        return Err(RemoteErrorCli {
+                            output: error,
+                            status,
+                            plain_admission_refusal: false,
+                        }
+                        .into());
                     }
                     bail!("server returned {}: {}", status, text);
                 }
@@ -824,6 +852,13 @@ impl GraphClient {
         mode: CliLoadMode,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<LoadOutput> {
+        let context = if from.is_some() {
+            WriteContext::Compound
+        } else if matches!(mode, CliLoadMode::Append | CliLoadMode::Merge) {
+            WriteContext::RepreparableLoad
+        } else {
+            WriteContext::Single
+        };
         match self {
             GraphClient::Remote {
                 http,
@@ -856,10 +891,14 @@ impl GraphClient {
                 );
                 // One attempt only. A lost response may follow a committed
                 // load or a created branch; neither can be replayed blindly.
-                let response = request.send().await?;
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|error| DataCommandFailure::remote(error.into(), context))?;
                 let output: GraphBatchLoadOutput =
                     remote_response_json_bounded(response, token.as_deref(), *response_limit)
-                        .await?;
+                        .await
+                        .map_err(|error| DataCommandFailure::remote(error, context))?;
                 Ok(load_output_from_graph_batch(
                     base_url,
                     mode.as_str(),
@@ -867,7 +906,7 @@ impl GraphClient {
                 ))
             }
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_session(uri, settings).await?;
+                let session = Self::open_write_session(uri, settings).await?;
                 let data = std::fs::read_to_string(data)?;
                 let receipt = session
                     .load_graph_batch_as_with_receipt(
@@ -877,7 +916,8 @@ impl GraphClient {
                         mode.into(),
                         actor.as_deref(),
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| DataCommandFailure::engine(error, context))?;
                 Ok(load_output_from_receipt(
                     uri,
                     branch,
@@ -925,9 +965,10 @@ impl GraphClient {
                     token.as_deref(),
                 )
                 .await
+                .map_err(|error| DataCommandFailure::remote(error, WriteContext::Compound))
             }
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_session(uri, settings).await?;
+                let session = Self::open_write_session(uri, settings).await?;
                 let receipt = session
                     .load_file_as_with_receipt(
                         branch,
@@ -936,7 +977,8 @@ impl GraphClient {
                         mode.into(),
                         actor.as_deref(),
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| DataCommandFailure::engine(error, WriteContext::Compound))?;
                 Ok(ingest_receipt_output(uri, &receipt, mode.into(), None))
             }
         }
@@ -1001,12 +1043,13 @@ impl GraphClient {
                     *response_limit,
                 )
                 .await
+                .map_err(|error| DataCommandFailure::remote(error, WriteContext::Single))
             }
             GraphClient::Embedded { uri, actor } => {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
-                let session = Self::open_session(uri, settings).await?;
+                let session = Self::open_write_session(uri, settings).await?;
                 let actor = actor.as_deref();
                 let receipt = session
                     .mutate_as_with_expected_head_receipt(
@@ -1026,7 +1069,7 @@ impl GraphClient {
                                 expected,
                                 actual,
                             } => precondition_failed_cli(message, expected, actual).into(),
-                            other => color_eyre::eyre::Report::from(other),
+                            other => DataCommandFailure::engine(other, WriteContext::Single),
                         }
                     })?;
                 Ok(ChangeOutput {
@@ -1046,7 +1089,7 @@ impl GraphClient {
     /// merge`) from `-e`/`--query`: `POST /mutate` with the source alone, or
     /// the engine call the matching `branch` verb makes, answered as the
     /// server answers it (`branch` received the effect, both counts `0`,
-    /// `commit` the target's head after a publishing merge). The `--set`
+    /// `commit` the engine's exact publication from a publishing merge). The `--set`
     /// values and the source's `set` lines reach the merge, the one control
     /// write that consults a setting.
     pub(crate) async fn branch_write_statement(
@@ -1074,6 +1117,7 @@ impl GraphClient {
                     *response_limit,
                 )
                 .await
+                .map_err(|error| DataCommandFailure::remote(error, WriteContext::Compound))
             }
             GraphClient::Embedded { uri, actor } => {
                 let query_name = write.statement_name().to_string();
@@ -1093,20 +1137,16 @@ impl GraphClient {
                     }
                     BranchWrite::Merge { source, into } => {
                         let target = into.unwrap_or_else(|| "main".to_string());
-                        let mut session = Self::open_session(uri, settings).await?;
+                        let mut session = Self::open_write_session(uri, settings).await?;
                         Self::apply_prefix(&mut session, query_source)?;
-                        let merge: BranchMergeOutcome = session
-                            .branch_merge_as(&source, &target, actor.as_deref())
-                            .await?
-                            .into();
-                        let commit = match merge {
-                            BranchMergeOutcome::AlreadyUpToDate => None,
-                            BranchMergeOutcome::FastForward | BranchMergeOutcome::Merged => session
-                                .list_commits(Some(&target))
-                                .await
-                                .ok()
-                                .and_then(|commits| commits.first().map(commit_output)),
-                        };
+                        let receipt = session
+                            .branch_merge_with_receipt_as(&source, &target, actor.as_deref())
+                            .await
+                            .map_err(|error| {
+                                DataCommandFailure::engine(error, WriteContext::Compound)
+                            })?;
+                        let merge: BranchMergeOutcome = receipt.outcome.into();
+                        let commit = receipt.commit.as_ref().map(commit_output);
                         (
                             target.clone(),
                             commit,
@@ -1307,6 +1347,13 @@ impl GraphClient {
                     *response_limit,
                 )
                 .await
+                .map_err(|error| {
+                    if expect_mutation {
+                        DataCommandFailure::remote(error, WriteContext::Single)
+                    } else {
+                        error
+                    }
+                })
             }
             GraphClient::Embedded { .. } => bail!(
                 "by-name invocation needs a server (the stored-query catalog is \
@@ -1327,24 +1374,24 @@ impl GraphClient {
                 base_url,
                 token,
                 ..
-            } => {
-                remote_json(
-                    http,
-                    Method::POST,
-                    remote_url(base_url, &["branches"], &[])?,
-                    Some(serde_json::to_value(BranchCreateRequest {
-                        from: Some(from.to_string()),
-                        name: name.to_string(),
-                    })?),
-                    token.as_deref(),
-                )
-                .await
-            }
+            } => remote_json(
+                http,
+                Method::POST,
+                remote_url(base_url, &["branches"], &[])?,
+                Some(serde_json::to_value(BranchCreateRequest {
+                    from: Some(from.to_string()),
+                    name: name.to_string(),
+                })?),
+                token.as_deref(),
+            )
+            .await
+            .map_err(|error| DataCommandFailure::remote(error, WriteContext::Compound)),
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_embedded(uri).await?;
+                let db = Self::open_write_session(uri, &[]).await?;
                 let actor = actor.as_deref();
                 db.branch_create_from_as(ReadTarget::branch(from), name, actor)
-                    .await?;
+                    .await
+                    .map_err(|error| DataCommandFailure::engine(error, WriteContext::Compound))?;
                 Ok(BranchCreateOutput {
                     uri: uri.clone(),
                     from: from.to_string(),
@@ -1362,20 +1409,21 @@ impl GraphClient {
                 base_url,
                 token,
                 ..
-            } => {
-                remote_json(
-                    http,
-                    Method::DELETE,
-                    remote_url(base_url, &["branches", name], &[])?,
-                    None,
-                    token.as_deref(),
-                )
-                .await
-            }
+            } => remote_json(
+                http,
+                Method::DELETE,
+                remote_url(base_url, &["branches", name], &[])?,
+                None,
+                token.as_deref(),
+            )
+            .await
+            .map_err(|error| DataCommandFailure::remote(error, WriteContext::Compound)),
             GraphClient::Embedded { uri, actor } => {
-                let db = Self::open_embedded(uri).await?;
+                let db = Self::open_write_session(uri, &[]).await?;
                 let actor = actor.as_deref();
-                db.branch_delete_as(name, actor).await?;
+                db.branch_delete_as(name, actor)
+                    .await
+                    .map_err(|error| DataCommandFailure::engine(error, WriteContext::Compound))?;
                 Ok(BranchDeleteOutput {
                     uri: uri.clone(),
                     name: name.to_string(),
@@ -1398,44 +1446,53 @@ impl GraphClient {
                 base_url,
                 token,
                 ..
-            } => {
-                remote_json(
-                    http,
-                    Method::POST,
-                    remote_url(base_url, &["branches", "merge"], &[])?,
-                    Some(serde_json::to_value(BranchMergeRequest {
-                        source: source.to_string(),
-                        target: Some(into.to_string()),
-                        delete_branch,
-                        settings: Self::remote_settings(settings)?,
-                    })?),
-                    token.as_deref(),
-                )
-                .await
-            }
+            } => remote_json(
+                http,
+                Method::POST,
+                remote_url(base_url, &["branches", "merge"], &[])?,
+                Some(serde_json::to_value(BranchMergeRequest {
+                    source: source.to_string(),
+                    target: Some(into.to_string()),
+                    delete_branch,
+                    settings: Self::remote_settings(settings)?,
+                })?),
+                token.as_deref(),
+            )
+            .await
+            .map_err(|error| DataCommandFailure::remote(error, WriteContext::Compound)),
             GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_session(uri, settings).await?;
+                let session = Self::open_write_session(uri, settings).await?;
                 let actor = actor.as_deref();
-                let outcome = session.branch_merge_as(source, into, actor).await?;
+                let receipt = session
+                    .branch_merge_with_receipt_as(source, into, actor)
+                    .await
+                    .map_err(|error| DataCommandFailure::engine(error, WriteContext::Compound))?;
                 // Composed exactly like the server handler: the merge is
                 // durable, so a deletion refusal/failure is reported in the
                 // payload, never as an error (parity_matrix pins the two
                 // composition sites against drift).
-                let (branch_deleted, branch_delete_error) = if delete_branch {
-                    match session.branch_delete_as(source, actor).await {
-                        Ok(()) => (Some(true), None),
-                        Err(err) => (Some(false), Some(err.to_string())),
-                    }
-                } else {
-                    (None, None)
-                };
+                let (branch_deleted, branch_delete_error, branch_delete_error_details) =
+                    if delete_branch {
+                        match session.branch_delete_as(source, actor).await {
+                            Ok(()) => (Some(true), None, None),
+                            Err(err) => {
+                                let details =
+                                    omnigraph_server::ApiError::from_omni(err).into_output();
+                                (Some(false), Some(details.error.clone()), Some(details))
+                            }
+                        }
+                    } else {
+                        (None, None, None)
+                    };
                 Ok(BranchMergeOutput {
                     source: source.to_string(),
                     target: into.to_string(),
-                    outcome: outcome.into(),
+                    outcome: receipt.outcome.into(),
+                    commit: receipt.commit.as_ref().map(commit_output),
                     actor_id: actor.map(String::from),
                     branch_deleted,
                     branch_delete_error,
+                    branch_delete_error_details,
                 })
             }
         }
@@ -1526,7 +1583,12 @@ impl GraphClient {
                 if !status.is_success() {
                     let text = response.text().await?;
                     if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-                        return Err(RemoteErrorCli { output: error }.into());
+                        return Err(RemoteErrorCli {
+                            output: error,
+                            status,
+                            plain_admission_refusal: false,
+                        }
+                        .into());
                     }
                     bail!("server returned {}: {}", status, text);
                 }

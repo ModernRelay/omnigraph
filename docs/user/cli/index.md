@@ -20,7 +20,8 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 
 Run `omnigraph <command> --help` for the flags supported by your installed
 version. The [CLI reference](reference.md) summarizes addressing, commands,
-configuration, and output formats.
+configuration, and output formats. See [write outcomes](outcomes.md) before
+adding retries to a script.
 
 For a managed cluster, first select it with `use` and cache an identity
 credential with `cluster token`. Run `graphs list` to discover graph names,
