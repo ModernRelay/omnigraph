@@ -2,17 +2,16 @@
 rfc: "0047"
 title: "Search plan truth: projectable ranking, deterministic order, and loud search failures"
 track: public
-status: draft
+status: accepted
 implementation: not-started
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-18
+updated: 2026-09-19
 discussion: "https://github.com/ModernRelay/omnigraph/pull/606"
 supersedes: []
 superseded_by: []
-blocked_on:
-  - "Complete boundary-tie handling at every native candidate cut, with bounded retention or explicit resource failure"
+blocked_on: []
 ---
 
 # RFC 0047: Search plan truth: projectable ranking, deterministic order, and loud search failures
@@ -429,9 +428,11 @@ the specification; the code is re-derived against the current tree.
 | 8 | `explain` v0: the logical plan and the retrieval descriptor for a query, as a CLI flag and a route; no surface exists today | CLI `cli.rs`, server routes, API types | CLI and server tests; OpenAPI |
 | 9 | #752: attribute the served read floor per phase and report it through `usage`; independent of 1–8 | server instrumentation | a cost test pinning the object-store request count of a trivial served read |
 
-PR 6 is the one with open design work: retaining a boundary-tie plateau
-within a budget is this RFC's `blocked_on`. PRs 1–5 and 7–9 have no open
-questions.
+PR 6 is the one with open design work: the mechanism that retains a
+boundary-tie plateau within a budget. Its contract is fixed here (retention
+within an explicit budget, or a typed failure); the mechanism is PR 6's to
+prove, and it is the second unresolved question below. PRs 1–5 and 7–9 have
+no open questions.
 
 **Deployment gate.** `T26` and `T27` refuse queries the compiler accepts
 today. Stored queries persist as text and recompile when a server starts,
@@ -454,6 +455,10 @@ rollout.
 1. Is `warnings`' human-format contract (stderr for every non-full-JSON CLI
    format) acceptable, or should the JSONL metadata record grow a warnings
    field in the same change?
+2. How PR 6 retains a boundary-tie plateau at every native candidate cut
+   within its budget: the retention mechanism and the budget's unit. The
+   contract is settled (bounded retention or a typed failure); the
+   mechanism is settled by PR 6's evidence.
 
 ## Decision log
 
@@ -507,6 +512,10 @@ rollout.
   explicit unknown by default, exact counts when explicitly requested. This
   keeps query completion separate from representation knowledge and avoids
   mandatory exhaustive counting solely for default discovery metadata.
+- 2026-09-19 — accepted by the maintainer on PR #606. The former `blocked_on`
+  entry (boundary-tie retention within a budget) is not a gate on the
+  decision: PR 6's contract is stated in the rollout, and the retention
+  mechanism is recorded as unresolved question 2 for PR 6 to settle.
 
 ## Appendix: agent context (non-normative)
 

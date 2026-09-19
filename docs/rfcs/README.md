@@ -197,7 +197,7 @@ then dated RFCs by date.
 | [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
 | [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
-| [0047](0047-search-plan-truth.md) | Search plan truth: projectable ranking, deterministic order, and loud search failures | public | draft | not-started |
+| [0047](0047-search-plan-truth.md) | Search plan truth: projectable ranking, deterministic order, and loud search failures | public | accepted | not-started |
 | [0048](0048-search-contracts.md) | Search contracts and retrieval algebra | public | draft | not-started |
 | [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | partial |
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | partial |
