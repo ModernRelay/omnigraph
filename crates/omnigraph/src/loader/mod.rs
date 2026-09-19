@@ -893,15 +893,16 @@ async fn load_jsonl_reader_once<R: BufRead>(
         .await?;
     fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
     let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
-    // `_queue_guards` holds the root-shared schema → branch → sorted-table
-    // gates across manifest publication. This closes same-process
-    // interleaving across the effect lifetime. The exact publisher token
-    // remains the persistent correctness authority; these local gates do not
-    // expand the documented single-writer-process boundary.
+    // `held_gates` holds the root-shared schema permit → branch →
+    // sorted-table gates across manifest publication. This closes
+    // same-process interleaving across the effect lifetime. The exact
+    // publisher token remains the persistent correctness authority; these
+    // local gates do not expand the documented single-writer-process
+    // boundary.
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
-        guards: _queue_guards,
+        gates: _held_gates,
     } = staged.commit_all(db, branch, &txn).await?;
     // Same detached-effects → publisher boundary as mutations: every table
     // effect is committed detached, but the graph manifest has not published

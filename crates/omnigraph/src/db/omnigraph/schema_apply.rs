@@ -254,15 +254,16 @@ where
     // before planning against the accepted contract.
     db.settle_pending_schema_install().await?;
 
-    // Process-local schema-control gate. RFC-022 mutation/load commit paths
-    // acquire this before their branch/table gates and retain it through
-    // publication. Taking it before the durable sentinel closes the old race in
-    // which schema apply could create the sentinel while a mutation already held
-    // a table queue, causing that mutation to advance Lance HEAD and only then
-    // discover the schema lock. The native sentinel remains the cross-handle /
-    // crash-visible authority; this queue removes the avoidable same-handle race.
-    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
-    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
+    // Process-local schema gate, EXCLUSIVE side: schema apply is a
+    // contract-lifecycle pass, so it excludes every shared holder (writers,
+    // maintenance, branch control, read captures) and they exclude it. The
+    // permit is taken before the branch/table gates and before the durable
+    // sentinel, and retained through sentinel release, so no shared holder
+    // can revalidate against a contract this apply is about to replace.
+    // The native sentinel remains the cross-handle / crash-visible
+    // authority; this permit removes the avoidable same-handle race (RFC
+    // 2026-09-18-shared-schema-gate).
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
     acquire_schema_apply_lock(db).await?;
     let result =
         apply_schema_with_lock(db, desired_schema_source, options, actor, validate_catalog).await;
@@ -615,10 +616,12 @@ where
         .datasets()
         .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect();
-    // The outer `apply_schema` holds the schema-control serialization key from
-    // before sentinel creation through sentinel release. Per-table guards here
-    // therefore cover only the concrete table effects; acquiring the schema key
-    // again would deadlock because these queues are intentionally non-reentrant.
+    // The outer `apply_schema` holds the exclusive schema permit from before
+    // sentinel creation through sentinel release. Per-table guards here
+    // therefore cover only the concrete table effects; re-acquiring either
+    // side of the schema gate on this task deadlocks — the gate is
+    // non-reentrant, and even a shared re-entry parks behind any queued
+    // writer under the plain-mode write-preferring lock.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
     let _schema_apply_queue_guards = db
         .write_queue()

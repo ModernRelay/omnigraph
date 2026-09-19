@@ -825,10 +825,11 @@ pub(crate) struct CommittedMutation {
     /// publisher checks them together with native branch identity, exact graph
     /// head, and schema identity as one authority precondition.
     pub(crate) expected_versions: crate::db::manifest::ExpectedTableVersions,
-    /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
-    /// caller MUST hold the complete set across manifest publish (see
-    /// `commit_all`) so no same-process writer interleaves after revalidation.
-    pub(crate) guards: Vec<crate::db::write_queue::QueueGuard>,
+    /// The write envelope: shared schema permit, coarse branch gate, and
+    /// sorted `(table, branch)` guards. The caller MUST hold the complete
+    /// set across manifest publish (see `commit_all`) so no same-process
+    /// writer interleaves after revalidation.
+    pub(crate) gates: crate::db::write_queue::HeldWriteGates,
 }
 
 decide_seam! {
@@ -844,7 +845,7 @@ impl StagedMutation {
     /// base (RFC 0067), and return the publisher input plus guards. No Lance
     /// HEAD moves here, and the published pins stay detached.
     ///
-    /// **Caller must hold the returned `_guards` Vec across the
+    /// **Caller must hold the returned gates across the
     /// subsequent manifest publish.** Releasing guards before publish
     /// would let another same-process writer publish between our detached
     /// commits and our publish. The exact publisher precondition would still
@@ -881,15 +882,16 @@ impl StagedMutation {
         for entry in &staged {
             queue_keys.push((entry.table_key.clone(), branch.map(str::to_string)));
         }
-        // Total order shared with schema apply: schema gate, branch gate, then
-        // sorted per-table gates. Hold the full set through manifest publish.
-        let schema_guard = db
-            .write_queue()
-            .acquire(&crate::db::write_queue::schema_apply_serial_queue_key())
-            .await;
+        // Total order shared with schema apply: schema permit (SHARED — a
+        // writer only reads the accepted contract view; schema apply's
+        // exclusive side excludes every writer, RFC
+        // 2026-09-18-shared-schema-gate), branch gate, then sorted
+        // per-table gates. Hold the full set through manifest publish.
+        let schema = db.write_queue().acquire_schema_shared().await;
         let branch_guard = db.write_queue().acquire_branch(branch).await;
-        let mut guards = vec![schema_guard, branch_guard];
-        guards.extend(db.write_queue().acquire_many(&queue_keys).await);
+        let mut queue = vec![branch_guard];
+        queue.extend(db.write_queue().acquire_many(&queue_keys).await);
+        let gates = crate::db::write_queue::HeldWriteGates::new(schema, queue);
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //
@@ -937,7 +939,7 @@ impl StagedMutation {
             return Ok(CommittedMutation {
                 updates: Vec::new(),
                 expected_versions,
-                guards,
+                gates,
             });
         }
 
@@ -996,7 +998,7 @@ impl StagedMutation {
         Ok(CommittedMutation {
             updates,
             expected_versions,
-            guards,
+            gates,
         })
     }
 }

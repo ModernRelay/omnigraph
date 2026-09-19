@@ -175,8 +175,7 @@ pub(super) async fn upgrade_system_columns(
     if !options.check {
         db.settle_pending_schema_install().await?;
     }
-    let schema_gate_key = crate::db::write_queue::schema_apply_serial_queue_key();
-    let _schema_gate = db.write_queue().acquire(&schema_gate_key).await;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
     db.refresh_coordinator_only().await?;
     let stamp = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
         .await?

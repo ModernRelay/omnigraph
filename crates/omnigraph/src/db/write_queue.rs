@@ -145,15 +145,6 @@ async fn scheduled_lock(slot: Arc<QueueSlot>) -> QueueGuard {
 /// serialize at the queue.
 pub(crate) type TableQueueKey = (String, Option<String>);
 
-/// The write-queue key that serializes every graph-global schema writer
-/// (schema apply and the system-column upgrade) against each other and
-/// against the passes that install or discard a staged schema contract. The
-/// name cannot collide with real table keys (those are `node:`/`edge:`
-/// prefixed).
-pub(crate) fn schema_apply_serial_queue_key() -> TableQueueKey {
-    ("__schema_apply__".to_string(), None)
-}
-
 /// The graph-global schema gate: the one shared/exclusive slot.
 ///
 /// It serializes every graph-global schema writer (schema apply and the
@@ -309,10 +300,20 @@ async fn scheduled_schema_exclusive(slot: Arc<SchemaGateSlot>) -> SchemaExclusiv
 /// order at release.
 #[must_use = "dropping the gates releases the write envelope"]
 pub(crate) struct HeldWriteGates {
-    pub(crate) schema: SchemaSharedPermit,
-    /// `queue[0]` is the branch gate, followed by the lex-sorted table
-    /// gates.
-    pub(crate) queue: Vec<QueueGuard>,
+    _schema: SchemaSharedPermit,
+    /// `[0]` is the branch gate, followed by the lex-sorted table gates.
+    _queue: Vec<QueueGuard>,
+}
+
+impl HeldWriteGates {
+    /// Assemble the envelope from the gates in acquisition order: the
+    /// shared schema permit, then the branch gate and sorted table gates.
+    pub(crate) fn new(schema: SchemaSharedPermit, queue: Vec<QueueGuard>) -> Self {
+        Self {
+            _schema: schema,
+            _queue: queue,
+        }
+    }
 }
 
 /// Non-cloneable ownership of the sole immutable export cut for one graph.
@@ -638,7 +639,7 @@ mod tests {
         );
         drop(shared);
         let qm2 = Arc::clone(&qm);
-        timeout(Duration::from_secs(2), async move {
+        let _exclusive = timeout(Duration::from_secs(2), async move {
             qm2.acquire_schema_exclusive().await
         })
         .await
@@ -678,7 +679,7 @@ mod tests {
             .expect("writer task must not panic");
         drop(exclusive);
         let qm2 = Arc::clone(&qm);
-        timeout(Duration::from_secs(2), async move {
+        let _shared = timeout(Duration::from_secs(2), async move {
             qm2.acquire_schema_shared().await
         })
         .await
@@ -702,7 +703,7 @@ mod tests {
             "handles for one root must exclude on one schema gate"
         );
         drop(exclusive);
-        timeout(Duration::from_secs(2), async move {
+        let _shared = timeout(Duration::from_secs(2), async move {
             second.acquire_schema_shared().await
         })
         .await
