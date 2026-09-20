@@ -1,4 +1,5 @@
 //! Diagnostic warm-query comparison; JSON timings are evidence, never assertions.
+#![recursion_limit = "512"]
 
 use std::collections::HashMap;
 use std::error::Error;
