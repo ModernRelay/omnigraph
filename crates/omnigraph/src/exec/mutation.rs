@@ -900,6 +900,7 @@ impl Omnigraph {
                         branch,
                         "prepared mutation authority changed before effects; repreparing"
                     );
+                    crate::instrumentation::record_mutation_reprepare();
                     self.refresh().await?;
                 }
                 result => return result,
