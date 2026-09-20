@@ -125,13 +125,7 @@ jobs:
     name: GQT (${{ matrix.mode }})
     needs: classify_changes
     runs-on: ubuntu-latest
-    # Sized for a cold build with margin (the slowest observed cold
-    # `ordinary` build is 27 minutes). A cache is derived state and no job
-    # may need one to fit its budget: the repository's caches exceed
-    # GitHub's cap, so every save evicts the least recently used entries
-    # (the jobs that finish first go first), and a run cancelled by its
-    # timeout cannot re-seed one because the compiler is still writing
-    # `target` when the post-step archives it.
+    # Cold-build budget and observations: docs/dev/ci.md, GQ Logic Tests.
     timeout-minutes: 60
     strategy:
       fail-fast: true
@@ -190,14 +184,7 @@ jobs:
         run: cargo test -p omnigraph-gqt --locked --timings --lib --test runner_dispatch -- --nocapture
 
       # A case's `at:` name arms a seam in the seam guard, so a cases-only
-      # diff can change its verdict while `Test Workspace` is skipped. The
-      # guard is a source walk over the engine, cluster and DST crates and
-      # the corpus that links only the seams crate, so under the same empty
-      # RUSTFLAGS it reuses the step above's artifacts and adds about a
-      # minute. One feature graph per job: as an engine integration test,
-      # `-p omnigraph-engine` resolved a second graph (the engine's
-      # dev-dependencies, no `dst`/`failpoints`) and rebuilt the substrate,
-      # 49 minutes cold against a 45-minute budget.
+      # diff can change its verdict while `Test Workspace` is skipped.
       - name: Run the seam guard the case corpus arms
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
         env:

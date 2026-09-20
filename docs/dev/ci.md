@@ -76,17 +76,20 @@ Branch protection currently requires these reporting contexts:
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
 unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
 the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
-the same flagless shape; the guard is a source walk that links only the
-seams crate, so it adds about a minute rather than a second engine build.
+the same flagless shape; the guard is a source walk whose crate declares no
+workspace crate (its dev-dependencies are `serde_yaml`, `syn` and `toml`), so
+it adds no second engine build.
 `GQT (dst)` runs the whole package, while `GQT (dst-clippy)` checks all
 package targets with Clippy. All three run from the repository root under
 the workspace Cargo configuration, which enables the seeded Tokio runtime.
-Each job has its own 60-minute budget and cache key; the budget covers a
-cold build with margin (at least twice the slowest observed cold build, 27
-minutes for `ordinary`), because a job that needs its cache to finish in
-time cannot re-seed that cache once it is evicted (see the cache rule under
-[Full correctness graphs](#full-correctness-graphs)). Matrix fail-fast cancels the remaining jobs
-when one fails; Cargo retains its default fail-fast between test targets.
+Each job has its own 60-minute budget and cache key. The budget is at least
+twice the observed 27-minute cold `ordinary` build. The roughly 30 minutes
+recorded for `dst.yml` cover a different package selection and workload;
+they do not establish a bound for GQT `dst` or `dst-clippy`. Exact cold
+timings for those jobs remain unverified. See the cache rule under
+[Full correctness graphs](#full-correctness-graphs) for the budget policy.
+Matrix fail-fast cancels the remaining jobs when one fails; Cargo retains
+its default fail-fast between test targets.
 The required context fails if classification or any qualification fails,
 is cancelled, or is skipped. A successful run still requires all three jobs
 to pass; fail-fast never turns incomplete qualification into success.
@@ -246,11 +249,12 @@ A cache is derived state, and no job may need one to fit its budget. The
 repository's caches exceed GitHub's cap, so every save evicts the least
 recently used entries: within one `main` run, the jobs that finish first are
 evicted first by the saves of the jobs that finish last. A run cancelled by
-its timeout cannot re-seed a cache either, because the compiler is still
-writing `target` when rust-cache's post-step archives it. Every budget
-therefore covers a cold build with margin, and a job runs one feature graph:
-two `cargo` invocations in one job select the same packages, or the second
-rebuilds every crate whose features differ (issue #755 was `GQT (ordinary)`
+its timeout saves no usable cache either (issue #755: every run after the
+cancelled `main` run restored nothing). Each `GQ Logic Tests` budget
+therefore covers a cold build with margin, and a second `cargo` invocation
+in a job must not change the dependency graph: it selects packages whose
+graph the first invocation already built, or it rebuilds every crate whose
+features differ (issue #755 was `GQT (ordinary)`
 running the seam guard as an engine integration test, whose
 dev-dependencies resolve a second graph, 49 minutes cold against 45).
 
@@ -322,7 +326,6 @@ cargo clippy --workspace --all-targets --locked \
 cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
-cargo test -p omnigraph-seams --locked --test failpoint_names_guard
 ```
 
 From `crates/omnigraph-gqt`, also run the complete configured package:

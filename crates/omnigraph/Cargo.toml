@@ -85,7 +85,7 @@ lance-io = { version = "11.0.0", features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 # tests/forbidden_apis.rs walks the engine's sources.
-syn = { version = "2", features = ["full", "visit"] }
+syn = { workspace = true }
 toml = "0.9"
 # benches/scenarios.rs: wait4/rusage peak-RSS and benchmark memory caps.
 libc = "0.2"

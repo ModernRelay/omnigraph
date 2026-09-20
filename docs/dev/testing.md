@@ -18,7 +18,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 |---|---|---|
 | `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
-| `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed (it links only this crate, so it costs a minute wherever it runs) | None |
+| `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
@@ -41,7 +41,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
-| Recovery and crash windows | `recovery.rs`, `failpoints.rs`, the seams crate's `failpoint_names_guard.rs`, in-source manifest/recovery tests |
+| Recovery and crash windows | `recovery.rs`, `failpoints.rs`, in-source manifest/recovery tests |
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, stamp 8) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
@@ -183,10 +183,9 @@ Canonical workspace graph:
 cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
-cargo test -p omnigraph-seams --locked --test failpoint_names_guard
 ```
 
-The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one. The separate `GQ Logic Tests` context owns GQT: the `runner_dispatch` command above covers dispatch (CI also runs it with `RUSTFLAGS` cleared to prove unavailable-DST refusal), the seam guard beside it is the check a cases-only change can turn red, and the complete corpus command runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
+The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one; it also runs the seams crate's seam guard, the check a cases-only change can turn red (CI runs it again in `GQT (ordinary)`, where `Test Workspace` is skipped). The separate `GQ Logic Tests` context owns GQT: the `runner_dispatch` command above covers dispatch (CI also runs it with `RUSTFLAGS` cleared to prove unavailable-DST refusal), and the complete corpus command runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
 
 AWS server support has a separate feature owner:
 

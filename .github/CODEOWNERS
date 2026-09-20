@@ -13,6 +13,7 @@
 /crates/omnigraph-dst/                  @azimafroozeh
 /crates/omnigraph-gqt/                  @azimafroozeh
 /crates/omnigraph-policy/               @aaltshuler
+/crates/omnigraph-seams/                @azimafroozeh @aaltshuler
 /crates/omnigraph-server/               @aaltshuler
 /crates/omnigraph-storage/              @azimafroozeh @aaltshuler
 /tools/omnigraph-vocabulary-guard/      @azimafroozeh @aaltshuler
