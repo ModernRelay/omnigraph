@@ -25,6 +25,7 @@ pub mod dst_ids;
 #[cfg(not(feature = "dst"))]
 pub(crate) mod dst_ids;
 pub mod embedding;
+pub(crate) mod engine;
 pub mod error;
 pub(crate) mod exec;
 pub mod graph_index;

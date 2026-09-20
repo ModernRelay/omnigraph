@@ -1,0 +1,149 @@
+# issue: none
+# notes: Search membership calls accept only the positive predicate form on either engine.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d","text":"needle"}}
+
+--- query
+set engine = v1;
+query refused_0() {
+    match { $d: Doc search($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v1;
+query refused_1() {
+    match { $d: Doc search($d.text, "needle") != true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v1;
+query refused_2() {
+    match { $d: Doc search($d.text, "needle") < true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v1;
+query refused_3($enabled: Bool) {
+    match { $d: Doc search($d.text, "needle") = $enabled }
+    return { $d.slug }
+}
+
+--- params
+{"enabled":true}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v1;
+query refused_4() {
+    match { $d: Doc true = search($d.text, "needle") }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v1;
+query refused_5() {
+    match { $d: Doc match_text($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v1;
+query refused_6() {
+    match { $d: Doc fuzzy($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v2;
+query refused_0() {
+    match { $d: Doc search($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v2;
+query refused_1() {
+    match { $d: Doc search($d.text, "needle") != true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v2;
+query refused_2() {
+    match { $d: Doc search($d.text, "needle") < true }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v2;
+query refused_3($enabled: Bool) {
+    match { $d: Doc search($d.text, "needle") = $enabled }
+    return { $d.slug }
+}
+
+--- params
+{"enabled":true}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v2;
+query refused_4() {
+    match { $d: Doc true = search($d.text, "needle") }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v2;
+query refused_5() {
+    match { $d: Doc match_text($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported
+
+--- query
+set engine = v2;
+query refused_6() {
+    match { $d: Doc fuzzy($d.text, "needle") = false }
+    return { $d.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`; other comparisons are not supported

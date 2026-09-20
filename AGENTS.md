@@ -32,7 +32,7 @@ Tools that support `@` imports include these automatically:
 - Version surveyed: 0.11.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
-- Workspace: compiler, storage, `omnigraph-seams` (the one seam type every
+- Workspace: compiler, planner (logical/physical plans and optimizer), storage, `omnigraph-seams` (the one seam type every
   test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
   package), policy, API types, cluster, CLI, server, Azure admission
   wrapper, benchmark harness,
@@ -86,6 +86,9 @@ The decision lens is ongoing liability: ask what a design looks like after five
 more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
+Always validate your assumptions and don't assume a certain function/modules/symbol will work in a certain way. Especially always validate your assumptions about Lance internals by reading the implementations in the upstream code.
+Reason from first principles about OmniGraph instead of in arbitrary database categories.
+Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md)
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:
@@ -108,10 +111,7 @@ working memory:
    Never acknowledge before durable graph visibility or return silent partial
    results.
 
-Do not add a custom WAL/transaction manager, a queue for manifest-derived work,
-inline vector/FTS rebuilds, raw public Lance writers, string-built query
-semantics, process-local locks advertised as distributed fencing, cloud-only
-correctness paths, or a shadow source of truth without an accepted RFC that
+Do not add a queue for manifest-derived work, inline vector/FTS rebuilds, raw public Lance writers, string-built query semantics, process-local locks advertised as distributed fencing, cloud-only correctness paths, or a shadow source of truth without an accepted RFC that
 changes the invariant.
 
 ## Build and test
@@ -184,6 +184,12 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
   expensive regression repros use `heavy-repro:` and thereby enroll in the
   nightly job.
+- Engine v1 is frozen: `crates/omnigraph/src/exec/query.rs`,
+  `exec/projection.rs`, `tests/traversal.rs` and `tests/search.rs` are
+  upstream's bytes, pinned by `crates/omnigraph/tests/v1_frozen.rs`. A defect
+  seen on v1 is fixed on v2 (`crates/omnigraph/src/engine/`), which the
+  session setting `engine = v2` selects; a v1 edit needs the pin updated in
+  the same PR and a reviewer's eyes.
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries

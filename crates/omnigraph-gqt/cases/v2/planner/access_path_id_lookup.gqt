@@ -1,0 +1,178 @@
+# issue: none
+# notes: The hash-join fixture with unreachable destinations must use id_lookup and preserve search membership and pair multiplicity.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Source {
+    slug: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index
+    summary: String @index
+    state: String
+}
+edge Links: Source -> Doc
+
+--- seed
+{"type":"Source","data":{"slug":"s1"}}
+{"type":"Source","data":{"slug":"s2"}}
+{"type":"Source","data":{"slug":"s3"}}
+{"type":"Source","data":{"slug":"s4"}}
+{"type":"Doc","data":{"slug":"a","body":"needle one","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"b","body":"needle two","summary":"beacon","state":"closed"}}
+{"type":"Doc","data":{"slug":"c","body":"other","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"d","body":"needle three","summary":"other","state":"open"}}
+{"type":"Doc","data":{"slug":"e","body":"needle four","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"f","body":"other needle","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"z00","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z01","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z02","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z03","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z04","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z05","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z06","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z07","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z08","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z09","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z10","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z11","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z12","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z13","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z14","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z15","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z16","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z17","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z18","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z19","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z20","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z21","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z22","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z23","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z24","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z25","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z26","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z27","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z28","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z29","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z30","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z31","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z32","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z33","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z34","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z35","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z36","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z37","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z38","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z39","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z40","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z41","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z42","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z43","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z44","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z45","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z46","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z47","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z48","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z49","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z50","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z51","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z52","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z53","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z54","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z55","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z56","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z57","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z58","body":"filler","summary":"filler","state":"closed"}}
+{"type":"Doc","data":{"slug":"z59","body":"filler","summary":"filler","state":"closed"}}
+{"edge":"Links","from":"s1","to":"a"}
+{"edge":"Links","from":"s1","to":"b"}
+{"edge":"Links","from":"s2","to":"a"}
+{"edge":"Links","from":"s2","to":"c"}
+{"edge":"Links","from":"s3","to":"d"}
+{"edge":"Links","from":"s3","to":"f"}
+{"edge":"Links","from":"s4","to":"d"}
+{"edge":"Links","from":"s4","to":"f"}
+
+--- query
+set engine = v2;
+query open_needles() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+    }
+    return { $s.slug, $d.slug }
+}
+--- expect unordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s3","d.slug":"d"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"d"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: access id_lookup
+scan Doc as $d: filter reads [d.state, d.body]
+pass access_path
+
+--- query
+set engine = v2;
+query every_link() {
+    match {
+        $s: Source
+        $s links $d
+    }
+    return { $s.slug, $d.slug }
+    order { $s.slug, $d.slug }
+}
+--- expect ordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s1","d.slug":"b"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s2","d.slug":"c"}
+{"s.slug":"s3","d.slug":"d"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"d"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: access id_lookup
+scan Doc as $d: no filter
+pass access_path
+
+--- query
+set engine = v2;
+query open_needle_beacons() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+        match_text($d.summary, "beacon")
+    }
+    return { $s.slug, $d.slug }
+}
+--- expect unordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: access id_lookup
+scan Doc as $d: filter reads [d.state, d.body, d.summary]
+pass access_path

@@ -1,9 +1,8 @@
 # issue: 694
 # red_on: fb6ed452 (2026-09-12), cleanup disabled: step 8 rejects the unrelated write with pending BranchMerge on branch 'target'
-# notes: Source and donor diverge; target inherits donor without owning a table fork.
-# notes: The fault fires after every merge table effect, including the created first-touch fork, and before confirmation.
-# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
-# notes: The failed merge compensates its own unconfirmed effects on a named target before returning, so step 8 succeeds and the merge retry lands.
+# notes: Target inherits donor without owning a table fork. Fail the merge
+# notes: after table effects but before confirmation; compensation must permit an
+# notes: unrelated write and a merge retry without reopening.
 
 --- runner
 timeout_ms: 10000

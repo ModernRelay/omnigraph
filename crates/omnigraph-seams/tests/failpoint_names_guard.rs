@@ -50,41 +50,219 @@ fn line_of(contents: &str, byte_off: usize) -> usize {
     contents[..byte_off].bytes().filter(|&b| b == b'\n').count() + 1
 }
 
-fn manifest_dir() -> PathBuf {
+/// The seams crate, where this guard lives.
+fn seams_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The host crate declares no workspace crate in any dependency table and no
+/// regular dependency, so `cargo test -p omnigraph-seams` never resolves the
+/// engine's graph (docs/dev/ci.md, cache rule).
+#[test]
+fn guard_host_crate_declares_no_workspace_or_regular_dependency_issue_755() {
+    let manifest = seams_dir().join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("{} is unreadable: {e}", manifest.display()));
+    let mut offending: Vec<String> = refused_dependencies(&text)
+        .into_iter()
+        .map(|entry| format!("{}: {entry}", manifest.display()))
+        .collect();
+    let lock = seams_dir().join("../../Cargo.lock");
+    let lock_text = std::fs::read_to_string(&lock)
+        .unwrap_or_else(|e| panic!("{} is unreadable: {e}", lock.display()));
+    offending.extend(
+        locked_dependencies(&lock_text, "omnigraph-seams")
+            .into_iter()
+            .filter(|name| name.starts_with("omnigraph"))
+            .map(|name| format!("{}: omnigraph-seams depends on {name}", lock.display())),
+    );
+    assert!(
+        offending.is_empty(),
+        "the seams crate hosts the seam guard and links into every engine build, so it \
+         declares no workspace crate in any dependency table (that crate's feature graph \
+         would come back into the guard's build) and no regular dependency at all:\n{}",
+        offending.join("\n")
+    );
+}
+
+/// Dependency names `Cargo.lock` records for `package`, whatever manifest
+/// spelling produced them. Cargo writes the list; `--locked` keeps it in
+/// step with the manifest, including workspace-inherited package aliases.
+fn locked_dependencies(lock: &str, package: &str) -> Vec<String> {
+    let mut in_package = false;
+    let mut in_list = false;
+    let mut names = Vec::new();
+    for raw in lock.lines() {
+        let line = raw.trim();
+        if line == "[[package]]" {
+            in_package = false;
+            in_list = false;
+        } else if line == format!("name = \"{package}\"") {
+            in_package = true;
+        } else if in_package && line == "dependencies = [" {
+            in_list = true;
+        } else if in_list && line == "]" {
+            in_list = false;
+        } else if in_list {
+            let entry = line.trim_matches(|c| c == '"' || c == ',');
+            names.push(entry.split(' ').next().unwrap_or(entry).to_string());
+        }
+    }
+    names
+}
+
+#[test]
+fn lock_oracle_reads_one_package_block() {
+    let lock = "[[package]]\nname = \"a\"\nversion = \"1\"\ndependencies = [\n \"omnigraph-engine\",\n \"syn 2.0.118\",\n]\n\n[[package]]\nname = \"b\"\nversion = \"1\"\n\n[[package]]\nname = \"c\"\ndependencies = [\n \"a\",\n]\n";
+    assert_eq!(
+        locked_dependencies(lock, "a"),
+        vec!["omnigraph-engine", "syn"]
+    );
+    assert_eq!(locked_dependencies(lock, "b"), Vec::<String>::new());
+    assert_eq!(locked_dependencies(lock, "c"), vec!["a"]);
+    assert_eq!(locked_dependencies(lock, "d"), Vec::<String>::new());
+}
+
+const DEPENDENCY_KINDS: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
+/// Refused entries as `<table path>.<name>`: anything in a regular
+/// `dependencies` table, and a workspace crate (by name, `package` or `path`)
+/// in any kind, at the root and under each `target.<cfg>`, read from decoded TOML.
+fn refused_dependencies(manifest: &str) -> Vec<String> {
+    let root: toml::Table = manifest
+        .parse()
+        .unwrap_or_else(|e| panic!("the manifest is not TOML: {e}"));
+    let mut scopes = vec![(String::new(), &root)];
+    if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+        for (cfg, value) in targets {
+            if let Some(table) = value.as_table() {
+                scopes.push((format!("target.{cfg}."), table));
+            }
+        }
+    }
+    let mut refused = Vec::new();
+    for (scope, table) in scopes {
+        for kind in DEPENDENCY_KINDS {
+            let Some(entries) = table.get(*kind).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            for (name, spec) in entries {
+                let package = spec.get("package").and_then(toml::Value::as_str);
+                let workspace_crate = name.starts_with("omnigraph")
+                    || package.is_some_and(|package| package.starts_with("omnigraph"))
+                    || spec.get("path").is_some();
+                if *kind == "dependencies" || workspace_crate {
+                    refused.push(format!("{scope}{kind}.{name}"));
+                }
+            }
+        }
+    }
+    refused
+}
+
+#[test]
+fn manifest_guard_reads_cargo_dependency_tables_only() {
+    let none = Vec::<String>::new();
+    let clean = "[package]\nname = \"x\"\n\n[dependencies]\n\n[dev-dependencies]\nsyn = \"2\"\n\n[lints]\nworkspace = true\n";
+    assert_eq!(refused_dependencies(clean), none);
+    assert_eq!(
+        refused_dependencies("[dev-dependencies] # omnigraph-engine = \"1\"\n"),
+        none
+    );
+    assert_eq!(
+        refused_dependencies("[dev-dependencies.syn]\nversion = \"2\"\n"),
+        none
+    );
+    assert_eq!(
+        refused_dependencies("[package.metadata.dependencies]\nnote = \"source walk\"\n"),
+        none
+    );
+    assert_eq!(
+        refused_dependencies("[package.metadata]\ndependencies.note = \"source walk\"\n"),
+        none
+    );
+    assert_eq!(refused_dependencies("dependencies = {}\n"), none);
+
+    assert_eq!(
+        refused_dependencies("[dependencies]\nserde_yaml = { workspace = true }\n"),
+        vec!["dependencies.serde_yaml"]
+    );
+    assert_eq!(
+        refused_dependencies("[dependencies.serde_yaml]\nworkspace = true\n"),
+        vec!["dependencies.serde_yaml"]
+    );
+    assert_eq!(
+        refused_dependencies("[\"depend\\u0065ncies\"]\nserde_yaml.workspace = true\n"),
+        vec!["dependencies.serde_yaml"]
+    );
+    assert_eq!(
+        refused_dependencies("dependencies.libc.version = \"0.2\"\n"),
+        vec!["dependencies.libc"]
+    );
+    assert_eq!(
+        refused_dependencies("target.'cfg(unix)'.dependencies.serde_yaml.workspace = true\n"),
+        vec!["target.cfg(unix).dependencies.serde_yaml"]
+    );
+    assert_eq!(
+        refused_dependencies("[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"),
+        vec!["target.cfg(unix).dependencies.libc"]
+    );
+    assert_eq!(
+        refused_dependencies(
+            "[target.'cfg(unix)'.dev-dependencies]\nomnigraph-storage = { workspace = true }\n"
+        ),
+        vec!["target.cfg(unix).dev-dependencies.omnigraph-storage"]
+    );
+    assert_eq!(
+        refused_dependencies("[dev-dependencies.omnigraph-engine]\npath = \"../omnigraph\"\n"),
+        vec!["dev-dependencies.omnigraph-engine"]
+    );
+    assert_eq!(
+        refused_dependencies(
+            "[dev-dependencies]\nengine = { package = \"omnigraph-engine\", workspace = true }\n"
+        ),
+        vec!["dev-dependencies.engine"]
+    );
+    assert_eq!(
+        refused_dependencies("[dev-dependencies]\nengine = { path = '../omnigraph' }\n"),
+        vec!["dev-dependencies.engine"]
+    );
+    assert_eq!(
+        refused_dependencies("[build-dependencies]\nomnigraph-compiler.workspace = true\n"),
+        vec!["build-dependencies.omnigraph-compiler"]
+    );
+}
+
+fn engine_dir() -> PathBuf {
+    seams_dir().join("../omnigraph")
+}
+
 fn cluster_dir() -> PathBuf {
-    manifest_dir().join("../omnigraph-cluster")
+    seams_dir().join("../omnigraph-cluster")
 }
 
 fn dst_dir() -> PathBuf {
-    manifest_dir().join("../omnigraph-dst")
+    seams_dir().join("../omnigraph-dst")
 }
 
 fn gqt_cases_dir() -> PathBuf {
-    manifest_dir().join("../omnigraph-gqt/cases")
+    seams_dir().join("../omnigraph-gqt/cases")
 }
 
-/// Production and test call sites of both crates. This guard file is
-/// deliberately not in the set (it names the patterns as literals itself).
+/// Production and test call sites of both crates; the seams crate's own
+/// sources (this guard included) are the helpers' definitions, not call
+/// sites, and are not walked.
 fn files_to_scan() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in [
-        manifest_dir().join("src"),
-        manifest_dir().join("tests"),
+        engine_dir().join("src"),
+        engine_dir().join("tests"),
         cluster_dir().join("src"),
         cluster_dir().join("tests"),
     ] {
         collect_ext(&root, "rs", &mut out);
     }
-    out.retain(|file| !is_this_guard(file));
     out
-}
-
-fn is_this_guard(file: &Path) -> bool {
-    file.file_name()
-        .is_some_and(|n| n == "failpoint_names_guard.rs")
 }
 
 fn collect_ext(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
@@ -147,7 +325,7 @@ fn seam_decisions_use_the_compile_checked_catalog() {
 }
 
 fn engine_failpoints_test() -> PathBuf {
-    manifest_dir().join("tests/failpoints.rs")
+    engine_dir().join("tests/failpoints.rs")
 }
 
 /// One declared seam static and the file it lives in.
@@ -654,7 +832,6 @@ fn arming_files(roots: &ArmingRoots) -> Vec<PathBuf> {
                 .filter(|file| is_test_source(root, file)),
         );
     }
-    files.retain(|file| !is_this_guard(file));
     files
 }
 
@@ -704,24 +881,53 @@ fn armers(roots: &ArmingRoots, gqt_cases: Option<&Path>) -> Armers {
     }
 }
 
-/// The cases the runner discovers: regular `.gqt` files directly under
-/// `cases`, dot-named ones skipped (`omnigraph-gqt/src/lib.rs`, discovery).
+/// The runner's discovery owner, shared without a crate dependency cycle.
+#[path = "../../omnigraph-gqt/src/discovery.rs"]
+mod gqt_discovery;
+
 fn case_files(cases: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(cases) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path.extension().is_some_and(|e| e == "gqt")
-                && path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| !n.starts_with('.'))
-        })
-        .collect()
+    gqt_discovery::list_cases(cases).0
+}
+
+#[test]
+fn nested_cases_arm_seams_but_hidden_and_linked_cases_do_not() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cases = temporary.path();
+    let nested = cases.join("v2/planner");
+    std::fs::create_dir_all(&nested).unwrap();
+    let visible = nested.join("case.gqt");
+    std::fs::write(&visible, "--- seam\nat: nested.seam\n").unwrap();
+    std::fs::write(cases.join("case.gqt"), "--- seam\nat: root.seam\n").unwrap();
+    std::fs::write(nested.join(".hidden.gqt"), "--- seam\nat: hidden.seam\n").unwrap();
+    std::fs::write(nested.join("other.txt"), "--- seam\nat: other.seam\n").unwrap();
+    let hidden = cases.join(".hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::write(hidden.join("case.gqt"), "--- seam\nat: hidden.seam\n").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&visible, cases.join("linked.gqt")).unwrap();
+        std::os::unix::fs::symlink(&nested, cases.join("linked_directory")).unwrap();
+        assert!(case_files(&cases.join("linked_directory")).is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = std::ffi::OsString::from_vec(b"invalid_\xff.gqt".to_vec());
+        std::fs::write(cases.join(invalid), "--- seam\nat: invalid.seam\n").unwrap();
+    }
+    assert_eq!(case_files(cases), [cases.join("case.gqt"), visible]);
+    let found = armers(
+        &ArmingRoots {
+            harness: Vec::new(),
+            src: Vec::new(),
+        },
+        Some(cases),
+    );
+    assert_eq!(
+        found.case_names,
+        ["nested.seam".to_string(), "root.seam".to_string()].into()
+    );
 }
 
 /// The `at` of every bare `--- seam` section (the one header the runner
@@ -966,11 +1172,11 @@ fn check_helper_pairing(catalogs: &[&Catalog], files: &[PathBuf], violations: &m
 fn engine_arming_roots() -> ArmingRoots {
     ArmingRoots {
         harness: vec![
-            manifest_dir().join("tests"),
+            engine_dir().join("tests"),
             dst_dir().join("src"),
             dst_dir().join("tests"),
         ],
-        src: vec![manifest_dir().join("src")],
+        src: vec![engine_dir().join("src")],
     }
 }
 
@@ -982,7 +1188,7 @@ fn cluster_arming_roots() -> ArmingRoots {
 }
 
 fn engine_catalog_path() -> PathBuf {
-    manifest_dir().join("src/seams/catalog.rs")
+    engine_dir().join("src/seams/catalog.rs")
 }
 
 fn cluster_catalog_path() -> PathBuf {
@@ -992,7 +1198,7 @@ fn cluster_catalog_path() -> PathBuf {
 /// The seams crate's decision installers, `.name(` for every `pub fn` taking
 /// `&'static self`; only arming text may call one.
 fn arming_calls() -> Vec<String> {
-    let lib = manifest_dir().join("../omnigraph-seams/src/lib.rs");
+    let lib = seams_dir().join("src/lib.rs");
     let text = std::fs::read_to_string(&lib)
         .unwrap_or_else(|e| panic!("seams crate {} is unreadable: {e}", lib.display()));
     let mut calls = Vec::new();
@@ -1019,7 +1225,7 @@ fn catalogs_are_complete_unique_and_used() {
 
     let engine = parse_catalog(
         &engine_catalog_path,
-        &manifest_dir().join("src"),
+        &engine_dir().join("src"),
         "omnigraph::seams::catalog",
     );
     let cluster = parse_catalog(
@@ -1031,7 +1237,7 @@ fn catalogs_are_complete_unique_and_used() {
     let engine_armers = armers(&engine_arming_roots(), Some(&gqt_cases_dir()));
     let cluster_armers = armers(&cluster_arming_roots(), None);
 
-    let engine_src = production_names(&manifest_dir().join("src"), &engine_catalog_path);
+    let engine_src = production_names(&engine_dir().join("src"), &engine_catalog_path);
     let cluster_src = production_names(&cluster_dir().join("src"), &cluster_catalog_path);
 
     let mut violations = Vec::new();
@@ -1040,7 +1246,7 @@ fn catalogs_are_complete_unique_and_used() {
     check_declaration_placement(
         &engine,
         &engine_catalog_path,
-        &manifest_dir().join("src"),
+        &engine_dir().join("src"),
         &mut violations,
     );
     check_declaration_placement(
@@ -1062,7 +1268,7 @@ fn catalogs_are_complete_unique_and_used() {
 
 #[test]
 fn arming_files_never_cross() {
-    let engine_src = manifest_dir().join("src");
+    let engine_src = engine_dir().join("src");
     let cluster_src = cluster_dir().join("src");
     let crossing: BTreeSet<PathBuf> = crossing_files(&engine_src, &engine_catalog_path())
         .into_iter()

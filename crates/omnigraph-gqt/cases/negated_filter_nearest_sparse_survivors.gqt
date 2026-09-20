@@ -1,10 +1,6 @@
 # issue: none
-# notes: two stacked `not` blocks over 52 docs keep rows 49 and 50 only, limit
-# notes: 3: the rungs k = 3, 12, 48 cover rows 0..47 and hold no survivor (row
-# notes: 48 is the spare), the next rung would pass the x16 ceiling, so the
-# notes: exact pass scores all 52 rows flat and returns both survivors (2 < 3):
-# notes: d049, d050. Short here = the exact pass did not run; more rows = a
-# notes: `not` block was pushed or the anti-join leaked.
+# notes: Two negations keep only d049 and d050. Limit 3 must return both.
+# notes: Keep 52 docs: k = 3, 12, 48 finds neither; crossing the 16x ceiling requires the exact pass.
 
 --- runner
 timeout_ms: 10000
@@ -18,9 +14,6 @@ node Doc {
     n: I64 @index
     name: String @index
     embedding: Vector(4) @index
-}
-
-edge Knows: Doc -> Doc {
 }
 
 --- seed
@@ -78,7 +71,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d051","n":51,"name":"doc-051","embedding":[51.0,0.0,0.0,0.0]}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_sparse_survivors($q: Vector(4)) {
     match {
         $d: Doc
         not { $d.n < 49 }

@@ -87,7 +87,7 @@ CLASSES = {
             # The seam guard counts a case's `at:` name as arming a seam, so
             # `GQT (ordinary)` runs this test on `run_gqt` beside
             # `Test Workspace`'s engine-input run.
-            "crates/omnigraph/tests/failpoint_names_guard.rs": "GQ Logic Tests (ordinary) + Test Workspace",
+            "crates/omnigraph-seams/tests/failpoint_names_guard.rs": "GQ Logic Tests (ordinary) + Test Workspace",
         },
     ),
     "deployment": (
@@ -325,11 +325,11 @@ def self_test() -> int:
             "crates/d/src/lib.rs": 'let p = "deploy/azure/main.bicep"; // root-relative\n',
             "crates/e/src/lib.rs": 'let p = r#"Dockerfile"#;\n',
             "crates/f/Cargo.toml": '[package]\nname = "f"\n[[bin]]\nname = "x"\npath = "../deploy/x.rs"\n',
-            "crates/omnigraph/tests/failpoint_names_guard.rs.extra.rs": 'let d = "../omnigraph-gqt/cases";\n',
+            "crates/omnigraph-seams/tests/failpoint_names_guard.rs.extra.rs": 'let d = "../omnigraph-gqt/cases";\n',
         }
         green = {
             "crates/omnigraph-gqt/src/lib.rs": 'const DIR: &str = "crates/omnigraph-gqt/cases";\n',
-            "crates/omnigraph/tests/failpoint_names_guard.rs": 'let d = "../omnigraph-gqt/cases";\n',
+            "crates/omnigraph-seams/tests/failpoint_names_guard.rs": 'let d = "../omnigraph-gqt/cases";\n',
             "crates/g/src/lib.rs": '// Deployment setup is documented in deploy/azure/README.md.\n/// Cases live in crates/omnigraph-gqt/cases.\n/* see docker/entrypoint.sh */\nfn noop() {}\n',
             "crates/h/src/lib.rs": 'let url = "https://example.invalid/deploy/azure"; let seg = "crates/x/deploy/y"; let dev = "Dockerfile.dev"; let boot = "bootstrap.Dockerfile";\n',
             "crates/i/Cargo.toml": '[package]\nname = "i" # built from deploy/azure, see docker/\n',

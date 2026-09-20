@@ -1,10 +1,7 @@
 # issue: 624
 # red_on: 2026-09-15, pre-fix build at 379d8ed1 (the parent of #695's f0dcd2e6): step 7, the `value = 0` scalar read on tgt, failed with `storage: LanceError(IO): … Not found: …/nodes/<dataset>/tree/a.<ULID>/_indices/<uuid>/page_lookup.lance`; steps 1-6 green; green at f0dcd2e6 (#695) itself.
-# notes: one indexed seed row; a fast-forwards into the untouched tgt; tgt's own
-# notes: insert is the first-touch fork that mis-stamped the inherited index.
-# notes: The issue's "direct write to the target between the two merges, still
-# notes: fails" row: the BTREE read and the full-text count on tgt, then the
-# notes: second merge, which is three-way after tgt's write.
+# notes: After fast-forward, the target's first write must preserve inherited
+# notes: scalar and text indexes. A later merge must still succeed.
 
 --- runner
 timeout_ms: 10000

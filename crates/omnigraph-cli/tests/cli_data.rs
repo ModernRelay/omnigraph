@@ -2110,6 +2110,68 @@ query insert_person($name: String, $age: I32) {
     );
 }
 
+/// The `explain` statement through the embedded `query` door: the plan as
+/// one row per node (`tree`, `depth`, `node`, `detail`), and the `mutate`
+/// door's refusal.
+#[test]
+fn explain_statement_answers_the_plan_as_rows() {
+    const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(EXPLAIN_ADULTS)
+            .arg("--json"),
+    ));
+    assert_eq!(payload["query_name"], "adults");
+    assert_eq!(payload["columns"][0], "tree");
+    assert_eq!(payload["columns"][1], "depth");
+    assert_eq!(payload["columns"][2], "node");
+    assert_eq!(payload["columns"][3], "detail");
+    let rows = payload["rows"].as_array().unwrap();
+    let root = rows
+        .iter()
+        .find(|row| row["tree"] == "logical" && row["depth"] == 0)
+        .unwrap_or_else(|| panic!("no logical root row: {payload}"));
+    assert!(root["node"].is_string(), "{root}");
+    let detail: Value = serde_json::from_str(root["detail"].as_str().unwrap())
+        .expect("detail holds the node's own fields as JSON");
+    assert!(detail.is_object(), "{detail}");
+    assert!(
+        rows.iter().any(|row| row["tree"] == "physical"),
+        "{payload}"
+    );
+    assert!(
+        rows.iter().any(|row| row["tree"] == "plan"
+            && row["node"] == "route"
+            && row["detail"] == "engine"),
+        "{payload}"
+    );
+
+    let refused = output_failure(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(EXPLAIN_ADULTS)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("statement 'explain' is a read; use POST /query"),
+        "{stderr}"
+    );
+}
+
 /// GitHub #365: the embedded transport must preserve the typed stale-head
 /// outcome all the way through the CLI boundary. This is deliberately local
 /// and non-ignored so exit code 4 cannot depend on loopback/server coverage.

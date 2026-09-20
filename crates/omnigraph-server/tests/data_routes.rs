@@ -1664,6 +1664,21 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
             target_refusal,
         ),
         (
+            "/mutate",
+            json!({"query": EXPLAIN_ADULTS}),
+            "statement 'explain' is a read; use POST /query",
+        ),
+        (
+            "/change",
+            json!({"query": EXPLAIN_ADULTS}),
+            "the explain statement is not served on deprecated routes; use POST /query",
+        ),
+        (
+            "/read",
+            json!({"query_source": EXPLAIN_ADULTS}),
+            "the explain statement is not served on deprecated routes; use POST /query",
+        ),
+        (
             "/read",
             json!({"query_source": "branch list"}),
             deprecated_refusal,
@@ -1883,7 +1898,7 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
 
 const PROCESS_SETTING_NEEDLE: &str = "is a process setting";
 const UNKNOWN_VALUE_NEEDLE: &str = "expected one of off, on, verify";
-const UNKNOWN_SETTING_NEEDLE: &str = "unknown setting `engine`";
+const UNKNOWN_SETTING_NEEDLE: &str = "unknown setting `turbo`";
 const SET_PARAMETER_SHAPE: &str = "query parameter 'set' takes <name>=<value>, got 'merge_lineage'";
 const NO_STATEMENT_NEEDLE: &str = "carries no statement";
 const SHOW_AT_WRITE_DOOR: &str = "statement 'show merge_lineage' is a read; use POST /query";
@@ -2167,6 +2182,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
     assert_eq!(
         body,
         show_output(&[
+            show_row("engine", "v1", "v1", "default", "request"),
             show_row("rrf_plan", "auto", "auto", "default", "process"),
             show_row(
                 "merge_lineage",
@@ -2339,14 +2355,15 @@ async fn settings_set_parameter_on_the_change_routes_follows_the_definition() {
     let (_temp, app) = app_for_loaded_graph().await;
     let commit_id = load_commit(&app, r#"{"type":"Person","data":{"name":"S1","age":1}}"#).await;
 
-    let cases: [(&str, Option<&str>); 5] = [
+    let cases: [(&str, Option<&str>); 6] = [
         ("set=merge_lineage=off", None),
+        ("set=engine=v2", None),
         ("set=merge_lineage=both", Some(UNKNOWN_VALUE_NEEDLE)),
         (
             "set=stage_write_concurrency=8",
             Some(PROCESS_SETTING_NEEDLE),
         ),
-        ("set=engine=v2", Some(UNKNOWN_SETTING_NEEDLE)),
+        ("set=turbo=v2", Some(UNKNOWN_SETTING_NEEDLE)),
         ("set=merge_lineage", Some(SET_PARAMETER_SHAPE)),
     ];
     for (query, refusal) in cases {
@@ -2380,13 +2397,18 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         &app,
         json_post(
             "/query",
-            &json!({"query": "set merge_lineage = off;\nreset all;\nshow all;"}),
+            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nreset all;\nshow all;"}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        body["rows"][1],
+        body["rows"][0],
+        show_row("engine", "v1", "v1", "default", "request"),
+        "{body}"
+    );
+    assert_eq!(
+        body["rows"][2],
         show_row(
             "merge_lineage",
             default_merge_lineage(),
@@ -2397,7 +2419,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         "{body}"
     );
     assert_eq!(
-        body["rows"][2],
+        body["rows"][3],
         show_row("ann_nprobes", "5", "20", "env", "process"),
         "reset all returns to the process value, not the definition's: {body}"
     );
@@ -2517,6 +2539,196 @@ async fn query_endpoint_runs_inline_read() {
     assert_eq!(body["query_name"], "get_person");
     assert_eq!(body["row_count"], 1);
     assert_eq!(body["rows"][0]["p.name"], "Alice");
+}
+
+const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+
+/// One tree of an `explain` answer, rebuilt from its pre-order rows: a node
+/// is its `detail` fields plus `node`, its children the rows one level deeper
+/// that follow it.
+fn explain_tree(body: &Value, tree: &str) -> Value {
+    fn build(rows: &[&Value], index: &mut usize, depth: i64) -> Value {
+        let row = rows[*index];
+        *index += 1;
+        let mut node: serde_json::Map<String, Value> =
+            serde_json::from_str(row["detail"].as_str().unwrap())
+                .unwrap_or_else(|err| panic!("{err}: {row}"));
+        node.insert("node".to_string(), row["node"].clone());
+        let mut inputs = Vec::new();
+        while *index < rows.len() && rows[*index]["depth"] == depth + 1 {
+            inputs.push(build(rows, index, depth + 1));
+        }
+        node.insert("inputs".to_string(), Value::Array(inputs));
+        Value::Object(node)
+    }
+    let rows: Vec<&Value> = body["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows: {body}"))
+        .iter()
+        .filter(|row| row["tree"] == tree)
+        .collect();
+    assert!(!rows.is_empty(), "no `{tree}` rows: {body}");
+    assert_eq!(rows[0]["depth"], 0, "{body}");
+    let mut index = 0;
+    let root = build(&rows, &mut index, 0);
+    assert_eq!(
+        index,
+        rows.len(),
+        "every `{tree}` row hangs off the root: {body}"
+    );
+    root
+}
+
+/// The `plan` rows of an `explain` answer whose `node` is `name`, as details.
+fn explain_plan_rows<'a>(body: &'a Value, name: &str) -> Vec<&'a str> {
+    body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["tree"] == "plan" && row["node"] == name)
+        .map(|row| {
+            assert!(row.get("depth").is_none(), "{row}");
+            row["detail"].as_str().unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_answers_an_explain_statement_as_rows() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_ADULTS, "branch": "main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["query_name"], "adults");
+    assert_eq!(body["columns"], json!(["tree", "depth", "node", "detail"]));
+    assert_eq!(body["rows"][0]["tree"], "logical", "{body}");
+    let logical = explain_tree(&body, "logical");
+    assert!(logical["node"].is_string(), "{logical}");
+    assert_eq!(
+        logical["inputs"][0]["table"], "node:Person",
+        "the logical tree scans Person: {logical}"
+    );
+    assert_eq!(
+        logical["inputs"][0]["filter"]["reads"],
+        json!([{"binding": "p", "property": "age"}]),
+        "the age filter is pushed into the scan: {logical}"
+    );
+    assert_eq!(
+        logical["inputs"][0]["filter"]["text"], "$p.age > 30",
+        "the filter prints as GQ: {logical}"
+    );
+    assert!(
+        logical["inputs"][0].get("side").is_none()
+            && logical["inputs"][0].get("fragments").is_none(),
+        "a query scan carries no diff-side or substrate fields: {logical}"
+    );
+    let physical = explain_tree(&body, "physical");
+    assert!(physical["node"].is_string(), "{physical}");
+    assert!(
+        !explain_plan_rows(&body, "pass").is_empty(),
+        "one plan row per fired pass: {body}"
+    );
+    assert_eq!(explain_plan_rows(&body, "route"), vec!["engine"], "{body}");
+    assert!(
+        explain_plan_rows(&body, "logical_hash")[0].len() == 16,
+        "{body}"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_ADULTS, "name": "adults", "snapshot": "0123456789abcdef"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_INSERT_PERSON, "name": "insert_person"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"], "`explain` applies to a read query; 'insert_person' contains mutations",
+        "{body}"
+    );
+}
+
+const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}\n";
+
+const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match {\n        $a: Person\n        $b: Person\n        $a.age > $b.age\n    }\n    return { $a.name, $b.name }\n}\n";
+
+/// The `explain` answer lists the lowered DataFusion tree after the physical
+/// tree: a filter over two bindings, which no scan can take, is a
+/// `FilterExec` over the `CrossJoinExec` of the two `ScanExec` rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_explain_lists_the_lowered_datafusion_tree() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": EXPLAIN_OLDER_PAIRS, "branch": "main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["rows"].as_array().unwrap();
+    let mut trees: Vec<&str> = Vec::new();
+    for row in rows {
+        let tree = row["tree"].as_str().unwrap();
+        if trees.last() != Some(&tree) {
+            trees.push(tree);
+        }
+    }
+    assert_eq!(
+        trees,
+        vec!["logical", "physical", "datafusion", "plan"],
+        "the three trees then the plan rows: {body}"
+    );
+    let datafusion: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["tree"] == "datafusion")
+        .collect();
+    assert_eq!(datafusion[0]["depth"], 0, "{body}");
+    let filter = datafusion
+        .iter()
+        .find(|row| row["node"] == "FilterExec")
+        .unwrap_or_else(|| panic!("a filter over two bindings is a FilterExec row: {body}"));
+    let predicate = filter["detail"].as_str().unwrap();
+    assert!(
+        predicate.contains("a.age") && predicate.contains("b.age"),
+        "the predicate reads both bindings: {predicate}"
+    );
+    assert_eq!(
+        datafusion
+            .iter()
+            .filter(|row| row["node"] == "ScanExec")
+            .count(),
+        2,
+        "one ScanExec per binding: {body}"
+    );
+    assert!(
+        datafusion.iter().any(|row| row["node"] == "CrossJoinExec"),
+        "{body}"
+    );
+    assert!(
+        explain_plan_rows(&body, "datafusion").is_empty(),
+        "the tree is available, so no `datafusion` plan row: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

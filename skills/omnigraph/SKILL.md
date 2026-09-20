@@ -147,6 +147,11 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 - `changes <poll [--start now|beginning|after:<id> | --cursor <c>] | baseline --out <snapshot.jsonl>> [filters…] [--json]`
 - `schema apply --schema <f.pg> [--allow-data-loss] [--json]` · `schema show` (alias `get`) — `apply` **refuses a cluster-managed graph** (evolve those via `cluster apply`)
 
+Read queries default to `engine=v1`; `--set engine=v2` or a GQ
+`set engine = v2;` prefix selects planned execution. `query -e 'explain query q() { … }'`
+returns the v2 logical, physical and available DataFusion trees without
+executing the query. It uses the ordinary query target and parameter flags.
+
 **Served only** (needs `--server`/`--profile`): `graphs list [--json]`
 
 **Direct / storage** — reject `--server`. `init` requires its positional URI;

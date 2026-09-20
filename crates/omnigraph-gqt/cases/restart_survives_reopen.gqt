@@ -1,6 +1,5 @@
 # issue: none
-# notes: pins that committed mutations survive a store reopen; exercises
-# notes: mutate, loop, restart, and read steps in one case.
+# notes: Mutations in a foreach loop survive reopening.
 
 --- runner
 timeout_ms: 10000

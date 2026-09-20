@@ -1,0 +1,142 @@
+# issue: none
+# notes: A dense traversal (4 sources, 8 edges, 6 docs: the frontier estimate
+# notes: saturates at the table) reads the destination table once as the build
+# notes: side of a hash join; the scalar filter and the searches stay inside that
+# notes: one read, two searches conjoined. Rows and multiplicity are the
+# notes: per-batch id lookup's. The last step is the same two searches on a
+# notes: root scan: the build side is a root scan, so it conjoins them too.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Source {
+    slug: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index
+    summary: String @index
+    state: String
+}
+edge Links: Source -> Doc
+
+--- seed
+{"type":"Source","data":{"slug":"s1"}}
+{"type":"Source","data":{"slug":"s2"}}
+{"type":"Source","data":{"slug":"s3"}}
+{"type":"Source","data":{"slug":"s4"}}
+{"type":"Doc","data":{"slug":"a","body":"needle one","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"b","body":"needle two","summary":"beacon","state":"closed"}}
+{"type":"Doc","data":{"slug":"c","body":"other","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"d","body":"needle three","summary":"other","state":"open"}}
+{"type":"Doc","data":{"slug":"e","body":"needle four","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"f","body":"other needle","summary":"beacon","state":"open"}}
+{"edge":"Links","from":"s1","to":"a"}
+{"edge":"Links","from":"s1","to":"b"}
+{"edge":"Links","from":"s2","to":"a"}
+{"edge":"Links","from":"s2","to":"c"}
+{"edge":"Links","from":"s3","to":"d"}
+{"edge":"Links","from":"s3","to":"f"}
+{"edge":"Links","from":"s4","to":"d"}
+{"edge":"Links","from":"s4","to":"f"}
+
+--- query
+set engine = v2;
+query open_needles() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+    }
+    return { $s.slug, $d.slug }
+}
+--- expect unordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s3","d.slug":"d"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"d"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: access hash_join
+scan Doc as $d: filter reads [d.state, d.body]
+pass access_path
+
+--- query
+set engine = v2;
+query every_link() {
+    match {
+        $s: Source
+        $s links $d
+    }
+    return { $s.slug, $d.slug }
+    order { $s.slug, $d.slug }
+}
+--- expect ordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s1","d.slug":"b"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s2","d.slug":"c"}
+{"s.slug":"s3","d.slug":"d"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"d"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: access hash_join
+scan Doc as $d: no filter
+pass access_path
+
+--- query
+set engine = v2;
+query open_needle_beacons() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+        match_text($d.summary, "beacon")
+    }
+    return { $s.slug, $d.slug }
+}
+--- expect unordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+scan Doc as $d: access hash_join
+scan Doc as $d: filter reads [d.state, d.body, d.summary]
+pass access_path
+
+--- query
+set engine = v2;
+query root_scan_two_searches() {
+    match {
+        $d: Doc { state: "open" }
+        search($d.body, "needle")
+        match_text($d.summary, "beacon")
+    }
+    return { $d.slug }
+}
+--- expect unordered
+{"d.slug":"a"}
+{"d.slug":"e"}
+{"d.slug":"f"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: filter reads [d.state, d.body, d.summary]

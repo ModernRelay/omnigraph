@@ -1,0 +1,179 @@
+# issue: none
+# notes: Metadata counts preserve rows and shapes; ineligible aggregates keep their scans.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    score: I64?
+}
+node Empty {
+    slug: String @key
+}
+edge Knows: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"a","score":1}}
+{"type":"Doc","data":{"slug":"b","score":1}}
+{"type":"Doc","data":{"slug":"c"}}
+{"edge":"Knows","from":"a","to":"b","data":{}}
+{"edge":"Knows","from":"a","to":"c","data":{}}
+
+--- query
+set engine = v2;
+query count_empty() {
+    match { $e: Empty } return { count($e) as n }
+}
+
+--- expect unordered
+{"n":0}
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_aliases() {
+    match { $d: Doc } return { count($d) as a, count($d) as b } order { a desc } limit 1
+}
+
+--- expect unordered
+{"a":3,"b":3}
+
+--- expect shape
+a: I64
+b: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_unaliased() {
+    match { $d: Doc } return { count($d) }
+}
+
+--- expect unordered
+{"d":3}
+
+--- expect shape
+d: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_limit_zero() {
+    match { $d: Doc } return { count($d) as n } limit 0
+}
+
+--- expect unordered
+
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_property() {
+    match { $d: Doc } return { count($d.score) as n }
+}
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- expect plan
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_filtered() {
+    match { $d: Doc $d.score > 0 } return { count($d) as n }
+}
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- expect plan
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_grouped() {
+    match { $d: Doc } return { $d.score, count($d) as n }
+}
+
+--- expect unordered
+{"d.score":1,"n":2}
+{"n":1}
+
+--- expect shape
+d.score: I64?
+n: I64
+
+--- expect plan
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_traversal() {
+    match { $d: Doc $d knows $t } return { count($d) as n }
+}
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- expect plan
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_pairs() {
+    match { $d: Doc $e: Doc } return { count($d) as n }
+}
+
+--- expect unordered
+{"n":9}
+
+--- expect shape
+n: I64
+
+--- expect plan
+not pass aggregate_pushdown
+
+--- query
+set engine = v2;
+query count_mixed() {
+    match { $d: Doc } return { count($d) as n, sum($d.score) as total }
+}
+
+--- expect unordered
+{"n":3,"total":2.0}
+
+--- expect shape
+n: I64
+total: F64?
+
+--- expect plan
+not pass aggregate_pushdown

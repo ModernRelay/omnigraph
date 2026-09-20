@@ -1,0 +1,73 @@
+# issue: none
+# notes: Six pairs tie on a.rank. Limit 5 cuts within that tie;
+# notes: hidden identity keys select the page members. Row order is not asserted.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    rank: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","rank":1}}
+{"type":"Person","data":{"name":"bob","rank":1}}
+{"type":"Person","data":{"name":"carol","rank":2}}
+
+--- query
+query first_five_pairs() {
+    match {
+        $a: Person
+        $b: Person
+    }
+    return { $a.name, $b.name }
+    order { $a.rank asc }
+    limit 5
+}
+
+--- expect unordered
+{"a.name": "alice", "b.name": "alice"}
+{"a.name": "alice", "b.name": "bob"}
+{"a.name": "alice", "b.name": "carol"}
+{"a.name": "bob", "b.name": "alice"}
+{"a.name": "bob", "b.name": "bob"}
+
+--- expect shape
+a.name: String
+b.name: String
+
+--- query
+query aliased() {
+    match { $p: Person }
+    return { $p.rank as r, $p.name as n }
+    order { r desc, n asc }
+}
+
+--- expect ordered
+{"r": 2, "n": "carol"}
+{"r": 1, "n": "alice"}
+{"r": 1, "n": "bob"}
+
+--- expect shape
+r: I64
+n: String
+
+--- query
+query names_by_rank() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.rank asc, $p.name asc }
+}
+
+--- expect ordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String

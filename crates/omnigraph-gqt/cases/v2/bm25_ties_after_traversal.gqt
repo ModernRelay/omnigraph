@@ -1,0 +1,87 @@
+# issue: none
+# notes: A tied BM25 winner outside the initial scan window must survive traversal before the final limit.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index
+}
+
+node Artifact {
+    slug: String @key
+}
+
+edge ChunkOfArtifact: Chunk -> Artifact {
+    label: String
+}
+
+--- seed
+{"type":"Artifact","data":{"slug":"art-0"}}
+{"type":"Chunk","data":{"slug":"chunk-z00","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z01","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z02","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z03","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z04","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z05","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z06","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z07","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z08","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z09","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-a","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z10","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z11","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z12","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z13","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z14","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z15","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z16","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z17","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z18","text":"needle filler"}}
+{"type":"Chunk","data":{"slug":"chunk-z19","text":"needle filler"}}
+{"edge":"ChunkOfArtifact","id":"e-z00","from":"chunk-z00","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-a","from":"chunk-a","to":"art-0","data":{"label":"of"}}
+{"edge":"ChunkOfArtifact","id":"e-z19","from":"chunk-z19","to":"art-0","data":{"label":"of"}}
+
+--- query
+set engine = v2;
+query recall($q: String) {
+    match {
+        $c: Chunk
+        $c chunkOfArtifact $a
+        search($c.text, $q)
+    }
+    return { $c.slug, $a.slug }
+    order { bm25($c.text, $q) }
+    limit 1
+}
+
+--- params
+{"q": "needle"}
+
+--- expect ordered
+{"c.slug": "chunk-a", "a.slug": "art-0"}
+
+--- expect shape
+c.slug: String
+a.slug: String
+
+--- query
+set engine = v2;
+query root_tie($q: String) {
+    match { $c: Chunk }
+    return { $c.slug }
+    order { bm25($c.text, $q) }
+    limit 1
+}
+--- params
+{"q":"needle"}
+--- expect ordered
+{"c.slug":"chunk-a"}
+--- expect shape
+c.slug: String

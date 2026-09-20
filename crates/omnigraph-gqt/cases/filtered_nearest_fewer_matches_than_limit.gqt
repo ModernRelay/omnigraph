@@ -1,7 +1,5 @@
 # issue: none
-# notes: pushed `$d.n = 7` over 10 docs, limit 3: one row matches (1 < 3) and
-# notes: it is the 8th nearest, outside the unfiltered top-3 (rows 0..2). The
-# notes: answer is that one row, no padding from non-matching rows.
+# notes: Only d007 matches, outside the unfiltered top three. Limit 3 must return that one row.
 
 --- runner
 timeout_ms: 10000
@@ -17,9 +15,6 @@ node Doc {
     embedding: Vector(4) @index
 }
 
-edge Knows: Doc -> Doc {
-}
-
 --- seed
 {"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
@@ -33,7 +28,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d009","n":9,"name":"doc-009","embedding":[9.0,0.0,0.0,0.0]}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_single_match($q: Vector(4)) {
     match {
         $d: Doc
         $d.n = 7

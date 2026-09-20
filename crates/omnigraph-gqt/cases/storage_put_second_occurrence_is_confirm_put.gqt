@@ -1,6 +1,6 @@
 # issue: none
-# notes: On `storage.put` under `__recovery/*`, occurrence 2 is the confirm put of the mutation: occurrence 1 is the arm put, and the second call of the step rewrites the same sidecar as Confirmed.
-# notes: The mutation stays healthy because the confirm put is followed by the delete of the canonical name, so the misdirected copy is the only object left behind and no read path needs it; the reopen at step 2 and the read at step 3 see both rows.
+# notes: Misdirect the second storage.put under __recovery/*: the confirm put, after the arm put.
+# notes: Reopen serves both committed rows after a foreign-named confirm put.
 
 --- runner
 timeout_ms: 10000

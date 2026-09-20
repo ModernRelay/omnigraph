@@ -1547,9 +1547,6 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
         )
         .await
         .map(|_| ()),
-        // Boxed: the engine's maintenance futures are enormous; inlining all
-        // three into one poll fn overflows the 2 MiB test stack (known engine
-        // trait — see lessons_learned on RUST_MIN_STACK).
         Op::Optimize => Box::pin(db.optimize()).await.map(|_| ()),
         Op::Cleanup => Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
             keep_versions: Some(1),

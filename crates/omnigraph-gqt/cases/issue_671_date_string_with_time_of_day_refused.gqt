@@ -1,7 +1,7 @@
 # issue: 671
 # red_on: 2026-09-06, pre-fix build at 54afa755: the +05:00 insert succeeded and stored 2023-12-31, the date() literal and the Z param matched no rows, and a seed of the same string read back as 2023-12-31 (the filed case).
-# notes: A Date string with a time of day is refused on every user-facing entry;
-# notes: loader entry: loader/mod.rs load_refuses_date_string_with_a_time_of_day.
+# notes: Date accepts a calendar day, not a timestamp, through parameters and
+# notes: literals. Loader coverage: load_refuses_date_string_with_a_time_of_day.
 
 --- runner
 timeout_ms: 10000
@@ -62,9 +62,7 @@ query filter_on_datetime_param($day: Date) {
 
 --- query
 query read_back() {
-    match {
-        $e: Event
-    }
+    match { $e: Event }
     return { $e.name, $e.day }
 }
 

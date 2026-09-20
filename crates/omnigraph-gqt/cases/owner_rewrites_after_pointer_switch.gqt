@@ -1,8 +1,6 @@
 # issue: none
-# notes: A branch writes Person, main merges it, main writes Person, main merges into the branch
-# notes: (pointer switch, no child pins the branch's fork), the branch writes Person again: the
-# notes: old fork is an orphan and the write reclaims it and succeeds. bob, written on main before
-# notes: the switch, is visible on the branch only if the reclaimed fork starts from main's lineage.
+# notes: After feature adopts main, its next write must reclaim its former fork.
+# notes: bob proves that fork starts from main's lineage; main keeps its own values after restart.
 
 --- runner
 timeout_ms: 10000

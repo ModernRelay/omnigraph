@@ -63,9 +63,13 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
                     Rule::show_stmt => {
                         statement = Some(FileBody::Show(parse_setting_target(inner)?));
                     }
+                    Rule::explain_stmt => {
+                        statement = Some(FileBody::Explain(parse_explain_stmt(inner)?));
+                    }
                     Rule::statement_trailer => {
                         let subject = match statement {
                             Some(FileBody::Show(_)) => "a show statement",
+                            Some(FileBody::Explain(_)) => "an `explain` statement",
                             _ => "a branch statement",
                         };
                         return Err(ParseDiagnostic::new(
@@ -86,6 +90,16 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
         settings,
         body: statement.unwrap_or(FileBody::Queries(queries)),
     })
+}
+
+fn parse_explain_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<QueryDecl, ParseDiagnostic> {
+    let decl = pair
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::query_decl)
+        .expect("grammar: explain_stmt holds one query_decl after kw_explain");
+    parse_query_decl(decl).map_err(compiler_error_to_diagnostic)
 }
 
 fn pair_span(pair: &pest::iterators::Pair<Rule>) -> SourceSpan {

@@ -1,4 +1,4 @@
-//! One libtest test per `cases/*.gqt`, registered at run time by
+//! One libtest test per `cases/**/*.gqt`, registered at run time by
 //! `datatest-stable` (`harness = false` in `Cargo.toml`), so
 //! `cargo test -p omnigraph-gqt <substr>` runs the matching cases,
 //! `-- --list` names them all, and `--test-threads` sets the concurrency.
@@ -31,5 +31,5 @@ fn case(path: &Path) -> datatest_stable::Result<()> {
 }
 
 datatest_stable::harness! {
-    { test = case, root = "cases", pattern = r"^[^./][^/]*\.gqt$" },
+    { test = case, root = "cases", pattern = r"^(?:[^./][^/]*/)*[^./][^/]*\.gqt$" },
 }

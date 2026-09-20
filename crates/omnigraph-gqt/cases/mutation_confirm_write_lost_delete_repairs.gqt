@@ -1,6 +1,6 @@
 # issue: none
-# notes: Only the sidecar confirm put is lost; the post-commit delete lands and removes the arm-time object, so no residue survives the mutation.
-# notes: The reopen finds nothing under `__recovery/` and serves both rows; the delivery record proves the confirm put was skipped.
+# notes: Skip the confirm put; the normal post-commit delete removes the Armed sidecar.
+# notes: The committed rows remain readable after reopening.
 
 --- runner
 timeout_ms: 10000

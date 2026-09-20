@@ -110,7 +110,8 @@ impl EffectiveSettings {
         let settings_variables = omnigraph_compiler::settings::DEFINITIONS
             .iter()
             .map(|spec| spec.env);
-        for key in std::iter::once("FAILPOINTS")
+        for key in ["FAILPOINTS", crate::ENGINE_ENV]
+            .into_iter()
             .chain(settings_variables)
             .chain(crate::RETIRED_SETTING_ENVIRONMENT)
         {
@@ -150,7 +151,9 @@ mod tests {
                 "DST_ENTROPY_SEED",
                 "LANCE_MEM_POOL_SIZE",
                 "FAILPOINTS",
+                crate::ENGINE_ENV,
                 "OMNIGRAPH_TRAVERSAL_MODE",
+                "OMNIGRAPH_ENGINE",
                 "OMNIGRAPH_RRF_PLAN",
                 "OMNIGRAPH_MERGE_LINEAGE",
                 "OMNIGRAPH_ANN_NPROBES",

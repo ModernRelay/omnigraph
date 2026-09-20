@@ -20,12 +20,19 @@ const PUBLIC_LIBRARY_PACKAGES: &[&str] = &[
     "omnigraph-cluster",
     "omnigraph-compiler",
     "omnigraph-engine",
+    "omnigraph-planner",
     "omnigraph-policy",
+    "omnigraph-seams",
     "omnigraph-server",
     "omnigraph-storage",
 ];
-const INTERNAL_LIBRARY_PACKAGES: &[&str] =
-    &["omnigraph-azure-admission", "omnigraph-vocabulary-guard"];
+const INTERNAL_LIBRARY_PACKAGES: &[&str] = &[
+    "omnigraph-azure-admission",
+    "omnigraph-bench",
+    "omnigraph-dst",
+    "omnigraph-gqt",
+    "omnigraph-vocabulary-guard",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ToolConfig {
@@ -44,6 +51,20 @@ pub(crate) fn scan_worktree(
     root: &Path,
     config: &ToolConfig,
 ) -> Result<Vec<InventoryRow>, GuardError> {
+    scan_workspace(root, config, PackagePresence::Current)
+}
+
+#[derive(Clone, Copy)]
+enum PackagePresence {
+    Current,
+    Historical,
+}
+
+fn scan_workspace(
+    root: &Path,
+    config: &ToolConfig,
+    presence: PackagePresence,
+) -> Result<Vec<InventoryRow>, GuardError> {
     let root = root.canonicalize().map_err(|error| {
         GuardError::PublicRust(format!(
             "cannot canonicalize public Rust workspace {}: {error}",
@@ -51,7 +72,7 @@ pub(crate) fn scan_worktree(
         ))
     })?;
     validate_tool(&config.executable)?;
-    let packages = workspace_library_packages(&root)?;
+    let packages = workspace_library_packages(&root, presence)?;
     let mut rows: BTreeMap<String, InventoryRow> = BTreeMap::new();
     for package in packages {
         let manifest_path = workspace_relative_manifest_path(&root, &package.manifest_path)?;
@@ -236,7 +257,7 @@ pub(crate) fn scan_git_commit(
         )));
     }
 
-    scan_worktree(&tree_path, config)
+    scan_workspace(&tree_path, config, PackagePresence::Historical)
 }
 
 pub(crate) fn scan_output(output: &str, package: &str, manifest_path: &str) -> Vec<InventoryRow> {
@@ -302,7 +323,10 @@ fn validate_tool(executable: &Path) -> Result<(), GuardError> {
     Ok(())
 }
 
-fn workspace_library_packages(root: &Path) -> Result<Vec<Package>, GuardError> {
+fn workspace_library_packages(
+    root: &Path,
+    presence: PackagePresence,
+) -> Result<Vec<Package>, GuardError> {
     let output = Command::new("cargo")
         .current_dir(root)
         .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
@@ -374,10 +398,17 @@ fn workspace_library_packages(root: &Path) -> Result<Vec<Package>, GuardError> {
             },
         );
     }
+    select_public_packages(by_name, presence)
+}
+
+fn select_public_packages(
+    mut by_name: BTreeMap<String, Package>,
+    presence: PackagePresence,
+) -> Result<Vec<Package>, GuardError> {
     let discovered: BTreeSet<_> = by_name.keys().map(String::as_str).collect();
     let expected: BTreeSet<_> = PUBLIC_LIBRARY_PACKAGES.iter().copied().collect();
     let missing: Vec<_> = expected.difference(&discovered).copied().collect();
-    if !missing.is_empty() {
+    if matches!(presence, PackagePresence::Current) && !missing.is_empty() {
         return Err(GuardError::PublicRust(format!(
             "expected public library package(s) missing from cargo metadata: {}",
             missing.join(", ")
@@ -397,7 +428,7 @@ fn workspace_library_packages(root: &Path) -> Result<Vec<Package>, GuardError> {
     }
     let mut output: Vec<_> = PUBLIC_LIBRARY_PACKAGES
         .iter()
-        .map(|name| by_name.remove(*name).expect("presence checked above"))
+        .filter_map(|name| by_name.remove(*name))
         .collect();
     output.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(output)
@@ -476,13 +507,68 @@ pub fn omnigraph::ordinary(value: usize)
 
     #[test]
     fn expected_package_set_is_explicit() {
-        assert_eq!(PUBLIC_LIBRARY_PACKAGES.len(), 7);
+        assert_eq!(PUBLIC_LIBRARY_PACKAGES.len(), 9);
+        assert!(PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-planner"));
+        assert!(PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-seams"));
         assert!(PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-engine"));
         assert!(!PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-azure-admission"));
         assert!(!PUBLIC_LIBRARY_PACKAGES.contains(&"omnigraph-vocabulary-guard"));
         assert_eq!(
             INTERNAL_LIBRARY_PACKAGES,
-            &["omnigraph-azure-admission", "omnigraph-vocabulary-guard",]
+            &[
+                "omnigraph-azure-admission",
+                "omnigraph-bench",
+                "omnigraph-dst",
+                "omnigraph-gqt",
+                "omnigraph-vocabulary-guard"
+            ]
+        );
+    }
+
+    #[test]
+    fn historical_scan_admits_newer_registered_crates_being_absent_but_not_unknown_crates() {
+        let packages = || {
+            PUBLIC_LIBRARY_PACKAGES
+                .iter()
+                .filter(|name| **name != "omnigraph-planner")
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        Package {
+                            name: name.to_string(),
+                            manifest_path: PathBuf::from(format!("crates/{name}/Cargo.toml")),
+                            has_non_default_features: false,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            select_public_packages(packages(), PackagePresence::Historical)
+                .unwrap()
+                .len(),
+            8
+        );
+        assert!(
+            select_public_packages(packages(), PackagePresence::Current)
+                .unwrap_err()
+                .to_string()
+                .contains("omnigraph-planner")
+        );
+        let mut unknown = packages();
+        unknown.insert(
+            "unknown".into(),
+            Package {
+                name: "unknown".into(),
+                manifest_path: PathBuf::from("unknown/Cargo.toml"),
+                has_non_default_features: false,
+            },
+        );
+        assert!(
+            select_public_packages(unknown, PackagePresence::Historical)
+                .unwrap_err()
+                .to_string()
+                .contains("unclassified workspace library")
         );
     }
 

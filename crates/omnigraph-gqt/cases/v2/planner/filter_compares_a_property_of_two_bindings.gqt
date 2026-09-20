@@ -1,0 +1,113 @@
+# issue: none
+# notes: Predicate demand across scans and correlated negation, including null
+# notes: ages and integer comparisons with fractional literals.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64?
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":20}}
+{"type":"Person","data":{"name":"carol","age":20}}
+{"type":"Person","data":{"name":"dave"}}
+
+--- query
+set engine = v2;
+query older_pairs() {
+    match {
+        $a: Person
+        $b: Person
+        $a.age > $b.age
+    }
+    return { $a.name, $b.name }
+}
+
+--- expect unordered
+{"a.name":"alice","b.name":"bob"}
+{"a.name":"alice","b.name":"carol"}
+
+--- expect shape
+a.name: String
+b.name: String
+
+--- expect plan
+filter reads [a.age, b.age]
+scan Person as $a: no filter
+scan Person as $b: no filter
+not pass predicate_pushdown
+
+--- query
+set engine = v2;
+query nobody_older() {
+    match {
+        $p: Person
+        not {
+            $q: Person
+            $q.age > $p.age
+        }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"dave"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+filter reads [p.age, q.age]
+scan Person as $p: no filter
+scan Person as $q: no filter
+
+--- query
+set engine = v2;
+query pushed_into_the_scan() {
+    match {
+        $p: Person
+        $p.age > 20.5
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"alice"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+scan Person as $p: filter reads [p.age]
+pass predicate_pushdown
+
+--- query
+set engine = v2;
+query kept_in_memory_inside_a_negation() {
+    match {
+        $p: Person
+        not { $p.age > 20.5 }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"bob"}
+{"p.name":"carol"}
+{"p.name":"dave"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+filter reads [p.age]
+scan Person as $p: no filter

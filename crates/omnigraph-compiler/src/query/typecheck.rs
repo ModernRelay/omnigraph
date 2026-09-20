@@ -1119,6 +1119,22 @@ fn typecheck_filter(
     let left_type = resolve_expr_type(catalog, &filter.left, ctx, params)?;
     let right_type = resolve_expr_type(catalog, &filter.right, ctx, params)?;
 
+    let is_search_predicate = |expr: &Expr| {
+        matches!(
+            expr,
+            Expr::Search { .. } | Expr::MatchText { .. } | Expr::Fuzzy { .. }
+        )
+    };
+    if (is_search_predicate(&filter.left) || is_search_predicate(&filter.right))
+        && !(is_search_predicate(&filter.left)
+            && filter.op == CompOp::Eq
+            && matches!(filter.right, Expr::Literal(Literal::Bool(true))))
+    {
+        return Err(CompilerError::Type(
+            "T38: search predicates require a standalone call or `= true`; other comparisons are not supported".to_string(),
+        ));
+    }
+
     if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
         // Blob values never participate in `.gq` filters. Keep this ahead of
         // every operator-specific early return so public-AST callers cannot

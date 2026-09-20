@@ -1,14 +1,8 @@
 # issue: none
-# notes: PROBE: the overfetch loop's exact pass. Edges leave docs 60..99 (40 of
-# notes: 100, above the gate's 10% ratio, so the scan is unfiltered). With
-# notes: limit 2 the passes k = 2, 8, 32 cover docs 0..31, none with an edge;
-# notes: the pass past the 16x ceiling scores the whole type flat, no cap, and
-# notes: returns the two nearest edge-bearing docs. Short here = the exact pass
-# notes: did not run. Step 2 (limit 50, above the 40 survivors): the first rung
-# notes: would cover the whole type, so the exact pass runs at once and the
-# notes: answer is exactly the survivors, in order. Rust twin:
-# notes: issue_567_nearest_traversal_prefilters_then_overfetches (tests/search.rs),
-# notes: forced-postfilter half.
+# notes: Keep 100 docs and 40 edge sources (d60..d99), above the 10% gate threshold.
+# notes: Limit 2: k = 2, 8, 32 finds no source; the 16x ceiling forces an exact pass.
+# notes: Limit 50: the first retry covers the corpus and returns all 40 survivors.
+# notes: Rust probe: issue_567_nearest_traversal_prefilters_then_overfetches (tests/search.rs), forced-postfilter half.
 
 --- runner
 timeout_ms: 10000

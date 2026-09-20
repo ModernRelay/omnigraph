@@ -1,8 +1,5 @@
 # issue: none
-# notes: 8 docs indexed, then the three nearest to -0.3 (0, 1, 2) deleted: the
-# notes: whole first window of limit 3 is gone (3 deleted >= 3), so an engine
-# notes: masking deletions after the top-k answers nothing. Deleted rows never
-# notes: return and the limit fills from the 5 survivors (5 > 3): d003, d004, d005.
+# notes: Delete the first three neighbors after indexing. Limit 3 must fill from the five survivors.
 
 --- runner
 timeout_ms: 10000
@@ -18,9 +15,6 @@ node Doc {
     embedding: Vector(4) @index
 }
 
-edge Knows: Doc -> Doc {
-}
-
 --- seed
 {"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
@@ -32,7 +26,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d007","n":7,"name":"doc-007","embedding":[7.0,0.0,0.0,0.0]}}
 
 --- mutate
-query del($s: String) {
+query delete_doc($s: String) {
     delete Doc where slug = $s
 }
 
@@ -42,7 +36,7 @@ query del($s: String) {
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query del($s: String) {
+query delete_doc($s: String) {
     delete Doc where slug = $s
 }
 
@@ -52,7 +46,7 @@ query del($s: String) {
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query del($s: String) {
+query delete_doc($s: String) {
     delete Doc where slug = $s
 }
 
@@ -62,10 +56,8 @@ query del($s: String) {
 --- expect affected: nodes=1 edges=0
 
 --- query
-query scenario($q: Vector(4)) {
-    match {
-        $d: Doc
-    }
+query nearest_after_delete($q: Vector(4)) {
+    match { $d: Doc }
     return { $d.slug }
     order { nearest($d.embedding, $q) }
     limit 3

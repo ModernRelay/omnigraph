@@ -122,7 +122,7 @@ pub fn lint_query_file(
 ) -> QueryLintOutput {
     let query_path = query_path.into();
     let parsed = match parse_query_diagnostic(query_source) {
-        Ok(file) => file.into_declarations(),
+        Ok(file) => file.body.into_read_declarations(),
         Err(diagnostic) => Err(parse_error_message(query_source, diagnostic)),
     };
     match parsed {

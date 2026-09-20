@@ -1,6 +1,6 @@
 # issue: none
-# notes: The runner section injects one merge failure under DST.
-# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
+# notes: Fail before arming merge recovery. The same Omnigraph must accept an unrelated write
+# notes: without reopening, while source and target retain their separate rows.
 
 --- runner
 timeout_ms: 10000

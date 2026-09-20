@@ -1,8 +1,7 @@
 # issue: none
-# notes: keyed twin of unkeyed_edge_dup_three_way_merge.gqt: with @key(@src, @dst) (RFC 0044) the self-loop
-# notes: born on both sides derives one id and merges to one row, the branch's re-insert of an inherited
-# notes: pair upserts, main's person write merges beside them, and source delete plus restart keep one
-# notes: row per pair.
+# notes: Keyed twin of unkeyed_edge_dup_three_way_merge.gqt: repeated pairs upsert.
+# notes: Both branches add the same self-loop; merge, source deletion and restart keep one per pair.
+# notes: main's independent Person insert must also survive.
 
 --- runner
 timeout_ms: 10000
@@ -33,27 +32,27 @@ branch create b0
 --- expect ok
 
 --- mutate branch: main
-query change() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_main() { insert Knows { from: "Diana", to: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query change() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_branch() { insert Knows { from: "Diana", to: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query change() { insert Knows { from: "Diana", to: "Diana" } }
+query upsert_branch_loop() { insert Knows { from: "Diana", to: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query change() { insert Knows { from: "Alice", to: "Bob" } }
+query upsert_inherited_edge() { insert Knows { from: "Alice", to: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query change() { insert Person { name: "Eve" } }
+query add_person_on_main() { insert Person { name: "Eve" } }
 
 --- expect affected: nodes=1 edges=0
 

@@ -1,10 +1,7 @@
 # issue: none
-# notes: `$d knows $t` with TWO out-edges per source over 40 docs, edges leaving
-# notes: 10, 20, 30 (3 of 40 = 7.5%, gate prefilters): every eligible doc yields
-# notes: two rows. Step 1, limit 3 counts ROWS: three rows over two docs, d010
-# notes: twice then d020 once (6 rows > 3). Step 2 returns both ends under limit
-# notes: 4: the two nearest docs' four (d, t) pairs (6 > 4); the order within one
-# notes: d is unspecified, so the expect is the unordered set.
+# notes: Each source has two edges. Limit 3 counts rows: d010 twice, then d020 once.
+# notes: Limit 4 returns both pairs for d010 and d020; order within one source is unspecified.
+# notes: Keep 40 docs: 3/40 eligible sources selects the gate prefilter.
 
 --- runner
 timeout_ms: 10000
@@ -72,7 +69,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e030_1","from":"d030","to":"d032","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_counts_rows($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t
@@ -94,7 +91,7 @@ query scenario($q: Vector(4)) {
 d.slug: String
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_returns_pairs($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

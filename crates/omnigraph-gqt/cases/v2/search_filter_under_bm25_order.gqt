@@ -1,0 +1,41 @@
+# issue: none
+# notes: A BM25 ordering must preserve a search filter on another property of the same binding.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+    body: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"doc-both","title":"alpha report","body":"needle filler"}}
+{"type":"Doc","data":{"slug":"doc-body-only","title":"beta report","body":"needle needle filler"}}
+{"type":"Doc","data":{"slug":"doc-title-only","title":"alpha memo","body":"plain filler"}}
+
+--- query
+set engine = v2;
+query filtered_rank($t: String, $q: String) {
+    match {
+        $d: Doc
+        search($d.title, $t)
+    }
+    return { $d.slug }
+    order { bm25($d.body, $q) }
+    limit 5
+}
+
+--- params
+{"t": "alpha", "q": "needle"}
+
+--- expect ordered
+{"d.slug": "doc-both"}
+
+--- expect shape
+d.slug: String

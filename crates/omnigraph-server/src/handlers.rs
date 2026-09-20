@@ -11,10 +11,10 @@ use omnigraph_compiler::query::ast::{BranchStmt, EmptyFile, FileBody, QueryDecl,
 
 mod dispatch;
 use dispatch::{
-    Door, ReadDispatch, classify, control_write_at_read_door, read_at_write_door,
-    refuse_empty_file, refuse_process_settings, refuse_settings_at_deprecated_route,
-    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, session_with_prefix,
-    show_at_write_door,
+    Door, ReadDispatch, classify, control_write_at_read_door, explain_at_write_door,
+    read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
+    refuse_settings_at_deprecated_route, refuse_statement_envelope, refuse_wrong_door,
+    run_branch_statement, session_with_prefix, show_at_write_door,
 };
 
 /// Liveness probe.
@@ -727,10 +727,16 @@ pub(crate) async fn server_read(
 /// additionally carries the pinned graph-commit token.
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
-/// `snapshot`, `name`, or `params`: it answers one row per branch (column
+/// `snapshot`, `name`, or `params`: it answers one result per branch (field
 /// `name`, byte order) under the same `read` check as `GET /branches`.
 /// `branch create`, `branch delete`, and `branch merge` are rejected with
 /// 400; send them to `POST /mutate`.
+///
+/// The GQ statement `explain query …` is served here too: the query is not
+/// run, and the result describes its v2 logical, physical and available
+/// DataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by
+/// `plan` entries for the passes and the document's other fields, under the
+/// request's target and `params`.
 pub(crate) async fn server_query(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -1181,6 +1187,10 @@ pub(crate) async fn run_mutate(
             };
         }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
+        FileBody::Explain(_) => {
+            refuse_explain(door)?;
+            return Err(explain_at_write_door());
+        }
     };
     let branch = branch.unwrap_or_else(|| "main".to_string());
     let actor_arc = actor
@@ -1294,6 +1304,11 @@ pub(crate) async fn run_query(
             authorize_scope_free_read(&handle, actor)?;
             let session = session_with_prefix(&session, &file.settings)?;
             return Ok(ReadDispatch::Show(session.show(id)));
+        }
+        body @ FileBody::Explain(_) => {
+            refuse_explain(door)?;
+            body.into_read_declarations()
+                .map_err(ApiError::bad_request)?
         }
     };
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
@@ -2953,7 +2968,8 @@ pub(crate) struct ParsedChangeParams {
     pub ops: Vec<api::ChangeOpOutput>,
     /// The `set=<name>=<value>` parameters, each checked against the settings
     /// definition and the `process` scope rule: validated here; consulted by
-    /// nothing until the `engine` setting lands (the Session settings RFC's rollout step 2).
+    /// nothing until the change feed's planner entry reads `engine` (the
+    /// Session settings RFC's rollout step 2).
     pub settings: Vec<(SettingId, SettingValue)>,
 }
 
