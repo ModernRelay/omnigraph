@@ -1,0 +1,45 @@
+# issue: none
+# red_on: 2026-09-16 working tree: `planner internal error: a GQ expand op has no input`.
+# notes: People with no outgoing Knows edge survive the negation.
+# notes: The correlated traversal must keep the outer scan projection narrow.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    embedding: Vector(4)?
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Person","data":{"name":"carol","embedding":[1.0,0.0,0.0,0.0]}}
+{"edge":"Knows","from":"alice","to":"bob"}
+
+--- query
+set engine = v2;
+query people_without_outgoing_edges() {
+    match {
+        $p: Person
+        not { $p knows $q }
+    }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"bob"}
+{"p.name":"carol"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+scan Person as $p: columns [__id, name]
+pass projection_pushdown

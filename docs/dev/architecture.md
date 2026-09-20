@@ -18,6 +18,7 @@ flowchart TB
     HTTP[omnigraph-server]
     CLUSTER[omnigraph-cluster]
     COMPILER[omnigraph-compiler]
+    PLANNER[omnigraph-planner]
     ENGINE[omnigraph engine]
     POLICY[omnigraph-policy]
     STORAGE[omnigraph-storage]
@@ -30,6 +31,8 @@ flowchart TB
     HTTP --> POLICY
     CLUSTER --> ENGINE
     ENGINE --> COMPILER
+    ENGINE --> PLANNER
+    PLANNER --> COMPILER
     ENGINE --> POLICY
     ENGINE --> STORAGE
     ENGINE --> LANCE
@@ -68,6 +71,7 @@ alias is reused. See [invariants.md](invariants.md) and
 | Layer | Owns |
 |---|---|
 | `omnigraph-compiler` | `.pg` and `.gq` parsing, catalog, type checking, lint, migration planning, and typed IR lowering. It has no Lance dependency. |
+| `omnigraph-planner` | Logical and physical plans, optimizer passes, cost estimates and explain documents; metadata enters through `PlanSource`, with no Lance dependency. |
 | `omnigraph` (`omnigraph-engine`) | Snapshots, query and mutation execution, graph topology, graph branches/lineage, validation, multi-dataset publication, and recovery. |
 | `omnigraph-storage` | Shared local/S3/Azure control-object access used for manifests' companion objects, cluster state, locks, approvals, and recovery artifacts. |
 | Lance | Dataset files, transactions, versions, native refs, secondary indexes, compaction, and version cleanup. |

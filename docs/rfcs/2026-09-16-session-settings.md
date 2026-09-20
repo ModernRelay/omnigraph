@@ -44,8 +44,10 @@ The first setting is `engine`, values `v1` and `v2`, default `v1`. Under
 ***engine version 2*** (the engine version 2 planner RFC, PR #711, which
 names the planner, the execution engine and memory management as engine
 version 2's components; the planner and `omnigraph-exec` are the two with
-code today) has registered run through it, and every other operation runs
-the existing code. Four knobs the engine reads today from the process
+code today) has registered run through it. Read queries are different:
+under `v2` every read compiles and executes its plan without registry
+fallback; a planner refusal is an error. Other operations retain their
+existing execution paths until their planner integrations are enabled. Four knobs the engine reads today from the process
 environment or a test task-local become the other four settings: the merge
 lineage mode and the staged-write concurrency, and two diagnostics, the
 reciprocal rank fusion plan and the vector probe count. The traversal mode is
@@ -445,8 +447,9 @@ follow-up runner RFC.
 
 Nothing to migrate. A server that receives no `settings` and no `set`
 behaves as today. `show` is the only new read, and it reads the session, not
-the store. `engine = v2` is a request, not a guarantee: an unregistered
-shape runs the existing code under both values. Under `v2` the two planner
+the store. `engine = v2` guarantees planned execution for read queries,
+with a planner refusal surfaced as an error. Other operations can retain
+the existing code under both values. Under `v2` the two planner
 decisions record their outcome in the planner decision probes
 (`record_planner_decision`, `changes/planned.rs:77`;
 `record_planner_merge_decision`, `exec/merge/planned.rs:135`), which only a
@@ -777,9 +780,9 @@ storage boundary; a session never touches a dataset.
   undeclared name or value is refused, not defaulted, at a door and at
   process startup alike; a resource width is `process` scope. `show all`
   makes every effective value and its source observable at any door.
-  `engine = v2` is a request, not a guarantee: an unregistered shape runs
-  the existing code, and the door-visible witness of which engine ran is the
-  runner RFC's job (Operators).
+  `engine = v2` read queries execute their plans or return an error; they
+  never fall back to v1. Other operations retain the registry boundary,
+  and their door-visible execution witness is the runner RFC's job (Operators).
 - **13, evidence matches the boundary.** The statements are visible in rows
   and errors, so their evidence is `.gqt` cases; the deletion of the
   task-locals and the definition's completeness are mechanism claims and get
@@ -1089,7 +1092,11 @@ tree. None is depended on.
    calls read it, `planner_route()`, `PLANNER_ROUTE_OVERRIDE` and the three
    `with_planner_route` call sites go with `Route::PlannerBehindFlag` and
    `RouteOverride`, the three entries declare `Planner`.
-   `implementation: complete`.
+   `implementation: complete`. The `engine` row, the `SettingsRequest`
+   field and the read path's route (`Session::query` and `run_query_at`
+   run the plan route under `engine = v2`) landed with engine version 2's
+   read-path PR (RFC 0068 milestone 3); the two gate calls and the registry
+   entries follow with the change-feed and merge planner.
 
 Each step is independently safe: step 1 changes no default, and step 2
 changes no behavior for a caller that never sets `engine`. If that PR merges

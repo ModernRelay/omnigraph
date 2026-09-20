@@ -12,6 +12,7 @@
 /crates/omnigraph-compiler/             @azimafroozeh @aaltshuler
 /crates/omnigraph-dst/                  @azimafroozeh
 /crates/omnigraph-gqt/                  @azimafroozeh
+/crates/omnigraph-planner/              @azimafroozeh @aaltshuler
 /crates/omnigraph-policy/               @aaltshuler
 /crates/omnigraph-seams/                @azimafroozeh @aaltshuler
 /crates/omnigraph-server/               @aaltshuler

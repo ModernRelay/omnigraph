@@ -881,24 +881,53 @@ fn armers(roots: &ArmingRoots, gqt_cases: Option<&Path>) -> Armers {
     }
 }
 
-/// The cases the runner discovers: regular `.gqt` files directly under
-/// `cases`, dot-named ones skipped (`omnigraph-gqt/src/lib.rs`, discovery).
+/// The runner's discovery owner, shared without a crate dependency cycle.
+#[path = "../../omnigraph-gqt/src/discovery.rs"]
+mod gqt_discovery;
+
 fn case_files(cases: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(cases) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path.extension().is_some_and(|e| e == "gqt")
-                && path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| !n.starts_with('.'))
-        })
-        .collect()
+    gqt_discovery::list_cases(cases).0
+}
+
+#[test]
+fn nested_cases_arm_seams_but_hidden_and_linked_cases_do_not() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cases = temporary.path();
+    let nested = cases.join("v2/planner");
+    std::fs::create_dir_all(&nested).unwrap();
+    let visible = nested.join("case.gqt");
+    std::fs::write(&visible, "--- seam\nat: nested.seam\n").unwrap();
+    std::fs::write(cases.join("case.gqt"), "--- seam\nat: root.seam\n").unwrap();
+    std::fs::write(nested.join(".hidden.gqt"), "--- seam\nat: hidden.seam\n").unwrap();
+    std::fs::write(nested.join("other.txt"), "--- seam\nat: other.seam\n").unwrap();
+    let hidden = cases.join(".hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::write(hidden.join("case.gqt"), "--- seam\nat: hidden.seam\n").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&visible, cases.join("linked.gqt")).unwrap();
+        std::os::unix::fs::symlink(&nested, cases.join("linked_directory")).unwrap();
+        assert!(case_files(&cases.join("linked_directory")).is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = std::ffi::OsString::from_vec(b"invalid_\xff.gqt".to_vec());
+        std::fs::write(cases.join(invalid), "--- seam\nat: invalid.seam\n").unwrap();
+    }
+    assert_eq!(case_files(cases), [cases.join("case.gqt"), visible]);
+    let found = armers(
+        &ArmingRoots {
+            harness: Vec::new(),
+            src: Vec::new(),
+        },
+        Some(cases),
+    );
+    assert_eq!(
+        found.case_names,
+        ["nested.seam".to_string(), "root.seam".to_string()].into()
+    );
 }
 
 /// The `at` of every bare `--- seam` section (the one header the runner

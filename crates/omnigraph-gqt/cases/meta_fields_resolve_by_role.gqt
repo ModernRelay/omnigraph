@@ -1,5 +1,6 @@
 # issue: none
-# notes: RFC 0040 Query language: `$p.@id`, `$e.@src`, `$e.@dst` and a bare `@id` in a mutation predicate resolve to the system columns by role; a bare `id` is a user property (declared here on `Doc`) or the unknown-property error.
+# notes: Use @id, @src and @dst for system fields. Plain id, src and dst
+# notes: refer to declared user properties; otherwise they are errors.
 
 --- runner
 timeout_ms: 10000
@@ -14,7 +15,6 @@ node Person {
 }
 node Doc {
     id: String @key
-    title: String?
 }
 edge Knows: Person -> Person {
     since: I32?
@@ -28,7 +28,7 @@ edge Bare: Person -> Person {}
 --- seed
 {"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
-{"type":"Doc","data":{"id":"d1","title":"spec"}}
+{"type":"Doc","data":{"id":"d1"}}
 {"edge":"Knows","id":"knows-alice-bob","from":"alice","to":"bob","data":{"since":2020,"id":"edge-data","src":"source-data","dst":"target-data"}}
 
 --- query
@@ -247,75 +247,75 @@ query absent_edge_endpoint() { delete Knows where @dst = "absent" }
 --- expect affected: nodes=0 edges=0
 
 --- query
-query q() { match { $p: Person } return { $p.@src } }
+query node_has_no_source() { match { $p: Person } return { $p.@src } }
 
 --- expect error: T6: binding `$p` has no meta-field `@src`; its meta-fields are `@id`
 
 --- query
-query q() { match { $p: Person } return { $p.@owner } }
+query node_has_no_owner() { match { $p: Person } return { $p.@owner } }
 
 --- expect error: T6: binding `$p` has no meta-field `@owner`; its meta-fields are `@id`
 
 --- query
-query q() { match { $p: Person { id: "alice" } } return { $p.name } }
+query bare_node_id_filter() { match { $p: Person { id: "alice" } } return { $p.name } }
 
 --- expect error: T2: type `Person` has no property `id`; filter the system identity with `$p.@id = ...` in the match block
 
 --- query
-query q() { match { $p: Person
+query bare_edge_id() { match { $p: Person
  $p $e:bare $f } return { $e.id } }
 
 --- expect error: T6: edge `Bare` has no property `id`; the system identity is `$e.@id`
 
 --- query
-query q() { match { $p: Person
+query bare_edge_source() { match { $p: Person
  $p $e:bare $f } return { $e.src } }
 
 --- expect error: T6: edge `Bare` has no property `src`; the system endpoint is `$e.@src`
 
 --- query
-query q() { match { $p: Person
+query bare_edge_destination() { match { $p: Person
  $p $e:bare $f } return { $e.dst } }
 
 --- expect error: T6: edge `Bare` has no property `dst`; the system endpoint is `$e.@dst`
 
 --- query
-query q() { match { $p: Person } return { $p.salary } }
+query unknown_node_property() { match { $p: Person } return { $p.salary } }
 
 --- expect error: T6: type `Person` has no property `salary`
 
 --- mutate
-query q() { insert Person { name: "x", id: "x" } }
+query insert_node_id_property() { insert Person { name: "x", id: "x" } }
 
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query q() { update Person set { id: "x" } where @id = "alice" }
+query update_node_id_property() { update Person set { id: "x" } where @id = "alice" }
 
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query q() { insert Bare { from: "alice", to: "bob", id: "x" } }
+query insert_edge_id_property() { insert Bare { from: "alice", to: "bob", id: "x" } }
 
 --- expect error: T11: type `Bare` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query q() { delete Bare where src = "alice" }
+query delete_by_bare_source() { delete Bare where src = "alice" }
 
 --- expect error: T11: type `Bare` has no property `src`; the system endpoint is `@src`
 
 --- mutate
-query q() { delete Bare where dst = "bob" }
+query delete_by_bare_destination() { delete Bare where dst = "bob" }
 
 --- expect error: T11: type `Bare` has no property `dst`; the system endpoint is `@dst`
 
 --- mutate
-query q() { delete Person where @src = "alice" }
+query delete_node_by_source() { delete Person where @src = "alice" }
 
 --- expect error: T11: type `Person` has no meta-field `@src`; the meta-fields of this type are `@id`
 
 --- mutate
-query q() { delete Knows where @owner = "alice" }
+query delete_edge_by_owner() { delete Knows where @owner = "alice" }
 
 --- expect error: T11: type `Knows` has no meta-field `@owner`; the meta-fields of this type are `@id`, `@src`, `@dst`
 

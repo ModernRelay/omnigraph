@@ -5,7 +5,7 @@ Reads every decision seam declared in the engine's sources
 (`crates/omnigraph/src/**/*.rs`, each static beside the site it guards and
 indexed by `crates/omnigraph/src/seams/catalog.rs`), every store place in
 `STORE_PLACES` (`crates/omnigraph-dst/src/store_places.rs`), every `at:` a
-corpus case names (`crates/omnigraph-gqt/cases/*.gqt`), and prints one row
+corpus case names (`crates/omnigraph-gqt/cases/**/*.gqt`), and prints one row
 per seam and per store place: name, where it is declared, operation,
 declared effects (store effects and admitted store actions prefixed
 `store:`), and the cases that prove it. Seams whose
@@ -107,11 +107,33 @@ def fields_of(body: str) -> dict[str, str]:
     return {k: scalar(v) for k, v in FIELD.findall(body)}
 
 
+def case_files(root: pathlib.Path) -> list[pathlib.Path]:
+    paths = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        if directory.is_symlink():
+            continue
+        for path in directory.iterdir():
+            if path.name.startswith(".") or path.is_symlink():
+                continue
+            try:
+                path.name.encode("utf-8")
+            except UnicodeEncodeError:
+                continue
+            if path.is_dir():
+                pending.append(path)
+            elif path.is_file() and path.suffix == ".gqt":
+                paths.append(path)
+    return sorted(paths)
+
+
 def corpus() -> list[tuple[str, str, str, str, str]]:
     """One row per `--- seam` directive: case, `at`, `action`, `subject`, and the
     group of consecutive directives that precede one step."""
     rows = []
-    for path in sorted(CASES.glob("*.gqt")):
+    for path in case_files(CASES):
+        name = path.relative_to(CASES).as_posix()
         text = path.read_text()
         if not text.endswith("\n"):
             text += "\n"
@@ -126,11 +148,11 @@ def corpus() -> list[tuple[str, str, str, str, str]]:
                 run = True
             fields = fields_of(m["body"])
             rows.append((
-                path.name,
+                name,
                 fields.get("at", ""),
                 fields.get("action", ""),
                 fields.get("subject", ""),
-                f"{path.name}:{group}",
+                f"{name}:{group}",
             ))
     return rows
 

@@ -1,8 +1,9 @@
 # issue: none
-# notes: The roll-back leg of the #601 heal: the arm put is misdirected to `__recovery/dstm-<opid>.json` and the confirm put then fails, so the mutation surfaces the injected error and the foreign-named sidecar stays Armed with no visible commit.
-# notes: The reopen lists the foreign file, rolls the intent back, and deletes the sidecar at the uri it was listed from; the write after the reopen succeeds and the rolled-back row is absent. The sibling cases `issue_601_*` cover the roll-forward leg (mutation published, reopen finalizes).
-# notes: Two seams before one step name distinct seams (RFC 0066); the failing confirm put is `mutation_sidecar_confirm_put_failure_rolls_back.gqt` with the misdirect added.
-# notes: Red on the unfixed engine (`recovery.rs` of fe9eb339, 2026-09-16): step 3 refused with RecoveryRequired "pending Mutation recovery operation blocks writes on branch 'main'", the same barrier the `issue_601_*` cases were red on; the reopen had deleted the canonical name and left the foreign file.
+# notes: Misdirect the arm put, then fail the confirm put: the foreign-named sidecar stays Armed.
+# notes: Reopen must roll it back at its listed URI, omit bob, and allow the next write.
+# notes: The issue_601_* cases cover the corresponding roll-forward path.
+# notes: Red at fe9eb339 (2026-09-16): reopening left the foreign file and step 3 refused
+# notes: with RecoveryRequired for pending Mutation recovery on main.
 
 --- runner
 timeout_ms: 10000

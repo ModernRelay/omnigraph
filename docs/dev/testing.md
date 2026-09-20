@@ -17,6 +17,7 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | Package | Primary owners | Shared support |
 |---|---|---|
 | `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
+| `omnigraph-planner` | In-source optimizer/cost tests and `tests/query_plan.rs`, `tests/registry.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
 | `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
@@ -38,6 +39,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 |---|---|
 | Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
 | Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
+| V2 execution, memory and frozen v1 | `engine_v2.rs`, `engine_v2_memory.rs`, `v1_frozen.rs`; `repro_issue_703.rs` and `repro_issue_723.rs` own ignored scale symptoms |
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
@@ -157,7 +159,12 @@ cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # matching case
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 ```
 
-Every `.gqt` case is its own libtest test named `case::<file>.gqt`, registered
+Discovery includes every `.gqt` file below `cases/`, recursively. Shared
+cases live at its root; v2-specific cases live in `v2/`, and plan assertions
+in `v2/planner/`. A v2 case still explicitly selects `engine = v2`; directory
+placement does not select an engine.
+
+Every case is its own libtest test named `case::<relative/path>.gqt`, registered
 at run time (`datatest-stable`), so the ordinary name filter selects cases, a
 case-only pull request needs no Rust change, and `cargo-nextest` sees each
 case (an IDE's test-results view lists cases from the

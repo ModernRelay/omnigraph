@@ -5,7 +5,7 @@ COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | query_decl*) ~ EOI }
+query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl*) ~ EOI }
 
 // Settings statements stand at the head of a file, before its one statement
 // or its declarations; `show` is itself the one statement. Names are looked
@@ -18,13 +18,15 @@ show_stmt     = { kw_show ~ (kw_all | setting_name) ~ ";" }
 setting_name  = @{ ident ~ ("." ~ ident)* }
 setting_value = { integer | ident | string_lit }
 
-// Branch statements: one per file, never beside a query declaration. Each
-// keyword is atomic and closed by a word boundary: an identifier character
-// may not follow it (`branch createb0` is a parse error), a quoted name may.
+// Statements: one per file, never beside a query declaration. Each keyword
+// is atomic and closed by a word boundary: an identifier character may not
+// follow it (`branch createb0` is a parse error), a quoted name may.
 branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge | branch_list) }
+// `explain` wraps the one read declaration whose plan is answered as rows.
+explain_stmt  = { kw_explain ~ query_decl }
 // Anything the file holds after its one statement, matched so the parser
 // refuses it by name instead of leaving `EOI` to report the expected tokens.
-statement_trailer = { (setting_stmt | show_stmt | branch_stmt | query_decl)+ }
+statement_trailer = { (setting_stmt | show_stmt | branch_stmt | explain_stmt | query_decl)+ }
 branch_create = { kw_create ~ branch_name ~ (kw_from ~ branch_name)? }
 branch_delete = { kw_delete ~ branch_name }
 branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? }
@@ -32,6 +34,7 @@ branch_list   = { kw_list }
 branch_name   = { ident | string_lit }
 
 kw_branch = @{ "branch" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_explain = @{ "explain" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create = @{ "create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete = @{ "delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge  = @{ "merge" ~ !(ASCII_ALPHANUMERIC | "_") }

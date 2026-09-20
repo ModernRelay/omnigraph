@@ -1,8 +1,6 @@
 # issue: none
-# notes: a refused merge discards its scoped settings copy and writes nothing:
-# notes: after each refusal the session still reads its own `off`/`file`, and
-# notes: the rows on source and main survive a restart unchanged.
-# notes: the prefix is accepted on the branch statement itself.
+# notes: A conflicting merge must neither leak its setting override nor
+# notes: change either branch, including after restart.
 
 --- runner
 timeout_ms: 10000

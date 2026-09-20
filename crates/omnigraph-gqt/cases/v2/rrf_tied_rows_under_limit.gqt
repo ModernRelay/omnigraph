@@ -1,0 +1,139 @@
+# issue: none
+# notes: RRF ranking preserves identity ordering among tied joined rows before LIMIT.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64
+    text: String @index
+}
+node Probe {
+    slug: String @key
+    n: I64
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"best","n":1,"text":"needle needle"}}
+{"type":"Doc","data":{"slug":"other","n":2,"text":"hay"}}
+{"type":"Probe","data":{"slug":"p00","n":1}}
+{"type":"Probe","data":{"slug":"p01","n":1}}
+{"type":"Probe","data":{"slug":"p02","n":1}}
+{"type":"Probe","data":{"slug":"p03","n":1}}
+{"type":"Probe","data":{"slug":"p04","n":1}}
+{"type":"Probe","data":{"slug":"p05","n":1}}
+{"type":"Probe","data":{"slug":"p06","n":1}}
+{"type":"Probe","data":{"slug":"p07","n":1}}
+{"type":"Probe","data":{"slug":"p08","n":1}}
+{"type":"Probe","data":{"slug":"p09","n":1}}
+{"type":"Probe","data":{"slug":"p10","n":1}}
+{"type":"Probe","data":{"slug":"p11","n":1}}
+{"type":"Probe","data":{"slug":"p12","n":1}}
+{"type":"Probe","data":{"slug":"p13","n":1}}
+{"type":"Probe","data":{"slug":"p14","n":1}}
+{"type":"Probe","data":{"slug":"p15","n":1}}
+{"type":"Probe","data":{"slug":"p16","n":1}}
+{"type":"Probe","data":{"slug":"p17","n":1}}
+{"type":"Probe","data":{"slug":"p18","n":1}}
+{"type":"Probe","data":{"slug":"p19","n":1}}
+{"type":"Probe","data":{"slug":"p20","n":1}}
+{"type":"Probe","data":{"slug":"p21","n":1}}
+{"type":"Probe","data":{"slug":"p22","n":1}}
+{"type":"Probe","data":{"slug":"p23","n":1}}
+{"type":"Probe","data":{"slug":"p24","n":1}}
+{"type":"Probe","data":{"slug":"p25","n":1}}
+{"type":"Probe","data":{"slug":"p26","n":1}}
+{"type":"Probe","data":{"slug":"p27","n":1}}
+{"type":"Probe","data":{"slug":"p28","n":1}}
+{"type":"Probe","data":{"slug":"p29","n":1}}
+{"type":"Probe","data":{"slug":"p30","n":1}}
+{"type":"Probe","data":{"slug":"p31","n":1}}
+{"type":"Probe","data":{"slug":"p32","n":1}}
+{"type":"Probe","data":{"slug":"p33","n":1}}
+{"type":"Probe","data":{"slug":"p34","n":1}}
+{"type":"Probe","data":{"slug":"p35","n":1}}
+{"type":"Probe","data":{"slug":"p36","n":1}}
+{"type":"Probe","data":{"slug":"p37","n":1}}
+{"type":"Probe","data":{"slug":"p38","n":1}}
+{"type":"Probe","data":{"slug":"p39","n":1}}
+{"type":"Probe","data":{"slug":"p40","n":1}}
+{"type":"Probe","data":{"slug":"p41","n":1}}
+{"type":"Probe","data":{"slug":"p42","n":1}}
+{"type":"Probe","data":{"slug":"p43","n":1}}
+{"type":"Probe","data":{"slug":"p44","n":1}}
+{"type":"Probe","data":{"slug":"p45","n":1}}
+{"type":"Probe","data":{"slug":"p46","n":1}}
+{"type":"Probe","data":{"slug":"p47","n":1}}
+{"type":"Probe","data":{"slug":"p48","n":1}}
+{"type":"Probe","data":{"slug":"p49","n":1}}
+{"type":"Probe","data":{"slug":"p50","n":1}}
+{"type":"Probe","data":{"slug":"p51","n":1}}
+{"type":"Probe","data":{"slug":"p52","n":1}}
+{"type":"Probe","data":{"slug":"p53","n":1}}
+{"type":"Probe","data":{"slug":"p54","n":1}}
+{"type":"Probe","data":{"slug":"p55","n":1}}
+{"type":"Probe","data":{"slug":"p56","n":1}}
+{"type":"Probe","data":{"slug":"p57","n":1}}
+{"type":"Probe","data":{"slug":"p58","n":1}}
+{"type":"Probe","data":{"slug":"p59","n":1}}
+{"type":"Probe","data":{"slug":"p60","n":1}}
+{"type":"Probe","data":{"slug":"p61","n":1}}
+{"type":"Probe","data":{"slug":"p62","n":1}}
+{"type":"Probe","data":{"slug":"p63","n":1}}
+
+--- query
+set engine = v1;
+query fused_v1($t: String) {
+    match {
+        $d: Doc
+        $p: Probe
+        $d.n = $p.n
+    }
+    return { $p.slug }
+    order { rrf(bm25($d.text, $t), bm25($d.text, $t)) }
+    limit 5
+}
+
+--- params
+{"t":"needle"}
+
+--- expect unordered
+{"p.slug":"p00"}
+{"p.slug":"p01"}
+{"p.slug":"p02"}
+{"p.slug":"p03"}
+{"p.slug":"p04"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query fused_v2($t: String) {
+    match {
+        $d: Doc
+        $p: Probe
+        $d.n = $p.n
+    }
+    return { $p.slug }
+    order { rrf(bm25($d.text, $t), bm25($d.text, $t)) }
+    limit 5
+}
+
+--- params
+{"t":"needle"}
+
+--- expect unordered
+{"p.slug":"p00"}
+{"p.slug":"p01"}
+{"p.slug":"p02"}
+{"p.slug":"p03"}
+{"p.slug":"p04"}
+
+--- expect shape
+p.slug: String

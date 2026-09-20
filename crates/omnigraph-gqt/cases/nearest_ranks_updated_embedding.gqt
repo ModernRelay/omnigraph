@@ -1,8 +1,6 @@
 # issue: none
-# notes: 5 docs indexed, then the farthest (d004 at 4.0) moved to -1.0. Nearest
-# notes: from -0.3 under limit 6 (above the 5 live rows): the moved row ranks
-# notes: SECOND by its new vector (0.7, between d000 at 0.3 and d001 at 1.3) and
-# notes: exactly 5 rows come back, so its old position is gone, not a sixth row.
+# notes: Move d004 from 4.0 to -1.0 after indexing. It must rank second from -0.3.
+# notes: Limit 6 exceeds the five live rows, so the old vector must not appear as a duplicate.
 
 --- runner
 timeout_ms: 10000
@@ -18,9 +16,6 @@ node Doc {
     embedding: Vector(4) @index
 }
 
-edge Knows: Doc -> Doc {
-}
-
 --- seed
 {"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
@@ -29,7 +24,7 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0]}}
 
 --- mutate
-query mv($s: String, $e: Vector(4)) {
+query move_embedding($s: String, $e: Vector(4)) {
     update Doc set { embedding: $e } where slug = $s
 }
 
@@ -39,10 +34,8 @@ query mv($s: String, $e: Vector(4)) {
 --- expect affected: nodes=1 edges=0
 
 --- query
-query scenario($q: Vector(4)) {
-    match {
-        $d: Doc
-    }
+query nearest_after_update($q: Vector(4)) {
+    match { $d: Doc }
     return { $d.slug }
     order { nearest($d.embedding, $q) }
     limit 6

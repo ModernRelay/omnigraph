@@ -1,8 +1,7 @@
 # issue: 605
 # red_on: 2026-09-03, pre-fix build: panicked at hconcat_batches `duplicate column`, '_.id' (step 1), 'p.id' (steps 2, 3), '__temp_p.id' (step 4); step 5 returned no rows.
-# notes: four shapes that hand the executor one column twice, plus a rebound
-# notes: outer variable inside not {} whose filter was dropped; one outgoing
-# notes: edge per source keeps each step at one row per source.
+# notes: Repeated anonymous destinations, bindings and self-loops must not
+# notes: duplicate batch columns. A rebound variable inside negation keeps its filter.
 
 --- runner
 timeout_ms: 10000

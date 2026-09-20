@@ -1,5 +1,5 @@
 # issue: none
-# notes: the node object keeps `@id` and the declared non-Blob, non-Vector properties (the engine rewrites Blob columns before executing, so the exclusion only runs here).
+# notes: Node objects include @id and scalar properties, omit nulls, and exclude Blob and Vector properties.
 
 --- runner
 timeout_ms: 10000

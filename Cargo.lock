@@ -5734,6 +5734,7 @@ dependencies = [
  "libc",
  "object_store",
  "omnigraph-compiler",
+ "omnigraph-planner",
  "omnigraph-policy",
  "omnigraph-seams",
  "omnigraph-storage",
@@ -5769,12 +5770,24 @@ dependencies = [
  "omnigraph-compiler",
  "omnigraph-dst",
  "omnigraph-engine",
+ "omnigraph-planner",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "omnigraph-planner"
+version = "0.11.0"
+dependencies = [
+ "arrow-schema",
+ "omnigraph-compiler",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -5796,6 +5809,7 @@ version = "0.11.0"
 dependencies = [
  "serde_yaml",
  "syn",
+ "tempfile",
  "toml",
 ]
 

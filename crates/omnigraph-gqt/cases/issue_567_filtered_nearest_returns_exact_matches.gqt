@@ -1,10 +1,7 @@
 # issue: 567
 # red_on: 2026-09-04, never red on a released tree: guards the contract the probe ladder must keep (a pushed filter admitting fewer rows than `limit` returns exactly those rows, in distance order); the ladder's uncapped rescan on this shape was the whole-index read of the issue.
-# notes: `keep` holds on d02 and d07 only; `limit 5` asks for more than the
-# notes: two matches. The answer is the two matches in distance order, no
-# notes: padding from non-matching rows, no error. Rust twin:
-# notes: issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k
-# notes: (tests/search.rs).
+# notes: Only d02 and d07 match; limit 5 must return both in distance order.
+# notes: Rust probe: issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k (tests/search.rs).
 
 --- runner
 timeout_ms: 10000

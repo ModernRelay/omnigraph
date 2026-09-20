@@ -1,17 +1,8 @@
 # issue: none
-# notes: one 60-doc fixture, two edge types, three filter positions beside a hop.
-# notes: Knows leaves 10, 20, 30, 40, 50 (5 of 60 = 8.3%, gate prefilters); Likes
-# notes: leaves every 5th doc from 5 (11 of 60 = 18%, Threshold fallback).
-# notes: Step 1 `$d.n > 15  $d knows $t`, limit 2: the pushed filter AND the
-# notes: gate's id list on one scan; 20, 30, 40, 50 survive both (4 > 2): d020,
-# notes: d030. Step 2 `$d knows $t  $t.n > 25`, limit 2: the target filter cannot
-# notes: be pushed, the gate's ids over-admit (10 and 20 have targets 11, 21),
-# notes: the first prefiltered pass holds 10, 20 and loses both; the overfetch
-# notes: rerun under the same id list reaches 30, 40, 50 (3 > 2): d030, d040.
-# notes: Step 3 `$d.n > 15  $d likes $t`, limit 2: above the fence, so the
-# notes: filter is pushed and the traversal drops rows above an unfiltered scan;
-# notes: k 2 (16, 17) and 8 (16..23: one source, 20) are short, k 32 fills:
-# notes: d020, d025. Three different answers, one per path.
+# notes: Keep 60 docs: Knows has 5/60 sources (gate prefilter); Likes has 11/60 (above the 10% threshold).
+# notes: Source filter with Knows: intersect the numeric filter and eligible IDs.
+# notes: Target filter with Knows: the first two candidates fail; retry under the same eligible IDs.
+# notes: Source filter with Likes: k = 2 and 8 underfill; k = 32 finds both nearest sources.
 
 --- runner
 timeout_ms: 10000
@@ -112,7 +103,7 @@ edge Likes: Doc -> Doc {
 {"edge":"Likes","id":"l055","from":"d055","to":"d056","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_with_source_filter($q: Vector(4)) {
     match {
         $d: Doc
         $d.n > 15
@@ -134,7 +125,7 @@ query scenario($q: Vector(4)) {
 d.slug: String
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_with_target_filter($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t
@@ -156,7 +147,7 @@ query scenario($q: Vector(4)) {
 d.slug: String
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_with_source_filter_above_gate($q: Vector(4)) {
     match {
         $d: Doc
         $d.n > 15

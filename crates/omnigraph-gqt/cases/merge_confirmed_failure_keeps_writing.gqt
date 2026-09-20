@@ -1,6 +1,6 @@
 # issue: none
-# notes: The runner section injects one merge failure under DST.
-# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
+# notes: Fail after confirmation, before graph publication: the immediate read stays unchanged.
+# notes: The next unrelated write on the same Omnigraph completes recovery and makes bob visible.
 
 --- runner
 timeout_ms: 10000

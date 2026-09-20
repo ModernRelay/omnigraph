@@ -1,14 +1,8 @@
 # issue: none
-# notes: `off`, `on` and `verify` merge the same source update into three
-# notes: equally diverged targets and produce the same rows; the mode picks the
-# notes: classifier route, not the result, and the proof that three different
-# notes: routes ran is the route counters in
-# notes: `crates/omnigraph/tests/merge_cost.rs::merge_lineage_setting_selects_the_completed_classifier`,
-# notes: which a case cannot attach. The mutation arms before the branch work
-# notes: prove a settings prefix is scoped to its operation, including a
-# notes: refused one (T12): the session keeps `off`/`file` across all three.
-# notes: `settings_show_set_reset.gqt` carries why a fresh session reads
-# notes: `verify`.
+# notes: Off, on and verify merge the same update into equally diverged
+# notes: targets. Scoped settings must not change the case session. Route counters
+# notes: are checked by merge_lineage_setting_selects_the_completed_classifier in
+# notes: crates/omnigraph/tests/merge_cost.rs; these assertions check rows and scope.
 
 --- runner
 timeout_ms: 10000

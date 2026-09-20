@@ -1,8 +1,6 @@
 # issue: none
-# notes: `$t knows $d` with nearest on $d over 40 docs, edges 9->10, 19->20,
-# notes: 29->30: the eligible docs are the edge TARGETS (3 of 40 = 7.5%, gate
-# notes: prefilters from the incoming adjacency), limit 2 (3 > 2): d010, d020. An
-# notes: engine reading the outgoing side answers d009, d019.
+# notes: Rank edge targets, not sources: d010 and d020, rather than d009 and d019.
+# notes: Keep 40 docs: 3/40 eligible targets selects the gate prefilter.
 
 --- runner
 timeout_ms: 10000
@@ -67,7 +65,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e029_0","from":"d029","to":"d030","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_edge_targets($q: Vector(4)) {
     match {
         $d: Doc
         $t knows $d

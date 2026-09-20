@@ -1,10 +1,7 @@
 # issue: none
-# notes: `$d knows $t  $t knows $u` over 20 docs with chains 0->1->2, 10->11->12,
-# notes: 15->16->17: six docs have an out-edge (30%, Threshold fallback), only the
-# notes: three heads have a two-hop path. Limit 2: the first pass (0, 1) keeps
-# notes: head 0 and drops middle 1 at the second hop, short; the x4 rerun (0..7)
-# notes: adds nothing; the next rung (32) would cover the 20 live rows, so the
-# notes: exact pass runs and the answer is the two nearest heads, d000, d010.
+# notes: Three two-hop paths start at d000, d010 and d015. Nearest must rank their sources.
+# notes: Keep 20 docs: six one-hop sources exceeds the 10% gate threshold.
+# notes: At limit 2, k = 2 and 8 find only d000; the next retry covers the corpus and runs exact.
 
 --- runner
 timeout_ms: 10000
@@ -52,7 +49,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e015_b","from":"d016","to":"d017","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_two_hop_sources($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

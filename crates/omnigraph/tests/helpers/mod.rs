@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
 pub mod cost;
+pub mod expand_projection;
 #[cfg(feature = "failpoints")]
 pub mod failpoint;
 pub mod recovery;
+pub mod transfer_aggregation;
 
 use std::sync::Arc;
 

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use omnigraph::error::OmniError;
 use omnigraph_compiler::QueryResult;
+use omnigraph_compiler::settings::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -197,7 +198,13 @@ struct Input {
     environment: Environment,
     seed: Option<u64>,
     effective_settings: settings::EffectiveSettings,
+    #[serde(default, skip_serializing_if = "is_v1")]
+    engine: Engine,
     bless: bool,
+}
+
+fn is_v1(engine: &Engine) -> bool {
+    *engine == Engine::V1
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +640,7 @@ fn run_invocation(
     summary: &mut Summary,
 ) -> Result<(), String> {
     refuse_ambient()?;
+    let engine = crate::engine_from_env()?;
     let selected = selection.target;
     let selected_storage = selection.storage;
     let selected_seed = selection.seed;
@@ -758,6 +766,7 @@ fn run_invocation(
                     environment: env.clone(),
                     seed,
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
+                    engine,
                     bless,
                 };
                 let mut outcome = run_child(&input, executable, left);
@@ -980,7 +989,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                 .map_err(|e| format!("worker_failed: runtime: {e}"))?;
             runtime.block_on(capture(
                 input_digest,
-                crate::execute_case(&case, &input.case_path, input.bless),
+                crate::execute_case_on_engine(&case, &input.case_path, input.bless, input.engine),
             ))
         }
         Some(seed) => dst_report(input, &case, seed, input_digest),
@@ -1084,6 +1093,7 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
                         &self.input.case_path,
                         &resources.root,
                         storage,
+                        self.input.engine,
                     ),
                 ),
             )
@@ -1209,6 +1219,7 @@ fn replay_attempts(
     executed: &mut Vec<Attempt>,
 ) -> Result<(), String> {
     refuse_ambient()?;
+    crate::engine_from_env()?;
     for attempt in &summary.attempts {
         attempt
             .input

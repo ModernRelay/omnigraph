@@ -1,6 +1,6 @@
 # issue: none
-# notes: Only the post-commit sidecar delete is lost, so an EffectsConfirmed sidecar survives beside its visible `__manifest` commit.
-# notes: The reopen finalizes it on the confirmed roll-forward path (one RolledForward audit row, sidecar deleted) and serves both rows.
+# notes: Skip the post-commit delete, leaving an EffectsConfirmed sidecar beside the published commit.
+# notes: Reopen must finish recovery and serve both rows.
 
 --- runner
 timeout_ms: 10000

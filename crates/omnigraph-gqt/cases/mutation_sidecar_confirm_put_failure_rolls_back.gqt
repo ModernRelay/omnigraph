@@ -1,7 +1,6 @@
 # issue: none
-# notes: The sidecar confirm put returns an error after the table versions are written and before the `__manifest` commit.
-# notes: The mutation surfaces the injected error, the sidecar stays Armed with no visible commit, and the reopen rolls the intent back.
-# notes: The second action at `mutation.sidecar_confirm_put` (`skip` is `issue_602_stale_sidecar_heals_on_reopen.gqt`), armed with no engine change.
+# notes: Fail the confirm put after table writes but before graph publication.
+# notes: Reopen must roll back the Armed intent and leave bob absent.
 
 --- runner
 timeout_ms: 10000
