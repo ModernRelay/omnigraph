@@ -181,23 +181,41 @@ One repetition is one measured child: it builds a fresh `Chunk` fixture
 `--writers` closed-loop tasks over clones of one `Session` — the production
 server shape — issuing insert-only mutations with disjoint per-worker keys
 for `--warmup-secs` plus `--duration-secs`. `--write-branches B` spreads
-writers round-robin over `B` forks instead of `main`. Setup, warm-up,
+writers round-robin over `B` forks instead of `main`; the first write on
+each fork pays the deferred first-touch fork of `node:Chunk`, which the
+warm-up absorbs unless `--warmup-secs 0` puts it inside the window. Setup, warm-up,
 verification and teardown sit outside the measured window. After every
 counter and clock is read, a fresh handle verifies exact per-branch row
 counts (seeded rows plus this run's acknowledgements) and reads sampled
-acknowledged keys back. A typed read-set conflict (the graph head moved
-under a concurrent writer) is retried by the driver like a real client,
-inside the same op's service time, and counted as `authority_conflicts`;
-any other worker error, any key conflict, or a verification mismatch fails
-the run rather than emitting a green record.
+acknowledged keys back. `Omnigraph::mutate` replays a typed read-set
+conflict (the graph head moved under a concurrent writer) itself, up to 32
+times for an insert-only mutation; the record counts those replays as
+`reprepares` and `io.per_op.reprepares_per_commit`. A conflict reaches the
+driver only when that loop is exhausted; the driver retries it like a real
+client and counts the exhaustion as `authority_conflicts`. Both kinds of
+retry sit inside the op's service time. Any other worker error, any key
+conflict, or a verification mismatch fails the run rather than emitting a
+green record.
+
+`commits_per_sec` divides by `window_us`, the measured window alone;
+`drain_us` is the time ops in flight at the stop took to finish.
+`commits_by_second` is the acknowledgement count per second of the window,
+which is where a plateau or a stall shows; `completed_in_drain` holds the
+ops that finished after the stop.
 
 Op counting rides the ungated instrumentation surface: Lance manifest- and
 table-plane logical calls through per-run `IOTracker` wrappers installed on
 the graph open and on every writer task, and control-plane calls through
-`CountingStorageAdapter`. Counters are logical calls at the wrapping seam,
-not physical requests; the `io.per_op` block divides them by acknowledged
+`CountingStorageAdapter`. Counters are logical calls, not physical
+requests; the `io.per_op` block divides them by acknowledged
 commits, which is where a future group-commit change must show
-`manifest_writes_per_commit` falling below one. `--no-probes` runs the same
+`manifest_writes_per_commit` falling below one. The unit is one range get
+or one put at the seam, so these counts are not the round trips RFC 0067
+counts per write and must not be divided by them. The totals are read from
+each probed Lance `ObjectStore`'s own `io_tracker`, not from the wrapper:
+on a local target Lance writes and reads file bodies through its direct
+local writer and reader, which never reach a wrapped store, and the
+store's own tracker sees both paths. `--no-probes` runs the same
 workload without any counting for an A/B of the counting overhead.
 
 To measure an S3-compatible store, pass `--target-uri s3://bucket/prefix`;

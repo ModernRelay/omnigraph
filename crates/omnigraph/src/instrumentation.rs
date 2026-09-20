@@ -69,6 +69,23 @@ macro_rules! declare_engine_cargo_features {
 // registry from Cargo.toml and refuses execution on any mismatch.
 declare_engine_cargo_features!("default", "dst", "failpoints");
 
+/// The distinct Lance `ObjectStore`s one probe plane opened datasets on.
+#[derive(Clone, Default)]
+pub struct ProbedStores(Arc<Mutex<Vec<Arc<lance::io::ObjectStore>>>>);
+
+impl ProbedStores {
+    fn register(&self, store: Arc<lance::io::ObjectStore>) {
+        let mut stores = self.0.lock().unwrap();
+        if !stores.iter().any(|known| Arc::ptr_eq(known, &store)) {
+            stores.push(store);
+        }
+    }
+
+    pub fn stores(&self) -> Vec<Arc<lance::io::ObjectStore>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
 /// Each wrapper is attached (when present) to the datasets that category opens,
@@ -175,6 +192,17 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
+    /// Pre-effect reprepares `Omnigraph::mutate` took after a `ReadSetChanged`
+    /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
+    /// exhaustion of that loop, so this is the one view of the attempts behind
+    /// an acknowledged write.
+    pub mutation_reprepares: Arc<AtomicU64>,
+    /// The Lance `ObjectStore`s behind the opens that carried
+    /// `manifest_wrapper` / `table_wrapper`. A store's own `io_tracker` also
+    /// sees Lance's direct local reader and writer, which on `file://` never
+    /// reach a `WrappingObjectStore`; read it for backend-complete counts.
+    pub manifest_stores: ProbedStores,
+    pub table_stores: ProbedStores,
     /// Uncapped retries taken after a capped BM25 scan under-filled. Only a
     /// standalone `bm25()` ordering carries a cap (`rrf()` arms are never
     /// capped — see `execute_rrf_fusion`); its capped and uncapped runs are
@@ -503,6 +531,29 @@ pub(crate) fn record_open(uri: &str) {
 pub(crate) fn record_manifest_scan() {
     let _ = current(|p| {
         p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Register the store behind a probed open under the plane whose wrapper the
+/// open carried. No-op unless a cost probe is active.
+fn record_probed_store(wrapper: &Arc<dyn WrappingObjectStore>, store: Arc<lance::io::ObjectStore>) {
+    let _ = current(|p| {
+        let carried = |plane: &Option<Arc<dyn WrappingObjectStore>>| {
+            plane.as_ref().is_some_and(|w| Arc::ptr_eq(w, wrapper))
+        };
+        if carried(&p.manifest_wrapper) {
+            p.manifest_stores.register(store.clone());
+        }
+        if carried(&p.table_wrapper) {
+            p.table_stores.register(store);
+        }
+    });
+}
+
+/// Record one pre-effect mutation reprepare. No-op unless a cost probe is active.
+pub(crate) fn record_mutation_reprepare() {
+    let _ = current(|p| {
+        p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
     });
 }
 
@@ -1414,8 +1465,8 @@ pub(crate) async fn open_dataset(
         .unwrap_or_else(crate::lance_access::control_session);
     builder = builder.with_session(session);
     let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
-    if let Some(wrapper) = wrapper {
-        store_params.object_store_wrapper = Some(wrapper);
+    if let Some(wrapper) = &wrapper {
+        store_params.object_store_wrapper = Some(wrapper.clone());
     }
     let handler = crate::storage_layer::lance_clone::configured_commit_handler(
         uri,
@@ -1427,7 +1478,7 @@ pub(crate) async fn open_dataset(
     builder = builder
         .with_store_params(store_params)
         .with_commit_handler(handler);
-    builder.load().await.map_err(|error| match error {
+    let dataset = builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a
         // pinned historical read count as reclaimed history:
         //   - VersionNotFound: the dataset exists, that version was GC'd.
@@ -1453,7 +1504,15 @@ pub(crate) async fn open_dataset(
             }
         }
         error => OmniError::storage(error),
-    })
+    })?;
+    if let Some(wrapper) = &wrapper {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        record_probed_store(wrapper, store);
+    }
+    Ok(dataset)
 }
 
 /// Per-method call counts for [`CountingStorageAdapter`].
