@@ -708,38 +708,36 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
     }
 }
 
-/// The shared RRF row oracle needs a cross join and multiple probe batches.
-/// Read its fixture directly so schema, seed and ranking query cannot drift.
+/// An RRF order over a cross join whose right input crosses the 8,192-row
+/// batch boundary. GQT owns the rows; it cannot observe operators or batches.
 #[tokio::test]
 #[serial]
-async fn rrf_batch_order_case_exercises_cross_join_and_multiple_probe_batches() {
+async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
     use arrow_array::StringArray;
+    use std::fmt::Write;
 
-    let case =
-        include_str!("../../omnigraph-gqt/cases/rrf_cross_join_batch_order_preserves_rank.gqt");
-    let section = |start: &str, end: &str| {
-        case.split_once(start)
-            .unwrap()
-            .1
-            .split_once(end)
-            .unwrap()
-            .0
-            .trim()
-    };
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    n: I64\n    text: String @index\n}\nnode Probe {\n    slug: String @key\n    n: I64\n}\n";
+    const PROBE_ROWS: usize = 8193;
+    let mut seed = String::from(
+        "{\"type\": \"Doc\", \"data\": {\"slug\": \"best\", \"n\": 8192, \"text\": \"needle needle needle needle filler\"}}\n\
+         {\"type\": \"Doc\", \"data\": {\"slug\": \"worse\", \"n\": 0, \"text\": \"needle filler\"}}\n",
+    );
+    for n in 0..PROBE_ROWS {
+        writeln!(
+            seed,
+            "{{\"type\": \"Probe\", \"data\": {{\"slug\": \"q{n:05}\", \"n\": {n}}}}}"
+        )
+        .unwrap();
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = session(
-        Omnigraph::init(
-            dir.path().to_str().unwrap(),
-            section("--- schema\n", "--- seed\n"),
-        )
-        .await
-        .unwrap(),
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
     );
-    db.load_jsonl(section("--- seed\n", "--- query\n"), LoadMode::Overwrite)
-        .await
-        .unwrap();
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     let db = with_setting(&db, "engine", "v2");
-    let source = section("--- query\n", "--- params\n");
+    let source = "query fused($t: String) {\n    match {\n        $d: Doc\n        $p: Probe\n        $d.n = $p.n\n    }\n    return { $d.slug }\n    order { rrf(bm25($d.text, $t), bm25($d.text, $t)) }\n    limit 1\n}";
     let result = query_main(
         &db,
         &format!("explain {source}"),

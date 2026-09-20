@@ -77,7 +77,8 @@ required context aggregating four qualification jobs. `GQT (ordinary)` checks
 unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
 the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
 the same flagless shape; the guard is a source walk whose crate declares no
-workspace crate (its dev-dependencies are `serde_yaml`, `syn` and `toml`), so
+workspace crate (its dev-dependencies are `serde_yaml`, `syn`, `tempfile` and
+`toml`), so
 it adds no second engine build.
 `GQT (dst)` runs the whole package. `GQT (engine-v2)` runs the same package
 with `OMNIGRAPH_GQ_ENGINE=v2` as the case default; explicit case settings
