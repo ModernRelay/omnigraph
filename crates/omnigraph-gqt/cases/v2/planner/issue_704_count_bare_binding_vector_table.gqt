@@ -1,0 +1,38 @@
+# issue: 704
+# red_on: 2026-09-18, before aggregate_pushdown: count n=3 was correct, but the required pass was absent. Stock main at 0cba5098 also read embedding.
+# notes: Count every Doc, including the one without an embedding.
+# notes: The count reads live-row metadata without scanning identity or property columns.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4)?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2"}}
+
+--- query
+set engine = v2;
+query count_docs() {
+    match { $d: Doc }
+    return { count($d) as n }
+}
+
+--- expect unordered
+{"n":3}
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown
+not pass projection_pushdown

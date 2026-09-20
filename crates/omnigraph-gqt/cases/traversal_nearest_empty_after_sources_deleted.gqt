@@ -1,9 +1,7 @@
 # issue: none
-# notes: three docs, one edge d001 -> d002; the source is deleted after the
-# notes: index build (the delete reports its edge), then `$d knows $t` nearest
-# notes: limit 2: no doc has an edge, the eligible set is proven empty and the
-# notes: answer is empty. Rust twin (probes: no scan runs):
-# notes: issue_567_proven_empty_eligible_set_runs_no_scan_and_no_overfetch.
+# notes: Delete the only edge source after indexing; the delete must also remove its edge.
+# notes: Nearest over the remaining traversal returns no rows.
+# notes: Rust probe: issue_567_proven_empty_eligible_set_runs_no_scan_and_no_overfetch.
 
 --- runner
 timeout_ms: 10000
@@ -29,7 +27,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e001_0","from":"d001","to":"d002","data":{}}
 
 --- mutate
-query del($s: String) {
+query delete_doc($s: String) {
     delete Doc where slug = $s
 }
 
@@ -39,7 +37,7 @@ query del($s: String) {
 --- expect affected: nodes=1 edges=1
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_after_source_delete($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

@@ -1,0 +1,94 @@
+# issue: none
+# notes: Destination id lookup preserves conjunctions of search membership predicates.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Source {
+    slug: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index
+    summary: String @index
+    state: String
+}
+edge Links: Source -> Doc
+
+--- seed
+{"type":"Source","data":{"slug":"root"}}
+{"type":"Doc","data":{"slug":"hit","body":"needle zeta","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"body-only","body":"needle","summary":"other","state":"open"}}
+{"type":"Doc","data":{"slug":"summary-only","body":"other zeta","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"unlinked-hit","body":"needle zeta","summary":"beacon","state":"open"}}
+{"type":"Doc","data":{"slug":"f05","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f06","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f07","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f08","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f09","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f10","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f11","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f12","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f13","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f14","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f15","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f16","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f17","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f18","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f19","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f20","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f21","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f22","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f23","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f24","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f25","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f26","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f27","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f28","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f29","body":"filler","summary":"filler","state":"open"}}
+{"type":"Doc","data":{"slug":"f30","body":"filler","summary":"filler","state":"open"}}
+{"edge":"Links","from":"root","to":"hit"}
+{"edge":"Links","from":"root","to":"body-only"}
+{"edge":"Links","from":"root","to":"summary-only"}
+
+--- query
+set engine = v2;
+query one_destination_search() {
+    match {
+        $s: Source
+        $s links $d
+        search($d.body, "needle")
+    }
+    return { $d.slug }
+}
+--- expect unordered
+{"d.slug":"hit"}
+{"d.slug":"body-only"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: access id_lookup
+scan Doc as $d: filter reads [d.body]
+
+--- query
+set engine = v2;
+query two_destination_searches() {
+    match {
+        $s: Source
+        $s links $d
+        search($d.body, "needle")
+        match_text($d.summary, "beacon")
+    }
+    return { $d.slug }
+}
+--- expect unordered
+{"d.slug":"hit"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: access id_lookup
+scan Doc as $d: filter reads [d.body, d.summary]

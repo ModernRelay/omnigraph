@@ -1,0 +1,68 @@
+# issue: none
+# notes: One-hop and two-hop traversal choose different expansion modes on the same graph.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"hub"}}
+{"type":"Person","data":{"name":"leaf0000"}}
+{"type":"Person","data":{"name":"leaf0001"}}
+{"type":"Person","data":{"name":"leaf0002"}}
+{"edge":"Knows","from":"hub","to":"leaf0000"}
+{"edge":"Knows","from":"hub","to":"leaf0001"}
+{"edge":"Knows","from":"hub","to":"leaf0002"}
+
+--- query
+set engine = v2;
+query one_hop() {
+    match {
+        $a: Person
+        $a knows $b
+    }
+    return { $b.name }
+}
+
+--- expect unordered
+{"b.name":"leaf0000"}
+{"b.name":"leaf0001"}
+{"b.name":"leaf0002"}
+
+--- expect shape
+b.name: String
+
+--- expect plan
+expand $a Knows $b: mode indexed_scan
+pass expand_mode
+
+--- query
+set engine = v2;
+query two_hops() {
+    match {
+        $a: Person
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+
+--- expect unordered
+{"b.name":"leaf0000"}
+{"b.name":"leaf0001"}
+{"b.name":"leaf0002"}
+
+--- expect shape
+b.name: String
+
+--- expect plan
+expand $a Knows $b: mode csr
+pass expand_mode

@@ -1,0 +1,85 @@
+# issue: none
+# notes: Explicit edge ids and keyed endpoints make hidden tie-breaks stable across runs.
+# notes: Four parallel edges tie on the unreturned user sort key; seed order differs from id order.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    rank: I64
+}
+edge Knows: Person -> Person {
+    label: String
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","rank":1}}
+{"type":"Person","data":{"name":"bob","rank":1}}
+{"edge":"Knows","id":"edge-d","from":"alice","to":"bob","data":{"label":"delta"}}
+{"edge":"Knows","id":"edge-b","from":"alice","to":"bob","data":{"label":"beta"}}
+{"edge":"Knows","id":"edge-c","from":"alice","to":"bob","data":{"label":"gamma"}}
+{"edge":"Knows","id":"edge-a","from":"alice","to":"bob","data":{"label":"alpha"}}
+
+--- query
+query all_edges() {
+    match {
+        $p: Person { name: "alice" }
+        $p $w:knows $f
+    }
+    return { $w.label }
+    order { $p.rank }
+}
+
+--- expect ordered
+{"w.label":"alpha"}
+{"w.label":"beta"}
+{"w.label":"gamma"}
+{"w.label":"delta"}
+
+--- expect shape
+w.label: String
+
+--- query
+query first_page() {
+    match {
+        $p: Person { name: "alice" }
+        $p $w:knows $f
+    }
+    return { $w.label }
+    order { $p.rank }
+    limit 2
+}
+
+--- expect ordered
+{"w.label":"alpha"}
+{"w.label":"beta"}
+
+--- expect shape
+w.label: String
+
+--- query
+query next_page() {
+    match {
+        $p: Person { name: "alice" }
+        $p $w:knows $f
+        $w.@id > "edge-b"
+    }
+    return { $w.label }
+    order { $p.rank }
+    limit 2
+}
+
+--- expect ordered
+{"w.label":"gamma"}
+{"w.label":"delta"}
+
+--- expect shape
+w.label: String

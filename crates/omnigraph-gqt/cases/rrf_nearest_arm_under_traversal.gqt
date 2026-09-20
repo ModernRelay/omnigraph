@@ -1,8 +1,6 @@
 # issue: none
-# notes: rrf(nearest, bm25) with `$d knows $t` over 10 docs, edges leaving 3, 6,
-# notes: 9 (30%, the rrf gate's Threshold fallback), limit 2: both arms rank the
-# notes: eligible rows in row order and the unfiltered top-2 (0, 1) has no edge,
-# notes: so the fused set is the two nearest docs with an edge (3 > 2): d003, d006.
+# notes: Only d003, d006 and d009 have edges; both RRF arms rank them in that order.
+# notes: Keep 10 docs: 3/10 eligible sources exceeds the 10% gate threshold; the unfiltered top two have no edge.
 
 --- runner
 timeout_ms: 10000
@@ -38,18 +36,18 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e009_0","from":"d009","to":"d000","data":{}}
 
 --- query
-query fused($q: Vector(4), $t: String) {
+query nearest_and_text_with_edges($q: Vector(4), $text: String) {
     match {
         $d: Doc
         $d knows $t
     }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    order { rrf(nearest($d.embedding, $q), bm25($d.text, $text)) }
     limit 2
 }
 
 --- params
-{"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
+{"q": [-0.3, 0.0, 0.0, 0.0], "text": "needle"}
 
 --- expect unordered
 {"d.slug":"d003"}

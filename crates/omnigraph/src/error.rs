@@ -506,6 +506,18 @@ impl OmniError {
         datafusion::error::DataFusionError::External(source)
     }
 
+    /// A memory refusal carried by a build stream, excluding the scratch quota.
+    pub(crate) fn is_query_memory_failure(error: &datafusion::error::DataFusionError) -> bool {
+        if matches!(
+            error.find_root(),
+            datafusion::error::DataFusionError::ResourcesExhausted(_)
+        ) {
+            return !crate::table_store::is_scratch_exhaustion(error);
+        }
+        matches!(recover_datafusion_stream_failure(error),
+            Some(Self::ResourceLimitExceeded { resource, .. }) if resource == "query_memory_bytes")
+    }
+
     /// Preserve typed storage evidence carried through DataFusion execution;
     /// otherwise retain the user query/execution category.
     pub fn datafusion(error: datafusion::error::DataFusionError) -> Self {
@@ -1937,5 +1949,39 @@ mod tests {
             "merge conflicts: node type 'Person', entity id 'p1' (divergent_update): divergent update for id 'p1'"
         );
         assert!(!error.to_string().contains("table_key"));
+    }
+    /// GQT cannot construct DataFusion carriers or distinguish build failure classes.
+    #[test]
+    fn hash_build_fallback_accepts_only_memory_refusals() {
+        use datafusion::error::DataFusionError;
+        for (error, retry) in [
+            (
+                DataFusionError::ResourcesExhausted("allocation refused".into()),
+                true,
+            ),
+            (
+                DataFusionError::ResourcesExhausted("max_temp_directory_size exceeded".into()),
+                false,
+            ),
+            (
+                OmniError::resource_limit("query_memory_bytes", 1, 2).into_datafusion_external(),
+                true,
+            ),
+            (
+                OmniError::resource_limit("query_scratch_bytes", 1, 2).into_datafusion_external(),
+                false,
+            ),
+            (
+                OmniError::manifest_internal("build error").into_datafusion_external(),
+                false,
+            ),
+        ] {
+            let shared = DataFusionError::Shared(std::sync::Arc::new(error));
+            assert_eq!(
+                OmniError::is_query_memory_failure(&shared),
+                retry,
+                "{shared}"
+            );
+        }
     }
 }

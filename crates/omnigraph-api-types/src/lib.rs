@@ -11,7 +11,7 @@ use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::{
-    MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
+    Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
@@ -59,9 +59,12 @@ pub mod branch_statement_refusals {
     pub const NAME_OR_PARAMS: &str = "a branch statement takes no name and no parameters";
     /// An expected head beside a statement.
     pub const COMMIT_PRECONDITION: &str = "a branch statement takes no commit precondition";
-    /// Any statement sent to a deprecated route.
+    /// Any branch statement sent to a deprecated route.
     pub const DEPRECATED_ROUTE: &str =
         "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
+    /// An `explain` statement sent to a deprecated route.
+    pub const EXPLAIN_DEPRECATED_ROUTE: &str =
+        "the explain statement is not served on deprecated routes; use POST /query";
 
     /// Fill the `{statement}` placeholder of the two door refusals.
     pub fn with_statement(template: &str, statement: &str) -> String {
@@ -91,6 +94,10 @@ pub mod query_file_refusals {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SettingsRequest {
+    /// `engine`: `v1` or `v2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = engine_schema)]
+    pub engine: Option<Engine>,
     /// `merge_lineage`: `off`, `on` or `verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = merge_lineage_schema)]
@@ -102,6 +109,12 @@ impl SettingsRequest {
     /// a session applies with source `request`.
     pub fn assignments(&self) -> Vec<(SettingId, SettingValue)> {
         let mut assignments = Vec::new();
+        if let Some(engine) = self.engine {
+            assignments.push((
+                SettingId::Engine,
+                SettingValue::Ident(engine.as_str().to_string()),
+            ));
+        }
         if let Some(merge_lineage) = self.merge_lineage {
             assignments.push((
                 SettingId::MergeLineage,
@@ -128,6 +141,10 @@ fn setting_schema(id: SettingId) -> utoipa::openapi::schema::Object {
             .maximum(max)
             .build(),
     }
+}
+
+fn engine_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::Engine)
 }
 
 fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
@@ -686,8 +703,8 @@ pub struct CommitChangesQuery {
     pub op: Vec<ChangeOpOutput>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
-    /// The value is validated here and selects nothing in this release: the
-    /// consumer is the `engine` setting, the Session settings RFC's rollout step 2.
+    /// Values are validated as session settings; `engine` does not change
+    /// change-feed execution.
     #[serde(default)]
     pub set: Vec<String>,
 }
@@ -716,8 +733,8 @@ pub struct ChangeFeedQuery {
     pub op: Vec<ChangeOpOutput>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
-    /// The value is validated here and selects nothing in this release: the
-    /// consumer is the `engine` setting, the Session settings RFC's rollout step 2.
+    /// Values are validated as session settings; `engine` does not change
+    /// change-feed execution.
     #[serde(default)]
     pub set: Vec<String>,
 }
@@ -824,7 +841,12 @@ pub struct QueryRequest {
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
     /// deprecated alias `POST /change`) instead. May instead be the branch
     /// statement `branch list`, sent with no `name`, `params`, `branch`, or
-    /// `snapshot`.
+    /// `snapshot`; or one `explain` statement (`explain query …`), which
+    /// answers the v2 plan instead of
+    /// running it, as one result per plan node (fields `tree`, `depth`, `node`,
+    /// `detail`: the logical, physical and available DataFusion trees, then `plan` entries for
+    /// the passes and the document's other fields), under the same `params`,
+    /// `branch`, or `snapshot` as the query itself.
     #[schema(
         example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
     )]
@@ -1955,10 +1977,14 @@ mod tests {
             .map(|spec| spec.name)
             .collect();
         let populated = SettingsRequest {
+            engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
         };
-        let expected = format!("{{\"{}\":\"off\"}}", request_rows[0]);
-        assert_eq!(request_rows.len(), 1);
+        let expected = format!(
+            "{{\"{}\":\"v2\",\"{}\":\"off\"}}",
+            request_rows[0], request_rows[1]
+        );
+        assert_eq!(request_rows.len(), 2);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated

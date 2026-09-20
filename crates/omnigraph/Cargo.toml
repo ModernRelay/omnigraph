@@ -33,6 +33,7 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.11.0" }
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.11.0" }
 omnigraph-seams = { path = "../omnigraph-seams", version = "0.11.0" }
+omnigraph-planner = { path = "../omnigraph-planner", version = "0.11.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 lance-select = { workspace = true }

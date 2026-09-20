@@ -1,0 +1,76 @@
+# issue: none
+# notes: Ordered LIMIT zero returns no rows, including grouped aggregation.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- query
+set engine = v1;
+query ordered_limit_zero_v1() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.name }
+    limit 0
+}
+
+--- expect unordered
+--- expect shape
+p.name: String
+
+
+--- query
+set engine = v2;
+query ordered_limit_zero_v2() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.name }
+    limit 0
+}
+
+--- expect unordered
+--- expect shape
+p.name: String
+
+
+--- query
+set engine = v2;
+query ordered_limit_zero_desc_v2() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc }
+    limit 0
+}
+
+--- expect unordered
+--- expect shape
+p.name: String
+p.age: I64
+
+
+--- query
+set engine = v2;
+query aggregate_ordered_limit_zero_v2() {
+    match { $p: Person }
+    return { $p.name, count($p) as n }
+    order { n desc }
+    limit 0
+}
+
+--- expect unordered
+--- expect shape
+p.name: String
+n: I64
+

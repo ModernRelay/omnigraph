@@ -130,7 +130,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        mode: [ordinary, dst, dst-clippy]
+        mode: [ordinary, dst, engine-v2, dst-clippy]
     permissions:
       contents: read
     env:
@@ -195,6 +195,14 @@ jobs:
       # from any directory; these steps run from the repo root.
       - name: Run complete GQ logic tests with DST
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst'
+        run: cargo test -p omnigraph-gqt --locked --timings -- --nocapture
+
+      # The same corpus on the plan route (RFC 0068 milestone 3): every
+      # embedded-engine case must answer the same rows on both routes.
+      - name: Run complete GQ logic tests on engine v2
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'engine-v2'
+        env:
+          OMNIGRAPH_GQ_ENGINE: v2
         run: cargo test -p omnigraph-gqt --locked --timings -- --nocapture
 
       - name: Clippy GQT with DST

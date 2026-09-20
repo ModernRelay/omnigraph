@@ -102,7 +102,7 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
-    /// Execute a read query, or `branch list`, against a branch or snapshot.
+    /// Execute a read query, `branch list`, or an `explain` statement against a branch or snapshot.
     ///
     /// Canonical read endpoint, paired with `mutate`; `read` is a visible alias that warns.
     #[command(visible_alias = "read")]
@@ -111,13 +111,14 @@ pub(crate) enum Command {
         /// the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), or one
-        /// `branch list` statement.
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
+        /// `branch list` statement, or one `explain query …` statement, which
+        /// answers the plan the query would run under as results.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
         /// the `branch list` statement, which takes no name, params, --branch
-        /// or --snapshot.
+        /// or --snapshot, or an `explain query …` statement.
         #[arg(
             short = 'e',
             long = "query-string",

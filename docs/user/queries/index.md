@@ -3,10 +3,13 @@
 A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
 covered in [Mutations](../mutations/index.md). A file may instead hold exactly
-one branch statement (`branch create`, `branch delete`, `branch merge`, or
-`branch list`), never beside a query declaration; see
-[Branches, Commits, and History](../branching/index.md). Either may open
-with [session settings](#session-settings) lines.
+one statement, never beside a query declaration: a branch statement (`branch
+create`, `branch delete`, `branch merge`, or `branch list`; see
+[Branches, Commits, and History](../branching/index.md)), a `show` statement
+(see [session settings](#session-settings)), or an `explain` statement, which
+answers the plan a read query would run under instead of its rows (see
+[Explain](explain.md)). Any of them may open with
+[session settings](#session-settings) lines.
 
 ```gq
 query engineers($title: String) @description("People with a title") {
@@ -276,6 +279,7 @@ refuses startup; no default is substituted.
 
 | Name | Type and values | Default | Scope | Process default variable | What it chooses |
 |---|---|---|---|---|---|
+| `engine` | enum `v1`, `v2` | `v1` | request | `OMNIGRAPH_ENGINE` | whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution |
 | `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
 | `ann_nprobes` | integer, at least `0` | `20` | process | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
@@ -292,7 +296,7 @@ settings line's refusal as `ERROR line <n>, column <c>: <message>`.
 set merge_lineage = fast;
 error: unknown value `fast` for setting `merge_lineage`; expected one of off, on, verify
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
-error: unknown setting `traversal`; expected one of rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency
+error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string
 set stage_write_concurrency = 0;

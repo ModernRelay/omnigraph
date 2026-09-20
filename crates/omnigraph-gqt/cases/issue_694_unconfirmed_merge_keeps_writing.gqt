@@ -1,8 +1,7 @@
 # issue: 694
 # red_on: ed3ea500 (2026-09-09): step 6 rejects the unrelated write with pending BranchMerge
-# notes: The runner section injects one merge failure under DST.
-# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
-# notes: The failed merge compensates its own unconfirmed effects before returning, so step 6 succeeds and the merge retry lands.
+# notes: Fail after table effects but before confirmation. The merge must undo its unconfirmed effects.
+# notes: The same Omnigraph must accept an unrelated write and a merge retry without reopening.
 
 --- runner
 timeout_ms: 10000

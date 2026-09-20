@@ -1,11 +1,7 @@
 # issue: 473
 # red_on: none; guard case, green before and after RFC 0062 (a net-zero branch merges as fast_forward and publishes no registration)
-# notes: The same-branch re-registration of issue 473. `b0` forks from `main`,
-# notes: makes real edge commits that net back to the fork point (insert b->c,
-# notes: then delete it), and merges into an unmoved `main`. The adopt arm would
-# notes: re-emit `main`'s own registration `(Knows, v2, None, 1 row)`, so the
-# notes: merge reports `fast_forward` and publishes no registration for the
-# notes: table, and `main` still reads its one edge.
+# notes: Insert then delete b->c on b0: the branch has real commits but no net change.
+# notes: Merging into unchanged main must fast-forward and retain its single a->b edge.
 
 --- runner
 timeout_ms: 10000

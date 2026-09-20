@@ -32,7 +32,7 @@ Tools that support `@` imports include these automatically:
 - Version surveyed: 0.11.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
-- Workspace: compiler, storage, `omnigraph-seams` (the one seam type every
+- Workspace: compiler, planner (logical/physical plans and optimizer), storage, `omnigraph-seams` (the one seam type every
   test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
   package), policy, API types, cluster, CLI, server, Azure admission
   wrapper, benchmark harness,
@@ -184,6 +184,12 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
   expensive regression repros use `heavy-repro:` and thereby enroll in the
   nightly job.
+- Engine v1 is frozen: `crates/omnigraph/src/exec/query.rs`,
+  `exec/projection.rs`, `tests/traversal.rs` and `tests/search.rs` are
+  upstream's bytes, pinned by `crates/omnigraph/tests/v1_frozen.rs`. A defect
+  seen on v1 is fixed on v2 (`crates/omnigraph/src/engine/`), which the
+  session setting `engine = v2` selects; a v1 edit needs the pin updated in
+  the same PR and a reviewer's eyes.
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries

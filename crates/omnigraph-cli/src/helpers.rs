@@ -7,7 +7,9 @@ use std::io::IsTerminal;
 use omnigraph_api_types::{
     ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
 };
-use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, QueryFile, show_statement_name};
+use omnigraph_compiler::query::ast::{
+    BranchStmt, BranchWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
+};
 use omnigraph_compiler::settings::SettingId;
 
 use super::*;
@@ -873,14 +875,15 @@ pub(crate) fn load_params_json(params: &ParamsArgs) -> Result<Option<Value>> {
     }
 }
 
-/// Pick the query the caller named out of an already-parsed source. The
-/// `Branch` arm stays as the guard: a statement never reaches a declaration
-/// path.
+/// Pick the query the caller named out of an already-parsed source. An
+/// `explain` statement offers its one declaration (the engine answers the
+/// plan); the `Branch` arm stays as the guard: a branch statement never
+/// reaches a declaration path.
 pub(crate) fn select_named_query(
     query_file: QueryFile,
     requested_name: Option<&str>,
 ) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
-    let queries = match query_file.into_declarations() {
+    let queries = match query_file.body.into_read_declarations() {
         Ok(queries) => queries,
         Err(message) => bail!("{message}"),
     };
@@ -931,6 +934,14 @@ pub(crate) fn show_at_write_door(id: Option<SettingId>) -> String {
     branch_statement_refusals::with_statement(
         branch_statement_refusals::READ_AT_WRITE_DOOR,
         &show_statement_name(id),
+    )
+}
+
+/// The server's refusal for an `explain` statement sent through `mutate`.
+pub(crate) fn explain_at_write_door() -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::READ_AT_WRITE_DOOR,
+        EXPLAIN_STATEMENT_NAME,
     )
 }
 

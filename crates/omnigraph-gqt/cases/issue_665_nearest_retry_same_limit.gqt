@@ -1,8 +1,7 @@
 # issue: 665
 # red_on: 2026-09-04, main c253f111: returned 0 rows instead of d001.
-# notes: two docs, one edge d001 -> d000. The nearest doc to the query is d000,
-# notes: which has no out-edge; the scan's top-1 is dropped by the traversal and
-# notes: the under-fill retry reruns with the same k, so the answer stays empty.
+# notes: The nearest doc, d000, has no outgoing edge. Retrying with the same limit stays empty;
+# notes: a wider retry must find d001.
 
 --- runner
 timeout_ms: 10000

@@ -1,10 +1,6 @@
 # issue: none
-# notes: one branch lifecycle end to end: create, write on the branch and on
-# notes: main, merge the divergence, then a second branch whose write collides
-# notes: with main's, its merge refused, the branch deleted, and the deletion
-# notes: read back through `branch list` and a read targeting the gone branch.
-# notes: The merge of b0 is a three-way merge (both sides wrote after the
-# notes: fork), so the outcome is `merged` rather than a fast forward.
+# notes: Divergent writes merge; conflicting updates fail. Deleting the conflicting branch
+# notes: removes it from branch list and makes reads targeting it fail.
 
 --- runner
 timeout_ms: 10000

@@ -1,7 +1,6 @@
 # issue: none
-# notes: keyed twin of unkeyed_edge_dup_fast_forward.gqt: with @key(@src, @dst) (RFC 0044) the branch's
-# notes: re-insert of an inherited pair upserts the one row, so the fast-forward merge and the restart
-# notes: keep exactly one copy.
+# notes: Re-inserting a keyed pair upserts: fast-forward and restart keep one copy of that pair.
+# notes: Compare unkeyed_edge_dup_fast_forward.gqt, which keeps two copies.
 
 --- runner
 timeout_ms: 10000
@@ -32,7 +31,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query change() { insert Knows { from: "Bob", to: "Diana" } }
+query upsert_inherited_edge() { insert Knows { from: "Bob", to: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 

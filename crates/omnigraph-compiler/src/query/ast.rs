@@ -1,10 +1,12 @@
+use std::fmt::Write as _;
+
 use crate::settings::{SettingId, SettingValue};
 
 pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
 /// A parsed `.gq` source: the `set` and `reset` lines at its head, then its
-/// body, which is a list of `query` declarations, one branch statement, or
-/// one `show` statement.
+/// body, which is a list of `query` declarations, one branch statement, one
+/// `show` statement, or one `explain` statement wrapping a read declaration.
 #[derive(Debug, Clone)]
 pub struct QueryFile {
     pub settings: Vec<SettingStmt>,
@@ -18,6 +20,7 @@ pub enum FileBody {
     Queries(Vec<QueryDecl>),
     Branch(BranchStmt),
     Show(Option<SettingId>),
+    Explain(QueryDecl),
 }
 
 /// Which empty a source is: no statement at all, or a settings prefix with
@@ -59,6 +62,57 @@ pub fn show_statement_name(id: Option<SettingId>) -> String {
     format!("show {}", id.map_or("all", SettingId::name))
 }
 
+/// Refusal text for a consumer that expected `query` declarations and got
+/// an `explain` statement; the branch statements carry theirs on
+/// [`BranchStmt::not_a_declaration_message`].
+const EXPLAIN_NOT_A_DECLARATION: &str = "`explain` is a statement, not a query declaration";
+
+/// The statement name of `explain`, as the door refusals spell it.
+pub const EXPLAIN_STATEMENT_NAME: &str = "explain";
+
+impl FileBody {
+    /// The declarations of a declaration file.
+    ///
+    /// # Errors
+    ///
+    /// The not-a-declaration message of a branch, `show` or `explain`
+    /// statement.
+    pub fn into_declarations(self) -> Result<Vec<QueryDecl>, String> {
+        match self {
+            FileBody::Queries(queries) => Ok(queries),
+            FileBody::Branch(stmt) => Err(stmt.not_a_declaration_message()),
+            FileBody::Show(id) => Err(format!(
+                "`{}` is a settings statement, not a query declaration",
+                show_statement_name(id)
+            )),
+            FileBody::Explain(_) => Err(EXPLAIN_NOT_A_DECLARATION.to_string()),
+        }
+    }
+
+    /// The declarations a read door selects from: those of a declaration
+    /// file, or the one read declaration under an `explain` statement.
+    ///
+    /// # Errors
+    ///
+    /// As [`FileBody::into_declarations`] for a branch or `show` statement,
+    /// and the `explain` refusal when the wrapped declaration holds mutations.
+    pub fn into_read_declarations(self) -> Result<Vec<QueryDecl>, String> {
+        match self {
+            FileBody::Explain(decl) if !decl.mutations.is_empty() => Err(format!(
+                "`explain` applies to a read query; '{}' contains mutations",
+                decl.name
+            )),
+            FileBody::Explain(decl) => Ok(vec![decl]),
+            body => body.into_declarations(),
+        }
+    }
+
+    /// Whether this body is an `explain` statement.
+    pub fn is_explain(&self) -> bool {
+        matches!(self, FileBody::Explain(_))
+    }
+}
+
 impl QueryFile {
     /// Which empty this file is, `None` when its body carries a statement:
     /// the one reading of an empty `Queries` body every door shares.
@@ -73,20 +127,13 @@ impl QueryFile {
         }
     }
 
-    /// The declarations of a declaration file.
+    /// [`FileBody::into_declarations`] of this file's body.
     ///
     /// # Errors
     ///
-    /// The not-a-declaration message of a branch or `show` statement.
+    /// As [`FileBody::into_declarations`].
     pub fn into_declarations(self) -> Result<Vec<QueryDecl>, String> {
-        match self.body {
-            FileBody::Queries(queries) => Ok(queries),
-            FileBody::Branch(stmt) => Err(stmt.not_a_declaration_message()),
-            FileBody::Show(id) => Err(format!(
-                "`{}` is a settings statement, not a query declaration",
-                show_statement_name(id)
-            )),
-        }
+        self.body.into_declarations()
     }
 
     /// The one declaration of a single-query file. Test support: production
@@ -108,6 +155,7 @@ impl QueryFile {
             },
             FileBody::Branch(stmt) => panic!("{}", stmt.not_a_declaration_message()),
             FileBody::Show(id) => panic!("`{}` is not a declaration", show_statement_name(*id)),
+            FileBody::Explain(_) => panic!("{EXPLAIN_NOT_A_DECLARATION}"),
         }
     }
 }
@@ -375,6 +423,66 @@ pub enum Literal {
     Date(String),
     DateTime(String),
     List(Vec<Literal>),
+}
+
+/// The literal as explain text. It is the spelling the parser accepts except
+/// for `null`, a negative number and a non-finite float, which GQ has no
+/// literal for. A float prints in fixed notation with a decimal point.
+impl std::fmt::Display for Literal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Literal::Null => f.write_str("null"),
+            Literal::String(text) => write_gq_string(f, text),
+            Literal::Integer(value) => write!(f, "{value}"),
+            Literal::Float(value) => {
+                let text = value.to_string();
+                f.write_str(&text)?;
+                if value.is_finite() && !text.contains('.') {
+                    f.write_str(".0")?;
+                }
+                Ok(())
+            }
+            Literal::Bool(value) => write!(f, "{value}"),
+            Literal::Date(text) => {
+                f.write_str("date(")?;
+                write_gq_string(f, text)?;
+                f.write_str(")")
+            }
+            Literal::DateTime(text) => {
+                f.write_str("datetime(")?;
+                write_gq_string(f, text)?;
+                f.write_str(")")
+            }
+            Literal::List(items) => {
+                f.write_str("[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                f.write_str("]")
+            }
+        }
+    }
+}
+
+/// A GQ string literal: double-quoted, with the escapes
+/// [`crate::error::decode_string_literal`] decodes (`\"`, `\\`, `\n`, `\r`,
+/// `\t`), so the text stays on one line.
+fn write_gq_string(f: &mut std::fmt::Formatter<'_>, text: &str) -> std::fmt::Result {
+    f.write_char('"')?;
+    for character in text.chars() {
+        match character {
+            '"' => f.write_str("\\\"")?,
+            '\\' => f.write_str("\\\\")?,
+            '\n' => f.write_str("\\n")?,
+            '\r' => f.write_str("\\r")?,
+            '\t' => f.write_str("\\t")?,
+            other => f.write_char(other)?,
+        }
+    }
+    f.write_char('"')
 }
 
 #[derive(Debug, Clone)]

@@ -5,11 +5,13 @@
 
 use super::*;
 use crate::api::branch_statement_refusals as refusals;
-use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, SettingStmt, show_statement_name};
+use omnigraph_compiler::query::ast::{
+    BranchStmt, BranchWrite, EXPLAIN_STATEMENT_NAME, SettingStmt, show_statement_name,
+};
 use omnigraph_compiler::settings::{SettingId, SettingRow};
 
-/// The HTTP entry a GQ source arrived through. A branch statement is served
-/// only at its own door: `Query` serves `branch list`, `Mutate` serves
+/// The HTTP entry a GQ source arrived through. A statement is served only at
+/// its own door: `Query` serves `branch list` and `explain`, `Mutate` serves
 /// `branch create`, `branch delete`, and `branch merge`, and the deprecated
 /// `Read` and `Change` serve none. `Read` is also the one door that runs a
 /// mutation body.
@@ -150,6 +152,25 @@ pub(super) fn refuse_wrong_door(
         (Door::Mutate, BranchStmt::List) => Err(read_at_write_door()),
         (Door::Query, BranchStmt::List) | (Door::Mutate, BranchStmt::Write(_)) => Ok(()),
     }
+}
+
+/// An `explain` statement is served at `Query` alone: a read refused at
+/// `Mutate` as `branch list` is, and at the deprecated routes as every
+/// statement is.
+pub(super) fn refuse_explain(door: Door) -> std::result::Result<(), ApiError> {
+    match door {
+        Door::Query => Ok(()),
+        Door::Read | Door::Change => Err(ApiError::bad_request(refusals::EXPLAIN_DEPRECATED_ROUTE)),
+        Door::Mutate => Err(explain_at_write_door()),
+    }
+}
+
+/// `explain` is a read: the same refusal `branch list` meets at the write door.
+pub(super) fn explain_at_write_door() -> ApiError {
+    ApiError::bad_request(refusals::with_statement(
+        refusals::READ_AT_WRITE_DOOR,
+        EXPLAIN_STATEMENT_NAME,
+    ))
 }
 
 /// A branch statement names every branch it acts on, so a request target, a

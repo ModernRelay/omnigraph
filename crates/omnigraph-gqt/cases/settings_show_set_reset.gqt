@@ -1,15 +1,7 @@
 # issue: none
-# notes: the case session's show, set and reset: `show all` returns one row per
-# notes: definition row in definition order, so `--- expect ordered` applies; a
-# notes: fresh case reports every default with source `default`; a settings step
-# notes: sets the value with source `file`; a reset returns to the default; the
-# notes: last assignment in one settings step wins; a settings prefix on a
-# notes: `show` step is scoped to that step (the Session settings RFC, Evidence and tests).
-# notes: `merge_lineage` reads `verify` because `SessionSettings::default` picks
-# notes: `verify` under `cfg!(debug_assertions)` and the corpus runs in debug;
-# notes: the `default` column still reports the definition's `on`. The other
-# notes: `settings_*` cases point here for that rationale instead of repeating
-# notes: it.
+# notes: Show values and their sources across set, reset and scoped prefixes.
+# notes: Debug builds start merge_lineage at verify; its declared default is on.
+# notes: Pin engine to v1 so show all is identical under either runner baseline.
 
 --- runner
 timeout_ms: 10000
@@ -23,12 +15,17 @@ node Person {
 }
 
 --- seed
-{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+set engine = v1;
+
+--- expect ok
 
 --- query
 show all;
 
 --- expect ordered
+{"name": "engine", "value": "v1", "default": "v1", "source": "file", "scope": "request"}
 {"name": "rrf_plan", "value": "auto", "default": "auto", "source": "default", "scope": "process"}
 {"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
 {"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "process"}
