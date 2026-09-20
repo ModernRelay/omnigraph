@@ -125,7 +125,8 @@ jobs:
     name: GQT (${{ matrix.mode }})
     needs: classify_changes
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Cold-build budget and observations: docs/dev/ci.md, GQ Logic Tests.
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
@@ -182,14 +183,13 @@ jobs:
           RUSTFLAGS: ""
         run: cargo test -p omnigraph-gqt --locked --timings --lib --test runner_dispatch -- --nocapture
 
-      # A case's `at:` name arms a seam in the engine's seam guard, so a
-      # cases-only diff can change its verdict while `Test Workspace` is
-      # skipped; same flagless build as the step above.
+      # A case's `at:` name arms a seam in the seam guard, so a cases-only
+      # diff can change its verdict while `Test Workspace` is skipped.
       - name: Run the seam guard the case corpus arms
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
         env:
           RUSTFLAGS: ""
-        run: cargo test -p omnigraph-engine --locked --timings --test failpoint_names_guard
+        run: cargo test -p omnigraph-seams --locked --timings --test failpoint_names_guard
 
       # The workspace .cargo/config.toml enables the seeded Tokio runtime
       # from any directory; these steps run from the repo root.

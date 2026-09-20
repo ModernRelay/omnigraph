@@ -691,8 +691,9 @@ admitted by a case. Read-path sites (`read.*`, `classify.*`) are `Unreachable`
 too until a read step kind exists.
 
 The catalog is held honest by the existing source walker.
-`crates/omnigraph/tests/failpoint_names_guard.rs:19-24`
-(`docs/dev/testing.md:43`) is the catalog guard today and is rewritten for the
+`crates/omnigraph-seams/tests/failpoint_names_guard.rs:19-24` (an engine
+integration test when this RFC was written, moved to the seams crate by #757;
+`docs/dev/testing.md:43`) is the catalog guard today and is rewritten for the
 new call prefixes, so that every `fail(&`, `skip(&`, `contention(&`,
 `guarded(`, `park_first(` and `catalog::decide(` argument is a catalog
 static rather than a literal, every declared static is re-exported by the
@@ -861,13 +862,13 @@ modules; nothing durable is written by any of this.
   a slot (thread-local `Option`, install/uninstall pair) and this RFC keeps
   their shape and their entry-point signatures; it differs from them only by
   writing the slot once as `Storage<B>` instead of three times.
-  `tests/failpoint_names_guard.rs` is the in-repo pattern for a source-walk
+  `crates/omnigraph-seams/tests/failpoint_names_guard.rs` is the in-repo pattern for a source-walk
   catalog guard, and it is extended rather than replaced.
 
 ## Evidence and tests
 
 Owners extended (`docs/dev/testing.md:23,43,60`): `crates/omnigraph/tests/failpoints.rs`,
-`crates/omnigraph/tests/failpoint_names_guard.rs`,
+`crates/omnigraph-seams/tests/failpoint_names_guard.rs`,
 `crates/omnigraph-cluster/tests/failpoints.rs`,
 `crates/omnigraph-dst/tests/scenarios.rs`, and the GQT corpus.
 

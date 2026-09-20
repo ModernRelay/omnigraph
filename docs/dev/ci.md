@@ -21,8 +21,8 @@ outside every class is engine input and runs every job. The `.gqt` corpus is
 read by the `omnigraph-gqt` crate (its `include_str!` cases and its harness,
 all under `GQ Logic Tests`, whose `dst-clippy` job compiles the crate so
 `Lint (clippy)` owes it nothing), by `scripts/check-fix-regression.py`
-(`Fix Regression Gate`, always on), and by the engine's seam guard
-`crates/omnigraph/tests/failpoint_names_guard.rs`, which counts a case's
+(`Fix Regression Gate`, always on), and by the seam guard
+`crates/omnigraph-seams/tests/failpoint_names_guard.rs`, which counts a case's
 `at:` name as arming a seam: `Test Workspace` runs it on engine input and
 `GQT (ordinary)` runs it on `run_gqt`, so a cases-only PR that drops the last
 case arming a seam turns the guard red where the PR can see it. No crate
@@ -74,12 +74,22 @@ Branch protection currently requires these reporting contexts:
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
-unit tests and unavailable-DST refusal from the workspace root. `GQT (dst)`
-runs the whole package, while `GQT (dst-clippy)` checks all package targets
-with Clippy. Both run from `crates/omnigraph-gqt`, whose Cargo configuration
-enables the seeded Tokio runtime. Each job has its own
-45-minute budget and cache key. Matrix fail-fast cancels the remaining jobs
-when one fails; Cargo retains its default fail-fast between test targets.
+unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
+the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
+the same flagless shape; the guard is a source walk whose crate declares no
+workspace crate (its dev-dependencies are `serde_yaml`, `syn` and `toml`), so
+it adds no second engine build.
+`GQT (dst)` runs the whole package, while `GQT (dst-clippy)` checks all
+package targets with Clippy. All three run from the repository root under
+the workspace Cargo configuration, which enables the seeded Tokio runtime.
+Each job has its own 60-minute budget and cache key. The budget is at least
+twice the observed 27-minute cold `ordinary` build. The roughly 30 minutes
+recorded for `dst.yml` cover a different package selection and workload;
+they do not establish a bound for GQT `dst` or `dst-clippy`. Exact cold
+timings for those jobs remain unverified. See the cache rule under
+[Full correctness graphs](#full-correctness-graphs) for the budget policy.
+Matrix fail-fast cancels the remaining jobs when one fails; Cargo retains
+its default fail-fast between test targets.
 The required context fails if classification or any qualification fails,
 is cancelled, or is skipped. A successful run still requires all three jobs
 to pass; fail-fast never turns incomplete qualification into success.
@@ -235,6 +245,19 @@ jobs also save when red (`cache-on-failure`): dependency artifacts are valid
 whatever the test verdict, and a red seed run would otherwise leave every
 pull request cold until `main` is green again.
 
+A cache is derived state, and no job may need one to fit its budget. The
+repository's caches exceed GitHub's cap, so every save evicts the least
+recently used entries: within one `main` run, the jobs that finish first are
+evicted first by the saves of the jobs that finish last. A run cancelled by
+its timeout saves no usable cache either (issue #755: every run after the
+cancelled `main` run restored nothing). Each `GQ Logic Tests` budget
+therefore covers a cold build with margin, and a second `cargo` invocation
+in a job must not change the dependency graph: it selects packages whose
+graph the first invocation already built, or it rebuilds every crate whose
+features differ (issue #755 was `GQT (ordinary)`
+running the seam guard as an engine integration test, whose
+dev-dependencies resolve a second graph, 49 minutes cold against 45).
+
 Every Rust job in those three workflows installs the `rust-toolchain.toml`
 pin with a bare `rustup toolchain install`; the rustc version is part of
 every cache key, so the pin is what keeps caches warm across Rust releases.
@@ -286,7 +309,8 @@ list):
 
 `gq-logic-tests.yml` separately owns authored GQT execution through DST. Every
 step runs from the repo root under the workspace Cargo configuration; the
-refusal step clears `RUSTFLAGS` to build the one flagless shape. An
+refusal step clears `RUSTFLAGS` to build the one flagless shape, and the seam
+guard step runs under the same empty `RUSTFLAGS` to share its artifacts. An
 unavailable-runtime refusal test does not replace executing the DST cases.
 
 ## Local pre-push checks
