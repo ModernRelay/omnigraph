@@ -1,5 +1,6 @@
 //! Diagnostic v1/v2 comparison of the four issue shapes; every measurement is a
 //! fresh child process whose peak RSS is evidence, never an assertion.
+#![recursion_limit = "512"]
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
