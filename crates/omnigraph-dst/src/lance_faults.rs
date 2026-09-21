@@ -70,13 +70,19 @@ pub struct LanceFaultState {
     seed: u64,
     /// Per-(op, location) call counters — the self-synchronizing index.
     counters: Mutex<std::collections::HashMap<(String, String), u64>>,
+    /// The ack-loss hook's OWN counter namespace: `lose_ack` decisions never
+    /// consume `fault` indices, so enabling the verb cannot shift the
+    /// error/latency draw sequence of an existing pinned plan.
+    ack_counters: Mutex<std::collections::HashMap<(String, String), u64>>,
     error_pct: u64,
     read_error_pct: u64,
     latency_pct: u64,
     max_latency_ms: u64,
+    ack_loss_pct: u64,
     enabled: AtomicBool,
     suspended: AtomicBool,
     injected: AtomicUsize,
+    acks_lost: AtomicUsize,
 }
 
 /// FNV-1a — tiny, dependency-free, deterministic across processes (never
@@ -95,13 +101,16 @@ impl LanceFaultState {
         Arc::new(Self {
             seed: plan.seed ^ LANCE_REALM_SALT,
             counters: Mutex::new(std::collections::HashMap::new()),
+            ack_counters: Mutex::new(std::collections::HashMap::new()),
             error_pct: plan.error_pct,
             read_error_pct: plan.read_error_pct,
             latency_pct: plan.latency_pct,
             max_latency_ms: plan.max_latency_ms,
+            ack_loss_pct: plan.ack_loss_pct,
             enabled: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             injected: AtomicUsize::new(0),
+            acks_lost: AtomicUsize::new(0),
         })
     }
 
@@ -121,6 +130,50 @@ impl LanceFaultState {
     /// realm actually saw weather).
     pub fn injected(&self) -> usize {
         self.injected.load(Ordering::SeqCst)
+    }
+
+    /// Acknowledgements this realm actually lost (report evidence the
+    /// durable-but-denied direction saw action).
+    pub fn acks_lost(&self) -> usize {
+        self.acks_lost.load(Ordering::SeqCst)
+    }
+
+    /// The ack-loss hook, Lance realm: call AFTER the inner store confirmed a
+    /// write-class call — the mirror of the adapter realm's `lose_ack`, and
+    /// the position IS the semantics: the effect is DURABLE, only the
+    /// acknowledgement is lost (the shape a dropped S3 200 produces). Covers
+    /// data and txn files, and the `__manifest` dataset's commit puts — the
+    /// graph-publication door itself. Self-synchronizing like `fault`, on its
+    /// own counter namespace and with distinct rotations, so the decision
+    /// depends only on `(seed, op, location, nth-ack-of-that-pair)`.
+    fn lose_ack(&self, op: &str, location: &str) -> object_store::Result<()> {
+        if self.ack_loss_pct == 0 || !self.active() {
+            return Ok(());
+        }
+        let n = {
+            let mut counters = self.ack_counters.lock().unwrap();
+            let slot = counters
+                .entry((op.to_string(), location.to_string()))
+                .or_insert(0);
+            let v = *slot;
+            *slot += 1;
+            v
+        };
+        let mut rng = SplitMix64(
+            self.seed
+                ^ fnv1a(op).rotate_left(17)
+                ^ fnv1a(location).rotate_left(47)
+                ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        if rng.below(100) < self.ack_loss_pct {
+            self.acks_lost.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "dst-lance-realm",
+                source: format!("{}: lance {op} {location}", crate::harness::ACK_LOSS_MARKER)
+                    .into(),
+            });
+        }
+        Ok(())
     }
 
     fn active(&self) -> bool {
@@ -288,6 +341,16 @@ fn count_lance_completion(op: &str, location: &str) {
     }
 }
 
+/// Ack-loss cut, Lance realm: call AFTER `count_lance_completion` — the
+/// write landed and was counted durable; this hook may still drop the
+/// caller's acknowledgement (see [`LanceFaultState::lose_ack`]).
+fn lose_lance_ack(op: &str, location: &str) -> object_store::Result<()> {
+    match active_state() {
+        Some(state) => state.lose_ack(op, location),
+        None => Ok(()),
+    }
+}
+
 async fn fault(
     read: bool,
     op: &str,
@@ -443,6 +506,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         let out = self.inner.put_opts(location, payload, opts).await;
         if out.is_ok() {
             count_lance_completion("put", location.as_ref());
+            lose_lance_ack("put", location.as_ref())?;
         }
         out
     }
@@ -525,6 +589,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
                     let _turn = fault(false, "delete", path.as_ref()).await?;
                     inner.delete(&path).await?;
                     count_lance_completion("delete", path.as_ref());
+                    lose_lance_ack("delete", path.as_ref())?;
                     Ok(path)
                 }
             })
@@ -573,6 +638,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         let out = self.inner.copy_opts(from, to, options).await;
         if out.is_ok() {
             count_lance_completion("copy", from.as_ref());
+            lose_lance_ack("copy", from.as_ref())?;
         }
         out
     }

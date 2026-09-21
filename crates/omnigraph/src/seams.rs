@@ -147,37 +147,3 @@ pub(crate) fn contention(seam: &'static DecideSeam) -> Result<()> {
     let _ = seam;
     Ok(())
 }
-
-/// Site helper for a seam that wraps one operation: run `op` under the
-/// seam. `Ok(Some(_))` is the operation's own result, `Ok(None)` means the
-/// decider skipped it, `Err` is the operation's own error or the injected
-/// one. The seam lists every outcome the code after the call survives; a
-/// `skip` is honest only when that code treats `None` as a real outcome.
-#[inline]
-#[track_caller]
-#[cfg_attr(
-    not(feature = "failpoints"),
-    allow(
-        clippy::manual_async_fn,
-        reason = "The failpoints build captures the caller before constructing the future."
-    )
-)]
-pub(crate) fn guarded<T>(
-    seam: &'static DecideSeam,
-    op: impl std::future::Future<Output = Result<T>>,
-) -> impl std::future::Future<Output = Result<Option<T>>> {
-    #[cfg(feature = "failpoints")]
-    let caller = std::panic::Location::caller();
-    async move {
-        #[cfg(feature = "failpoints")]
-        match seam.crossed_from(caller) {
-            Decision::Pass | Decision::Store(_) => {}
-            Decision::Fire(Effect::Skip) => return Ok(None),
-            Decision::Fire(Effect::Fail) => return Err(injected(seam)),
-            Decision::Fire(Effect::Contention) => return Err(injected_contention(seam)),
-        }
-        #[cfg(not(feature = "failpoints"))]
-        let _ = seam;
-        Ok(Some(op.await?))
-    }
-}

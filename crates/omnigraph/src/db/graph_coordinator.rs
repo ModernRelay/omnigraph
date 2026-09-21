@@ -192,6 +192,7 @@ impl GraphCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub async fn open(root_uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
         let control_session = crate::lance_access::control_session();
         Self::open_with_session(root_uri, storage, &control_session).await
@@ -215,6 +216,7 @@ impl GraphCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub async fn open_branch(
         root_uri: &str,
         branch: &str,
@@ -749,8 +751,9 @@ impl GraphCoordinator {
 
     /// Publish a pre-minted lineage intent under an explicit authority
     /// precondition. The intent's identity and timestamp remain stable across
-    /// publisher retries and can also be persisted by the caller's recovery
-    /// protocol before this method is invoked.
+    /// publisher retries and can also be persisted by the caller before this
+    /// method is invoked (schema apply records the commit id in its staged
+    /// contract).
     pub(crate) async fn commit_changes_with_intent_and_expected(
         &mut self,
         changes: &[ManifestChange],

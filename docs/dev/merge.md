@@ -176,9 +176,10 @@ rules, and the small cache/layout controls in the
 it unset, so timing does not read the clock. Its top-level timing flow is:
 
 `OuterPrepare` -> ((`ProvenInsertHistory` -> `ProvenInsertPlanScan`) | `TableWalk`)
--> `CandidateValidation` -> `FinalRevalidation` -> `RecoveryArm` ->
-`PhysicalPublish` -> `RecoveryConfirm` -> `ManifestPublish` -> `RecoveryCleanup`
--> `OuterRestoreRefresh`.
+-> `CandidateValidation` -> `FinalRevalidation` -> `PhysicalPublish` ->
+`ManifestPublish` -> `OuterRestoreRefresh`. The `RecoveryArm`,
+`RecoveryConfirm` and `RecoveryCleanup` phases retired with the merge
+sidecar (RFC 0067).
 
 The parenthesized classification routes are chosen per table, so a mixed-table
 operation can record both route families. `TableWalk` covers one general
@@ -237,16 +238,18 @@ structured result to its public 409 representation.
 
 ## Publication and recovery
 
-A merge with physical table effects uses one BranchMerge recovery sidecar.
-Its complete intended delta includes pointer-only siblings as well as the
-physical effects. Unique first-touch names and owners are fixed in that sidecar
-before native creation. A merge containing only pointer changes needs no table
-effect sidecar. Both routes publish the target through one manifest CAS.
+A merge with physical table effects chains each merged table's chunks as
+detached commits on the target's pin and publishes one pin per table (RFC
+0067); pointer-only siblings ride the same manifest CAS, and a merge
+containing only pointer changes stages nothing. A first-touch fork is created
+without an intent record.
 
-After recovery arm, a failed table link or publish retains recovery ownership
-and returns `RecoveryRequired`. Merge does not re-run semantic classification
-around a committed prefix. Full recovery either publishes the complete
-confirmed result or compensates the owned partial set before visibility.
+A failure anywhere before the CAS returns the original error and leaves the
+target untouched: the chunk chains and any fork the attempt created are
+reclaimable garbage, and a retry plans from scratch. A target that advanced
+meanwhile makes the merge lose its CAS and return the ordinary conflict. After
+the CAS the merge is acknowledged, and any pin its promotion did not reach
+stays pending for the next writer or cleanup.
 
 ## Outcomes
 

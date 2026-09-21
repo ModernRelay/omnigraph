@@ -288,11 +288,10 @@ fn replay_uses_frozen_case_and_rejects_changed_evidence() {
 #[test]
 fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text =
-        std::fs::read_to_string(root.join("cases/issue_602_stale_sidecar_heals_on_reopen.gqt"))
-            .unwrap();
+    let text = std::fs::read_to_string(root.join("cases/mutation_pending_pin_survives_reopen.gqt"))
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("issue_602_two_seams.gqt");
+    let path = dir.path().join("two_seams.gqt");
     std::fs::write(&path, &text).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
         .arg(&path)
@@ -313,14 +312,12 @@ fn several_seams_before_one_step_each_deliver_and_a_repeated_seam_is_refused() {
         .collect::<Vec<_>>();
     assert_eq!(
         delivered,
-        vec![
-            "mutation.sidecar_confirm_put",
-            "mutation.sidecar_post_publish_delete"
-        ],
+        vec!["publish.load_state", "mutation.post_publish_pre_promotion"],
         "one delivery record per seam, in declaration order"
     );
 
-    let confirm_block = "--- seam\nat: mutation.sidecar_confirm_put\noccurrence: 1\naction: skip\nscope: next_step\n";
+    let confirm_block =
+        "--- seam\nat: publish.load_state\noccurrence: 1\naction: contention\nscope: next_step\n";
     let repeated = text.replace(confirm_block, &format!("{confirm_block}\n{confirm_block}"));
     assert_ne!(
         repeated, text,
@@ -377,7 +374,7 @@ fn contention_action_records_the_retryable_effect_and_keeps_legacy_fail() {
     }
     std::fs::write(
         &path,
-        text.replace("publish.load_state", "mutation.sidecar_confirm_put"),
+        text.replace("publish.load_state", "mutation.post_table_commit"),
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
@@ -466,290 +463,4 @@ fn selecting_engine_does_not_allow_blessing_a_shared_case() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("bless requires"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
-}
-
-#[cfg(tokio_unstable)]
-#[test]
-fn known_recovery_failure_is_explicit_and_replay_status_is_verified() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = root.join("cases/dst_mutation_failure_keeps_writing.gqt");
-    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("KNOWN_FAILURE environment="));
-    let (report_path, summary) = report(&output);
-    assert_eq!(summary["code"], "known_failure");
-    assert_eq!(summary["scope"], "full");
-    let attempts = summary["attempts"].as_array().unwrap();
-    assert_eq!(attempts.len(), 4);
-    for attempt in attempts {
-        assert_eq!(attempt["known_failure"], true);
-        assert_eq!(attempt["outcome"]["Ok"]["code"], "assertion_failed");
-        assert!(
-            attempt["outcome"]["Ok"]["result"]["Err"]
-                .as_str()
-                .unwrap()
-                .contains("step 4 (mutate)")
-        );
-    }
-    let replay = |path: &Path| {
-        Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-            .arg("--replay")
-            .arg(path)
-            .output()
-            .unwrap()
-    };
-    let replayed = replay(&report_path);
-    assert!(
-        replayed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&replayed.stderr)
-    );
-    assert_eq!(report(&replayed).1["code"], "known_failure");
-    let dir = tempfile::tempdir().unwrap();
-    let tampered = dir.path().join("tampered.json");
-    for field in ["attempt", "summary"] {
-        let mut forged = summary.clone();
-        if field == "attempt" {
-            forged["attempts"][0]["known_failure"] = false.into();
-        } else {
-            forged["code"] = "passed".into();
-        }
-        std::fs::write(&tampered, serde_json::to_vec(&forged).unwrap()).unwrap();
-        let output = replay(&tampered);
-        assert!(!output.status.success(), "accepted forged {field} status");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("report_failed"));
-    }
-    let selected = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-        .arg(&path)
-        .args(["--target", "omnigraph-engine-dst", "--seed", "42"])
-        .output()
-        .unwrap();
-    assert!(selected.status.success());
-    assert_eq!(report(&selected).1["scope"], "partial");
-}
-
-#[cfg(tokio_unstable)]
-#[test]
-fn known_failure_does_not_waive_changed_failure_missing_fault_or_unexpected_pass() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text =
-        std::fs::read_to_string(root.join("cases/dst_mutation_failure_keeps_writing.gqt")).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("known_failure_refusals.gqt");
-    let selected = text.replace("seeds: [0, 42]", "seeds: [42]");
-    for (text, expected) in [
-        (
-            selected.replace("pending Mutation recovery", "different Mutation recovery"),
-            "recovery required",
-        ),
-        (
-            selected.replace("occurrence: 1", "occurrence: 2"),
-            "seam_unobserved",
-        ),
-        (
-            selected.replace("step: 4", "step: 5").replace(
-                "--- mutate branch: work\nquery retry",
-                "--- restart\n\n--- mutate branch: work\nquery retry",
-            ),
-            "unexpected_pass",
-        ),
-    ] {
-        std::fs::write(&path, text).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(!output.status.success(), "accepted {expected}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            report(&output).1["attempts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|a| a["known_failure"] == false)
-        );
-    }
-    std::fs::write(&path, &selected).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-        .arg(&path)
-        .env("OMNIGRAPH_GQ_BLESS", "1")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("bless is refused for known_failure"));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), selected);
-}
-
-/// Both forms of the issue 601 case misdirect the same arm put: one hit
-/// each with `write_text`, the canonical name requested, the `dstm-` name
-/// stored beside it, and both pass: the heal deletes the listed uri.
-#[cfg(tokio_unstable)]
-#[test]
-fn store_effect_and_store_place_misdirect_the_same_put() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(
-        root.join("cases/issue_601_foreign_named_sidecar_blocks_branch.gqt"),
-    )
-    .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("issue_601_two_forms.gqt");
-    let code_seam = "--- seam\nat: recovery.sidecar_write\noccurrence: 1\naction: misdirect\nscope: next_step\n";
-    let store_seam = "--- seam\nat: storage.put\nsubject: \"__recovery/*\"\noccurrence: 1\naction: misdirect\nscope: next_step\n";
-    assert!(
-        text.contains(code_seam),
-        "the seam block must be found verbatim"
-    );
-    let mut requested_seen: Vec<String> = Vec::new();
-    for (form, seam, subject) in [
-        ("store effect", code_seam, serde_json::json!("__recovery/*")),
-        ("store place", store_seam, serde_json::json!("__recovery/*")),
-    ] {
-        std::fs::write(&path, text.replace(code_seam, seam)).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{form}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let (_, summary) = report(&output);
-        for attempt in summary["attempts"].as_array().unwrap() {
-            assert_eq!(attempt["known_failure"], false, "{form}");
-            let deliveries = attempt["outcome"]["Ok"]["evidence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|event| event["kind"] == "seam_delivered")
-                .collect::<Vec<_>>();
-            assert_eq!(deliveries.len(), 1, "{form}");
-            let value = &deliveries[0]["value"];
-            assert_eq!(value["effect"], "misdirect", "{form}");
-            assert_eq!(value["subject"], subject, "{form}");
-            assert_eq!(value["hit"]["method"], "write_text", "{form}");
-            let requested = value["hit"]["requested"].as_str().unwrap();
-            let file = requested.strip_prefix("__recovery/").unwrap();
-            assert!(
-                file.ends_with(".json") && !file.contains('/') && !file.starts_with("dstm-"),
-                "{form}: {requested}"
-            );
-            assert_eq!(
-                value["hit"]["stored"].as_str().unwrap(),
-                format!("__recovery/dstm-{file}"),
-                "{form}"
-            );
-            requested_seen.push(requested.to_string());
-        }
-    }
-    assert!(
-        requested_seen.windows(2).all(|pair| pair[0] == pair[1]),
-        "both forms misdirect the same object: {requested_seen:?}"
-    );
-
-    for (variant, expected) in [
-        (
-            text.replace(
-                code_seam,
-                &code_seam.replace(
-                    "scope: next_step\n",
-                    "scope: next_step\nsubject: \"__recovery/*\"\n",
-                ),
-            ),
-            "declares its own subject",
-        ),
-        (
-            text.replace(
-                code_seam,
-                &store_seam.replace("subject: \"__recovery/*\"\n", ""),
-            ),
-            "requires subject",
-        ),
-        (
-            text.replace(
-                code_seam,
-                &store_seam.replace("action: misdirect", "action: fail"),
-            ),
-            "does not admit engine action fail",
-        ),
-        (
-            text.replace(code_seam, &format!("{code_seam}\n{store_seam}")),
-            "one store action per step",
-        ),
-        (
-            text.replace(
-                code_seam,
-                &code_seam.replace("recovery.sidecar_write", "mutation.post_sidecar_pre_fork"),
-            ),
-            "does not admit action misdirect",
-        ),
-        (
-            text.replace(code_seam, &store_seam.replace("__recovery/*", "[")),
-            "subject is not a glob",
-        ),
-        (
-            text.replace(
-                code_seam,
-                &store_seam.replace("action: misdirect", "action: lose"),
-            ),
-            "lists action lose but it is not admitted",
-        ),
-        (
-            text.replace(
-                code_seam,
-                &code_seam.replace("action: misdirect", "action: lose"),
-            ),
-            "does not admit action lose",
-        ),
-    ] {
-        std::fs::write(&path, &variant).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-            .arg(&path)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !output.status.success(),
-            "accepted a case that should say {expected:?}"
-        );
-        assert!(stderr.contains(expected), "{expected:?} not in: {stderr}");
-    }
-
-    let braces = "__recovery/{*.json,*.bin}";
-    std::fs::write(
-        &path,
-        text.replace(code_seam, &store_seam.replace("__recovery/*", braces)),
-    )
-    .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-        .arg(&path)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "brace alternation: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let (_, summary) = report(&output);
-    for attempt in summary["attempts"].as_array().unwrap() {
-        let deliveries = attempt["outcome"]["Ok"]["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|event| event["kind"] == "seam_delivered")
-            .collect::<Vec<_>>();
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0]["value"]["subject"], serde_json::json!(braces));
-    }
 }

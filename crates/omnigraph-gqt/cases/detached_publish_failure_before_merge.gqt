@@ -1,0 +1,48 @@
+# issue: none
+# notes: A failure before main's __manifest merge returns the injected error and leaves the old rows intact. The same handle writes again; restart preserves the accepted writes and never exposes the rejected row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: publish.pre_merge
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+query rejected_write() { insert Person { name: "bob" } }
+--- expect error: injected failpoint triggered: publish.pre_merge
+
+--- query
+query unchanged_rows() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+--- expect shape
+p.name: String
+
+--- mutate
+query next_write() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query durable_rows() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String

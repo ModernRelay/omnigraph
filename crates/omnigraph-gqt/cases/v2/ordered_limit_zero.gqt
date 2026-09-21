@@ -73,4 +73,3 @@ query aggregate_ordered_limit_zero_v2() {
 --- expect shape
 p.name: String
 n: I64
-

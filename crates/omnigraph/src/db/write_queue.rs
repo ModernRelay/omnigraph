@@ -9,34 +9,28 @@
 //! attempts additionally take a coarse branch effect gate because validation
 //! may depend on tables they do not write. This module owns both queue classes;
 //! callers in `MutationStaging::commit_all`, branch controls, `branch_merge`,
-//! `schema_apply`, `ensure_indices`, cleanup, branch forking, and recovery acquire the applicable guards
-//! before a Lance HEAD advance or destructive recovery action. Serialization
-//! remains in-process only; cross-process writers on one graph remain
-//! one-winner-CAS at publish.
+//! `schema_apply`, `ensure_indices`, cleanup, and branch forking acquire the
+//! applicable guards before a table effect or destructive ref action.
+//! Serialization remains in-process only; cross-process writers on one graph
+//! remain one-winner-CAS at publish.
 //!
 //! ## Why exclusive `tokio::sync::Mutex<()>` per key
 //!
-//! Lance's `Dataset::restore` "wins" against concurrent Append/Update/
-//! Delete/CreateIndex/Merge per `check_restore_txn`, silently orphaning
-//! the concurrent writer's commit. The queue's *only* application-layer
-//! job is to serialize Restore against every other writer on the same
-//! `(table_key, branch_ref)`. Lance OCC handles the rest of the conflict
-//! matrix (Append vs Append fully compatible, Update vs Update rebases or
-//! retries, etc.) but cannot make Restore symmetric — that's an upstream
-//! design choice. Until Lance fixes Restore (or BatchCommitTables
-//! changes the protocol), every writer takes the same exclusive lock.
-//!
-//! `RwLock` (shared for normal writes, exclusive for Restore) is the
-//! natural follow-up but adds a writer-classification surface that's
-//! easy to get wrong; misclassifying any writer reintroduces the
-//! orphaning hazard. We start with `Mutex` and revisit based on
-//! production telemetry.
+//! Every writer stages detached from its table's pin and becomes visible
+//! only through the manifest CAS (RFC 0067), so the queue is not a
+//! correctness authority for table data. Its application-layer job is to
+//! keep same-process writers on one `(table_key, branch_ref)` from
+//! interleaving between revalidation and publication (the loser's detached
+//! versions would be wasted garbage) and to serialize destructive ref
+//! deletion and fork creation against live writers. Every writer takes the
+//! same exclusive lock; a shared/exclusive split would add a
+//! writer-classification surface that's easy to get wrong.
 //!
 //! ## Sorted-order acquisition
 //!
 //! `acquire_many` accepts a slice of keys and acquires them in
 //! lexicographic order. Multi-table writers and control paths (mutation
-//! finalize, branch merge, schema apply, maintenance, and recovery) MUST go through
+//! finalize, branch merge, schema apply, and maintenance) MUST go through
 //! `acquire_many` so all callers agree on acquisition order — this is
 //! how lock-order inversion deadlock is prevented.
 
@@ -165,9 +159,9 @@ pub(crate) struct ExportDestructivePermit {
 ///
 /// Every `Omnigraph` handle for one canonical root identity shares the same
 /// manager via a process-global weak registry. This matters beyond HTTP's usual
-/// `Arc<Omnigraph>` shape: a separately-opened handle can run recovery, and
-/// Lance Restore/ref deletion must serialize with a live writer owned by the
-/// first handle. The registry deliberately keys only by the queue root
+/// `Arc<Omnigraph>` shape: a separately-opened handle can settle a staged
+/// schema contract or delete refs, which must serialize with a live writer
+/// owned by the first handle. The registry deliberately keys only by the queue root
 /// identity; custom storage adapters for the same URI conservatively serialize
 /// too.
 #[derive(Default)]
@@ -175,7 +169,7 @@ pub(crate) struct WriteQueueManager {
     /// Held only briefly per `acquire` call: clone out the per-key Arc,
     /// release the std mutex, then await the per-key tokio Mutex.
     queues: Mutex<HashMap<TableQueueKey, Arc<QueueSlot>>>,
-    /// Coarse per-branch effect gate used by sidecar-backed RFC-022 writers.
+    /// Coarse per-branch effect gate used by RFC-022 writers.
     ///
     /// This is deliberately separate from `queues`: a branch is authority,
     /// not a synthetic table key. Registered graph-visible effect writers
@@ -239,8 +233,8 @@ impl WriteQueueManager {
     /// Acquire the coarse effect gate for one graph branch.
     ///
     /// RFC-022-enrolled callers MUST acquire this before any per-table queue.
-    /// It is an in-process contention optimization only; publisher OCC and
-    /// recovery remain the correctness authorities.
+    /// It is an in-process contention optimization only; publisher OCC
+    /// remains the correctness authority.
     pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> QueueGuard {
         let key = branch.map(str::to_string);
         scheduled_lock(self.branch_slot(&key)).await
@@ -299,7 +293,7 @@ impl WriteQueueManager {
 
     /// Acquire exclusive access to many `(table_key, branch)` keys
     /// atomically, in lex-sorted order. Used by multi-table writers
-    /// (mutation finalize, branch_merge, recovery) so all callers
+    /// (mutation finalize, branch_merge, schema apply) so all callers
     /// agree on acquisition order — prevents lock-order inversion.
     ///
     /// Empty input returns an empty Vec without touching the map.

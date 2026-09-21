@@ -1655,6 +1655,17 @@ async fn run(cli: Cli) -> Result<()> {
                 .iter()
                 .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
                 .count();
+            let blocked_count = stats
+                .datasets
+                .iter()
+                .filter(|s| {
+                    matches!(s.action, omnigraph::db::RepairAction::Refused)
+                        && matches!(
+                            s.classification,
+                            omnigraph::db::RepairClassification::BlockedPromotion
+                        )
+                })
+                .count();
             if json {
                 let value = serde_json::json!({
                     "uri": uri,
@@ -1710,12 +1721,30 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("rerun with --confirm to publish verified maintenance drift");
                 }
             }
-            if refused_count > 0 {
+            let drift_refused = refused_count - blocked_count;
+            if blocked_count > 0 && drift_refused == 0 {
+                bail!(
+                    "repair reports {} blocked promotion(s), one per table and branch; nothing resolves a \
+                     blocked pin yet and --force --confirm refuses the same way; reads, mutations \
+                     and loads on those tables continue",
+                    blocked_count
+                );
+            }
+            if drift_refused > 0 {
+                let blocked_note = if blocked_count > 0 {
+                    format!(
+                        "; {} more blocked promotion(s), which --force does not resolve",
+                        blocked_count
+                    )
+                } else {
+                    String::new()
+                };
                 bail!(
                     "repair refused {} suspicious or unverifiable dataset(s); review the preview \
                      output and rerun with --force --confirm only if publishing that drift is \
-                     intentional",
-                    refused_count
+                     intentional{}",
+                    drift_refused,
+                    blocked_note
                 );
             }
         }
@@ -1781,6 +1810,7 @@ async fn run(cli: Cli) -> Result<()> {
                         "bytes_removed": s.bytes_removed,
                         "old_versions_removed": s.old_versions_removed,
                         "error": s.error,
+                        "deferred": s.deferred,
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
@@ -1789,7 +1819,12 @@ async fn run(cli: Cli) -> Result<()> {
                 let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
                 let failed: Vec<String> = stats
                     .iter()
-                    .filter(|s| s.error.is_some())
+                    .filter(|s| s.error.is_some() && !s.deferred)
+                    .map(|s| graph_type_subject(&s.type_key))
+                    .collect();
+                let deferred: Vec<String> = stats
+                    .iter()
+                    .filter(|s| s.deferred)
                     .map(|s| graph_type_subject(&s.type_key))
                     .collect();
                 println!(
@@ -1798,8 +1833,17 @@ async fn run(cli: Cli) -> Result<()> {
                     policy_desc,
                     total_versions,
                     total_bytes,
-                    stats.len() - failed.len()
+                    stats.len() - failed.len() - deferred.len()
                 );
+                if !deferred.is_empty() {
+                    println!(
+                        "  {} dataset(s) kept their versions because a blocked pin or an \
+                         unproven detached copy is retained (not a failure; --json names the \
+                         versions): {}",
+                        deferred.len(),
+                        deferred.join(", ")
+                    );
+                }
                 if !failed.is_empty() {
                     println!(
                         "  {} dataset(s) failed and will be retried on the next cleanup: {}",

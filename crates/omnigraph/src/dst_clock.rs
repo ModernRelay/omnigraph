@@ -1,5 +1,5 @@
 //! The time seam: every behavior-feeding and stamp-feeding wall-clock read
-//! in the engine (optimize cutoff, schema-apply cutoff, recovery `started_at`
+//! in the engine (optimize cutoff, schema-apply cutoff, lineage `created_at`
 //! stamps) goes through [`now_utc`] or [`system_time_now`].
 //!
 //! Uninstalled (default, production): real `Utc::now()` / `SystemTime::now()`.

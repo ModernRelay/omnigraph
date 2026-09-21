@@ -207,21 +207,6 @@ impl CommitGraph {
         Ok(commits)
     }
 
-    /// The maximal commit (by [`GraphCommit::lineage_key`]) satisfying `pred`.
-    /// Callers wanting "the latest X" use this instead of consuming
-    /// `load_commits` positionally, so no caller couples to iteration
-    /// direction.
-    pub(crate) fn latest_commit_matching(
-        &self,
-        pred: impl Fn(&GraphCommit) -> bool,
-    ) -> Option<GraphCommit> {
-        self.commit_by_id
-            .values()
-            .filter(|commit| pred(commit))
-            .max_by(|a, b| a.lineage_key().cmp(&b.lineage_key()))
-            .cloned()
-    }
-
     pub fn get_commit(&self, commit_id: &str) -> Option<GraphCommit> {
         self.commit_by_id.get(commit_id).cloned()
     }

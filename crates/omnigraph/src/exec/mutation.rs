@@ -558,6 +558,7 @@ async fn open_table_for_mutation(
         opened.full_path.clone(),
         opened.table_branch.clone(),
         opened.pinned_native_ref.clone(),
+        opened.entry.clone(),
         opened.deferred_fork.clone(),
         opened.expected_version,
         op_kind,
@@ -655,6 +656,14 @@ decide_seam! {
 
 decide_seam! {
     pub static MUTATION_POST_FINALIZE_PRE_PUBLISHER = ("mutation.post_finalize_pre_publisher", Mutation, [Fail]);
+}
+
+decide_seam! {
+    /// After the manifest published every pin and before the writer promotes
+    /// them from its held handles (RFC 0067). The write is durable and
+    /// visible; a failure here leaves the pins pending for the next writer
+    /// of each table or for cleanup.
+    pub static MUTATION_POST_PUBLISH_PRE_PROMOTION = ("mutation.post_publish_pre_promotion", Mutation, [Fail]);
 }
 
 decide_seam! {
@@ -771,8 +780,7 @@ impl Session {
     /// internally retried — when the local authoritative check observes a
     /// mismatch. This is not a distributed lease: an unsupported foreign
     /// writer that races after that check is rejected by the exact publisher,
-    /// but may require recovery after table effects and therefore returns
-    /// [`OmniError::RecoveryRequired`]. All other error behavior matches
+    /// which leaves the graph unchanged. All other error behavior matches
     /// [`Self::mutate_as`].
     pub async fn mutate_as_with_expected_head(
         &self,
@@ -928,18 +936,16 @@ impl Omnigraph {
         if let Some(name) = requested.as_deref() {
             crate::db::ensure_public_branch_ref(name, "mutate")?;
         }
-        // Stage A: converge any roll-forward-eligible sidecars, then close the
-        // barrier on every unresolved intent for this graph branch. This MUST
-        // run before `open_write_txn`: healing may advance the manifest, and a
-        // deferred Armed intent remains ownership even when no table HEAD moved.
-        self.heal_pending_recovery_sidecars_for_write(&[requested.as_deref()])
-            .await?;
-        // Capture one branch-wide write authority after the recovery barrier:
-        // native branch identity, exact optional graph head, accepted schema
-        // identity/catalog, and the base table snapshot. Execution, validation,
-        // staging, and publication all use this immutable attempt. `commit_all`
-        // revalidates the complete token under the root-shared schema → branch →
-        // sorted-table gates before it arms recovery or advances Lance HEAD.
+        // Install this handle's published-but-uninstalled schema contract, if
+        // any. This MUST run before `open_write_txn`, which captures the
+        // accepted schema identity and catalog.
+        self.settle_pending_schema_install().await?;
+        // Capture one branch-wide write authority: native branch identity,
+        // exact optional graph head, accepted schema identity/catalog, and the
+        // base table snapshot. Execution, validation, staging, and publication
+        // all use this immutable attempt. `commit_all` revalidates the complete
+        // token under the root-shared schema → branch → sorted-table gates
+        // before its first detached commit.
         let mut txn = self.open_write_txn(requested.as_deref()).await?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
@@ -960,10 +966,10 @@ impl Omnigraph {
         // Per-query staging accumulator. Inserts and updates push batches into
         // `pending`; deletes push predicates into `delete_predicates`. At the
         // boundary, `stage_all` prepares one exact transaction per touched table
-        // and `commit_all` records those identities in a durable schema-v3
-        // recovery intent before independently advancing the table HEADs. The
-        // publisher then makes the complete result graph-visible in one manifest
-        // CAS. Branch is threaded explicitly — no coordinator swap.
+        // and `commit_all` commits each as a detached version of its pinned
+        // base (RFC 0067). The publisher then makes the complete result
+        // graph-visible in one manifest CAS. Branch is threaded explicitly — no
+        // coordinator swap.
         let mut staging = MutationStaging::default();
 
         // Lower + validate up front so the touched-dataset set is known before
@@ -1027,31 +1033,22 @@ impl Omnigraph {
                 // `_queue_guards` holds the root-shared schema gate, branch
                 // effect gate, and sorted table gates acquired by `commit_all`.
                 // They remain held through manifest publication, covering the
-                // complete same-process sidecar/effect lifetime. They are a
-                // local serialization aid; the exact publisher precondition and
-                // durable v3 recovery plan remain the correctness authorities.
+                // complete same-process effect lifetime. They are a local
+                // serialization aid; the exact publisher precondition remains
+                // the correctness authority.
                 let super::staging::CommittedMutation {
                     updates,
                     expected_versions,
-                    sidecar_handle,
+                    promotions,
                     guards: _queue_guards,
                 } = staged
-                    .commit_all(
-                        self,
-                        requested.as_deref(),
-                        crate::db::manifest::SidecarKind::Mutation,
-                        actor_id,
-                        &txn,
-                        &lineage_intent,
-                    )
+                    .commit_all(self, requested.as_deref(), &txn, &lineage_intent)
                     .await?;
-                // Failpoint for the confirmed-effects → publisher boundary:
-                // table HEADs have advanced but graph visibility has not. The
-                // v3 sidecar already contains exact transaction identities,
-                // immutable manifest delta, and fixed lineage/rollback outcomes.
-                // Any failure from here is `RecoveryRequired`; synchronous heal
-                // or a read-write open converges the recorded outcome. See
-                // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
+                // Failpoint for the detached-effects → publisher boundary:
+                // every table effect is committed detached but nothing is
+                // graph-visible. A failure here leaves the graph unchanged and
+                // the detached versions as reclaimable garbage. See
+                // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
                 fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
                 let publish_result = self
                     .commit_updates_on_branch_with_expected(
@@ -1063,42 +1060,19 @@ impl Omnigraph {
                         lineage_intent,
                     )
                     .await;
-                let commit = match publish_result {
-                    Ok(commit) => commit,
-                    Err(err) => {
-                        // A sidecar exists iff at least one table effect was
-                        // committed. Lineage-only / zero-row mutations have no
-                        // physical residual to recover, so preserve their original
-                        // publish error (notably ReadSetChanged) and let the normal
-                        // retry/409 path handle it.
-                        return match sidecar_handle.as_ref() {
-                            Some(handle) => Err(OmniError::recovery_required(
-                                handle.operation_id.clone(),
-                                err.to_string(),
-                            )),
-                            None => Err(err),
-                        };
-                    }
-                };
-                if let Some(handle) = sidecar_handle {
-                    // Best-effort cleanup: the manifest publish already
-                    // succeeded, so the user's mutation is durable. A failed
-                    // delete leaves a fixed, idempotent v3 outcome for the next
-                    // synchronous heal or read-write open to audit and remove.
-                    // Failing the user here would report an error for a write
-                    // that already landed.
-                    if let Err(err) = crate::db::manifest::delete_sidecar_after_publish(
-                        &handle,
-                        self.storage_adapter(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            operation_id = handle.operation_id.as_str(),
-                            "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-                        );
-                    }
+                // RFC 0067: every effect is a detached commit of its pinned base,
+                // so a publish failure leaves the graph unchanged; the error
+                // is returned as is (a moved head is `ReadSetChanged`).
+                let commit = publish_result?;
+                // Promotion lands each pin's linear twin from the handles this
+                // writer holds. The write is already durable and visible, so
+                // a failure here is logged and left for the next writer.
+                match fail(&MUTATION_POST_PUBLISH_PRE_PROMOTION) {
+                    Ok(()) => self.promote_held_all(promotions).await,
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "promotion skipped after publication; the next writer promotes"
+                    ),
                 }
                 Ok(crate::MutationReceipt {
                     result: total,

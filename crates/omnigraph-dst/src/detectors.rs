@@ -150,8 +150,8 @@ oracles! {
     // ---- prediction (expectation = the model's per-op prediction) -------
     OpArbitration, "prediction",
         &[Store(Query), Store(Physical)],
-        "harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break) / reconcile_watch_resolution (keep-serving composition widening)",
-        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects; a keep-serving resolution instead matches against every composition and order of the deferred and interrupting ops";
+        "harness.rs::reconcile_after_failure (hypothesis arbitration + ghost tie-break)",
+        "after a failed op the world renders as exactly one model hypothesis — Applied / ForkOnly / NotApplied — with the export tie-break resolving ghost-only effects";
     MergePrediction, "prediction",
         &[Store(Claim)],
         "harness.rs::predict_merge + the accept/conflict asserts around branch_merge",
@@ -168,7 +168,7 @@ oracles! {
     // ---- obligation (expectation = a standing contract) -----------------
     CrashContract, "obligation",
         &[Store(Query)],
-        "harness.rs::reconcile_after_failure + reconcile_watch_resolution (legal-state + monotonicity asserts)",
+        "harness.rs::reconcile_after_failure (legal-state + monotonicity asserts)",
         "the two-sided crash contract: atomicity (no partial application) and recovery monotonicity (no demoted commit, no deleted durable fork)";
     BirthContract, "obligation",
         &[Store(Claim)],
@@ -182,10 +182,6 @@ oracles! {
         &[Store(Physical)],
         "harness.rs final audit residue check + tests::dst_residue_channel_sees_planted_file",
         "no universe ends owing recovery work: __recovery/ empty at quiesce, backed by the planted-file channel canary";
-    LiveWriteAvailability, "obligation",
-        &[Store(Session)],
-        "harness.rs::run_universe_caught keep-serving watch (Scenario::keep_serving_ops)",
-        "a live handle must not wedge permanently on one pending effect-free Armed recovery operation: with reconcile's reopen deferred, consecutive same-operation RecoveryRequired refusals (clean-recovery-state maintenance refusals interleave without resetting the streak) stay under the keep-serving budget (issue #554)";
     MaintenanceObligations, "obligation",
         &[Store(Query)],
         "harness.rs::maintenance_obligations",
@@ -503,17 +499,17 @@ mod tests {
         };
         assert_eq!(
             Oracle::ALL.len(),
-            22,
-            "oracle count drifted from the documented 22"
+            21,
+            "oracle count drifted from the documented 21"
         );
         assert_eq!(count("differential"), 7);
         assert_eq!(count("prediction"), 4);
-        assert_eq!(count("obligation"), 9);
+        assert_eq!(count("obligation"), 8);
         assert_eq!(count("meta"), 2);
         // Detector count: one per (source, oracle) pairing.
         let detectors: usize = Oracle::ALL.iter().map(|o| o.sources().len()).sum();
         assert_eq!(
-            detectors, 25,
+            detectors, 24,
             "detector count drifted (three oracles ride two sources each)"
         );
     }

@@ -25,13 +25,13 @@ mod migrations;
 // Entirely test-only since RFC-013 step 3a: with both reads (Fix 2) and writes
 // bypassing the Lance namespace, nothing in production routes through it; the
 // `LanceNamespace` impls are retained only to validate the contract in unit tests.
+#[path = "manifest/legacy_sidecars.rs"]
+mod legacy_sidecars;
 #[cfg(test)]
 #[path = "manifest/namespace.rs"]
 mod namespace;
 #[path = "manifest/publisher.rs"]
 pub(crate) mod publisher;
-#[path = "manifest/recovery.rs"]
-pub(crate) mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
 #[path = "manifest/upgrade.rs"]
@@ -54,33 +54,19 @@ use layout::{
     open_manifest_dataset_native_with_session, open_manifest_dataset_with_identifier_with_session,
     open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
+pub(crate) use legacy_sidecars::{
+    pending_legacy_sidecars, refuse_legacy_sidecars, refuse_pending_recovery,
+};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{
     OMNIGRAPH_ROW_COUNT_KEY, object_store_path_from_uri, table_version_metadata_for_state,
 };
-pub(crate) use migrations::{publish_stamp_advance, stamp_for_system_columns};
+pub(crate) use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
-#[cfg(test)]
-pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
-pub(crate) use recovery::{
-    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
-    RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
-    RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
-    RecoverySidecar, RecoverySidecarHandle, RecoverySystemColumnUpgrade, RecoveryTableUpdateSlot,
-    SidecarKind, SidecarTablePin, SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
-    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
-    confirm_schema_apply_sidecar_v9, delete_sidecar, delete_sidecar_after_publish,
-    ensure_read_only_schema_coherent, finalize_effect_free_occ_sidecar,
-    heal_pending_sidecars_roll_forward, list_sidecars, new_branch_merge_sidecar_v9,
-    new_ensure_indices_sidecar_v9, new_occ_sidecar_v9, new_optimize_sidecar_v9,
-    new_schema_apply_sidecar_v9, new_system_column_upgrade_sidecar_v9,
-    recover_failed_branch_merge_under_gates, recover_manifest_drift, refuse_pending_recovery,
-    schema_apply_serial_queue_key, write_sidecar,
-};
 pub use state::DatasetEntry;
 #[cfg(test)]
 use state::string_column;
@@ -251,9 +237,16 @@ pub(crate) fn system_columns_at_image(
 pub(crate) struct NativeForkReferences {
     referenced: HashSet<(TableIdentity, String)>,
     owned: HashSet<(TableIdentity, String)>,
+    live_incarnations: HashSet<String>,
 }
 
 impl NativeForkReferences {
+    pub(crate) fn retains_unpublished_fork(&self, native: &str) -> bool {
+        crate::branch_names::retain_unpublished_table_fork(native, |incarnation| {
+            self.live_incarnations.contains(incarnation)
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn contains(&self, identity: TableIdentity, native: &str) -> bool {
         self.referenced.contains(&(identity, native.to_string()))
@@ -578,6 +571,8 @@ impl Snapshot {
                         entry.native_dataset_branch.as_deref(),
                         entry.published_dataset_version,
                         entry.version_metadata.e_tag(),
+                        entry.version_metadata.staged_version(),
+                        entry.version_metadata.transaction_uuid(),
                         &location,
                         Some(&caches.session),
                     )
@@ -887,9 +882,11 @@ impl DatasetEntry {
         // cached path (`Snapshot::open_lance_dataset` → handle cache) calls the same opener on
         // a miss with the shared session, so both paths count on the per-query
         // `table_wrapper`.
-        crate::instrumentation::open_dataset(
+        crate::instrumentation::open_pinned_dataset(
             &location,
-            crate::instrumentation::VersionResolution::At(self.published_dataset_version),
+            self.published_dataset_version,
+            self.version_metadata.staged_version(),
+            self.version_metadata.transaction_uuid(),
             session,
             crate::instrumentation::table_wrapper(),
         )
@@ -1283,7 +1280,7 @@ impl ManifestCoordinator {
 
     /// Read one exact native manifest ref for a control-plane liveness proof.
     /// The caller must hold the schema-control gate (and the target's ordinary
-    /// branch/table gates before destroying it), or full recovery quiescence.
+    /// branch/table gates before destroying it).
     /// Native refs must come from a listing in that same envelope. This does
     /// not capture a BranchIdentifier and must not serve general reads or OCC.
     pub(crate) async fn snapshot_native_under_control_gates(
@@ -1324,6 +1321,11 @@ impl ManifestCoordinator {
         let mut references = NativeForkReferences {
             referenced: HashSet::new(),
             owned: HashSet::new(),
+            live_incarnations: branches
+                .iter()
+                .filter_map(|native| crate::branch_names::split_native_branch_name(native).1)
+                .map(str::to_owned)
+                .collect(),
         };
         let mut add = |native: Option<&str>, snapshot: Snapshot| {
             for entry in snapshot.datasets() {
@@ -1350,6 +1352,18 @@ impl ManifestCoordinator {
             );
         }
         Ok(references)
+    }
+
+    /// Historical table pins on one live graph branch, for cleanup's twin proof.
+    /// The caller holds the cleanup control gates; these are immutable published
+    /// records, never authority to publish new data or infer an abandoned writer.
+    pub(crate) async fn table_versions_under_control_gates(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Vec<DatasetEntry>> {
+        let dataset = open_manifest_dataset_with_session(root_uri, branch, control_session).await?;
+        state::read_manifest_entries(&dataset).await
     }
 
     /// Inventory registered table lifetimes, including soft-dropped tables, under cleanup's gates.
@@ -1930,3 +1944,12 @@ mod system_roles_tests;
 #[cfg(test)]
 #[path = "manifest/tests.rs"]
 mod tests;
+
+/// The write-queue key that serializes every graph-global schema writer
+/// (schema apply and the system-column upgrade) against each other and
+/// against the passes that install or discard a staged schema contract. The
+/// name cannot collide with real table keys (those are `node:`/`edge:`
+/// prefixed).
+pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQueueKey {
+    ("__schema_apply__".to_string(), None)
+}

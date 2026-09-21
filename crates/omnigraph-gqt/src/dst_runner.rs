@@ -13,19 +13,12 @@ use sha2::{Digest, Sha256};
 use crate::runner_config::{Environment, Execution};
 use crate::{CaseOutcome, parse_case, stem_of};
 
-mod known_failure;
 mod seams;
 mod settings;
 
-pub(crate) use seams::{
-    Admitted, admit_seam, arm_seams, finish_seams, refuse_two_store_actors, resolve_seam,
-};
 #[cfg(tokio_unstable)]
 use seams::{DECORATION, DecideGuard};
-
-pub(crate) fn validate_known_failure(case: &crate::Case) -> Result<(), String> {
-    known_failure::validate(case)
-}
+pub(crate) use seams::{admit_seam, arm_seams, finish_seams, refuse_two_store_actors};
 
 const WORKER_INPUT: &str = "OMNIGRAPH_GQT_WORKER_INPUT";
 const WORKER_REPORT: &str = "OMNIGRAPH_GQT_WORKER_REPORT";
@@ -224,7 +217,6 @@ struct Attempt {
     environment: Environment,
     seed: Option<u64>,
     replay: usize,
-    known_failure: bool,
     input: Input,
     outcome: Result<WorkerReport, String>,
 }
@@ -339,7 +331,6 @@ fn error_code(error: &str) -> &'static str {
         "worker_failed",
         "report_failed",
         "timeout",
-        "unexpected_pass",
     ] {
         if error.starts_with(&format!("{code}:")) {
             return code;
@@ -356,9 +347,6 @@ fn result_code(result: &Result<(), String>) -> &'static str {
 }
 
 fn summary_code(summary: &Summary) -> &str {
-    if summary.result.is_ok() && summary.attempts.iter().any(|attempt| attempt.known_failure) {
-        return "known_failure";
-    }
     let code = result_code(&summary.result);
     if code != "assertion_failed" {
         return code;
@@ -712,9 +700,6 @@ fn run_invocation(
             .collect::<Result<Vec<_>, _>>()?;
         refuse_two_store_actors(seams, &admitted)?;
     }
-    if bless && case.known_failure.is_some() {
-        return Err("invalid_case: bless is refused for known_failure cases".into());
-    }
     if bless
         && (case.runner.environments.len() != 1
             || !matches!(selected_envs[0].execution, Execution::Engine { .. }))
@@ -778,25 +763,13 @@ fn run_invocation(
                         outcome = Err("report_failed: invocation evidence budget exhausted; remaining attempts not run".into());
                     }
                 }
-                let mut known_failure = false;
                 match &outcome {
                     Ok(report) => {
-                        match known_failure::classify(&case, report) {
-                            Ok(accepted) => {
-                                known_failure = accepted;
-                                if accepted {
-                                    println!(
-                                        "KNOWN_FAILURE environment={} seed={seed:?} replay={replay}: known recovery failure",
-                                        env
-                                    );
-                                }
-                            }
-                            Err(error) => {
-                                failures.push(format!(
-                                    "{error}; environment={} seed={seed:?} replay={replay}",
-                                    env
-                                ));
-                            }
+                        if let Err(error) = &report.result {
+                            failures.push(format!(
+                                "{error}; environment={} seed={seed:?} replay={replay}",
+                                env
+                            ));
                         }
                         reports.push(json(report)?);
                     }
@@ -811,7 +784,6 @@ fn run_invocation(
                     environment: env.clone(),
                     seed,
                     replay,
-                    known_failure,
                     input,
                     outcome,
                 });
@@ -1292,7 +1264,6 @@ fn replay_attempts(
             .as_ref()
             .map_err(|e| format!("report_failed: incomplete prior execution: {e}"))?;
         let case = parse_case(&attempt.input.stem, &attempt.input.text)?;
-        known_failure::verify_status(&case, prior, attempt.known_failure)?;
         if summary.declared.as_ref() != Some(&case.runner.environments) {
             return Err("report_failed: declared environments differ from frozen input".into());
         }
@@ -1314,7 +1285,6 @@ fn replay_attempts(
                     environment: attempt.environment.clone(),
                     seed: attempt.seed,
                     replay: attempt.replay,
-                    known_failure: false,
                     input: attempt.input.clone(),
                     outcome: Err(error),
                 });
@@ -1327,18 +1297,13 @@ fn replay_attempts(
                 attempt.environment, attempt.seed
             ));
         }
-        let known_failure = match known_failure::classify(&case, &report) {
-            Ok(known_failure) => known_failure,
-            Err(error) => {
-                failures.push(error);
-                false
-            }
-        };
+        if let Err(error) = &report.result {
+            failures.push(error.clone());
+        }
         executed.push(Attempt {
             environment: attempt.environment.clone(),
             seed: attempt.seed,
             replay: attempt.replay,
-            known_failure,
             input: attempt.input.clone(),
             outcome: Ok(report),
         });

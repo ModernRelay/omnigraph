@@ -376,6 +376,8 @@ impl TableHandleCache {
         table_branch: Option<&str>,
         version: u64,
         e_tag: Option<&str>,
+        staged_version: Option<u64>,
+        transaction_uuid: Option<&str>,
         location: &str,
         session: Option<&Arc<Session>>,
     ) -> Result<Dataset> {
@@ -394,9 +396,11 @@ impl TableHandleCache {
         // Miss: open without holding the lock (the open is async IO). A concurrent
         // double-miss opens twice and one wins the insert — correct (the dataset
         // at a version is immutable) and rare.
-        let ds = crate::instrumentation::open_dataset(
+        let ds = crate::instrumentation::open_pinned_dataset(
             location,
-            crate::instrumentation::VersionResolution::At(version),
+            version,
+            staged_version,
+            transaction_uuid,
             session,
             crate::instrumentation::table_wrapper(),
         )
@@ -407,6 +411,45 @@ impl TableHandleCache {
         }
         inner.insert(key, ds.clone());
         Ok(ds)
+    }
+
+    /// A held handle for this pin, without opening on a miss (RFC 0067: a
+    /// writer that just published a pin holds the handle it needs).
+    pub async fn get(
+        &self,
+        dataset_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        e_tag: Option<&str>,
+    ) -> Option<Dataset> {
+        let key = TableHandleKey {
+            table_path: dataset_path.to_string(),
+            table_branch: table_branch.map(str::to_string),
+            version,
+            e_tag: e_tag.map(str::to_string),
+        };
+        let mut inner = self.inner.lock().await;
+        inner.entries.get(&key).cloned()
+    }
+
+    /// Hold a handle the writer already opened or landed for this pin, so the
+    /// next open of the same pin costs no request (RFC 0067).
+    pub async fn insert(
+        &self,
+        dataset_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        e_tag: Option<&str>,
+        dataset: Dataset,
+    ) {
+        let key = TableHandleKey {
+            table_path: dataset_path.to_string(),
+            table_branch: table_branch.map(str::to_string),
+            version,
+            e_tag: e_tag.map(str::to_string),
+        };
+        let mut inner = self.inner.lock().await;
+        inner.insert(key, dataset);
     }
 }
 

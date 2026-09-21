@@ -83,8 +83,10 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     assert!(planned.plan.ok, "{:?}", planned.plan.diagnostics);
     let expected = planned.authorization.unwrap();
 
-    // This is a real effects-confirmed Mutation sidecar, not hand-written JSON.
-    // The table transaction has committed while the graph manifest is unchanged.
+    // RFC 0067: an interrupted mutation arms no recovery — its detached
+    // staging is unreachable garbage — so it must NOT block planning. Only a
+    // sidecar from a build that predates detached commits can occupy
+    // `__recovery/`, and this build cannot interpret one; plant that.
     let graph = dir.path().join("graphs/knowledge.omni");
     let uri = graph.to_str().unwrap();
     let writer = session(Box::pin(Omnigraph::open(uri)).await.unwrap());
@@ -102,7 +104,23 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
         assert!(error.to_string().contains("injected failpoint"), "{error}");
     }
     drop(writer);
-    assert_eq!(fs::read_dir(graph.join("__recovery")).unwrap().count(), 1);
+    assert!(
+        !graph.join("__recovery").exists(),
+        "an interrupted mutation leaves no recovery record (RFC 0067)"
+    );
+    let unblocked = Box::pin(plan_config_dir_authorized(
+        dir.path(),
+        PlanOptions { observe: true },
+        &caller,
+    ))
+    .await;
+    assert!(
+        unblocked.plan.ok,
+        "an interrupted mutation must not block planning: {:?}",
+        unblocked.plan.diagnostics
+    );
+    fs::create_dir_all(graph.join("__recovery")).unwrap();
+    fs::write(graph.join("__recovery/01LEGACYSIDECAR.json"), "{}").unwrap();
     let before_graph = file_bytes(&graph);
     let ledger = dir.path().join("__cluster/state.json");
     let before_ledger = fs::read(&ledger).unwrap();
@@ -148,9 +166,21 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
         "no ledger writes"
     );
 
-    // The existing explicit storage-holder path keeps its recovery behavior.
-    let legacy = Box::pin(apply_config_dir(dir.path())).await;
-    assert!(legacy.ok && legacy.converged, "{:?}", legacy.diagnostics);
+    // The explicit storage-holder path refuses the sidecar too: this build
+    // cannot interpret one, and only the build that wrote it may resolve it.
+    let refused_legacy = Box::pin(apply_config_dir(dir.path())).await;
+    assert!(
+        !refused_legacy.ok,
+        "the storage-holder path must refuse a legacy sidecar: {:?}",
+        refused_legacy.diagnostics
+    );
+    fs::remove_file(graph.join("__recovery/01LEGACYSIDECAR.json")).unwrap();
+    let resolved = Box::pin(apply_config_dir(dir.path())).await;
+    assert!(
+        resolved.ok && resolved.converged,
+        "{:?}",
+        resolved.diagnostics
+    );
     assert_eq!(fs::read_dir(graph.join("__recovery")).unwrap().count(), 0);
     let recovered = session(Box::pin(Omnigraph::open_read_only(uri)).await.unwrap());
     assert!(recovered.schema_source().contains("email"));
@@ -164,7 +194,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     .unwrap();
     assert_eq!(
         result.num_rows(),
-        1,
-        "original data write recovers through Tier 0"
+        0,
+        "an unacknowledged write is never resurrected (RFC 0067)"
     );
 }
