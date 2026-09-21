@@ -69,6 +69,23 @@ macro_rules! declare_engine_cargo_features {
 // registry from Cargo.toml and refuses execution on any mismatch.
 declare_engine_cargo_features!("default", "dst", "failpoints");
 
+/// The distinct Lance `ObjectStore`s one probe plane opened datasets on.
+#[derive(Clone, Default)]
+pub struct ProbedStores(Arc<Mutex<Vec<Arc<lance::io::ObjectStore>>>>);
+
+impl ProbedStores {
+    fn register(&self, store: Arc<lance::io::ObjectStore>) {
+        let mut stores = self.0.lock().unwrap();
+        if !stores.iter().any(|known| Arc::ptr_eq(known, &store)) {
+            stores.push(store);
+        }
+    }
+
+    pub fn stores(&self) -> Vec<Arc<lance::io::ObjectStore>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
 /// Each wrapper is attached (when present) to the datasets that category opens,
@@ -175,6 +192,17 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
+    /// Pre-effect reprepares `Omnigraph::mutate` took after a `ReadSetChanged`
+    /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
+    /// exhaustion of that loop, so this is the one view of the attempts behind
+    /// an acknowledged write.
+    pub mutation_reprepares: Arc<AtomicU64>,
+    /// The Lance `ObjectStore`s behind the opens that carried
+    /// `manifest_wrapper` / `table_wrapper`. A store's own `io_tracker` also
+    /// sees Lance's direct local reader and writer, which on `file://` never
+    /// reach a `WrappingObjectStore`; read it for backend-complete counts.
+    pub manifest_stores: ProbedStores,
+    pub table_stores: ProbedStores,
     /// Uncapped retries taken after a capped BM25 scan under-filled. Only a
     /// standalone `bm25()` ordering carries a cap (`rrf()` arms are never
     /// capped — see `execute_rrf_fusion`); its capped and uncapped runs are
@@ -341,8 +369,338 @@ where
     QUERY_IO_PROBES.scope(probes, fut).await
 }
 
+/// Capture the observer before moving query work to a blocking task. That task
+/// reinstalls it with `with_query_io_probes`; Tokio does not inherit task locals.
+pub(crate) fn capture_query_io_probes() -> Option<QueryIoProbes> {
+    QUERY_IO_PROBES.try_with(Clone::clone).ok()
+}
+
 fn current<R>(f: impl FnOnce(&QueryIoProbes) -> R) -> Option<R> {
     QUERY_IO_PROBES.try_with(f).ok()
+}
+
+tokio::task_local! {
+    static QUERY_MEMORY_LIMIT: u64;
+}
+
+/// Run `fut` with the engine v2 read route's memory pool capped at `bytes`
+/// for every query it runs. Test-only entry point; nothing in production
+/// sets it, so the pool takes its constant.
+pub async fn with_query_memory_limit<F>(bytes: u64, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    QUERY_MEMORY_LIMIT.scope(bytes, fut).await
+}
+
+/// The pool cap a test installed for this task, if any; `None` in production.
+pub(crate) fn query_memory_limit() -> Option<u64> {
+    QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
+}
+
+/// Reservations and execution metrics observed by v2 acceptance tests.
+/// Holding a pool here keeps the observer alive without retaining reservations.
+#[derive(Clone, Debug, Default)]
+pub struct QueryMemoryProbes {
+    pools: Arc<Mutex<Vec<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>>>,
+    metrics: Arc<Mutex<Vec<QueryExecutionMetrics>>>,
+    ladder_reports: Arc<Mutex<Vec<QueryLadderReport>>>,
+    blocking_started: Arc<AtomicU64>,
+    active_blocking: Arc<AtomicU64>,
+    refusals: Arc<Mutex<Vec<String>>>,
+    pause: Arc<Mutex<Option<Arc<QueryBlockingPause>>>>,
+}
+
+/// A completed DataFusion node's metrics, captured before its plan is dropped.
+#[derive(Clone, Debug)]
+pub struct QueryExecutionMetrics {
+    pub operator: String,
+    pub spill_count: usize,
+    pub spilled_rows: usize,
+    pub spilled_bytes: usize,
+    pub output_rows: usize,
+    pub values: std::collections::BTreeMap<String, usize>,
+}
+
+impl QueryMemoryProbes {
+    pub fn reserved_bytes(&self) -> usize {
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|pool| pool.reserved())
+            .sum()
+    }
+
+    pub fn pools_created(&self) -> usize {
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    pub fn blocking_started(&self) -> u64 {
+        self.blocking_started.load(Ordering::SeqCst)
+    }
+
+    pub fn active_blocking_work(&self) -> u64 {
+        self.active_blocking.load(Ordering::SeqCst)
+    }
+
+    pub fn refusals(&self) -> Vec<String> {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn record_refusal(&self, name: &str) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(name.to_string());
+    }
+
+    /// Pause a blocking body's first charged-work checkpoint. The bounded wait
+    /// prevents an incorrectly inline body from hanging the test runtime.
+    #[doc(hidden)]
+    pub fn pause_blocking_work(&self) -> QueryBlockingPauseGuard {
+        let pause = Arc::new(QueryBlockingPause::default());
+        *self
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        QueryBlockingPauseGuard(pause)
+    }
+
+    pub fn ladder_reports(&self) -> Vec<QueryLadderReport> {
+        self.ladder_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn execution_metrics(&self) -> Vec<QueryExecutionMetrics> {
+        self.metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+tokio::task_local! {
+    static QUERY_MEMORY_PROBES: QueryMemoryProbes;
+}
+
+/// Observe pools, blocking bodies, and completed plan metrics within `fut`.
+pub async fn with_query_memory_probes<F>(probes: QueryMemoryProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    QUERY_MEMORY_PROBES.scope(probes, fut).await
+}
+
+#[derive(Debug, Default)]
+struct QueryBlockingPause {
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+    entered: AtomicU64,
+    waiting: AtomicU64,
+}
+
+/// Releases the test checkpoint even when an assertion unwinds.
+#[doc(hidden)]
+pub struct QueryBlockingPauseGuard(Arc<QueryBlockingPause>);
+
+impl QueryBlockingPauseGuard {
+    pub fn entered(&self) -> bool {
+        self.0.entered.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.0.waiting.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn release(&self) {
+        *self
+            .0
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.0.wake.notify_all();
+    }
+}
+
+impl Drop for QueryBlockingPauseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub(crate) fn current_query_memory_probes() -> Option<QueryMemoryProbes> {
+    QUERY_MEMORY_PROBES.try_with(Clone::clone).ok()
+}
+
+/// Facts consumed by the query-level nearest overfetch decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryLadderReport {
+    pub rows: usize,
+    pub k: usize,
+    pub maximum_nprobes: Option<usize>,
+    pub exhausted: bool,
+    pub dataset_rows: u64,
+}
+
+pub(crate) fn record_query_ladder_report(report: QueryLadderReport) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        probes
+            .ladder_reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(report);
+    });
+}
+
+pub(crate) fn record_query_memory_pool(
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        probes
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::clone(pool));
+    });
+}
+
+fn query_operator_metrics(
+    node: &dyn datafusion::physical_plan::ExecutionPlan,
+) -> Option<QueryExecutionMetrics> {
+    node.metrics().map(|metrics| QueryExecutionMetrics {
+        operator: node.name().to_string(),
+        spill_count: metrics.spill_count().unwrap_or(0),
+        spilled_rows: metrics.spilled_rows().unwrap_or(0),
+        spilled_bytes: metrics.spilled_bytes().unwrap_or(0),
+        output_rows: metrics.output_rows().unwrap_or(0),
+        values: metrics
+            .iter()
+            .fold(std::collections::BTreeMap::new(), |mut values, metric| {
+                *values.entry(metric.value().name().to_string()).or_default() +=
+                    metric.value().as_usize();
+                values
+            }),
+    })
+}
+
+/// Capture only operators constructed for this execution; shared children are
+/// captured once from the owning query plan after execution ends.
+pub(crate) fn record_query_runtime_metrics(
+    nodes: &[Arc<dyn datafusion::physical_plan::ExecutionPlan>],
+) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        probes
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(
+                nodes
+                    .iter()
+                    .filter_map(|node| query_operator_metrics(node.as_ref())),
+            );
+    });
+}
+
+pub(crate) fn record_query_execution_metrics(
+    root: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) {
+    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
+        fn visit(
+            node: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+            visited: &mut std::collections::HashSet<*const ()>,
+            out: &mut Vec<QueryExecutionMetrics>,
+        ) {
+            if !visited.insert(Arc::as_ptr(node).cast::<()>()) {
+                return;
+            }
+            out.extend(query_operator_metrics(node.as_ref()));
+            for child in node.children() {
+                visit(child, visited, out);
+            }
+        }
+        visit(
+            root,
+            &mut std::collections::HashSet::new(),
+            &mut probes
+                .metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    });
+}
+
+/// Captured on the query task, then moved into its blocking closure. Tokio task
+/// locals are not inherited by `spawn_blocking`.
+pub(crate) struct QueryBlockingWorkGuard {
+    probes: Option<QueryMemoryProbes>,
+    started: bool,
+}
+
+pub(crate) fn query_blocking_work_guard() -> QueryBlockingWorkGuard {
+    QueryBlockingWorkGuard {
+        probes: QUERY_MEMORY_PROBES.try_with(Clone::clone).ok(),
+        started: false,
+    }
+}
+
+impl QueryBlockingWorkGuard {
+    pub(crate) fn checkpoint(&self) {
+        let Some(probes) = &self.probes else { return };
+        let Some(pause) = probes
+            .pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+            return;
+        }
+        pause.waiting.store(1, Ordering::SeqCst);
+        let released = pause
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            pause
+                .wake
+                .wait_timeout_while(released, std::time::Duration::from_secs(5), |released| {
+                    !*released
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        pause.waiting.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn started(&mut self) {
+        if !self.started {
+            self.started = true;
+            if let Some(probes) = &self.probes {
+                probes.active_blocking.fetch_add(1, Ordering::SeqCst);
+                probes.blocking_started.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl Drop for QueryBlockingWorkGuard {
+    fn drop(&mut self) {
+        if self.started {
+            if let Some(probes) = &self.probes {
+                probes.active_blocking.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -503,6 +861,29 @@ pub(crate) fn record_open(uri: &str) {
 pub(crate) fn record_manifest_scan() {
     let _ = current(|p| {
         p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Register the store behind a probed open under the plane whose wrapper the
+/// open carried. No-op unless a cost probe is active.
+fn record_probed_store(wrapper: &Arc<dyn WrappingObjectStore>, store: Arc<lance::io::ObjectStore>) {
+    let _ = current(|p| {
+        let carried = |plane: &Option<Arc<dyn WrappingObjectStore>>| {
+            plane.as_ref().is_some_and(|w| Arc::ptr_eq(w, wrapper))
+        };
+        if carried(&p.manifest_wrapper) {
+            p.manifest_stores.register(store.clone());
+        }
+        if carried(&p.table_wrapper) {
+            p.table_stores.register(store);
+        }
+    });
+}
+
+/// Record one pre-effect mutation reprepare. No-op unless a cost probe is active.
+pub(crate) fn record_mutation_reprepare() {
+    let _ = current(|p| {
+        p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
     });
 }
 
@@ -1492,8 +1873,8 @@ pub(crate) async fn open_dataset(
         .unwrap_or_else(crate::lance_access::control_session);
     builder = builder.with_session(session);
     let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
-    if let Some(wrapper) = wrapper {
-        store_params.object_store_wrapper = Some(wrapper);
+    if let Some(wrapper) = &wrapper {
+        store_params.object_store_wrapper = Some(wrapper.clone());
     }
     let handler = crate::storage_layer::lance_clone::configured_commit_handler(
         uri,
@@ -1505,7 +1886,7 @@ pub(crate) async fn open_dataset(
     builder = builder
         .with_store_params(store_params)
         .with_commit_handler(handler);
-    builder.load().await.map_err(|error| match error {
+    let dataset = builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a
         // pinned historical read count as reclaimed history:
         //   - VersionNotFound: the dataset exists, that version was GC'd.
@@ -1531,7 +1912,15 @@ pub(crate) async fn open_dataset(
             }
         }
         error => OmniError::storage(error),
-    })
+    })?;
+    if let Some(wrapper) = &wrapper {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        record_probed_store(wrapper, store);
+    }
+    Ok(dataset)
 }
 
 /// Per-method call counts for [`CountingStorageAdapter`].

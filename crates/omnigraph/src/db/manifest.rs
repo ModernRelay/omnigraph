@@ -1342,6 +1342,18 @@ impl ManifestCoordinator {
         Ok(references)
     }
 
+    /// Historical table pins on one live graph branch, for cleanup's twin proof.
+    /// The caller holds the cleanup control gates; these are immutable published
+    /// records, never authority to publish new data or infer an abandoned writer.
+    pub(crate) async fn table_versions_under_control_gates(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Vec<DatasetEntry>> {
+        let dataset = open_manifest_dataset_with_session(root_uri, branch, control_session).await?;
+        state::read_manifest_entries(&dataset).await
+    }
+
     /// Inventory registered table lifetimes, including soft-dropped tables, under cleanup's gates.
     pub(crate) async fn table_registrations_under_control_gates(
         root_uri: &str,

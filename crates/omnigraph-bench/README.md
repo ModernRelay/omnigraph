@@ -460,3 +460,59 @@ Machine-readable diagnostic-mode failures keep the suite/case/point identity
 and all completed runs or repetitions. A worker killed at its hard deadline
 contributes structured process-containment evidence, but never a partial
 sample.
+
+## Diagnostic engine comparison
+
+`examples/compare_engines.rs` compares v1 and v2 through `Session::query`
+on the same synthetic graph and engine handle. It checks result columns,
+row counts and complete result equality before timing, then checks every
+measured result again outside the timer. The ten shapes cover lookup, narrow
+and whole-node scans, filtering, counting, grouped aggregation, ordered top-k,
+traversal, filtered traversal and negation.
+
+```bash
+RUSTFLAGS= cargo run --release --locked -p omnigraph-bench --example compare_engines -- \
+  --rows 10000 --iterations 20 --warmups 5
+```
+
+Setup, index construction, JSON conversion and verification are outside the
+measured window. Five warm-up passes precede 20 measured pairs; engine order
+alternates and query order rotates. The timer includes query compilation/cache
+lookup, planning and execution through materialized result batches. Tokio uses
+four workers. The fixture has one edge per two nodes, a 1,080-byte biography
+and a 32-dimensional vector per node. Run sizes must be multiples of 100,
+from 1,000 through 100,000.
+
+Output is diagnostic JSON lines, not durable suite records. This measures warm
+local latency with shared engine caches and an uncontrolled OS page cache; it
+does not qualify cold reads, cloud storage, concurrent throughput or search.
+Repeat in fresh processes and record the executable/source hashes, machine,
+profile and effective Lance thread/pool settings alongside the raw samples.
+
+### Traversal and aggregation memory diagnostic
+
+`examples/issue_shapes.rs` measures `count_bare`, `destination_projection`,
+`grouped_fanout` and `destination_search` with 200 hubs and 500 edges per hub.
+Each person has a biography and a 1,024-dimensional vector; every tenth
+person matches the text search. The default fixture holds 20,000 people.
+
+```bash
+RUSTFLAGS= cargo run --release --locked -p omnigraph-bench --example issue_shapes -- \
+  --out /tmp/omnigraph-issue-shapes-run --rows 20000 --repeats 4
+```
+
+Both diagnostics refuse builds carrying encoded Rust flags. Build-time
+commit, dirty-state and compiler facts identify the compiled code; the memory
+diagnostic additionally hashes its executable and embedded source before
+measurement. Output is diagnostic evidence, never a qualified performance claim.
+
+Before timing, both engines are checked against complete fixture-derived
+results and against each other. A known v1 destination-search mismatch is
+recorded and that engine/shape is excluded from timing; every other mismatch
+refuses the run. Every timed answer is checked outside the timer. Each
+engine/shape/repeat uses a fresh child, so peak RSS cannot inherit another
+engine's high-water mark. `ru_maxrss` includes opening, warmups and result
+verification: it is a process upper bound, not operator live memory. The OS
+page cache is uncontrolled. An even repeat count balances which engine runs
+first. `--out` is required and existing output files are refused. `--store`,
+when supplied, must be empty; an old fixture is not trusted from its row count.

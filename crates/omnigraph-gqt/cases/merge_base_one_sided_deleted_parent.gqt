@@ -1,8 +1,6 @@
 # issue: none
-# notes: companion of issue_639_shared_merged_parent_base: the ordinary flow around a deleted branch: s forks main; x forks main,
-# notes: writes, is merged into main and deleted; s merges into main. Only main's
-# notes: walk reaches x's commit before shared history, so it is not a base
-# notes: candidate and the merge proceeds on the fork point (RFC 0063 step 1).
+# notes: Only main imports x before x is deleted; s still descends from the original fork.
+# notes: Merging s must use that shared fork, not x's one-sided commit (RFC 0063).
 
 --- runner
 timeout_ms: 10000

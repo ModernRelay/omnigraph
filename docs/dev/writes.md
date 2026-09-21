@@ -28,9 +28,11 @@ promote each pin from the held handles (best effort; a pending pin is promoted l
 ```
 
 An error before the manifest CAS leaves the graph unchanged: the detached
-versions are unreferenced garbage and the caller retries from scratch. After
-it the write is acknowledged whether or not its promotion ran. No writer
-arms a recovery record, and no write replans around a partial state, because
+versions are unreferenced staging, retained until reclamation can be proved.
+The caller retries from a fresh snapshot. A successful publication is
+acknowledged whether or not promotion ran. A lost acknowledgement is resolved
+against the exact attempted manifest; unavailable readback stays indeterminate.
+No writer arms a recovery record, and no write replans around a partial state, because
 no partial state is ever visible. Schema apply and the system-column upgrade
 additionally stage and install the schema contract around their CAS; only
 they can report `RecoveryRequired`, naming a manifest commit that landed
@@ -118,7 +120,7 @@ every participant as a detached version of its pinned base: no recovery
 sidecar is armed, a table's linear HEAD never moves, and nothing can rebase.
 The manifest then publishes every pin as `(base + 1, staged version,
 transaction uuid)` in one CAS; a publish that loses the CAS returns the plain
-`ReadSetChanged` and the detached manifests are reclaimable garbage. After
+`ReadSetChanged` and unproven detached staging is retained. After
 publication the writer promotes each pin from the handles it already holds,
 replaying the recorded transaction at `base` so the linear history gains an
 identical twin. A promotion that fails or is blocked never fails the write:
@@ -126,11 +128,15 @@ the pin stays pending, readable through its staged version, and the next
 writer of that table or `cleanup` promotes it. A writer whose captured
 snapshot predates a promotion sees the linear HEAD one past its published
 version; the current manifest explains that HEAD, so the writer reprepares
-(`ReadSetChanged`) rather than reporting drift. Cleanup deletes a promoted
-pin's detached manifest as soon as it promotes it, skips version GC on a
-table whose pin is blocked, and with `--older-than` reaps every other
-detached manifest older than the threshold that no pending chain protects
-(superseded pins, promoted chain links and attempts that never published). A pin whose target version a
+(`ReadSetChanged`) rather than reporting drift. Cleanup skips version GC on a
+table whose pin is blocked. Detached manifests are reclaimed only when a
+published pin and matching transaction UUID prove their linear twins. Age
+filters proven surplus; it does not prove that an unpublished writer stopped.
+Cleanup retains uncertain staging and defers version/file GC for its table,
+while continuing on unaffected tables. Historical pins and chain links use the
+same proof so successful writes do not leave redundant detached copies.
+
+A pin whose target version a
 foreign linear commit occupies is blocked: a later mutation stages from the
 detached version and its own promotion waits behind the block, while the
 graph-global writers (schema apply, Optimize) promote every pending pin
@@ -142,7 +148,7 @@ its name (Lance 11 folds only through a linear commit), keeping a vector
 index's partition count; the batch publishes once with an exact CAS on every
 planned pin, and a pin a concurrent writer moved fails the run with a
 read-set conflict so the next run re-plans. A failure before publication
-leaves nothing but reclaimable detached versions; one after it leaves
+leaves unproven detached versions that cleanup retains; one after it leaves
 pending pins the next writer or cleanup promotes. A strict mutation prepared
 before Optimize's publication reports the same read-set conflict as it would
 after any other writer. `omnigraph repair` reports blocked pins as
@@ -292,7 +298,7 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached manifests are reclaimable garbage |
+| Any writer fails before publication, after any detached effect | Typed error; no graph movement; unproven detached staging is retained |
 | Any writer fails after publication, before promotion | Acknowledged; the pin stays pending, readable through its staged version, and the next writer of the table or cleanup promotes it |
 | Schema apply or the system-column upgrade fails after publication, before its contract is installed | `RecoveryRequired` naming the published commit; the next read-write open, `refresh`, or that handle's next write installs the staged contract |
 | A foreign linear commit occupies a pin's target version | The pin is blocked: content writers keep writing behind it, graph-global writers refuse the table, `repair` reports `blocked_promotion` |

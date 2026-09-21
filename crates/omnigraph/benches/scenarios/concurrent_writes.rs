@@ -16,13 +16,15 @@
 //! (`cw-w{worker}-{seq}`), the shape that exercises the write path's real
 //! serialization — the process-global write queue and the exclusive schema
 //! gate every writer crosses in `commit_all` — without manufacturing key
-//! conflicts. A typed read-set/authority conflict (`ReadSetChanged`: the
-//! graph head moved under a concurrent writer) is the engine asking the
-//! client to retry from current state; the driver retries it like a real
-//! client, inside the same op's service time, and counts it
-//! (`authority_conflicts`). Engine-internal reprepares stay invisible at
-//! the API and are likewise part of service time. Any other worker error,
-//! any `KeyConflict`, or a verification mismatch invalidates the run.
+//! conflicts. `Omnigraph::mutate` replays a typed read-set/authority
+//! conflict (`ReadSetChanged`: the graph head moved under a concurrent
+//! writer) itself, up to `MAX_PRE_EFFECT_REPREPARES` times for an
+//! insert-only mutation; the `mutation_reprepares` probe counts those
+//! replays (`reprepares_per_commit`). A `ReadSetChanged` reaches the driver
+//! only when that loop is exhausted; the driver then retries the op like a
+//! real client and counts the exhaustion (`authority_conflicts`). Both
+//! kinds of retry ride inside the op's service time. Any other worker
+//! error, any `KeyConflict`, or a verification mismatch invalidates the run.
 //!
 //! Concurrency shape: N tokio tasks over clones of ONE `Session` (one
 //! `Arc<Omnigraph>`) — the production server shape (one engine handle per
@@ -32,8 +34,10 @@
 //! `QueryIoProbes` value (Lance manifest/table planes, `IOTracker`
 //! wrappers) installed on the graph open and on EVERY worker task — the
 //! probes are a tokio task-local and do not cross `tokio::spawn` — plus a
-//! `CountingStorageAdapter` for the engine control plane. Counters are
-//! logical calls at the wrapping seam, not physical requests. Verification
+//! `CountingStorageAdapter` for the engine control plane. The Lance totals
+//! are read from each probed `ObjectStore`'s own tracker (`ProbedStores`),
+//! because on `file://` Lance's direct local reader and writer never reach
+//! a wrapper. Counters are logical calls, not physical requests. Verification
 //! runs on a fresh, uncounted handle after every counter and clock has been
 //! read.
 
@@ -46,8 +50,8 @@ use lance_io::utils::tracking_store::IOTracker;
 use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{
-    CountingStorageAdapter, QueryIoProbes, StorageReadCounts, enabled_engine_cargo_features,
-    with_query_io_probes,
+    CountingStorageAdapter, ProbedStores, QueryIoProbes, StorageReadCounts,
+    enabled_engine_cargo_features, with_query_io_probes,
 };
 use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
@@ -135,14 +139,22 @@ struct LancePlaneTotals {
     read_iops: u64,
     read_bytes: u64,
     write_iops: u64,
+    write_bytes: u64,
 }
 
 impl LancePlaneTotals {
-    fn drain_from(&mut self, tracker: &IOTracker) {
-        let stats = tracker.incremental_stats();
-        self.read_iops += stats.read_iops;
-        self.read_bytes += stats.read_bytes;
-        self.write_iops += stats.write_iops;
+    /// Totals come from each probed store's own tracker, which also sees
+    /// Lance's direct local reader and writer; the wrapper tracker misses
+    /// those on `file://` and is drained only to bound its request log.
+    fn drain_from(&mut self, wrapper: &IOTracker, stores: &ProbedStores) {
+        let _ = wrapper.incremental_stats();
+        for store in stores.stores() {
+            let stats = store.io_stats_incremental();
+            self.read_iops += stats.read_iops;
+            self.read_bytes += stats.read_bytes;
+            self.write_iops += stats.write_iops;
+            self.write_bytes += stats.written_bytes;
+        }
     }
 }
 
@@ -194,11 +206,9 @@ impl ControlSnapshot {
     }
 }
 
-/// A typed read-set/authority conflict: the engine refusing to publish over
-/// state that moved since capture and asking the caller to retry from the
-/// current branch state. Under concurrent same-branch writers this is an
-/// expected outcome, not an invalid run; the driver retries it like a real
-/// client and the record counts it.
+/// A typed read-set/authority conflict that outlived the engine's own
+/// reprepare loop. Under concurrent same-branch writers this is an expected
+/// outcome, not an invalid run; the driver retries it and the record counts it.
 fn is_authority_conflict(error: &omnigraph::error::OmniError) -> bool {
     matches!(
         error,
@@ -210,18 +220,52 @@ fn is_authority_conflict(error: &omnigraph::error::OmniError) -> bool {
     )
 }
 
+/// Why a worker stopped, classified once from the typed `OmniError`.
+enum WorkerFailure {
+    KeyConflict(String),
+    Other(String),
+}
+
+impl WorkerFailure {
+    fn classify(error: &omnigraph::error::OmniError) -> Self {
+        match error {
+            omnigraph::error::OmniError::KeyConflict { .. } => Self::KeyConflict(error.to_string()),
+            _ => Self::Other(error.to_string()),
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::KeyConflict(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+enum VerificationFailure {
+    RowCount(String),
+    Readback(String),
+}
+
+impl VerificationFailure {
+    fn message(&self) -> &str {
+        match self {
+            Self::RowCount(message) | Self::Readback(message) => message,
+        }
+    }
+}
+
 struct WorkerOutcome {
     worker: usize,
     branch: String,
     acked_ops: u64,
     warmup_ops: u64,
-    /// Typed authority conflicts the driver retried (see
+    /// Exhaustions of the engine's reprepare loop the driver retried (see
     /// [`is_authority_conflict`]).
     authority_conflicts: u64,
     /// `(start_offset_us_from_run_start, service_time_us)` for ops whose
     /// start fell inside the measured window.
     samples: Vec<(u64, u64)>,
-    error: Option<String>,
+    failure: Option<WorkerFailure>,
 }
 
 /// What the measured probes scope hands back to the (unprobed) tail of the
@@ -231,7 +275,12 @@ struct MeasuredRun {
     branches: Vec<String>,
     setup: serde_json::Value,
     warmup_elapsed_us: u64,
-    measured_elapsed_us: u64,
+    /// The measured window: flip to `PHASE_MEASURED` until `PHASE_STOP`.
+    window_us: u64,
+    /// `PHASE_STOP` until the last worker joined: ops in flight at the stop.
+    drain_us: u64,
+    /// `mutation_reprepares` taken after the measured flip.
+    reprepares: u64,
     outcomes: Vec<WorkerOutcome>,
     lance_manifest: LancePlaneTotals,
     lance_table: LancePlaneTotals,
@@ -448,7 +497,7 @@ async fn run_measured(
                 let mut acked_ops = 0u64;
                 let mut warmup_ops = 0u64;
                 let mut authority_conflicts = 0u64;
-                let mut error = None;
+                let mut failure = None;
                 'ops: loop {
                     let current_phase = phase.load(Ordering::Acquire);
                     if current_phase == PHASE_STOP {
@@ -474,17 +523,14 @@ async fn run_measured(
                                 }
                                 break;
                             }
-                            // A typed authority conflict (the read set moved
-                            // between capture and revalidation — here,
-                            // `graph_head` advanced under a concurrent
-                            // writer) is the engine ASKING the client to
-                            // retry from current state; a closed-loop driver
-                            // retries the same op, the retry rides inside
-                            // this op's service time, and the record counts
-                            // it. Nothing durable precedes the refusal
-                            // (presumed abort), so re-issuing the same slug
-                            // is safe — a duplicate would surface as a
-                            // KeyConflict and invalidate the run.
+                            // The engine already replayed this op up to
+                            // `MAX_PRE_EFFECT_REPREPARES` times; this arm
+                            // sees only the exhaustion of that loop. No
+                            // graph-visible effect precedes the refusal (the
+                            // staged files are reclaimable orphans), so
+                            // re-issuing the same slug is safe — a duplicate
+                            // would surface as a KeyConflict and invalidate
+                            // the run.
                             Err(op_error) if is_authority_conflict(&op_error) => {
                                 authority_conflicts += 1;
                                 if phase.load(Ordering::Acquire) == PHASE_STOP {
@@ -494,7 +540,7 @@ async fn run_measured(
                                 }
                             }
                             Err(op_error) => {
-                                error = Some(format!("{op_error}"));
+                                failure = Some(WorkerFailure::classify(&op_error));
                                 break 'ops;
                             }
                         }
@@ -507,7 +553,7 @@ async fn run_measured(
                     warmup_ops,
                     authority_conflicts,
                     samples,
-                    error,
+                    failure,
                 }
             };
             handles.push(if no_probes {
@@ -529,26 +575,32 @@ async fn run_measured(
         // Discard warmup-window IO so the measured totals start clean; the
         // tails of warmup-started ops still land in the measured totals and
         // the record says so.
-        let _ = manifest_tracker.incremental_stats();
-        let _ = table_tracker.incremental_stats();
+        LancePlaneTotals::default().drain_from(&manifest_tracker, &probes_for_main.manifest_stores);
+        LancePlaneTotals::default().drain_from(&table_tracker, &probes_for_main.table_stores);
         let warmup_elapsed_us = run_start.elapsed().as_micros() as u64;
         let control_before = control_counts.as_deref().map(ControlSnapshot::capture);
+        let reprepares_before = probes_for_main.mutation_reprepares.load(Ordering::Relaxed);
         phase.store(PHASE_MEASURED, Ordering::Release);
         let measured_started = Instant::now();
         while measured_started.elapsed() < duration {
             let remaining = duration.saturating_sub(measured_started.elapsed());
             tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
-            lance_manifest.drain_from(&manifest_tracker);
-            lance_table.drain_from(&table_tracker);
+            lance_manifest.drain_from(&manifest_tracker, &probes_for_main.manifest_stores);
+            lance_table.drain_from(&table_tracker, &probes_for_main.table_stores);
         }
         phase.store(PHASE_STOP, Ordering::Release);
+        let window_us = measured_started.elapsed().as_micros() as u64;
         let mut outcomes = Vec::with_capacity(handles.len());
         for handle in handles {
             outcomes.push(handle.await.expect("worker task join"));
         }
-        let measured_elapsed_us = measured_started.elapsed().as_micros() as u64;
-        lance_manifest.drain_from(&manifest_tracker);
-        lance_table.drain_from(&table_tracker);
+        let drain_us = (measured_started.elapsed().as_micros() as u64).saturating_sub(window_us);
+        let reprepares = probes_for_main
+            .mutation_reprepares
+            .load(Ordering::Relaxed)
+            .saturating_sub(reprepares_before);
+        lance_manifest.drain_from(&manifest_tracker, &probes_for_main.manifest_stores);
+        lance_table.drain_from(&table_tracker, &probes_for_main.table_stores);
         let control_delta = match (&control_before, control_counts.as_deref()) {
             (Some(before), Some(counts)) => {
                 Some(before.delta_json(&ControlSnapshot::capture(counts)))
@@ -559,13 +611,16 @@ async fn run_measured(
             "data_open_count": probes_for_main.data_open_count.load(Ordering::Relaxed),
             "internal_open_count": probes_for_main.internal_open_count.load(Ordering::Relaxed),
             "manifest_scan_count": probes_for_main.manifest_scan_count.load(Ordering::Relaxed),
+            "mutation_reprepares_since_open": probes_for_main.mutation_reprepares.load(Ordering::Relaxed),
         });
         MeasuredRun {
             root_uri,
             branches,
             setup,
             warmup_elapsed_us,
-            measured_elapsed_us,
+            window_us,
+            drain_us,
+            reprepares,
             outcomes,
             lance_manifest,
             lance_table,
@@ -597,12 +652,21 @@ async fn judge_and_summarize(
     let mut per_branch_acked: std::collections::BTreeMap<&str, u64> =
         std::collections::BTreeMap::new();
     let mut service_times: Vec<u64> = Vec::new();
+    let mut commits_by_second = vec![0u64; args.duration_secs as usize];
+    let mut completed_in_drain = 0u64;
     for outcome in &measured.outcomes {
-        if let Some(error) = &outcome.error {
-            if error.contains("KeyConflict") || error.contains("key conflict") {
+        if let Some(failure) = &outcome.failure {
+            if matches!(failure, WorkerFailure::KeyConflict(_)) {
                 key_conflicts += 1;
             }
-            errors.push(format!("worker {}: {error}", outcome.worker));
+            errors.push(format!("worker {}: {}", outcome.worker, failure.message()));
+        }
+        for (start_offset, service) in &outcome.samples {
+            let completed_us = (start_offset + service).saturating_sub(measured.warmup_elapsed_us);
+            match commits_by_second.get_mut((completed_us / 1_000_000) as usize) {
+                Some(second) if completed_us < measured.window_us => *second += 1,
+                _ => completed_in_drain += 1,
+            }
         }
         warmup_ops += outcome.warmup_ops;
         authority_conflicts += outcome.authority_conflicts;
@@ -618,8 +682,10 @@ async fn judge_and_summarize(
         service_times.extend(outcome.samples.iter().map(|(_, service)| *service));
     }
     service_times.sort_unstable();
-    let elapsed_secs = (measured.measured_elapsed_us as f64 / 1_000_000.0).max(f64::EPSILON);
-    let commits_per_sec = ops_committed as f64 / elapsed_secs;
+    // Samples are ops that STARTED inside the window, so the window (not
+    // window plus drain) is their denominator.
+    let window_secs = (measured.window_us as f64 / 1_000_000.0).max(f64::EPSILON);
+    let commits_per_sec = ops_committed as f64 / window_secs;
     let mean = if service_times.is_empty() {
         0
     } else {
@@ -631,7 +697,7 @@ async fn judge_and_summarize(
     // counts are exact, and a sample of acknowledged slugs reads back by
     // key. Aging restores the logical base fixture, so the expectation is
     // seeded rows plus this run's acknowledgements.
-    let mut verification_failures: Vec<String> = Vec::new();
+    let mut verification_failures: Vec<VerificationFailure> = Vec::new();
     let mut sampled_readback = 0usize;
     let verify = Session::from_defaults(
         Arc::new(
@@ -653,10 +719,10 @@ async fn judge_and_summarize(
         let expected = args.rows + acked as usize;
         let actual = helpers::count_rows_branch(&verify, branch, "node:Chunk").await;
         if actual != expected {
-            verification_failures.push(format!(
+            verification_failures.push(VerificationFailure::RowCount(format!(
                 "branch {branch}: expected {expected} Chunk rows (seeded {} + acked {acked}), found {actual}",
                 args.rows
-            ));
+            )));
         }
         // The last acknowledged slug of up to 8 workers per branch reads
         // back by key: the freshest write is the one a lost-durability bug
@@ -675,13 +741,13 @@ async fn judge_and_summarize(
                 .await
             {
                 Ok(result) if result.num_rows() == 1 => {}
-                Ok(result) => verification_failures.push(format!(
+                Ok(result) => verification_failures.push(VerificationFailure::Readback(format!(
                     "branch {branch}: acknowledged slug '{slug}' read back {} rows, expected 1",
                     result.num_rows()
-                )),
-                Err(error) => verification_failures.push(format!(
+                ))),
+                Err(error) => verification_failures.push(VerificationFailure::Readback(format!(
                     "branch {branch}: readback of acknowledged slug '{slug}' failed: {error}"
-                )),
+                ))),
             }
             sampled_readback += 1;
         }
@@ -705,6 +771,16 @@ async fn judge_and_summarize(
         .collect();
 
     let passed = errors.is_empty() && verification_failures.is_empty();
+    let rows_exact = !verification_failures
+        .iter()
+        .any(|failure| matches!(failure, VerificationFailure::RowCount(_)));
+    let verification_messages: Vec<&str> = verification_failures
+        .iter()
+        .map(VerificationFailure::message)
+        .collect();
+    let io_coverage = "counts are read from each probed Lance ObjectStore's own io_tracker, which \
+                       also sees the direct local reader and writer a WrappingObjectStore misses \
+                       on local-fs; one put per file written, one read per range get";
     let per_op = |total: u64| -> f64 {
         if ops_committed == 0 {
             0.0
@@ -726,8 +802,11 @@ async fn judge_and_summarize(
         "warmup_ops": warmup_ops,
         "warmup_elapsed_us": measured.warmup_elapsed_us,
         "ops_committed": ops_committed,
-        "elapsed_measured_us": measured.measured_elapsed_us,
+        "window_us": measured.window_us,
+        "drain_us": measured.drain_us,
         "commits_per_sec": commits_per_sec,
+        "commits_by_second": commits_by_second,
+        "completed_in_drain": completed_in_drain,
         "service_time_us": {
             "min": service_times.first().copied().unwrap_or(0),
             "mean": mean,
@@ -742,23 +821,26 @@ async fn judge_and_summarize(
         "errors": errors,
         "key_conflicts": key_conflicts,
         "authority_conflicts": authority_conflicts,
-        "retry_note": "a typed read-set/authority conflict (`ReadSetChanged`, e.g. \
-                       graph_head moved under a concurrent writer) is the engine \
-                       asking the client to retry from current state; the driver \
-                       retries the same op like a real client, the retry rides \
-                       inside that op's service time, and `authority_conflicts` \
-                       counts the occurrences; engine-internal reprepares stay \
-                       invisible at the API and are likewise included",
+        "reprepares": if args.no_probes { serde_json::json!(null) } else { serde_json::json!(measured.reprepares) },
+        "retry_note": "`Omnigraph::mutate` replays a typed read-set/authority conflict \
+                       (`ReadSetChanged`, e.g. graph_head moved under a concurrent \
+                       writer) itself, up to MAX_PRE_EFFECT_REPREPARES times for an \
+                       insert-only mutation; `reprepares` counts those replays inside \
+                       the measured window. `authority_conflicts` counts only the \
+                       exhaustions of that loop, which the driver retries like a real \
+                       client. Both ride inside the op's service time",
         "io": if args.no_probes { serde_json::json!(null) } else { serde_json::json!({
             "manifest": {
                 "read_iops": measured.lance_manifest.read_iops,
                 "read_bytes": measured.lance_manifest.read_bytes,
                 "write_iops": measured.lance_manifest.write_iops,
+                "write_bytes": measured.lance_manifest.write_bytes,
             },
             "table": {
                 "read_iops": measured.lance_table.read_iops,
                 "read_bytes": measured.lance_table.read_bytes,
                 "write_iops": measured.lance_table.write_iops,
+                "write_bytes": measured.lance_table.write_bytes,
             },
             "probes": measured.probe_counters,
             "control_plane": measured.control_delta,
@@ -767,8 +849,12 @@ async fn judge_and_summarize(
                 "manifest_writes_per_commit": per_op(measured.lance_manifest.write_iops),
                 "table_reads_per_commit": per_op(measured.lance_table.read_iops),
                 "table_writes_per_commit": per_op(measured.lance_table.write_iops),
+                "reprepares_per_commit": per_op(measured.reprepares),
             },
-            "counter_semantics": "logical calls at the wrapping seam, not physical requests",
+            "counter_semantics": "logical calls recorded by the Lance ObjectStore tracker (one per \
+                                  range get, one per file put), not physical requests and not \
+                                  round trips",
+            "io_coverage": io_coverage,
             "probe_coverage": "task-local probes installed on the counting open and every \
                                worker task; wrappers attach at dataset open, so IO on wrapped \
                                handles is counted regardless of thread; measured totals start \
@@ -789,15 +875,15 @@ async fn judge_and_summarize(
                                  measured window; fixture build, aging, layout preparation, \
                                  verification and teardown are outside it",
         "verification": {
-            "rows_exact": verification_failures.iter().all(|f| !f.contains("Chunk rows")),
+            "rows_exact": rows_exact,
             "sampled_readback": sampled_readback,
-            "failures": verification_failures,
+            "failures": verification_messages,
             "passed": passed,
         },
     });
     assert!(
         passed,
-        "concurrent-writes run invalid: errors={errors:?} verification={verification_failures:?}"
+        "concurrent-writes run invalid: errors={errors:?} verification={verification_messages:?}"
     );
     record
 }

@@ -40,7 +40,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query, or the `branch list` or `show` statement | direct or served |
+| `query` | Run a read query, or the `branch list`, `show`, or `explain` statement | direct or served |
 | `mutate` | Run an insert/update/delete query, or a `branch create`, `branch delete`, or `branch merge` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
@@ -82,12 +82,12 @@ its registry name alone. Parameters come inline, `--params '{"name":"Ada"}'`,
 or from a file, `--params-file params.json`. `--set NAME=VALUE`, repeatable,
 gives a [session setting](index.md#session-settings) a value for the run of
 `query`, `mutate`, `branch merge`, `commit changes`, `changes poll`, `load`
-and `ingest`.
-
-The source may instead be one branch statement, `mutate -e 'branch create b0'`
-or `query -e 'branch list'` (control writes through `mutate`, the listing
-through `query`), which takes no `--branch`, `--snapshot`, `--if-commit`, name,
-or params; see [Work with branches](index.md#work-with-branches).
+and `ingest`. The source may instead be one branch statement, `mutate -e
+'branch create b0'` or `query -e 'branch list'` (writes through `mutate`, the
+listing through `query`; no `--branch`, `--snapshot`, `--if-commit`, name, or
+params; see [Work with branches](index.md#work-with-branches)), or one
+`explain` statement, `query -e 'explain query q() { … }'`, answering the plan
+as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result

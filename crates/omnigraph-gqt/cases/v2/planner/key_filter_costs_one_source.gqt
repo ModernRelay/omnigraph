@@ -1,0 +1,230 @@
+# issue: none
+# notes: A key equality reduces the source frontier before expansion mode and destination access are chosen.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Links: Person -> Person
+
+--- seed
+{"type": "Person", "data": {"name": "p000"}}
+{"type": "Person", "data": {"name": "p001"}}
+{"type": "Person", "data": {"name": "p002"}}
+{"type": "Person", "data": {"name": "p003"}}
+{"type": "Person", "data": {"name": "p004"}}
+{"type": "Person", "data": {"name": "p005"}}
+{"type": "Person", "data": {"name": "p006"}}
+{"type": "Person", "data": {"name": "p007"}}
+{"type": "Person", "data": {"name": "p008"}}
+{"type": "Person", "data": {"name": "p009"}}
+{"type": "Person", "data": {"name": "p010"}}
+{"type": "Person", "data": {"name": "p011"}}
+{"type": "Person", "data": {"name": "p012"}}
+{"type": "Person", "data": {"name": "p013"}}
+{"type": "Person", "data": {"name": "p014"}}
+{"type": "Person", "data": {"name": "p015"}}
+{"type": "Person", "data": {"name": "p016"}}
+{"type": "Person", "data": {"name": "p017"}}
+{"type": "Person", "data": {"name": "p018"}}
+{"type": "Person", "data": {"name": "p019"}}
+{"type": "Person", "data": {"name": "p020"}}
+{"type": "Person", "data": {"name": "p021"}}
+{"type": "Person", "data": {"name": "p022"}}
+{"type": "Person", "data": {"name": "p023"}}
+{"type": "Person", "data": {"name": "p024"}}
+{"type": "Person", "data": {"name": "p025"}}
+{"type": "Person", "data": {"name": "p026"}}
+{"type": "Person", "data": {"name": "p027"}}
+{"type": "Person", "data": {"name": "p028"}}
+{"type": "Person", "data": {"name": "p029"}}
+{"type": "Person", "data": {"name": "p030"}}
+{"type": "Person", "data": {"name": "p031"}}
+{"type": "Person", "data": {"name": "p032"}}
+{"type": "Person", "data": {"name": "p033"}}
+{"type": "Person", "data": {"name": "p034"}}
+{"type": "Person", "data": {"name": "p035"}}
+{"type": "Person", "data": {"name": "p036"}}
+{"type": "Person", "data": {"name": "p037"}}
+{"type": "Person", "data": {"name": "p038"}}
+{"type": "Person", "data": {"name": "p039"}}
+{"type": "Person", "data": {"name": "p040"}}
+{"type": "Person", "data": {"name": "p041"}}
+{"type": "Person", "data": {"name": "p042"}}
+{"type": "Person", "data": {"name": "p043"}}
+{"type": "Person", "data": {"name": "p044"}}
+{"type": "Person", "data": {"name": "p045"}}
+{"type": "Person", "data": {"name": "p046"}}
+{"type": "Person", "data": {"name": "p047"}}
+{"type": "Person", "data": {"name": "p048"}}
+{"type": "Person", "data": {"name": "p049"}}
+{"type": "Person", "data": {"name": "p050"}}
+{"type": "Person", "data": {"name": "p051"}}
+{"type": "Person", "data": {"name": "p052"}}
+{"type": "Person", "data": {"name": "p053"}}
+{"type": "Person", "data": {"name": "p054"}}
+{"type": "Person", "data": {"name": "p055"}}
+{"type": "Person", "data": {"name": "p056"}}
+{"type": "Person", "data": {"name": "p057"}}
+{"type": "Person", "data": {"name": "p058"}}
+{"type": "Person", "data": {"name": "p059"}}
+{"type": "Person", "data": {"name": "p060"}}
+{"type": "Person", "data": {"name": "p061"}}
+{"type": "Person", "data": {"name": "p062"}}
+{"type": "Person", "data": {"name": "p063"}}
+{"type": "Person", "data": {"name": "p064"}}
+{"type": "Person", "data": {"name": "p065"}}
+{"type": "Person", "data": {"name": "p066"}}
+{"type": "Person", "data": {"name": "p067"}}
+{"type": "Person", "data": {"name": "p068"}}
+{"type": "Person", "data": {"name": "p069"}}
+{"type": "Person", "data": {"name": "p070"}}
+{"type": "Person", "data": {"name": "p071"}}
+{"type": "Person", "data": {"name": "p072"}}
+{"type": "Person", "data": {"name": "p073"}}
+{"type": "Person", "data": {"name": "p074"}}
+{"type": "Person", "data": {"name": "p075"}}
+{"type": "Person", "data": {"name": "p076"}}
+{"type": "Person", "data": {"name": "p077"}}
+{"type": "Person", "data": {"name": "p078"}}
+{"type": "Person", "data": {"name": "p079"}}
+{"type": "Person", "data": {"name": "p080"}}
+{"type": "Person", "data": {"name": "p081"}}
+{"type": "Person", "data": {"name": "p082"}}
+{"type": "Person", "data": {"name": "p083"}}
+{"type": "Person", "data": {"name": "p084"}}
+{"type": "Person", "data": {"name": "p085"}}
+{"type": "Person", "data": {"name": "p086"}}
+{"type": "Person", "data": {"name": "p087"}}
+{"type": "Person", "data": {"name": "p088"}}
+{"type": "Person", "data": {"name": "p089"}}
+{"type": "Person", "data": {"name": "p090"}}
+{"type": "Person", "data": {"name": "p091"}}
+{"type": "Person", "data": {"name": "p092"}}
+{"type": "Person", "data": {"name": "p093"}}
+{"type": "Person", "data": {"name": "p094"}}
+{"type": "Person", "data": {"name": "p095"}}
+{"type": "Person", "data": {"name": "p096"}}
+{"type": "Person", "data": {"name": "p097"}}
+{"type": "Person", "data": {"name": "p098"}}
+{"type": "Person", "data": {"name": "p099"}}
+{"edge": "Links", "from": "p000", "to": "p001"}
+{"edge": "Links", "from": "p001", "to": "p002"}
+{"edge": "Links", "from": "p002", "to": "p003"}
+{"edge": "Links", "from": "p003", "to": "p004"}
+{"edge": "Links", "from": "p004", "to": "p005"}
+{"edge": "Links", "from": "p005", "to": "p006"}
+{"edge": "Links", "from": "p006", "to": "p007"}
+{"edge": "Links", "from": "p007", "to": "p008"}
+{"edge": "Links", "from": "p008", "to": "p009"}
+{"edge": "Links", "from": "p009", "to": "p010"}
+{"edge": "Links", "from": "p010", "to": "p011"}
+{"edge": "Links", "from": "p011", "to": "p012"}
+{"edge": "Links", "from": "p012", "to": "p013"}
+{"edge": "Links", "from": "p013", "to": "p014"}
+{"edge": "Links", "from": "p014", "to": "p015"}
+{"edge": "Links", "from": "p015", "to": "p016"}
+{"edge": "Links", "from": "p016", "to": "p017"}
+{"edge": "Links", "from": "p017", "to": "p018"}
+{"edge": "Links", "from": "p018", "to": "p019"}
+{"edge": "Links", "from": "p019", "to": "p020"}
+{"edge": "Links", "from": "p020", "to": "p021"}
+{"edge": "Links", "from": "p021", "to": "p022"}
+{"edge": "Links", "from": "p022", "to": "p023"}
+{"edge": "Links", "from": "p023", "to": "p024"}
+{"edge": "Links", "from": "p024", "to": "p025"}
+{"edge": "Links", "from": "p025", "to": "p026"}
+{"edge": "Links", "from": "p026", "to": "p027"}
+{"edge": "Links", "from": "p027", "to": "p028"}
+{"edge": "Links", "from": "p028", "to": "p029"}
+{"edge": "Links", "from": "p029", "to": "p030"}
+{"edge": "Links", "from": "p030", "to": "p031"}
+{"edge": "Links", "from": "p031", "to": "p032"}
+{"edge": "Links", "from": "p032", "to": "p033"}
+{"edge": "Links", "from": "p033", "to": "p034"}
+{"edge": "Links", "from": "p034", "to": "p035"}
+{"edge": "Links", "from": "p035", "to": "p036"}
+{"edge": "Links", "from": "p036", "to": "p037"}
+{"edge": "Links", "from": "p037", "to": "p038"}
+{"edge": "Links", "from": "p038", "to": "p039"}
+{"edge": "Links", "from": "p039", "to": "p040"}
+{"edge": "Links", "from": "p040", "to": "p041"}
+{"edge": "Links", "from": "p041", "to": "p042"}
+{"edge": "Links", "from": "p042", "to": "p043"}
+{"edge": "Links", "from": "p043", "to": "p044"}
+{"edge": "Links", "from": "p044", "to": "p045"}
+{"edge": "Links", "from": "p045", "to": "p046"}
+{"edge": "Links", "from": "p046", "to": "p047"}
+{"edge": "Links", "from": "p047", "to": "p048"}
+{"edge": "Links", "from": "p048", "to": "p049"}
+{"edge": "Links", "from": "p049", "to": "p050"}
+{"edge": "Links", "from": "p050", "to": "p051"}
+{"edge": "Links", "from": "p051", "to": "p052"}
+{"edge": "Links", "from": "p052", "to": "p053"}
+{"edge": "Links", "from": "p053", "to": "p054"}
+{"edge": "Links", "from": "p054", "to": "p055"}
+{"edge": "Links", "from": "p055", "to": "p056"}
+{"edge": "Links", "from": "p056", "to": "p057"}
+{"edge": "Links", "from": "p057", "to": "p058"}
+{"edge": "Links", "from": "p058", "to": "p059"}
+{"edge": "Links", "from": "p059", "to": "p060"}
+{"edge": "Links", "from": "p060", "to": "p061"}
+{"edge": "Links", "from": "p061", "to": "p062"}
+{"edge": "Links", "from": "p062", "to": "p063"}
+{"edge": "Links", "from": "p063", "to": "p064"}
+{"edge": "Links", "from": "p064", "to": "p065"}
+{"edge": "Links", "from": "p065", "to": "p066"}
+{"edge": "Links", "from": "p066", "to": "p067"}
+{"edge": "Links", "from": "p067", "to": "p068"}
+{"edge": "Links", "from": "p068", "to": "p069"}
+{"edge": "Links", "from": "p069", "to": "p070"}
+{"edge": "Links", "from": "p070", "to": "p071"}
+{"edge": "Links", "from": "p071", "to": "p072"}
+{"edge": "Links", "from": "p072", "to": "p073"}
+{"edge": "Links", "from": "p073", "to": "p074"}
+{"edge": "Links", "from": "p074", "to": "p075"}
+{"edge": "Links", "from": "p075", "to": "p076"}
+{"edge": "Links", "from": "p076", "to": "p077"}
+{"edge": "Links", "from": "p077", "to": "p078"}
+{"edge": "Links", "from": "p078", "to": "p079"}
+{"edge": "Links", "from": "p079", "to": "p080"}
+{"edge": "Links", "from": "p080", "to": "p081"}
+{"edge": "Links", "from": "p081", "to": "p082"}
+{"edge": "Links", "from": "p082", "to": "p083"}
+{"edge": "Links", "from": "p083", "to": "p084"}
+{"edge": "Links", "from": "p084", "to": "p085"}
+{"edge": "Links", "from": "p085", "to": "p086"}
+{"edge": "Links", "from": "p086", "to": "p087"}
+{"edge": "Links", "from": "p087", "to": "p088"}
+{"edge": "Links", "from": "p088", "to": "p089"}
+{"edge": "Links", "from": "p089", "to": "p090"}
+{"edge": "Links", "from": "p090", "to": "p091"}
+{"edge": "Links", "from": "p091", "to": "p092"}
+{"edge": "Links", "from": "p092", "to": "p093"}
+{"edge": "Links", "from": "p093", "to": "p094"}
+{"edge": "Links", "from": "p094", "to": "p095"}
+{"edge": "Links", "from": "p095", "to": "p096"}
+{"edge": "Links", "from": "p096", "to": "p097"}
+{"edge": "Links", "from": "p097", "to": "p098"}
+{"edge": "Links", "from": "p098", "to": "p099"}
+
+--- query
+set engine = v2;
+query one_start() {
+    match { $a: Person { name: "p000" } $a links{1,2} $b }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"p001"}
+{"b.name":"p002"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Links $b: mode indexed_scan
+scan Person as $b: access id_lookup

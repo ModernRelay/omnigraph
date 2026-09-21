@@ -416,6 +416,7 @@ impl GraphClient {
             id.refuse_from_request()?;
             given.set(*id, value)?;
             match id {
+                SettingId::Engine => request.engine = Some(given.engine()),
                 SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
                 SettingId::RrfPlan | SettingId::AnnNprobes | SettingId::StageWriteConcurrency => {
                     bail!(

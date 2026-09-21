@@ -20,6 +20,7 @@ omnigraph_seams::catalog! {
     crate::db::manifest::graph::INIT_TABLE_CREATE_POST_NATIVE,
     crate::db::manifest::publisher::PUBLISH_LOAD_STATE,
     crate::db::manifest::publisher::PUBLISH_POST_MERGE_PRE_ACK,
+    crate::db::manifest::publisher::PUBLISH_READ_BACK,
     crate::db::manifest::upgrade::UPGRADE_AFTER_ACTIVATION,
     crate::db::manifest::upgrade::UPGRADE_AFTER_BRANCH,
     crate::db::manifest::upgrade::UPGRADE_AFTER_FENCE,

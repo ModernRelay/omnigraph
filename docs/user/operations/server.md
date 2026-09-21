@@ -219,9 +219,9 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
-`POST /query` and `POST /mutate` also serve the GQ branch statements:
-`branch list` on `/query`, and `branch create`, `branch delete`, and
-`branch merge` on `/mutate`. See [Branching](../branching/index.md).
+`/query` also serves `branch list`, `show`, and [explain](../queries/explain.md).
+`/mutate` serves `branch create`, `branch delete`, and `branch merge`.
+See [Branching](../branching/index.md).
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).

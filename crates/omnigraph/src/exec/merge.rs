@@ -517,7 +517,7 @@ async fn cursor_rows_equal(a: Option<&CursorRow>, b: Option<&CursorRow>) -> Resu
 /// hydration streams through a byte-governed scan and hard-charges every
 /// retained batch, so an over-budget chunk is dropped mid-stream and retried
 /// with half the rows regardless of how it was planned.
-const HYDRATION_CHUNK_TARGET_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
+pub(crate) const HYDRATION_CHUNK_TARGET_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 /// Hard retained-byte ceiling for one hydration chunk. Crossing it aborts
 /// the chunk's scan and halves the row count (down to one row, which is
 /// always accepted — a single indivisible row must hydrate whatever its
@@ -525,9 +525,9 @@ const HYDRATION_CHUNK_TARGET_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 /// what a merge may actually write). Peak resident hydration is therefore
 /// bounded by this ceiling plus one in-flight scanner batch for every data
 /// shape, including widths no sampling could have predicted.
-const HYDRATION_CHUNK_HARD_BYTES: u64 = 2 * KEYED_WRITE_MAX_BYTES;
+pub(crate) const HYDRATION_CHUNK_HARD_BYTES: u64 = 2 * KEYED_WRITE_MAX_BYTES;
 /// First-chunk row count before any width measurement exists.
-const HYDRATION_CHUNK_SEED_ROWS: usize = 4;
+pub(crate) const HYDRATION_CHUNK_SEED_ROWS: usize = 4;
 /// Row and decoded-byte targets for the hydration scan's emitted batches.
 /// Small batches make the hard charge granular: the accumulation check runs
 /// per batch, so the one uncharged in-flight batch stays near this byte
@@ -3951,7 +3951,7 @@ fn proven_fast_forward_needs_no_validation(
         })
 }
 
-fn row_id_at(batch: &RecordBatch, row: usize, id_col: &str) -> Result<String> {
+pub(crate) fn row_id_at(batch: &RecordBatch, row: usize, id_col: &str) -> Result<String> {
     let ids = batch
         .column_by_name(id_col)
         .ok_or_else(|| OmniError::manifest(format!("batch missing '{id_col}' column")))?

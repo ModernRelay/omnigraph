@@ -17,8 +17,9 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | Package | Primary owners | Shared support |
 |---|---|---|
 | `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
+| `omnigraph-planner` | In-source optimizer/cost tests and `tests/query_plan.rs`, `tests/registry.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
-| `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors | None |
+| `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
 | `omnigraph-cluster` | In-source lifecycle tests; `tests/failpoints.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
@@ -38,10 +39,11 @@ The engine integration suite is grouped by behavior, not implementation module:
 |---|---|
 | Initialization and representative journeys | `lifecycle.rs`, `end_to_end.rs`, `composite_flow.rs`, `consistency.rs` |
 | Query results and operators | `aggregation.rs`, `literal_filters.rs`, `ordering.rs`, `traversal.rs`, `traversal_indexed.rs`, `proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
+| V2 execution, memory and frozen v1 | `engine_v2.rs`, `engine_v2_memory.rs`, `v1_frozen.rs`; `repro_issue_703.rs` and `repro_issue_723.rs` own ignored scale symptoms |
 | Search and physical indexes | `search.rs`, `scalar_indexes.rs`, `lance_surface_guards.rs`, `rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `branching.rs`, `point_in_time.rs`, `changes.rs`, `merge_truth_table.rs`, `merge_fast_forward.rs` |
-| Recovery and crash windows | `recovery.rs`, `failpoints.rs` (including the `live_handle_*` liveness owners: a live handle writes again once faults stop, without reopening), `detached_commit_matrix.rs` (the RFC 0067 writer × window × fault × recovery-actor matrix over the insert, multi-table, load, cleanup, ensure-indices, full-text-rebuild, merge, schema-apply, optimize and system-column-upgrade writers; the same-handle liveness actor runs by default and `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors), `failpoint_names_guard.rs`, in-source manifest/recovery tests |
+| Recovery and crash windows | `recovery.rs`, `failpoints.rs` (including the `live_handle_*` liveness owners: a live handle writes again once faults stop, without reopening), `detached_commit_matrix.rs` (the RFC 0067 writer × window × fault × recovery-actor matrix over the insert, multi-table, load, cleanup, ensure-indices, full-text-rebuild, merge, schema-apply, optimize and system-column-upgrade writers; the same-handle liveness actor runs by default and `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors), in-source manifest/recovery tests |
 | Maintenance and substrate fences | `maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
@@ -74,7 +76,7 @@ site between two steps (one declared effect), or `guarded` around the one
 operation it wraps (every outcome that operation can have; a further action
 there is then a case, not an edit). A private module on the path from the
 crate root to the declaring file becomes `pub(crate)` for the re-export.
-`tests/failpoint_names_guard.rs` checks the index, that no static is left
+`crates/omnigraph-seams/tests/failpoint_names_guard.rs` checks the index, that no static is left
 in the catalog, under a test module or without `pub`, that a single-effect
 helper takes a seam declaring exactly its effect, that production code under
 `src/` crosses it, and that test code (an integration target, a `tests.rs` /
@@ -160,7 +162,12 @@ cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # matching case
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 ```
 
-Every `.gqt` case is its own libtest test named `case::<file>.gqt`, registered
+Discovery includes every `.gqt` file below `cases/`, recursively. Shared
+cases live at its root; v2-specific cases live in `v2/`, and plan assertions
+in `v2/planner/`. A v2 case still explicitly selects `engine = v2`; directory
+placement does not select an engine.
+
+Every case is its own libtest test named `case::<relative/path>.gqt`, registered
 at run time (`datatest-stable`), so the ordinary name filter selects cases, a
 case-only pull request needs no Rust change, and `cargo-nextest` sees each
 case (an IDE's test-results view lists cases from the
@@ -188,7 +195,7 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked 
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```
 
-The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one. The separate `GQ Logic Tests` context owns GQT: the `runner_dispatch` command above covers dispatch (CI also runs it with `RUSTFLAGS` cleared to prove unavailable-DST refusal), and the complete corpus command runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
+The feature-superset command compiles the current tree with failpoint hooks present but inert unless a test enables one; it also runs the seams crate's seam guard, the check a cases-only change can turn red (CI runs it again in `GQT (ordinary)`, where `Test Workspace` is skipped). The separate `GQ Logic Tests` context owns GQT: the `runner_dispatch` command above covers dispatch (CI also runs it with `RUSTFLAGS` cleared to prove unavailable-DST refusal), and the complete corpus command runs both execution targets. Neither command substitutes for the other. Also run formatting and both workspace Clippy graphs plus configured GQT Clippy; [ci.md](ci.md) lists the exact gates.
 
 AWS server support has a separate feature owner:
 

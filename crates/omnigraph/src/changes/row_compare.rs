@@ -528,7 +528,7 @@ pub(crate) async fn rows_equal_across_vintages(
     .await
 }
 
-fn column_name_at_vintage(
+pub(crate) fn column_name_at_vintage(
     name: &str,
     from_columns: SystemColumns,
     to_columns: SystemColumns,

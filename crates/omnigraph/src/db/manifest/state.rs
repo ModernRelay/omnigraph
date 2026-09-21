@@ -540,14 +540,8 @@ fn finish_manifest_state(
     })
 }
 
-// After RFC-013 P2 folded the publish path off this accessor (it now projects
-// version entries out of `read_publish_scan`'s single scan), the only remaining
-// caller is `BranchManifestNamespace::version_entries`. That namespace module is
-// `#[cfg(test)]` (see `db/manifest.rs`: "nothing in production routes through it;
-// the `LanceNamespace` impls are retained only to validate the contract in unit
-// tests"), so this stays `#[cfg(test)]` too — otherwise it is dead code in
-// non-test builds.
-#[cfg(test)]
+// Preserve historical registrations for cleanup's published-pin proof, including
+// versions superseded by later writes. Current snapshots alone are insufficient.
 pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<DatasetEntry>> {
     let scan = read_manifest_scan(dataset, false).await?;
     let registrations = scan.table_registrations;

@@ -1,0 +1,46 @@
+# issue: none
+# notes: Undirected traversal exercises the CSR cost choice and both edge directions.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Links: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Person","data":{"name":"carol"}}
+{"edge":"Links","from":"alice","to":"bob"}
+{"edge":"Links","from":"bob","to":"carol"}
+
+--- query
+set engine = v2;
+query linked_either_way() {
+    match {
+        $s: Person
+        $s <links> $d
+    }
+    return { $s.name, $d.name }
+}
+
+--- expect unordered
+{"s.name":"alice","d.name":"bob"}
+{"s.name":"bob","d.name":"alice"}
+{"s.name":"bob","d.name":"carol"}
+{"s.name":"carol","d.name":"bob"}
+
+--- expect shape
+s.name: String
+d.name: String
+
+--- expect plan
+expand $s Links $d: mode csr
+pass expand_mode

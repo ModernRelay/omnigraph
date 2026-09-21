@@ -1,11 +1,8 @@
 # issue: 624
 # red_on: 2026-09-15, pre-fix build at 379d8ed1 (the parent of #695's f0dcd2e6): step 7 `branch merge b into tgt` failed with `storage: LanceError(IO): … Not found: …/nodes/<dataset>/tree/a.<ULID>/_indices/<uuid>/page_lookup.lance`; steps 1-6 green, the first merge `fast_forward`; green at f0dcd2e6 (#695) itself.
-# notes: the issue's exact order: a fast-forwards into the untouched tgt, then b
-# notes: merges into tgt with no tgt write in between. The fast-forward switched
-# notes: tgt's Person registration onto a's Lance branch; the merge's first-touch
-# notes: fork of that table stamped the index inherited from main with a's base,
-# notes: so the index file was looked up under a's tree. Every index kind seeded
-# notes: on main (BTREE, full-text, vector, built-in id) is read on tgt afterwards.
+# notes: Fast-forward a into untouched tgt, then merge b without a tgt write between merges.
+# notes: Read every inherited index kind (scalar, full-text, vector, built-in id) on tgt.
+# notes: Keep the 32 seed rows: this case exercises index inheritance, not just row visibility.
 
 --- runner
 timeout_ms: 10000

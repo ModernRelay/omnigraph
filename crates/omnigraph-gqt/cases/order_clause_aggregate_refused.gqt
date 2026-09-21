@@ -1,8 +1,6 @@
 # issue: none
-# notes: pins the order-clause refusal shape: an aggregate written out in
-# notes: full inside order { } is refused; ordering by its projection alias is the
-# notes: supported spelling. The refusal message carries no error-code prefix, so
-# notes: the raw fragment is the pin.
+# notes: An aggregate expression inside order is refused. Order by its
+# notes: return alias instead.
 
 --- runner
 timeout_ms: 10000

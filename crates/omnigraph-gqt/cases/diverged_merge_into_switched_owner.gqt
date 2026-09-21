@@ -1,11 +1,8 @@
 # issue: none
 # red_on: 2026-09-08, PR 662 @ 2850d86f: `branch merge hotfix into feature` failed with `merge target ref … already exists … refusing to claim unowned physical state`.
-# notes: After main is merged into a branch that owned a fork (pointer switch), the former fork
-# notes: lingers unregistered and unpinned. A later diverged branch merged into that branch is a
-# notes: first touch; it must reclaim the orphan fork and succeed, as the branch's own next write
-# notes: would. hotfix forks from main, so its merge base is main's commit, not feature's head: a
-# notes: three-way merge whose target side is unchanged. bob, written on main before the switch,
-# notes: is visible on feature only if the reclaimed fork starts from main's lineage.
+# notes: After feature adopts main, merging hotfix must reclaim feature's former fork.
+# notes: hotfix forks from main, so this is a three-way merge with an unchanged target.
+# notes: bob proves the reclaimed fork starts from main's lineage.
 
 --- runner
 timeout_ms: 10000

@@ -1,0 +1,131 @@
+# issue: none
+# notes: Projection demand follows returns, filters, search ordering, correlated negation, and traversal.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node T {
+    slug: String @key
+    state: String
+    rank: I64
+    kind: String
+    kind_ref: String
+    embedding: Vector(2)?
+}
+edge Knows: T -> T
+
+--- seed
+{"type":"T","data":{"slug":"a","state":"open","rank":1,"kind":"k","kind_ref":"k","embedding":[1.0,0.0]}}
+{"type":"T","data":{"slug":"b","state":"closed","rank":2,"kind":"j","kind_ref":"k","embedding":[0.0,1.0]}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- query
+set engine = v2;
+query plain() {
+    match { $c: T }
+    return { $c.state }
+    order { $c.state }
+}
+--- expect ordered
+{"c.state":"closed"}
+{"c.state":"open"}
+--- expect shape
+c.state: String
+--- expect plan
+scan T as $c: columns [__id, slug, state]
+pass projection_pushdown
+
+--- query
+set engine = v2;
+query contribute() {
+    match { $c: T $c.state = "open" }
+    return { $c.rank, count($c.slug) as n }
+    order { $c.rank }
+}
+--- expect unordered
+{"c.rank":1,"n":1}
+--- expect shape
+c.rank: I64
+n: I64
+--- expect plan
+scan T as $c: columns [__id, slug, state, rank]
+
+--- query
+set engine = v2;
+query entity() {
+    match { $c: T }
+    return { $c }
+    order { $c.rank }
+}
+--- expect unordered
+{"c":{"@id":"a","slug":"a","state":"open","rank":1,"kind":"k","kind_ref":"k"}}
+{"c":{"@id":"b","slug":"b","state":"closed","rank":2,"kind":"j","kind_ref":"k"}}
+--- expect shape
+c: T
+--- expect plan
+scan T as $c: columns [__id, slug, state, rank, kind, kind_ref]
+
+--- query
+set engine = v2;
+query leading_nearest() {
+    match { $c: T }
+    return { $c.slug }
+    order { nearest($c.embedding, [1.0, 0.0]) }
+    limit 1
+}
+--- expect ordered
+{"c.slug":"a"}
+--- expect shape
+c.slug: String
+--- expect plan
+scan T as $c: columns [__id, slug]
+
+--- query
+set engine = v2;
+query negated() {
+    match { $c: T not { $x: T $x.kind = $c.kind_ref } }
+    return { $c.slug }
+}
+--- expect unordered
+--- expect shape
+c.slug: String
+--- expect plan
+scan T as $c: columns [__id, slug, kind_ref]
+scan T as $x: columns [__id, slug, kind]
+
+--- query
+set engine = v2;
+query destination() {
+    match { $a: T $a knows $b $a.state = "open" $b.kind = $a.kind_ref }
+    return { $b.slug }
+}
+--- expect unordered
+--- expect shape
+b.slug: String
+--- expect plan
+scan T as $a: columns [__id, slug, state, kind_ref]
+scan T as $a: filter reads [a.state]
+scan T as $b: columns [__id, slug, kind]
+scan T as $b: no filter
+filter reads [b.kind, a.kind_ref]
+
+--- query
+set engine = v2;
+query unused_binding() {
+    match { $c: T $d: T }
+    return { $c.slug }
+}
+--- expect unordered
+{"c.slug":"a"}
+{"c.slug":"a"}
+{"c.slug":"b"}
+{"c.slug":"b"}
+--- expect shape
+c.slug: String
+--- expect plan
+scan T as $c: columns [__id, slug]
+scan T as $d: columns [__id, slug, state, rank, kind, kind_ref]

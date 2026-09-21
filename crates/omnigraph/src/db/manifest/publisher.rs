@@ -237,6 +237,12 @@ decide_seam! {
     pub static PUBLISH_POST_MERGE_PRE_ACK = ("publish.post_merge_pre_ack", AnyWrite, [Fail]);
 }
 
+decide_seam! {
+    /// Readback may be unavailable after a lost acknowledgement. This cannot
+    /// turn an indeterminate commit into permission to replay the mutation.
+    pub static PUBLISH_READ_BACK = ("publish.read_back", AnyWrite, [Fail]);
+}
+
 impl GraphNamespacePublisher {
     fn checked_base_incarnation(
         &self,
@@ -1216,7 +1222,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 fold_graph_heads,
             )?;
 
-            match self.merge_rows(dataset, rows).await {
+            match self.merge_rows(dataset.clone(), rows).await {
                 Ok(new_dataset) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(
@@ -1251,14 +1257,29 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     // to double-apply.
                     let ambiguous = !matches!(&err, OmniError::Manifest(m) if m.details.is_some());
                     if let (true, Some(intent)) = (ambiguous, lineage) {
-                        match self.dataset().await {
+                        if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
+                            return Err(publish_outcome_in_doubt(&err, readback_err));
+                        }
+                        match dataset.checkout_version(new_manifest_version).await {
                             Ok(reloaded) => match read_publish_scan(&reloaded).await {
                                 Ok(scan) => {
                                     let branch_key =
                                         intent.branch.as_deref().unwrap_or(MAIN_BRANCH_HEAD_KEY);
-                                    let landed = reloaded.version().version == new_manifest_version
-                                        && scan.graph_heads.get(branch_key)
-                                            == Some(&intent.graph_commit_id);
+                                    // Read the attempted immutable version on the captured
+                                    // native branch, even when another writer has moved HEAD.
+                                    let landed = scan.graph_heads.get(branch_key)
+                                        == Some(&intent.graph_commit_id)
+                                        && scan.lineage_rows.iter().any(|commit| {
+                                            commit.graph_commit_id == intent.graph_commit_id
+                                                && commit.graph_manifest_version
+                                                    == new_manifest_version
+                                                && commit.graph_branch == intent.branch
+                                                && commit.parent_commit_id == parent_commit_id
+                                                && commit.merged_parent_commit_id
+                                                    == intent.merged_parent_commit_id
+                                                && commit.actor_id == intent.actor_id
+                                                && commit.created_at == intent.created_at
+                                        });
                                     if landed {
                                         // Durable; only the ack was lost. Return
                                         // the exact success outcome this attempt
@@ -1272,12 +1293,19 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                                             projection: Some(Box::new(projection)),
                                         });
                                     }
-                                    // Our commit is not the branch head at our
-                                    // version: it never landed, or a later commit
-                                    // superseded it in the ack-loss window.
-                                    // Surface the original error; a retry
-                                    // re-checks authority and fails typed rather
-                                    // than double-applying.
+                                    if scan.graph_heads.get(branch_key)
+                                        == Some(&intent.graph_commit_id)
+                                        || scan.lineage_rows.iter().any(|commit| {
+                                            commit.graph_commit_id == intent.graph_commit_id
+                                        })
+                                    {
+                                        return Err(publish_outcome_in_doubt(
+                                            &err,
+                                            "attempted commit identity has inconsistent lineage",
+                                        ));
+                                    }
+                                    // This exact version belongs to a different commit.
+                                    // A moved latest HEAD alone would prove nothing.
                                     return Err(err);
                                 }
                                 Err(scan_err) => {

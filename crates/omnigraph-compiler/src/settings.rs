@@ -57,6 +57,14 @@ pub struct SettingSpec {
 
 pub const DEFINITIONS: &[SettingSpec] = &[
     SettingSpec {
+        name: "engine",
+        kind: SettingKind::Enum(&["v1", "v2"]),
+        default: "v1",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_ENGINE",
+        doc: "whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution",
+    },
+    SettingSpec {
         name: "rrf_plan",
         kind: SettingKind::Enum(&["auto", "force_prefilter", "force_postfilter"]),
         default: "auto",
@@ -96,6 +104,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
 /// One variant per [`DEFINITIONS`] row, in the table's order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingId {
+    Engine,
     RrfPlan,
     MergeLineage,
     AnnNprobes,
@@ -105,6 +114,7 @@ pub enum SettingId {
 impl SettingId {
     /// Every setting, in definition order.
     pub const ALL: [SettingId; DEFINITIONS.len()] = [
+        SettingId::Engine,
         SettingId::RrfPlan,
         SettingId::MergeLineage,
         SettingId::AnnNprobes,
@@ -229,6 +239,16 @@ pub enum Traversal {
     Csr,
 }
 
+/// `engine`: the route a read query runs on. `V1` is the executor, `V2` the
+/// plan runner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Engine {
+    #[default]
+    V1,
+    V2,
+}
+
 /// `rrf_plan`: the reciprocal rank fusion plan on a traversal-constrained
 /// `nearest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +286,7 @@ macro_rules! enum_spelling {
     };
 }
 
+enum_spelling!(Engine { V1 => "v1", V2 => "v2" });
 enum_spelling!(Traversal { Auto => "auto", Indexed => "indexed", Csr => "csr" });
 enum_spelling!(RrfPlan { Auto => "auto", ForcePrefilter => "force_prefilter", ForcePostfilter => "force_postfilter" });
 enum_spelling!(MergeLineage { Off => "off", On => "on", Verify => "verify" });
@@ -303,6 +324,7 @@ pub const STORED_QUERY_CARRIES_NO_SETTINGS: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSettings {
     traversal: Traversal,
+    engine: Engine,
     rrf_plan: RrfPlan,
     merge_lineage: MergeLineage,
     ann_nprobes: Option<usize>,
@@ -315,6 +337,7 @@ impl Default for SessionSettings {
     fn default() -> Self {
         let mut settings = SessionSettings {
             traversal: Traversal::Auto,
+            engine: Engine::V1,
             rrf_plan: RrfPlan::Auto,
             merge_lineage: MergeLineage::On,
             ann_nprobes: None,
@@ -366,6 +389,7 @@ impl SessionSettings {
     /// its range; `self` is unchanged then.
     pub fn set(&mut self, id: SettingId, value: &SettingValue) -> Result<(), SessionSettingsError> {
         match id {
+            SettingId::Engine => self.engine = parse_enum(id, value, Engine::from_spelling)?,
             SettingId::RrfPlan => self.rrf_plan = parse_enum(id, value, RrfPlan::from_spelling)?,
             SettingId::MergeLineage => {
                 self.merge_lineage = parse_enum(id, value, MergeLineage::from_spelling)?
@@ -387,6 +411,7 @@ impl SessionSettings {
     /// the field the row names, and no other field.
     pub fn copy_field(&mut self, from: &SessionSettings, id: SettingId) {
         match id {
+            SettingId::Engine => self.engine = from.engine,
             SettingId::RrfPlan => self.rrf_plan = from.rrf_plan,
             SettingId::MergeLineage => self.merge_lineage = from.merge_lineage,
             SettingId::AnnNprobes => self.ann_nprobes = from.ann_nprobes,
@@ -399,6 +424,7 @@ impl SessionSettings {
     /// The current value in GQ spelling, the `value` column of `show`.
     pub fn get(&self, id: SettingId) -> String {
         match id {
+            SettingId::Engine => self.engine.as_str().to_string(),
             SettingId::RrfPlan => self.rrf_plan.as_str().to_string(),
             SettingId::MergeLineage => self.merge_lineage.as_str().to_string(),
             SettingId::AnnNprobes => self.ann_nprobes.unwrap_or(0).to_string(),
@@ -428,6 +454,10 @@ impl SessionSettings {
 
     pub fn traversal(&self) -> Traversal {
         self.traversal
+    }
+
+    pub fn engine(&self) -> Engine {
+        self.engine
     }
 
     pub fn rrf_plan(&self) -> RrfPlan {
@@ -650,7 +680,12 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency"
+            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency"
+        );
+        let err = SessionSettings::default().with("engine", "v3").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown value `v3` for setting `engine`; expected one of v1, v2"
         );
         let err = SessionSettings::default()
             .with("merge_lineage", "v3")
@@ -693,12 +728,14 @@ mod tests {
     #[test]
     fn values_are_typed_and_the_same_under_every_spelling() {
         let settings = SessionSettings::try_from_values(&[
+            ("engine", "v2"),
             ("rrf_plan", "\"force_prefilter\""),
             ("merge_lineage", "off"),
             ("ann_nprobes", "0"),
             ("stage_write_concurrency", "64"),
         ])
         .unwrap();
+        assert_eq!(settings.engine(), Engine::V2);
         assert_eq!(settings.rrf_plan(), RrfPlan::ForcePrefilter);
         assert_eq!(settings.merge_lineage(), MergeLineage::Off);
         assert_eq!(settings.ann_nprobes(), None);
@@ -766,8 +803,20 @@ mod tests {
             sources[SettingId::StageWriteConcurrency as usize],
             Source::Default
         );
+        assert_eq!(settings.engine(), Engine::V1);
+        assert_eq!(sources[SettingId::Engine as usize], Source::Default);
+        let (v2, sources) =
+            from_env_with(|variable| (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string()))
+                .unwrap();
+        assert_eq!(v2.engine(), Engine::V2);
+        assert_eq!(sources[SettingId::Engine as usize], Source::Env);
 
         for (variable, value, expected) in [
+            (
+                "OMNIGRAPH_ENGINE",
+                "v3",
+                "OMNIGRAPH_ENGINE: unknown value `v3` for setting `engine`; expected one of v1, v2",
+            ),
             (
                 "OMNIGRAPH_LOAD_CONCURRENCY",
                 "0",

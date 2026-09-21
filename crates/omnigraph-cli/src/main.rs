@@ -1356,6 +1356,10 @@ async fn run(cli: Cli) -> Result<()> {
                         body: FileBody::Show(id),
                         ..
                     }) => Err(color_eyre::eyre::eyre!("{}", show_at_write_door(id))),
+                    Ok(QueryFile {
+                        body: FileBody::Explain(_),
+                        ..
+                    }) => Err(color_eyre::eyre::eyre!("{}", explain_at_write_door())),
                     parsed => {
                         if let Ok(file) = &parsed {
                             refuse_prefix_this_door_cannot_run(&client, file)?;

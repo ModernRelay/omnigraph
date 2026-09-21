@@ -99,14 +99,24 @@ const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata by
 // context. Concurrent contexts each own that envelope; these are per-execution
 // bounds, not a process-global admission controller. Keep the values explicit
 // so ambient Lance tuning cannot silently widen one execution.
-const ORDERED_SCAN_MEMORY_BYTES: u64 = 150 * 1024 * 1024;
-const ORDERED_SCAN_SCRATCH_BYTES: u64 = 100 * 1024 * 1024 * 1024;
-const ORDERED_SCAN_EXECUTION_BATCH_ROWS: usize = 8_192;
+pub(crate) const ORDERED_SCAN_MEMORY_BYTES: u64 = 150 * 1024 * 1024;
+pub(crate) const ORDERED_SCAN_SCRATCH_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+pub(crate) const ORDERED_SCAN_EXECUTION_BATCH_ROWS: usize = 8_192;
 // Lance uses the same guard below its own SortExecs because a sorter cannot
 // spill its first input batch. One quarter of the production pool is 37.5 MiB,
 // above OmniGraph's 32 MiB logical write envelope while leaving room for sort
 // bookkeeping. Tests with smaller pools derive the same fraction dynamically.
-const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_BYTES / 4;
+pub(crate) const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_BYTES / 4;
+
+/// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
+pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
+    (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
+}
+
+/// DataFusion's sort spill reservation under a pool of `memory_limit` bytes.
+pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
+    (memory_limit / 3).min(40 * 1024 * 1024) as usize
+}
 
 /// Configuration surface for a scan after projection, filtering, and ordering
 /// have been selected by [`TableStore::scan_stream_with`].
@@ -162,6 +172,79 @@ impl FtsFilterDemand {
 
     fn is_empty(&self) -> bool {
         !self.all_columns && self.columns.is_empty()
+    }
+}
+
+/// A configured scanner and the full-text reads its validation checks.
+struct PreparedScan {
+    scanner: Scanner,
+    has_ordering: bool,
+    has_sql_filter: bool,
+    full_text_columns: Option<HashSet<String>>,
+    filter_demand: FtsFilterDemand,
+}
+
+impl PreparedScan {
+    fn configure<F>(
+        ds: &Dataset,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        order_by: Option<Vec<ColumnOrdering>>,
+        with_row_id: bool,
+        configure: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&mut ScanTuning<'_>) -> Result<()>,
+    {
+        let has_ordering = order_by
+            .as_ref()
+            .is_some_and(|ordering| !ordering.is_empty());
+        let mut scanner = ds.scan();
+        if with_row_id {
+            scanner.with_row_id();
+        }
+        if let Some(columns) = projection {
+            scanner.project(columns).map_err(OmniError::storage)?;
+        }
+        if let Some(filter_sql) = filter {
+            scanner.filter(filter_sql).map_err(OmniError::storage)?;
+        }
+        if let Some(ordering) = order_by {
+            scanner
+                .order_by(Some(ordering))
+                .map_err(OmniError::storage)?;
+        }
+        let mut tuning = ScanTuning {
+            scanner: &mut scanner,
+            full_text_columns: None,
+            filter_demand: FtsFilterDemand::default(),
+        };
+        configure(&mut tuning)?;
+        let full_text_columns = tuning.full_text_columns;
+        let filter_demand = tuning.filter_demand;
+        Ok(Self {
+            scanner,
+            has_ordering,
+            has_sql_filter: filter.is_some(),
+            full_text_columns,
+            filter_demand,
+        })
+    }
+
+    /// The scanner, once its full-text reads are checked against `dataset`.
+    async fn validated(self, dataset: &Dataset) -> Result<Scanner> {
+        if self.has_sql_filter {
+            TableStore::validate_full_text_scan(dataset, &self.scanner, self.full_text_columns)
+                .await?;
+        } else if self.full_text_columns.is_some() || !self.filter_demand.is_empty() {
+            TableStore::validate_full_text_demand(
+                dataset,
+                self.full_text_columns,
+                self.filter_demand,
+            )
+            .await?;
+        }
+        Ok(self.scanner)
     }
 }
 
@@ -264,6 +347,11 @@ impl ScanTuning<'_> {
     }
 }
 
+pub(crate) fn is_scratch_exhaustion(error: &DataFusionError) -> bool {
+    matches!(error.find_root(), DataFusionError::ResourcesExhausted(message)
+        if message.contains("disk space") || message.contains("max_temp_directory_size"))
+}
+
 fn mark_ordered_scan_resource_error(
     error: DataFusionError,
     memory_limit: u64,
@@ -272,12 +360,11 @@ fn mark_ordered_scan_resource_error(
 ) -> DataFusionError {
     let message = error.to_string();
     if matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) {
-        let (resource, limit) =
-            if message.contains("disk space") || message.contains("max_temp_directory_size") {
-                ("ordered_scan_scratch_bytes", scratch_limit)
-            } else {
-                ("ordered_scan_memory_bytes", memory_limit)
-            };
+        let (resource, limit) = if is_scratch_exhaustion(&error) {
+            ("ordered_scan_scratch_bytes", scratch_limit)
+        } else {
+            ("ordered_scan_memory_bytes", memory_limit)
+        };
         return OmniError::resource_limit(resource, limit, limit.saturating_add(1))
             .into_datafusion_external();
     }
@@ -1939,45 +2026,13 @@ impl TableStore {
         // The storage and mutation futures are already deeply composed; making
         // every closure here another generic async layer pushes otherwise
         // ordinary integration-test crates past rustc's layout-query limit.
-        let prepared = (|| -> Result<_> {
-            let has_ordering = order_by
-                .as_ref()
-                .is_some_and(|ordering| !ordering.is_empty());
-            let mut scanner = ds.scan();
-            if with_row_id {
-                scanner.with_row_id();
-            }
-            if let Some(columns) = projection {
-                scanner.project(columns).map_err(OmniError::storage)?;
-            }
-            if let Some(filter_sql) = filter {
-                scanner.filter(filter_sql).map_err(OmniError::storage)?;
-            }
-            if let Some(ordering) = order_by {
-                scanner
-                    .order_by(Some(ordering))
-                    .map_err(OmniError::storage)?;
-            }
-            let mut tuning = ScanTuning {
-                scanner: &mut scanner,
-                full_text_columns: None,
-                filter_demand: FtsFilterDemand::default(),
-            };
-            configure(&mut tuning)?;
-            let columns = tuning.full_text_columns;
-            let filter_demand = tuning.filter_demand;
-            Ok((scanner, has_ordering, columns, filter_demand))
-        })();
-
-        let has_sql_filter = filter.is_some();
+        let prepared =
+            PreparedScan::configure(ds, projection, filter, order_by, with_row_id, configure);
         let dataset = ds.clone();
         Box::pin(async move {
-            let (scanner, has_ordering, columns, filter_demand) = prepared?;
-            if has_sql_filter {
-                Self::validate_full_text_scan(&dataset, &scanner, columns).await?;
-            } else if columns.is_some() || !filter_demand.is_empty() {
-                Self::validate_full_text_demand(&dataset, columns, filter_demand).await?;
-            }
+            let prepared = prepared?;
+            let has_ordering = prepared.has_ordering;
+            let scanner = prepared.validated(&dataset).await?;
             if has_ordering {
                 Self::execute_bounded_ordered_scan(
                     scanner,
@@ -1993,6 +2048,28 @@ impl TableStore {
             } else {
                 scanner.try_into_stream().await.map_err(OmniError::storage)
             }
+        })
+    }
+
+    /// A validated scan plan for execution under the caller's TaskContext.
+    /// INPUT CONTRACT: that of [`Self::scan_stream_with`], without `order_by`:
+    /// every `projection` name must exist in `ds`'s schema at its pinned version.
+    pub(crate) fn scan_plan_with<F>(
+        ds: &Dataset,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        with_row_id: bool,
+        configure: F,
+    ) -> BoxFuture<'static, Result<Arc<dyn ExecutionPlan>>>
+    where
+        F: FnOnce(&mut ScanTuning<'_>) -> Result<()>,
+    {
+        let prepared =
+            PreparedScan::configure(ds, projection, filter, None, with_row_id, configure);
+        let dataset = ds.clone();
+        Box::pin(async move {
+            let scanner = prepared?.validated(&dataset).await?;
+            scanner.create_plan().await.map_err(OmniError::storage)
         })
     }
 
@@ -2073,8 +2150,7 @@ impl TableStore {
             OmniError::manifest_internal("ordered scan requires an explicit scratch bound")
         })?;
 
-        let input_batch_limit =
-            (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize;
+        let input_batch_limit = sort_input_batch_bytes(memory_limit);
         let plan = scanner.create_plan().await.map_err(OmniError::storage)?;
         // DataFusion cannot spill a first SortExec input batch that is larger
         // than its memory pool. Lance applies this same hard-cap node below
@@ -2106,7 +2182,7 @@ impl TableStore {
         // counter. Per-operation ownership makes the envelope and its cleanup
         // exact without maintaining another long-lived runtime view.
         let mut session_config = SessionConfig::new()
-            .with_sort_spill_reservation_bytes((memory_limit / 3).min(40 * 1024 * 1024) as usize);
+            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit));
         if let Some(target_partitions) = options.target_partition {
             session_config = session_config.with_target_partitions(target_partitions);
         }

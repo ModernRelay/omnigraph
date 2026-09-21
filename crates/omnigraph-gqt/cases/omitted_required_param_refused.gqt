@@ -1,10 +1,7 @@
 # issue: none
-# notes: pins the refusal issue 722 asked for, which PR 569 (v0.10.0) already
-# notes: ships: a declared non-nullable parameter the caller never supplies (no
-# notes: params at all, or an empty object) is refused before execution, the same
-# notes: way an explicit null is; a v0.9.0 server instead drops the unbound `$id`
-# notes: filter and returns every row. An omitted nullable parameter fills with
-# notes: null and matches no row. Green on fe9eb339 at first run, 2026-09-16.
+# notes: Reject missing, empty and null required parameters without changing
+# notes: data. An omitted nullable parameter becomes null and matches nothing.
+# notes: Already green on fe9eb339 (2026-09-16); guards the issue 722 symptom.
 
 --- runner
 timeout_ms: 10000

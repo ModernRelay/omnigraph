@@ -2,7 +2,12 @@
 
 GQ describes operations; GQT describes the scenario and expectations; DST
 controls execution. This private test package is not shipped in release builds.
-Each top-level `cases/*.gqt` file is one test in the complete corpus.
+Every `.gqt` file under `cases/`, including subdirectories, is one test
+in the complete corpus. Test names retain the path relative to `cases/`.
+Shared cases live directly under `cases/`; v2-specific cases live under
+`cases/v2/`, with plan assertions under `cases/v2/planner/`.
+These directories organize the corpus. Cases that require v2 still select it
+explicitly with `set engine = v2;`; discovery never changes the engine.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
@@ -130,6 +135,56 @@ converts by renaming the section and its `return_error` action to
 concurrent steps, server/CLI sessions and network simulation are future
 extensions.
 
+## Plan expectations
+
+A query step may carry an `--- expect plan` section directly after its
+`--- expect shape`. The query's effective engine must be `v2`, selected by
+the runner baseline, a case settings step, or the query's `set engine = v2;`
+prefix. Under `v1` the harness fails before executing or explaining the
+query: v1 produces no plan. Each line asserts one fact of the selected v2
+plan, obtained from the engine's explain document before row
+comparison, without executing the query a second time:
+
+```text
+--- expect plan
+scan Doc as $d: columns [__id, slug, state]
+scan Doc: not columns [embedding]
+scan Doc as $d: filter reads [d.state]
+scan Doc as $e: no filter
+scan Doc as $e: access hash_join
+expand $d Knows $e: mode indexed_scan
+filter reads [d.rank, e.rank]
+pass projection_pushdown
+not pass aggregate_pushdown
+```
+
+A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
+bound to that binding) and claims one fact of each: `columns [..]` the exact
+columns it projects; `not columns [..]` columns it must not read; `filter
+reads [..]` a pushed filter reading exactly those columns (`binding.property`);
+`no filter` no pushed filter at all. `filter reads [..]` on its own states that
+an in-memory `Filter` node stays in the plan reading exactly those columns.
+`pass <name>` states that a named optimizer pass fired, `not pass <name>` that
+it did not. Every list is a set. A mismatch prints the whole explain document.
+Pass names must be registered optimizer passes. Excluded columns must
+exist in the selected type's catalog schema. Unknown names fail even in
+negative assertions. Assert destination projection on the dependent scan;
+`Expand` carries topology alone.
+An `expand $src <Edge> $dst:` line selects every matching physical `Expand` between
+those bindings over that edge type and claims `mode csr` or `mode
+indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
+when the cost model chose it); it fails when no such expand is in the physical
+plan or its mode differs. A `scan <Type>[ as $var]: access <id_lookup|hash_join>`
+line selects the physical scans of that type (or the one bound to that
+binding) and claims the access path the planner recorded on a dependent
+scan: `id_lookup` reads the destination once per slice of at most 256 input
+rows, `hash_join`
+reads the destination table once as the build side of a hash join the
+traversal probes (pass `access_path` when the cost model decided); it fails
+when no such scan is in the physical plan, the scan is a table scan (no
+access path), or the path differs. Nothing is compared as rendered text, so a planner
+that reaches the same facts by another route keeps the case green.
+
 ## Run and reproduce
 
 Run the complete package (the workspace Cargo configuration enables seeded
@@ -139,6 +194,7 @@ Tokio from any directory; the commands below use crate-relative paths):
 cd crates/omnigraph-gqt
 cargo test -p omnigraph-gqt --locked
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list
+cargo test -p omnigraph-gqt --test gq_logic_tests v2/planner/
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --test-threads=2
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
@@ -183,6 +239,23 @@ unset, empty, or `0` leaves it disabled. Other values, including non-UTF-8
 values, produce an `invalid_case` report before execution or rewriting.
 Replay ignores this variable and refuses saved blessing invocations.
 
+`OMNIGRAPH_GQ_ENGINE` selects the initial `engine` setting for direct and
+DST case sessions, and the baseline `reset engine` restores. Unset, empty,
+or `v1` selects the executor; `v2` selects the plan route. CI runs the corpus
+under both routes. A case's `set engine = …;` overrides this baseline like
+any other setting. `--- expect plan` requires the query's effective engine
+to be `v2`; a query prefix or case setting can override the runner baseline.
+Plan-specific corpus cases explicitly select v2, while shared row cases
+inherit the baseline and run on both routes.
+
+Invocation reports freeze the selected engine in the worker input before
+clearing the worker environment. Replay uses that recorded engine even if
+`OMNIGRAPH_GQ_ENGINE` now selects the other route. Reports whose input has no
+engine field mean `v1`; v1 reports continue to omit the field. Engine input
+is covered by the report's input digest, and the executable and source
+identity checks still apply. Any other value, including non-UTF-8 values,
+produces an `invalid_case` report before workers start, including on replay.
+
 `OMNIGRAPH_GQ_BLESS=1` is supported only for a case declaring one direct-engine
 environment. A subset selection cannot bless a multi-environment case. It rewrites a failing row or shape expectation and still returns
 failure until a subsequent run confirms it. DST cannot bless. The legacy
@@ -190,9 +263,11 @@ failure until a subsequent run confirms it. DST cannot bless. The legacy
 file invocations refuse that ambient override and take their timeout from the
 runner section. Ambient fault, entropy and pool overrides also refuse
 admission, including replay, as does a set settings variable
-(`OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`, `OMNIGRAPH_ANN_NPROBES`,
-`OMNIGRAPH_LOAD_CONCURRENCY`) and the retired `OMNIGRAPH_TRAVERSAL_MODE`,
-which names no setting any more. A case session never reads the environment, so
-neither variable decides anything; the refusal keeps a stale one in a CI
-environment from being mistaken for a live control, and keeps the retired name
-from lingering. A case that must run one value writes it in a `set` step.
+(`OMNIGRAPH_ENGINE`, `OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
+`OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`) and the retired
+`OMNIGRAPH_TRAVERSAL_MODE`, which names no setting any more. A case session
+never reads the environment (the runner's own `OMNIGRAPH_GQ_ENGINE` above is
+the one seed), so neither variable decides anything; the refusal keeps a stale
+one in a CI environment from being mistaken for a live control, and keeps the
+retired name from lingering. A case that must run one value writes it in a
+`set` step.

@@ -649,8 +649,9 @@ fn branch_controls_reuse_phased_isolation_and_verify_exact_branch_views() {
 /// 3. Boundary — the measured window opens only after the warmup drain, and
 ///    verification runs on a fresh handle after every counter and clock has
 ///    been read.
-/// 4. Refusals — an unusable target and the watchdog use the harness's
-///    refusal/timeout exit codes, and an invalid run (worker error or
+/// 4. Refusals — an unusable target exits 78, the harness's refusal code;
+///    the watchdog exits 75 (`EX_TEMPFAIL`), which the harness reports as a
+///    plain failed run; and an invalid run (worker error or
 ///    verification mismatch) fails the child rather than emitting a green
 ///    record.
 #[test]
@@ -692,7 +693,7 @@ fn concurrent_writes_is_closed_loop_labeled_probe_covered_and_verified() {
         .split_once("phase.store(PHASE_MEASURED")
         .expect("measured flip");
     assert!(
-        before_flip.contains("manifest_tracker.incremental_stats()"),
+        before_flip.contains("drain_from(&manifest_tracker, &probes_for_main.manifest_stores)"),
         "warmup IO must be drained before the measured window opens"
     );
     assert!(after_flip.contains("let measured_started = Instant::now()"));

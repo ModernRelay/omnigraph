@@ -45,7 +45,7 @@ use omnigraph_compiler::query::typecheck::{
 use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::settings::{
-    DEFINITIONS, SessionSettings, SettingId, SettingRow, Traversal,
+    DEFINITIONS, Engine, SessionSettings, SettingId, SettingRow, Traversal,
 };
 use omnigraph_compiler::{
     JsonParamMode, PropType, QueryResult, ScalarType, json_params_to_param_map,
@@ -60,7 +60,12 @@ pub use dst_runner::{
 use omnigraph::storage::StorageAdapter;
 use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
 
+mod plan;
 mod shape;
+use plan::{PlanExpect, parse_plan_body, plan_mismatch, validate_plan_columns};
+
+mod discovery;
+pub use discovery::list_cases;
 use shape::{
     ShapeExpect, ShapeLine, ShapeType, bless_shape_lines, parse_shape_body, shape_mismatch,
     spell_shape_line,
@@ -69,6 +74,11 @@ use shape::{
 pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
 pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
+/// `OMNIGRAPH_GQ_ENGINE=v2` runs every query step of an embedded-engine case
+/// on the plan route; unset, empty, or `v1` runs the route production runs.
+/// A server target keeps the server's route; this runner setting selects
+/// embedded sessions only.
+pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 
 #[derive(Debug)]
 struct Case {
@@ -159,6 +169,9 @@ struct QueryStep {
     /// The match clause carries an unbound traversal, so a successful run
     /// must show at least one Expand on the pinned path.
     expects_expand: bool,
+    /// The `--- expect plan` section, checked against the engine's explain
+    /// document before the rows.
+    plan: Option<PlanExpect>,
 }
 
 #[derive(Debug)]
@@ -1226,6 +1239,7 @@ fn complete_decl_step(
                 params_raw: step.params_raw,
                 expects_expand: step.expects_expand,
                 expect: rows_expect(ordered, section, loop_var)?,
+                plan: None,
             }))
         }
         (ExpectHeader::Error(needle), is_mutation) => {
@@ -1251,6 +1265,7 @@ fn complete_decl_step(
                     params_raw: step.params_raw,
                     expects_expand: step.expects_expand,
                     expect: QueryExpect::Error { needle },
+                    plan: None,
                 })
             })
         }
@@ -1336,6 +1351,7 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut open_loop: Option<(String, Vec<String>, Vec<Step>)> = None;
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
+    let mut awaiting_plan: Option<Step> = None;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
@@ -1391,6 +1407,10 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         };
         if !(kind == "expect" && rest.trim().starts_with("shape")) {
             settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
+        }
+        if let Some(step) = awaiting_plan.take_if(|_| !(kind == "expect" && rest.trim() == "plan"))
+        {
+            push_step(&mut items, &mut open_loop, step);
         }
         if awaiting_seam_step && !matches!(kind, "mutate" | "seam") {
             return Err(
@@ -1540,6 +1560,11 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         });
                         continue;
                     }
+                    FileBody::Explain(_) => {
+                        return Err(format!(
+                            "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
+                        ));
+                    }
                 };
                 let [decl] = decls.as_slice() else {
                     return Err(format!(
@@ -1636,6 +1661,25 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             len: section.body.len(),
                         },
                     };
+                    awaiting_plan = Some(step);
+                    continue;
+                }
+                if rest.trim() == "plan" {
+                    let Some(mut step) = awaiting_plan.take() else {
+                        return Err(format!(
+                            "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`",
+                            section.header_line + 1
+                        ));
+                    };
+                    let lines = parse_plan_body(&section.body)
+                        .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
+                    let Step::Query(query) = &mut step else {
+                        return Err(format!(
+                            "line {}: `--- expect plan` is supported only on query steps",
+                            section.header_line + 1
+                        ));
+                    };
+                    query.plan = Some(PlanExpect { lines });
                     push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
@@ -1743,6 +1787,9 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         return Err("the final step is missing its `--- expect`".into());
     }
     settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
+    if let Some(step) = awaiting_plan.take() {
+        push_step(&mut items, &mut open_loop, step);
+    }
     if open_loop.is_some() {
         return Err("a loop is not closed with `--- endloop`".into());
     }
@@ -2085,6 +2132,18 @@ async fn run_query_step(
         message,
         bless_lines: None,
     };
+    if step.plan.is_some()
+        && session
+            .effective(&step.source)
+            .map_err(|error| fail(format!("query settings failed: {error}")))?
+            .engine()
+            != Engine::V2
+    {
+        return Err(fail(
+            "expect plan requires engine = v2; effective engine is v1, which produces no plan"
+                .into(),
+        ));
+    }
     // A params refusal is one of the ways "the query must fail": route it
     // into an `error:` expectation instead of always failing the step.
     let params = match build_params(step.params_raw.as_ref(), &step.decl.params, binding) {
@@ -2129,6 +2188,24 @@ async fn run_query_step(
             shape,
         } => {
             let result = outcome.map_err(|e| fail(format!("query failed: {e}")))?;
+            if let Some(plan) = &step.plan {
+                let explain = session
+                    .explain_query(
+                        ReadTarget::branch(&step.branch),
+                        &step.source,
+                        &step.name,
+                        &params,
+                    )
+                    .await
+                    .map_err(|e| fail(format!("explain failed: {e}")))?;
+                validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
+                if let Some(mismatch) = plan_mismatch(&plan.lines, &explain) {
+                    return Err(fail(format!(
+                        "{mismatch}\nexplain document:\n{}",
+                        serde_json::to_string_pretty(&explain).unwrap_or_default()
+                    )));
+                }
+            }
             let catalog = session.catalog();
             let inferred = typecheck_query(&catalog, &step.decl)
                 .and_then(|ctx| infer_query_result_schema(&catalog, &step.decl, &ctx))
@@ -2528,7 +2605,10 @@ async fn run_mutate_step(
 /// A fresh store for one case: init from the schema, the case session over
 /// it, seed, and build indices when the case needs them. The tempdir rides
 /// along so the store outlives the call.
-async fn open_case_store(case: &Case) -> Result<(Session, String, tempfile::TempDir), String> {
+async fn open_case_store(
+    case: &Case,
+    engine: Engine,
+) -> Result<(Session, String, tempfile::TempDir), String> {
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
     let uri = dir
         .path()
@@ -2538,16 +2618,18 @@ async fn open_case_store(case: &Case) -> Result<(Session, String, tempfile::Temp
     let db = Omnigraph::init(&uri, &case.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
-    let session = case_session(db, case)?;
+    let session = case_session(db, case, engine)?;
     seed_case(&session, case).await?;
     Ok((session, uri, dir))
 }
 
-/// The case session: the definition's defaults over the fresh handle, then
-/// the `# traversal:` header pin on the harness-only traversal field, which
-/// no `show` reports.
-fn case_session(db: Omnigraph, case: &Case) -> Result<Session, String> {
-    let mut settings = SessionSettings::default();
+/// The case session: the definition's defaults over the fresh handle, the
+/// runner's `engine` (`OMNIGRAPH_GQ_ENGINE`) as the baseline `engine` row,
+/// then the `# traversal:` pin on the harness-only field no `show` reports.
+fn case_session(db: Omnigraph, case: &Case, engine: Engine) -> Result<Session, String> {
+    let mut settings = SessionSettings::default()
+        .with("engine", engine.as_str())
+        .map_err(|e| format!("invalid_case: {e}"))?;
     if let Some(mode) = case.traversal {
         let pinned = Traversal::from_spelling(mode).ok_or_else(|| {
             format!("`# traversal: {mode}` refused: expected one of auto, indexed, csr")
@@ -2581,11 +2663,28 @@ fn execute_case<'a>(
     path: &'a Path,
     bless: bool,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_case_inner(case, path, bless).boxed()
+    match engine_from_env() {
+        Ok(engine) => execute_case_on_engine(case, path, bless, engine),
+        Err(error) => futures::future::ready(Err(error)).boxed(),
+    }
 }
 
-async fn execute_case_inner(case: &Case, path: &Path, bless: bool) -> Result<(), String> {
-    let (session, uri, _dir) = open_case_store(case).await?;
+fn execute_case_on_engine<'a>(
+    case: &'a Case,
+    path: &'a Path,
+    bless: bool,
+    engine: Engine,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    execute_case_inner(case, path, bless, engine).boxed()
+}
+
+async fn execute_case_inner(
+    case: &Case,
+    path: &Path,
+    bless: bool,
+    engine: Engine,
+) -> Result<(), String> {
+    let (session, uri, _dir) = open_case_store(case, engine).await?;
     execute_steps(case, path, bless, session, &uri, None).await
 }
 
@@ -2595,11 +2694,12 @@ async fn execute_case_with_storage(
     path: &Path,
     uri: &str,
     storage: Arc<dyn StorageAdapter>,
+    engine: Engine,
 ) -> Result<(), String> {
     let db = Omnigraph::init_with_storage(uri, &case.schema, storage.clone(), Default::default())
         .await
         .map_err(|e| format!("init failed: {e}"))?;
-    let session = case_session(db, case)?;
+    let session = case_session(db, case, engine)?;
     seed_case(&session, case).await?;
     execute_steps(case, path, false, session, uri, Some(storage)).await
 }
@@ -2651,7 +2751,13 @@ async fn execute_steps_inner(
                 dst_runner::record(
                     "expectation",
                     match step {
-                        Step::Query(q) => read_expect_evidence(&q.expect),
+                        Step::Query(q) => {
+                            let mut evidence = read_expect_evidence(&q.expect);
+                            if let Some(plan) = &q.plan {
+                                evidence["plan"] = serde_json::json!(plan.lines);
+                            }
+                            evidence
+                        }
                         Step::List(l) => read_expect_evidence(&l.expect),
                         Step::Mutate(m) => match &m.expect {
                             MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
@@ -2898,50 +3004,29 @@ pub fn bless_from_env() -> Result<bool, String> {
     }
 }
 
+/// The `engine` baseline of every case session, as `OMNIGRAPH_GQ_ENGINE`
+/// names it; `V1`, the definition's default, when unset.
+///
+/// # Errors
+///
+/// Refuses any value other than `v1`, `v2`, or empty.
+pub fn engine_from_env() -> Result<Engine, String> {
+    match std::env::var(ENGINE_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(Engine::V1),
+        Err(std::env::VarError::NotUnicode(v)) => Err(format!(
+            "invalid_case: {ENGINE_ENV} requires UTF-8, got {v:?}"
+        )),
+        Ok(v) if v.is_empty() => Ok(Engine::V1),
+        Ok(v) => Engine::from_spelling(&v).ok_or_else(|| {
+            format!("invalid_case: {ENGINE_ENV} takes v1 or v2 (or empty/unset), got `{v}`")
+        }),
+    }
+}
+
 /// The per-case wall-time budget: `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` or the
 /// default.
 pub fn case_budget_from_env() -> Duration {
     Duration::from_secs(env_positive(CASE_TIMEOUT_ENV).unwrap_or(DEFAULT_CASE_TIMEOUT_SECS))
-}
-
-/// Splits the corpus dir into `.gqt` case files and foreign entries; a
-/// foreign entry is a mis-renamed, nested, symlinked, dot-prefixed, or
-/// non-UTF-8-named case that would otherwise silently never run. The rule
-/// that RUNS a case is the test target's `datatest_stable::harness!` pattern
-/// (`tests/gq_logic_tests.rs`): a regular file (symlinks are not followed)
-/// with a UTF-8 name that ends in `.gqt` and does not start with `.`. This
-/// function mirrors that rule so `corpus_layout` refuses what the target
-/// would skip; `scripts/check-fix-regression.py` (`corpus_case`) mirrors
-/// the name half, and both self-tests walk one name battery. Dot-prefixed
-/// entries without a `.gqt` extension (`.DS_Store`, `.gitkeep`, and a file
-/// named exactly `.gqt`, which has no extension) are neither cases nor
-/// foreign: they are skipped, as the target skips every hidden file.
-pub fn list_cases(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let mut files = Vec::new();
-    let mut foreign = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                foreign.push(entry.file_name().to_string_lossy().into_owned());
-                continue;
-            };
-            let is_regular_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
-            let is_gqt =
-                is_regular_file && path.extension().and_then(|s| s.to_str()) == Some("gqt");
-            if name.starts_with('.') && !is_gqt {
-                continue;
-            }
-            if is_gqt && !name.starts_with('.') {
-                files.push(path);
-            } else {
-                foreign.push(name);
-            }
-        }
-    }
-    files.sort();
-    foreign.sort();
-    (files, foreign)
 }
 
 /// The case name: the file stem, or `<non-utf8>` for a name the corpus

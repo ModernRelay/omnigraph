@@ -269,7 +269,7 @@ jobs:
       # still runs its unit tests and reports success either way, so branch
       # protection and the exact-SHA release gates stay wired.
       VOCABULARY_AUDIT_ENABLED: "false"
-    # A cold default + relevant all-features rustdoc pass over all seven public
+    # A cold default + relevant all-features rustdoc pass over all nine public
     # library crates is substrate-sized. The first hosted run completed the
     # public-Rust step in 39 minutes, while the larger breaking-contract tree
     # was still compiling when a 45-minute whole-job bound cancelled it. Keep

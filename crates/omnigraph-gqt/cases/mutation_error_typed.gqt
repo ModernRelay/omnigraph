@@ -1,8 +1,5 @@
 # issue: none
-# notes: a mutation inserting a node that omits its non-nullable @key property
-# notes: is refused at typecheck, pinned by its stable code. A mutation whose match
-# notes: merely misses is not an error: delete on an absent key succeeds with zero
-# notes: affected counts.
+# notes: Omitting a required key fails typechecking with T12; deleting an absent key affects zero rows.
 
 --- runner
 timeout_ms: 10000

@@ -18,10 +18,13 @@ for nearest-neighbor ordering.
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
-A `bm25()` ordering with a `limit` reads only the top-scoring matches (a small
-multiple of the limit) instead of every matching entity; when traversals or
-filters leave the limit unfilled, the query automatically rescans without the
-bound, so results are never truncated. Full-text rankings inside `rrf()` are
+With `engine = v2`, a `bm25()` ordering reads every matching entity before
+applying the final limit. Equal scores are then ordered by entity identity,
+including when the smallest identity lies beyond the first search candidates.
+Engine v1 uses a bounded candidate scan and retries without the bound when
+traversals or filters leave the limit unfilled.
+
+Full-text rankings inside `rrf()` are
 never bounded this way: each full-text arm scans every matching entity, and
 fusion ranks the entities that satisfy the graph and property filters, so
 bounding an arm could silently drop an entity's contribution and shift fused
@@ -87,6 +90,11 @@ cap remains a recall/latency tradeoff.
 Use full-text functions for token search, fuzzy terms, and relevance. Use the
 query language's exact `contains` and `starts_with` predicates for literal,
 case-sensitive substring and prefix matching.
+
+`search`, `match_text`, and `fuzzy` are positive predicates in `match`: use
+a standalone call or compare the call to literal `true` with `=`. Other
+comparisons, including `= false`, `!= true`, a Boolean parameter, and a
+call on the right side, are refused at type checking (`T38`).
 
 ```gq
 query relevant($q: String) {

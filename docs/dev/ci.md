@@ -12,7 +12,7 @@ puts each changed path in one class:
 | Class | Paths | Jobs that run |
 |---|---|---|
 | documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
-| GQT cases | `crates/omnigraph-gqt/cases/*.gqt` (the runner reads top-level files; a nested `.gqt` still classifies as a case) | the guards plus `GQ Logic Tests` (`run_gqt`) |
+| GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
 
@@ -21,8 +21,8 @@ outside every class is engine input and runs every job. The `.gqt` corpus is
 read by the `omnigraph-gqt` crate (its `include_str!` cases and its harness,
 all under `GQ Logic Tests`, whose `dst-clippy` job compiles the crate so
 `Lint (clippy)` owes it nothing), by `scripts/check-fix-regression.py`
-(`Fix Regression Gate`, always on), and by the engine's seam guard
-`crates/omnigraph/tests/failpoint_names_guard.rs`, which counts a case's
+(`Fix Regression Gate`, always on), and by the seam guard
+`crates/omnigraph-seams/tests/failpoint_names_guard.rs`, which counts a case's
 `at:` name as arming a seam: `Test Workspace` runs it on engine input and
 `GQT (ordinary)` runs it on `run_gqt`, so a cases-only PR that drops the last
 case arming a seam turns the guard red where the PR can see it. No crate
@@ -73,17 +73,30 @@ Branch protection currently requires these reporting contexts:
 - `Dependency Guard (cargo deny)`
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
-required context aggregating three qualification jobs. `GQT (ordinary)` checks
-unit tests and unavailable-DST refusal from the workspace root. `GQT (dst)`
-runs the whole package, while `GQT (dst-clippy)` checks all package targets
-with Clippy. Both run from `crates/omnigraph-gqt`, whose Cargo configuration
-enables the seeded Tokio runtime. Each job has its own
-45-minute budget and cache key. Matrix fail-fast cancels the remaining jobs
-when one fails; Cargo retains its default fail-fast between test targets.
+required context aggregating four qualification jobs. `GQT (ordinary)` checks
+unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
+the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
+the same flagless shape; the guard is a source walk whose crate declares no
+workspace crate (its dev-dependencies are `serde_yaml`, `syn`, `tempfile` and
+`toml`), so
+it adds no second engine build.
+`GQT (dst)` runs the whole package. `GQT (engine-v2)` runs the same package
+with `OMNIGRAPH_GQ_ENGINE=v2` as the case default; explicit case settings
+still apply. `GQT (dst-clippy)` checks all package targets with Clippy. All
+four run from the repository root under
+the workspace Cargo configuration, which enables the seeded Tokio runtime.
+Each job has its own 60-minute budget and cache key. The budget is at least
+twice the observed 27-minute cold `ordinary` build. The roughly 30 minutes
+recorded for `dst.yml` cover a different package selection and workload;
+they do not establish a bound for GQT `dst`, `engine-v2` or `dst-clippy`. Exact cold
+timings for those jobs remain unverified. See the cache rule under
+[Full correctness graphs](#full-correctness-graphs) for the budget policy.
+Matrix fail-fast cancels the remaining jobs when one fails; Cargo retains
+its default fail-fast between test targets.
 The required context fails if classification or any qualification fails,
-is cancelled, or is skipped. A successful run still requires all three jobs
+is cancelled, or is skipped. A successful run still requires all four jobs
 to pass; fail-fast never turns incomplete qualification into success.
-Test jobs upload invocation reports, and all three jobs upload available
+Test jobs upload invocation reports, and all four jobs upload available
 Cargo build timings separately, including on failure.
 Every corpus case is enrolled, including cases whose required graph
 behavior currently fails. `Test Workspace` excludes this separately tested
@@ -94,7 +107,7 @@ workflow carries the `Classify Changes` copy under the name
 `Classify Changes (GQ Logic Tests)`. `Fix Regression Gate`
 (`fix-regression-gate.yml`) holds every issue the PR body closes by keyword
 (`Closes #N`, `Closes ModernRelay/omnigraph#N`, or the issue URL) to a
-regression in the diff: a top-level `.gqt` case or a `#[test]`-attributed
+regression in the diff: a `.gqt` case anywhere in the corpus or a `#[test]`-attributed
 `issue_N` function, added or strengthened, in a top-level test target
 (`tests/<name>.rs`) or `src/` module under `crates/*` or `tools/*` (an owner
 test not yet named for the issue is renamed to carry `issue_N` when
@@ -107,7 +120,7 @@ fixture modules, a script under a crate, a rustdoc-only change) go through
 the `no-repro` label, which a maintainer applies to waive the check per PR;
 `scripts/check-fix-regression.py` is the check. A failure names the code
 paths that made the gate look, the ways through, any near miss in the diff (a
-case whose header says `# issue: N` under another name or a subdirectory, a
+case whose header says `# issue: N` under another name, a
 test named with the bare number, moved, under a leading `_`, or in a helper
 module, an issue-named function with no test attribute), and a case skeleton,
 as a log line and as a GitHub error annotation. It is a policy check, so it runs on `pull_request_target`: the
@@ -235,6 +248,19 @@ jobs also save when red (`cache-on-failure`): dependency artifacts are valid
 whatever the test verdict, and a red seed run would otherwise leave every
 pull request cold until `main` is green again.
 
+A cache is derived state, and no job may need one to fit its budget. The
+repository's caches exceed GitHub's cap, so every save evicts the least
+recently used entries: within one `main` run, the jobs that finish first are
+evicted first by the saves of the jobs that finish last. A run cancelled by
+its timeout saves no usable cache either (issue #755: every run after the
+cancelled `main` run restored nothing). Each `GQ Logic Tests` budget
+therefore covers a cold build with margin, and a second `cargo` invocation
+in a job must not change the dependency graph: it selects packages whose
+graph the first invocation already built, or it rebuilds every crate whose
+features differ (issue #755 was `GQT (ordinary)`
+running the seam guard as an engine integration test, whose
+dev-dependencies resolve a second graph, 49 minutes cold against 45).
+
 Every Rust job in those three workflows installs the `rust-toolchain.toml`
 pin with a bare `rustup toolchain install`; the rustc version is part of
 every cache key, so the pin is what keeps caches warm across Rust releases.
@@ -286,7 +312,8 @@ list):
 
 `gq-logic-tests.yml` separately owns authored GQT execution through DST. Every
 step runs from the repo root under the workspace Cargo configuration; the
-refusal step clears `RUSTFLAGS` to build the one flagless shape. An
+refusal step clears `RUSTFLAGS` to build the one flagless shape, and the seam
+guard step runs under the same empty `RUSTFLAGS` to share its artifacts. An
 unavailable-runtime refusal test does not replace executing the DST cases.
 
 ## Local pre-push checks

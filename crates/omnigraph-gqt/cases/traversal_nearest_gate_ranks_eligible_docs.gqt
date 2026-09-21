@@ -1,10 +1,6 @@
 # issue: none
-# notes: `$d knows $t` over 50 docs with edges leaving 10, 20, 30, 40: 4 of 50
-# notes: eligible (8%, at most 5 keeps the gate's 10% fence), so the gate pushes
-# notes: the four ids into the scan. Limit 3 with 4 eligible (4 > 3) fills from
-# notes: the eligible docs alone; query point 25.3 ranks them d030 (4.7), d020
-# notes: (5.3), d040 (14.7), so the answer is the exact order among the eligible
-# notes: ids, not row order. The unfiltered top-3 (25, 26, 24) has no edge.
+# notes: Keep 50 docs: 4/50 eligible sources selects the gate prefilter.
+# notes: Query point 25.3 ranks eligible docs d030, d020, d040; the unfiltered top three have no edge.
 
 --- runner
 timeout_ms: 10000
@@ -80,7 +76,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e040_0","from":"d040","to":"d041","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_eligible_docs($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

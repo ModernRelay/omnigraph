@@ -1060,6 +1060,7 @@ fn parse_branch(input: &str) -> BranchStmt {
             queries.len()
         ),
         FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
+        FileBody::Explain(_) => panic!("expected a branch statement, got an explain statement"),
     }
 }
 
@@ -1199,6 +1200,80 @@ fn branch_statement_never_shares_a_file_with_a_declaration() {
     );
     let err = parse_query("mutation { insert Person { name: \"a\" } }").unwrap_err();
     assert!(err.to_string().contains("expected query_file"), "{err}");
+}
+
+fn parse_explained(input: &str) -> QueryDecl {
+    match parse_query(input).unwrap().body {
+        FileBody::Explain(decl) => decl,
+        other => panic!("expected an explain statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn explain_statement_wraps_one_declaration() {
+    let decl = parse_explained(
+        "explain query q($n: String) {\n    match { $p: Person { name: $n } }\n    return { $p.name }\n}\n",
+    );
+    assert_eq!(decl.name, "q");
+    assert_eq!(decl.params.len(), 1);
+    assert_eq!(decl.return_clause.len(), 1);
+    let decl =
+        parse_explained("  explain\n  query m() { insert Person { name: \"a\" } } // trailing\n");
+    assert_eq!(decl.mutations.len(), 1);
+}
+
+#[test]
+fn explain_statement_never_shares_a_file_with_a_declaration() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let err = parse_query(&format!("explain {decl}{decl}")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("an `explain` statement stands alone in its file"),
+        "{err}"
+    );
+    let err = parse_query(&format!("explain {decl}explain {decl}")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("an `explain` statement stands alone in its file"),
+        "{err}"
+    );
+    for input in [
+        format!("{decl}explain {decl}"),
+        format!("explain {decl}branch list\n"),
+        format!("branch list\nexplain {decl}"),
+    ] {
+        let error = parse_query(&input).unwrap_err();
+        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+    }
+}
+
+#[test]
+fn explain_keyword_ends_at_a_word_boundary_and_needs_a_declaration() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    for input in [
+        "explainquery q() { match { $p: Person } return { $p.name } }".to_string(),
+        format!("explain_ {decl}"),
+        "explain".to_string(),
+        "explain branch list".to_string(),
+        format!("explain explain {decl}"),
+    ] {
+        let error = parse_query(&input).unwrap_err();
+        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+    }
+}
+
+#[test]
+fn explain_stays_an_identifier_inside_bodies() {
+    let input = r#"
+query explain($e: String) {
+match {
+    $p: Person { explain: $e }
+}
+return { $p.explain as explain }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    assert_eq!(qf.single_decl().name, "explain");
 }
 
 #[test]

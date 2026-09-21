@@ -1,8 +1,7 @@
 # issue: none
-# notes: an `expect ordered` step's `order` keys must be total over the rows it
-# notes: returns. The engine's `<var>.id` tie-break is an implementation detail no
-# notes: expect may depend on: it is the `@key` value for keyed node types and a
-# notes: per-load ULID otherwise; the second key here is what makes the order total.
+# notes: Ordered expectations use a total user key, or explicit identities for every binding
+# notes: when the documented identity tie-break determines a page boundary.
+# notes: Rank groups the rows; name orders ties explicitly.
 
 --- runner
 timeout_ms: 10000

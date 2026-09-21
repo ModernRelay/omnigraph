@@ -1,0 +1,36 @@
+# issue: none
+# notes: Return a whole Person beside integer, float, string and boolean
+# notes: literals. Preserve the missing age on bob.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob"}}
+
+--- query
+query tagged_people() {
+    match { $p: Person }
+    return { $p, 1 as one, 2.5 as ratio, "x" as tag, true as flag }
+}
+
+--- expect unordered
+{"p": {"@id": "alice", "name": "alice", "age": 30}, "one": 1, "ratio": 2.5, "tag": "x", "flag": true}
+{"p": {"@id": "bob", "name": "bob"}, "one": 1, "ratio": 2.5, "tag": "x", "flag": true}
+
+--- expect shape
+p: Person
+one: I64
+ratio: F64
+tag: String
+flag: Bool

@@ -13,7 +13,7 @@ supersedes: []
 superseded_by: []
 blocked_on:
   - "Engine: the promotion reconciler with idempotent, order-preserving, uuid-checked replay and its crash and two-process evidence."
-  - "Storage: cleanup that promotes pending pins first, reaps promoted and abandoned detached manifests, and keeps stock Lance version cleanup for the linear chain, on file, S3, and Azure."
+  - "Storage: cleanup that promotes pending pins first, reaps only UUID-verified promoted detached manifests, and keeps stock Lance version cleanup for the linear chain, on file, S3, and Azure."
   - "Maintenance: Optimize staged as one detached Rewrite transaction built from the RewriteResults with fragment ids above the base high-water mark, lagging indexes rebuilt whole as a chained detached CreateIndex, published with an exact pin CAS and promoted by replay."
   - "Compatibility: format stamp v10, the pin shape with target version, staged id and transaction uuid, and the refusal fence for older binaries."
 ---
@@ -161,9 +161,10 @@ transactions since; this RFC applies that shape inside the graph, where
   report: pins whose promotion is blocked by a foreign linear commit. Such a
   table keeps accepting writes (they chain detached); the blocked twin is a
   garbage-collection and change-feed-pruning cost until repaired.
-- `omnigraph cleanup` first promotes every pending pin, then runs stock Lance
-  version cleanup on the linear chain as today, then deletes detached
-  manifests that are promoted or unreferenced. `--keep N` keeps its meaning.
+- `omnigraph cleanup` first promotes every pending pin, then
+  deletes detached copies with verified linear twins of published pins, and
+  runs stock Lance version cleanup on eligible tables. Uncertain staging
+  defers GC for its table. `--keep N` keeps its meaning for eligible tables.
 - `optimize` stages compaction as detached transactions and promotes them
   like any other write; it no longer holds a maintenance sidecar or a
   one-mutation-process boundary.
@@ -333,36 +334,37 @@ is unblocked is an unresolved question below.
 
 ### Garbage collection
 
-Stock `cleanup_old_versions` stays in charge of the linear chain. Files
-referenced only by a pending detached version are protected by the ordinary
-unverified-file age gate (OmniGraph sets `delete_unverified: false`) and by
-promoting before cleaning. Two facts from the prototype sharpen this. The
-existing cleanup pre-check that every main table's Lance HEAD equals its
-published version makes cleanup refuse outright while any pin is pending, so
-promote-first is what lets cleanup run at all, not only what keeps it safe.
-And the age gate held even with a zero `--older-than` against a writer parked
-after its detached commit on S3: the in-flight data file survived, the writer
-published and promoted afterwards, and the row was readable, because
-`delete_unverified: false` keeps Lance's seven-day unverified threshold
-regardless of the version horizon. A detached manifest whose twin has been
-pruned is garbage that the resolution rule above already refuses to serve;
-reaping it is a byte cost, so it follows the same retention horizon as
-abandoned manifests rather than the pruning of its twin. Two more facts from
-the prototype: cleanup promotes the same pin once per branch that inherits
-it, so the second branch finds the detached manifest already reaped, which
-is why cold promotion checks the target first; and a lazy branch pin whose
-linear version was lost while its staged manifest survives is no longer an
-unopenable pin that cleanup must refuse, because resolution serves the
-staged version and promotion recreates the linear twin, a fail-closed case
-that becomes self-healing until the staged manifest is reaped in turn. After promotion the twin references the same files,
-so the detached manifest is the only surplus object; `cleanup` deletes
-detached manifests whose pin is promoted, and abandoned detached manifests
-older than the retention horizon, through `list_detached_manifests`. Lance
-never removes detached manifests itself and, as probe 3 shows, would delete
-their data if they were the only reference; both facts are why promotion
-precedes cleanup. Upstream's pending `Dataset::referenced_files` (#8097)
-refuses datasets with detached versions for the same reason; extending it to
-include referenced detached manifests is the upstream ask this RFC files.
+Stock `cleanup_old_versions` stays in charge of the linear chain. Cleanup
+promotes pending pins first and checks exact-pin readability before GC.
+Recognized blocked chains are exempt from the physical-HEAD-equals-published
+check and skip GC for their table; healthy tables continue. Unexplained HEAD
+drift still fails closed.
+The original fresh-writer probe with a zero `--older-than` survived because
+Lance's `delete_unverified: false` keeps unverified data for seven days. That
+observation is not a writer-liveness proof. A writer can outlive an age horizon
+between detached staging and graph publication; Lance's per-commit timeout does
+not bound that interval.
+
+Cleanup therefore inventories immutable published pins, including superseded
+pins, and verifies each candidate's transaction UUID against its linear twin.
+For a published chain it verifies the corresponding twin of each link before
+reclaiming the detached copy. Missing, foreign, or unreadable evidence retains
+the manifest. Age is only an eligibility filter after that proof. Cleanup
+classifies chains before deleting links, so deleting one copy cannot invalidate
+the proof for another copy in the same pass.
+
+Stock Lance does not trace detached references and may remove old unverified
+data even with `delete_unverified: false`. Any retained detached manifest thus
+defers version/file GC for its table storage, while unaffected tables continue.
+The conservative consequence is indefinite retention of unproven abandoned
+staging. Durable writer fencing, rather than a larger timeout, is the prerequisite
+for reclaiming that state. No new journal or lease is introduced here.
+
+Lost acknowledgement resolution reads the attempted immutable manifest version
+on the captured native branch, checking commit identity and lineage. A newer
+HEAD is not evidence of failure. Success returns that exact version with its
+matching state and projection. An unavailable readback remains explicitly
+indeterminate and is never an instruction to retry a non-idempotent mutation.
 
 ### Reads
 
@@ -932,8 +934,8 @@ The extended run adds the same-handle, other-process and cleanup actors
   publication and promotion leaves reads correct through the staged pin and
   the next writer promotes; most existing cells are deleted with the code.
 - `maintenance.rs`: promote-then-clean ordering, reaping of promoted and
-  abandoned detached manifests, retained snapshots, sibling branches, and the
-  S3/Azure suites; Optimize staged as one detached Rewrite.
+  retention of uncertain detached manifests, retained snapshots, sibling
+  branches, and the S3/Azure suites; Optimize staged as one detached Rewrite.
 - `maintenance.rs::non_strict_load_refuses_uncovered_drift_before_folding_it`
   and `recovery.rs::drift_guard_advice_ignores_other_branch_sidecars`: both
   expect a write to be refused while a foreign linear commit exists; under

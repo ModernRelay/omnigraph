@@ -1367,7 +1367,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nThe value is validated here and selects nothing in this release: the\nconsumer is the `engine` setting, the Session settings RFC's rollout step 2.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
             "required": false,
             "schema": {
               "type": "array",
@@ -1835,7 +1835,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nThe value is validated here and selects nothing in this release: the\nconsumer is the `engine` setting, the Session settings RFC's rollout step 2.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
             "required": false,
             "schema": {
               "type": "array",
@@ -3208,7 +3208,7 @@
           "queries"
         ],
         "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one row per branch (column\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one result per branch (field\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.\n\nThe GQ statement `explain query …` is served here too: the query is not\nrun, and the result describes its v2 logical, physical and available\nDataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by\n`plan` entries for the passes and the document's other fields, under the\nrequest's target and `params`.",
         "operationId": "cluster_query",
         "parameters": [
           {
@@ -5334,7 +5334,7 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead. May instead be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`.",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead. May instead be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself.",
             "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
           },
           "settings": {
@@ -5644,6 +5644,14 @@
         "type": "object",
         "description": "The `settings` field of a request: one optional value per `request`-scope\nsetting of the definition, applied to the request's session before the\nsource's own `set` lines, so a `set` line in the request's text overrides\nthe field. An absent field is empty. A `process` setting has no field\nhere, so `{\"stage_write_concurrency\": 64}` is refused as an unknown field.",
         "properties": {
+          "engine": {
+            "type": "string",
+            "description": "whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution",
+            "enum": [
+              "v1",
+              "v2"
+            ]
+          },
           "merge_lineage": {
             "type": "string",
             "description": "how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared",

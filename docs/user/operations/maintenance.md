@@ -160,7 +160,7 @@ At least one retention option is required:
 | Option | Meaning |
 |---|---|
 | `--keep N` | Request retention of the newest `N` versions per retained node or edge dataset |
-| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff; also reap detached manifests older than the threshold that no pending write protects |
+| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff; also reap older detached manifests only after verifying the linear twin of a published write |
 
 When both are present, a version must be outside both retention windows before
 it can be removed. Live branches and other storage references may keep
@@ -186,6 +186,14 @@ Before cleanup:
 Cleanup fails closed if it cannot prove that live branches or storage drift
 are safe. A failure to clean one backing dataset is reported in
 the result; fix the cause and rerun cleanup to converge.
+
+Detached manifests without a verified linear twin are retained even when old:
+a writer may still publish them. Cleanup reports skipped version GC for their
+table, preserving their data files, and continues with unaffected tables. This
+can retain abandoned staging indefinitely; an age cutoff is not proof that a
+writer has stopped. Proven promoted copies and intermediate chain links remain
+reclaimable. `repair` reports a foreign commit blocking promotion but does not
+adopt it, including with `--force`.
 
 ## Suggested cadence
 

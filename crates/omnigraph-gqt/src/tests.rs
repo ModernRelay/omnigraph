@@ -387,6 +387,12 @@ fn branch_list_takes_rows_or_error_and_needs_a_shape() {
     let text = format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}");
     let case = parse_case("x", &text).unwrap();
     assert_eq!(case.items.len(), 2);
+    let text = format!("{HDR}{SCHEMA}{SEED}{LIST}--- expect plan\npass projection_pushdown\n");
+    let error = refusal("x", &text);
+    assert!(
+        error.contains("`--- expect plan` is supported only on query steps"),
+        "{error}"
+    );
 }
 
 /// A quoted statement name carries `${` past the compiler (`string_char`
@@ -1474,7 +1480,7 @@ async fn pinned_step_runs_only_its_pinned_path() {
             .await
             .unwrap_or_else(|e| panic!("{mode}: {e}"));
 
-        let (session, _uri, _dir) = open_case_store(&case).await.unwrap();
+        let (session, _uri, _dir) = open_case_store(&case, Engine::V1).await.unwrap();
         assert_eq!(session.settings().traversal().as_str(), mode);
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
@@ -1522,7 +1528,7 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
          --- restart\n"
     );
     let case = parse_case("pinned", &text).unwrap();
-    let (mut session, uri, _dir) = open_case_store(&case).await.unwrap();
+    let (mut session, uri, _dir) = open_case_store(&case, Engine::V1).await.unwrap();
     let Some(Item::Step(Step::Query(query))) = case.items.first() else {
         panic!("first item is the query step");
     };
@@ -1642,11 +1648,7 @@ async fn bounded_records_a_panicking_case() {
     assert!(err.starts_with("case panicked: boom"), "{err}");
 }
 
-/// The checked-in corpus itself: at least one case, and no foreign entry (a
-/// mis-renamed, nested, symlinked, or dot-prefixed case would otherwise
-/// silently never run: the test target registers what its
-/// `datatest_stable::harness!` pattern matches, and `list_cases` mirrors
-/// that rule so this test refuses what the target would skip).
+/// The checked-in corpus is nonempty and contains no entries discovery would skip.
 #[test]
 fn corpus_layout() {
     let root = corpus_root();
@@ -1829,16 +1831,25 @@ fn corpus_flags_foreign_entries() {
     std::fs::write(dir.path().join("c.GQT"), "x").unwrap();
     std::fs::create_dir(dir.path().join("nested")).unwrap();
     std::fs::write(dir.path().join("nested").join("d.gqt"), "x").unwrap();
+    std::fs::create_dir_all(dir.path().join("v2/planner")).unwrap();
+    std::fs::write(dir.path().join("v2/planner/plan.gqt"), "x").unwrap();
+    std::fs::write(dir.path().join("v2/planner/.hidden.gqt"), "x").unwrap();
+    std::fs::write(dir.path().join("v2/planner/notes.txt"), "x").unwrap();
+    std::fs::create_dir(dir.path().join(".cache")).unwrap();
+    std::fs::write(dir.path().join(".cache/skipped.gqt"), "x").unwrap();
     let mut expected = vec![
         ".hidden.gqt".to_string(),
         "b.txt".to_string(),
         "c.GQT".to_string(),
-        "nested".to_string(),
+        "v2/planner/.hidden.gqt".to_string(),
+        "v2/planner/notes.txt".to_string(),
     ];
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("a.gqt", dir.path().join("link.gqt")).unwrap();
         expected.push("link.gqt".to_string());
+        std::os::unix::fs::symlink("planner", dir.path().join("v2/link")).unwrap();
+        expected.push("v2/link".to_string());
     }
     // APFS refuses a name that is not valid UTF-8 (EILSEQ), so this row runs
     // where the file system takes it.
@@ -1851,7 +1862,14 @@ fn corpus_flags_foreign_entries() {
     }
     expected.sort();
     let (files, foreign) = list_cases(dir.path());
-    assert_eq!(files, vec![dir.path().join("a.gqt")]);
+    assert_eq!(
+        files,
+        vec![
+            dir.path().join("a.gqt"),
+            dir.path().join("nested/d.gqt"),
+            dir.path().join("v2/planner/plan.gqt"),
+        ]
+    );
     assert_eq!(foreign, expected);
 }
 

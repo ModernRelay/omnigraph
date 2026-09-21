@@ -185,6 +185,50 @@ pub(crate) async fn promote_pin(
     Ok(Promotion::Promoted(target))
 }
 
+/// Detached copies whose exact linear twins are proved by an immutable
+/// published pin and its recorded chain. A missing link proves nothing about
+/// any predecessor; a UUID mismatch never authorizes deletion.
+pub(crate) async fn promoted_chain_versions(
+    db: &Omnigraph,
+    entry: &DatasetEntry,
+) -> Result<Vec<u64>> {
+    let (Some(staged), Some(uuid)) = (
+        entry.version_metadata.staged_version(),
+        entry.version_metadata.transaction_uuid(),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let full_path = format!("{}/{}", db.root_uri(), entry.dataset_path);
+    let location = table_location(&full_path, entry.native_dataset_branch.as_deref());
+    if !matches!(
+        target_state(db, &location, entry.published_dataset_version, uuid).await?,
+        Some(Promotion::AlreadyPromoted)
+    ) {
+        return Ok(Vec::new());
+    }
+    let chain = match walk_chain(db, &location, staged).await {
+        Ok((_, chain)) => chain,
+        Err(OmniError::HistoricalVersionReclaimed { .. }) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if chain[0].1 != uuid {
+        return Ok(Vec::new());
+    }
+    let mut redundant = Vec::new();
+    for (index, (version, uuid)) in chain.into_iter().enumerate() {
+        let Some(target) = entry.published_dataset_version.checked_sub(index as u64) else {
+            break;
+        };
+        if matches!(
+            target_state(db, &location, target, &uuid).await?,
+            Some(Promotion::AlreadyPromoted)
+        ) {
+            redundant.push(version);
+        }
+    }
+    Ok(redundant)
+}
+
 /// One link of a chain: replay `staged` at `target`, rechecking the target
 /// when Lance refuses the replay because a racing promoter landed first.
 async fn promote_step(

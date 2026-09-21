@@ -7439,6 +7439,16 @@ async fn rfc_0067_blocked_chain_diff_keeps_the_acknowledged_insert() {
 #[tokio::test]
 #[serial]
 async fn rfc_0067_cleanup_skips_version_gc_on_a_blocked_pin() {
+    assert_cleanup_skips_blocked_pin(false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_cleanup_skips_version_gc_on_a_blocked_chain() {
+    assert_cleanup_skips_blocked_pin(true).await;
+}
+
+async fn assert_cleanup_skips_blocked_pin(extend_chain: bool) {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
@@ -7449,6 +7459,21 @@ async fn rfc_0067_cleanup_skips_version_gc_on_a_blocked_pin() {
     let mut raw = helpers::open_dataset_head_exact(&person_uri, None).await;
     helpers::lance_delete_inline(&mut raw, "1 = 2").await;
     assert_eq!(raw.version().version, target);
+    if extend_chain {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "blocked-cleanup-second")], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            person_head_and_published(&db, "main").await,
+            (target, target + 1)
+        );
+        assert_eq!(count_rows(&db, "node:Person").await, before + 2);
+    }
     for entry in std::fs::read_dir(std::path::Path::new(&person_uri).join("data")).unwrap() {
         let path = entry.unwrap().path();
         if path.is_file() {
@@ -7467,6 +7492,18 @@ async fn rfc_0067_cleanup_skips_version_gc_on_a_blocked_pin() {
         })
         .await
         .unwrap();
+    let company = stats
+        .iter()
+        .find(|row| row.type_key == "node:Company")
+        .unwrap();
+    assert!(
+        company.error.is_none(),
+        "healthy table must be cleaned: {company:?}"
+    );
+    assert!(
+        company.old_versions_removed > 0,
+        "healthy table must reclaim versions: {company:?}"
+    );
     let person = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -7484,7 +7521,10 @@ async fn rfc_0067_cleanup_skips_version_gc_on_a_blocked_pin() {
         .await
         .unwrap();
     let rows = read_table(&reopened, "node:Person").await;
-    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), before + 1);
+    assert_eq!(
+        rows.iter().map(|b| b.num_rows()).sum::<usize>(),
+        before + 1 + usize::from(extend_chain)
+    );
 }
 
 #[tokio::test]
@@ -7535,14 +7575,8 @@ async fn rfc_0067_cleanup_reaps_aged_surplus_detached_manifests() {
     );
 }
 
-/// RFC 0067 retention floor: a *fresh, unpublished* detached manifest — the
-/// residue of a cross-process writer that has staged its detached commit but
-/// not yet published its pin — must survive `cleanup(older_than: ZERO)`. Such a
-/// manifest is absent from `protected_detached` (built from published pins
-/// only), so the age floor is its sole guard; reaping it and then having that
-/// writer publish-then-crash would leave a pin pointing at a reaped staged
-/// manifest with no twin, an unrecoverable table. The second half proves the
-/// floor is what protects it: once backdated, the same manifest IS reaped.
+/// Unpublished staging retains its manifest and data regardless of age: cleanup
+/// has no durable evidence that the writer has stopped.
 #[tokio::test]
 #[serial]
 async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest() {
@@ -7598,8 +7632,7 @@ async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest()
         "zero-age cleanup reaped a fresh unpublished detached manifest; stranded={stranded:?} after={after:?}"
     );
 
-    // Backdate the stranded manifests past the floor: now they ARE reaped,
-    // proving the floor — not permanence — protected them above.
+    // Aging cannot establish that a writer has stopped.
     for name in &stranded {
         std::fs::File::open(versions_dir.join(name))
             .unwrap()
@@ -7614,8 +7647,131 @@ async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest()
     .unwrap();
     let aged = detached_files();
     assert!(
-        stranded.is_disjoint(&aged),
-        "an aged unpublished detached manifest must be reaped; stranded={stranded:?} still={aged:?}"
+        stranded.is_subset(&aged),
+        "an aged unpublished detached manifest must be retained; stranded={stranded:?} still={aged:?}"
+    );
+}
+
+#[test]
+#[ignore = "environment: OMNIGRAPH_RFC0067_CLEANUP_URI; subprocess helper"]
+fn rfc_0067_external_cleanup_process() {
+    let Ok(uri) = std::env::var("OMNIGRAPH_RFC0067_CLEANUP_URI") else {
+        return;
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let db = Omnigraph::open(&uri).await.unwrap();
+            db.cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: Some(std::time::Duration::ZERO),
+            })
+            .await
+            .unwrap();
+        });
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_cleanup_keeps_a_live_aged_detached_write() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let graph_uri = dir.path().to_str().unwrap().to_string();
+    let versions_dir = std::path::Path::new(&person_uri).join("_versions");
+    let before: std::collections::BTreeSet<_> = std::fs::read_dir(&versions_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let data_dir = std::path::Path::new(&person_uri).join("data");
+    let old_data: std::collections::BTreeSet<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let _observe = catalog::MUTATION_POST_TABLE_COMMIT.observe(move || {
+        // Age only this writer's staging, beyond Lance's unverified-file grace.
+        let mut aged_data = 0;
+        for file in std::fs::read_dir(&data_dir).unwrap() {
+            let file = file.unwrap();
+            if !old_data.contains(&file.file_name()) && file.path().is_file() {
+                aged_data += 1;
+                std::fs::File::open(file.path())
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(aged_data > 0, "must exercise aged referenced data too");
+        let mut staged = 0;
+        for file in std::fs::read_dir(&versions_dir).unwrap() {
+            let file = file.unwrap();
+            if !before.contains(&file.file_name())
+                && file.file_name().to_string_lossy().starts_with('d')
+            {
+                staged += 1;
+                std::fs::File::open(file.path())
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(
+            staged > 0,
+            "the live write must have staged a new detached manifest"
+        );
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rfc_0067_external_cleanup_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMNIGRAPH_RFC0067_CLEANUP_URI", &graph_uri)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cleanup child: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+    let outcome = {
+        let _skip = catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "aged-in-flight")], &[("$age", 42)]),
+        )
+        .await
+    };
+    outcome.expect("the graph write was acknowledged");
+    let reopened = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let opened = snapshot.open_dataset("node:Person").await;
+    assert!(
+        opened.is_ok(),
+        "acknowledged table is unreadable after cleanup reaped live staging: {opened:?}"
+    );
+    let names = collect_column_strings(&read_table(&reopened, "node:Person").await, "name");
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.as_str() == "aged-in-flight")
+            .count(),
+        1
     );
 }
 
@@ -7628,43 +7784,125 @@ async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest()
 #[tokio::test]
 #[serial]
 async fn rfc_0067_lost_ack_of_a_durable_publish_reads_back_as_success() {
+    assert_lost_ack_reads_back_as_success(false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_lost_ack_after_another_publish_reads_back_as_success() {
+    assert_lost_ack_reads_back_as_success(true).await;
+}
+
+struct AdvanceBeforeLostAck {
+    uri: String,
+    fired: std::sync::atomic::AtomicBool,
+}
+impl omnigraph::seams::Behavior for AdvanceBeforeLostAck {}
+impl omnigraph::seams::Decide for AdvanceBeforeLostAck {
+    fn decide(&self, _: &'static str) -> omnigraph::seams::Decision {
+        if self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return omnigraph::seams::Decision::Pass;
+        }
+        run_rfc023_external_writer(
+            self.uri.clone(),
+            LoadMode::Merge,
+            r#"{"type":"Company","data":{"name":"later-writer"}}"#.to_string(),
+        )
+        .unwrap();
+        omnigraph::seams::Decision::Fire(omnigraph::seams::Effect::Fail)
+    }
+}
+
+async fn assert_lost_ack_reads_back_as_success(advance_head: bool) {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-    let before = count_rows(&db, "node:Person").await;
-
     let outcome = {
-        let _fp = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        let _guard = if advance_head {
+            catalog::PUBLISH_POST_MERGE_PRE_ACK.install(Arc::new(AdvanceBeforeLostAck {
+                uri: dir.path().to_str().unwrap().to_string(),
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }))
+        } else {
+            catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1)
+        };
         mutate_main(
             &db,
             MUTATION_QUERIES,
             "insert_person",
-            &mixed_params(&[("$name", "ackloss")], &[("$age", 42)]),
+            &mixed_params(&[("$name", "ack-overtaken")], &[("$age", 42)]),
         )
         .await
     };
-    assert!(
-        outcome.is_ok(),
-        "a durable commit whose ack was lost must read back as success, got: {outcome:?}"
-    );
-    assert_eq!(
-        count_rows(&db, "node:Person").await,
-        before + 1,
-        "the acknowledged-then-lost row must be visible on the writer's handle"
-    );
-
-    // Durable across a fresh open, and no residue was left behind.
     let reopened = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
-    assert_eq!(
-        count_rows(&reopened, "node:Person").await,
-        before + 1,
-        "the row must survive a fresh open"
-    );
     let names = collect_column_strings(&read_table(&reopened, "node:Person").await, "name");
     assert!(
-        names.iter().any(|name| name == "ackloss"),
-        "the read-back-confirmed row must be present by name"
+        names.contains(&"ack-overtaken".to_string()),
+        "first commit must be durable"
     );
+    let companies = collect_column_strings(&read_table(&reopened, "node:Company").await, "name");
+    assert_eq!(
+        companies.contains(&"later-writer".to_string()),
+        advance_head,
+        "external-writer schedule must be exercised"
+    );
+    assert!(
+        outcome.is_ok(),
+        "durable write was misreported after another writer advanced HEAD: {outcome:?}"
+    );
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.as_str() == "ack-overtaken")
+            .count(),
+        1
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, names.len());
+    assert_eq!(count_rows(&db, "node:Company").await, companies.len());
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "same-handle-next")], &[("$age", 43)]),
+    )
+    .await
+    .unwrap();
+    let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(count_rows(&fresh, "node:Person").await, names.len() + 1);
+    assert_eq!(count_rows(&fresh, "node:Company").await, companies.len());
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_unavailable_ack_readback_is_indeterminate_without_replay() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = count_rows(&db, "node:Person").await;
+    let outcome = {
+        let _ack = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        let _read = catalog::PUBLISH_READ_BACK.fail_once_at(1);
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "indeterminate")], &[("$age", 42)]),
+        )
+        .await
+    };
+    let error = outcome.unwrap_err().to_string();
+    assert!(error.contains("outcome is in doubt"), "{error}");
+    let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        count_rows(&fresh, "node:Person").await,
+        before + 1,
+        "no automatic replay"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, before + 1);
 }
 
 /// GENERALIZED LIVENESS, persistent pre-publish faults: the same live handle
@@ -8273,4 +8511,18 @@ async fn rfc_0067_pending_merge_diff_keeps_every_chunk() {
         changes.stats.inserts,
         after_rows - before_rows
     );
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
+    assert!(
+        raw.list_detached_manifests().await.unwrap().is_empty(),
+        "promoted merge chain intermediates must be reclaimed"
+    );
+    let fresh = Omnigraph::open_read_only(&uri).await.unwrap();
+    assert_eq!(count_rows(&fresh, "node:Person").await, after_rows);
 }

@@ -1,0 +1,70 @@
+# issue: none
+# notes: A search parameter may share its name with a traversal binding.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(4) @index
+}
+
+edge Knows: Doc -> Doc {
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0],"text":"needle needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0],"text":"needle needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d002","embedding":[2.0,0.0,0.0,0.0],"text":"needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d003","embedding":[3.0,0.0,0.0,0.0],"text":"needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0],"text":"needle needle filler"}}
+{"type":"Doc","data":{"slug":"d005","embedding":[5.0,0.0,0.0,0.0],"text":"needle filler"}}
+{"edge":"Knows","id":"e002_0","from":"d002","to":"d003","data":{}}
+{"edge":"Knows","id":"e004_0","from":"d004","to":"d005","data":{}}
+
+--- query
+set engine = v1;
+query fused_v1($q: Vector(4), $t: String) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    limit 1
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
+
+--- expect unordered
+{"d.slug":"d002"}
+
+--- expect shape
+d.slug: String
+
+--- query
+set engine = v2;
+query fused_v2($q: Vector(4), $t: String) {
+    match {
+        $d: Doc
+        $d knows $t
+    }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    limit 1
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0], "t": "needle"}
+
+--- expect unordered
+{"d.slug":"d002"}
+
+--- expect shape
+d.slug: String

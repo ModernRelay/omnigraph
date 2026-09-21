@@ -180,6 +180,7 @@ enum WriteProtocol {
     Bootstrap,
     SchemaContractInstall,
     ReadOnlyAccess,
+    ReadTaskCancellation,
 }
 
 impl WriteProtocol {
@@ -195,6 +196,9 @@ impl WriteProtocol {
             Self::Bootstrap => "bootstrap".into(),
             Self::SchemaContractInstall => "staged schema contract installation (RFC 0067)".into(),
             Self::ReadOnlyAccess => "read-only raw snapshot access".into(),
+            Self::ReadTaskCancellation => {
+                "cancel a queued Tokio read worker; no storage effect".into()
+            }
         }
     }
 }
@@ -285,9 +289,10 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "list_commits"),
-    ("exec/query.rs", "query"),
-    ("exec/query.rs", "query_with_head"),
-    ("exec/query.rs", "run_query_at"),
+    ("exec/query_doors.rs", "query"),
+    ("exec/query_doors.rs", "query_with_head"),
+    ("exec/query_doors.rs", "run_query_at"),
+    ("exec/query_doors.rs", "explain_query"),
 ];
 
 // Every crate-visible async method on the two low-level coordinators is also
@@ -422,6 +427,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/manifest.rs",
         "ManifestCoordinator",
         "table_registrations_under_control_gates",
+    ),
+    (
+        "db/manifest.rs",
+        "ManifestCoordinator",
+        "table_versions_under_control_gates",
     ),
     (
         "db/manifest.rs",
@@ -630,7 +640,7 @@ gateway_surfaces! {
         "scan_stream_for_rewrite", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "materialize_blob_batch", "scan_stream", "scan_stream_bounded",
-        "scan_stream_with", "ordered_scan_error", "scan", "scan_with",
+        "scan_stream_with", "scan_plan_with", "ordered_scan_error", "scan", "scan_with",
         "scan_edges_by_endpoint",
         "scan_edges_by_endpoint_projected",
         "key_column_index_coverage", "fts_covers_all_fragments", "has_unindexed_fragments",
@@ -716,7 +726,7 @@ durable_calls! {
     // (A `table_version_management` config key is deliberately not written:
     // neither the pinned Lance substrate nor this crate reads it.)
     ("db/manifest/graph.rs", "Dataset::write(", 2, WriteProtocol::Bootstrap),
-    ("db/manifest/publisher.rs", ".dataset()", 3, WriteProtocol::ReadOnlyAccess),
+    ("db/manifest/publisher.rs", ".dataset()", 2, WriteProtocol::ReadOnlyAccess),
     ("db/manifest/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
     ("db/manifest/publisher.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("db/manifest/publisher.rs", ".execute_reader(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -751,6 +761,7 @@ durable_calls! {
     ("omnigraph-storage/lib.rs", ".put_part(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
     ("omnigraph-storage/lib.rs", ".complete(", 1, WriteProtocol::Composed("Azure multipart rename destination publication")),
     ("omnigraph-storage/lib.rs", ".abort(", 1, WriteProtocol::Composed("Azure multipart rename failure cleanup")),
+    ("engine/operators/memory.rs", ".abort(", 1, WriteProtocol::ReadTaskCancellation),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".fork_branch_from_state(", 1, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
@@ -762,7 +773,7 @@ durable_calls! {
     ("db/omnigraph/promotion.rs", ".promote_detached(", 3, WriteProtocol::Exact("RFC 0067 promotion replay")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 2, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/promotion.rs", ".into_dataset()", 1, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/optimize.rs", ".delete(", 2, WriteProtocol::Composed("RFC 0067 reap of a promoted pin's detached manifest after promotion, and of aged surplus detached manifests under the cleanup age policy")),
+    ("db/omnigraph/optimize.rs", ".delete(", 1, WriteProtocol::Composed("RFC 0067 reap only after a published pin and UUID-matching linear twin prove a detached copy redundant")),
     ("storage_layer.rs", ".dataset()", 30, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
@@ -2764,10 +2775,8 @@ fn lance_branch_enumeration_stays_behind_retry_boundary() {
     );
 }
 
-/// Ordering is an executor-selection boundary: Lance's ordinary scanner uses
-/// an unbounded SortExec. Every raw `Scanner::order_by` call must therefore
-/// remain in `TableStore::scan_stream_with`, whose callback receives the
-/// restricted `ScanTuning` surface and cannot add ordering afterward.
+/// PreparedScan owns raw ordering; the stream door selects its bounded executor.
+/// The plan door supplies no ordering, and ScanTuning cannot add it.
 #[test]
 fn lance_ordering_stays_behind_bounded_scan_executor() {
     let src = engine_src_root();
@@ -2790,25 +2799,36 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
     assert_eq!(
         sites,
         vec![("table_store.rs".to_string(), 1)],
-        "raw Lance ordering must remain centralized in TableStore::scan_stream_with"
+        "raw Lance ordering must remain centralized in PreparedScan::configure"
     );
 
     let table_store = std::fs::read_to_string(src.join("table_store.rs"))
         .expect("read table_store.rs for ordered-scan owner signature");
     let ast = parse_rust_source(&table_store, "table_store.rs");
     let mut owner = None;
+    let mut stream_door = None;
+    let mut plan_door = None;
     let mut tuning_exposes_order_by = false;
     for item in &ast.items {
         let Item::Impl(implementation) = item else {
             continue;
         };
-        if is_named_type(&implementation.self_ty, "TableStore") {
+        if is_named_type(&implementation.self_ty, "PreparedScan") {
             owner = implementation.items.iter().find_map(|item| match item {
-                syn::ImplItem::Fn(function) if function.sig.ident == "scan_stream_with" => {
-                    Some(function)
-                }
+                syn::ImplItem::Fn(function) if function.sig.ident == "configure" => Some(function),
                 _ => None,
             });
+        }
+        if is_named_type(&implementation.self_ty, "TableStore") {
+            for item in &implementation.items {
+                if let syn::ImplItem::Fn(function) = item {
+                    match function.sig.ident.to_string().as_str() {
+                        "scan_stream_with" => stream_door = Some(function),
+                        "scan_plan_with" => plan_door = Some(function),
+                        _ => {}
+                    }
+                }
+            }
         }
         if is_named_type(&implementation.self_ty, "ScanTuning") {
             tuning_exposes_order_by = implementation.items.iter().any(|item| {
@@ -2816,11 +2836,36 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
             });
         }
     }
-    let owner = owner.expect("TableStore::scan_stream_with must own raw Lance ordering");
+    let owner = owner.expect("PreparedScan::configure must own raw Lance ordering");
     assert_eq!(
         method_call_count(&owner.block, "order_by"),
         1,
-        "TableStore::scan_stream_with must own the one raw Lance order_by call"
+        "PreparedScan::configure must own the one raw Lance order_by call"
+    );
+    let mut calls = CallInventory::default();
+    calls.visit_block(&stream_door.expect("stream door exists").block);
+    assert_eq!(calls.counts.get("execute_bounded_ordered_scan"), Some(&1));
+
+    #[derive(Default)]
+    struct UnorderedPlanCalls(usize);
+    impl<'ast> Visit<'ast> for UnorderedPlanCalls {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if final_path_ident(&node.func).as_deref() == Some("configure") {
+                self.0 += 1;
+                assert!(
+                    matches!(node.args.iter().nth(3), Some(syn::Expr::Path(path))
+                        if path.path.is_ident("None")),
+                    "the plan door must not request Lance ordering"
+                );
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+    let mut calls = UnorderedPlanCalls::default();
+    calls.visit_block(&plan_door.expect("plan door exists").block);
+    assert_eq!(
+        calls.0, 1,
+        "the plan door must configure exactly one scanner"
     );
     assert!(
         !tuning_exposes_order_by,

@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-15
+updated: 2026-09-18
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -33,9 +33,9 @@ dedicated workspace crate, `omnigraph-gqt` (`publish = false`, outside
 `default-members`, and outside the explicit `-p` list `release.yml`
 builds, so never in a release), holds the corpus and the runner: its one
 integration-test target, `crates/omnigraph-gqt/tests/gq_logic_tests.rs`,
-registers every top-level, non-dot-prefixed
-`crates/omnigraph-gqt/cases/*.gqt` file (any other entry except an
-extension-less dot-file fails `corpus_layout`, Runner mechanics) as its own libtest-compatible test and
+recursively registers every non-dot-prefixed `.gqt` file under
+`crates/omnigraph-gqt/cases/` (invalid entries fail `corpus_layout`,
+Runner mechanics) as its own libtest-compatible test and
 runs each case against a fresh temporary store: init, load, index, then
 the steps in order.
 
@@ -157,9 +157,9 @@ refusal message, and the remaining cases still run. The per-case lines
 print on every run: the target's harness never captures output, so
 `--nocapture` changes nothing for it (the crate's unit tests, under real
 libtest, still honor it). Every case is its own libtest-compatible test,
-named `case::<file>.gqt`, so
+named `case::<relative/path>.gqt`, so
 `cargo test -p omnigraph-gqt --test gq_logic_tests issue_563`
-restricts the run to cases whose file name contains the argument, and
+restricts the run to cases whose relative path contains the argument, and
 `-- --list` names every registered case.
 
 ***Bless mode*** (the update-in-place workflow rustc calls `--bless` and
@@ -502,7 +502,38 @@ in Seams at an explicit step. A step is one of:
   `DateTime`). A shape section anywhere but directly after a rows expect is
   refused, and so is a rows expect without one; the latter refusal names the
   two routes: write it from the `.pg` schema, or fill it with
-  `OMNIGRAPH_GQ_BLESS=1` and review the diff.
+  `OMNIGRAPH_GQ_BLESS=1` and review the diff. A rows step may carry one
+  optional `--- expect plan` section, the ***plan section***, directly after
+  its shape section: one assertion per line over the plan the step's query
+  runs under, in nine forms. The query's effective engine must
+  be v2, after applying the runner baseline, case settings and query prefix.
+  Under v1 the runner fails the step before execution or explain because
+  v1 produces no plan. A `scan <Type>[ as $var]:` head
+  selects the scans of that node type (every scan of it, or the one bound
+  to `$var`) and claims one fact of each: `columns [<a>, <b>]` the exact
+  columns it projects; `not columns [<a>, <b>]` columns it must not read;
+  `filter reads [<v.a>, <v.b>]` a pushed filter reading exactly those
+  columns, each spelled `binding.property`; `no filter` no pushed filter.
+  `filter reads [<a.x>, <b.y>]` without a scan head states that an in-memory
+  `Filter` node stays in the plan reading exactly those columns. `pass
+  <name>` states that the named optimizer pass fired; `not pass <name>` that
+  it did not. Pass names must be registered optimizer passes; excluded
+  columns must exist in the selected type's catalog schema. An unknown name
+  is refused even in a negative assertion. Expansion destination projection
+  belongs to its dependent `scan`, not the topology-only `Expand`.
+  An `expand $<src> <Edge> $<dst>:` head selects the one physical `Expand`
+  between those bindings over that edge type and claims `mode csr` or `mode
+  indexed_scan`, the traversal mode the planner recorded on it; it fails
+  when the physical plan holds no such expand or its mode differs.
+  A `scan <Type>[ as $var]: access <id_lookup|hash_join>` line selects the
+  physical scans of that node type (or the one bound to `$var`) and claims
+  the access path the planner recorded on a dependent scan, the per-batch
+  id lookup or the destination table read once as a hash join's build side;
+  it fails when the physical plan holds no such scan, the scan is a table
+  scan, or its access path differs.
+  Every list is a set. A plan section anywhere but directly
+  after a shape section, an empty one, or a line outside the nine forms is
+  refused with the forms spelled out.
 - `--- mutate` holding exactly one GQ declaration with a mutation body,
   followed by an optional `--- params` and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
@@ -1278,15 +1309,13 @@ expect section is JSONL, one object per row, same keys.
   operation that later stops being deterministic is refused by name in
   the harness, the way `@embed` is today. Second, given that set, the
   engine's order is total, which is an authoring rule: the `order` keys
-  must be total over the rows the step returns. The `<var>.id` tie-break
-  `apply_ordering` appends to every non-aggregate ordering is an
-  implementation detail no expect may depend on (it is the `@key` value
-  for keyed node types and a per-load ULID otherwise, so an unkeyed
-  type's order changes across runs), an aggregate result batch carries no
-  `<var>.id` column at all, so group rows tied on the sort key have no
-  guaranteed order, and a tie on the sort keys surfaces as flakiness the
-  harness cannot see statically (`ordered_two_key_sort.gqt` is the corpus
-  example). The harness checks the parsed declaration and refuses
+  must be total over the rows the step returns, including the documented
+  `<var>.id` tie-break for non-aggregate ordering. A case may depend on
+  that tie-break only when it fixes every binding's identity, through an
+  `@key` property or an explicit id; generated ULIDs vary across runs.
+  Aggregate result batches have no `<var>.id` columns, so their user sort
+  keys must determine a total order. The harness cannot prove this
+  statically (`ordered_two_key_sort.gqt` is a corpus example). The harness checks the parsed declaration and refuses
   `ordered` where no total order is possible: no `order` clause; an
   `order` clause led by
   `rrf()`, whose fusion sorts by score alone; and any aggregate in the
@@ -1344,6 +1373,27 @@ expect section is JSONL, one object per row, same keys.
   shape section is the author's statement of the columns, the way the rows
   body is the author's statement of the values, and the computed check
   proves the compiler and the executor agree.
+- The plan section, when present, is checked before the shape section,
+  against the explain document `Session::explain_query` returns for the
+  step's declaration on the step's branch (the same compile, the same pinned
+  snapshot, after query execution): a `scan` projection or filter line selects the `TableScan` nodes
+  of the document's `logical_plan` whose table is `node:<Type>` (and whose
+  `binding` is `$var` when named) and compares the line's column set with
+  each selected scan's `projection` (equality for `columns`, disjointness
+  for `not columns`) or with the reads of each selected scan's `filter`
+  predicate (equality for `filter reads`, absence for `no filter`; the reads
+  of an `and` predicate are the union of its sides); a bare `filter reads`
+  line requires a `Filter` node whose `predicate` reads exactly that set; a
+  `pass` line requires its name in the document's `passes`, a `not pass`
+  line its absence. An `expand $src Edge $dst: mode` line selects every
+  matching physical `Expand` and compares its recorded mode. A `scan`
+  `access` line selects physical `Scan` nodes and compares the dependent
+  scan access path. No selected node, a scan without a projection, or a
+  contradicted line fails the step with the line, what the document holds
+  instead, and the whole document; bless never rewrites a plan section. The comparison
+  is over the document's fields, never over rendered text, so a later
+  planner that reaches the same facts by another route keeps the case green
+  .
 
 Ranking scores are projectable (`nearest` and `bm25` since v0.11.0, `T33`
 ties the projection to the executed retrieval) and their values are
@@ -1353,9 +1403,13 @@ project the score only when the value itself is the claim.
 ### Runner mechanics
 
 The test target is `harness = false` and hands discovery to
-`datatest-stable`: every `cases/*.gqt` file, rooted at the crate, is
-registered at run time as its own libtest-compatible test (a libtest-mimic
-trial under `datatest-stable`) named `case::<file>.gqt`. The runner it
+`datatest-stable`: every `.gqt` file under `cases/`, including subdirectories,
+is registered at run time as its own libtest-compatible test (a libtest-mimic
+trial under `datatest-stable`) named `case::<relative/path>.gqt`. Shared cases
+live directly under `cases/`; v2-specific cases live in `cases/v2/`, with
+plan assertions in `cases/v2/planner/`. Directory placement is organizational:
+a case that requires v2 still explicitly selects `engine = v2`, and discovery
+never supplies a setting. The runner it
 calls (parser, execution, comparison, bless) is the crate's library,
 `crates/omnigraph-gqt/src/lib.rs`, and the format self-tests are unit
 tests beside it in `crates/omnigraph-gqt/src/tests.rs`; the crate is
@@ -1397,11 +1451,11 @@ checkout or a bad rename, never a green run; `--exact` excepted: it
 resolves the one name without scanning); a name filter matching
 nothing runs zero tests and exits green, libtest's own behavior, where
 the merged selector failed on an unmatched value. The `corpus_layout`
-unit test fails on an empty corpus and on any entry that is not a
-top-level regular `.gqt` file with a UTF-8 name (a symlink is foreign),
-dot-prefixed `.gqt` names included; dot-prefixed
-entries without the extension (`.DS_Store`, `.gitkeep`) are skipped (a
-mis-renamed, nested, or dot-prefixed case must never silently skip). One
+unit test recursively admits normal directories and regular `.gqt` files
+with UTF-8 names. It fails on an empty corpus, symlinks, foreign files,
+and dot-prefixed case files. Hidden directories and non-case dot-files
+(`.DS_Store`, `.gitkeep`) are skipped. A nested case is enrolled; an invalid
+entry must never silently skip. One
 new dev-dependency, `datatest-stable` (bringing `libtest-mimic`,
 `fancy-regex`, `camino`, `escape8259` into the lockfile), which takes
 libtest's own arguments, so the workspace's `-- --nocapture` is accepted
