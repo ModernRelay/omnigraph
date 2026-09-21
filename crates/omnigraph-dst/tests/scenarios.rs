@@ -2227,6 +2227,12 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// 38/66, _audit l.get 1228 -> 1230) and a read-only open probes the staged
 /// schema state once for its coherence proof (_audit a.exists 79 -> 81,
 /// _verify 376 -> 389).
+/// Conservative detached reclamation reads historical published pins and
+/// verifies UUID-matching linear twins before deleting any detached copy.
+/// Cleanup l.get rises 353 -> 515; the complete pass's l.list falls 168 -> 158.
+/// This keep-only fixture now also reaps proven historical copies, moving
+/// Cleanup a.delete 8 -> 14. Every other count is unchanged; this is the
+/// measured cost of the reclamation proof, not a general performance claim.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
