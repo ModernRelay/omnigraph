@@ -90,6 +90,26 @@ See [Operating a cluster](../clusters/index.md).
 - Azure admission failure: inspect the lease owner before using the admission
   tool's break-glass flow.
 
+### Blocked pin
+
+A pin is blocked when a foreign commit occupies the linear version its
+published write was meant to take. The condition is per table.
+
+- From a write: a branch merge, index build, schema apply, system-column
+  upgrade, optimize, or a branch's first write to that table returns a
+  conflict that names the table and says the published pin at that version
+  cannot be promoted. Retrying returns the same error.
+- From `cleanup`: the table's result row says version GC was skipped for it.
+  Other tables are collected and the command exits 0.
+- From `repair`: the table is classified `blocked_promotion` with action
+  `refused`, on every live branch that carries the pin, and the command exits
+  non-zero. `--force --confirm` refuses the same way.
+
+Reads, mutations and loads on that table keep working, and every acknowledged
+row stays readable. The table's old versions are not reclaimed while the block
+stands. No command resolves a blocked pin yet. To move the data off the blocked
+table, export the graph and load it into a new one.
+
 See [Maintenance](maintenance.md) and [Deployment](../deployment.md).
 
 ## Useful diagnostics

@@ -310,6 +310,61 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         });
     }
 
+    let mut judged = snapshot
+        .datasets()
+        .map(pin_key)
+        .collect::<std::collections::HashSet<_>>();
+    for branch in optimize::cleanup_graph_branches(db)
+        .await?
+        .into_iter()
+        .flatten()
+    {
+        if crate::db::is_internal_system_branch(&branch) {
+            continue;
+        }
+        let branch_snapshot = match db.fresh_snapshot_for_branch(Some(&branch)).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(branch, %error, "repair could not read a branch's pins; its blocked pins are not reported");
+                continue;
+            }
+        };
+        for entry in branch_snapshot.datasets() {
+            if !judged.insert(pin_key(entry)) {
+                continue;
+            }
+            let reason = match super::promotion::blocked_pin_reason(db, entry).await {
+                Ok(Some(reason)) => reason,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(branch, table = %entry.type_key, %error, "repair could not judge a branch pin; it is not reported");
+                    continue;
+                }
+            };
+            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
+            let head = match db
+                .storage()
+                .open_dataset_head(&full_path, entry.native_dataset_branch.as_deref())
+                .await
+            {
+                Ok(head) => head,
+                Err(error) => {
+                    tracing::warn!(branch, table = %entry.type_key, %error, "repair could not open a branch table head; its blocked pin is not reported");
+                    continue;
+                }
+            };
+            tables.push(DatasetRepairStats {
+                type_key: entry.type_key.clone(),
+                published_dataset_version: entry.published_dataset_version,
+                lance_head_version: head.version(),
+                classification: RepairClassification::BlockedPromotion,
+                action: RepairAction::Refused,
+                operations: Vec::new(),
+                error: Some(format!("branch '{branch}': {reason}")),
+            });
+        }
+    }
+
     let manifest_version = if updates.is_empty() {
         None
     } else {
@@ -341,6 +396,17 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         datasets: tables,
         graph_manifest_version: manifest_version,
     })
+}
+
+/// One pin as several branches can share it: table, lineage and target.
+fn pin_key(
+    entry: &crate::db::manifest::DatasetEntry,
+) -> (crate::db::manifest::TableIdentity, Option<String>, u64) {
+    (
+        entry.identity,
+        entry.native_dataset_branch.clone(),
+        entry.published_dataset_version,
+    )
 }
 
 async fn classify_drift(

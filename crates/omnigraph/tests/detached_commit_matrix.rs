@@ -375,6 +375,13 @@ fn rfc0067_matrix_child_process() {
             let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
             let outcome: omnigraph::error::Result<()> = match op.as_str() {
                 "cleanup" => db.cleanup(reclaim_everything()).await.map(|_| ()),
+                "cleanup_keep" => db
+                    .cleanup(CleanupPolicyOptions {
+                        keep_versions: Some(1),
+                        older_than: None,
+                    })
+                    .await
+                    .map(|_| ()),
                 "ensure_indices" => db.ensure_indices().await.map(|_| ()),
                 "merge" => db
                     .branch_merge(&format!("src_{name}"), "main")
@@ -425,6 +432,136 @@ fn spawn_child(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap()
+}
+
+fn finish_cleanup_child(mut child: std::process::Child) {
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "cleanup child failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(45) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("cleanup child timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// GQT cannot run another process while the first-touch table commit is unpublished.
+#[tokio::test]
+#[serial]
+async fn cleanup_retains_live_first_touch_fork_until_owner_recreation() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(
+        Omnigraph::init(&root, "node Person { name: String @key age: I32? }\n")
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    let person_uri = table_uri(&db, "node:Person").await;
+    let child_root = root.clone();
+    let child_barrier = dir.path().to_path_buf();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observer_hits = hits.clone();
+    let seam = catalog::MUTATION_POST_TABLE_COMMIT.observe(move || {
+        observer_hits.fetch_add(1, Ordering::SeqCst);
+        finish_cleanup_child(spawn_child(
+            &child_root,
+            &child_barrier,
+            "first_touch_cleanup",
+            "cleanup_keep",
+            "none",
+            1,
+        ));
+    });
+    let outcome = db
+        .load_as(
+            "feature",
+            None,
+            r#"{"type":"Person","data":{"name":"Grace","age":37}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await;
+    drop(seam);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    outcome.expect("cleanup must preserve the unpublished first-touch fork");
+    drop(db);
+
+    let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+    let snapshot = fresh
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let former_fork = snapshot
+        .dataset("node:Person")
+        .unwrap()
+        .native_dataset_branch
+        .clone()
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        2,
+    );
+    drop(snapshot);
+    fresh.branch_delete("feature").await.unwrap();
+    fresh.branch_create("feature").await.unwrap();
+    finish_cleanup_child(spawn_child(
+        &root,
+        dir.path(),
+        "recreated_owner_cleanup",
+        "cleanup_keep",
+        "none",
+        1,
+    ));
+    assert!(
+        !lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(&former_fork),
+        "a recreated logical owner must not retain its predecessor's fork",
+    );
+    let reopened = helpers::session(Omnigraph::open(&root).await.unwrap());
+    assert_eq!(
+        reopened
+            .snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        1,
+    );
 }
 
 /// Run one cell; returns a one-line report. Panics with the cell named on

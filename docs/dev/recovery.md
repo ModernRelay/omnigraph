@@ -15,7 +15,7 @@ recovery audit ([RFC 0067](../rfcs/0067-detached-table-commits.md)).
 
 | Interrupted | What is on storage | Who finishes it |
 |---|---|---|
-| Before the manifest commit | Detached Lance versions nothing references, possibly an unregistered added-type dataset, possibly a staged schema contract whose publishing commit is not in lineage | Nobody has to. The caller retries from scratch. Cleanup retains detached manifests without a proven linear twin, the next schema apply reclaims the leftover dataset under its sentinel, and the next read-write open discards the staging |
+| Before the manifest commit | Detached Lance versions nothing references, possibly an unregistered added-type dataset, possibly a staged schema contract whose publishing commit is not in lineage | Nobody has to. The caller retries from scratch. Cleanup retains detached manifests without a proven linear twin and defers that table's version GC, the next schema apply reclaims the leftover dataset under its sentinel, and the next read-write open discards the staging |
 | After the manifest commit, before promotion | A pending pin `(target linear version, staged detached version, transaction uuid)`: the published rows live in the staged version and the table's linear HEAD is still at the base | Reads resolve the pin through its staged version. The next writer of that table promotes it before it stages, and `cleanup` promotes every pending pin before it collects versions |
 | After a schema apply's or system-column upgrade's manifest commit, before the contract files are installed | A staged contract whose publishing commit is in lineage, and possibly the schema-apply sentinel | The same handle's next write entry (`settle_pending_schema_install`), any handle's `refresh`, or the next read-write open installs it; the open also reclaims the sentinel. A read-only open refuses until then |
 
@@ -37,12 +37,14 @@ target version. It is derived, idempotent and order-preserving:
 - a promotion that fails never fails the write. The pin stays pending.
 
 A pin whose target version a foreign linear commit occupies is **blocked**.
-Mutations, loads, merges and index maintenance keep writing behind it (they
-stage from the detached version); the graph-global writers (schema apply, the
-system-column upgrade, optimize) promote before they plan and refuse a blocked
+Mutations and loads keep writing behind it (they stage from the detached
+version); the writers that plan on the table's linear HEAD (branch merge,
+index builds, schema apply, the system-column upgrade, optimize, and a
+first-touch fork of that table) promote before they plan and refuse a blocked
 pin; `cleanup` skips version collection for that table because only the pin's
 detached version holds the acknowledged rows; `repair` reports it as
-`blocked_promotion` and never adopts the foreign commit.
+`blocked_promotion` on every live branch and never adopts the foreign commit.
+Nothing resolves a blocked pin yet.
 
 ## Staged schema contracts
 
@@ -131,7 +133,10 @@ Native branch create/delete residue is different from a data-table effect.
 An unreferenced clone-only tree is reclaimable only when no physical
 `BranchContents` exists, including a logically retired native ref. A
 first-touch table fork is created without any intent record: a fork no
-manifest entry references is garbage that explicit cleanup classifies, after
+manifest entry references is retained while the graph branch incarnation in
+its name is a live native graph branch, because its writer may not have
+published yet. Once that incarnation is gone it is garbage that explicit
+cleanup classifies, after
 proving that live table pins, tags and Lance ancestry no longer require it.
 An old owner's absence from the logical branch list alone is not proof.
 

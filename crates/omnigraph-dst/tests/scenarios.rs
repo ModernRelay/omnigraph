@@ -2233,6 +2233,10 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// This keep-only fixture now also reaps proven historical copies, moving
 /// Cleanup a.delete 8 -> 14. Every other count is unchanged; this is the
 /// measured cost of the reclamation proof, not a general performance claim.
+/// Reclamation then reads each pinned table's linear head once, so a copy
+/// whose twin was pruned behind the head is reclaimable and a fork is judged
+/// by its owner's liveness: Cleanup l.list 158 -> 206, l.get 515 -> 529, and
+/// the pruned-twin copies this fixture leaves move a.delete 14 -> 20.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {

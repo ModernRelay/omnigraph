@@ -133,6 +133,41 @@ pub(crate) async fn walk_chain(
     }
 }
 
+/// The linear base a walked chain replays onto, or the reason the chain's
+/// shape blocks the pin. Shared by promotion and `repair`'s read-only report.
+async fn replay_base(
+    db: &Omnigraph,
+    table_key: &str,
+    location: &str,
+    target: u64,
+    uuid: &str,
+    base: Option<u64>,
+    chain: &[(u64, String)],
+) -> Result<std::result::Result<u64, String>> {
+    if chain[0].1 != uuid {
+        return Ok(Err(
+            "staged version carries no matching transaction".to_string()
+        ));
+    }
+    Ok(match base {
+        Some(base) if base + chain.len() as u64 == target => Ok(base),
+        Some(base) => Err(format!(
+            "{table_key}: a chain of {} detached commits on linear base {base} does not reach target {target}",
+            chain.len()
+        )),
+        None => {
+            let base = target.saturating_sub(chain.len() as u64);
+            if open_at(db, location, base).await?.is_none() {
+                Err(format!(
+                    "{table_key}: chain predecessors were reclaimed and linear base {base} is absent"
+                ))
+            } else {
+                Ok(base)
+            }
+        }
+    })
+}
+
 /// Promote the pin `(target, staged, uuid)` of one table, and every detached
 /// commit behind it, oldest first. A promoter that did not stage the pin
 /// checks the target first: the same pin is registered on every branch that
@@ -152,28 +187,9 @@ pub(crate) async fn promote_pin(
         return Ok(known);
     }
     let (base, chain) = walk_chain(db, &location, staged).await?;
-    if chain[0].1 != uuid {
-        return Ok(Promotion::Blocked(
-            "staged version carries no matching transaction".to_string(),
-        ));
-    }
-    let base = match base {
-        Some(base) if base + chain.len() as u64 == target => base,
-        Some(base) => {
-            return Ok(Promotion::Blocked(format!(
-                "{table_key}: a chain of {} detached commits on linear base {base} does not reach target {target}",
-                chain.len()
-            )));
-        }
-        None => {
-            let base = target.saturating_sub(chain.len() as u64);
-            if open_at(db, &location, base).await?.is_none() {
-                return Ok(Promotion::Blocked(format!(
-                    "{table_key}: chain predecessors were reclaimed and linear base {base} is absent"
-                )));
-            }
-            base
-        }
+    let base = match replay_base(db, table_key, &location, target, uuid, base, &chain).await? {
+        Ok(base) => base,
+        Err(reason) => return Ok(Promotion::Blocked(reason)),
     };
     for (index, (staged, uuid)) in chain.iter().rev().enumerate() {
         let step_target = base + 1 + index as u64;
@@ -185,9 +201,9 @@ pub(crate) async fn promote_pin(
     Ok(Promotion::Promoted(target))
 }
 
-/// Detached copies whose exact linear twins are proved by an immutable
-/// published pin and its recorded chain. A missing link proves nothing about
-/// any predecessor; a UUID mismatch never authorizes deletion.
+/// Detached copies whose linear twins an immutable published pin and its chain
+/// prove, or whose targets were pruned behind the linear head. A missing link
+/// proves nothing about any predecessor; a UUID mismatch never authorizes deletion.
 pub(crate) async fn promoted_chain_versions(
     db: &Omnigraph,
     entry: &DatasetEntry,
@@ -200,10 +216,12 @@ pub(crate) async fn promoted_chain_versions(
     };
     let full_path = format!("{}/{}", db.root_uri(), entry.dataset_path);
     let location = table_location(&full_path, entry.native_dataset_branch.as_deref());
-    if !matches!(
-        target_state(db, &location, entry.published_dataset_version, uuid).await?,
-        Some(Promotion::AlreadyPromoted)
-    ) {
+    let head = db
+        .storage()
+        .open_dataset_head(&full_path, entry.native_dataset_branch.as_deref())
+        .await?
+        .version();
+    if !twin_settled(db, &location, entry.published_dataset_version, uuid, head).await? {
         return Ok(Vec::new());
     }
     let chain = match walk_chain(db, &location, staged).await {
@@ -219,14 +237,69 @@ pub(crate) async fn promoted_chain_versions(
         let Some(target) = entry.published_dataset_version.checked_sub(index as u64) else {
             break;
         };
-        if matches!(
-            target_state(db, &location, target, &uuid).await?,
-            Some(Promotion::AlreadyPromoted)
-        ) {
+        if twin_settled(db, &location, target, &uuid, head).await? {
             redundant.push(version);
         }
     }
     Ok(redundant)
+}
+
+/// The foreign commit or chain shape blocking a pin or a link of its chain, judged
+/// without replaying anything; `None` while the pin is linear, pending or promoted.
+pub(crate) async fn blocked_pin_reason(
+    db: &Omnigraph,
+    entry: &DatasetEntry,
+) -> Result<Option<String>> {
+    let (Some(staged), Some(uuid)) = (
+        entry.version_metadata.staged_version(),
+        entry.version_metadata.transaction_uuid(),
+    ) else {
+        return Ok(None);
+    };
+    let full_path = format!("{}/{}", db.root_uri(), entry.dataset_path);
+    let location = table_location(&full_path, entry.native_dataset_branch.as_deref());
+    match target_state(db, &location, entry.published_dataset_version, uuid).await? {
+        Some(Promotion::Blocked(reason)) => return Ok(Some(reason)),
+        Some(_) => return Ok(None),
+        None => {}
+    }
+    let (base, chain) = match walk_chain(db, &location, staged).await {
+        Ok(walked) => walked,
+        Err(OmniError::HistoricalVersionReclaimed { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let target = entry.published_dataset_version;
+    if let Err(reason) =
+        replay_base(db, &entry.type_key, &location, target, uuid, base, &chain).await?
+    {
+        return Ok(Some(reason));
+    }
+    for (index, (_, uuid)) in chain.iter().enumerate().skip(1) {
+        let Some(target) = entry.published_dataset_version.checked_sub(index as u64) else {
+            break;
+        };
+        if let Some(Promotion::Blocked(reason)) = target_state(db, &location, target, uuid).await? {
+            return Ok(Some(reason));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a copy's twin is proved at `target`, or was pruned behind `head`.
+/// `head` is read before the target, so an absent target at or below it was
+/// committed and then removed; resolution never serves the copy from there.
+async fn twin_settled(
+    db: &Omnigraph,
+    location: &str,
+    target: u64,
+    uuid: &str,
+    head: u64,
+) -> Result<bool> {
+    Ok(match target_state(db, location, target, uuid).await? {
+        Some(Promotion::AlreadyPromoted) => true,
+        Some(_) => false,
+        None => head >= target,
+    })
 }
 
 /// One link of a chain: replay `staged` at `target`, rechecking the target
@@ -592,7 +665,7 @@ pub(crate) async fn promote_pin_at_head(
 /// effect would rebase over the foreign commit occupying the pin's target.
 fn blocked_for_linear_writer(table_key: &str, target: u64, reason: &str) -> OmniError {
     OmniError::manifest_conflict(format!(
-        "{table_key}: the published pin at version {target} cannot be promoted ({reason}); this writer commits on the table's linear HEAD and waits for `omnigraph repair`, while mutations and loads continue detached behind the pin"
+        "{table_key}: the published pin at version {target} cannot be promoted ({reason}); this writer commits on the table's linear HEAD and is refused while the block stands; `omnigraph repair` reports the block and nothing resolves a blocked pin yet; reads, mutations and loads continue"
     ))
 }
 
@@ -985,6 +1058,60 @@ mod tests {
         assert!(
             matches!(error, OmniError::HistoricalVersionReclaimed { .. }),
             "{error}"
+        );
+    }
+
+    /// A copy whose twin was pruned behind the linear head is reclaimable,
+    /// while a foreign transaction at the target never authorizes deletion.
+    #[tokio::test]
+    async fn pruned_twin_is_reclaimable_and_a_foreign_target_is_not() {
+        let (_dir, db) = graph_with_people().await;
+        let entry = person_entry(&db).await;
+        let (_, location) = location_of(&db, &entry);
+        let base = entry.published_dataset_version;
+        let head = db.storage().open_snapshot_at_entry(&entry).await.unwrap();
+        let (detached, identity) = detached_delete(&db, head, "a").await;
+
+        load_one(&db, "z").await;
+        let pin = person_entry(&db).await;
+        assert_eq!(pin.published_dataset_version, base + 1);
+        let staged = pin
+            .version_metadata
+            .staged_version()
+            .expect("a load publishes a staged pin");
+        let mut foreign = pin.clone();
+        foreign.version_metadata = foreign
+            .version_metadata
+            .clone()
+            .with_staged(detached.version(), identity.uuid.clone());
+        assert_eq!(
+            promoted_chain_versions(&db, &foreign).await.unwrap(),
+            Vec::<u64>::new(),
+            "a foreign transaction at the target proves nothing"
+        );
+        assert_eq!(
+            promoted_chain_versions(&db, &pin).await.unwrap(),
+            vec![staged]
+        );
+        let mut pending = pin.clone();
+        pending.published_dataset_version = base + 2;
+        assert_eq!(
+            promoted_chain_versions(&db, &pending).await.unwrap(),
+            Vec::<u64>::new(),
+            "an absent target above the linear head is a pending pin, not a pruned twin"
+        );
+
+        load_one(&db, "y").await;
+        let linear = format!(
+            "{location}/_versions/{:020}.manifest",
+            u64::MAX - (base + 1)
+        );
+        db.storage_adapter().delete(&linear).await.unwrap();
+        assert!(open_at(&db, &location, base + 1).await.unwrap().is_none());
+        assert_eq!(
+            promoted_chain_versions(&db, &pin).await.unwrap(),
+            vec![staged],
+            "a twin pruned behind the linear head leaves its copy reclaimable"
         );
     }
 }

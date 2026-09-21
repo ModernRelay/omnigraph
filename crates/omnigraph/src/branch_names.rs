@@ -36,6 +36,32 @@ pub(crate) fn table_fork_name(owner: &str, base_manifest_version: u64, commit_id
     format!("fork.{incarnation}.m{base_manifest_version}.{commit_id}")
 }
 
+/// Names can conservatively retain unpublished forks, never authorize ownership.
+/// Unknown generated names lack enough evidence to reclaim safely.
+pub(crate) fn retain_unpublished_table_fork(
+    native: &str,
+    incarnation_is_live: impl FnOnce(&str) -> bool,
+) -> bool {
+    let Some(rest) = native.strip_prefix("fork.") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(incarnation), Some(base), Some(commit), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return true;
+    };
+    if !is_incarnation(incarnation)
+        || !is_incarnation(commit)
+        || !base.strip_prefix('m').is_some_and(|version| {
+            version.bytes().all(|byte| byte.is_ascii_digit()) && version.parse::<u64>().is_ok()
+        })
+    {
+        return true;
+    }
+    incarnation_is_live(incarnation)
+}
+
 fn is_incarnation(candidate: &str) -> bool {
     candidate.len() == INCARNATION_LEN
         && candidate.bytes().all(|byte| {
@@ -112,6 +138,36 @@ pub(crate) fn resolve_native_branch<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpublished_fork_retention_tracks_incarnations_not_logical_names() {
+        let incarnation = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let replacement = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        let native = table_fork_name(
+            &native_branch_name("feature", incarnation),
+            42,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        );
+        assert!(retain_unpublished_table_fork(&native, |owner| owner == incarnation));
+        assert!(!retain_unpublished_table_fork(&native, |owner| owner == replacement));
+        assert!(!retain_unpublished_table_fork(&native, |_| false));
+    }
+
+    #[test]
+    fn unknown_generated_forks_are_retained_without_authorizing_identity() {
+        for native in [
+            "fork.legacy.m42.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "fork.future-format",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.mbad.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.bad",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAW/child",
+        ] {
+            assert!(retain_unpublished_table_fork(native, |_| {
+                panic!("unknown names cannot identify an owner")
+            }));
+        }
+        assert!(!retain_unpublished_table_fork("feature", |_| true));
+    }
 
     #[test]
     fn minted_native_names_split_back_to_their_logical_name() {

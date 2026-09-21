@@ -1,0 +1,80 @@
+# issue: none
+# notes: Two first-touch attempts fail at different fork windows, the third lands; the branch is deleted and recreated and its first touch is clean.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+branch create work
+--- expect ok
+
+--- seam
+at: fork.post_create_pre_open
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate branch: work
+query add_carol() { insert Person { name: "carol", age: 50 } }
+--- expect error: injected failpoint triggered: fork.post_create_pre_open
+
+--- seam
+at: mutation.post_fork_pre_commit
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate branch: work
+query add_carol() { insert Person { name: "carol", age: 50 } }
+--- expect error: injected failpoint triggered: mutation.post_fork_pre_commit
+
+--- mutate branch: work
+query add_carol() { insert Person { name: "carol", age: 50 } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch delete work
+--- expect ok
+
+--- mutate
+branch create work
+--- expect ok
+
+--- mutate branch: work
+query add_dave() { insert Person { name: "dave", age: 60 } }
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: work
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+{"p.name":"dave","p.age":60}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+--- expect shape
+p.name: String
+p.age: I64

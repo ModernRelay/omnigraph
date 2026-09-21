@@ -1,0 +1,94 @@
+# issue: none
+# notes: A divergent merge with inserts, updates and deletes fails at branch_merge.rewrite_after_merge_pre_delete; main keeps its own rows and the retry merges.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+edge Knows: Person -> Person { @key(@src, @dst) }
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"Knows","from":"bob","to":"alice"}
+
+--- mutate
+branch create source
+--- expect ok
+
+--- mutate branch: source
+query source_changes() {
+    insert Person { name: "carol", age: 50 }
+    update Person set { age: 31 } where name = "alice"
+}
+--- expect affected: nodes=2 edges=0
+
+--- mutate branch: source
+query delete_bob() { delete Person where name = "bob" }
+--- expect affected: nodes=1 edges=2
+
+--- mutate
+query advance() { insert Person { name: "erin", age: 70 } }
+--- expect affected: nodes=1 edges=0
+
+--- seam
+at: branch_merge.rewrite_after_merge_pre_delete
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch merge source into main
+--- expect error: injected failpoint triggered: branch_merge.rewrite_after_merge_pre_delete
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+{"p.name":"erin","p.age":70}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+{"p.name":"alice","q.name":"bob"}
+{"p.name":"bob","q.name":"alice"}
+--- expect shape
+p.name: String
+q.name: String
+
+--- mutate
+branch merge source into main
+--- expect ok
+
+--- restart
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":31}
+{"p.name":"carol","p.age":50}
+{"p.name":"erin","p.age":70}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query branch: main
+query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+--- expect unordered
+
+--- expect shape
+p.name: String
+q.name: String

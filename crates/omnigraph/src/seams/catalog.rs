@@ -20,6 +20,7 @@ omnigraph_seams::catalog! {
     crate::db::manifest::graph::INIT_TABLE_CREATE_POST_NATIVE,
     crate::db::manifest::publisher::PUBLISH_LOAD_STATE,
     crate::db::manifest::publisher::PUBLISH_POST_MERGE_PRE_ACK,
+    crate::db::manifest::publisher::PUBLISH_PRE_MERGE,
     crate::db::manifest::publisher::PUBLISH_READ_BACK,
     crate::db::manifest::upgrade::UPGRADE_AFTER_ACTIVATION,
     crate::db::manifest::upgrade::UPGRADE_AFTER_BRANCH,
@@ -83,6 +84,7 @@ omnigraph_seams::catalog! {
     crate::table_store::CHANGE_FEED_ETAG_WITNESS,
     crate::table_store::FORK_POST_CREATE_PRE_OPEN,
     crate::db::omnigraph::optimize::CLEANUP_PRE_REAP,
+    crate::db::omnigraph::optimize::CLEANUP_REAP_DELETE,
     crate::db::omnigraph::promotion::PROMOTION_POST_LANDED,
     crate::table_store::PROMOTION_PRE_REPLAY,
 }

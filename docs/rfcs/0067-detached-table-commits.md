@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - ragnorc
 created: 2026-09-14
-updated: 2026-09-18
+updated: 2026-09-21
 discussion: null
 supersedes: []
 superseded_by: []
@@ -19,9 +19,6 @@ blocked_on:
 ---
 
 # RFC 0067: Detached table commits
-
-> Number provisional: the registry names 0066 as next available at drafting
-> time; recheck when the PR opens.
 
 **Surveyed:** OmniGraph 0.11.0 on `main` at `d1dd8b97`; unmodified Lance
 11.0.0 from crates.io and Lance `main` at v12.0.0-rc.1 (2026-09-14); RFCs
@@ -54,8 +51,8 @@ degrades garbage collection and change-feed pruning, never correctness.
 
 This removes the recovery sidecar, the effect classifier, `Restore`
 compensation, the two recovery modes, the write-entry recovery barrier, and
-the HEAD-equals-pin precondition for content writers, and makes per-table
-native forks unnecessary for new graph branches. Lance's linear history,
+the HEAD-equals-pin precondition for mutation and load. Per-table native
+forks stay: a graph branch creates one at its first write to a table. Lance's linear history,
 version cleanup, row-lineage stamps, tags, and compaction remain the physical
 truth once promoted, which is the property upstream's own transaction
 designs preserve.
@@ -150,29 +147,49 @@ transactions since; this RFC applies that shape inside the graph, where
   it exists with the recorded uuid, otherwise to the detached version. Both
   have identical rows, row ids, and fragment ids (probes 6, 7).
 - A lost acknowledgement (severed connection after publication) remains a
-  client correlation problem; #513's idempotency key on the lineage row
-  applies unchanged.
+  client correlation problem. #513's idempotency key on the lineage row is
+  future work and is not in the engine. Until it lands, an outcome the
+  publisher cannot confirm is an in-doubt error (HTTP 500, `code: internal`)
+  whose message names the `graph_commit_id`, so a client can look that commit
+  up before it retries. [Garbage collection](#garbage-collection) owns the
+  resolution rule.
 - Read-write open performs no content-write recovery sweep. The residual
   recovery surface is: first-touch dataset creation (a linear v1 create),
   schema contract file promotion after the schema-apply publication (the RFC
   0022 §4.9 authority-first pattern), and graph-branch create/delete
   (unchanged).
 - `omnigraph repair` loses its drift classes for content tables and gains one
-  report: pins whose promotion is blocked by a foreign linear commit. Such a
-  table keeps accepting writes (they chain detached); the blocked twin is a
-  garbage-collection and change-feed-pruning cost until repaired.
+  report: pins whose promotion is blocked by a foreign linear commit, on every
+  live graph branch. Two writer classes meet a blocked pin differently.
+  Mutation and load keep writing (they chain detached behind the pin). The
+  writers that plan on the table's linear HEAD are refused: branch merge, index
+  builds, schema apply, the system-column upgrade, Optimize, and a branch's
+  first-touch fork of that table. The block is reported, not resolved: `repair`
+  refuses it in preview and in confirm, with or without `--force`, and no
+  command resolves it yet (see [Unresolved questions](#unresolved-questions)).
+  Until one does, the blocked twin is a garbage-collection and
+  change-feed-pruning cost.
 - `omnigraph cleanup` first promotes every pending pin, then
   deletes detached copies with verified linear twins of published pins, and
-  runs stock Lance version cleanup on eligible tables. Uncertain staging
-  defers GC for its table. `--keep N` keeps its meaning for eligible tables.
+  runs stock Lance version cleanup on eligible tables, where an **eligible
+  table** is one that holds no detached copy of a blocked pin and no detached
+  copy without reclamation proof. A blocked or unproven copy defers GC for its
+  table, and the deferral reason names the retained versions. `--older-than`
+  only filters which proven copies are reaped; it never makes a table
+  ineligible. `--keep N` keeps its meaning for eligible tables. A write that
+  fails between its detached commit and publication leaves an unproven copy,
+  so its table stays deferred on every run; the operator has no recourse yet
+  beyond reading the reason. `cleanup` exits 0 when every table was visited,
+  including deferred ones.
 - `optimize` stages compaction as detached transactions and promotes them
   like any other write; it no longer holds a maintenance sidecar or a
   one-mutation-process boundary.
 - Direct CLI writers and a live server no longer interact through
   `__recovery/`. They race only at the manifest publication.
-- Graph branches created after activation own no per-table native forks. Older
-  branches keep their existing forks and pins; new writes to them stage
-  detached inside the fork's tree and promote there.
+- A graph branch owns a per-table native fork from its first write to that
+  table. The fork is created at first touch without an intent record, and
+  writes to it stage detached inside the fork's tree and promote there.
+  [Branches](#branches) owns the rule for how long `cleanup` retains a fork.
 
 ## Design
 
@@ -247,7 +264,7 @@ serving a write from the cache is exactly as safe as serving a read.
 | Writer | Today | Under this RFC |
 |---|---|---|
 | Mutation / Load | sidecar arm, N exact linear commits, sidecar confirm, CAS, delete; per-commit exactness check | N detached commits from the pinned bases, one CAS, N promotions. No sidecar; nothing can rebase before publication. |
-| Branch merge | pre-minted chain of at most 1,024 transactions per table, confirmed-chain proof, partial-prefix rollback | chunks chain detached; pointer adoption pins the source's staged or linear version directly; abandoned chains are garbage; promotion replays each chunk in order, or restores the chain tip when the chain is long (row stamps of restored rows are then not monotonic, and the pruned change-feed and proven-pure-insert paths already fall back on `Restore`). The pre-minted identity keeps its uuid and binds to the version actually staged on, which for a chained chunk is detached; the pin publishes the linear base plus the chain length with the tip as its staged version. Prototyped: a merge of two inserts, an update and a delete produced a chain of three and promoted in order. |
+| Branch merge | pre-minted chain of at most 1,024 transactions per table, confirmed-chain proof, partial-prefix rollback | chunks chain detached; pointer adoption pins the source's staged or linear version directly; abandoned chains are garbage; promotion replays each chunk in order, which is the only shipped path (a `Restore` of the chain tip for long chains is an unresolved question below). The pre-minted identity keeps its uuid and binds to the version actually staged on, which for a chained chunk is detached; the pin publishes the linear base plus the chain length with the tip as its staged version. Prototyped: a merge of two inserts, an update and a delete produced a chain of three and promoted in order. |
 | Schema apply | exact Overwrite and create identities, Armed/EffectsConfirmed, rollback reclaims first-touch datasets | existing-table rewrites stage detached and promote; new-type creation is a linear v1 create at the identity path, which the accepted allocator makes deterministic, so the retry reclaims an unregistered leftover under the sentinel instead of needing a rollback; the staged contract records the graph commit that publishes it, and promotion follows the publication as idempotent work whose authority is that commit in lineage (an unpublished staging is discarded at the next read-write open) |
 | Ensure indices / FTS rebuild | one mixed CreateIndex per table under a sidecar | CreateIndex stages detached and promotes; index files live under the root `_indices/{uuid}`; the analyzer certificate is unchanged; the index is usable on the detached version (probe 4). Prototyped for ensure-indices: no sidecar, the pre-minted identity bound as for merge, and the branching suite's index cases pass. |
 | Optimize | bounded maintenance sidecar, one-mutation-process boundary, monotonic publication that adopts whatever pin is current | `plan_compaction`, execute each `CompactionTask` against the pinned base, assign the `RewriteResult` fragments ids above the base's high-water mark, stage one detached `Rewrite`, publish the tip, promote by replay (probe 13 prototyped a `ReserveFragments` plus `Rewrite` pair; the shipped step needs no reservation). With stable row ids the tasks are not address-style, so no index remap and no fragment-reuse index. Publication must be an exact CAS on the pin the compaction was planned from: today's monotonic publish is safe only because the linear commit already serialized against concurrent writers, and under detached staging it would publish a compaction over a writer's newer pin and hide that writer's rows. A moved pin means the staged compaction is discarded and Optimize re-plans. Compaction is a single detached `Rewrite` with fragment ids allocated above the base's maximum; there is no `ReserveFragments`, whose replay would not conflict with its twin (see Promotion). A deferred index build commits detached after the rewrite and stays inside Optimize's one pin; the stale auto-cleanup config strip leaves Optimize for an explicit migration step, because a delete-only `UpdateConfig` replay does not conflict with its twin either. Index folding through Lance's own merge cannot: Lance 11 keeps `merge_indices` crate-private and `optimize_indices` only commits linearly. The shipped step folds a lagging scalar or vector index by rebuilding it whole under its name with the public `CreateIndexBuilder` as a detached commit chained on the rewrite, which leaves the one segment Lance's merge would leave and keeps a vector index's partition count; a public uncommitted merge remains an upstream ask that would make the fold incremental. Prototyped, including the cross-process loser. |
@@ -307,9 +324,12 @@ two-process evidence below; both leave exactly one twin at the target.
 Promotion order per table follows the manifest clock. The publishing writer
 promotes its own pins after the CAS. A later writer on the same table
 promotes any pending predecessors before staging, so its detached base is a
-linear version whenever promotion is healthy; when a predecessor is blocked,
-it stages from the detached base instead and its own promotion waits behind
-the block. `cleanup` promotes everything pending before it reclaims.
+linear version whenever promotion is healthy. When a predecessor is blocked,
+a mutation or load stages from the detached base instead and its own
+promotion waits behind the block. A writer that plans on the table's linear
+HEAD (branch merge, index build, schema apply, the system-column upgrade,
+Optimize, a first-touch fork) is refused behind a blocked pin, because its
+effect would rebase over the foreign commit. `cleanup` promotes everything pending before it reclaims.
 
 This makes the reconciler part of the write path, not only of `cleanup`:
 a write whose pin is held in the handle cache pays nothing, a write on a
@@ -349,13 +369,23 @@ Cleanup therefore inventories immutable published pins, including superseded
 pins, and verifies each candidate's transaction UUID against its linear twin.
 For a published chain it verifies the corresponding twin of each link before
 reclaiming the detached copy. Missing, foreign, or unreadable evidence retains
-the manifest. Age is only an eligibility filter after that proof. Cleanup
+the manifest, with one exception: a detached copy whose linear target is
+absent while the table head is at or past the target is reclaimable, because
+the twin was promoted and later pruned and the resolution rule already
+refuses to serve that copy. A foreign uuid at the target stays
+non-reclaimable. `--older-than` only filters which proven copies a run reaps:
+a proven copy younger than the cutoff stays in place and does not defer its
+table's GC. Cleanup
 classifies chains before deleting links, so deleting one copy cannot invalidate
-the proof for another copy in the same pass.
+the proof for another copy in the same pass. It deletes a chain's links oldest
+first and the tip last. The proof is keyed on the pin's staged tip, so a pass
+that stops early leaves the tip and the next pass proves the remaining links
+again.
 
 Stock Lance does not trace detached references and may remove old unverified
-data even with `delete_unverified: false`. Any retained detached manifest thus
-defers version/file GC for its table storage, while unaffected tables continue.
+data even with `delete_unverified: false`. A retained pending or unproven
+detached manifest thus defers version/file GC for its table storage, and the
+deferral reason names the retained versions, while unaffected tables continue.
 The conservative consequence is indefinite retention of unproven abandoned
 staging. Durable writer fencing, rather than a larger timeout, is the prerequisite
 for reclaiming that state. No new journal or lease is introduced here.
@@ -363,8 +393,13 @@ for reclaiming that state. No new journal or lease is introduced here.
 Lost acknowledgement resolution reads the attempted immutable manifest version
 on the captured native branch, checking commit identity and lineage. A newer
 HEAD is not evidence of failure. Success returns that exact version with its
-matching state and projection. An unavailable readback remains explicitly
-indeterminate and is never an instruction to retry a non-idempotent mutation.
+matching state and projection. When the publish failed before any object-store
+request, the attempted version does not exist and the branch head is below it,
+the commit never landed and the caller gets the original error. A storage error
+is excluded from that rule, because its request may still land after the
+probe. Any other unavailable readback remains explicitly
+indeterminate and is never an instruction to retry a non-idempotent mutation;
+that in-doubt error names the `graph_commit_id`.
 
 ### Reads
 
@@ -380,8 +415,14 @@ versions of the root datasets. Writes on the branch stage detached from those
 pins and promote inside the same lineage. Counters diverge per chain exactly
 as native shallow clones diverge today; three-way merge compares logical ids.
 RFC 0042's incarnation-suffixed refs remain for `__manifest` native branches.
-Table forks named `fork.{...}` are no longer created; existing ones are
-retained physical state reclaimed by cleanup when nothing pins them.
+Table forks named `fork.{owner incarnation}.m{base manifest version}.{graph
+commit}` are created at a branch's first write to a table, without an intent
+record. A fork is unpublished until its writer's manifest CAS lands, and
+nothing pins it in that window. Cleanup must retain an unpublished fork while
+the graph branch incarnation in its name is a live native graph branch, and
+must retain a generated fork name it cannot parse. It may reclaim an
+unpublished fork once that incarnation is gone. Age proves nothing here
+either.
 
 ### Format and migration
 
@@ -390,8 +431,8 @@ ignores the two keys, opens the linear target, and reads every promoted row,
 which the unpatched CLI confirmed against a graph the prototype had written.
 It fails only while a pin is pending, with "historical published dataset
 version N was reclaimed", which is a misdiagnosis rather than a refusal. The
-stamp therefore exists for the pending window, and a downgrade is possible
-after a `cleanup` has promoted everything. The persisted change is exactly two new keys in a
+stamp therefore exists for the pending window. No downgrade route exists: the
+v10 stamp refuses every older binary, promoted or not. The persisted change is exactly two new keys in a
 registration row's version metadata map, `omnigraph.staged_version` and
 `omnigraph.transaction_uuid`, written by `to_create_table_version_request`
 and parsed by `parse_namespace_version_request` next to the existing fork
@@ -427,12 +468,14 @@ binary resolves it.
   promotion changes garbage-collection and pruning cost, never query meaning.
 - 11 (bounded, observable failure): improved; a failed write can no longer
   leave the graph in a recovery-required state, and a blocked promotion is a
-  reported, non-blocking condition.
+  reported condition that never fails a read, a mutation or a load.
 - 12 (one source of truth): unchanged and simpler; no second intent authority.
 - 13 (evidence matches the boundary): this RFC's gates.
 
 Deny-list items touched: "a logical precondition based on physical state" is
-removed with the HEAD-equals-pin check. No custom storage primitive is added;
+removed for mutation and load, which no longer check HEAD against the pin.
+The HEAD-equals-pin check is kept for linear pins: the writers that plan on
+the linear HEAD and `cleanup`'s drift refusal still require it. No custom storage primitive is added;
 garbage collection stays with Lance for the linear chain, and detached
 manifest reaping uses the public listing.
 
@@ -918,7 +961,7 @@ The extended run adds the same-handle, other-process and cleanup actors
   no non-rebasing commit), #8801 and #9118 (preconditions exclude detached),
   #8097 (referenced files refuses detached), #9062 (orphan staging manifests),
   #8465 and issue #8466 (restore row-id reuse: only restores to an older
-  version are affected; this RFC restores only chain tips), #9180 (directory
+  version are affected; this RFC ships no `Restore`), #9180 (directory
   manifest write cost, same shape as this graph's `__manifest`).
 - Discussions #3734, #5952, #5849, #6775, #7260, #7264, #7499.
 - Lance 12.0.0-rc.1 release notes: no change to detached commits, cleanup
@@ -1001,9 +1044,8 @@ The extended run adds the same-handle, other-process and cleanup actors
    table is unblocked remains the open question below.
 
 Each stop leaves `main` shippable; the stamp gates activation. Roll the
-server out before any CLI that writes to the same bucket, because a pending
-pin is unreadable to an older binary until promoted, and a `cleanup` before
-a downgrade promotes everything.
+server out before any CLI that writes to the same bucket, because the v10
+stamp refuses an older binary.
 
 Still not validated after the prototype, and therefore the gates that
 remain: an incremental index fold inside Optimize, which needs the upstream
@@ -1018,8 +1060,11 @@ client retries converge against their own durable-but-denied commits), the
 requalified randomized schema-apply face with its crash windows, and the
 revived persisted-write lie verbs against the schema control objects, which
 the engine answers with a loud typed refusal. The failure matrix covers ten
-writers — load, the explicit full-text rebuild, and the system-column
-upgrade included — across every window, fault and recovery actor.
+writers (load, the explicit full-text rebuild, and the system-column upgrade
+included), each across its own windows, every fault and every recovery actor.
+The `Cleanup` writer carries two of the six window kinds, `InPromotion` and
+`CleanupPreReap`; it has no detached effect or publication of its own to
+interrupt.
 
 ## Throughput after this RFC
 
@@ -1126,18 +1171,26 @@ claims).
   keep the branch gate for same-branch writers and make the schema gate a
   shared/exclusive lock so cross-branch writers and independent merges stop
   serializing process-wide (#643); nothing in this RFC depends on the gates
-  for correctness.
-- The chain length above which merge promotion uses `Restore` of the tip
-  instead of per-chunk replay.
+  for correctness. Decided by the engine maintainers in the change that
+  closes #643.
+- Whether merge promotion ever uses `Restore` of the chain tip instead of
+  per-chunk replay, and above which chain length. Per-chunk replay is the only
+  shipped path. A `Restore` makes the row stamps of restored rows
+  non-monotonic. Decided by the engine maintainers when a measured merge shows
+  per-chunk promotion cost near the 1,024-chunk bound.
 - Group commit at the branch gate is a separate proposal; here it is N
-  detached commits, one publication, N promotions.
+  detached commits, one publication, N promotions. Decided in that proposal,
+  when it opens.
 - How a blocked table is unblocked. A foreign linear commit occupying a
   pin's target never resolves on its own, and every later pin on that table
   waits behind it. The candidates are a `repair` arm that restores the
   blocked pin's detached version over the intruder as a new linear version
   and re-targets the chain behind it, or leaving such tables permanently
   detached with reclamation degraded. Either needs the two-process and
-  fleet evidence in the rollout gates before it is chosen.
+  fleet evidence in the rollout gates before it is chosen. Until then the
+  block is reported by `repair` and resolved by nothing. Decided by the engine
+  maintainers when that evidence exists, or at the first blocked pin `repair`
+  reports on a production graph, whichever comes first.
 
 ## Decision log
 
@@ -1145,8 +1198,10 @@ claims).
 - 2026-09-15: prototyped the design inside the engine for mutation and load
   behind an environment flag; six prototype tests and nineteen existing
   suites pass with it on, and everything passes with it off except the
-  durable-call guard; recorded the witness, metadata, predecessor and
-  registry findings above.
+  durable-call guard; recorded under Evidence and tests what the
+  prototype added to the design: the e-tag witness rule, the two keys in the metadata map, promotion
+  of a pending predecessor before staging, and the durable-call guard
+  registration.
 - 2026-09-15: probe 14 validated the commit-record sequel's storage
   assumptions on the local backend; S3 and Azure runs remain for its own RFC.
 - 2026-09-15: validation pass over every stated assumption. Corrected three
@@ -1173,3 +1228,71 @@ claims).
   author's July 2026 upstream proposal (#7264) and Lance's own transaction
   discussions assume; this removes the OmniGraph-owned garbage collector and
   the change-discovery rewrite from the gates. Added probes 6 and 7.
+- 2026-09-21: amended from the implementation. Each sub-bullet opens with
+  the sentence it supersedes.
+  - Frontmatter `blocked_on`, Storage: "reaps promoted and abandoned detached
+    manifests". Cleanup reaps only UUID-verified promoted detached manifests.
+  - Summary: "and makes per-table native forks unnecessary for new graph
+    branches." Forks stay and are created at a branch's first write to a
+    table. The HEAD-equals-pin precondition is removed for mutation and load
+    only.
+  - User and operational behavior, lost acknowledgement: "#513's idempotency
+    key on the lineage row applies unchanged." The key is future work; the
+    in-doubt error is HTTP 500 `code: internal` and names the
+    `graph_commit_id`.
+  - User and operational behavior, `repair`: "Such a table keeps accepting
+    writes (they chain detached); the blocked twin is a garbage-collection
+    and change-feed-pruning cost until repaired." Mutation and load chain
+    detached; the writers that plan on the linear HEAD are refused; `repair`
+    reports the block on every live graph branch and nothing resolves it yet.
+  - User and operational behavior, `cleanup`: "then deletes detached
+    manifests that are promoted or unreferenced", and its successor
+    "Uncertain staging defers GC for its table." The bullet now defines an
+    eligible table, says that only a pending or unproven copy defers GC, that
+    `--older-than` filters the reap only, and what exit 0 covers.
+  - User and operational behavior, branches: "Graph branches created after
+    activation own no per-table native forks." A branch owns a fork from its
+    first write to a table.
+  - Content writers, branch merge row: "or restores the chain tip when the
+    chain is long". Per-chunk replay is the only shipped path; the tip
+    `Restore` is an unresolved question.
+  - Promotion: "when a predecessor is blocked, it stages from the detached
+    base instead and its own promotion waits behind the block." That holds
+    for mutation and load; a writer that plans on the linear HEAD is refused.
+  - Garbage collection: "`cleanup` deletes detached manifests whose pin is
+    promoted, and abandoned detached manifests older than the retention
+    horizon", and its successor "Age is only an eligibility filter after that
+    proof." Reclamation needs the twin proof; `--older-than` filters which
+    proven copies are reaped and never defers a table's GC; links are deleted
+    oldest first.
+  - Garbage collection, pruned twin: "A detached manifest whose twin has been
+    pruned is garbage that the resolution rule above already refuses to
+    serve; reaping it is a byte cost, so it follows the same retention
+    horizon as abandoned manifests". Restored as a rule with its predicate:
+    the target is absent and the table head is at or past it.
+  - Garbage collection, lost acknowledgement: "An unavailable readback
+    remains explicitly indeterminate and is never an instruction to retry a
+    non-idempotent mutation." A publish that failed before any object-store
+    request, whose attempted version is absent with the branch head below it,
+    returns the original error; the rest, storage errors included, stays
+    indeterminate.
+  - Branches: "Table forks named `fork.{...}` are no longer created; existing
+    ones are retained physical state reclaimed by cleanup when nothing pins
+    them." Forks are created at first touch and retained while the graph
+    branch incarnation in their name is live.
+  - Format and migration: "and a downgrade is possible after a `cleanup` has
+    promoted everything." Rollout: "and a `cleanup` before a downgrade
+    promotes everything." The v10 stamp refuses every older binary; no
+    downgrade route exists.
+  - Invariants: "is removed with the HEAD-equals-pin check." The check is
+    kept for linear pins. Also "a reported, non-blocking condition": a
+    blocked pin refuses the writers that plan on the linear HEAD.
+  - Evidence and tests, `maintenance.rs`: "reaping of promoted and abandoned
+    detached manifests". The owner covers reaping of promoted and retention
+    of uncertain detached manifests. Upstream surfaces: "this RFC restores
+    only chain tips". No `Restore` ships.
+  - Rollout: "across every window, fault and recovery actor." The `Cleanup`
+    writer carries two of the six window kinds.
+  - Unresolved questions: "The chain length above which merge promotion uses
+    `Restore` of the tip instead of per-chunk replay." Reworded to whether it
+    is used at all; every item now names who decides it and when.

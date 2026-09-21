@@ -229,6 +229,13 @@ decide_seam! {
 }
 
 decide_seam! {
+    /// Before the `__manifest` merge-insert is issued: nothing has landed, and
+    /// the failure carries no conflict details, so the publish loop's ambiguity
+    /// arm must prove the attempted version absent instead of reporting doubt.
+    pub static PUBLISH_PRE_MERGE = ("publish.pre_merge", AnyWrite, [Fail]);
+}
+
+decide_seam! {
     /// After the `__manifest` merge-insert committed durably and before the
     /// publisher acknowledges it: the graph is already published and visible,
     /// only the caller's acknowledgement is at risk (the lost-ack window). A
@@ -956,6 +963,7 @@ impl GraphNamespacePublisher {
     }
 
     async fn merge_rows(&self, dataset: Dataset, rows: Vec<PendingVersionRow>) -> Result<Dataset> {
+        fail(&PUBLISH_PRE_MERGE)?;
         let batch = Self::pending_rows_to_batch(rows)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
         let dataset = Arc::new(dataset);
@@ -1073,11 +1081,15 @@ pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
 /// error so a caller does not blindly retry a possibly-durable write; kind
 /// Internal, so the server surfaces it as a server-side unknown rather than a
 /// definitive conflict (RFC 0067).
-fn publish_outcome_in_doubt(original: &OmniError, cause: impl std::fmt::Display) -> OmniError {
+fn publish_outcome_in_doubt(
+    original: &OmniError,
+    graph_commit_id: &str,
+    cause: impl std::fmt::Display,
+) -> OmniError {
     OmniError::manifest_internal(format!(
-        "manifest publish outcome is in doubt: the commit may be durable but it could not be \
-         confirmed ({cause}); reopen the graph to observe it and do not blindly retry a \
-         non-idempotent write. original error: {original}"
+        "manifest publish outcome is in doubt: graph commit {graph_commit_id} may be durable but \
+         it could not be confirmed ({cause}); reopen the graph and look that commit up before \
+         retrying a non-idempotent write. original error: {original}"
     ))
 }
 
@@ -1258,7 +1270,11 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     let ambiguous = !matches!(&err, OmniError::Manifest(m) if m.details.is_some());
                     if let (true, Some(intent)) = (ambiguous, lineage) {
                         if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
-                            return Err(publish_outcome_in_doubt(&err, readback_err));
+                            return Err(publish_outcome_in_doubt(
+                                &err,
+                                &intent.graph_commit_id,
+                                readback_err,
+                            ));
                         }
                         match dataset.checkout_version(new_manifest_version).await {
                             Ok(reloaded) => match read_publish_scan(&reloaded).await {
@@ -1301,6 +1317,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                                     {
                                         return Err(publish_outcome_in_doubt(
                                             &err,
+                                            &intent.graph_commit_id,
                                             "attempted commit identity has inconsistent lineage",
                                         ));
                                     }
@@ -1309,11 +1326,35 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                                     return Err(err);
                                 }
                                 Err(scan_err) => {
-                                    return Err(publish_outcome_in_doubt(&err, scan_err));
+                                    return Err(publish_outcome_in_doubt(
+                                        &err,
+                                        &intent.graph_commit_id,
+                                        scan_err,
+                                    ));
                                 }
                             },
                             Err(readback_err) => {
-                                return Err(publish_outcome_in_doubt(&err, readback_err));
+                                let version_absent = matches!(
+                                    readback_err,
+                                    LanceError::VersionNotFound { .. }
+                                        | LanceError::DatasetNotFound { .. }
+                                );
+                                let failed_before_any_store_request =
+                                    err.storage_failure().is_none();
+                                if version_absent
+                                    && failed_before_any_store_request
+                                    && matches!(
+                                        dataset.latest_version_id().await,
+                                        Ok(latest) if latest < new_manifest_version
+                                    )
+                                {
+                                    return Err(err);
+                                }
+                                return Err(publish_outcome_in_doubt(
+                                    &err,
+                                    &intent.graph_commit_id,
+                                    readback_err,
+                                ));
                             }
                         }
                     }

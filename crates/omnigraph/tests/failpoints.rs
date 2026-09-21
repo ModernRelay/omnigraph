@@ -8526,3 +8526,216 @@ async fn rfc_0067_pending_merge_diff_keeps_every_chunk() {
     let fresh = Omnigraph::open_read_only(&uri).await.unwrap();
     assert_eq!(count_rows(&fresh, "node:Person").await, after_rows);
 }
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    for name in ["window-one", "window-two", "window-three"] {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+    }
+    let person_uri = node_table_uri(&db, "Person").await;
+    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
+    let detached_before = raw.list_detached_manifests().await.unwrap().len();
+    assert!(
+        detached_before >= 3,
+        "every write leaves its promoted detached copy"
+    );
+
+    for pass in 0..2 {
+        let stats = db
+            .cleanup(omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
+            })
+            .await
+            .unwrap();
+        let person = stats
+            .iter()
+            .find(|row| row.type_key == "node:Person")
+            .unwrap();
+        assert!(
+            person.error.is_none(),
+            "pass {pass}: proven copies inside the age window must not defer version GC: {person:?}"
+        );
+    }
+
+    let detached_after = raw.list_detached_manifests().await.unwrap().len();
+    assert_eq!(
+        detached_after, detached_before,
+        "young proven copies are kept, not reaped"
+    );
+    let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let names = collect_column_strings(&read_table(&fresh, "node:Person").await, "name");
+    for name in ["window-one", "window-two", "window-three"] {
+        assert!(
+            names.contains(&name.to_string()),
+            "{name} must survive cleanup"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_cleanup_delete_failure_mid_chain_converges_on_the_next_pass() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let (uri, _, _) = setup_branch_merge_multichunk_adopt(&dir).await;
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    {
+        let _fp = catalog::BRANCH_MERGE_POST_PUBLISH_PRE_PROMOTION.fire_always();
+        db.branch_merge("feature", "main").await.unwrap();
+    }
+    let after_rows = count_rows(&db, "node:Person").await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
+    let mut links = Vec::new();
+    for copy in raw.list_detached_manifests().await.unwrap() {
+        let staged = raw.checkout_version(copy.version).await.unwrap();
+        let transaction = staged.read_transaction().await.unwrap().unwrap();
+        links.push((copy.version, transaction.read_version));
+    }
+    let before = links.len();
+    assert!(before >= 2, "the merge chain stages one copy per chunk");
+    let policy = || omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    };
+
+    let interrupted = {
+        let _fp = catalog::CLEANUP_REAP_DELETE.fail_once_at(2);
+        db.cleanup(policy()).await.unwrap()
+    };
+    let person = interrupted
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        person.error.is_some(),
+        "the failed delete is reported: {person:?}"
+    );
+    assert!(
+        !person.deferred,
+        "a failed delete is a failure, not a deferral"
+    );
+    let survivors = raw
+        .list_detached_manifests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|copy| copy.version)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        survivors.len(),
+        before - 1,
+        "exactly one copy was deleted before the failure"
+    );
+    for (version, read_version) in &links {
+        assert!(
+            survivors.contains(version) || !survivors.contains(read_version),
+            "copy {version} was deleted while its older link {read_version} remains"
+        );
+    }
+
+    let converged = db.cleanup(policy()).await.unwrap();
+    let person = converged
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        person.error.is_none(),
+        "the surviving tip re-proves the rest of its chain: {person:?}"
+    );
+    assert!(
+        raw.list_detached_manifests().await.unwrap().is_empty(),
+        "every proven copy is reclaimed on the next pass"
+    );
+    let fresh = Omnigraph::open_read_only(&uri).await.unwrap();
+    assert_eq!(count_rows(&fresh, "node:Person").await, after_rows);
+}
+
+#[tokio::test]
+#[serial]
+async fn rfc_0067_blocked_branch_pin_is_reported_by_repair_and_cleanup() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fork-first")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    leave_pending_person_pin(&db, "feature", "fork-blocked").await;
+    let (_, target) = person_head_and_published(&db, "feature").await;
+    let native = helpers::snapshot_branch(&db, "feature")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .native_dataset_branch
+        .clone()
+        .expect("the branch write forked Person");
+    let person_uri = node_table_uri(&db, "Person").await;
+    let mut raw = helpers::open_dataset_head_exact(&person_uri, Some(&native)).await;
+    helpers::lance_delete_inline(&mut raw, "1 = 2").await;
+    assert_eq!(raw.version().version, target);
+
+    let repair = db.repair(RepairOptions::default()).await.unwrap();
+    let blocked = repair
+        .datasets
+        .iter()
+        .filter(|row| row.classification == RepairClassification::BlockedPromotion)
+        .collect::<Vec<_>>();
+    assert_eq!(blocked.len(), 1, "{repair:?}");
+    assert_eq!(blocked[0].type_key, "node:Person");
+    assert_eq!(blocked[0].action, RepairAction::Refused);
+    assert!(
+        blocked[0].error.as_deref().is_some_and(|error| {
+            error.contains("branch 'feature'") && error.contains("foreign")
+        }),
+        "{blocked:?}"
+    );
+
+    let cleanup = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        })
+        .await
+        .unwrap();
+    let person = cleanup
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        person
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("(blocked pin)")),
+        "the deferral names the retained copy and its cause: {person:?}"
+    );
+    assert!(
+        person.deferred,
+        "a retained copy is a deferral, not a failure"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        before + 2
+    );
+}

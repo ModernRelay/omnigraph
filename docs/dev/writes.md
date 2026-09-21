@@ -130,17 +130,24 @@ snapshot predates a promotion sees the linear HEAD one past its published
 version; the current manifest explains that HEAD, so the writer reprepares
 (`ReadSetChanged`) rather than reporting drift. Cleanup skips version GC on a
 table whose pin is blocked. Detached manifests are reclaimed only when a
-published pin and matching transaction UUID prove their linear twins. Age
-filters proven surplus; it does not prove that an unpublished writer stopped.
-Cleanup retains uncertain staging and defers version/file GC for its table,
-while continuing on unaffected tables. Historical pins and chain links use the
-same proof so successful writes do not leave redundant detached copies.
+published pin and matching transaction UUID prove their linear twins, or when
+the target version is absent while the table head is at or past it (the
+resolution rule already refuses to serve such a copy). Age filters which
+proven copies a run reaps and never defers a table's version GC; it does not
+prove that an unpublished writer stopped. Cleanup retains a pending or unproven
+copy and defers version/file GC for its table, naming the retained versions in
+the reason, while continuing on unaffected tables. Historical pins and chain
+links use the same proof so successful writes do not leave redundant detached
+copies, and a chain's links are deleted oldest first so the tip that carries
+the proof goes last.
 
 A pin whose target version a
-foreign linear commit occupies is blocked: a later mutation stages from the
-detached version and its own promotion waits behind the block, while the
-graph-global writers (schema apply, Optimize) promote every pending pin
-before they plan and refuse a blocked one. Optimize plans each table's
+foreign linear commit occupies is blocked: a later mutation or load stages
+from the detached version and its own promotion waits behind the block, while
+the writers that plan on the table's linear HEAD (branch merge, index builds,
+schema apply, the system-column upgrade, Optimize, and a first-touch fork of
+that table) promote every pending pin before they plan and refuse a blocked
+one. Optimize plans each table's
 compaction from its pin and stages the rewrite detached with fragment ids
 above the base's high-water mark, so it needs no `ReserveFragments`; a
 lagging scalar or vector index is rebuilt whole as a detached commit under
@@ -152,9 +159,11 @@ leaves unproven detached versions that cleanup retains; one after it leaves
 pending pins the next writer or cleanup promotes. A strict mutation prepared
 before Optimize's publication reports the same read-set conflict as it would
 after any other writer. `omnigraph repair` reports blocked pins as
-`blocked_promotion` and never adopts the foreign commit. First-touch branch
-forks are created without an intent record; an unreferenced fork is garbage
-that cleanup classifies.
+`blocked_promotion` on every live branch and never adopts the foreign commit;
+nothing resolves a blocked pin yet. First-touch branch
+forks are created without an intent record; cleanup retains an unreferenced
+fork while the graph branch incarnation in its name is live, and classifies
+it as garbage once that incarnation is gone.
 
 The index writer (`ensure_indices` and the explicit full-text rebuild)
 follows the same protocol: it opens each productive table at its pin, stages
@@ -248,8 +257,11 @@ the existing unique commit ID separates attempts across legacy owners.
 The base manifest version and graph commit ID already belong to the captured
 attempt. Name construction adds no storage request, version reservation, or
 rename. The fork is created from the captured source ref and version without
-any intent record; a fork no manifest entry references is garbage that
-cleanup classifies.
+any intent record. A fork no manifest entry references is unpublished, not
+abandoned: cleanup retains it while the owner incarnation in its name is a
+live native graph branch, retains a generated name it cannot parse (the
+`legacy` spelling included), and reclaims it once that incarnation is gone.
+The name only retains; it never establishes ownership.
 
 `TableVersionMetadata.table_fork_owner` records ownership in the existing
 manifest metadata. Existing owned writes retain the actual physical ref;
@@ -301,7 +313,7 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Any writer fails before publication, after any detached effect | Typed error; no graph movement; unproven detached staging is retained |
 | Any writer fails after publication, before promotion | Acknowledged; the pin stays pending, readable through its staged version, and the next writer of the table or cleanup promotes it |
 | Schema apply or the system-column upgrade fails after publication, before its contract is installed | `RecoveryRequired` naming the published commit; the next read-write open, `refresh`, or that handle's next write installs the staged contract |
-| A foreign linear commit occupies a pin's target version | The pin is blocked: content writers keep writing behind it, graph-global writers refuse the table, `repair` reports `blocked_promotion` |
+| A foreign linear commit occupies a pin's target version | The pin is blocked: mutations and loads keep writing behind it; branch merge, index builds, schema apply, the system-column upgrade, Optimize and a first-touch fork refuse the table; `repair` reports `blocked_promotion` on every live branch and nothing resolves it yet |
 | A sidecar from a build that predates detached commits is present | A read-write open and the storage upgrade refuse until that build has resolved it |
 
 An acknowledgement is returned only after the manifest commit is durable and

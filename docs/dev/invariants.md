@@ -44,7 +44,9 @@ five more changes like this one?**
 5. **Crash convergence is part of the commit protocol.** An effect that is
    durable before publication must be unreachable: a detached version or a
    staged file nothing references, which a retry ignores. Cleanup requires
-   proof before reclaiming detached versions; age does not prove abandonment.
+   proof before reclaiming detached versions, and it retains an unpublished
+   first-touch fork while the graph branch incarnation in its name is live;
+   age does not prove abandonment for either.
    An effect that is published must carry in the manifest itself what finishes
    it: a pin's target version, staged version and transaction uuid, a staged
    schema contract's publishing commit. There is no side record to classify.

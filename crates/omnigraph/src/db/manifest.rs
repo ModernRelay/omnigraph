@@ -237,9 +237,16 @@ pub(crate) fn system_columns_at_image(
 pub(crate) struct NativeForkReferences {
     referenced: HashSet<(TableIdentity, String)>,
     owned: HashSet<(TableIdentity, String)>,
+    live_incarnations: HashSet<String>,
 }
 
 impl NativeForkReferences {
+    pub(crate) fn retains_unpublished_fork(&self, native: &str) -> bool {
+        crate::branch_names::retain_unpublished_table_fork(native, |incarnation| {
+            self.live_incarnations.contains(incarnation)
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn contains(&self, identity: TableIdentity, native: &str) -> bool {
         self.referenced.contains(&(identity, native.to_string()))
@@ -1314,6 +1321,11 @@ impl ManifestCoordinator {
         let mut references = NativeForkReferences {
             referenced: HashSet::new(),
             owned: HashSet::new(),
+            live_incarnations: branches
+                .iter()
+                .filter_map(|native| crate::branch_names::split_native_branch_name(native).1)
+                .map(str::to_owned)
+                .collect(),
         };
         let mut add = |native: Option<&str>, snapshot: Snapshot| {
             for entry in snapshot.datasets() {

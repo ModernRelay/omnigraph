@@ -174,6 +174,9 @@ pub struct DatasetCleanupStats {
     pub bytes_removed: u64,
     pub old_versions_removed: u64,
     pub error: Option<String>,
+    /// `error` is a retention reason, not a failure: version GC was skipped for
+    /// a blocked pin or an unproven detached copy, and nothing went wrong.
+    pub deferred: bool,
 }
 
 struct OptimizeTableTask {
@@ -989,7 +992,7 @@ pub async fn cleanup_all_datasets(
     // acknowledged rows only in a detached version, which stock version GC
     // does not protect. Skip GC on it, and protect every link of its chain
     // from the detached-manifest reaper below.
-    let mut blocked_gc_paths = std::collections::HashSet::<String>::new();
+    let mut blocked_gc_locations = std::collections::HashSet::<String>::new();
     let mut protected_detached =
         std::collections::HashMap::<String, std::collections::HashSet<u64>>::new();
     let mut table_locations = std::collections::BTreeSet::<(String, Option<String>)>::new();
@@ -1036,11 +1039,11 @@ pub async fn cleanup_all_datasets(
                 entry.version_metadata.transaction_uuid(),
             ) && let Some(chain) = settle_pin_before_cleanup(db, entry, staged, uuid).await?
             {
-                blocked_gc_paths.insert(full_path.clone());
                 let location = super::promotion::table_location(
                     &full_path,
                     entry.native_dataset_branch.as_deref(),
                 );
+                blocked_gc_locations.insert(location.clone());
                 protected_detached
                     .entry(location)
                     .or_default()
@@ -1059,7 +1062,7 @@ pub async fn cleanup_all_datasets(
             if entry.native_dataset_branch.is_some() {
                 continue;
             }
-            if branch_target.is_none() && !blocked_gc_paths.contains(&full_path) {
+            if branch_target.is_none() && !blocked_gc_locations.contains(&full_path) {
                 let head = db.storage().open_dataset_head(&full_path, None).await?;
                 if head.version() != entry.published_dataset_version {
                     return Err(OmniError::manifest_conflict(format!(
@@ -1120,7 +1123,7 @@ pub async fn cleanup_all_datasets(
 
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
     let storage = db.storage();
-    let blocked_gc_paths = &blocked_gc_paths;
+    let blocked_gc_locations = &blocked_gc_locations;
     let deferred_gc = &deferred_gc;
 
     // Fault-isolated per table: a single table's GC failure is recorded on its
@@ -1129,17 +1132,23 @@ pub async fn cleanup_all_datasets(
     // converge on re-run rather than fail wholesale (invariant 13).
     let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path, live_main_floor)| async move {
-            let outcome: Result<RemovalStats> = async {
+            let outcome: Result<std::result::Result<RemovalStats, String>> = async {
                 fail(&CLEANUP_TABLE_GC)?;
-                if blocked_gc_paths.contains(&full_path) {
-                    return Err(OmniError::manifest_conflict(
+                if blocked_gc_locations.contains(&full_path) {
+                    return Ok(Err(
                         "a published write's promotion is blocked by a foreign commit at its \
-                         target version; version GC is skipped for this table; repair reports \
-                         the block but does not adopt the foreign commit",
+                         target version; version GC is skipped for this table; `omnigraph \
+                         repair` reports the block and nothing resolves a blocked pin yet; \
+                         reads, mutations and loads continue"
+                            .to_string(),
                     ));
                 }
-                if let Some(reason) = deferred_gc.get(&full_path) {
-                    return Err(OmniError::manifest_conflict(reason.clone()));
+                match deferred_gc.get(&full_path) {
+                    Some(GcSkip::Retained(reason)) => return Ok(Err(reason.clone())),
+                    Some(GcSkip::Failed(reason)) => {
+                        return Err(OmniError::manifest_conflict(reason.clone()));
+                    }
+                    None => {}
                 }
                 // `cleanup_old_versions` is a Lance-only maintenance API not
                 // surfaced through `TableStorage` — see the optimize path
@@ -1186,16 +1195,33 @@ pub async fn cleanup_all_datasets(
                 };
                 lance::dataset::cleanup::cleanup_old_versions(ds, policy)
                     .await
+                    .map(Ok)
                     .map_err(OmniError::storage)
             }
             .await;
             match outcome {
-                Ok(removed) => DatasetCleanupStats {
+                Ok(Ok(removed)) => DatasetCleanupStats {
                     type_key: table_key,
                     bytes_removed: removed.bytes_removed,
                     old_versions_removed: removed.old_versions,
                     error: None,
+                    deferred: false,
                 },
+                Ok(Err(reason)) => {
+                    tracing::info!(
+                        target: "omnigraph::cleanup",
+                        table = %table_key,
+                        reason,
+                        "version GC deferred for dataset",
+                    );
+                    DatasetCleanupStats {
+                        type_key: table_key,
+                        bytes_removed: 0,
+                        old_versions_removed: 0,
+                        error: Some(reason),
+                        deferred: true,
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         target: "omnigraph::cleanup",
@@ -1208,6 +1234,7 @@ pub async fn cleanup_all_datasets(
                         bytes_removed: 0,
                         old_versions_removed: 0,
                         error: Some(err.to_string()),
+                        deferred: false,
                     }
                 }
             }
@@ -1245,7 +1272,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
         .await
 }
 
-async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
+pub(super) async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
     let mut branches = db
         .coordinator
         .read()
@@ -1457,7 +1484,7 @@ decide_seam! {
 async fn reconcile_orphaned_branches_under_control_gates(
     db: &Omnigraph,
     before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
-    deferred_gc: &std::collections::HashMap<String, String>,
+    deferred_gc: &std::collections::HashMap<String, GcSkip>,
 ) -> Result<BranchReconcileStats> {
     let resolved = db.resolved_branch_target(None).await?;
     let live_identities = resolved
@@ -1480,8 +1507,8 @@ async fn reconcile_orphaned_branches_under_control_gates(
     let mut references = None;
     let storage = db.storage();
     for (identity, table_key, full_path) in table_targets {
-        if let Some(reason) = deferred_gc.get(&full_path) {
-            stats.failures.push((table_key, reason.clone()));
+        if let Some(skip) = deferred_gc.get(&full_path) {
+            stats.failures.push((table_key, skip.reason().to_string()));
             continue;
         }
         let inventory = async {
@@ -1546,6 +1573,7 @@ async fn reconcile_orphaned_branches_under_control_gates(
                     native.as_str() == "main"
                         || crate::db::is_internal_system_branch(native)
                         || references.contains_tree(identity, native)
+                        || references.retains_unpublished_fork(native)
                 })
                 .cloned(),
         );
@@ -1825,19 +1853,73 @@ async fn settle_pin_before_cleanup(
     }
 }
 
+decide_seam! {
+    /// In cleanup, before each proven detached manifest is deleted (RFC 0067).
+    /// A failure here leaves the chain's tip for the next cleanup to re-prove.
+    pub static CLEANUP_REAP_DELETE = ("cleanup.reap_delete", Unreachable, [Fail]);
+}
+
+/// Why a detached copy keeps its table out of version GC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RetainedDetached {
+    /// A link of a blocked pin's chain: acknowledged rows live only there.
+    PendingPin,
+    /// No published pin proves a linear twin carries the copy's transaction.
+    NoTwinProof,
+}
+
+/// The deferral reason of one table: every retained copy with its cause.
+fn retained_detached_reason(mut retained: Vec<(u64, RetainedDetached)>) -> String {
+    retained.sort_unstable();
+    let listed = retained
+        .iter()
+        .take(8)
+        .map(|(version, why)| match why {
+            RetainedDetached::PendingPin => format!("{version} (blocked pin)"),
+            RetainedDetached::NoTwinProof => format!("{version} (no twin proof)"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = retained.len().saturating_sub(8);
+    let suffix = if more == 0 {
+        String::new()
+    } else {
+        format!(" and {more} more")
+    };
+    format!(
+        "detached versions remain: {listed}{suffix}; version GC is skipped to preserve their data"
+    )
+}
+
 /// Reap only detached copies with a UUID-verified twin of a published pin.
 /// Every retained detached manifest also retains its data: stock Lance GC does
 /// not trace detached references, even with `delete_unverified: false`.
+/// Why one table's version GC is skipped for this run.
+enum GcSkip {
+    /// Copies are retained by rule; nothing went wrong.
+    Retained(String),
+    /// The reaper could not finish its proof or a delete.
+    Failed(String),
+}
+
+impl GcSkip {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Retained(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
+
 async fn reap_detached_manifests(
     db: &Omnigraph,
     locations: &std::collections::BTreeSet<(String, Option<String>)>,
     protected: &std::collections::HashMap<String, std::collections::HashSet<u64>>,
     published: &std::collections::HashMap<String, Vec<crate::db::manifest::DatasetEntry>>,
     before_timestamp: Option<chrono::DateTime<chrono::Utc>>,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, GcSkip> {
     let mut deferred = std::collections::HashMap::new();
     for (full_path, table_branch) in locations {
-        let result: Result<bool> = async {
+        let result: Result<Vec<(u64, RetainedDetached)>> = async {
             let location = super::promotion::table_location(full_path, table_branch.as_deref());
             let handle = db
                 .storage()
@@ -1866,6 +1948,7 @@ async fn reap_detached_manifests(
             // Historical pins outlive their detached copies. Verify only copies
             // still present, rather than reopening every old linear version.
             let mut redundant = std::collections::HashSet::new();
+            let mut proven_chains = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for entry in published.get(&location).into_iter().flatten() {
                 let key = (
@@ -1877,32 +1960,56 @@ async fn reap_detached_manifests(
                     .is_some_and(|version| candidates.contains_key(&version))
                     && seen.insert(key)
                 {
-                    redundant.extend(super::promotion::promoted_chain_versions(db, entry).await?);
+                    let mut chain = super::promotion::promoted_chain_versions(db, entry).await?;
+                    chain.reverse();
+                    redundant.extend(chain.iter().copied());
+                    proven_chains.push(chain);
                 }
             }
-            let mut retained = false;
-            for (version, last_modified) in candidates {
-                if protected
+            let is_protected = |version: &u64| {
+                protected
                     .get(&location)
-                    .is_some_and(|versions| versions.contains(&version))
-                    || !redundant.contains(&version)
-                    || before_timestamp.is_some_and(|cutoff| last_modified >= cutoff)
-                {
-                    retained = true;
-                    continue;
+                    .is_some_and(|versions| versions.contains(version))
+            };
+            let retained = candidates
+                .keys()
+                .filter_map(|version| {
+                    if is_protected(version) {
+                        Some((*version, RetainedDetached::PendingPin))
+                    } else if !redundant.contains(version) {
+                        Some((*version, RetainedDetached::NoTwinProof))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            for chain in proven_chains {
+                for version in chain {
+                    let Some(last_modified) = candidates.get(&version).copied() else {
+                        continue;
+                    };
+                    if is_protected(&version)
+                        || before_timestamp.is_some_and(|cutoff| last_modified >= cutoff)
+                    {
+                        break;
+                    }
+                    fail(&CLEANUP_REAP_DELETE)?;
+                    let detached = super::promotion::detached_manifest_path(&location, version);
+                    db.storage_adapter().delete(&detached).await?;
+                    candidates.remove(&version);
                 }
-                let detached = super::promotion::detached_manifest_path(&location, version);
-                db.storage_adapter().delete(&detached).await?;
             }
             Ok(retained)
         }
         .await;
-        let reason = match result {
-            Ok(false) => continue,
-            Ok(true) => "detached manifests remain without reclamation proof or within the retention window; version GC is skipped to preserve their data".to_string(),
-            Err(error) => format!("could not prove detached manifests reclaimable; version GC is skipped: {error}"),
+        let skip = match result {
+            Ok(retained) if retained.is_empty() => continue,
+            Ok(retained) => GcSkip::Retained(retained_detached_reason(retained)),
+            Err(error) => GcSkip::Failed(format!(
+                "could not prove detached manifests reclaimable; version GC is skipped: {error}"
+            )),
         };
-        deferred.insert(full_path.clone(), reason);
+        deferred.insert(full_path.clone(), skip);
     }
     deferred
 }

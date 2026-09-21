@@ -125,12 +125,14 @@ does not rewrite lost or corrupt data.
 
 A `blocked_promotion` classification names a table whose published write
 cannot land on the linear history because a foreign commit took its version.
-Reads, mutations, branch merge and index maintenance keep working through
-the pin; schema apply, the system-column upgrade, and optimize refuse that
-table until the block is
-resolved, and `cleanup` skips version GC for it because only the pin's
-detached version holds the acknowledged rows. Repair reports it and never
-adopts the foreign commit, with or without `--force`.
+Reads, mutations and loads keep working through the pin. Branch merge, index
+builds, schema apply, the system-column upgrade, optimize and a branch's first
+write to that table refuse it. `cleanup` skips version GC for it because only
+the pin's detached version holds the acknowledged rows. Repair reports the
+block on every live branch, so one table can appear once per branch with the
+same `type_key` (the `error` field names the branch), and never adopts the
+foreign commit, with or without `--force`. No command resolves a blocked pin yet; see
+[Troubleshooting](troubleshooting.md#blocked-pin).
 
 If you cannot verify suspicious drift, restore or rebuild from a trusted export
 or backup.
@@ -160,15 +162,17 @@ At least one retention option is required:
 | Option | Meaning |
 |---|---|
 | `--keep N` | Request retention of the newest `N` versions per retained node or edge dataset |
-| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff; also reap older detached manifests only after verifying the linear twin of a published write |
+| `--older-than DURATION` | Remove only older versions; defer unused-fork collection while any data or branch-reference object is newer than the cutoff; among detached manifests whose linear twin is verified, reap only the older ones. A verified detached manifest newer than the cutoff stays in place and does not defer its table's version GC |
 
 When both are present, a version must be outside both retention windows before
 it can be removed. Live branches and other storage references may keep
 additional versions. The count applies to dataset versions, not graph commits,
-and does not retain unused forks indefinitely. With `--keep` alone, an unused
-fork can be collected immediately. An explicit `--older-than` also protects the
-entire fork until every data and branch-reference object is older than the
-cutoff. Deleting a branch starts a fresh grace period for its retained history,
+and does not by itself retain forks. A fork that no pin references is collected
+once the graph branch incarnation in its name is gone: immediately with `--keep`
+alone, and with `--older-than` only after every data and branch-reference object
+of the fork is older than the cutoff. Forks of a live branch are kept. Forks
+whose name carries no incarnation, which includes every fork of a branch
+created before incarnation-suffixed names, are kept permanently. Deleting a branch starts a fresh grace period for its retained history,
 even when that history is old. Choose a policy that matches your rollback and audit needs.
 
 For `s3://` and `az://` targets, destructive execution also requires an
@@ -177,7 +181,8 @@ without `--yes`.
 
 Before cleanup:
 
-1. stop writers and long-lived Blob readers;
+1. stop long-lived Blob readers and readers of snapshots the policy removes;
+   writers may keep running (see below);
 2. verify important branches and snapshots;
 3. make or verify a backup/export;
 4. resolve interrupted operations and any drift reported by `repair`;
@@ -187,13 +192,31 @@ Cleanup fails closed if it cannot prove that live branches or storage drift
 are safe. A failure to clean one backing dataset is reported in
 the result; fix the cause and rerun cleanup to converge.
 
-Detached manifests without a verified linear twin are retained even when old:
-a writer may still publish them. Cleanup reports skipped version GC for their
-table, preserving their data files, and continues with unaffected tables. This
-can retain abandoned staging indefinitely; an age cutoff is not proof that a
-writer has stopped. Proven promoted copies and intermediate chain links remain
-reclaimable. `repair` reports a foreign commit blocking promotion but does not
-adopt it, including with `--force`.
+Cleanup may run beside live writers. A write that has not published yet keeps
+its detached manifests, and a branch's first-write table fork is kept while
+that branch is live. Such a table's version GC is deferred for the run, and a
+later cleanup converges once the write has published. A write that lands on
+main while cleanup is classifying can make the run stop with a HEAD-drift
+refusal; rerun cleanup.
+
+Two things defer a table's version GC: a detached manifest without a verified
+linear twin, and a blocked pin. Cleanup promotes a pending pin itself. Both are retained
+even when old, because a writer may still publish them and an age cutoff is
+not proof that a writer has stopped. The table's result row sets `deferred` to `true` and its `error` field (under `--json`) names the retained
+detached versions and which cause applies. Cleanup preserves their data files
+and continues with unaffected tables. Staging that a failed write abandoned is
+retained indefinitely and keeps deferring that table. A detached manifest whose
+linear twin is verified never defers version GC, whatever its age;
+`--older-than` only decides whether it is reaped in this run. A detached
+manifest whose target version is gone while the table is already at or past
+that version is also reclaimable. A chain's links are deleted oldest first, so
+an interrupted run leaves a chain the next run can still verify.
+
+Exit 0 means every table was visited and nothing that a live branch, a
+pending pin or an unverified detached manifest needs was removed. It does not
+mean every table was collected: read the result rows for failed and deferred
+tables. `repair` reports a foreign commit blocking promotion but does not adopt
+it, including with `--force`.
 
 ## Suggested cadence
 

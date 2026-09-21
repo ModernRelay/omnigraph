@@ -2223,6 +2223,35 @@ async fn cleanup_age_window_preserves_recent_detached_fork_snapshot() {
     assert_eq!(before.num_rows(), base_count + 1);
     db.cleanup(CleanupPolicyOptions {
         keep_versions: Some(1),
+        older_than: Some(Duration::ZERO),
+    })
+    .await
+    .unwrap();
+    assert!(
+        Dataset::open(&company_uri)
+            .await
+            .unwrap()
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(&native),
+        "zero-age cleanup must retain forks while their native owner remains live",
+    );
+    let reopened = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
+    let after = reopened
+        .query(
+            ReadTarget::snapshot(saved_commit),
+            query,
+            "companies",
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.num_rows(), base_count + 1);
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
         older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
     })
     .await
@@ -2237,17 +2266,12 @@ async fn cleanup_age_window_preserves_recent_detached_fork_snapshot() {
             .contains_key(&native),
         "an exact endpoint inside the explicit age window must survive pointer detachment",
     );
-    let reopened = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
-    let after = reopened
-        .query(
-            ReadTarget::snapshot(saved_commit),
-            query,
-            "companies",
-            &Default::default(),
-        )
+    let retained = helpers::open_dataset_head_exact(&company_uri, Some(&native))
+        .await
+        .checkout_version(saved_entry.published_dataset_version)
         .await
         .unwrap();
-    assert_eq!(after.num_rows(), base_count + 1);
+    assert_eq!(retained.count_rows(None).await.unwrap(), base_count + 1);
     db.cleanup(CleanupPolicyOptions {
         keep_versions: Some(1),
         older_than: Some(Duration::ZERO),
@@ -2262,7 +2286,7 @@ async fn cleanup_age_window_preserves_recent_detached_fork_snapshot() {
             .await
             .unwrap()
             .contains_key(&native),
-        "an unused fork becomes reclaimable once every age observation is outside the window",
+        "a retired owner's unused fork becomes reclaimable outside the age window",
     );
     assert_eq!(
         count_rows_branch(&reopened, "feature", "node:Company").await,
@@ -2568,6 +2592,8 @@ async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
             .dataset("node:Company")
             .unwrap()
             .clone();
+        db.branch_delete("feature").await.unwrap();
+        db.branch_create("feature").await.unwrap();
         db.cleanup(CleanupPolicyOptions {
             keep_versions: Some(1),
             older_than: None,
@@ -2584,7 +2610,7 @@ async fn cleanup_preserves_detached_native_fork_pinned_by_lazy_child() {
                 .await
                 .unwrap()
                 .contains_key(borrowed.native_dataset_branch.as_deref().unwrap()),
-            "the written child still needs its ancestor's native fork"
+            "the child still needs its retired ancestor's native fork"
         );
         let reopened = Omnigraph::open(db.uri()).await.unwrap();
         for handle in [&db, &reopened] {

@@ -1,0 +1,88 @@
+# issue: none
+# notes: An update failing after all detached effects preserves the old values before and after restart. Retrying on the same branch remains writable.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+branch create work
+
+--- expect ok
+
+--- seam
+at: mutation.post_finalize_pre_publisher
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate branch: work
+query update_alice() { update Person set { age: 31 } where name = "alice" }
+
+--- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
+
+--- query branch: work
+query values_before_restart() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I64
+
+--- restart
+
+--- query branch: work
+query values_after_restart() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I64
+
+--- mutate branch: work
+query update_again() { update Person set { age: 32 } where name = "alice" }
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: work
+query durable_values() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query branch: main
+query main_unchanged() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":30}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I64
