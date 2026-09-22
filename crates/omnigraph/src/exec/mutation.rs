@@ -435,13 +435,7 @@ fn predicate_to_sql(
         }
     };
 
-    // #283: emit the column UNQUOTED. Lance's `Scanner::filter(&str)` (the
-    // committed-scan consumer) preserves an unquoted identifier's case but
-    // treats a double-quoted `"col"` as a string literal, so quoting here
-    // would silently match zero committed rows. The pending-batch MemTable
-    // query is instead made case-preserving by disabling DataFusion identifier
-    // normalization on its `SessionContext` (see `scan_pending_batches`).
-    Ok(format!("{} {} {}", column, op, value_sql))
+    Ok(format!("`{}` {} {}", column, op, value_sql))
 }
 
 /// Replace specific columns in a RecordBatch with new literal values.
@@ -1765,31 +1759,26 @@ fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
 mod predicate_sql_tests {
     use super::*;
 
-    // #283: a camelCase column in a mutation predicate must be emitted
-    // UNQUOTED and case-preserved. The committed-scan consumer, Lance's
-    // `Scanner::filter(&str)`, preserves an unquoted identifier's case but
-    // treats a double-quoted `"col"` as a string literal (which silently
-    // matches zero rows), so the predicate string must not quote the column.
-    // The pending MemTable path stays case-preserving by disabling DataFusion
-    // identifier normalization on its context, not by quoting here.
     #[test]
-    fn predicate_to_sql_preserves_camelcase_column_unquoted() {
-        let predicate = IRMutationPredicate {
-            property: "repoName".to_string(),
-            op: CompOp::Eq,
-            value: IRExpr::Literal(Literal::String("acme".into())),
-        };
-        let sql = predicate_to_sql(
-            &predicate,
-            &ParamMap::new(),
-            false,
-            omnigraph_compiler::SYSTEM_COLUMNS_V3,
-        )
-        .unwrap();
-        assert_eq!(
-            sql, "repoName = 'acme'",
-            "column must be unquoted and case-preserved, got {sql}"
-        );
+    fn predicate_to_sql_backtick_quotes_column_case_preserved() {
+        for (property, expected) in [
+            ("repoName", "`repoName` = 'acme'"),
+            ("interval", "`interval` = 'acme'"),
+        ] {
+            let predicate = IRMutationPredicate {
+                property: property.to_string(),
+                op: CompOp::Eq,
+                value: IRExpr::Literal(Literal::String("acme".into())),
+            };
+            let sql = predicate_to_sql(
+                &predicate,
+                &ParamMap::new(),
+                false,
+                omnigraph_compiler::SYSTEM_COLUMNS_V3,
+            )
+            .unwrap();
+            assert_eq!(sql, expected);
+        }
     }
 
     #[test]

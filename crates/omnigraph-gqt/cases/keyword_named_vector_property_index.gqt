@@ -1,0 +1,40 @@
+# issue: none
+# notes: Indexed Vector properties named like SQL prefix keywords (`interval`,
+# notes: `exists`, `trim`) must still be trainable: index reconciliation counts
+# notes: the non-null rows with a filter that reaches Lance as SQL text.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    interval: Vector(2) @index
+    exists: Vector(2) @index
+    trim: Vector(2) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","interval":[0.0,0.0],"exists":[0.0,0.0],"trim":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","interval":[1.0,0.0],"exists":[1.0,0.0],"trim":[1.0,0.0]}}
+
+--- query
+query nearest_by_keyword_property($q: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.trim, $q) }
+    limit 2
+}
+
+--- params
+{"q": [0.9, 0.0]}
+
+--- expect ordered
+{"d.slug":"b"}
+{"d.slug":"a"}
+
+--- expect shape
+d.slug: String

@@ -727,7 +727,7 @@ async fn vector_column_trainable(
 ) -> Result<bool> {
     Ok(db
         .storage()
-        .count_rows(ds, Some(format!("{column} IS NOT NULL")))
+        .count_rows(ds, Some(format!("`{column}` IS NOT NULL")))
         .await?
         > 0)
 }
