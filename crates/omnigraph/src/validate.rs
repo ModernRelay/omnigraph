@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray};
-use datafusion::prelude::{Expr, col, lit};
+use datafusion::prelude::{Expr, col, ident, lit};
 use datafusion::scalar::ScalarValue;
 use futures::TryStreamExt;
 use lance::Dataset;
@@ -467,7 +467,7 @@ impl<'a> CommittedState<'a> {
                     .filter(|(canonical, _)| seen.insert(canonical[i].as_str()))
                     .map(|(_, typed)| lit(typed[i].clone()))
                     .collect();
-                let in_list = col(column.as_str()).in_list(values, false);
+                let in_list = ident(column.as_str()).in_list(values, false);
                 expr = Some(match expr {
                     Some(acc) => acc.and(in_list),
                     None => in_list,

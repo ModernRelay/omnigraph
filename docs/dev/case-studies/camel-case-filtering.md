@@ -41,24 +41,21 @@ The IR property is already one unqualified field name, so parsing a qualified SQ
 
 ### Pending mutation scan
 
-Mutation predicates are also rendered as an unquoted string such as:
+Mutation predicates are rendered as a SQL string with two consumers:
+
+- Lance's committed-row scanner, which preserves the case of an unquoted identifier.
+- DataFusion's SQL parser for the pending in-memory `MemTable`, which normalized an unquoted identifier to lowercase.
+
+Double-quoting the column was not a shared fix: at the Lance boundary, `"repoName"` is a string literal and silently matches no committed rows. The first fix therefore left the predicate unquoted and disabled normalization on the pending DataFusion context. That form had a second hole: a property named like a SQL keyword construct (`interval`, `exists`, `trim`) is a parse error when bare, in both consumers, so `delete Span where interval = 1` failed while reads on `interval` worked.
+
+The predicate is now rendered with backticks:
 
 ```text
-repoName = 'acme'
+`repoName` = 'acme'
+`interval` = 1
 ```
 
-That string has two consumers:
-
-- Lance's committed-row scanner preserves the case of the unquoted identifier.
-- DataFusion's SQL parser for the pending in-memory `MemTable` normalized it to lowercase.
-
-Quoting the column was not a shared fix: at this Lance boundary, double quotes were interpreted as a string literal and could silently match no committed rows. The predicate therefore remains unquoted, while the pending DataFusion context disables normalization:
-
-```rust
-config.options_mut().sql_parser.enable_ident_normalization = false;
-```
-
-This matters only when a multi-statement mutation re-reads a pending row, which explains why ordinary single-statement mutation tests did not expose the second bug.
+Lance reads a backtick-quoted identifier as a case-preserving column (its documented escape for non-standard names), and the generic SQL dialect DataFusion parses the pending query with delimits identifiers with backticks as well, so a quoted identifier is exempt from normalization and the override is gone. The pending side matters only when a multi-statement mutation re-reads a pending row, which explains why ordinary single-statement mutation tests did not expose the second consumer.
 
 ## Regression ownership
 

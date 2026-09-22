@@ -1,0 +1,47 @@
+# issue: 765
+# red_on: 2026-09-22, main @ ed145db4: the insert failed with `No field named versiontag` from the committed-uniqueness probe.
+# notes: A node type with a camelCase `@unique` property accepts a fresh value and
+# notes: refuses a committed one: the probe must address the column by its exact name.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Release {
+    slug: String @key
+    versionTag: String @unique
+}
+
+--- seed
+{"type":"Release","data":{"slug":"r1","versionTag":"v0.1.0"}}
+
+--- mutate
+query insert_release() {
+    insert Release { slug: "r2", versionTag: "v0.2.0" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_duplicate_tag() {
+    insert Release { slug: "r3", versionTag: "v0.1.0" }
+}
+
+--- expect error: @unique violation on Release.versionTag: value 'v0.1.0' held by 'r1' and 'r3'
+
+--- query
+query releases() {
+    match { $r: Release }
+    return { $r.slug, $r.versionTag }
+}
+
+--- expect unordered
+{"r.slug": "r1", "r.versionTag": "v0.1.0"}
+{"r.slug": "r2", "r.versionTag": "v0.2.0"}
+
+--- expect shape
+r.slug: String
+r.versionTag: String
