@@ -197,6 +197,9 @@ jobs:
       - name: Check required contexts report on the merge queue
         run: python3 scripts/check-merge-group-triggers.py --self-test
 
+      - name: Check required test cells exist in the sources
+        run: python3 scripts/check-ci-cells.py --self-test
+
       - name: Assert the classification copies match this workflow
         run: |
           python3 scripts/check-classify-copy.py --self-test
@@ -1113,11 +1116,10 @@ jobs:
 
   azurite_integration:
     name: Azurite Azure Integration
-    # This configured backend contract runs after merge, on tags, and by
-    # manual dispatch. Keep it independent of `test` so cold backend graphs
-    # start together and a failure reports at its real boundary.
+    # Reporting context on pull requests and after merge (docs/dev/ci.md);
+    # independent of `test` so a failure reports at its real boundary.
     needs: classify_changes
-    if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
     # Cold failpoint and default-feature Lance graphs compile sequentially on
     # the first cache miss; keep the timeout above the RustFS shard envelope.
@@ -1226,59 +1228,47 @@ jobs:
           PY
 
       - name: Run exact Azure integration owners
+        # Each owner is named once; scripts/check-ci-cells.py reads the names.
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/azurite-azure.log"
           : >"$test_log"
 
-          cargo test --locked -p omnigraph-storage \
-            tests::contract_suite_azure_when_configured \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
-          cargo test --locked -p omnigraph-azure-admission \
-            tests::configured_azurite_enforces_one_lease_owner_and_explicit_break \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          require_cell() {
+            grep -Eq "test (tests::)?${1} \.\.\. ok" "$test_log" \
+              || { echo "::error::required Azure cell '${1}' did not execute normally"; exit 1; }
+          }
+          run_cell() {
+            local name="$1"
+            shift
+            cargo test --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee -a "$test_log"
+            require_cell "${name#tests::}"
+          }
+
+          run_cell tests::contract_suite_azure_when_configured -p omnigraph-storage
+          run_cell tests::configured_azurite_enforces_one_lease_owner_and_explicit_break -p omnigraph-azure-admission
           cargo test --locked -p omnigraph-azure-admission --test supervisor \
             -- --nocapture 2>&1 | tee -a "$test_log"
-          cargo test --locked -p omnigraph-engine --features failpoints --test failpoints \
-            azure_recovery_rolls_forward_after_finalize_publisher_failure \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
-          cargo test --locked -p omnigraph-engine --features failpoints --test failpoints \
-            azure_schema_apply_recovers_source_and_destination_after_partial_rename \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
-          cargo test --locked -p omnigraph-cluster --test s3_cluster \
-            azure_cluster_full_lifecycle_import_apply_serve_evolve_delete \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
-          cargo test --locked -p omnigraph-server --test s3 \
-            server_opens_azure_graph_directly_and_serves_snapshot_and_read \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
-          cargo test --locked -p omnigraph-server --test s3 \
-            server_boots_azure_cluster_from_bare_storage_uri_and_serves_query \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
-          cargo test --locked -p omnigraph-cli --test system_local \
-            local_cli_azure_end_to_end_init_load_read_flow \
-            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+          for test_name in \
+            held_admission_never_launches_child_then_runs_once_after_release \
+            held_job_terminated_before_admission_fails_without_launching_child \
+            graceful_server_signal_drains_process_group_before_release \
+            unexpected_server_exit_strands_lease_until_explicit_break
+          do
+            require_cell "$test_name"
+          done
+          run_cell azure_write_pending_pin_is_promoted_by_the_next_write -p omnigraph-engine --features failpoints --test failpoints
+          run_cell azure_optimize_pending_pin_is_promoted_by_the_next_write -p omnigraph-engine --features failpoints --test failpoints
+          run_cell azure_schema_apply_recovers_source_and_destination_after_partial_rename -p omnigraph-engine --features failpoints --test failpoints
+          run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete -p omnigraph-cluster --test s3_cluster
+          run_cell server_opens_azure_graph_directly_and_serves_snapshot_and_read -p omnigraph-server --test s3
+          run_cell server_boots_azure_cluster_from_bare_storage_uri_and_serves_query -p omnigraph-server --test s3
+          run_cell local_cli_azure_end_to_end_init_load_read_flow -p omnigraph-cli --test system_local
 
           if grep -Eiq 'skipping .*azure|skipping .*azurite' "$test_log"; then
             echo "::error::a configured Azure test emitted its unconfigured skip"
             exit 1
           fi
-          for test_name in \
-            contract_suite_azure_when_configured \
-            configured_azurite_enforces_one_lease_owner_and_explicit_break \
-            held_admission_never_launches_child_then_runs_once_after_release \
-            held_job_terminated_before_admission_fails_without_launching_child \
-            graceful_server_signal_drains_process_group_before_release \
-            unexpected_server_exit_strands_lease_until_explicit_break \
-            azure_recovery_rolls_forward_after_finalize_publisher_failure \
-            azure_schema_apply_recovers_source_and_destination_after_partial_rename \
-            azure_cluster_full_lifecycle_import_apply_serve_evolve_delete \
-            server_opens_azure_graph_directly_and_serves_snapshot_and_read \
-            server_boots_azure_cluster_from_bare_storage_uri_and_serves_query \
-            local_cli_azure_end_to_end_init_load_read_flow
-          do
-            grep -Eq "test (tests::)?${test_name} \.\.\. ok" "$test_log" \
-              || { echo "::error::required Azure cell '${test_name}' did not execute normally"; exit 1; }
-          done
 
       - name: Verify control and Lance objects share the declared container
         run: |
