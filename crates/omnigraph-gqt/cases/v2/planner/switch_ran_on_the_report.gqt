@@ -1,0 +1,73 @@
+# issue: none
+# notes: A run-time switch is plan data: the `HashJoin` node declares its
+# notes: `id_lookup` fallback and the Expand its alternative mode, and the
+# notes: execution report names the side each one took. On the ordinary path
+# notes: (a build that fits the pool) the hash join runs and the traversal
+# notes: ends on the mode the planner chose; the memory-refusal side
+# notes: (`ran id_lookup`) needs a pool no case can set and is owned by
+# notes: omnigraph/tests/engine_v2_memory.rs.
+# red_on: 2026-09-22, task 0226 PR C tree (branch v2-plan-lower-trait before PR D): `ran` was not a claim the grammar knew, the report carried a bool per attempt and no node declared a fallback.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Source {
+    slug: String @key
+}
+node Doc {
+    slug: String @key
+    state: String
+}
+edge Links: Source -> Doc
+
+--- seed
+{"type":"Source","data":{"slug":"s1"}}
+{"type":"Source","data":{"slug":"s2"}}
+{"type":"Source","data":{"slug":"s3"}}
+{"type":"Source","data":{"slug":"s4"}}
+{"type":"Doc","data":{"slug":"a","state":"open"}}
+{"type":"Doc","data":{"slug":"b","state":"closed"}}
+{"type":"Doc","data":{"slug":"c","state":"open"}}
+{"type":"Doc","data":{"slug":"d","state":"open"}}
+{"type":"Doc","data":{"slug":"e","state":"open"}}
+{"type":"Doc","data":{"slug":"f","state":"open"}}
+{"edge":"Links","from":"s1","to":"a"}
+{"edge":"Links","from":"s1","to":"b"}
+{"edge":"Links","from":"s2","to":"a"}
+{"edge":"Links","from":"s2","to":"c"}
+{"edge":"Links","from":"s3","to":"d"}
+{"edge":"Links","from":"s3","to":"f"}
+{"edge":"Links","from":"s4","to":"d"}
+{"edge":"Links","from":"s4","to":"f"}
+
+--- query
+set engine = v2;
+query open_links() {
+    match {
+        $s: Source
+        $s links $d
+        $d: Doc { state: "open" }
+    }
+    return { $s.slug, $d.slug }
+    order { $s.slug, $d.slug }
+}
+--- expect ordered
+{"s.slug":"s1","d.slug":"a"}
+{"s.slug":"s2","d.slug":"a"}
+{"s.slug":"s2","d.slug":"c"}
+{"s.slug":"s3","d.slug":"d"}
+{"s.slug":"s3","d.slug":"f"}
+{"s.slug":"s4","d.slug":"d"}
+{"s.slug":"s4","d.slug":"f"}
+--- expect shape
+s.slug: String
+d.slug: String
+--- expect plan
+hash join $d ran hash_join
+expand $s Links $d: mode indexed_scan ran indexed_scan
+pass access_path
+pass expand_mode

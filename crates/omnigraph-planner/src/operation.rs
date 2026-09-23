@@ -1,11 +1,11 @@
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::QueryIR;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The physical owner of one table image: the dataset, its native Lance
 /// branch and the pinned version (RFC 0065), so a routed plan reads exactly
 /// the owner the executor reads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableRef {
     pub type_key: String,
     pub dataset_path: String,

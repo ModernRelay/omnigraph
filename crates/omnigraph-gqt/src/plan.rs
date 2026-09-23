@@ -8,12 +8,22 @@
 //! scan Doc: not columns [embedding]
 //! scan Doc as $d: filter reads [d.state]
 //! scan Doc as $b: no filter
-//! scan Doc as $d: access hash_join
+//! scan Doc as $d: access id_lookup
+//! hash join $d
+//! hash join $d ran id_lookup
+//! scan Doc as $d: ranked bm25
+//! scan Doc as $d: ranked nearest fetch 10
+//! scan Doc as $d: ranked nearest fetch 10 nprobes 20
 //! expand $d Knows $e: mode indexed_scan
+//! expand $d Knows $e: mode indexed_scan ran csr
 //! filter reads [a.state, b.state]
 //! pass projection_pushdown
 //! not pass aggregate_pushdown
 //! ```
+//!
+//! A `ran` claim names the side of the node's declared switch that ran,
+//! read from the execution report of the same run (the last attempt of the
+//! node's row), joined to the explain row by the node's `id`.
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_planner::optimizer::{
@@ -24,7 +34,13 @@ use omnigraph_planner::optimizer::{
 use serde::Serialize;
 use serde_json::Value;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access <id_lookup|hash_join>`, `expand $src <Edge> $dst: mode <csr|indexed_scan>`, `filter reads [a.x, b.y]`, `pass <name>`, `not pass <name>`";
+use crate::report::Row;
+
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a, $b]`, `sort no tiebreak`, `pass <name>`, `not pass <name>`";
+
+const ID_LOOKUP: &str = "id_lookup";
+const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
+const EXPAND_MODES: [&str; 2] = ["csr", "indexed_scan"];
 
 /// What one `scan` line claims of the selected scans.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -48,22 +64,44 @@ pub(crate) enum PlanLine {
         binding: Option<String>,
         claim: ScanClaim,
     },
-    /// A physical scan reaches destination rows through the named access path.
+    /// A physical scan is a traversal's destination reached by the per-slice
+    /// id lookup (`id_restriction` `input`).
     ScanAccess {
         type_name: String,
         binding: Option<String>,
-        access: String,
+    },
+    /// A physical `HashJoin` reaches `$binding`'s rows through a build of
+    /// its table, and when `ran` is claimed, the run took that side of the
+    /// join's declared switch.
+    HashJoin {
+        binding: String,
+        ran: Option<String>,
+    },
+    /// Every selected physical scan is ranked, and one of them by the named
+    /// index, asking it for `fetch` candidates and under the probe cap
+    /// `nprobes` (`0` no cap) when claimed; an `rrf()` has one scan per arm.
+    ScanRanked {
+        type_name: String,
+        binding: Option<String>,
+        index: String,
+        fetch: Option<u64>,
+        nprobes: Option<u64>,
     },
     /// The physical `Expand` from `$src` over `edge_type` to `$dst` runs in
-    /// `mode` (`csr` or `indexed_scan`).
+    /// `mode` (`csr` or `indexed_scan`), and when `ran` is claimed, the run
+    /// ended on that mode.
     ExpandMode {
         src: String,
         edge_type: String,
         dst: String,
         mode: String,
+        ran: Option<String>,
     },
     /// An in-memory `Filter` node stays in the plan reading exactly `reads`.
     Filter { reads: Vec<String> },
+    /// A physical `Sort` declares exactly the ids of `tiebreak` after its
+    /// keys, none when empty.
+    Sort { tiebreak: Vec<String> },
     /// The optimizer pass `name` fired, or did not when `negated`.
     Pass { name: String, negated: bool },
 }
@@ -120,13 +158,47 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             lines.push(PlanLine::Filter { reads });
             continue;
         }
+        if let Some(claim) = line.strip_prefix("sort ") {
+            let claim = claim.trim();
+            let tiebreak = if claim == "no tiebreak" {
+                Vec::new()
+            } else {
+                claim
+                    .strip_prefix("tiebreak")
+                    .and_then(binding_list)
+                    .ok_or_else(|| refused("claims `tiebreak [$a, $b]` or `no tiebreak`"))?
+            };
+            lines.push(PlanLine::Sort { tiebreak });
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("hash join ") {
+            let rest = rest.trim_start();
+            let (binding, claim) = rest.split_once(' ').unwrap_or((rest, ""));
+            let binding = binding
+                .strip_prefix('$')
+                .filter(|binding| identifier(binding))
+                .ok_or_else(|| refused("names the joined binding with `$`"))?;
+            let ran = match choice_and_ran(&format!("{ID_LOOKUP} {claim}"), &JOIN_SIDES) {
+                Some((_, ran)) => ran,
+                None => {
+                    return Err(refused(
+                        "claims `hash join $var[ ran <hash_join|id_lookup>]`",
+                    ));
+                }
+            };
+            lines.push(PlanLine::HashJoin {
+                binding: binding.to_string(),
+                ran,
+            });
+            continue;
+        }
         let (rest, expand) = if let Some(rest) = line.strip_prefix("scan ") {
             (rest, false)
         } else if let Some(rest) = line.strip_prefix("expand ") {
             (rest, true)
         } else {
             return Err(refused(
-                "knows four line heads: `scan`, `expand`, `filter`, `pass`",
+                "knows six line heads: `scan`, `hash join`, `expand`, `filter`, `sort`, `pass`",
             ));
         };
         let Some((selector, claim)) = rest.split_once(':') else {
@@ -143,17 +215,19 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             if !identifier(src) || !identifier(dst) || !identifier(edge_type) {
                 return Err(refused("names nonempty traversal bindings and edge type"));
             }
-            let mode = claim
+            let (mode, ran) = claim
                 .trim()
                 .strip_prefix("mode ")
-                .map(str::trim)
-                .filter(|mode| ["csr", "indexed_scan"].contains(mode))
-                .ok_or_else(|| refused("claims `mode csr` or `mode indexed_scan`"))?;
+                .and_then(|rest| choice_and_ran(rest, &EXPAND_MODES))
+                .ok_or_else(|| {
+                    refused("claims `mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`")
+                })?;
             lines.push(PlanLine::ExpandMode {
                 src: src.to_string(),
                 edge_type: edge_type.to_string(),
                 dst: dst.to_string(),
-                mode: mode.to_string(),
+                mode,
+                ran,
             });
             continue;
         }
@@ -175,16 +249,45 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
         let claim = claim.trim();
         let claim = if claim == "no filter" {
             ScanClaim::NoFilter
-        } else if let Some(access) = claim.strip_prefix("access ") {
-            let access = access.trim();
-            if !["id_lookup", "hash_join"].contains(&access) {
-                return Err(refused("claims `access id_lookup` or `access hash_join`"));
+        } else if let Some(ranked) = claim.strip_prefix("ranked ") {
+            let mut words = ranked.split_whitespace();
+            let kind = words
+                .next()
+                .filter(|kind| ["nearest", "bm25"].contains(kind))
+                .ok_or_else(|| refused("claims `ranked nearest` or `ranked bm25`"))?;
+            let mut fetch = None;
+            let mut nprobes = None;
+            while let Some(key) = words.next() {
+                let count = words.next().and_then(|count| count.parse::<u64>().ok());
+                match (key, count) {
+                    ("fetch", Some(count)) if fetch.is_none() && nprobes.is_none() => {
+                        fetch = Some(count);
+                    }
+                    ("nprobes", Some(count)) if nprobes.is_none() => {
+                        nprobes = Some(count);
+                    }
+                    _ => {
+                        return Err(refused(
+                            "claims `ranked <kind>[ fetch <n>][ nprobes <n>]`: each key optional, at most once, in that order, followed by a whole number",
+                        ));
+                    }
+                }
             }
-            lines.push(PlanLine::ScanAccess {
+            lines.push(PlanLine::ScanRanked {
                 type_name,
                 binding,
-                access: access.to_string(),
+                index: kind.to_string(),
+                fetch,
+                nprobes,
             });
+            continue;
+        } else if let Some(access) = claim.strip_prefix("access ") {
+            if access.trim() != ID_LOOKUP {
+                return Err(refused(
+                    "claims `access id_lookup`; a destination read once as a build side is `hash join $var`",
+                ));
+            }
+            lines.push(PlanLine::ScanAccess { type_name, binding });
             continue;
         } else if let Some(list) = claim.strip_prefix("filter reads") {
             ScanClaim::FilterReads {
@@ -197,7 +300,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                     Some(list) => (false, list),
                     None => {
                         return Err(refused(
-                            "claims `columns`, `not columns`, `filter reads`, `no filter` or `access`",
+                            "claims `columns`, `not columns`, `filter reads`, `no filter`, `access` or `ranked`",
                         ));
                     }
                 },
@@ -228,18 +331,38 @@ fn identifier(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+/// A non-empty `[$a, $b]` list of bindings, or `None` when the text is not one.
+fn binding_list(text: &str) -> Option<Vec<String>> {
+    bracket_list(text, |part| {
+        let binding = part.strip_prefix('$')?;
+        identifier(binding).then(|| binding.to_string())
+    })
+}
+
+/// The binding of a `Sort` row's tie-break key: `$p.@id` names `p`.
+fn tiebreak_binding(key: &str) -> String {
+    key.strip_prefix('$')
+        .unwrap_or(key)
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn column_list(text: &str) -> Option<Vec<String>> {
+    bracket_list(text, |column| {
+        column
+            .split('.')
+            .all(identifier)
+            .then(|| column.to_string())
+    })
+}
+
+/// The items of a non-empty `[a, b]` list, each trimmed and read by `item`;
+/// `None` when the text is not such a list or `item` refuses one.
+fn bracket_list(text: &str, item: impl Fn(&str) -> Option<String>) -> Option<Vec<String>> {
     let inner = text.trim().strip_prefix('[')?.strip_suffix(']')?;
-    inner
-        .split(',')
-        .map(|part| {
-            let column = part.trim();
-            column
-                .split('.')
-                .all(identifier)
-                .then(|| column.to_string())
-        })
-        .collect()
+    inner.split(',').map(|part| item(part.trim())).collect()
 }
 
 pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Result<(), String> {
@@ -281,6 +404,7 @@ struct PlannedScan {
 /// recorded.
 #[derive(Debug)]
 struct PlannedExpandMode {
+    id: Option<u64>,
     src: String,
     edge_type: String,
     dst: String,
@@ -288,23 +412,79 @@ struct PlannedExpandMode {
 }
 
 /// One `Scan` of the explain document's physical plan with the access path
-/// it recorded (`None` on a table scan).
+/// it recorded (`None` on a table scan) and its ranking (`None` unranked).
 #[derive(Debug)]
 struct PlannedAccess {
     type_key: String,
     binding: Option<String>,
     access: Option<String>,
+    ranked: Option<PlannedRanking>,
 }
 
-/// The scans and the in-memory filters (each as its sorted reads) of the
-/// logical plan, and the traversal modes and scan access paths of the
-/// physical plan.
+/// One `HashJoin` of the explain document's physical plan with its node id.
+#[derive(Debug)]
+struct PlannedJoin {
+    id: Option<u64>,
+    binding: String,
+}
+
+/// The `ranked` object of a physical `Scan` row: the index, its fetch and
+/// its probe cap (`None` when the row carries no `nprobes` key, `Some(0)`
+/// when it is `null`, no cap).
+#[derive(Debug)]
+struct PlannedRanking {
+    kind: String,
+    fetch: Option<u64>,
+    nprobes: Option<u64>,
+}
+
+/// `<choice>[ ran <choice>]` over the words `allowed`: the planned choice
+/// and the side claimed to have run.
+fn choice_and_ran(rest: &str, allowed: &[&str]) -> Option<(String, Option<String>)> {
+    let mut words = rest.split_whitespace();
+    let choice = words.next().filter(|word| allowed.contains(word))?;
+    let ran = match (words.next(), words.next(), words.next()) {
+        (None, _, _) => None,
+        (Some("ran"), Some(side), None) if allowed.contains(&side) => Some(side.to_string()),
+        _ => return None,
+    };
+    Some((choice.to_string(), ran))
+}
+
+/// The side of node `id`'s declared switch the run took: the last attempt of
+/// the row that recorded one. `Err` names why there is no such side.
+fn ran_side(report: Option<&[Row]>, id: Option<u64>, what: &str) -> Result<String, String> {
+    let report = report.ok_or_else(|| {
+        format!("expect plan: `ran` on {what} needs the execution report of the run")
+    })?;
+    let id = id.ok_or_else(|| format!("expect plan: the {what} row carries no `id`"))?;
+    let sides: Vec<&str> = report
+        .iter()
+        .filter(|row| row.id as u64 == id)
+        .filter_map(|row| row.attempts.last()?.ran.side())
+        .collect();
+    match sides[..] {
+        [side] => Ok(side.to_string()),
+        [] => Err(format!(
+            "expect plan: the run recorded no side of a declared switch on {what} (node {id})"
+        )),
+        _ => Err(format!(
+            "expect plan: the run recorded {sides:?} on {what} (node {id}), one side expected"
+        )),
+    }
+}
+
+/// The logical plan's scans and in-memory filters, and the physical plan's
+/// traversal modes, access paths, hash joins and sort tie-breaks (`Err` names
+/// a `Sort` row with no `tiebreak` key).
 #[derive(Debug, Default)]
 struct PlannedNodes {
     scans: Vec<PlannedScan>,
     filters: Vec<Vec<String>>,
     modes: Vec<PlannedExpandMode>,
     accesses: Vec<PlannedAccess>,
+    joins: Vec<PlannedJoin>,
+    sorts: Vec<Result<Vec<String>, String>>,
 }
 
 fn planned_physical(node: &Value, out: &mut PlannedNodes) {
@@ -314,8 +494,10 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
             .unwrap_or_default()
             .to_string()
     };
+    let id = node.get("id").and_then(Value::as_u64);
     match node.get("node").and_then(Value::as_str) {
         Some("Expand") => out.modes.push(PlannedExpandMode {
+            id,
             src: text("src"),
             edge_type: text("edge_type"),
             dst: text("dst"),
@@ -331,7 +513,41 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                 .get("access")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            ranked: node
+                .get("ranked")
+                .and_then(Value::as_object)
+                .map(|ranked| PlannedRanking {
+                    kind: ranked
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    fetch: ranked.get("fetch").and_then(Value::as_u64),
+                    nprobes: ranked
+                        .get("nprobes")
+                        .map(|nprobes| nprobes.as_u64().unwrap_or(0)),
+                }),
         }),
+        Some("HashJoin") => out.joins.push(PlannedJoin {
+            id,
+            binding: text("binding"),
+        }),
+        Some("Sort") => out.sorts.push(
+            node.get("tiebreak")
+                .and_then(Value::as_array)
+                .map(|keys| {
+                    sorted_set(
+                        keys.iter()
+                            .filter_map(Value::as_str)
+                            .map(tiebreak_binding)
+                            .collect(),
+                    )
+                })
+                .ok_or_else(|| {
+                    let node = id.map(|id| format!(" (node {id})")).unwrap_or_default();
+                    format!("expect plan: the physical `Sort`{node} carries no `tiebreak` key")
+                }),
+        ),
         _ => {}
     }
     if let Some(inputs) = node.get("inputs").and_then(Value::as_array) {
@@ -432,8 +648,13 @@ fn sorted_set(mut columns: Vec<String>) -> Vec<String> {
 }
 
 /// The first line the explain document contradicts, spelled with what the
-/// document holds instead.
-pub(crate) fn plan_mismatch(lines: &[PlanLine], explain: &Value) -> Option<String> {
+/// document holds instead; a `ran` claim reads `report`, the execution
+/// report of the run the document belongs to.
+pub(crate) fn plan_mismatch(
+    lines: &[PlanLine],
+    explain: &Value,
+    report: Option<&[Row]>,
+) -> Option<String> {
     let mut nodes = PlannedNodes::default();
     if let Some(plan) = explain.get("logical_plan") {
         if let Err(error) = planned_nodes(plan, &mut nodes) {
@@ -472,11 +693,27 @@ pub(crate) fn plan_mismatch(lines: &[PlanLine], explain: &Value) -> Option<Strin
                     ));
                 }
             }
+            PlanLine::Sort { tiebreak } => {
+                if nodes.sorts.is_empty() {
+                    return Some("expect plan: the physical plan has no `Sort`".to_string());
+                }
+                let declared = match nodes.sorts.iter().cloned().collect::<Result<Vec<_>, _>>() {
+                    Ok(declared) => declared,
+                    Err(missing) => return Some(missing),
+                };
+                let want = sorted_set(tiebreak.clone());
+                if !declared.contains(&want) {
+                    return Some(format!(
+                        "expect plan: no sort tie-breaks on {want:?}; the plan's sorts tie-break on {declared:?}"
+                    ));
+                }
+            }
             PlanLine::ExpandMode {
                 src,
                 edge_type,
                 dst,
                 mode,
+                ran,
             } => {
                 let selected: Vec<_> = nodes
                     .modes
@@ -497,60 +734,144 @@ pub(crate) fn plan_mismatch(lines: &[PlanLine], explain: &Value) -> Option<Strin
                             expand.mode
                         ));
                     }
+                    let Some(ran) = ran else {
+                        continue;
+                    };
+                    let what = format!("the expand `${src} {edge_type} ${dst}`");
+                    match ran_side(report, expand.id, &what) {
+                        Err(mismatch) => return Some(mismatch),
+                        Ok(side) if side != *ran => {
+                            return Some(format!(
+                                "expect plan: {what} ran `{side}`, expected `ran {ran}`"
+                            ));
+                        }
+                        Ok(_) => {}
+                    }
                 }
             }
-            PlanLine::ScanAccess {
+            PlanLine::ScanRanked {
                 type_name,
                 binding,
-                access,
+                index: kind,
+                fetch,
+                nprobes,
             } => {
-                let type_key = format!("node:{type_name}");
-                let selected: Vec<&PlannedAccess> = nodes
-                    .accesses
+                let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
+                    Ok(selected) => selected,
+                    Err(mismatch) => return Some(mismatch),
+                };
+                let mut rankings = Vec::with_capacity(selected.len());
+                for scan in selected {
+                    let Some(ranked) = &scan.ranked else {
+                        return Some(format!(
+                            "expect plan: the scan of `{type_name}` is not ranked, expected `ranked {kind}`"
+                        ));
+                    };
+                    rankings.push(ranked);
+                }
+                let of_kind: Vec<&&PlannedRanking> = rankings
                     .iter()
-                    .filter(|scan| scan.type_key == type_key)
-                    .filter(|scan| {
-                        binding
-                            .as_ref()
-                            .is_none_or(|b| scan.binding.as_ref() == Some(b))
-                    })
+                    .filter(|ranked| ranked.kind == *kind)
                     .collect();
-                if selected.is_empty() {
-                    let known: Vec<String> = nodes
-                        .accesses
-                        .iter()
-                        .map(|scan| {
-                            format!(
-                                "{}{}",
-                                scan.type_key,
-                                scan.binding
-                                    .as_ref()
-                                    .map(|b| format!(" as ${b}"))
-                                    .unwrap_or_default()
-                            )
-                        })
-                        .collect();
+                if of_kind.is_empty() {
+                    let kinds: Vec<&str> = rankings.iter().map(|r| r.kind.as_str()).collect();
                     return Some(format!(
-                        "expect plan: no scan of `{type_name}`{} in the physical plan; it scans {known:?}",
-                        binding
-                            .as_ref()
-                            .map(|b| format!(" bound to `${b}`"))
-                            .unwrap_or_default()
+                        "expect plan: the scan of `{type_name}` is ranked by {kinds:?}, expected `{kind}`"
                     ));
                 }
+                if let Some(fetch) = fetch {
+                    let fetches: Vec<Option<u64>> = of_kind.iter().map(|r| r.fetch).collect();
+                    if !fetches.contains(&Some(*fetch)) {
+                        return Some(match fetches[..] {
+                            [None] => format!(
+                                "expect plan: the ranked scan of `{type_name}` has no fetch, expected {fetch}"
+                            ),
+                            [Some(have)] => format!(
+                                "expect plan: the ranked scan of `{type_name}` fetches {have}, expected {fetch}"
+                            ),
+                            _ => format!(
+                                "expect plan: the `{kind}` scans of `{type_name}` fetch {fetches:?}, expected {fetch}"
+                            ),
+                        });
+                    }
+                }
+                if let Some(nprobes) = nprobes {
+                    let caps: Vec<Option<u64>> = of_kind.iter().map(|r| r.nprobes).collect();
+                    if !caps.contains(&Some(*nprobes)) {
+                        return Some(match caps[..] {
+                            [None] => format!(
+                                "expect plan: the ranked scan of `{type_name}` carries no probe cap, expected nprobes {nprobes}"
+                            ),
+                            [Some(have)] => format!(
+                                "expect plan: the ranked scan of `{type_name}` probes {have}, expected nprobes {nprobes}"
+                            ),
+                            _ => format!(
+                                "expect plan: the `{kind}` scans of `{type_name}` probe {caps:?}, expected nprobes {nprobes}"
+                            ),
+                        });
+                    }
+                }
+            }
+            PlanLine::ScanAccess { type_name, binding } => {
+                let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
+                    Ok(selected) => selected,
+                    Err(mismatch) => return Some(mismatch),
+                };
                 for scan in selected {
                     match &scan.access {
                         None => {
-                            return Some(format!(
-                                "expect plan: the scan of `{type_name}` is a table scan with no access path, expected `{access}`"
-                            ));
+                            let joined = nodes
+                                .joins
+                                .iter()
+                                .any(|join| Some(&join.binding) == scan.binding.as_ref());
+                            return Some(if joined {
+                                format!(
+                                    "expect plan: the scan of `{type_name}` is the build side of a hash join, expected `access {ID_LOOKUP}`"
+                                )
+                            } else {
+                                format!(
+                                    "expect plan: the scan of `{type_name}` is a table scan with no access path, expected `access {ID_LOOKUP}`"
+                                )
+                            });
                         }
-                        Some(have) if have != access => {
+                        Some(have) if have != ID_LOOKUP => {
                             return Some(format!(
-                                "expect plan: the scan of `{type_name}` reaches its rows by `{have}`, expected `{access}`"
+                                "expect plan: the scan of `{type_name}` reaches its rows by `{have}`, expected `{ID_LOOKUP}`"
                             ));
                         }
                         Some(_) => {}
+                    }
+                }
+            }
+            PlanLine::HashJoin { binding, ran } => {
+                let selected: Vec<&PlannedJoin> = nodes
+                    .joins
+                    .iter()
+                    .filter(|join| join.binding == *binding)
+                    .collect();
+                if selected.is_empty() {
+                    let known: Vec<String> = nodes
+                        .joins
+                        .iter()
+                        .map(|join| format!("${}", join.binding))
+                        .collect();
+                    return Some(format!(
+                        "expect plan: no hash join over `${binding}` in the physical plan; it joins {known:?}"
+                    ));
+                }
+                for join in selected {
+                    let Some(ran) = ran else {
+                        continue;
+                    };
+                    let what = format!("the hash join over `${binding}`");
+                    match ran_side(report, join.id, &what) {
+                        Err(mismatch) => return Some(mismatch),
+                        Ok(side) if side != *ran => {
+                            return Some(format!(
+                                "expect plan: {what} ran `{side}`, expected `ran {ran}`"
+                            ));
+                        }
+                        Ok(_) => {}
                     }
                 }
             }
@@ -602,6 +923,45 @@ pub(crate) fn plan_mismatch(lines: &[PlanLine], explain: &Value) -> Option<Strin
         }
     }
     None
+}
+
+/// The physical scans of `type_name` (bound to `binding` when named), or
+/// the mismatch naming what the plan scans instead.
+fn physical_scans<'n>(
+    nodes: &'n PlannedNodes,
+    type_name: &str,
+    binding: Option<&str>,
+) -> Result<Vec<&'n PlannedAccess>, String> {
+    let type_key = format!("node:{type_name}");
+    let selected: Vec<&PlannedAccess> = nodes
+        .accesses
+        .iter()
+        .filter(|scan| scan.type_key == type_key)
+        .filter(|scan| binding.is_none_or(|b| scan.binding.as_deref() == Some(b)))
+        .collect();
+    if selected.is_empty() {
+        let known: Vec<String> = nodes
+            .accesses
+            .iter()
+            .map(|scan| {
+                format!(
+                    "{}{}",
+                    scan.type_key,
+                    scan.binding
+                        .as_ref()
+                        .map(|b| format!(" as ${b}"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        return Err(format!(
+            "expect plan: no scan of `{type_name}`{} in the physical plan; it scans {known:?}",
+            binding
+                .map(|b| format!(" bound to `${b}`"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(selected)
 }
 
 fn scan_mismatch(type_name: &str, scan: &PlannedScan, claim: &ScanClaim) -> Option<String> {
@@ -656,6 +1016,11 @@ fn projection_mismatch(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The document alone: no `ran` line in these tests reads a report.
+    fn check(lines: &[PlanLine], explain: &Value) -> Option<String> {
+        plan_mismatch(lines, explain, None)
+    }
 
     fn explain() -> Value {
         json!({
@@ -722,36 +1087,36 @@ mod tests {
         ];
         let lines = parse_plan_body(&body).unwrap();
         assert_eq!(lines.len(), 7);
-        assert_eq!(plan_mismatch(&lines, &explain()), None);
+        assert_eq!(check(&lines, &explain()), None);
     }
 
     #[test]
     fn a_read_column_fails_the_negative_form() {
         let lines = parse_plan_body(&[(0, "scan Doc: not columns [slug]")]).unwrap();
-        let mismatch = plan_mismatch(&lines, &explain()).unwrap();
+        let mismatch = check(&lines, &explain()).unwrap();
         assert!(mismatch.contains("reads `slug`"), "{mismatch}");
     }
 
     #[test]
     fn filter_claims_read_the_predicates() {
         let lines = parse_plan_body(&[(0, "scan Doc as $e: filter reads [e.rank]")]).unwrap();
-        let mismatch = plan_mismatch(&lines, &explain()).unwrap();
+        let mismatch = check(&lines, &explain()).unwrap();
         assert!(mismatch.contains("carries no filter"), "{mismatch}");
         let lines = parse_plan_body(&[(0, "scan Doc as $d: no filter")]).unwrap();
-        let mismatch = plan_mismatch(&lines, &explain()).unwrap();
+        let mismatch = check(&lines, &explain()).unwrap();
         assert!(mismatch.contains("carries a filter reading"), "{mismatch}");
         let lines = parse_plan_body(&[(0, "scan Doc as $d: filter reads [d.state]")]).unwrap();
-        let mismatch = plan_mismatch(&lines, &explain()).unwrap();
+        let mismatch = check(&lines, &explain()).unwrap();
         assert!(mismatch.contains("filters on"), "{mismatch}");
         let lines = parse_plan_body(&[(0, "filter reads [d.rank]")]).unwrap();
-        let mismatch = plan_mismatch(&lines, &explain()).unwrap();
+        let mismatch = check(&lines, &explain()).unwrap();
         assert!(mismatch.contains("no in-memory filter reads"), "{mismatch}");
     }
 
     #[test]
     fn a_fired_pass_fails_the_negated_form() {
         let lines = parse_plan_body(&[(0, "not pass predicate_pushdown")]).unwrap();
-        let mismatch = plan_mismatch(&lines, &explain()).unwrap();
+        let mismatch = check(&lines, &explain()).unwrap();
         assert!(mismatch.contains("fired"), "{mismatch}");
     }
 
@@ -759,16 +1124,12 @@ mod tests {
     fn an_unknown_scan_or_pass_is_named() {
         let lines = parse_plan_body(&[(0, "scan Other: columns [__id]")]).unwrap();
         assert!(
-            plan_mismatch(&lines, &explain())
+            check(&lines, &explain())
                 .unwrap()
                 .contains("no scan of `Other`")
         );
         let lines = parse_plan_body(&[(0, "pass late_materialization")]).unwrap();
-        assert!(
-            plan_mismatch(&lines, &explain())
-                .unwrap()
-                .contains("did not fire")
-        );
+        assert!(check(&lines, &explain()).unwrap().contains("did not fire"));
     }
 
     #[test]
@@ -778,6 +1139,48 @@ mod tests {
         assert!(parse_plan_body(&[(0, "filter reads d.slug")]).is_err());
         assert!(parse_plan_body(&[(0, "expand knows: mode csr")]).is_err());
         assert!(parse_plan_body(&[]).is_err());
+    }
+
+    /// A `sort` line claims the ids a physical `Sort` declares after its
+    /// keys; a `Sort` row without a `tiebreak` key declares nothing to compare.
+    #[test]
+    fn sort_claims_read_the_declared_tiebreak() {
+        let declared = json!({"physical_plan": {"node": "Sort", "id": 1, "tiebreak": ["$p.@id"]}});
+        let bare = json!({"physical_plan": {"node": "Sort", "id": 1, "tiebreak": []}});
+        let lines = parse_plan_body(&[(0, "sort tiebreak [$p]")]).unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::Sort {
+                tiebreak: vec!["p".to_string()]
+            }
+        );
+        assert_eq!(check(&lines, &declared), None);
+        let mismatch = check(&lines, &bare).unwrap();
+        assert!(
+            mismatch.contains("no sort tie-breaks on [\"p\"]; the plan's sorts tie-break on [[]]"),
+            "{mismatch}"
+        );
+        let lines = parse_plan_body(&[(0, "sort no tiebreak")]).unwrap();
+        assert_eq!(check(&lines, &bare), None);
+        let mismatch = check(&lines, &declared).unwrap();
+        assert!(
+            mismatch.contains("no sort tie-breaks on []; the plan's sorts tie-break on [[\"p\"]]"),
+            "{mismatch}"
+        );
+        let missing = json!({"physical_plan": {"node": "Sort", "id": 1}});
+        let mismatch = check(&lines, &missing).unwrap();
+        assert!(
+            mismatch.contains("the physical `Sort` (node 1) carries no `tiebreak` key"),
+            "{mismatch}"
+        );
+        for refused in [
+            "sort tiebreak $p",
+            "sort tiebreak []",
+            "sort tiebreaks [$p]",
+            "sort",
+        ] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
+        }
     }
 
     #[test]
@@ -802,16 +1205,17 @@ mod tests {
                 edge_type: "Knows".to_string(),
                 dst: "e".to_string(),
                 mode: "indexed_scan".to_string(),
+                ran: None,
             }
         );
-        assert_eq!(plan_mismatch(&lines, &explain), None);
+        assert_eq!(check(&lines, &explain), None);
         for (claim, message) in [
             ("expand $d Knows $e: mode csr", "runs `indexed_scan`"),
             ("expand $d Likes $e: mode csr", "no expand `$d Likes $e`"),
             ("expand $e Knows $d: mode csr", "no expand"),
         ] {
             let lines = parse_plan_body(&[(0, claim)]).unwrap();
-            let mismatch = plan_mismatch(&lines, &explain).unwrap();
+            let mismatch = check(&lines, &explain).unwrap();
             assert!(mismatch.contains(message), "{mismatch}");
         }
         for refused in [
@@ -819,59 +1223,270 @@ mod tests {
             "expand $d Knows $e: columns [__id]",
             "expand $d Knows: mode csr",
             "expand $d Knows e: mode csr",
+            "expand $d Knows $e: mode csr ran",
+            "expand $d Knows $e: mode csr ran fast",
+            "expand $d Knows $e: mode csr took csr",
+        ] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
+        }
+    }
+
+    /// A `ran` claim reads the last attempt of the node's row, joined by the
+    /// explain row's `id`.
+    #[test]
+    fn ran_claims_read_the_report_by_node_id() {
+        let explain = json!({
+            "physical_plan": {"node": "Projection", "id": 4, "inputs": [
+                {"node": "HashJoin", "id": 3, "binding": "d", "fallback": "id_lookup", "inputs": [
+                    {"node": "Expand", "id": 1, "src": "s", "edge_type": "Links", "dst": "d", "mode": "indexed_scan",
+                     "inputs": [{"node": "Scan", "id": 0, "table": "node:Source", "binding": "s"}]},
+                    {"node": "Scan", "id": 2, "table": "node:Doc", "binding": "d"}
+                ]}
+            ]},
+        });
+        let report: Vec<Row> = serde_json::from_value(json!([
+            {"id": 3, "operator": "HashJoinExec", "status": "executed",
+             "attempts": [{"rung": 0, "ran": "hash_join", "actual_rows": 3}, {"rung": 1, "ran": "id_lookup", "actual_rows": 3}]},
+            {"id": 2, "operator": "ScanExec", "status": "executed",
+             "attempts": [{"rung": 0, "ran": true, "actual_rows": 2}]},
+            {"id": 1, "operator": "ExpandExec", "status": "executed",
+             "attempts": [{"rung": 0, "ran": "csr", "actual_rows": 3}]},
+            {"id": 0, "operator": "ScanExec", "status": "executed",
+             "attempts": [{"rung": 0, "ran": true, "actual_rows": 1}]}
+        ]))
+        .unwrap();
+        let lines = parse_plan_body(&[
+            (0, "hash join $d ran id_lookup"),
+            (1, "expand $s Links $d: mode indexed_scan ran csr"),
+        ])
+        .unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::HashJoin {
+                binding: "d".to_string(),
+                ran: Some("id_lookup".to_string()),
+            }
+        );
+        assert_eq!(plan_mismatch(&lines, &explain, Some(&report)), None);
+        for (claim, message) in [
+            (
+                "hash join $d ran hash_join",
+                "ran `id_lookup`, expected `ran hash_join`",
+            ),
+            (
+                "expand $s Links $d: mode indexed_scan ran indexed_scan",
+                "ran `csr`, expected `ran indexed_scan`",
+            ),
+        ] {
+            let lines = parse_plan_body(&[(0, claim)]).unwrap();
+            let mismatch = plan_mismatch(&lines, &explain, Some(&report)).unwrap();
+            assert!(mismatch.contains(message), "{claim}: {mismatch}");
+        }
+        let lines = parse_plan_body(&[(0, "hash join $d ran hash_join")]).unwrap();
+        assert!(
+            plan_mismatch(&lines, &explain, None)
+                .unwrap()
+                .contains("needs the execution report")
+        );
+        let no_switch: Vec<Row> = report.iter().filter(|row| row.id != 3).cloned().collect();
+        assert!(
+            plan_mismatch(&lines, &explain, Some(&no_switch))
+                .unwrap()
+                .contains("recorded no side of a declared switch")
+        );
+    }
+
+    #[test]
+    fn access_and_hash_join_claims_read_the_physical_plan() {
+        let explain = json!({
+            "logical_plan": {"node": "TableScan", "table": "node:Doc", "binding": "d"},
+            "physical_plan": {"node": "Projection", "inputs": [
+                {"node": "HashJoin", "binding": "d", "fallback": "id_lookup", "inputs": [
+                    {"node": "Expand", "src": "s", "edge_type": "Links", "dst": "d", "mode": "csr",
+                     "inputs": [{"node": "Scan", "table": "node:Source", "binding": "s"}]},
+                    {"node": "Scan", "table": "node:Doc", "binding": "d"}
+                ]}
+            ]},
+            "passes": ["resolve", "access_path"],
+        });
+        let lines = parse_plan_body(&[(0, "hash join $d"), (1, "pass access_path")]).unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::HashJoin {
+                binding: "d".to_string(),
+                ran: None,
+            }
+        );
+        assert_eq!(check(&lines, &explain), None);
+        for (claim, message) in [
+            (
+                "scan Doc as $d: access id_lookup",
+                "is the build side of a hash join",
+            ),
+            (
+                "scan Source as $s: access id_lookup",
+                "table scan with no access path",
+            ),
+            ("hash join $e", "no hash join over `$e`"),
+            ("scan Other: access id_lookup", "no scan of `Other`"),
+        ] {
+            let lines = parse_plan_body(&[(0, claim)]).unwrap();
+            let mismatch = check(&lines, &explain).unwrap();
+            assert!(mismatch.contains(message), "{mismatch}");
+        }
+        let looked_up = json!({
+            "physical_plan": {"node": "Projection", "inputs": [
+                {"node": "Scan", "table": "node:Doc", "binding": "d", "id_restriction": "input",
+                 "access": "id_lookup", "inputs": [
+                    {"node": "Expand", "src": "s", "edge_type": "Links", "dst": "d", "mode": "csr",
+                     "inputs": [{"node": "Scan", "table": "node:Source", "binding": "s"}]}
+                ]}
+            ]},
+        });
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: access id_lookup")]).unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::ScanAccess {
+                type_name: "Doc".to_string(),
+                binding: Some("d".to_string()),
+            }
+        );
+        assert_eq!(check(&lines, &looked_up), None);
+        let lines = parse_plan_body(&[(0, "hash join $d")]).unwrap();
+        assert!(
+            check(&lines, &looked_up)
+                .unwrap()
+                .contains("no hash join over `$d`")
+        );
+        for refused in [
+            "scan Doc as $d: access fast",
+            "scan Doc as $d: access",
+            "scan Doc as $d: access hash_join",
+            "scan Doc as $d: access id_lookup ran id_lookup",
+            "hash join d",
+            "hash join $d ran",
+            "hash join $d ran csr",
+            "hash join $d took hash_join",
         ] {
             assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
         }
     }
 
     #[test]
-    fn scan_access_claims_read_the_physical_plan() {
+    fn scan_ranked_claims_read_the_physical_plan() {
         let explain = json!({
-            "logical_plan": {"node": "TableScan", "table": "node:Doc", "binding": "d"},
-            "physical_plan": {"node": "Projection", "inputs": [
-                {"node": "Scan", "table": "node:Doc", "binding": "d", "id_restriction": "input",
-                 "access": "hash_join", "inputs": [
-                    {"node": "Expand", "src": "s", "edge_type": "Links", "dst": "d", "mode": "csr",
-                     "inputs": [{"node": "Scan", "table": "node:Source", "binding": "s"}]}
+            "physical_plan": {"node": "Page", "inputs": [{"node": "Sort", "inputs": [
+                {"node": "Projection", "inputs": [
+                    {"node": "Scan", "table": "node:Doc", "binding": "d",
+                     "ranked": {"kind": "nearest", "property": "embedding", "query": "$q",
+                                "fetch": 10, "nprobes": 20, "scope": "order"}}
                 ]}
-            ]},
-            "passes": ["resolve", "access_path"],
+            ]}]},
         });
         let lines = parse_plan_body(&[
-            (0, "scan Doc as $d: access hash_join"),
-            (1, "scan Doc: access hash_join"),
-            (2, "pass access_path"),
+            (0, "scan Doc as $d: ranked nearest fetch 10"),
+            (1, "scan Doc: ranked nearest"),
+            (2, "scan Doc: ranked nearest fetch 10 nprobes 20"),
         ])
         .unwrap();
         assert_eq!(
             lines[0],
-            PlanLine::ScanAccess {
+            PlanLine::ScanRanked {
                 type_name: "Doc".to_string(),
                 binding: Some("d".to_string()),
-                access: "hash_join".to_string(),
+                index: "nearest".to_string(),
+                fetch: Some(10),
+                nprobes: None,
             }
         );
-        assert_eq!(plan_mismatch(&lines, &explain), None);
+        assert_eq!(lines[2].clone(), {
+            let mut capped = lines[0].clone();
+            if let PlanLine::ScanRanked {
+                binding, nprobes, ..
+            } = &mut capped
+            {
+                *binding = None;
+                *nprobes = Some(20);
+            }
+            capped
+        });
+        assert_eq!(check(&lines, &explain), None);
         for (claim, message) in [
+            ("scan Doc as $d: ranked bm25", "is ranked by [\"nearest\"]"),
             (
-                "scan Doc as $d: access id_lookup",
-                "reaches its rows by `hash_join`",
+                "scan Doc as $d: ranked nearest fetch 3",
+                "fetches 10, expected 3",
             ),
             (
-                "scan Source as $s: access id_lookup",
-                "table scan with no access path",
+                "scan Doc as $d: ranked nearest fetch 10 nprobes 1",
+                "probes 20, expected nprobes 1",
             ),
             (
-                "scan Doc as $e: access hash_join",
+                "scan Doc as $e: ranked nearest",
                 "no scan of `Doc` bound to `$e`",
             ),
-            ("scan Other: access hash_join", "no scan of `Other`"),
         ] {
             let lines = parse_plan_body(&[(0, claim)]).unwrap();
-            let mismatch = plan_mismatch(&lines, &explain).unwrap();
-            assert!(mismatch.contains(message), "{mismatch}");
+            let mismatch = check(&lines, &explain).unwrap();
+            assert!(mismatch.contains(message), "{claim}: {mismatch}");
         }
-        for refused in ["scan Doc as $d: access fast", "scan Doc as $d: access"] {
+        let unranked =
+            json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d"}});
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked bm25")]).unwrap();
+        assert!(check(&lines, &unranked).unwrap().contains("is not ranked"));
+        let uncapped = json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d",
+            "ranked": {"kind": "bm25", "fetch": null}}});
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked bm25 fetch 10")]).unwrap();
+        assert!(check(&lines, &uncapped).unwrap().contains("has no fetch"));
+        let no_cap = json!({"physical_plan": {"node": "Scan", "table": "node:Doc", "binding": "d",
+            "ranked": {"kind": "nearest", "fetch": 10, "nprobes": null}}});
+        let lines =
+            parse_plan_body(&[(0, "scan Doc as $d: ranked nearest fetch 10 nprobes 0")]).unwrap();
+        assert_eq!(check(&lines, &no_cap), None, "0 spells no cap");
+        let fused = json!({"physical_plan": {"node": "RankFuse", "inputs": [
+            {"node": "Scan", "table": "node:Doc", "binding": "d",
+             "ranked": {"kind": "nearest", "fetch": 3, "scope": "primary"}},
+            {"node": "Scan", "table": "node:Doc", "binding": "d",
+             "ranked": {"kind": "bm25", "fetch": null, "scope": "secondary"}}
+        ]}});
+        let lines = parse_plan_body(&[
+            (0, "scan Doc as $d: ranked nearest fetch 3"),
+            (1, "scan Doc as $d: ranked bm25"),
+        ])
+        .unwrap();
+        assert_eq!(check(&lines, &fused), None, "one scan per arm");
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked nearest fetch 4")]).unwrap();
+        assert!(
+            check(&lines, &fused)
+                .unwrap()
+                .contains("fetches 3, expected 4")
+        );
+        let lines = parse_plan_body(&[(0, "scan Doc as $d: ranked nearest nprobes 20")]).unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::ScanRanked {
+                type_name: "Doc".to_string(),
+                binding: Some("d".to_string()),
+                index: "nearest".to_string(),
+                fetch: None,
+                nprobes: Some(20),
+            }
+        );
+        assert_eq!(
+            check(&lines, &explain),
+            None,
+            "`fetch` is optional beside `nprobes`"
+        );
+        for refused in [
+            "scan Doc as $d: ranked",
+            "scan Doc as $d: ranked fuzzy",
+            "scan Doc as $d: ranked bm25 fetch",
+            "scan Doc as $d: ranked bm25 fetch ten",
+            "scan Doc as $d: ranked bm25 limit 10",
+            "scan Doc as $d: ranked nearest nprobes 4 fetch 10",
+            "scan Doc as $d: ranked nearest nprobes 4 nprobes 4",
+            "scan Doc as $d: ranked nearest fetch 10 nprobes",
+        ] {
             assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
         }
     }
@@ -916,11 +1531,7 @@ mod tests {
             {"node":"Expand", "src":"d", "edge_type":"Knows", "dst":"e", "mode":"csr"},
             {"node":"Expand", "src":"d", "edge_type":"Knows", "dst":"e", "mode":"indexed_scan"}
         ]}});
-        assert!(
-            plan_mismatch(&lines, &explain)
-                .unwrap()
-                .contains("indexed_scan")
-        );
+        assert!(check(&lines, &explain).unwrap().contains("indexed_scan"));
     }
 
     #[test]
@@ -935,7 +1546,7 @@ mod tests {
             let explain =
                 json!({"logical_plan": {"node":"TableScan", "table":"node:Doc", "filter":filter}});
             assert!(
-                plan_mismatch(&lines, &explain)
+                check(&lines, &explain)
                     .unwrap()
                     .contains("malformed predicate")
             );

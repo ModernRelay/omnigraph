@@ -200,9 +200,10 @@ scan Doc as $d: columns [__id, slug, state]
 scan Doc: not columns [embedding]
 scan Doc as $d: filter reads [d.state]
 scan Doc as $e: no filter
-scan Doc as $e: access hash_join
+hash join $e
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
+sort tiebreak [$d, $e]
 pass projection_pushdown
 not pass aggregate_pushdown
 ```
@@ -213,6 +214,9 @@ columns it projects; `not columns [..]` columns it must not read; `filter
 reads [..]` a pushed filter reading exactly those columns (`binding.property`);
 `no filter` no pushed filter at all. `filter reads [..]` on its own states that
 an in-memory `Filter` node stays in the plan reading exactly those columns.
+`sort tiebreak [$a, $b]` states that a physical `Sort` declares exactly those
+bindings' ids as the keys it appends after the order keys, `sort no tiebreak`
+that a `Sort` declares none.
 `pass <name>` states that a named optimizer pass fired, `not pass <name>` that
 it did not. Every list is a set. A mismatch prints the whole explain document.
 Pass names must be registered optimizer passes. Excluded columns must
@@ -223,16 +227,25 @@ An `expand $src <Edge> $dst:` line selects every matching physical `Expand` betw
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
 when the cost model chose it); it fails when no such expand is in the physical
-plan or its mode differs. A `scan <Type>[ as $var]: access <id_lookup|hash_join>`
-line selects the physical scans of that type (or the one bound to that
-binding) and claims the access path the planner recorded on a dependent
-scan: `id_lookup` reads the destination once per slice of at most 256 input
-rows, `hash_join`
-reads the destination table once as the build side of a hash join the
-traversal probes (pass `access_path` when the cost model decided); it fails
-when no such scan is in the physical plan, the scan is a table scan (no
-access path), or the path differs. Nothing is compared as rendered text, so a planner
-that reaches the same facts by another route keeps the case green.
+plan or its mode differs. A `scan <Type>[ as $var]: access id_lookup` line
+selects the physical scans of that type (or the one bound to that binding)
+and claims each is a traversal's destination read once per slice of at most
+256 input rows; it fails when no such scan is in the physical plan, the scan
+is a table scan (no access path) or the build side of a hash join. A `hash
+join $var` line claims that a physical `HashJoin` reaches `$var`'s rows by
+reading its table once as the build side the traversal probes (pass
+`access_path` when the cost model decided); it fails when the plan holds no
+hash join over that binding. The `hash join` and `expand` lines take a
+trailing `ran <side>` (`hash join $e ran id_lookup`, `mode indexed_scan ran
+csr`): the side of the node's declared switch the run took, read from the
+execution report of the same run (the last attempt of the node's row, joined
+to the explain row by the node's `id`); it fails when the run recorded no
+side on that node or another side. A `scan <Type>[ as $var]: ranked
+<nearest|bm25>[ fetch <n>][ nprobes <n>]` line claims the ranked access path
+of the scan, the candidates it asks the index for and, on a `nearest` scan,
+the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
+setting does). Nothing is compared as rendered text, so a planner that
+reaches the same facts by another route keeps the case green.
 
 ## Run and reproduce
 

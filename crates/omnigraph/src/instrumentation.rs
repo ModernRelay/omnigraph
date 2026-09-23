@@ -592,24 +592,6 @@ fn query_operator_metrics(
     })
 }
 
-/// Capture only operators constructed for this execution; shared children are
-/// captured once from the owning query plan after execution ends.
-pub(crate) fn record_query_runtime_metrics(
-    nodes: &[Arc<dyn datafusion::physical_plan::ExecutionPlan>],
-) {
-    let _ = QUERY_MEMORY_PROBES.try_with(|probes| {
-        probes
-            .metrics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(
-                nodes
-                    .iter()
-                    .filter_map(|node| query_operator_metrics(node.as_ref())),
-            );
-    });
-}
-
 pub(crate) fn record_query_execution_metrics(
     root: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 ) {

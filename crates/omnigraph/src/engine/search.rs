@@ -1,14 +1,21 @@
-//! v2's copy of v1's search-mode extraction, prefilter gates and probe
-//! ladders (phase 4). Copied, never referenced: the frozen `exec/query.rs`
-//! stays upstream's bytes.
+//! The run-time side of a ranked scan: the `SearchMode` one `ScanExec` runs
+//! under, built per scan node from the plan's `RankedAccess` and the bound
+//! values; the per-pass `Pass` the overfetch ladder and the prefilter gates
+//! write; the gates and probe ladders themselves (v2's copy of v1's, phase 4;
+//! the frozen `exec/query.rs` stays upstream's bytes).
+
+use omnigraph_planner::{
+    GatePolicy, Hop, NodeId, OverfetchRung, Prefilter, PrefilterMode, RankKind,
+};
 
 use super::*;
 
-/// Describes how the query's ordering changes the scan mode.
+/// How one scan's ranking runs: what the plan's `RankedAccess` asks for,
+/// with the bound query value and this pass's widening and gate verdicts.
 #[derive(Debug, Default, Clone)]
 pub(super) struct SearchMode {
-    /// Vector ANN search: (variable, property, query_vector, k).
-    pub(super) nearest: Option<(String, String, Vec<f32>, usize)>,
+    /// Vector ANN search on the scan's binding.
+    pub(super) nearest: Option<NearestTarget>,
     /// Maximum number of IVF payload partitions a nearest scan may search,
     /// per index delta; `None` is uncapped. The scan-site ladder in
     /// `execute_node_scan` widens a maximum that starves the scan.
@@ -17,20 +24,123 @@ pub(super) struct SearchMode {
     /// overfetch loop's exact pass.
     pub(super) nearest_exact: bool,
     /// The nearest prefilter gate proved the answer empty: no node of the
-    /// ranked type satisfies an Expand's first hop. Set only by
-    /// `nearest_prefilter_gate`, never on an RRF arm.
+    /// ranked type satisfies an Expand's first hop. Read off the `Pass` by
+    /// `Lowering::search_mode`; an RRF arm's pass never carries it.
     pub(super) answer_proven_empty: bool,
-    /// BM25 full-text search: (variable, property, query_text).
-    pub(super) bm25: Option<(String, String, String)>,
-    /// RRF fusion: (primary, secondary, k_constant, limit).
-    pub(super) rrf: Option<RrfMode>,
-    /// The set a gate ANDs into the ranked scan as `id IN (...)`. Never set
-    /// on an RRF nearest arm.
+    /// BM25 full-text search on the scan's binding.
+    pub(super) bm25: Option<Bm25Target>,
+    /// The set a gate ANDs into the ranked scan as `id IN (...)`, read off the
+    /// `Pass` by `Lowering::search_mode`; the arms an `rrf()` prefilter feeds
+    /// are the plan's `Prefilter.feeds`.
     pub(super) eligible_ids: Option<EligibleIds>,
 }
 
+/// `nearest($v.property, q)` as one scan runs it: the bound query vector and
+/// the candidates asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct NearestTarget {
+    pub(super) property: String,
+    pub(super) vector: Vec<f32>,
+    pub(super) k: usize,
+}
+
+/// `bm25($v.property, q)` as one scan runs it: the bound query text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Bm25Target {
+    pub(super) property: String,
+    pub(super) text: String,
+}
+
+/// The overfetch ladder's rung for one nearest scan: the candidates it asks
+/// for, the probe cap it runs under, and whether it runs flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NearestRung {
+    pub(super) k: usize,
+    pub(super) maximum: Option<usize>,
+    pub(super) exact: bool,
+}
+
+/// What one pass of the tree runs its ranked scans under, keyed by the scan's
+/// node id: the ladder's rung, the gate's eligible set, the proven-empty
+/// verdict. The plan says what is ranked; this says how this pass runs it.
+#[derive(Debug, Default, Clone)]
+pub(super) struct Pass {
+    nearest: HashMap<NodeId, NearestRung>,
+    eligible: HashMap<NodeId, EligibleIds>,
+    proven_empty: HashSet<NodeId>,
+}
+
+impl Pass {
+    /// This pass asking scan `id` for `k` candidates under the probe cap
+    /// `maximum` (`None` = uncapped). The cap is the rung that filled the
+    /// previous pass's scan, so the rerun does not re-climb from the base cap.
+    pub(super) fn with_nearest_k(&self, id: NodeId, k: usize, maximum: Option<usize>) -> Self {
+        let mut pass = self.clone();
+        pass.nearest.insert(
+            id,
+            NearestRung {
+                k,
+                maximum,
+                exact: false,
+            },
+        );
+        pass
+    }
+
+    /// This pass running scan `id` flat over `k` = every live row of the
+    /// type: the overfetch loop's exact pass.
+    pub(super) fn with_exact_nearest(&self, id: NodeId, k: usize) -> Self {
+        let mut pass = self.clone();
+        pass.nearest.insert(
+            id,
+            NearestRung {
+                k,
+                maximum: None,
+                exact: true,
+            },
+        );
+        pass
+    }
+
+    pub(super) fn prefiltered(mut self, id: NodeId, ids: EligibleIds) -> Self {
+        self.eligible.insert(id, ids);
+        self
+    }
+
+    pub(super) fn proven_empty(mut self, id: NodeId) -> Self {
+        self.proven_empty.insert(id);
+        self
+    }
+
+    pub(super) fn rung(&self, id: NodeId) -> Option<NearestRung> {
+        self.nearest.get(&id).copied()
+    }
+
+    pub(super) fn eligible(&self, id: NodeId) -> Option<&EligibleIds> {
+        self.eligible.get(&id)
+    }
+
+    pub(super) fn is_proven_empty(&self, id: NodeId) -> bool {
+        self.proven_empty.contains(&id)
+    }
+
+    /// Whether any scan of this pass was proven empty: the pipeline over it
+    /// feeds nothing.
+    pub(super) fn answer_proven_empty(&self) -> bool {
+        !self.proven_empty.is_empty()
+    }
+}
+
+/// What the `rrf` gate reads of one arm of an `rrf()`: the index it ranks
+/// with and the ranked property, whose FTS coverage the gate checks.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ArmTarget<'a> {
+    pub(super) kind: RankKind,
+    pub(super) property: &'a str,
+}
+
 /// Shared eligible-id set, `Debug`-opaque so a logged `SearchMode` prints the
-/// cardinality instead of up to `DEFAULT_RRF_GATE_MAX_IDS` id strings.
+/// cardinality instead of up to `GatePolicy::max_ids` id strings.
 #[derive(Clone)]
 pub(super) struct EligibleIds(Arc<Vec<String>>);
 
@@ -66,241 +176,71 @@ pub(super) struct NearestScanReport {
     pub(super) dataset_rows: u64,
 }
 
-/// The next pass of `execute_query`'s overfetch loop after `factor` × `k0`
-/// candidates left the answer short above a full scan.
+/// The next pass of the overfetch ladder: the declared rung it takes (the
+/// report's `rung`, `1` for the first rerun) with that rung's run-time values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OverfetchRung {
+pub(super) struct NextPass {
+    pub(super) rung: usize,
+    pub(super) step: PassStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassStep {
     /// Ask for `k` candidates under the cap that filled the previous pass.
-    Wider {
-        factor: usize,
-        k: usize,
-        maximum: Option<usize>,
-    },
+    Wider { k: usize, maximum: Option<usize> },
     /// The exact pass: every live row of the type, scored flat, no probe cap.
     Exact { k: usize },
 }
 
-/// Widen nearest's candidate limit by four, then scan the whole type exactly.
-/// Lance returns at most `k` candidates regardless of probe width.
-/// Return `None` when the previous scan already requested every live row.
+/// The first rung of the declared `ladder` at or after `from` (the rungs
+/// before it were taken or skipped) that can still widen the scan: a `Wider`
+/// rung whose `k` is below the type's live rows, else the `Exact` rung when
+/// the scan asked for fewer rows than the type holds. Lance returns at most
+/// `k` candidates regardless of probe width. `None` when the previous scan
+/// already requested every live row or the ladder is spent.
 pub(super) fn next_overfetch_rung(
-    factor: usize,
-    k0: usize,
+    ladder: &[OverfetchRung],
+    from: usize,
     scan: NearestScanReport,
-) -> Option<OverfetchRung> {
+) -> Option<NextPass> {
     let whole = usize::try_from(scan.dataset_rows).unwrap_or(usize::MAX);
-    let next = factor.saturating_mul(ANN_OVERFETCH_STEP);
-    let k = k0.saturating_mul(next);
-    if next <= ANN_OVERFETCH_MAX_FACTOR && k < whole {
-        return Some(OverfetchRung::Wider {
-            factor: next,
-            k,
-            maximum: scan.maximum_nprobes,
+    for (index, rung) in ladder.iter().enumerate().skip(from) {
+        let step = match *rung {
+            OverfetchRung::Wider { k, .. } if k < whole => PassStep::Wider {
+                k,
+                maximum: scan.maximum_nprobes,
+            },
+            OverfetchRung::Wider { .. } => continue,
+            OverfetchRung::Exact if whole > scan.k => PassStep::Exact { k: whole },
+            OverfetchRung::Exact => return None,
+        };
+        return Some(NextPass {
+            rung: index + 1,
+            step,
         });
     }
-    (whole > scan.k).then_some(OverfetchRung::Exact { k: whole })
+    None
 }
 
 impl SearchMode {
-    /// This mode asking the nearest scan for `k` candidates under the probe
-    /// cap `maximum` (`None` = uncapped). The cap is the rung that filled the
-    /// previous pass's scan, so the rerun does not re-climb from the base cap.
-    pub(super) fn with_nearest_k(&self, k: usize, maximum: Option<usize>) -> Self {
-        let mut mode = self.clone();
-        if let Some((_, _, _, current)) = mode.nearest.as_mut() {
-            *current = k;
-        }
-        mode.ann_probe_budget = maximum;
-        mode
-    }
-
-    /// This mode running the nearest scan flat over `k` = every live row of
-    /// the type: the overfetch loop's exact pass.
-    pub(super) fn with_exact_nearest(&self, k: usize) -> Self {
-        let mut mode = self.with_nearest_k(k, None);
-        mode.nearest_exact = true;
-        mode
-    }
-
-    /// Whether `variable`'s scan is proven empty: `answer_proven_empty` on
-    /// the mode that ranks `variable` by `nearest`.
-    pub(super) fn scan_proven_empty(&self, variable: &str) -> bool {
-        self.answer_proven_empty
-            && self
-                .nearest
-                .as_ref()
-                .is_some_and(|(var, ..)| var == variable)
-    }
-
-    /// The eligible-id set to AND into `variable`'s scan, if this mode ranks
-    /// `variable` (a bm25 arm, or a standalone nearest) and a prefilter gate
-    /// chose the prefilter plan.
-    pub(super) fn eligible_ids_for(&self, variable: &str) -> Option<&[String]> {
-        let ids = self.eligible_ids.as_ref()?;
-        let ranks_variable = self.bm25.as_ref().is_some_and(|(var, ..)| var == variable)
-            || self
-                .nearest
-                .as_ref()
-                .is_some_and(|(var, ..)| var == variable);
-        ranks_variable.then(|| ids.0.as_slice())
+    /// The eligible-id set a prefilter gate chose for this scan.
+    pub(super) fn eligible_ids(&self) -> Option<&[String]> {
+        self.eligible_ids.as_ref().map(|ids| ids.0.as_slice())
     }
 }
 
-#[derive(Debug, Clone)]
+/// `rrf(a, b, k)` as the fusion runs it: the rank constant and the fused rows.
+#[derive(Debug, Clone, Copy)]
 pub(super) struct RrfMode {
-    pub(super) primary: Box<SearchMode>,
-    pub(super) secondary: Box<SearchMode>,
     pub(super) k: u32,
     pub(super) limit: usize,
-}
-
-/// Extract search ordering mode from the IR.
-pub(super) async fn extract_search_mode(
-    ir: &QueryIR,
-    params: &ParamMap,
-    catalog: &Catalog,
-    embedding: &EmbeddingResolver<'_>,
-    settings: &SessionSettings,
-) -> Result<SearchMode> {
-    if ir.order_by.is_empty() {
-        return Ok(SearchMode::default());
-    }
-    let ordering = &ir.order_by[0];
-    match &ordering.expr {
-        IRExpr::Nearest {
-            variable,
-            property,
-            query,
-        } => {
-            let vec = resolve_nearest_query_vec(
-                ir, catalog, variable, property, query, params, embedding,
-            )
-            .await?;
-            let k = usize::try_from(ir.limit.ok_or_else(|| {
-                OmniError::manifest("nearest() ordering requires a limit clause".to_string())
-            })?)
-            .unwrap_or(usize::MAX);
-            Ok(SearchMode {
-                nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: settings.ann_nprobes(),
-                ..Default::default()
-            })
-        }
-        IRExpr::Bm25 { field, query } => {
-            let var = match field.as_ref() {
-                IRExpr::PropAccess { variable, .. } => variable.clone(),
-                _ => {
-                    return Err(OmniError::manifest(
-                        "bm25 field must be a property access".to_string(),
-                    ));
-                }
-            };
-            let prop = extract_property(field).ok_or_else(|| {
-                OmniError::manifest("bm25 field must be a property access".to_string())
-            })?;
-            let text = resolve_to_string(query, params).ok_or_else(|| {
-                OmniError::manifest("bm25 query must resolve to a string".to_string())
-            })?;
-            Ok(SearchMode {
-                bm25: Some((var, prop, text)),
-                ..Default::default()
-            })
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-        } => {
-            let limit = usize::try_from(ir.limit.ok_or_else(|| {
-                OmniError::manifest("rrf() ordering requires a limit clause".to_string())
-            })?)
-            .unwrap_or(usize::MAX);
-            let k_val = k
-                .as_ref()
-                .and_then(|e| resolve_to_int(e, params))
-                .map(|k| u32::try_from(k).unwrap_or(u32::MAX))
-                .unwrap_or(60);
-
-            let primary_mode =
-                extract_sub_search_mode(ir, primary, params, catalog, embedding, settings).await?;
-            let secondary_mode =
-                extract_sub_search_mode(ir, secondary, params, catalog, embedding, settings)
-                    .await?;
-
-            Ok(SearchMode {
-                rrf: Some(RrfMode {
-                    primary: Box::new(primary_mode),
-                    secondary: Box::new(secondary_mode),
-                    k: k_val,
-                    limit,
-                }),
-                ..Default::default()
-            })
-        }
-        _ => Ok(SearchMode::default()),
-    }
-}
-
-/// Extract a nearest or BM25 arm for RRF fusion. BM25 arms are uncapped:
-/// pruning contributions can change fused ranks even when the result fills its limit.
-pub(super) async fn extract_sub_search_mode(
-    ir: &QueryIR,
-    expr: &IRExpr,
-    params: &ParamMap,
-    catalog: &Catalog,
-    embedding: &EmbeddingResolver<'_>,
-    settings: &SessionSettings,
-) -> Result<SearchMode> {
-    match expr {
-        IRExpr::Nearest {
-            variable,
-            property,
-            query,
-        } => {
-            let vec = resolve_nearest_query_vec(
-                ir, catalog, variable, property, query, params, embedding,
-            )
-            .await?;
-            let k = ir
-                .limit
-                .map(|rows| usize::try_from(rows).unwrap_or(usize::MAX))
-                .unwrap_or(100);
-            Ok(SearchMode {
-                nearest: Some((variable.clone(), property.clone(), vec, k)),
-                ann_probe_budget: settings.ann_nprobes(),
-                ..Default::default()
-            })
-        }
-        IRExpr::Bm25 { field, query } => {
-            let var = match field.as_ref() {
-                IRExpr::PropAccess { variable, .. } => variable.clone(),
-                _ => {
-                    return Err(OmniError::manifest(
-                        "bm25 field must be a property access".to_string(),
-                    ));
-                }
-            };
-            let prop = extract_property(field).ok_or_else(|| {
-                OmniError::manifest("bm25 field must be a property access".to_string())
-            })?;
-            let text = resolve_to_string(query, params).ok_or_else(|| {
-                OmniError::manifest("bm25 query must resolve to a string".to_string())
-            })?;
-            Ok(SearchMode {
-                bm25: Some((var, prop, text)),
-                ..Default::default()
-            })
-        }
-        _ => Ok(SearchMode::default()),
-    }
 }
 
 /// Resolve a nearest query vector, embedding string inputs with the property's
 /// recorded model. Explicit vectors do not require an embedding client.
 pub(super) async fn resolve_nearest_query_vec(
-    ir: &QueryIR,
     catalog: &Catalog,
-    variable: &str,
+    type_name: &str,
     property: &str,
     expr: &IRExpr,
     params: &ParamMap,
@@ -311,7 +251,7 @@ pub(super) async fn resolve_nearest_query_vec(
         Literal::List(_) => literal_to_f32_vec(&lit),
         Literal::String(text) => {
             let (expected_dim, recorded_model) =
-                nearest_property_dim_and_model(ir, catalog, variable, property)?;
+                nearest_property_dim_and_model(catalog, type_name, property)?;
             let client = embedding.resolve().await?;
             if let Some(recorded) = &recorded_model {
                 let resolved = &client.config().model;
@@ -369,21 +309,13 @@ pub(super) fn literal_to_f32_vec(lit: &Literal) -> Result<Vec<f32>> {
 /// Resolve the nearest() target property's vector dimension and the embedding
 /// model recorded for it via `@embed("…", model="…")` (`None` if unrecorded).
 pub(super) fn nearest_property_dim_and_model(
-    ir: &QueryIR,
     catalog: &Catalog,
-    variable: &str,
+    type_name: &str,
     property: &str,
 ) -> Result<(usize, Option<String>)> {
-    let type_name = resolve_binding_type_name(&ir.pipeline, variable).ok_or_else(|| {
-        OmniError::manifest_internal(format!(
-            "nearest() variable '${}' is not bound to a node type in the lowered pipeline",
-            variable
-        ))
-    })?;
     let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
         OmniError::manifest_internal(format!(
-            "nearest() binding '${}' resolved unknown node type '{}'",
-            variable, type_name
+            "nearest() scan resolved unknown node type '{type_name}'"
         ))
     })?;
     let prop = node_type.properties.get(property).ok_or_else(|| {
@@ -406,31 +338,6 @@ pub(super) fn nearest_property_dim_and_model(
         .get(property)
         .and_then(|embed| embed.model.clone());
     Ok((dim, recorded_model))
-}
-
-pub(super) fn resolve_binding_type_name<'a>(
-    pipeline: &'a [IROp],
-    variable: &str,
-) -> Option<&'a str> {
-    for op in pipeline {
-        match op {
-            IROp::NodeScan {
-                variable: bound_var,
-                type_name,
-                ..
-            } if bound_var == variable => return Some(type_name.as_str()),
-            IROp::Expand {
-                dst_var, dst_type, ..
-            } if dst_var == variable => return Some(dst_type.as_str()),
-            IROp::AntiJoin { inner, .. } => {
-                if let Some(type_name) = resolve_binding_type_name(inner, variable) {
-                    return Some(type_name);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse
@@ -475,118 +382,12 @@ pub(super) fn check_param_date_literals(
     Ok(())
 }
 
-/// Check if the query's ordering is search-imposed (`nearest()`/`bm25`).
-pub(super) fn is_search_ordered(search_mode: &SearchMode) -> bool {
-    search_mode.nearest.is_some() || search_mode.bm25.is_some()
-}
-
-/// Synthetic orderings for a search-ordered plan: sort on the score column
-/// Lance appended to the scan (`nearest` ranks by ascending `_distance`,
-/// `bm25` by descending `_score`). The column rides the wide batch under the
-/// search binding's prefix like any other property — hydration replicates it
-/// onto every traversal row, so ranking is data on the rows and Expand
-/// emission order is not load-bearing — and `apply_ordering`'s `.id`
-/// tie-break makes the order total and deterministic. The bare names are
-/// reserved property names at schema validation, so a user column can never
-/// shadow them. Latent nulls note: `apply_ordering` places nulls first under
-/// asc; no in-tree path produces a null score (T23 blocks edge-binding
-/// nearest, hydration replicates non-null seed columns) — if one ever
-/// appears, rank nulls last explicitly here.
-pub(super) fn search_score_orderings(search_mode: &SearchMode) -> Option<Vec<IROrdering>> {
-    let (variable, property, descending) = if let Some((var, ..)) = &search_mode.nearest {
-        (var.clone(), "_distance", false)
-    } else if let Some((var, ..)) = &search_mode.bm25 {
-        (var.clone(), "_score", true)
-    } else {
-        return None;
-    };
-    Some(vec![IROrdering {
-        expr: IRExpr::PropAccess {
-            variable,
-            property: property.to_string(),
-        },
-        descending,
-    }])
-}
-
-/// Prefilter admission ratio: the gate's selective plan runs when
-/// |eligible| / corpus is at or below this. Set by the gate benchmark
-/// (`benches/scenarios.rs` `rrf-gate`, 2026-08-31): on a 100k-row corpus the
-/// prefiltered plan's warm wall clock still beat the postfilter plan's at
-/// 10% eligibility (31.5 ms vs 53.5 ms) and lost at 25% (85 ms vs 68.5 ms);
-/// a 200 KiB-payload corpus crossed even higher. 0.10 is the conservative
-/// (smaller) crossover across both corpora.
-pub(super) const DEFAULT_RRF_GATE_RATIO: f64 = 0.10;
-
-/// Absolute ceiling on the eligible-id in-list: the per-id predicate cost
-/// the ratio cannot see on huge corpora. Set by the same benchmark's 10^5 /
-/// 10^6 microbench (1e6-row corpus): at 1e5 ids the prefiltered plan still
-/// won (324.5 ms vs 360.5 ms warm) and at 1e6 it lost 1.7x (2.76 s vs
-/// 1.63 s) — `Expr` construction itself stays negligible (31 ms at 1e6);
-/// the loss is the in-list probe/filter evaluation.
-pub(super) const DEFAULT_RRF_GATE_MAX_IDS: usize = 100_000;
-
-pub(super) fn rrf_gate_ratio() -> f64 {
-    std::env::var("OMNIGRAPH_RRF_GATE_RATIO")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|r| r.is_finite() && *r >= 0.0)
-        .unwrap_or(DEFAULT_RRF_GATE_RATIO)
-}
-
-pub(super) fn rrf_gate_max_ids() -> usize {
-    std::env::var("OMNIGRAPH_RRF_GATE_MAX_IDS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_RRF_GATE_MAX_IDS)
-}
-
-/// Required first hops from a top-level scanned ranked variable, or `None`
-/// when it is an Expand destination or has no constraining Expand.
-/// AntiJoin and zero-hop Expands cannot constrain this superset of survivors.
-pub(super) fn rrf_gate_expand_sources<'a>(
-    pipeline: &'a [IROp],
-    ranked_var: &str,
-) -> Option<Vec<(&'a str, Direction)>> {
-    let mut introduced_by_scan = false;
-    let mut sources: Vec<(&str, Direction)> = Vec::new();
-    for op in pipeline {
-        match op {
-            IROp::NodeScan { variable, .. } if variable == ranked_var => {
-                introduced_by_scan = true;
-            }
-            IROp::Expand {
-                src_var,
-                dst_var,
-                edge_type,
-                direction,
-                min_hops,
-                dst_type: _,
-                max_hops: _,
-                dst_filters: _,
-                edge_binding: _,
-            } => {
-                if dst_var == ranked_var {
-                    return None;
-                }
-                if src_var == ranked_var && *min_hops > 0 {
-                    sources.push((edge_type.as_str(), *direction));
-                }
-            }
-            IROp::NodeScan { .. } | IROp::Filter(_) | IROp::AntiJoin { .. } => {}
-        }
-    }
-    if introduced_by_scan && !sources.is_empty() {
-        Some(sources)
-    } else {
-        None
-    }
-}
-
 /// The rrf prefilter gate: decide, before the arms run, between two ANSWER-IDENTICAL
 /// plans — prefilter (the uncapped bm25 arms rank only the traversal's
 /// eligible ids) and postfilter (the uncapped corpus-wide arms, v0.9 rrf
-/// semantics).
+/// semantics). The plan declares the pre-pass (`RankFuse.prefilter`: the
+/// ranked type, the required first hops, the scans it feeds) and the policy
+/// (`Assumptions.gate_policy`); the gate reads the store and decides.
 ///
 /// INVARIANT (single owner): with bm25 arms prefiltered and nearest arms
 /// untouched, over FTS-index-covered data,
@@ -597,7 +398,7 @@ pub(super) fn rrf_gate_expand_sources<'a>(
 /// identity:
 /// - the eligible set MUST over-approximate the traversal's survivors (a
 ///   superset only costs speedup; a subset changes answers) — every
-///   admitted shape in `rrf_gate_expand_sources` is an instance;
+///   shape the planner's `prefilter` admits is an instance;
 /// - full FTS fragment coverage (uncovered fragments are scored
 ///   filter-dependently, so a mask would change their scores);
 /// - `nearest` arms are never prefiltered (their constitutive `k` makes a
@@ -611,12 +412,10 @@ pub(super) fn rrf_gate_expand_sources<'a>(
 /// broad regime never builds them. Every decision records a
 /// `rrf_gate_verdicts` probe entry.
 pub(super) async fn rrf_prefilter_gate(
-    ir: &QueryIR,
-    snapshot: &Snapshot,
-    graph_index: &GraphIndexHandle,
-    catalog: &Catalog,
-    rrf: &RrfMode,
-    rrf_plan: RrfPlan,
+    context: &EngineContext<'_>,
+    arms: [ArmTarget<'_>; 2],
+    prefilter: &Prefilter,
+    policy: GatePolicy,
 ) -> Option<EligibleIds> {
     let fall_back =
         |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
@@ -634,46 +433,23 @@ pub(super) async fn rrf_prefilter_gate(
             });
         };
 
-    if rrf_plan == RrfPlan::ForcePostfilter {
+    if policy.mode == PrefilterMode::ForcePostfilter {
         fall_back(RrfGateFallback::Forced, true, None, None);
         return None;
     }
-    let forced = rrf_plan == RrfPlan::ForcePrefilter;
-    let arm_target = |mode: &SearchMode| {
-        mode.bm25
-            .as_ref()
-            .map(|(v, ..)| v.clone())
-            .or_else(|| mode.nearest.as_ref().map(|(v, ..)| v.clone()))
-    };
-    let (Some(primary_var), Some(secondary_var)) =
-        (arm_target(&rrf.primary), arm_target(&rrf.secondary))
-    else {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
-    };
-    if primary_var != secondary_var {
+    let forced = policy.mode == PrefilterMode::ForcePrefilter;
+    if !prefilter.admits() {
         fall_back(RrfGateFallback::Shape, forced, None, None);
         return None;
     }
-    let ranked_var = primary_var.as_str();
-    let bm25_props: Vec<&str> = [&rrf.primary, &rrf.secondary]
-        .into_iter()
-        .filter_map(|arm| arm.bm25.as_ref().map(|(_, prop, _)| prop.as_str()))
+    let bm25_props: Vec<&str> = arms
+        .iter()
+        .filter(|arm| arm.kind == RankKind::Bm25)
+        .map(|arm| arm.property)
         .collect();
-    if bm25_props.is_empty() {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
-    }
-
-    let Some(sources) = rrf_gate_expand_sources(&ir.pipeline, ranked_var) else {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
-    };
-    let Some(ranked_type) = resolve_binding_type_name(&ir.pipeline, ranked_var) else {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
-    };
-    let node_key = format!("node:{}", ranked_type);
+    let ranked_type = prefilter.ranked_type.as_str();
+    let node_key = format!("node:{ranked_type}");
+    let snapshot = context.snapshot;
     let Some(node_entry) = snapshot.dataset(&node_key) else {
         fall_back(RrfGateFallback::Shape, forced, None, None);
         return None;
@@ -698,16 +474,23 @@ pub(super) async fn rrf_prefilter_gate(
     }
 
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-    let (mut ids, eligible_count) =
-        match adjacency_eligible_ids(graph_index, catalog, ranked_type, &sources, corpus, forced)
-            .await
-        {
-            EligibleOutcome::Ids { ids, eligible } => (ids, eligible),
-            EligibleOutcome::FallBack { fallback, eligible } => {
-                fall_back(fallback, forced, eligible, Some(corpus));
-                return None;
-            }
-        };
+    let (mut ids, eligible_count) = match adjacency_eligible_ids(
+        &context.graph_index,
+        context.catalog,
+        ranked_type,
+        &prefilter.hops,
+        corpus,
+        forced,
+        policy,
+    )
+    .await
+    {
+        EligibleOutcome::Ids { ids, eligible } => (ids, eligible),
+        EligibleOutcome::FallBack { fallback, eligible } => {
+            fall_back(fallback, forced, eligible, Some(corpus));
+            return None;
+        }
+    };
     #[cfg(debug_assertions)]
     if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
         ids.retain(|id| *id != dropped);
@@ -742,9 +525,10 @@ pub(super) async fn adjacency_eligible_ids(
     graph_index: &GraphIndexHandle,
     catalog: &Catalog,
     ranked_type: &str,
-    sources: &[(&str, Direction)],
+    hops: &[Hop],
     corpus: u64,
     forced: bool,
+    policy: GatePolicy,
 ) -> EligibleOutcome {
     let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>| EligibleOutcome::FallBack {
         fallback,
@@ -760,9 +544,13 @@ pub(super) async fn adjacency_eligible_ids(
     let mut adjacencies: Vec<(
         Option<&crate::graph_index::CsrIndex>,
         Option<&crate::graph_index::CsrIndex>,
-    )> = Vec::with_capacity(sources.len());
-    for (edge_type, direction) in sources {
-        let Some(edge_def) = catalog.edge_types.get(*edge_type) else {
+    )> = Vec::with_capacity(hops.len());
+    for Hop {
+        edge_type,
+        direction,
+    } in hops
+    {
+        let Some(edge_def) = catalog.edge_types.get(edge_type) else {
             return fall_back(RrfGateFallback::Shape, None);
         };
         let side_matches = match direction {
@@ -800,8 +588,8 @@ pub(super) async fn adjacency_eligible_ids(
         return fall_back(RrfGateFallback::EmptyEligible, Some(0));
     }
     if !forced {
-        let ratio_ok = corpus > 0 && (eligible_count as f64) <= rrf_gate_ratio() * (corpus as f64);
-        let cap_ok = eligible_count <= rrf_gate_max_ids() as u64;
+        let ratio_ok = corpus > 0 && (eligible_count as f64) <= policy.ratio * (corpus as f64);
+        let cap_ok = eligible_count <= policy.max_ids;
         if !(ratio_ok && cap_ok) {
             return fall_back(RrfGateFallback::Threshold, Some(eligible_count));
         }
@@ -826,19 +614,14 @@ pub(super) async fn adjacency_eligible_ids(
 
 /// The nearest prefilter gate (issue #567): a standalone `nearest` whose
 /// ranked variable a top-level Expand constrains ANDs the traversal's
-/// eligible-id superset into its scan.
+/// eligible-id superset into its scan. The plan declares the pre-pass
+/// (`RankedAccess.prefilter`) and the policy; the gate reads the store.
 pub(super) async fn nearest_prefilter_gate(
-    ir: &QueryIR,
-    snapshot: &Snapshot,
-    graph_index: &GraphIndexHandle,
-    catalog: &Catalog,
-    mode: &SearchMode,
-    rrf_plan: RrfPlan,
+    context: &EngineContext<'_>,
+    prefilter: &Prefilter,
+    policy: GatePolicy,
 ) -> NearestGatePlan {
-    let Some((ranked_var, ..)) = mode.nearest.as_ref() else {
-        return NearestGatePlan::Postfilter;
-    };
-    let forced = rrf_plan != RrfPlan::Auto;
+    let forced = policy.mode != PrefilterMode::Auto;
     let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>, corpus: Option<u64>| {
         tracing::debug!(
             ?fallback,
@@ -853,25 +636,31 @@ pub(super) async fn nearest_prefilter_gate(
             corpus,
         });
     };
-    if rrf_plan == RrfPlan::ForcePostfilter {
+    if policy.mode == PrefilterMode::ForcePostfilter {
         fall_back(RrfGateFallback::Forced, None, None);
         return NearestGatePlan::Postfilter;
     }
-    let Some(sources) = rrf_gate_expand_sources(&ir.pipeline, ranked_var) else {
+    if !prefilter.admits() {
         fall_back(RrfGateFallback::Shape, None, None);
         return NearestGatePlan::Postfilter;
-    };
-    let Some(ranked_type) = resolve_binding_type_name(&ir.pipeline, ranked_var) else {
-        fall_back(RrfGateFallback::Shape, None, None);
-        return NearestGatePlan::Postfilter;
-    };
-    let node_key = format!("node:{}", ranked_type);
-    let Some(node_entry) = snapshot.dataset(&node_key) else {
+    }
+    let ranked_type = prefilter.ranked_type.as_str();
+    let node_key = format!("node:{ranked_type}");
+    let Some(node_entry) = context.snapshot.dataset(&node_key) else {
         fall_back(RrfGateFallback::Shape, None, None);
         return NearestGatePlan::Postfilter;
     };
     let corpus = node_entry.entity_count;
-    match adjacency_eligible_ids(graph_index, catalog, ranked_type, &sources, corpus, forced).await
+    match adjacency_eligible_ids(
+        &context.graph_index,
+        context.catalog,
+        ranked_type,
+        &prefilter.hops,
+        corpus,
+        forced,
+        policy,
+    )
+    .await
     {
         EligibleOutcome::Ids { ids, eligible } => {
             record_ann_prefilter_verdict(RrfGateVerdict {
@@ -905,29 +694,6 @@ pub(super) enum NearestGatePlan {
     /// scan returns its zero-row batch without running Lance and no
     /// overfetch can add a row.
     ProvenEmpty,
-}
-
-/// Whether any top-level Expand leaves `variable`: the precondition for the
-/// nearest prefilter gate to have anything to constrain the scan with. A
-/// presence test only; `rrf_gate_expand_sources` decides superset-safety.
-pub(super) fn pipeline_expands_from(pipeline: &[IROp], variable: &str) -> bool {
-    pipeline
-        .iter()
-        .any(|op| matches!(op, IROp::Expand { src_var, .. } if src_var == variable))
-}
-
-/// This arm's mode with the eligible-id prefilter attached iff the arm
-/// carries a bm25 target. A `nearest` arm passes through untouched:
-/// prefiltering its `k`-truncated scan would change the fused answer.
-pub(super) fn arm_with_bm25_prefilter(arm: &SearchMode, ids: &EligibleIds) -> SearchMode {
-    if arm.bm25.is_some() {
-        SearchMode {
-            eligible_ids: Some(ids.clone()),
-            ..arm.clone()
-        }
-    } else {
-        arm.clone()
-    }
 }
 
 /// Whether a filter's left operand is a full-text search call.
@@ -1011,13 +777,6 @@ pub(super) fn collect_referenced_edge_names(
 
 /// Per-rung multiplier of the probe ladder (20 → 80 → 320 → none).
 pub(super) const ANN_PROBE_ESCALATION_FACTOR: usize = 4;
-
-/// Per-rung multiplier and ceiling of the query-level overfetch loop
-/// (`k` → 4k → 16k, then one exact pass over the whole type) for a
-/// standalone `nearest` cut short of `limit` by an operator above a full scan.
-pub(super) const ANN_OVERFETCH_STEP: usize = 4;
-
-pub(super) const ANN_OVERFETCH_MAX_FACTOR: usize = 16;
 
 /// The next rung of the probe ladder after `current` starved a scan: ×4, or
 /// no cap once the next rung would cover the ranked partitions anyway.
@@ -1112,8 +871,8 @@ pub(super) fn batches_hold_infinite_distance(batches: &[RecordBatch]) -> bool {
 #[cfg(test)]
 mod ann_probe_budget_tests {
     use super::{
-        LadderStep, NearestScanReport, OverfetchRung, SearchMode, ladder_step, next_overfetch_rung,
-        next_probe_budget,
+        LadderStep, NearestRung, NearestScanReport, NextPass, OverfetchRung, Pass, PassStep,
+        ladder_step, next_overfetch_rung, next_probe_budget,
     };
 
     const IVF_SHORT: Option<(Option<u64>, Option<u64>)> = Some((Some(1), Some(1_000)));
@@ -1121,24 +880,38 @@ mod ann_probe_budget_tests {
     /// Rust test: no `.gqt` fixture trains an IVF index, so no case carries a probe cap.
     #[test]
     fn with_nearest_k_replaces_k_and_seeds_the_probe_cap() {
-        let mode = SearchMode {
-            nearest: Some(("d".into(), "embedding".into(), vec![0.5], 10)),
-            ann_probe_budget: Some(7),
-            ..Default::default()
-        };
-        let wider = mode.with_nearest_k(40, Some(28));
+        let pass = Pass::default();
+        assert_eq!(pass.rung(4), None);
+        let wider = pass.with_nearest_k(4, 40, Some(28));
         assert_eq!(
-            wider.nearest,
-            Some(("d".into(), "embedding".into(), vec![0.5], 40))
+            wider.rung(4),
+            Some(NearestRung {
+                k: 40,
+                maximum: Some(28),
+                exact: false,
+            })
         );
-        assert_eq!(wider.ann_probe_budget, Some(28));
-        let uncapped = mode.with_nearest_k(40, None);
-        assert_eq!(uncapped.ann_probe_budget, None);
+        assert_eq!(
+            wider.rung(5),
+            None,
+            "the rung is the scan's, not the pass's"
+        );
+        let uncapped = wider.with_nearest_k(4, 160, None);
+        assert_eq!(uncapped.rung(4).map(|rung| rung.maximum), Some(None));
+        let exact = uncapped.with_exact_nearest(4, 2_000);
+        assert_eq!(
+            exact.rung(4),
+            Some(NearestRung {
+                k: 2_000,
+                maximum: None,
+                exact: true,
+            })
+        );
     }
 
     /// Rust test: no `.gqt` fixture trains an IVF index, so no case reaches a wider rung.
     #[test]
-    fn overfetch_multiplies_then_runs_one_exact_pass() {
+    fn overfetch_takes_the_declared_rungs_in_order_then_the_exact_pass() {
         let scan = |k: usize, maximum: Option<usize>, dataset_rows: u64| NearestScanReport {
             rows: k,
             k,
@@ -1146,36 +919,60 @@ mod ann_probe_budget_tests {
             exhausted: false,
             dataset_rows,
         };
+        let ladder = OverfetchRung::ladder(10);
         assert_eq!(
-            next_overfetch_rung(1, 10, scan(10, Some(20), 2_000)),
-            Some(OverfetchRung::Wider {
-                factor: 4,
-                k: 40,
-                maximum: Some(20)
+            ladder,
+            [
+                OverfetchRung::Wider { factor: 4, k: 40 },
+                OverfetchRung::Wider { factor: 16, k: 160 },
+                OverfetchRung::Exact,
+            ]
+        );
+        assert_eq!(
+            next_overfetch_rung(&ladder, 0, scan(10, Some(20), 2_000)),
+            Some(NextPass {
+                rung: 1,
+                step: PassStep::Wider {
+                    k: 40,
+                    maximum: Some(20)
+                }
             })
         );
         assert_eq!(
-            next_overfetch_rung(4, 10, scan(40, None, 2_000)),
-            Some(OverfetchRung::Wider {
-                factor: 16,
-                k: 160,
-                maximum: None
+            next_overfetch_rung(&ladder, 1, scan(40, None, 2_000)),
+            Some(NextPass {
+                rung: 2,
+                step: PassStep::Wider {
+                    k: 160,
+                    maximum: None
+                }
             })
         );
         assert_eq!(
-            next_overfetch_rung(16, 10, scan(160, Some(80), 2_000)),
-            Some(OverfetchRung::Exact { k: 2_000 }),
+            next_overfetch_rung(&ladder, 2, scan(160, Some(80), 2_000)),
+            Some(NextPass {
+                rung: 3,
+                step: PassStep::Exact { k: 2_000 }
+            }),
             "past the ceiling the exact pass asks for the whole type"
         );
         assert_eq!(
-            next_overfetch_rung(4, 10, scan(40, Some(80), 100)),
-            Some(OverfetchRung::Exact { k: 100 }),
-            "a rung that would ask for the whole type anyway is the exact pass"
+            next_overfetch_rung(&ladder, 1, scan(40, Some(80), 100)),
+            Some(NextPass {
+                rung: 3,
+                step: PassStep::Exact { k: 100 }
+            }),
+            "a rung that would ask for the whole type anyway is skipped for the exact pass"
         );
         assert_eq!(
-            next_overfetch_rung(1, 160, scan(160, Some(20), 160)),
+            next_overfetch_rung(&OverfetchRung::ladder(160), 0, scan(160, Some(20), 160)),
             None,
             "a full scan that asked for exactly the whole type returned every row"
+        );
+        assert_eq!(
+            next_overfetch_rung(&ladder, 3, scan(2_000, None, 2_000)),
+            None,
+            "a spent ladder reruns nothing"
         );
     }
 

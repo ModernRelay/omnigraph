@@ -1,0 +1,246 @@
+{
+  "explain_version": 1,
+  "query": "query liked() {\n    match { $p: Person $p likes $d }\n    return { $p.name, $d.title }\n    order { $p.name, $d.title }\n}",
+  "physical_plan": {
+    "node": "Sort",
+    "keys": [
+      "$p.name asc",
+      "$d.title asc"
+    ],
+    "fetch": null,
+    "tiebreak": [],
+    "id": 5,
+    "properties": {
+      "ordering": [
+        "$p.name asc",
+        "$d.title asc"
+      ],
+      "rows": "unknown",
+      "work_bytes": "unknown",
+      "retained_limit": null,
+      "sources": []
+    },
+    "inputs": [
+      {
+        "node": "Projection",
+        "exprs": [
+          "$p.name",
+          "$d.title"
+        ],
+        "id": 4,
+        "properties": {
+          "ordering": null,
+          "rows": "unknown",
+          "work_bytes": "unknown",
+          "retained_limit": null,
+          "sources": []
+        },
+        "inputs": [
+          {
+            "node": "HashJoin",
+            "binding": "d",
+            "fallback": "id_lookup",
+            "id": 3,
+            "properties": {
+              "ordering": null,
+              "rows": "unknown",
+              "work_bytes": "unknown",
+              "retained_limit": null,
+              "sources": []
+            },
+            "inputs": [
+              {
+                "node": "Expand",
+                "src": "p",
+                "dst": "d",
+                "edge_type": "Likes",
+                "direction": "out",
+                "dst_type": "Doc",
+                "min_hops": 1,
+                "max_hops": 1,
+                "edge_binding": null,
+                "mode": "indexed_scan",
+                "alternatives": [
+                  "csr"
+                ],
+                "frontier_estimate": 2,
+                "id": 1,
+                "properties": {
+                  "ordering": null,
+                  "rows": "unknown",
+                  "work_bytes": "unknown",
+                  "retained_limit": null,
+                  "sources": []
+                },
+                "inputs": [
+                  {
+                    "node": "Scan",
+                    "binding": "p",
+                    "table": "node:Person",
+                    "version": 2,
+                    "projection": [
+                      "__id",
+                      "name"
+                    ],
+                    "filter": null,
+                    "ordered": false,
+                    "keys_only": false,
+                    "id": 0,
+                    "properties": {
+                      "ordering": null,
+                      "rows": {
+                        "known": 2
+                      },
+                      "work_bytes": "unknown",
+                      "retained_limit": null,
+                      "sources": [
+                        {
+                          "statistic": "scan_row_estimate(node:Person)",
+                          "value": "2",
+                          "origin": "manifest row count, at most one row under a key equality"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "node": "Scan",
+                "binding": "d",
+                "table": "node:Doc",
+                "version": 2,
+                "projection": [
+                  "__id",
+                  "title"
+                ],
+                "filter": null,
+                "ordered": false,
+                "keys_only": false,
+                "id": 2,
+                "properties": {
+                  "ordering": null,
+                  "rows": {
+                    "known": 2
+                  },
+                  "work_bytes": "unknown",
+                  "retained_limit": null,
+                  "sources": [
+                    {
+                      "statistic": "scan_row_estimate(node:Doc)",
+                      "value": "2",
+                      "origin": "manifest row count, at most one row under a key equality"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "profile": [
+    {
+      "tree": "profile",
+      "node": "Scan",
+      "detail": {
+        "id": 0,
+        "operator": "ScanExec",
+        "status": "executed",
+        "attempts": [
+          {
+            "rung": 0,
+            "ran": true,
+            "actual_rows": 2,
+            "drained": true
+          }
+        ]
+      }
+    },
+    {
+      "tree": "profile",
+      "node": "Expand",
+      "detail": {
+        "id": 1,
+        "operator": "ExpandExec",
+        "status": "executed",
+        "attempts": [
+          {
+            "rung": 0,
+            "ran": "indexed_scan",
+            "actual_rows": 3,
+            "drained": true
+          }
+        ]
+      }
+    },
+    {
+      "tree": "profile",
+      "node": "Scan",
+      "detail": {
+        "id": 2,
+        "operator": "ScanExec",
+        "status": "executed",
+        "attempts": [
+          {
+            "rung": 0,
+            "ran": true,
+            "actual_rows": 2,
+            "drained": true
+          }
+        ]
+      }
+    },
+    {
+      "tree": "profile",
+      "node": "HashJoin",
+      "detail": {
+        "id": 3,
+        "operator": "HashJoinExec",
+        "status": "executed",
+        "attempts": [
+          {
+            "rung": 0,
+            "ran": "hash_join",
+            "actual_rows": 3,
+            "drained": true
+          }
+        ]
+      }
+    },
+    {
+      "tree": "profile",
+      "node": "Projection",
+      "detail": {
+        "id": 4,
+        "operator": "ProjectionExec",
+        "status": "executed",
+        "attempts": [
+          {
+            "rung": 0,
+            "ran": true,
+            "actual_rows": 3,
+            "drained": true
+          }
+        ]
+      }
+    },
+    {
+      "tree": "profile",
+      "node": "Sort",
+      "detail": {
+        "id": 5,
+        "operator": "SortExec",
+        "status": "executed",
+        "attempts": [
+          {
+            "rung": 0,
+            "ran": true,
+            "actual_rows": 3,
+            "drained": true
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -84,7 +84,7 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         name: "ann_nprobes",
         kind: SettingKind::Integer { min: 0, max: None },
         default: "20",
-        scope: SettingScope::Process,
+        scope: SettingScope::Request,
         env: "OMNIGRAPH_ANN_NPROBES",
         doc: "the partition cap per index delta of a `nearest` scan; `0` is no cap",
     },

@@ -2032,7 +2032,7 @@ async fn settings_process_setting_in_request_text_is_refused_at_both_doors() {
 
     let (status, body) = json_response(
         &app,
-        json_post("/query", &json!({"query": "reset ann_nprobes;\nshow all;"})),
+        json_post("/query", &json!({"query": "reset rrf_plan;\nshow all;"})),
     )
     .await;
     assert_settings_refusal_needle(status, &body, PROCESS_SETTING_NEEDLE);
@@ -2174,6 +2174,25 @@ async fn settings_reset_in_text_returns_to_the_baseline_not_the_request_value() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn settings_field_carries_ann_nprobes_into_the_session() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": "show ann_nprobes;", "settings": {"ann_nprobes": 1}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        show_output(&[show_row("ann_nprobes", "1", "20", "request", "request")])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn settings_show_all_lists_the_definition_in_order() {
     let (_temp, app) = app_for_loaded_graph().await;
     let (status, body) =
@@ -2191,7 +2210,7 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
-            show_row("ann_nprobes", "20", "20", "default", "process"),
+            show_row("ann_nprobes", "20", "20", "default", "request"),
             show_row("stage_write_concurrency", "8", "8", "default", "process"),
         ])
     );
@@ -2420,7 +2439,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
     );
     assert_eq!(
         body["rows"][3],
-        show_row("ann_nprobes", "5", "20", "env", "process"),
+        show_row("ann_nprobes", "5", "20", "env", "request"),
         "reset all returns to the process value, not the definition's: {body}"
     );
 }

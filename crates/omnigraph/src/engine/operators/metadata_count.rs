@@ -12,7 +12,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 
-use super::{breaker_properties, breaker_stream, external};
+use super::{breaker_properties, breaker_stream, external, polled};
 use crate::db::Snapshot;
 use crate::error::OmniError;
 
@@ -82,7 +82,7 @@ impl ExecutionPlan for MetadataCountExec {
         let snapshot = self.snapshot.clone();
         let type_key = self.type_key.clone();
         let schema = self.schema();
-        Ok(breaker_stream(
+        let stream = breaker_stream(
             "MetadataCountExec",
             Arc::clone(&schema),
             &ctx,
@@ -104,6 +104,7 @@ impl ExecutionPlan for MetadataCountExec {
                 let columns = schema.fields().iter().map(|_| Arc::clone(&value)).collect();
                 RecordBatch::try_new(schema, columns).map_err(Into::into)
             },
-        ))
+        );
+        Ok(polled(&self.metrics, stream))
     }
 }

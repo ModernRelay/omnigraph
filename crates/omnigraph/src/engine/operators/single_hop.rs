@@ -9,15 +9,15 @@ use arrow_schema::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge};
 use futures::StreamExt;
 use omnigraph_planner::should_switch_to_csr;
 
 use super::expand::{ExpandStep, GraphEnv};
 use super::expand_stream::{align_sources, output_rows};
-use super::external;
 use super::memory::WorkMemory;
 use super::producer::{BatchSender, producer_stream};
+use super::{Switch, external};
 use crate::engine::graph::{
     CsrSource, EndpointColumns, ExpandStart, GraphIndexHandle, HopPolicy, decide_expand_start,
     endpoint_probes, intern, resolve_csr, scan_neighbor_map,
@@ -33,6 +33,7 @@ pub(super) fn execute(
     ctx: Arc<TaskContext>,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<SendableRecordBatchStream> {
+    let switch = Switch::gauge(metrics);
     let mut work = WorkMemory::new(ctx, "ExpandExec")?;
     work.set_metrics(metrics.clone());
     work.metric("input_rows", 0);
@@ -42,7 +43,9 @@ pub(super) fn execute(
         schema,
         memory,
         Some(metrics),
-        move |memory, sender| async move { run(input, &declared, &step, &env, &memory, &sender).await },
+        move |memory, sender| async move {
+            run(input, &declared, &step, &env, &switch, &memory, &sender).await
+        },
     ))
 }
 
@@ -51,6 +54,7 @@ async fn run(
     schema: &SchemaRef,
     step: &ExpandStep,
     env: &GraphEnv,
+    switch: &Gauge,
     memory: &Arc<WorkMemory>,
     sender: &BatchSender,
 ) -> Result<()> {
@@ -82,14 +86,20 @@ async fn run(
     .await
     .map_err(external)?;
     let mut source = match start {
-        ExpandStart::Csr => Source::csr(env, edge_def, step).await?,
+        ExpandStart::Csr => {
+            Switch::Csr.record(switch);
+            Source::csr(env, edge_def, step).await?
+        }
         ExpandStart::Indexed {
             edge_ds,
             hop_policy,
-        } => Source::Indexed {
-            edge_ds,
-            hop_policy,
-        },
+        } => {
+            Switch::IndexedScan.record(switch);
+            Source::Indexed {
+                edge_ds,
+                hop_policy,
+            }
+        }
     };
     let batch_size = output_rows(memory);
     walk_memory.entries::<u32>(batch_size * 2)?;
@@ -115,6 +125,7 @@ async fn run(
                 reason = "frontier outgrew the indexed path",
                 "expand mode switched between input batches",
             );
+            Switch::Csr.record(switch);
             source = Source::csr(env, edge_def, step).await?;
         }
         let input_memory = memory.child("expand input batch")?;

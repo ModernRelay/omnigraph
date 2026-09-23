@@ -5644,6 +5644,11 @@
         "type": "object",
         "description": "The `settings` field of a request: one optional value per `request`-scope\nsetting of the definition, applied to the request's session before the\nsource's own `set` lines, so a `set` line in the request's text overrides\nthe field. An absent field is empty. A `process` setting has no field\nhere, so `{\"stage_write_concurrency\": 64}` is refused as an unknown field.",
         "properties": {
+          "ann_nprobes": {
+            "type": "integer",
+            "description": "the partition cap per index delta of a `nearest` scan; `0` is no cap",
+            "minimum": 0
+          },
           "engine": {
             "type": "string",
             "description": "whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution",

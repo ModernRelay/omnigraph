@@ -11,7 +11,7 @@ use arrow_schema::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
@@ -20,7 +20,7 @@ use futures::StreamExt;
 use super::expand::{ExpandStep, GraphEnv};
 use super::memory::WorkMemory;
 use super::producer::{BatchSender, producer_stream};
-use super::{drain_one, external};
+use super::{Switch, drain_one, external};
 use crate::engine::graph::{bound_edge_pair_schema, execute_expand, produce_bound_edge_pairs};
 
 /// The most rows of one aligned output chunk, on all three strategies: the
@@ -28,6 +28,8 @@ use crate::engine::graph::{bound_edge_pair_schema, execute_expand, produce_bound
 /// the picked bytes, so the chunk bounds that reservation by row width.
 pub(super) const EXPAND_OUTPUT_ROWS: usize = 256;
 
+/// The `switch` gauge on `metrics` records the mode the traversal ends on,
+/// one side of the `Expand` node's declared switch.
 pub(super) fn execute(
     input: SendableRecordBatchStream,
     input_schema: SchemaRef,
@@ -40,6 +42,7 @@ pub(super) fn execute(
     if step.single_hop() && step.edge_binding.is_none() {
         return super::single_hop::execute(input, schema, step, env, ctx, metrics);
     }
+    let switch = Switch::gauge(metrics);
     let ctx = Arc::new(TaskContext::new(
         ctx.task_id(),
         ctx.session_id(),
@@ -69,7 +72,8 @@ pub(super) fn execute(
                 if wide.num_rows() == 0 {
                     return Ok(());
                 }
-                return emit_unbound(&wide, &step, &env, &memory, &sender, &declared).await;
+                return emit_unbound(&wide, &step, &env, &switch, &memory, &sender, &declared)
+                    .await;
             }
             let mut input = input;
             while let Some(batch) = input.next().await {
@@ -161,6 +165,7 @@ async fn emit_unbound(
     wide: &RecordBatch,
     step: &ExpandStep,
     env: &GraphEnv,
+    switch: &Gauge,
     memory: &Arc<WorkMemory>,
     sender: &BatchSender,
     schema: &SchemaRef,
@@ -171,6 +176,7 @@ async fn emit_unbound(
         &env.snapshot,
         &env.catalog,
         step,
+        switch,
         memory,
     )
     .await

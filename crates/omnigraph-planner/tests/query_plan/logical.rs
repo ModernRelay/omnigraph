@@ -297,6 +297,9 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
         fn filter_pushable(&self, _: &IRFilter) -> bool {
             false
         }
+        fn edge_dataset(&self, _: &str) -> Option<omnigraph_planner::DatasetPin> {
+            None
+        }
     }
     for dependent in [false, true] {
         for embedded in [false, true] {
@@ -349,10 +352,12 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
                     assert!(spec.filter.is_none());
                 }
             }
-            assert_eq!(
-                projection_of(&plan, binding),
-                set(&["__id", "slug", "state"])
-            );
+            let expected: &[&str] = if dependent {
+                &["__id", "slug", "state"]
+            } else {
+                &["slug", "state"]
+            };
+            assert_eq!(projection_of(&plan, binding), set(expected));
         }
     }
 }

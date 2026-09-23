@@ -21,7 +21,7 @@ use lance_index::scalar::FullTextSearchQuery;
 /// scanner a precomputed row-address set directly, composing with FTS and
 /// ANN, instead of an expression Lance must evaluate (BTREE probe per id,
 /// re-done every query). Worth revisiting if the id→row-addr probe or the
-/// gate's id-count cap (`DEFAULT_RRF_GATE_MAX_IDS`, set where in-list
+/// gate's id-count cap (`GatePolicy::max_ids`, set where in-list
 /// evaluation starts losing) ever shows up as the bottleneck: a mask built
 /// from a cached id→addr mapping would lift both.
 pub(super) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelude::Expr {
@@ -51,7 +51,7 @@ pub(super) async fn execute_node_scan(
 
     let mut filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
 
-    if let Some(eligible_ids) = search_mode.eligible_ids_for(variable) {
+    if let Some(eligible_ids) = search_mode.eligible_ids() {
         let in_list = id_in_list_expr(eligible_ids, catalog.system_columns.id);
         filter_expr = Some(match filter_expr {
             Some(expr) => expr.and(in_list),
@@ -59,28 +59,34 @@ pub(super) async fn execute_node_scan(
         });
     }
 
-    let nearest_target = search_mode
-        .nearest
-        .as_ref()
-        .filter(|(var, ..)| var == variable)
-        .map(|(_, prop, vec, k)| (prop.clone(), Float32Array::from(vec.clone()), *k));
-    let ranking = search_mode
-        .bm25
-        .as_ref()
-        .filter(|(var, ..)| var == variable);
+    let nearest_target = search_mode.nearest.as_ref().map(|target| {
+        (
+            target.property.clone(),
+            Float32Array::from(target.vector.clone()),
+            target.k,
+        )
+    });
+    let ranking = search_mode.bm25.as_ref();
     let mut hoisted_fts_queries: Vec<FullTextSearchQuery> = Vec::new();
     for filter in filters {
         let Some(query) = search_filter_query(filter, params)? else {
             continue;
         };
-        let ranked_matches_only = ranking
-            .is_some_and(|(_, prop, text)| search_filter_is_ranking(filter, prop, text, params));
+        let ranked_matches_only = ranking.is_some_and(|target| {
+            search_filter_is_ranking(filter, &target.property, &target.text, params)
+        });
         if !ranked_matches_only {
             hoisted_fts_queries.push(query);
         }
     }
     let (fts_query, member_ids) = match (ranking, conjoin_fts_queries(hoisted_fts_queries)) {
-        (Some((_, prop, text)), filter_query) => {
+        (
+            Some(Bm25Target {
+                property: prop,
+                text,
+            }),
+            filter_query,
+        ) => {
             let ids = match filter_query {
                 Some(query) => Some(
                     search_filter_member_ids(
@@ -110,7 +116,6 @@ pub(super) async fn execute_node_scan(
     }
     let columns = ScanColumns::new(
         node_type,
-        catalog,
         SearchColumns {
             distance: nearest_target.is_some(),
             score: fts_query.is_some(),
@@ -121,14 +126,14 @@ pub(super) async fn execute_node_scan(
     let read_projection = columns.read_projection();
     let projection = read_projection.as_deref();
     let scan_proven_empty =
-        search_mode.scan_proven_empty(variable) || member_ids.as_ref().is_some_and(Vec::is_empty);
+        search_mode.answer_proven_empty || member_ids.as_ref().is_some_and(Vec::is_empty);
     if !scan_proven_empty {
         crate::instrumentation::record_node_scan_projection(projection);
     }
     let mut probe_budget: Option<usize> = nearest_target.as_ref().and(search_mode.ann_probe_budget);
     let known_matches: Option<usize> = nearest_target
         .as_ref()
-        .and_then(|_| search_mode.eligible_ids_for(variable))
+        .and_then(|_| search_mode.eligible_ids())
         .map(<[String]>::len);
     let dataset_rows: Option<u64> = match nearest_target.as_ref() {
         Some(_) if !scan_proven_empty => Some(
@@ -331,11 +336,7 @@ pub(super) async fn execute_node_scan(
             );
         }
     }
-    if search_mode
-        .bm25
-        .as_ref()
-        .is_some_and(|(var, ..)| var == variable)
-    {
+    if search_mode.bm25.is_some() {
         crate::instrumentation::record_bm25_scan_rows(
             batches.iter().map(|b| b.num_rows() as u64).sum(),
         );
@@ -485,7 +486,6 @@ impl<'n> ScanColumns<'n> {
 
     pub(super) fn new(
         node_type: &'n omnigraph_compiler::catalog::NodeType,
-        catalog: &Catalog,
         search: SearchColumns,
         binding_columns: Option<&NeededColumns>,
     ) -> Self {
@@ -509,11 +509,10 @@ impl<'n> ScanColumns<'n> {
                 .iter()
                 .copied()
                 .filter(|name| {
-                    *name == catalog.system_columns.id
-                        || node_type
-                            .key
-                            .as_ref()
-                            .is_some_and(|key| key.iter().any(|k| k == name))
+                    node_type
+                        .key
+                        .as_ref()
+                        .is_some_and(|key| key.iter().any(|k| k == name))
                         || columns.contains(*name)
                 })
                 .chain(search_cols.iter().copied())
@@ -567,21 +566,14 @@ pub(super) fn scan_output_schema(
         .node_types
         .get(type_name)
         .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-    let nearest = search_mode
-        .nearest
-        .as_ref()
-        .is_some_and(|(var, ..)| var == variable);
-    let scores_fts = search_mode
-        .bm25
-        .as_ref()
-        .is_some_and(|(var, ..)| var == variable)
+    let nearest = search_mode.nearest.is_some();
+    let scores_fts = search_mode.bm25.is_some()
         || filters
             .iter()
             .filter(|filter| is_search_filter(filter))
             .any(|filter| build_fts_query(&filter.left, params).is_some());
     let columns = ScanColumns::new(
         node_type,
-        catalog,
         SearchColumns {
             distance: nearest,
             score: scores_fts,
@@ -602,7 +594,7 @@ pub(super) fn scan_output_schema(
 /// Every column the scan produced beside the catalog's rides through after
 /// the catalog columns, as the no-blob path (batch passed through untouched)
 /// already delivers it: a search scan's `_distance`/`_score` must survive
-/// this rebuild because `search_score_orderings` ranks on it.
+/// this rebuild because the planned `Sort` leads with it.
 pub(super) fn add_null_blob_columns(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,

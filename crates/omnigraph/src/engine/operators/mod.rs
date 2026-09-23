@@ -1,10 +1,15 @@
-//! Scan and graph `ExecutionPlan`s with shared query memory accounting.
-//! Each pipeline breaker drains the input it needs, admits retained batches
-//! and work storage to the query's pool, and emits results in batch-size
-//! slices.
+//! The read engine's operators, one per read `PhysicalNode` kind, with
+//! shared query memory accounting. Each pipeline breaker drains the input it
+//! needs, admits retained batches and work storage to the query's pool, and
+//! emits results in batch-size slices. Every operator counts the polls of
+//! the streams it hands out (`polled`) and, where its node declares a switch,
+//! sets the `switch` gauge to the side it took; the execution report reads
+//! both off `metrics()`.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use self::memory::WorkMemory;
 use arrow_array::RecordBatch;
@@ -12,34 +17,191 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{PlanProperties, SendableRecordBatchStream};
-use futures::{StreamExt, TryStreamExt};
+use datafusion::physical_plan::{PlanProperties, RecordBatchStream, SendableRecordBatchStream};
+use futures::{Stream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
 
 mod anti_join;
-mod charge;
+mod cross_join;
 mod expand;
 mod expand_stream;
-mod hash_fallback;
+mod filter;
+mod hash_join;
+mod limit;
 pub(in crate::engine) mod memory;
 mod metadata_count;
 mod producer;
+mod projection;
 mod rank_fuse;
 mod scan;
 mod single_hop;
+mod sort;
 
 pub(super) use anti_join::{
     AntiJoinMaskExec, OuterReferenceExec, OuterSlot, fresh_tag_column, tagged_schema,
 };
-pub(super) use charge::ChargeExec;
+pub(super) use cross_join::CrossJoinExec;
 pub(super) use expand::{ExpandExec, ExpandStep, GraphEnv};
-pub(super) use hash_fallback::{HashFallbackExec, HashProbeExec};
+pub(super) use filter::FilterExec;
+pub(super) use hash_join::{HashJoinExec, LookupSpec};
+pub(super) use limit::LimitExec;
 pub(super) use metadata_count::MetadataCountExec;
-pub(super) use rank_fuse::RankFuseExec;
+pub(super) use projection::ProjectionExec;
+pub(super) use rank_fuse::{ArmOrder, RankFuseExec};
 pub(super) use scan::{ScanExec, ScanSource};
+pub(super) use sort::{SortExec, SortKey};
+
+/// The `polls` counter: one per `poll_next` of any stream the operator handed
+/// out, so a zero says no consumer ever asked the operator for a batch.
+const POLLS: &str = "polls";
+
+/// The `drained` counter: one per stream the operator handed out whose
+/// consumer pulled it to its end, so a row count is complete only where this
+/// is set.
+const DRAINED: &str = "drained";
+
+/// The `switch` gauge: the slot of the [`Switch`] side an operator with a
+/// declared switch took, 0 until it took one.
+const SWITCH: &str = "switch";
+
+/// One side of a switch the plan declares on a node: the access path a
+/// `HashJoin` ran through, the mode an `Expand` ended on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Switch {
+    HashJoin,
+    IdLookup,
+    Csr,
+    IndexedScan,
+}
+
+impl Switch {
+    const ALL: [Self; 4] = [Self::HashJoin, Self::IdLookup, Self::Csr, Self::IndexedScan];
+
+    fn from_slot(slot: usize) -> Option<Self> {
+        Self::ALL.get(slot.checked_sub(1)?).copied()
+    }
+
+    fn slot(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|switch| *switch == self)
+            .map_or(0, |index| index + 1)
+    }
+
+    /// The gauge an operator with a declared switch sets; a later `record`
+    /// overwrites, so the value is the side the operator ended on.
+    pub(super) fn gauge(metrics: &ExecutionPlanMetricsSet) -> Gauge {
+        MetricBuilder::new(metrics).gauge(SWITCH, 0)
+    }
+
+    pub(super) fn record(self, gauge: &Gauge) {
+        gauge.set(self.slot());
+    }
+
+    /// The side the operator behind `metrics` took, `None` on an operator
+    /// without a declared switch or one that took no side yet.
+    pub(in crate::engine) fn read(metrics: &MetricsSet) -> Option<Self> {
+        metrics.iter().find_map(|metric| match metric.value() {
+            MetricValue::Gauge { name, gauge } if name == SWITCH => Self::from_slot(gauge.value()),
+            _ => None,
+        })
+    }
+}
+
+/// Whether any stream of the operator behind `metrics` was polled: its
+/// `polls` count; a DataFusion operator, which counts no polls, is read
+/// through the rows it produced or the end it recorded.
+pub(in crate::engine) fn was_polled(metrics: &MetricsSet) -> bool {
+    let mut counts_polls = false;
+    let mut polled = false;
+    let mut produced = false;
+    for metric in metrics.iter() {
+        match metric.value() {
+            MetricValue::Count { name, count } if name == POLLS => {
+                counts_polls = true;
+                polled = count.value() > 0;
+            }
+            MetricValue::OutputRows(count) if count.value() > 0 => produced = true,
+            MetricValue::EndTimestamp(end) if end.value().is_some() => produced = true,
+            _ => {}
+        }
+    }
+    if counts_polls { polled } else { produced }
+}
+
+/// Whether the operator behind `metrics` was drained: its consumer pulled a
+/// stream to its end. Only an omnigraph operator counts that; a DataFusion
+/// operator records its end timestamp on drop as well, which observes
+/// nothing, so it reads `None`.
+pub(in crate::engine) fn was_drained(metrics: &MetricsSet) -> Option<bool> {
+    let mut counts_polls = false;
+    let mut drained = false;
+    for metric in metrics.iter() {
+        match metric.value() {
+            MetricValue::Count { name, .. } if name == POLLS => counts_polls = true,
+            MetricValue::Count { name, count } if name == DRAINED => drained = count.value() > 0,
+            _ => {}
+        }
+    }
+    counts_polls.then_some(drained)
+}
+
+/// `stream` with every poll counted on `metrics`, and its end when reached.
+pub(super) fn polled(
+    metrics: &ExecutionPlanMetricsSet,
+    stream: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    Box::pin(Polled {
+        stream,
+        polls: MetricBuilder::new(metrics).counter(POLLS, 0),
+        drained: MetricBuilder::new(metrics).counter(DRAINED, 0),
+    })
+}
+
+struct Polled {
+    stream: SendableRecordBatchStream,
+    polls: Count,
+    drained: Count,
+}
+
+impl Stream for Polled {
+    type Item = DfResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.polls.add(1);
+        let polled = self.stream.as_mut().poll_next(cx);
+        if matches!(polled, Poll::Ready(None)) {
+            self.drained.add(1);
+        }
+        polled
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+}
+
+impl RecordBatchStream for Polled {
+    fn schema(&self) -> SchemaRef {
+        self.stream.schema()
+    }
+}
+
+/// A stream that ends at once: the operator ran and produced nothing, its
+/// input never executed.
+pub(super) fn empty_stream(schema: SchemaRef) -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::empty(),
+    ))
+}
 
 /// The properties of a pipeline breaker: one partition, output only
 /// once the input is complete, bounded.

@@ -8,13 +8,13 @@
 use omnigraph_compiler::ir::{IRExpr, IRFilter};
 use omnigraph_compiler::query::ast::CompOp;
 use omnigraph_compiler::types::Direction;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::logical::{LogicalId, LogicalNode, LogicalPlan, ScanSpec};
 use crate::source::PlanSource;
 
 /// The two Expand execution paths the cost model dispatches between.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpandMode {
     /// Per-hop neighbor lookup via the persisted src/dst BTREE. Work scales
@@ -34,10 +34,49 @@ impl ExpandMode {
     }
 }
 
+/// What an `Expand` may do at run time beside the mode the plan recorded:
+/// nothing when the session pinned the mode or the source held no edge
+/// statistics, or re-decide with the recorded cost inputs (before the first
+/// hop against the probed index coverage, the observed frontier and a warm
+/// CSR; between input batches and at every later hop with
+/// `should_switch_to_csr`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case")]
+pub enum ExpandPolicy {
+    /// The session's traversal pin chose the mode; the run takes no other.
+    Pinned,
+    /// No edge statistics: the mode is `Csr` and the run takes no other.
+    Uncosted,
+    /// The cost model chose the mode from `inputs`; the run may take the
+    /// other mode by the same model.
+    Costed { inputs: ExpandCostInputs },
+}
+
+impl ExpandPolicy {
+    /// The modes the run may switch to from `mode`.
+    pub fn alternatives(&self, mode: ExpandMode) -> Vec<ExpandMode> {
+        match self {
+            Self::Pinned | Self::Uncosted => Vec::new(),
+            Self::Costed { .. } => vec![match mode {
+                ExpandMode::IndexedScan => ExpandMode::Csr,
+                ExpandMode::Csr => ExpandMode::IndexedScan,
+            }],
+        }
+    }
+
+    /// The cost inputs of a `Costed` policy.
+    pub fn cost(&self) -> Option<&ExpandCostInputs> {
+        match self {
+            Self::Costed { inputs } => Some(inputs),
+            Self::Pinned | Self::Uncosted => None,
+        }
+    }
+}
+
 /// How a dependent scan reaches its destination rows: one Lance read per
 /// input batch (`id IN (batch ids)`), or one read of the whole destination
 /// table as the build side of a hash join the traversal probes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessPath {
     /// The per-batch id lookup: work scales with the frontier.
@@ -78,7 +117,7 @@ pub fn choose_access_path(
 /// Whether the per-hop `key_col IN (...)` scan is served by the BTREE
 /// (`Indexed`) or silently falls back to a full scan (`Degraded`). The planner
 /// assumes `Indexed`; the engine probes the dataset and corrects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexCoverage {
     Indexed,
     Degraded,
@@ -93,7 +132,7 @@ pub const CSR_BUILD_FACTOR: f64 = 1.5;
 /// Cardinality inputs for the (pure, IO-free) traversal-mode cost model. Every
 /// field is a manifest-resident count or an already-in-hand value; the chooser
 /// performs no scans.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExpandCostInputs {
     /// The frontier the decision is made for: the planner's row-count
     /// estimate of the Expand's input (`u64::MAX` when it has none).
@@ -465,6 +504,30 @@ mod tests {
         assert_eq!(
             choose_access_path(Some(1), Some(20), Some(0), budget),
             Some(AccessPath::IdLookup)
+        );
+    }
+
+    #[test]
+    fn a_costed_policy_declares_the_other_mode_and_a_pin_declares_none() {
+        let costed = ExpandPolicy::Costed {
+            inputs: inputs(1, 1_000, 100, 1, IndexCoverage::Indexed),
+        };
+        assert_eq!(
+            costed.alternatives(ExpandMode::IndexedScan),
+            [ExpandMode::Csr]
+        );
+        assert_eq!(
+            costed.alternatives(ExpandMode::Csr),
+            [ExpandMode::IndexedScan]
+        );
+        assert!(costed.cost().is_some());
+        for policy in [ExpandPolicy::Pinned, ExpandPolicy::Uncosted] {
+            assert!(policy.alternatives(ExpandMode::Csr).is_empty());
+            assert!(policy.cost().is_none());
+        }
+        assert_eq!(
+            serde_json::json!(ExpandPolicy::Pinned),
+            serde_json::json!({"policy": "pinned"})
         );
     }
 

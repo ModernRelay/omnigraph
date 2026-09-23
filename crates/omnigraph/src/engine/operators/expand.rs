@@ -12,9 +12,9 @@ use datafusion::physical_plan::{
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::types::Direction;
-use omnigraph_planner::{ExpandCostInputs, ExpandMode};
+use omnigraph_planner::{ExpandMode, ExpandPolicy};
 
-use super::{breaker_properties, external, joined_schema, streaming_properties};
+use super::{breaker_properties, external, joined_schema, polled, streaming_properties};
 use crate::db::Snapshot;
 use crate::engine::graph::{GraphIndexHandle, ModeOrigin, projectable_edge_property_columns};
 use crate::error::{OmniError, Result};
@@ -46,13 +46,14 @@ pub(crate) struct ExpandStep {
 }
 
 impl ExpandStep {
-    /// `forced`: the session's traversal pin chose the mode; `cost`: the
-    /// inputs the planner costed it from, absent without statistics.
-    pub(crate) fn origin(forced: bool, cost: Option<ExpandCostInputs>) -> ModeOrigin {
-        match (forced, cost) {
-            (true, _) => ModeOrigin::Pinned,
-            (false, Some(inputs)) => ModeOrigin::Costed(inputs),
-            (false, None) => ModeOrigin::Uncosted,
+    /// The plan's policy as the operator's origin: a pin takes no other
+    /// mode, a costed policy re-decides with its inputs, an uncosted one
+    /// starts on the CSR.
+    pub(crate) fn origin(policy: &ExpandPolicy) -> ModeOrigin {
+        match policy {
+            ExpandPolicy::Pinned => ModeOrigin::Pinned,
+            ExpandPolicy::Costed { inputs } => ModeOrigin::Costed(inputs.clone()),
+            ExpandPolicy::Uncosted => ModeOrigin::Uncosted,
         }
     }
 
@@ -210,5 +211,6 @@ impl ExecutionPlan for ExpandExec {
         let step = self.step.clone();
         let env = Arc::clone(&self.env);
         super::expand_stream::execute(input, input_schema, schema, step, env, ctx, &self.metrics)
+            .map(|stream| polled(&self.metrics, stream))
     }
 }

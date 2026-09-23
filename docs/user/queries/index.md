@@ -132,7 +132,10 @@ its own alias.
 Search expressions are documented in [Search](../search/index.md).
 
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
-final tie-breaker when user keys are equal. Ascending order places nulls first;
+final tie-breaker when user keys are equal, and on the `v2` engine only where
+the ids can change the visible order (when every returned expression is an
+order key, equal rows are indistinguishable and no id is read); `v1` appends
+every `<var>.id`, and the rows are the same either way. Ascending order places nulls first;
 descending order places them last. `nearest(...)` ordering requires a `limit`.
 
 Search orderings share that contract: `nearest(...)` ranks by ascending vector
@@ -282,7 +285,7 @@ refuses startup; no default is substituted.
 | `engine` | enum `v1`, `v2` | `v1` | request | `OMNIGRAPH_ENGINE` | whether a read query runs through engine version 2, the plan runner; this setting does not change change-feed or merge execution |
 | `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | `OMNIGRAPH_RRF_PLAN` | the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on` (a debug build defaults to `verify`) | request | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared |
-| `ann_nprobes` | integer, at least `0` | `20` | process | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
+| `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap; on `engine = v1` the setting is read at execution and no plan records it |
 | `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` |
 
 A name outside the table, a value of the wrong type, and a value outside the

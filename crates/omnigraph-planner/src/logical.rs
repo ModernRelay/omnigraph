@@ -3,12 +3,13 @@ use std::hash::{Hash, Hasher};
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{IRFilter, IROrdering, IRProjection};
+use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection};
 use omnigraph_compiler::types::Direction;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::operation::TableRef;
+use crate::physical::RankKind;
 use crate::source::SideId;
 
 /// The index of a node in a [`LogicalPlan`], distinct from a physical node id.
@@ -48,7 +49,7 @@ impl JoinKind {
 }
 
 /// A keyed outer join; cross joins carry no key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyJoinKind {
     FullOuter,
     LeftOuter,
@@ -172,13 +173,21 @@ impl Predicate {
 /// and `$v.@id` the identity alone (`count($v)`; `@id` is the object member
 /// name of the identity in RFC 0040). Rendered `v.prop` / `v`; GQ
 /// identifiers carry no `.`, so the first `.` splits exactly.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnRef {
     pub binding: String,
     pub property: Option<String>,
 }
 
 pub const IDENTITY_MEMBER: &str = "@id";
+
+/// A sort's tie-break bindings as the keys they add, `$p.@id`.
+pub fn tiebreak_text(bindings: &[String]) -> Vec<String> {
+    bindings
+        .iter()
+        .map(|binding| format!("${binding}.{IDENTITY_MEMBER}"))
+        .collect()
+}
 
 impl ColumnRef {
     pub fn entity(binding: &str) -> Self {
@@ -291,6 +300,15 @@ pub struct ScanSpec {
     pub binding: Option<String>,
 }
 
+/// One `nearest(...)` or `bm25(...)` arm of an `rrf()`, as the query wrote it.
+#[derive(Debug, Clone)]
+pub struct SearchArm {
+    pub binding: String,
+    pub property: String,
+    pub kind: RankKind,
+    pub query: IRExpr,
+}
+
 #[derive(Debug, Clone)]
 pub enum LogicalNode {
     /// Read one pinned table, optionally restricted by input identities.
@@ -313,12 +331,15 @@ pub enum LogicalNode {
         reads: Vec<ColumnRef>,
         return_exprs: Vec<IRProjection>,
     },
-    /// `keys` for the passes; `order_by` and `fetch` for the engine's sort.
+    /// `keys` for the passes; `order_by`, `fetch` and `tiebreak` for the
+    /// engine's sort, `tiebreak` the name-sorted bindings whose ids follow
+    /// the keys (empty where ids cannot change the order, `sort_tiebreak`).
     Sort {
         input: LogicalId,
         keys: Vec<String>,
         order_by: Vec<IROrdering>,
         fetch: Option<usize>,
+        tiebreak: Vec<String>,
     },
     /// Required input ordering for a diff or change-feed plan.
     Ordered {
@@ -381,11 +402,13 @@ pub enum LogicalNode {
         outer_var: String,
     },
     /// A leading `order { nearest($v.prop, q) }`: Lance ranks the binding's
-    /// scan on the vector column and appends `_distance`.
+    /// scan on the vector column and appends `_distance`. `query` is the
+    /// argument as the query wrote it.
     Nearest {
         input: LogicalId,
         binding: String,
         property: String,
+        query: IRExpr,
         k: Option<u64>,
         reads: Vec<ColumnRef>,
     },
@@ -394,13 +417,17 @@ pub enum LogicalNode {
         input: LogicalId,
         binding: String,
         property: String,
+        query: IRExpr,
         reads: Vec<ColumnRef>,
     },
     /// A leading `order { rrf(a, b) }`: both arms run the input tree, ranked
-    /// on their targets, and fuse.
+    /// on their targets, and fuse. `k` is the rank constant as written;
+    /// `limit` the query's limit, which sizes a nearest arm.
     RankFuse {
         input: LogicalId,
-        targets: Vec<String>,
+        arms: [SearchArm; 2],
+        k: Option<IRExpr>,
+        limit: Option<u64>,
         reads: Vec<ColumnRef>,
     },
     /// A `return` with an aggregate: the group keys and aggregate arguments
@@ -663,10 +690,16 @@ impl LogicalPlan {
                 "node": "Projection",
                 "columns": rendered(reads),
             }),
-            LogicalNode::Sort { keys, fetch, .. } => json!({
+            LogicalNode::Sort {
+                keys,
+                fetch,
+                tiebreak,
+                ..
+            } => json!({
                 "node": "Sort",
                 "keys": keys,
                 "fetch": fetch,
+                "tiebreak": tiebreak_text(tiebreak),
             }),
             LogicalNode::Ordered { keys, .. } => json!({
                 "node": "Sort", "keys": keys, "fetch": null,
@@ -754,9 +787,9 @@ impl LogicalPlan {
                 "property": property,
                 "reads": rendered(reads),
             }),
-            LogicalNode::RankFuse { targets, reads, .. } => json!({
+            LogicalNode::RankFuse { arms, reads, .. } => json!({
                 "node": "RankFuse",
-                "targets": targets,
+                "targets": arms.iter().map(|arm| &arm.binding).collect::<Vec<_>>(),
                 "reads": rendered(reads),
             }),
             LogicalNode::Aggregate { reads, .. } => json!({

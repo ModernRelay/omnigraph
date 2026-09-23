@@ -40,9 +40,9 @@ impl QueryContext {
     /// One session per query: `TrackConsumersPool` over `FairSpillPool` so a
     /// refusal names the consumers, one partition so row order is the
     /// operators' own, the ordered scan's batch size, scratch quota and sort
-    /// reservation, the pool `query_memory_limit` sizes.
-    pub(super) fn new() -> Result<Self> {
-        let memory_limit = query_memory_limit();
+    /// reservation, the pool `memory_limit` sizes: the limit the run's
+    /// `QuerySource` captured, never the ambient one.
+    pub(super) fn new(memory_limit: u64) -> Result<Self> {
         let scratch_limit = ORDERED_SCAN_SCRATCH_BYTES;
         let config = SessionConfig::new()
             .with_target_partitions(1)
@@ -74,6 +74,7 @@ impl QueryContext {
         self.session.task_ctx()
     }
 
+    #[cfg(test)]
     pub(super) fn memory_limit(&self) -> u64 {
         self.memory_limit
     }

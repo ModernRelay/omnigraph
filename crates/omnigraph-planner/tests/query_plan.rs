@@ -14,9 +14,9 @@ use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::optimizer::resolve;
 use omnigraph_planner::{
-    AccessPath, AdjacencyProof, Bounds, ExpandMode, ExpandStatistics, FragmentStat, LogicalNode,
-    LogicalPlan, MemorySource, NodeTypeSpec, Operation, PhysicalNode, PhysicalPlan, PlanError,
-    PlanSource, SideId, TableRef, rewrite,
+    AccessPath, AdjacencyProof, Bounds, ExpandMode, ExpandPolicy, ExpandStatistics, FragmentStat,
+    LogicalNode, LogicalPlan, MemorySource, NodeTypeSpec, Operation, PhysicalNode, PhysicalPlan,
+    PlanError, PlanSource, SideId, TableRef, rewrite,
 };
 
 const PROPERTIES: &[&str] = &[
@@ -209,24 +209,32 @@ fn expand_json(node: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
     }
 }
 
-/// The access path of every dependent physical scan, in post-order, and the
-/// `access` key of the explain JSON for the one dependent scan.
+/// The access path of every traversal destination in post-order (a dependent
+/// scan is `id_lookup`, a `HashJoin` node `hash_join`), and what the explain
+/// JSON prints for the one destination.
 fn access_paths(plan: &PhysicalPlan) -> (Vec<AccessPath>, serde_json::Value) {
     let paths = plan
         .post_order()
         .into_iter()
         .filter_map(|id| match plan.node(id) {
             Some(PhysicalNode::Scan {
-                source: omnigraph_planner::ScanInput::Dependent { access, .. },
+                source: omnigraph_planner::ScanInput::Dependent { .. },
                 ..
-            }) => Some(*access),
+            }) => Some(AccessPath::IdLookup),
+            Some(PhysicalNode::HashJoin { .. }) => Some(AccessPath::HashJoin),
             _ => None,
         })
         .collect();
     let json = plan.to_json();
     let destination = &json["inputs"][0]["inputs"][0];
-    assert_eq!(destination["id_restriction"], "input");
-    (paths, destination["access"].clone())
+    let access = if destination["node"] == "HashJoin" {
+        assert_eq!(destination["fallback"], "id_lookup");
+        serde_json::json!("hash_join")
+    } else {
+        assert_eq!(destination["id_restriction"], "input");
+        destination["access"].clone()
+    };
+    (paths, access)
 }
 
 const POOL_BYTES: u64 = 150 * 1024 * 1024;

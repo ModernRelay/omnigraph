@@ -262,13 +262,12 @@ fn build_chain<'a>(
                 source: ScanInput::Dependent { .. },
                 ..
             }
+            | PhysicalNode::HashJoin { .. }
             | PhysicalNode::CrossJoin { .. }
             | PhysicalNode::Filter { .. }
             | PhysicalNode::Expand { .. }
             | PhysicalNode::AntiJoin { .. }
             | PhysicalNode::OuterReference { .. }
-            | PhysicalNode::Nearest { .. }
-            | PhysicalNode::TextSearch { .. }
             | PhysicalNode::RankFuse { .. }
             | PhysicalNode::Projection { .. }
             | PhysicalNode::Aggregate { .. }

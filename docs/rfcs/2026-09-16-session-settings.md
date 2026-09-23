@@ -70,13 +70,17 @@ crosses requests. A setting marked `process` in the definition is refused
 when it arrives in a request, so a remote caller cannot widen a resource
 knob or switch a diagnostic on.
 
-Every `request` setting is answer-preserving: the same statement under any
+Every `request` setting except `ann_nprobes` is answer-preserving: the same statement under any
 assignment of them returns the same result rows in the same order where the
 statement orders them, the same row count, the same typed error outcome, and
-for a merge the same conflict list or the same published content. The two
-`process` diagnostics that change answers, `rrf_plan` and `ann_nprobes`, are
-set only by the process that hosts the engine and never by a remote caller
-(the `process` scope rule, The settings). Running one
+for a merge the same conflict list or the same published content. The
+`process` diagnostic that changes answers, `rrf_plan`, is set only by the
+process that hosts the engine and never by a remote caller (the `process`
+scope rule, The settings). `ann_nprobes` changes answers too and is `request`
+scope by the 2026-09-22 decision (Decision log): the plan carries the cap a
+`nearest` scan ran under (`RankedAccess.nprobes`, the `nprobes` field of an
+explain row), so a caller's cap is reproducible from the plan, and the trade
+of accuracy for speed is the caller's to make per request. Running one
 `.gqt` case under both engines on that promise is a follow-up RFC on the
 logic-test runner; this document gives it the statement and nothing else.
 
@@ -252,7 +256,7 @@ is involved.
 | `engine` | enum `v1`, `v2` | `v1` | request | yes | nothing (new) | whether a registered operation runs through engine version 2 |
 | `rrf_plan` | enum `auto`, `force_prefilter`, `force_postfilter` | `auto` | process | no (`docs/user/search/index.md:83`; `docs/dev/execution.md:137-139`) | `OMNIGRAPH_RRF_PLAN` | the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis (`docs/user/search/index.md:83`) |
 | `merge_lineage` | enum `off`, `on`, `verify` | `on`; a debug build defaults to `verify` | request | yes | `OMNIGRAPH_MERGE_LINEAGE` | how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared (`docs/user/branching/merge.md:124`) |
-| `ann_nprobes` | integer, at least `0`; `0` is no cap | `20` | process | no (`docs/user/search/index.md:80`; `docs/dev/execution.md:122-133`) | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan (`search/index.md:80`) |
+| `ann_nprobes` | integer, at least `0`; `0` is no cap | `20` | request | no (`docs/user/search/index.md`; `docs/dev/execution.md`) | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan (`search/index.md`) |
 | `stage_write_concurrency` | integer `1..=64` | `8` | process | yes | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` (`docs/user/mutations/index.md:116`) |
 
 The defaults are today's defaults; nothing changes for a caller that sets
@@ -265,10 +269,15 @@ carries it as a field with no name, no `set`, no `show` and no environment
 variable, set through `SessionSettings::with_traversal` by tests, DST and
 the `.gqt` `# traversal:` header pin; `OMNIGRAPH_TRAVERSAL_MODE` is retired
 (Compatibility, Environment). Every `request` setting is
-answer-preserving in the Summary's sense. `rrf_plan` and `ann_nprobes` are
-not, by the docs they cite: a forced plan can leave `limit` unfilled or rank
-differently, and a probe cap decides which approximate neighbours fill `k`;
-so both are `process` scope. The `process` scope rule, stated once here and
+answer-preserving in the Summary's sense, except `ann_nprobes`. `rrf_plan`
+and `ann_nprobes` are not, by the docs they cite: a forced plan can leave
+`limit` unfilled or rank differently, and a probe cap decides which
+approximate neighbours fill `k`. `rrf_plan` is `process` scope.
+`ann_nprobes` is `request` scope and changes answers because on `v2` the
+plan carries the cap a `nearest` scan ran under (Decision log, 2026-09-22),
+so a caller's cap is reproducible from the plan; on `v1` the cap is read at
+execution and no plan records it, which the user docs state beside the
+setting. The `process` scope rule, stated once here and
 referred to everywhere else: a `process` setting is set only by the process
 that hosts the engine, which is the server from its environment, the
 embedded CLI from its environment, its `--set` values and the file's text
@@ -760,13 +769,17 @@ storage boundary; a session never touches a dataset.
   global state in a task-local and the process environment. This design
   moves them into one typed struct on a value the caller holds, and deletes
   the task-locals. The two classes argue separately. Every `request`
-  setting is answer-preserving in the Summary's sense, so none is a
-  semantic smuggled through a transport flag. The two `process` diagnostics,
-  `rrf_plan` and `ann_nprobes`, do change search results (the table's
-  citations); that is why they are `process` scope: they are set only by the
-  process that hosts the engine, never by a remote caller's text, field or
-  parameter (the `process` scope rule, The settings), so no request carries
-  a semantic through them, and `show` names them. The
+  setting except `ann_nprobes` is answer-preserving in the Summary's sense,
+  so none of them is a semantic smuggled through a transport flag.
+  `ann_nprobes` changes search results and is `request` scope because on
+  `v2` the plan carries the cap a `nearest` scan ran under, so the caller's
+  choice is recorded, not smuggled; on `v1` the cap is read at execution and
+  no plan records it (the caveat the user docs carry). The `process`
+  diagnostic `rrf_plan` does change search results (the table's citations);
+  that is why it is `process` scope: it is set only by the process that
+  hosts the engine, never by a remote caller's text, field or parameter (the
+  `process` scope rule, The settings), so no request carries a semantic
+  through it, and `show` names it. The
   definition is a `const`, not a singleton: it holds no value and nothing
   writes to it.
 - **10, trust is established at the boundary and enforced at the engine.**
@@ -789,7 +802,8 @@ storage boundary; a session never touches a dataset.
   one Rust check each.
 
 Deny-list items engaged: "side channels for query semantics or discarded
-retrieval rank" (a `request` setting is answer-preserving, and a `process`
+retrieval rank" (a `request` setting other than `ann_nprobes` is
+answer-preserving, `ann_nprobes` is carried on the `v2` plan, and a `process`
 diagnostic is set only by the process that hosts the engine, the `process`
 scope rule in The settings and Invariant 9 above); "cost-blind plan choice or planner decisions based on
 hidden statistics" (the choice is explicit, named, and readable back). No
@@ -804,9 +818,11 @@ query parameter, `set`, on the two `GET` change routes; absent means the
 process defaults. Additive: a client that never sends them sees no change.
 An older server that does not know the field drops it silently (the three
 request types carry no `deny_unknown_fields`, `api-types/src/lib.rs:191`,
-`:708`, `:734`, `:889`) and answers 200 under `v1`. That is accepted: every
-`request` setting is answer-preserving, so the rows are the same, and a
-client that must know sends a `show` first (`show merge_lineage;` at rollout
+`:708`, `:734`, `:889`) and answers 200 under `v1`. That is accepted as a
+tradeoff: an older server drops the field, which is harmless for the
+answer-preserving settings and changes approximate rows for `ann_nprobes`;
+a client that needs the cap checks the server version, and a client that
+must know sends a `show` first (`show merge_lineage;` at rollout
 step 1, `show engine;` after step 2), which an older server answers with a
 parse-error 400. The parameter
 an older server refuses the way it refuses any unknown change-surface
@@ -1119,6 +1135,12 @@ routed) follows step 2.
 
 ## Decision log
 
+- 2026-09-22: `ann_nprobes` moves from `process` to `request` scope. A
+  caller may set the probe cap of its own `nearest` scans, because once the
+  plan carries `RankedAccess.nprobes` the answer is reproducible from the
+  plan, and a `.gqt` case can then set the cap two ways in two steps and
+  claim the `nprobes` the plan carries. `rrf_plan` and
+  `stage_write_concurrency` stay `process`.
 - 2026-09-16: initial draft.
 - 2026-09-16: the definition lives in `omnigraph-compiler`, module
   `settings`, re-exported by `omnigraph-api-types`; `rrf_plan` and

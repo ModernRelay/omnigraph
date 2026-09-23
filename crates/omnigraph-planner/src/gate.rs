@@ -2,17 +2,193 @@
 //! physical plan or a typed failure; routing includes explain diagnostics and
 //! sends unsupported operations to the executor with a typed reason.
 
-use omnigraph_compiler::ir::QueryIR;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
+use arrow_schema::SchemaRef;
+use omnigraph_compiler::ir::{IRExpr, IRFilter, QueryIR};
+use omnigraph_compiler::settings::{SettingId, Traversal};
+use omnigraph_compiler::types::Direction;
 use serde_json::{Value, json};
 
+use crate::error::PlanError;
 use crate::explain::{EntrySummary, Explain, OperationSummary};
 use crate::logical::{Census, LogicalPlan};
 use crate::operation::Operation;
 use crate::optimizer::{Bounds, Optimized, physical_plan, resolve, rewrite};
-use crate::physical::{NodeId, PhysicalNode, PhysicalPlan};
+use crate::physical::{Assumptions, DatasetPin, GatePolicy, NodeId, PhysicalNode, PhysicalPlan};
 use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
-use crate::source::PlanSource;
+use crate::source::{
+    AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
+    FragmentStat, NodeTypeSpec, PlanSource, SideId,
+};
+
+/// A `PlanSource` that records what the planner read through it: the
+/// parameter names of every filter it asked about and every setting, so the
+/// plan can carry them as its `Assumptions`.
+struct Recorded<'s> {
+    source: &'s dyn PlanSource,
+    read: RefCell<Assumptions>,
+}
+
+impl<'s> Recorded<'s> {
+    fn new(source: &'s dyn PlanSource) -> Self {
+        Self {
+            source,
+            read: RefCell::new(Assumptions::default()),
+        }
+    }
+
+    /// Everything read so far, with the policy and the limit the plan runs
+    /// under.
+    fn assumptions(&self, bounds: &Bounds) -> Assumptions {
+        let mut assumptions = self.read.borrow().clone();
+        assumptions.gate_policy = self.source.gate_policy();
+        assumptions.memory_limit = bounds.query_memory_pool_bytes;
+        assumptions
+    }
+}
+
+impl PlanSource for Recorded<'_> {
+    fn is_unique_property(&self, type_key: &str, property: &str) -> bool {
+        self.source.is_unique_property(type_key, property)
+    }
+
+    fn table_data_bytes(&self, type_key: &str) -> Option<u64> {
+        self.source.table_data_bytes(type_key)
+    }
+
+    fn column_data_bytes(&self, type_key: &str, column: &str) -> Option<u64> {
+        self.source.column_data_bytes(type_key, column)
+    }
+
+    fn query_memory_pool_bytes(&self) -> u64 {
+        self.source.query_memory_pool_bytes()
+    }
+
+    fn schema(&self, side: SideId) -> Result<SchemaRef, PlanError> {
+        self.source.schema(side)
+    }
+
+    fn fragments(&self, side: SideId) -> Vec<FragmentStat> {
+        self.source.fragments(side)
+    }
+
+    fn adjacency_proof(&self) -> Option<&AdjacencyProof> {
+        self.source.adjacency_proof()
+    }
+
+    fn node_type(&self, type_name: &str) -> Result<NodeTypeSpec, PlanError> {
+        let spec = self.source.node_type(type_name)?;
+        self.read.borrow_mut().datasets.insert(
+            spec.table.type_key.clone(),
+            spec.version.map(|version| DatasetPin {
+                dataset_path: spec.table.dataset_path.clone(),
+                native_branch: spec.table.native_branch.clone(),
+                version,
+            }),
+        );
+        Ok(spec)
+    }
+
+    fn filter_pushable(&self, filter: &IRFilter) -> bool {
+        let mut read = self.read.borrow_mut();
+        params_of_expr(&filter.left, &mut read.params);
+        params_of_expr(&filter.right, &mut read.params);
+        drop(read);
+        self.source.filter_pushable(filter)
+    }
+
+    fn expand_statistics(&self, edge_type: &str, direction: Direction) -> Option<ExpandStatistics> {
+        let statistics = self.source.expand_statistics(edge_type, direction)?;
+        let mut read = self.read.borrow_mut();
+        read.env.insert(
+            EXPAND_INDEXED_MAX_FRONTIER_ENV.to_string(),
+            statistics.max_frontier_cap.to_string(),
+        );
+        read.env.insert(
+            EXPAND_INDEXED_MAX_HOPS_ENV.to_string(),
+            statistics.max_hops_cap.to_string(),
+        );
+        Some(statistics)
+    }
+
+    fn edge_dataset(&self, edge_type: &str) -> Option<DatasetPin> {
+        let pin = self.source.edge_dataset(edge_type);
+        self.read
+            .borrow_mut()
+            .datasets
+            .insert(format!("edge:{edge_type}"), pin.clone());
+        pin
+    }
+
+    fn traversal(&self) -> Traversal {
+        let traversal = self.source.traversal();
+        self.read
+            .borrow_mut()
+            .settings
+            .insert("traversal".to_string(), traversal.as_str().to_string());
+        traversal
+    }
+
+    /// Recorded as the setting spells it: `0` is no cap.
+    fn ann_nprobes(&self) -> Option<usize> {
+        let nprobes = self.source.ann_nprobes();
+        self.read.borrow_mut().settings.insert(
+            SettingId::AnnNprobes.name().to_string(),
+            nprobes.unwrap_or_default().to_string(),
+        );
+        nprobes
+    }
+
+    fn gate_policy(&self) -> GatePolicy {
+        self.source.gate_policy()
+    }
+}
+
+/// Every parameter name `expr` names.
+fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
+    match expr {
+        IRExpr::Param(name) => {
+            out.insert(name.clone());
+        }
+        IRExpr::Nearest { query, .. } => params_of_expr(query, out),
+        IRExpr::Search { field, query }
+        | IRExpr::MatchText { field, query }
+        | IRExpr::Bm25 { field, query } => {
+            params_of_expr(field, out);
+            params_of_expr(query, out);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            params_of_expr(field, out);
+            params_of_expr(query, out);
+            if let Some(max_edits) = max_edits {
+                params_of_expr(max_edits, out);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            params_of_expr(primary, out);
+            params_of_expr(secondary, out);
+            if let Some(k) = k {
+                params_of_expr(k, out);
+            }
+        }
+        IRExpr::Aggregate { arg, .. } => params_of_expr(arg, out),
+        IRExpr::PropAccess { .. }
+        | IRExpr::Variable(_)
+        | IRExpr::Literal(_)
+        | IRExpr::AliasRef(_) => {}
+    }
+}
 
 /// Why the gate built no routed plan. A change-feed or merge operation then
 /// runs on the executor; a read query has no executor behind it, so
@@ -33,9 +209,23 @@ pub enum Unrouted {
     /// Resolution or a pass failed: an unknown name in the plan source, or a
     /// planner defect. A read query fails with this message.
     PlannerError { message: String },
+    /// A well-formed query shape the planner refuses by design
+    /// (`PlanError::Unsupported`); the caller's error, not a planner defect.
+    UnsupportedQuery { message: String },
 }
 
 impl Unrouted {
+    /// The route of a planning failure: an unsupported shape keeps its class,
+    /// everything else is a planner error.
+    fn of(error: PlanError) -> Self {
+        match error {
+            PlanError::Unsupported { detail } => Self::UnsupportedQuery { message: detail },
+            other => Self::PlannerError {
+                message: other.to_string(),
+            },
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::UnregisteredNode { .. } => "unregistered_node",
@@ -44,6 +234,7 @@ impl Unrouted {
             Self::DeclaredBytesOverBound { .. } => "declared_bytes_over_bound",
             Self::Override => "override",
             Self::PlannerError { .. } => "planner_error",
+            Self::UnsupportedQuery { .. } => "unsupported_query",
         }
     }
 
@@ -56,7 +247,9 @@ impl Unrouted {
             Self::RegistryRouteExecutor { entry } => json!({ "kind": self.kind(), "entry": entry }),
             Self::DeclaredBytesOverBound { node } => json!({ "kind": self.kind(), "node": node }),
             Self::Override => json!({ "kind": self.kind() }),
-            Self::PlannerError { message } => json!({ "kind": self.kind(), "message": message }),
+            Self::PlannerError { message } | Self::UnsupportedQuery { message } => {
+                json!({ "kind": self.kind(), "message": message })
+            }
         }
     }
 }
@@ -103,14 +296,16 @@ pub fn plan_query(
     bounds: &Bounds,
 ) -> Result<PhysicalPlan, Unrouted> {
     let operation = Operation::Query(Box::new(query.clone()));
-    let mut logical = resolve(&operation, source).map_err(|error| Unrouted::PlannerError {
-        message: error.to_string(),
-    })?;
-    crate::optimizer::optimize(&mut logical, source, bounds)
-        .map(|optimized| optimized.physical)
-        .map_err(|error| Unrouted::PlannerError {
-            message: error.to_string(),
+    let recorded = Recorded::new(source);
+    let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
+    crate::optimizer::optimize(&mut logical, &recorded, bounds)
+        .map(|mut optimized| {
+            optimized
+                .physical
+                .set_assumptions(recorded.assumptions(bounds));
+            optimized.physical
         })
+        .map_err(Unrouted::of)
 }
 
 /// Decide the route of one operation. The census is computed from the
@@ -125,13 +320,13 @@ pub fn route(
     bounds: &Bounds,
 ) -> Decision {
     let operation = OperationSummary::of(op);
+    let recorded = Recorded::new(source);
+    let source = &recorded;
     let mut plan = match resolve(op, source) {
         Ok(plan) => plan,
         Err(error) => {
             return executor(
-                Unrouted::PlannerError {
-                    message: error.to_string(),
-                },
+                Unrouted::of(error),
                 Explain::without_plan(operation, override_),
                 LogicalPlan::new(),
             );
@@ -142,20 +337,17 @@ pub fn route(
         Ok(fired) => fired,
         Err(error) => {
             let explain = LogicalView::of(&plan).explain(operation, override_, None, None, &[]);
-            return executor(
-                Unrouted::PlannerError {
-                    message: error.to_string(),
-                },
-                explain,
-                plan,
-            );
+            return executor(Unrouted::of(error), explain, plan);
         }
     };
     if matches!(op, Operation::Query(_)) {
         let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
         let logical = LogicalView::of(&plan);
         return match lowered {
-            Ok(optimized) => {
+            Ok(mut optimized) => {
+                optimized
+                    .physical
+                    .set_assumptions(recorded.assumptions(bounds));
                 let mut explain = logical
                     .explain(operation, override_, None, Some(&optimized), &fired)
                     .engine();
@@ -167,9 +359,7 @@ pub fn route(
                 }
             }
             Err(error) => executor(
-                Unrouted::PlannerError {
-                    message: error.to_string(),
-                },
+                Unrouted::of(error),
                 logical.explain(operation, override_, None, None, &fired),
                 plan,
             ),
@@ -201,9 +391,7 @@ pub fn route(
         Ok(optimized) => optimized,
         Err(error) => {
             return executor(
-                Unrouted::PlannerError {
-                    message: error.to_string(),
-                },
+                Unrouted::of(error),
                 logical.explain(operation, override_, Some(entry), None, &fired),
                 plan,
             );
