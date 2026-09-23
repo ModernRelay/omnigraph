@@ -293,6 +293,8 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("exec/query_doors.rs", "query_with_head"),
     ("exec/query_doors.rs", "run_query_at"),
     ("exec/query_doors.rs", "explain_query"),
+    ("exec/query_doors.rs", "query_inspected"),
+    ("exec/query_doors.rs", "replay_bound_plan"),
 ];
 
 // Every crate-visible async method on the two low-level coordinators is also

@@ -50,6 +50,16 @@ fn a_forced_traversal_overrides_the_cost_model() {
     let (plan, fired) = physical(&op, &source);
     assert_eq!(expand_modes(&plan), vec![(ExpandMode::Csr, Some(10))]);
     assert!(!fired.contains(&"expand_mode"), "{fired:?}");
+    assert!(
+        plan.live().any(|(_, node)| matches!(
+            node,
+            PhysicalNode::Expand {
+                policy: ExpandPolicy::Pinned,
+                ..
+            }
+        )),
+        "a pinned mode declares no alternative"
+    );
     let source = source_with_rows(Some(5_000))
         .with_expand_statistics("knows", Direction::Out, knows_statistics(5000))
         .with_traversal(Traversal::Indexed);
@@ -84,9 +94,7 @@ fn a_second_expand_after_a_csr_expand_reuses_the_warm_csr() {
         .post_order()
         .into_iter()
         .filter_map(|id| match plan.node(id) {
-            Some(PhysicalNode::Expand {
-                cost: Some(cost), ..
-            }) => Some(cost.csr_cached),
+            Some(PhysicalNode::Expand { policy, .. }) => policy.cost().map(|cost| cost.csr_cached),
             _ => None,
         });
     assert_eq!(csr_cached.collect::<Vec<bool>>(), vec![false, true]);
@@ -444,8 +452,12 @@ fn no_statistics_records_csr_with_no_estimate() {
     );
     assert!(matches!(
         plan.node(plan.post_order()[1]),
-        Some(PhysicalNode::Expand { cost: None, .. })
+        Some(PhysicalNode::Expand {
+            policy: ExpandPolicy::Uncosted,
+            ..
+        })
     ));
+    assert_eq!(expands[0]["alternatives"], serde_json::json!([]));
 }
 
 /// Synthetic caps isolate the cold cost comparison from hard-cap decisions.
@@ -466,9 +478,7 @@ fn two_hops_choose_a_cold_csr_below_both_caps() {
     let cost = plan
         .live()
         .find_map(|(_, node)| match node {
-            PhysicalNode::Expand {
-                cost: Some(cost), ..
-            } => Some(cost),
+            PhysicalNode::Expand { policy, .. } => policy.cost(),
             _ => None,
         })
         .expect("cost inputs");

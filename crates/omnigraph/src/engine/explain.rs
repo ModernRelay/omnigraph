@@ -8,20 +8,20 @@ use omnigraph_planner::PhysicalPlan;
 use super::plan_source::explain_query;
 use super::*;
 
-/// The planner's document for `ir` under `traversal`, the mode of the
-/// settings the caller's query doors run the same source under.
+#[cfg(doc)]
+use omnigraph_planner::BoundPlan;
+
+/// The planner's document for `ir` under `settings`, the settings the
+/// caller's query doors run the same source under.
 pub(crate) async fn explain_document(
     ir: &QueryIR,
     params: &ParamMap,
-    catalog: &Catalog,
+    catalog: &Arc<Catalog>,
     snapshot: &Snapshot,
-    traversal: Traversal,
+    settings: &SessionSettings,
 ) -> Result<serde_json::Value> {
-    let params = resolve_params(ir, params)?;
-    Ok(explain_query(ir, &params, catalog, snapshot, traversal)
-        .await?
-        .explain
-        .to_value())
+    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
+    Ok(explain_query(ir, &source)?.explain.to_value())
 }
 
 /// The `tree` value of the lowered DataFusion plan's rows: one per operator
@@ -63,53 +63,34 @@ enum LoweredTree {
 }
 
 /// The lowered DataFusion tree of the query's first pass in pre-order. An
-/// explain cannot embed query text, so that search mode is `Unavailable`;
+/// explain cannot embed query text, so binding such a plan is `Unavailable`;
 /// other failures propagate. Planning may already have read dataset metadata.
-async fn lowered_tree(
-    plan: &PhysicalPlan,
-    ir: &QueryIR,
-    params: &ResolvedParams,
-    snapshot: &Snapshot,
-    catalog: &Arc<Catalog>,
-    settings: &SessionSettings,
-) -> Result<LoweredTree> {
+async fn lowered_tree(plan: PhysicalPlan, source: &QuerySource<'_>) -> Result<LoweredTree> {
     let embedding = EmbeddingResolver::explain();
-    let mode = match extract_search_mode(ir, params.shared(), catalog, &embedding, settings).await {
+    let bound = match bind(plan, source, &embedding).await {
         Err(_) if embedding.was_requested() => {
             return Ok(LoweredTree::Unavailable(
                 "the nearest() query is a string; embedding it needs the embedding client"
                     .to_string(),
             ));
         }
-        mode => mode?,
+        bound => bound?,
     };
-    let graph_index = Arc::new(GraphIndexHandle::none());
-    let lowering = Lowering {
-        plan,
-        ir,
-        params,
-        snapshot,
-        graph_index: &graph_index,
-        catalog,
-        settings,
-        memory_limit: super::context::query_memory_limit(),
+    let context = EngineContext {
+        snapshot: source.snapshot,
+        catalog: source.catalog,
+        graph_index: Arc::new(GraphIndexHandle::none()),
     };
-    let run = match &mode.rrf {
-        Some(rrf) => RunMode::Fused {
-            rrf,
-            primary: &rrf.primary,
-            secondary: &rrf.secondary,
-        },
-        None => RunMode::Single(&mode),
-    };
-    let lowered = lowering.lower_query(&run)?;
+    let lowering = Lowering::new(&bound, &context);
+    let lowered = lowering.lower_query(&Pass::default())?;
     let mut operators = Vec::new();
     operator_lines(lowered.root.as_ref(), 0, &mut operators);
     Ok(LoweredTree::Operators(operators))
 }
 
+/// The four columns of an explain or profile result, one entry per row.
 #[derive(Default)]
-struct ExplainRows {
+pub(super) struct ExplainRows {
     tree: Vec<&'static str>,
     depth: Vec<Option<i64>>,
     node: Vec<String>,
@@ -117,7 +98,13 @@ struct ExplainRows {
 }
 
 impl ExplainRows {
-    fn push(&mut self, tree: &'static str, depth: Option<i64>, node: &str, detail: String) {
+    pub(super) fn push(
+        &mut self,
+        tree: &'static str,
+        depth: Option<i64>,
+        node: &str,
+        detail: String,
+    ) {
         self.tree.push(tree);
         self.depth.push(depth);
         self.node.push(node.to_string());
@@ -188,7 +175,7 @@ impl ExplainRows {
         }
     }
 
-    fn into_result(self) -> Result<QueryResult> {
+    pub(super) fn into_result(self) -> Result<QueryResult> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("tree", DataType::Utf8, false),
             Field::new("depth", DataType::Int64, true),
@@ -221,7 +208,9 @@ fn explain_detail(value: &serde_json::Value) -> String {
 /// the lowered `datafusion` tree, one row per node in pre-order with its
 /// `depth` (which rebuilds each tree), then `plan` rows: `datafusion` with
 /// the reason when that tree is unavailable, one per fired pass, one per
-/// other field of the document.
+/// other field of the document, and last `assumptions`, what the planner
+/// read: parameter names, setting values and the memory limit, never a
+/// parameter value.
 pub(crate) async fn explain_rows(
     ir: &QueryIR,
     params: &ParamMap,
@@ -229,9 +218,10 @@ pub(crate) async fn explain_rows(
     catalog: &Arc<Catalog>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
-    let params = resolve_params(ir, params)?;
-    let planned = explain_query(ir, &params, catalog, snapshot, settings.traversal()).await?;
-    let lowered = lowered_tree(&planned.physical, ir, &params, snapshot, catalog, settings).await?;
+    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
+    let planned = explain_query(ir, &source)?;
+    let assumptions = planned.physical.assumptions().clone();
+    let lowered = lowered_tree(planned.physical, &source).await?;
     let omnigraph_planner::explain::Explain {
         explain_version,
         route,
@@ -282,6 +272,7 @@ pub(crate) async fn explain_rows(
     if let Some(statistics) = statistics {
         rows.push_field("statistics", statistics)?;
     }
+    rows.push_field("assumptions", &assumptions)?;
     rows.into_result()
 }
 

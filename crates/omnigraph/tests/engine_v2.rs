@@ -848,7 +848,7 @@ query total($q: Vector(4)) {
         let mut pending = vec![&explain["physical_plan"]];
         let mut hash_builds = 0;
         while let Some(node) = pending.pop() {
-            if node["node"] == "Scan" && node["access"] == "hash_join" {
+            if node["node"] == "HashJoin" {
                 hash_builds += 1;
             }
             pending.extend(node["inputs"].as_array().into_iter().flatten());

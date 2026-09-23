@@ -10,7 +10,8 @@ use crate::physical::StatisticSource;
 use crate::registry::{Entry, Route};
 use crate::route::RouteOverride;
 
-/// Incremented when a field's meaning changes.
+/// Incremented when a field's meaning changes, or when a node kind is added
+/// or removed; additive keys do not bump it.
 pub const EXPLAIN_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

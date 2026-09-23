@@ -1,10 +1,13 @@
-//! Destination scans constrained by batches of graph identities.
+//! Destination scans constrained by batches of graph identities: the per-slice
+//! id lookup of a dependent `ScanExec`, and the fallback branch of
+//! `HashJoinExec`.
 
 use std::collections::{HashMap, HashSet};
 
 use super::*;
+use crate::engine::operators::LookupSpec;
 use crate::engine::operators::memory::WorkMemory;
-use crate::engine::operators::producer::producer_stream;
+use crate::engine::operators::producer::{BatchSender, producer_stream};
 use crate::engine::scan::{
     ScanColumns, SearchColumns, add_null_blob_columns, conjoin_fts_queries, hconcat_batches,
     id_in_list_expr, ir_filter_to_expr,
@@ -33,7 +36,7 @@ impl ScanExec {
                 "destination scan names unknown type '{type_name}'"
             ))
         })?;
-        let columns = ScanColumns::new(node_type, catalog, SearchColumns::default(), projection);
+        let columns = ScanColumns::new(node_type, SearchColumns::default(), projection);
         let mut destination = columns.empty_batch(node_type);
         if columns.has_blobs {
             destination = add_null_blob_columns(&destination, node_type)?;
@@ -59,7 +62,7 @@ impl ScanExec {
 
     pub(super) fn execute_input(
         &self,
-        mut input: SendableRecordBatchStream,
+        input: SendableRecordBatchStream,
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         let mut work = WorkMemory::new(ctx, "ScanExec")?;
@@ -67,48 +70,63 @@ impl ScanExec {
         let memory = Arc::new(work);
         let schema = self.schema();
         let declared = Arc::clone(&schema);
-        let type_name = self.type_name.clone();
-        let binding = self.binding.clone();
-        let filters = self.filters.clone();
-        let projection = self.projection.clone();
-        let params = Arc::clone(&self.params);
-        let snapshot = self.snapshot.clone();
-        let catalog = Arc::clone(&self.catalog);
+        let lookup = LookupSpec {
+            type_name: self.type_name.clone(),
+            binding: self.binding.clone(),
+            filters: self.filters.clone(),
+            projection: self.projection.clone(),
+            params: Arc::clone(&self.params),
+            snapshot: self.snapshot.clone(),
+            catalog: Arc::clone(&self.catalog),
+        };
         Ok(producer_stream(
             schema,
             memory,
             Some(&self.metrics),
             move |memory, sender| async move {
-                while let Some(batch) = input.next().await {
-                    let batch = batch?;
-                    let held = memory.child("scan candidate input")?;
-                    held.hold(&batch)?;
-                    memory.metric("input_rows", batch.num_rows());
-                    let rows = memory.ctx.session_config().batch_size().clamp(1, 256);
-                    for offset in (0..batch.num_rows()).step_by(rows) {
-                        let work = Arc::new(memory.child("destination scan batch")?);
-                        let candidates = batch.slice(offset, rows.min(batch.num_rows() - offset));
-                        let output = read_candidates(
-                            &candidates,
-                            &type_name,
-                            &binding,
-                            &filters,
-                            projection.as_ref(),
-                            &params,
-                            &snapshot,
-                            &catalog,
-                            &work,
-                        )
-                        .await
-                        .map_err(external)?;
-                        let output = conform(output, &declared).map_err(external)?;
-                        sender.send_bounded(output, work).await?;
-                    }
-                }
-                Ok(())
+                lookup_candidates(input, &lookup, &declared, &memory, &sender).await
             },
         ))
     }
+}
+
+/// Every batch of `input` resolved to destination rows one slice of at most
+/// 256 rows at a time, each slice one Lance read `id IN (slice ids)` with the
+/// pushed filters, sent in `declared`'s shape.
+pub(in crate::engine) async fn lookup_candidates(
+    mut input: SendableRecordBatchStream,
+    lookup: &LookupSpec,
+    declared: &SchemaRef,
+    memory: &Arc<WorkMemory>,
+    sender: &BatchSender,
+) -> DfResult<()> {
+    while let Some(batch) = input.next().await {
+        let batch = batch?;
+        let held = memory.child("scan candidate input")?;
+        held.hold(&batch)?;
+        memory.metric("input_rows", batch.num_rows());
+        let rows = memory.ctx.session_config().batch_size().clamp(1, 256);
+        for offset in (0..batch.num_rows()).step_by(rows) {
+            let work = Arc::new(memory.child("destination scan batch")?);
+            let candidates = batch.slice(offset, rows.min(batch.num_rows() - offset));
+            let output = read_candidates(
+                &candidates,
+                &lookup.type_name,
+                &lookup.binding,
+                &lookup.filters,
+                lookup.projection.as_ref(),
+                &lookup.params,
+                &lookup.snapshot,
+                &lookup.catalog,
+                &work,
+            )
+            .await
+            .map_err(external)?;
+            let output = conform(output, declared).map_err(external)?;
+            sender.send_bounded(output, work).await?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -221,7 +239,7 @@ async fn hydrate_nodes(
         .get(type_name)
         .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
 
-    let columns = ScanColumns::new(node_type, catalog, SearchColumns::default(), projection);
+    let columns = ScanColumns::new(node_type, SearchColumns::default(), projection);
     if ids.is_empty() {
         let empty = columns.empty_batch(node_type);
         return if columns.has_blobs {

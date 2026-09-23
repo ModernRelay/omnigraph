@@ -28,7 +28,7 @@ show all;
 {"name": "engine", "value": "v1", "default": "v1", "source": "file", "scope": "request"}
 {"name": "rrf_plan", "value": "auto", "default": "auto", "source": "default", "scope": "process"}
 {"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
-{"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "process"}
+{"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "request"}
 {"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
 
 --- query

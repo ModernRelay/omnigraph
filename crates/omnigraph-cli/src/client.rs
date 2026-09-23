@@ -418,7 +418,10 @@ impl GraphClient {
             match id {
                 SettingId::Engine => request.engine = Some(given.engine()),
                 SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
-                SettingId::RrfPlan | SettingId::AnnNprobes | SettingId::StageWriteConcurrency => {
+                SettingId::AnnNprobes => {
+                    request.ann_nprobes = Some(given.get(SettingId::AnnNprobes).parse()?)
+                }
+                SettingId::RrfPlan | SettingId::StageWriteConcurrency => {
                     bail!(
                         "setting `{}` has request scope but no request field; add it to \
                          `SettingsRequest`",
@@ -2202,7 +2205,9 @@ mod tests {
         ]);
         let client =
             GraphClient::managed(&server.origin, "knowledge", "data-credential".into()).unwrap();
-        let settings = parse_set_flags(&["merge_lineage=off".to_string()]).unwrap();
+        let settings =
+            parse_set_flags(&["merge_lineage=off".to_string(), "ann_nprobes=1".to_string()])
+                .unwrap();
         client
             .query(
                 ReadTarget::branch("main"),
@@ -2235,7 +2240,7 @@ mod tests {
 
         let requests = server.requests();
         assert_eq!(requests.len(), 4);
-        let field = json!({"merge_lineage": "off"});
+        let field = json!({"merge_lineage": "off", "ann_nprobes": 1});
         assert_eq!(requests[0].path, "/graphs/knowledge/query");
         assert_eq!(requests[0].body["settings"], field);
         assert_eq!(

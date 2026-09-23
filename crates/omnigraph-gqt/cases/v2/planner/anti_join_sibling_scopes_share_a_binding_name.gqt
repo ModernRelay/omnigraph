@@ -55,6 +55,6 @@ p.name: String
 
 --- expect plan
 scan P as $p: columns [__id, name, foo, bar]
-scan A as $x: columns [__id, name, foo]
-scan B as $x: columns [__id, name, bar]
+scan A as $x: columns [name, foo]
+scan B as $x: columns [name, bar]
 pass projection_pushdown

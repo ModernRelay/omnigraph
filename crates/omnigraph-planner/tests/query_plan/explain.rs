@@ -68,7 +68,7 @@ fn the_explain_document_names_the_binding_and_the_projection() {
     assert_eq!(scan["node"], "TableScan");
     assert_eq!(scan["binding"], "c");
     assert_eq!(scan["table"], "node:T");
-    assert_eq!(scan["projection"].as_array().map(Vec::len), Some(2));
+    assert_eq!(scan["projection"], serde_json::json!(["slug"]));
 }
 
 #[test]
@@ -122,6 +122,42 @@ fn physical_destination_scan_retains_its_input_and_does_not_claim_table_cardinal
     assert_eq!(destination["inputs"][0]["node"], "Expand");
 }
 
+/// An `Expand` carries the pinned version of its edge table into explain and
+/// through the bound plan's serde round trip. Rust and not `.gqt`: the pinned
+/// version is an engine replay fact no case observes.
+#[test]
+fn physical_expand_carries_its_pinned_edge_version() {
+    let source = source().with_edge_version("knows", 5);
+    let op = ir(
+        vec![scan("a"), expand("a", "b", vec![])],
+        vec![prop("b", "slug")],
+        vec![],
+    );
+    let (physical, _) = physical(&op, &source);
+    assert!(physical.live().any(|(_, node)| matches!(
+        node,
+        PhysicalNode::Expand {
+            version: Some(5),
+            ..
+        }
+    )));
+    let json = physical.to_json();
+    let expand = &json["inputs"][0]["inputs"][0]["inputs"][0];
+    assert_eq!(expand["node"], "Expand");
+    assert_eq!(expand["version"], 5);
+    let bound = omnigraph_planner::BoundPlan {
+        plan: physical,
+        values: omnigraph_planner::ValueTable {
+            params: Arc::new(Default::default()),
+            vectors: Default::default(),
+        },
+    };
+    let text = serde_json::to_string(&bound).expect("the bound plan serializes");
+    let back: omnigraph_planner::BoundPlan =
+        serde_json::from_str(&text).expect("the bound plan deserializes");
+    assert_eq!(back, bound);
+}
+
 /// A plan's words are GQ: `Sort` keys carry their direction, a leading search
 /// function leads the declared ordering with its score column, and a query
 /// node prints no `schema` and the root scan its pinned version.
@@ -173,7 +209,11 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert!(json["resume"].is_null());
     let sort = &json["inputs"][0];
     assert_eq!(sort["node"], "Sort");
-    assert_eq!(sort["keys"], serde_json::json!(["$c.rank desc"]));
+    assert_eq!(
+        sort["keys"],
+        serde_json::json!(["$c._distance asc", "$c.rank desc"])
+    );
+    assert_eq!(sort["fetch"], 10);
     assert_eq!(
         sort["properties"]["ordering"],
         serde_json::json!(["$c._distance asc", "$c.rank desc"])
@@ -181,10 +221,89 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert!(sort["properties"].get("schema").is_none());
     let projection = &sort["inputs"][0];
     assert_eq!(projection["exprs"], serde_json::json!(["$c.slug"]));
-    let root_scan = &projection["inputs"][0]["inputs"][0];
+    let root_scan = &projection["inputs"][0];
     assert_eq!(root_scan["node"], "Scan");
     assert_eq!(root_scan["version"], 7);
+    assert_eq!(
+        root_scan["ranked"],
+        serde_json::json!({
+            "kind": "nearest",
+            "property": "embedding",
+            "query": "$q",
+            "fetch": 10,
+            "nprobes": null,
+            "scope": "order",
+        })
+    );
+    assert_eq!(
+        root_scan["properties"]["ordering"],
+        serde_json::json!(["$c._distance asc"])
+    );
     assert!(root_scan["properties"].get("schema").is_none());
+}
+
+/// A bare search order plans the score `Sort` the engine runs, with the
+/// query's limit as its fetch; a fusion plans none, since it orders its own
+/// rows, and each arm is its own subtree.
+#[test]
+fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
+    let bm25 = IRExpr::Bm25 {
+        field: Box::new(prop("c", "text")),
+        query: Box::new(IRExpr::Param("t".to_string())),
+    };
+    let (plan, _) = physical(
+        &ir(vec![scan("c")], vec![prop("c", "slug")], vec![bm25.clone()]),
+        &source(),
+    );
+    let json = plan.to_json();
+    assert_eq!(json["node"], "Page");
+    let sort = &json["inputs"][0];
+    assert_eq!(sort["node"], "Sort");
+    assert_eq!(sort["keys"], serde_json::json!(["$c._score desc"]));
+    assert_eq!(sort["fetch"], 10);
+    assert_eq!(sort["inputs"][0]["node"], "Projection");
+    let ranked = &sort["inputs"][0]["inputs"][0]["ranked"];
+    assert_eq!(ranked["kind"], "bm25");
+    assert_eq!(ranked["query"], "$t");
+    assert!(ranked["fetch"].is_null());
+
+    let rrf = IRExpr::Rrf {
+        primary: Box::new(IRExpr::Nearest {
+            variable: "c".to_string(),
+            property: "embedding".to_string(),
+            query: Box::new(IRExpr::Param("q".to_string())),
+        }),
+        secondary: Box::new(bm25),
+        k: None,
+    };
+    let (plan, _) = physical(
+        &ir(vec![scan("c")], vec![prop("c", "slug")], vec![rrf]),
+        &source(),
+    );
+    let json = plan.to_json();
+    assert_eq!(json["node"], "Page");
+    assert_eq!(json["inputs"][0]["node"], "Projection");
+    let fuse = &json["inputs"][0]["inputs"][0];
+    assert_eq!(fuse["node"], "RankFuse");
+    assert_eq!(fuse["limit"], 10);
+    assert!(fuse["k"].is_null());
+    assert_eq!(
+        fuse["properties"]["ordering"],
+        serde_json::json!(["rrf($c, $c) desc"])
+    );
+    let arms = fuse["inputs"].as_array().expect("two arm inputs");
+    assert_eq!(arms.len(), 2);
+    assert_ne!(arms[0]["id"], arms[1]["id"]);
+    assert_eq!(arms[0]["ranked"]["kind"], "nearest");
+    assert_eq!(arms[0]["ranked"]["scope"], "primary");
+    assert_eq!(arms[0]["ranked"]["fetch"], 10);
+    assert_eq!(arms[1]["ranked"]["kind"], "bm25");
+    assert_eq!(arms[1]["ranked"]["scope"], "secondary");
+    assert!(
+        !plan
+            .live()
+            .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+    );
 }
 
 /// Both inputs of a `CrossJoin` keep their operators in `pipelines_json`, and

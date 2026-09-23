@@ -3,6 +3,7 @@ use super::*;
 use arrow_array::StructArray;
 use arrow_schema::Fields;
 use omnigraph_compiler::catalog::NodeType;
+use omnigraph_planner::PhysicalNode;
 
 /// Node type per pipeline binding, for projecting a bare `$p` as one struct,
 /// and the system column names the wide batch carries per binding. Owned:
@@ -13,9 +14,38 @@ pub(super) struct ProjectionContext {
 }
 
 impl ProjectionContext {
-    pub(super) fn for_query(catalog: &Arc<Catalog>, ir: &QueryIR) -> Self {
+    /// Every binding of `plan`: a scan or a metadata count binds its table's
+    /// node type, an `Expand` binds its destination, inner trees included.
+    pub(super) fn for_plan(catalog: &Arc<Catalog>, plan: &PhysicalPlan) -> Self {
         let mut bindings = HashMap::new();
-        collect_node_bindings(&ir.pipeline, &mut bindings);
+        for (_, node) in plan.live() {
+            match node {
+                PhysicalNode::Scan { spec, .. } | PhysicalNode::MetadataCount { spec, .. } => {
+                    let type_name = spec.table.type_key.strip_prefix("node:");
+                    if let (Some(binding), Some(type_name)) = (&spec.binding, type_name) {
+                        bindings.insert(binding.clone(), type_name.to_string());
+                    }
+                }
+                PhysicalNode::Expand { dst, dst_type, .. } => {
+                    bindings.insert(dst.clone(), dst_type.clone());
+                }
+                PhysicalNode::SortMergeJoin { .. }
+                | PhysicalNode::HashJoin { .. }
+                | PhysicalNode::HydrateByAddress { .. }
+                | PhysicalNode::RowCompare { .. }
+                | PhysicalNode::ClassifyThreeWay { .. }
+                | PhysicalNode::Limit { .. }
+                | PhysicalNode::Page { .. }
+                | PhysicalNode::CrossJoin { .. }
+                | PhysicalNode::Filter { .. }
+                | PhysicalNode::AntiJoin { .. }
+                | PhysicalNode::OuterReference { .. }
+                | PhysicalNode::RankFuse { .. }
+                | PhysicalNode::Projection { .. }
+                | PhysicalNode::Aggregate { .. }
+                | PhysicalNode::Sort { .. } => {}
+            }
+        }
         Self {
             catalog: Arc::clone(catalog),
             bindings,
@@ -26,8 +56,14 @@ impl ProjectionContext {
     pub(super) fn node_type(&self, variable: &str) -> Option<&NodeType> {
         self.catalog.node_types.get(self.bindings.get(variable)?)
     }
+
+    #[cfg(test)]
+    pub(super) fn bindings(&self) -> &HashMap<String, String> {
+        &self.bindings
+    }
 }
 
+#[cfg(test)]
 pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
     for op in pipeline {
         match op {
@@ -369,13 +405,6 @@ pub(super) fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {
             "nested list literals are not supported".to_string(),
         )),
     }
-}
-
-/// True when any projection is an aggregate — such a return collapses rows.
-pub(super) fn projections_have_aggregates(projections: &[IRProjection]) -> bool {
-    projections
-        .iter()
-        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }))
 }
 
 /// Evaluate a single projection expression against a wide batch.

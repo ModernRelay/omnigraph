@@ -1,0 +1,52 @@
+# issue: none
+# notes: The same order with and without a limit: the top-k rows are the first rows of the full sort, ties included.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"eve","age":50}}
+{"type":"Person","data":{"name":"ann","age":30}}
+{"type":"Person","data":{"name":"dee","age":40}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- query
+set engine = v2;
+query by_age_then_name() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc, $p.name }
+}
+--- expect ordered
+{"p.name":"eve","p.age":50}
+{"p.name":"bob","p.age":40}
+{"p.name":"dee","p.age":40}
+{"p.name":"ann","p.age":30}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query
+set engine = v2;
+query by_age_then_name_top_three() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc, $p.name }
+    limit 3
+}
+--- expect ordered
+{"p.name":"eve","p.age":50}
+{"p.name":"bob","p.age":40}
+{"p.name":"dee","p.age":40}
+--- expect shape
+p.name: String
+p.age: I64

@@ -12,18 +12,19 @@ use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
-    AccessPath, ExpandCostInputs, ExpandMode, HASH_JOIN_POOL_DIVISOR, IndexCoverage,
+    AccessPath, ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, IndexCoverage,
     choose_access_path, choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops,
     scan_row_estimate,
 };
 use crate::error::PlanError;
 use crate::logical::{
     ColumnRef, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode,
-    LogicalPlan, Predicate, ScanSpec, ordering_text,
+    LogicalPlan, Predicate, ScanSpec, SearchArm, ordering_text,
 };
 use crate::operation::{Operation, Side};
 use crate::physical::{
-    Estimate, NodeId, PhysicalNode, PhysicalPlan, Properties, ScanInput, StatisticSource,
+    Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties,
+    RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 use crate::source::{NodeTypeSpec, PlanSource, SideId};
 
@@ -43,6 +44,9 @@ pub struct Bounds {
     pub ordered_scan_max_input_batch_bytes: u64,
     /// Key rows a join's build side may hold before the executor refuses.
     pub build_key_cap_rows: u64,
+    /// The effective memory limit of the query, captured once where the
+    /// source is gathered; the run's memory pool is sized from this value.
+    pub query_memory_pool_bytes: u64,
     /// Set by the engine after a one-pass shape was refused at open: pass 6
     /// then hydrates by address whatever the manifest says.
     pub late_materialization_only: bool,
@@ -165,10 +169,12 @@ fn resolve_query(
     let mut current = resolve_pipeline(plan, pipeline, source, &mut next_binding, None)?;
     let schema = schema_of(plan, current)?;
     let mut orderings: &[IROrdering] = order_by;
+    let mut ranked = false;
     if let Some(leading) = orderings.first() {
         if let Some(node) = search_node(current, &leading.expr, *limit) {
             current = plan.add(node, schema.clone());
             orderings = &orderings[1..];
+            ranked = true;
         }
     }
     let mut reads = Vec::new();
@@ -197,21 +203,45 @@ fn resolve_query(
             schema.clone(),
         )
     };
-    if !orderings.is_empty() {
+    if ranked || !orderings.is_empty() {
         let mut keys = Vec::new();
         for IROrdering {
             expr,
             descending: _,
         } in orderings
         {
-            order_keys(expr, &mut keys);
+            match expr {
+                IRExpr::PropAccess { .. }
+                | IRExpr::AliasRef(_)
+                | IRExpr::Nearest { .. }
+                | IRExpr::Search { .. }
+                | IRExpr::Fuzzy { .. }
+                | IRExpr::MatchText { .. }
+                | IRExpr::Bm25 { .. }
+                | IRExpr::Rrf { .. } => order_keys(expr, &mut keys),
+                IRExpr::Variable(_)
+                | IRExpr::Param(_)
+                | IRExpr::Literal(_)
+                | IRExpr::Aggregate { .. } => {
+                    return Err(PlanError::Unsupported {
+                        detail: "unsupported ordering expression".to_string(),
+                    });
+                }
+            }
         }
+        let tiebreak = sort_tiebreak(
+            &scope_bindings(plan, current),
+            order_by,
+            return_exprs,
+            has_aggregates,
+        );
         current = plan.add(
             LogicalNode::Sort {
                 input: current,
                 keys,
                 order_by: orderings.to_vec(),
                 fetch: limit.and_then(|limit| usize::try_from(limit).ok()),
+                tiebreak,
             },
             schema.clone(),
         );
@@ -430,6 +460,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 input,
                 binding: variable.clone(),
                 property: property.clone(),
+                query: query.as_ref().clone(),
                 k: limit,
                 reads,
             })
@@ -444,6 +475,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 input,
                 binding: variable.clone(),
                 property: property.clone(),
+                query: query.as_ref().clone(),
                 reads,
             })
         }
@@ -452,13 +484,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
             secondary,
             k,
         } => {
-            let targets: Vec<String> = [primary, secondary]
-                .into_iter()
-                .filter_map(|arm| search_target(arm))
-                .collect();
-            if targets.len() != 2 {
-                return None;
-            }
+            let arms = [search_target(primary)?, search_target(secondary)?];
             let mut reads = Vec::new();
             for arm in [primary, secondary] {
                 search_arm_reads(arm, &mut reads);
@@ -468,7 +494,9 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
             }
             Some(LogicalNode::RankFuse {
                 input,
-                targets,
+                arms,
+                k: k.as_deref().cloned(),
+                limit,
                 reads,
             })
         }
@@ -476,11 +504,25 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
     }
 }
 
-fn search_target(expr: &IRExpr) -> Option<String> {
+fn search_target(expr: &IRExpr) -> Option<SearchArm> {
     match expr {
-        IRExpr::Nearest { variable, .. } => Some(variable.clone()),
-        IRExpr::Bm25 { field, .. } => match field.as_ref() {
-            IRExpr::PropAccess { variable, .. } => Some(variable.clone()),
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => Some(SearchArm {
+            binding: variable.clone(),
+            property: property.clone(),
+            kind: RankKind::Nearest,
+            query: query.as_ref().clone(),
+        }),
+        IRExpr::Bm25 { field, query } => match field.as_ref() {
+            IRExpr::PropAccess { variable, property } => Some(SearchArm {
+                binding: variable.clone(),
+                property: property.clone(),
+                kind: RankKind::Bm25,
+                query: query.as_ref().clone(),
+            }),
             _ => None,
         },
         _ => None,
@@ -509,6 +551,89 @@ fn order_keys(expr: &IRExpr, out: &mut Vec<String>) {
 
 /// Prefix of a `Sort` key that names a `return` alias, not a column.
 pub const ALIAS_KEY: &str = "alias:";
+
+/// The bindings whose rows a sort above `id` sees: every scan, traversal
+/// destination and edge binding of the pipeline under it, an anti-join's
+/// inner scope excluded, name-sorted and deduplicated.
+fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
+    fn walk(plan: &LogicalPlan, id: LogicalId, out: &mut Vec<String>) {
+        let Some(node) = plan.node(id) else {
+            return;
+        };
+        match node {
+            LogicalNode::TableScan { input, spec } => {
+                out.extend(spec.binding.iter().cloned());
+                if let Some(input) = input {
+                    walk(plan, *input, out);
+                }
+            }
+            LogicalNode::Expand {
+                input,
+                dst,
+                edge_binding,
+                ..
+            } => {
+                out.push(dst.clone());
+                out.extend(edge_binding.iter().cloned());
+                walk(plan, *input, out);
+            }
+            LogicalNode::AntiJoin { input, .. } => walk(plan, *input, out),
+            other => {
+                for input in other.inputs() {
+                    walk(plan, input, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(plan, id, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The bindings whose ids a sort appends after `keys` so its order is total;
+/// none for group rows, when every returned expression is a key (equal rows
+/// are indistinguishable), and never a binding whose `@id` is a key.
+fn sort_tiebreak(
+    bindings: &[String],
+    keys: &[IROrdering],
+    returns: &[IRProjection],
+    aggregate: bool,
+) -> Vec<String> {
+    if aggregate {
+        return Vec::new();
+    }
+    let key_texts: Vec<String> = keys
+        .iter()
+        .map(|key| match &key.expr {
+            IRExpr::AliasRef(alias) => returns
+                .iter()
+                .find(|projection| projection.alias.as_deref() == Some(alias))
+                .map_or_else(|| alias.clone(), |projection| projection.expr.to_string()),
+            expr => expr.to_string(),
+        })
+        .collect();
+    let covered = returns
+        .iter()
+        .all(|projection| key_texts.contains(&projection.expr.to_string()));
+    if covered {
+        return Vec::new();
+    }
+    bindings
+        .iter()
+        .filter(|binding| {
+            !keys.iter().any(|key| {
+                matches!(
+                    &key.expr,
+                    IRExpr::PropAccess { variable, property }
+                        if variable == *binding && property == IDENTITY_MEMBER
+                )
+            })
+        })
+        .cloned()
+        .collect()
+}
 
 fn reads_of_filter(filter: &IRFilter, out: &mut Vec<ColumnRef>) {
     let IRFilter { left, op: _, right } = filter;
@@ -828,6 +953,8 @@ pub fn physical_plan(
         access_path: false,
         csr_cached: false,
         decisions: Vec::new(),
+        ranking: None,
+        limit: None,
     };
     let root = lowering.lower(plan.root())?;
     let Lowering {
@@ -866,6 +993,24 @@ pub fn physical_plan(
         fired,
         statistics,
     })
+}
+
+/// The nodes of the pipeline under `root` that constrain its rows: every
+/// node reachable from `root` without entering an `AntiJoin`'s inner tree.
+fn top_level(plan: &PhysicalPlan, root: NodeId) -> Vec<NodeId> {
+    let mut nodes = Vec::new();
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        let Some(node) = plan.node(id) else {
+            continue;
+        };
+        nodes.push(id);
+        match node {
+            PhysicalNode::AntiJoin { input, .. } => pending.push(*input),
+            other => pending.extend(other.inputs()),
+        }
+    }
+    nodes
 }
 
 /// Diff lowering keeps the root schema; a merge derives both sides from
@@ -1131,8 +1276,9 @@ fn metadata_count_schema(return_exprs: &[IRProjection]) -> Result<SchemaRef, Pla
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Project independent and dependent query scans from binding demand. A diff
-/// or merge plan holds no `Projection` node and never reaches this pass.
+/// Project independent and dependent query scans from binding demand; the id
+/// column is a demand like any other (`@id`, a whole entity, `identity_reads`).
+/// A diff or merge plan holds no `Projection` node and never reaches this pass.
 fn projection_pushdown(plan: &mut LogicalPlan, source: &dyn PlanSource) -> Result<bool, PlanError> {
     let scans = plan
         .live()
@@ -1153,11 +1299,14 @@ fn projection_pushdown(plan: &mut LogicalPlan, source: &dyn PlanSource) -> Resul
             let demand = demands.entry(read.binding.clone()).or_default();
             match read.property.as_deref() {
                 None => demand.entity = true,
-                Some(IDENTITY_MEMBER) => {}
+                Some(IDENTITY_MEMBER) => demand.identity = true,
                 Some(property) => {
                     demand.properties.insert(property.to_string());
                 }
             }
+        }
+        for binding in identity_reads(node) {
+            demands.entry(binding).or_default().identity = true;
         }
     }
     for (id, binding, node_type) in scans {
@@ -1171,6 +1320,7 @@ fn projection_pushdown(plan: &mut LogicalPlan, source: &dyn PlanSource) -> Resul
             },
             |demand| demand.entity,
         );
+        let identity = whole_object || demand.is_some_and(|demand| demand.identity);
         let is_key = |name: &str| node_type.key.iter().any(|key| key == name);
         let is_object = |name: &str| node_type.object_columns.iter().any(|column| column == name);
         let named = |name: &str| demand.is_some_and(|demand| demand.properties.contains(name));
@@ -1180,7 +1330,7 @@ fn projection_pushdown(plan: &mut LogicalPlan, source: &dyn PlanSource) -> Resul
             .iter()
             .map(|field| field.name().as_str())
             .filter(|name| {
-                *name == node_type.columns.id
+                (identity && *name == node_type.columns.id)
                     || is_key(name)
                     || (whole_object && is_object(name))
                     || named(name)
@@ -1198,11 +1348,31 @@ fn projection_pushdown(plan: &mut LogicalPlan, source: &dyn PlanSource) -> Resul
 }
 
 /// What one binding's scan must read, gathered from every node of the tree.
-/// The identity (`$v.@id`) is no demand: every scan projects its id.
+/// `identity` is the id column, read only when something keys rows by it.
 #[derive(Debug, Default)]
 struct Demand {
     entity: bool,
+    identity: bool,
     properties: HashSet<String>,
+}
+
+/// The bindings whose id a node reads beside any column: a traversal's ends,
+/// a dependent scan, an anti-join's outer rows, a ranked scan's binding, and
+/// a sort's declared tie-breaks.
+fn identity_reads(node: &LogicalNode) -> Vec<String> {
+    match node {
+        LogicalNode::TableScan {
+            input: Some(_),
+            spec,
+        } => spec.binding.iter().cloned().collect(),
+        LogicalNode::Expand { src, dst, .. } => vec![src.clone(), dst.clone()],
+        LogicalNode::AntiJoin { outer_var, .. } => vec![outer_var.clone()],
+        LogicalNode::Nearest { binding, .. } | LogicalNode::TextSearch { binding, .. } => {
+            vec![binding.clone()]
+        }
+        LogicalNode::Sort { tiebreak, .. } => tiebreak.clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// The columns one node reads through query bindings. A `RankFuse` reads its
@@ -1242,6 +1412,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             keys,
             order_by: _,
             fetch: _,
+            tiebreak: _,
         } => out.extend(
             keys.iter()
                 .filter(|key| !key.starts_with(ALIAS_KEY))
@@ -1251,6 +1422,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             input: _,
             binding: _,
             property: _,
+            query: _,
             k: _,
             reads,
         }
@@ -1258,6 +1430,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             input: _,
             binding: _,
             property: _,
+            query: _,
             reads,
         }
         | LogicalNode::Aggregate {
@@ -1267,10 +1440,12 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
         } => out.extend(reads.iter().cloned()),
         LogicalNode::RankFuse {
             input: _,
-            targets,
+            arms,
+            k: _,
+            limit: _,
             reads,
         } => {
-            out.extend(targets.iter().map(|target| ColumnRef::entity(target)));
+            out.extend(arms.iter().map(|arm| ColumnRef::entity(&arm.binding)));
             out.extend(reads.iter().cloned());
         }
         LogicalNode::MetadataCount {
@@ -1427,9 +1602,163 @@ struct Lowering<'a> {
     /// it for free. Lowering order is execution order (inputs first).
     csr_cached: bool,
     decisions: Vec<StatisticSource>,
+    /// The ranking lowered below the node being lowered, if any.
+    ranking: Option<Ranking>,
+    /// The `limit` above the node being lowered: the fetch of the score sort.
+    limit: Option<usize>,
+}
+
+/// What a leading search function became in the physical plan: the score
+/// keys the query's `Sort` leads with, or a fusion, which orders its own rows.
+enum Ranking {
+    Scores(Vec<IROrdering>),
+    Fused,
 }
 
 impl Lowering<'_> {
+    /// Mark the scan of `binding` under `root` as ranked by `access`, and
+    /// return the score ordering it imposes with the ranked scan's id.
+    fn rank(
+        &mut self,
+        root: NodeId,
+        binding: &str,
+        access: RankedAccess,
+    ) -> Result<(IROrdering, NodeId), PlanError> {
+        let ordering = access.ordering(binding);
+        let scan = self.ranked_scan(root, binding)?;
+        let destination = matches!(
+            self.physical.node(scan),
+            Some(PhysicalNode::Scan {
+                source: ScanInput::Dependent { .. },
+                ..
+            })
+        ) || self.physical.subtree(root).into_iter().any(|id| {
+            matches!(self.physical.node(id), Some(PhysicalNode::HashJoin { build, .. }) if *build == scan)
+        });
+        if destination {
+            let function = match access.kind {
+                RankKind::Nearest => "nearest",
+                RankKind::Bm25 => "bm25",
+            };
+            return Err(PlanError::Unsupported {
+                detail: format!(
+                    "`{function}()` orders `${binding}`, a traversal destination, which engine v2 does not support; order on the traversal's source binding, or match the destination with search()"
+                ),
+            });
+        }
+        match self.physical.node_mut(scan) {
+            Some(PhysicalNode::Scan { ranked, .. }) if ranked.is_none() => {
+                *ranked = Some(access);
+                Ok((ordering, scan))
+            }
+            _ => Err(PlanError::Internal(format!(
+                "the scan of `${binding}` is ranked twice"
+            ))),
+        }
+    }
+
+    /// The one scan of `binding` under `root`.
+    fn ranked_scan(&self, root: NodeId, binding: &str) -> Result<NodeId, PlanError> {
+        let scans: Vec<NodeId> = self
+            .physical
+            .subtree(root)
+            .into_iter()
+            .filter(|id| {
+                matches!(
+                    self.physical.node(*id),
+                    Some(PhysicalNode::Scan { spec, .. }) if spec.binding.as_deref() == Some(binding)
+                )
+            })
+            .collect();
+        let [scan] = scans[..] else {
+            return Err(PlanError::Internal(format!(
+                "the ranked binding `${binding}` has {} scans under its search node",
+                scans.len()
+            )));
+        };
+        Ok(scan)
+    }
+
+    /// The pre-pass the top-level nodes `top` admit for `binding` (scanned by
+    /// `scan`, feeding `feeds`): the `Expand`s leaving it with `min_hops > 0`,
+    /// none when an `Expand` introduces it (the gate's shape fence).
+    fn prefilter(
+        &self,
+        top: &[NodeId],
+        binding: &str,
+        scan: NodeId,
+        feeds: Vec<NodeId>,
+    ) -> Result<Prefilter, PlanError> {
+        let ranked_type = match self.physical.node(scan) {
+            Some(PhysicalNode::Scan { spec, .. }) => spec.table.node_type_name(),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            PlanError::Internal(format!(
+                "the ranked binding `${binding}` scans no node table"
+            ))
+        })?
+        .to_string();
+        let mut introduced_by_scan = false;
+        let mut hops = Vec::new();
+        for &id in top {
+            match self.physical.node(id) {
+                Some(PhysicalNode::Scan { spec, .. })
+                    if spec.binding.as_deref() == Some(binding) =>
+                {
+                    introduced_by_scan = true;
+                }
+                Some(PhysicalNode::Expand { dst, .. }) if dst == binding => {
+                    hops.clear();
+                    introduced_by_scan = false;
+                    break;
+                }
+                Some(PhysicalNode::Expand {
+                    src,
+                    edge_type,
+                    direction,
+                    min_hops,
+                    ..
+                }) if src == binding && *min_hops > 0 => hops.push(Hop {
+                    edge_type: edge_type.clone(),
+                    direction: *direction,
+                }),
+                _ => {}
+            }
+        }
+        if !introduced_by_scan || feeds.is_empty() {
+            hops.clear();
+        }
+        Ok(Prefilter {
+            ranked_type,
+            hops,
+            feeds,
+        })
+    }
+
+    /// The `Sort` a query's return runs under: the user's keys, led by the
+    /// score keys of a ranking below; `None` where nothing runs it (a fusion
+    /// orders its own rows, an aggregate carries no score column).
+    fn sort_keys(&self, input: NodeId, order_by: &[IROrdering]) -> Option<Vec<IROrdering>> {
+        match &self.ranking {
+            None => Some(order_by.to_vec()),
+            Some(Ranking::Fused) => None,
+            Some(Ranking::Scores(_))
+                if matches!(
+                    self.physical.node(input),
+                    Some(PhysicalNode::Aggregate { .. })
+                ) =>
+            {
+                None
+            }
+            Some(Ranking::Scores(scores)) => {
+                let mut keys = scores.clone();
+                keys.extend(order_by.iter().cloned());
+                Some(keys)
+            }
+        }
+    }
+
     fn lower(&mut self, id: LogicalId) -> Result<NodeId, PlanError> {
         let logical = self.logical;
         let node = logical
@@ -1443,34 +1772,54 @@ impl Lowering<'_> {
                 }))
             }
             LogicalNode::TableScan { input, spec } => {
-                let source = match input {
-                    None => ScanInput::Table,
-                    Some(input) => {
-                        let access = self.access_path(*input, spec)?;
-                        ScanInput::Dependent {
-                            input: self.lower(*input)?,
-                            access,
-                        }
-                    }
-                };
-                Ok(self.physical.add(PhysicalNode::Scan {
+                let scan = |source| PhysicalNode::Scan {
                     source,
                     spec: spec.clone(),
                     ordered: false,
                     keys_only: false,
-                }))
+                    ranked: None,
+                };
+                let Some(input) = input else {
+                    return Ok(self.physical.add(scan(ScanInput::Table)));
+                };
+                let access = self.access_path(*input, spec)?;
+                let probe = self.lower(*input)?;
+                match access {
+                    AccessPath::IdLookup => Ok(self
+                        .physical
+                        .add(scan(ScanInput::Dependent { input: probe }))),
+                    AccessPath::HashJoin => {
+                        let binding = spec.binding.clone().ok_or_else(|| {
+                            PlanError::Internal(
+                                "a hash join's destination scan has no binding".to_string(),
+                            )
+                        })?;
+                        let build = self.physical.add(scan(ScanInput::Table));
+                        Ok(self.physical.add(PhysicalNode::HashJoin {
+                            probe,
+                            build,
+                            binding,
+                            fallback: access.declared_fallback(),
+                        }))
+                    }
+                }
             }
             LogicalNode::Sort {
                 input,
                 order_by,
                 fetch,
+                tiebreak,
                 ..
             } => {
                 let lowered = self.lower(*input)?;
+                let Some(order_by) = self.sort_keys(lowered, order_by) else {
+                    return Ok(lowered);
+                };
                 Ok(self.physical.add(PhysicalNode::Sort {
                     input: lowered,
-                    order_by: order_by.clone(),
+                    order_by,
                     fetch: *fetch,
+                    tiebreak: tiebreak.clone(),
                 }))
             }
             LogicalNode::CrossJoin { left, right } => {
@@ -1523,7 +1872,7 @@ impl Lowering<'_> {
                 ..
             } => {
                 let lowered = self.lower(*input)?;
-                let (mode, frontier_estimate, cost) =
+                let (mode, frontier_estimate, policy) =
                     self.expand_mode(*input, edge_type, *direction, *min_hops, *max_hops);
                 Ok(self.physical.add(PhysicalNode::Expand {
                     input: lowered,
@@ -1537,7 +1886,8 @@ impl Lowering<'_> {
                     edge_binding: edge_binding.clone(),
                     mode,
                     frontier_estimate,
-                    cost,
+                    policy,
+                    version: self.source.edge_dataset(edge_type).map(|pin| pin.version),
                 }))
             }
             LogicalNode::AntiJoin {
@@ -1563,35 +1913,130 @@ impl Lowering<'_> {
                 input,
                 binding,
                 property,
+                query,
                 k,
                 ..
             } => {
                 let lowered = self.lower(*input)?;
-                Ok(self.physical.add(PhysicalNode::Nearest {
-                    input: lowered,
-                    binding: binding.clone(),
+                let fetch = k.and_then(|k| usize::try_from(k).ok());
+                let access = RankedAccess {
+                    kind: RankKind::Nearest,
                     property: property.clone(),
-                    k: *k,
-                }))
+                    query: query.clone(),
+                    fetch,
+                    nprobes: self.source.ann_nprobes(),
+                    scope: RankScope::Order,
+                    overfetch: fetch.map(OverfetchRung::ladder).unwrap_or_default(),
+                    prefilter: None,
+                };
+                let (score, scan) = self.rank(lowered, binding, access)?;
+                let top = top_level(&self.physical, lowered);
+                let expanded_from = top.iter().any(|id| {
+                    matches!(self.physical.node(*id), Some(PhysicalNode::Expand { src, .. }) if src == binding)
+                });
+                if expanded_from {
+                    let prefilter = self.prefilter(&top, binding, scan, vec![scan])?;
+                    if let Some(PhysicalNode::Scan {
+                        ranked: Some(ranked),
+                        ..
+                    }) = self.physical.node_mut(scan)
+                    {
+                        ranked.prefilter = Some(prefilter);
+                    }
+                }
+                self.ranking = Some(Ranking::Scores(vec![score]));
+                Ok(lowered)
             }
             LogicalNode::TextSearch {
                 input,
                 binding,
                 property,
+                query,
                 ..
             } => {
                 let lowered = self.lower(*input)?;
-                Ok(self.physical.add(PhysicalNode::TextSearch {
-                    input: lowered,
-                    binding: binding.clone(),
+                let access = RankedAccess {
+                    kind: RankKind::Bm25,
                     property: property.clone(),
-                }))
+                    query: query.clone(),
+                    fetch: None,
+                    nprobes: None,
+                    scope: RankScope::Order,
+                    overfetch: Vec::new(),
+                    prefilter: None,
+                };
+                let (score, _) = self.rank(lowered, binding, access)?;
+                self.ranking = Some(Ranking::Scores(vec![score]));
+                Ok(lowered)
             }
-            LogicalNode::RankFuse { input, targets, .. } => {
-                let lowered = self.lower(*input)?;
+            LogicalNode::RankFuse {
+                input,
+                arms,
+                k,
+                limit,
+                ..
+            } => {
+                let primary = self.lower(*input)?;
+                let secondary = self.physical.duplicate(primary).ok_or_else(|| {
+                    PlanError::Internal("the rrf arm subtree has a tombstone".to_string())
+                })?;
+                let limit = limit.and_then(|limit| usize::try_from(limit).ok());
+                let [primary_arm, secondary_arm] = arms;
+                let mut lowered_arms = Vec::with_capacity(2);
+                let mut bm25_scans = Vec::new();
+                let mut primary_scan = None;
+                for (root, arm, scope) in [
+                    (primary, primary_arm, RankScope::Primary),
+                    (secondary, secondary_arm, RankScope::Secondary),
+                ] {
+                    let access = RankedAccess {
+                        kind: arm.kind,
+                        property: arm.property.clone(),
+                        query: arm.query.clone(),
+                        fetch: match arm.kind {
+                            RankKind::Nearest => Some(limit.unwrap_or(RRF_NEAREST_ARM_K)),
+                            RankKind::Bm25 => None,
+                        },
+                        nprobes: match arm.kind {
+                            RankKind::Nearest => self.source.ann_nprobes(),
+                            RankKind::Bm25 => None,
+                        },
+                        scope,
+                        overfetch: Vec::new(),
+                        prefilter: None,
+                    };
+                    let (_, scan) = self.rank(root, &arm.binding, access)?;
+                    if arm.kind == RankKind::Bm25 {
+                        bm25_scans.push(scan);
+                    }
+                    primary_scan.get_or_insert(scan);
+                    lowered_arms.push(RankArm {
+                        input: root,
+                        binding: arm.binding.clone(),
+                        kind: arm.kind,
+                    });
+                }
+                let feeds = if primary_arm.binding == secondary_arm.binding {
+                    bm25_scans
+                } else {
+                    Vec::new()
+                };
+                let primary_scan = primary_scan
+                    .ok_or_else(|| PlanError::Internal("an rrf has two arms".to_string()))?;
+                let prefilter = self.prefilter(
+                    &top_level(&self.physical, primary),
+                    &primary_arm.binding,
+                    primary_scan,
+                    feeds,
+                )?;
+                let [primary_arm, secondary_arm] = <[RankArm; 2]>::try_from(lowered_arms)
+                    .map_err(|_| PlanError::Internal("an rrf has two arms".to_string()))?;
+                self.ranking = Some(Ranking::Fused);
                 Ok(self.physical.add(PhysicalNode::RankFuse {
-                    input: lowered,
-                    targets: targets.clone(),
+                    arms: [primary_arm, secondary_arm],
+                    k: k.clone(),
+                    limit,
+                    prefilter,
                 }))
             }
             LogicalNode::Ordered { input, keys } => {
@@ -1606,6 +2051,7 @@ impl Lowering<'_> {
                 }
             }
             LogicalNode::Limit { input, rows } => {
+                self.limit = Some(*rows);
                 let lowered = self.lower(*input)?;
                 Ok(self.physical.add(PhysicalNode::Limit {
                     input: lowered,
@@ -1738,8 +2184,8 @@ impl Lowering<'_> {
     }
 
     /// Pass 8, the traversal mode: the session's pin, else the cost model over
-    /// the input's row-count estimate and the edge statistics; `Csr` and no
-    /// estimate when the source holds none. A `Csr` Expand realizes the CSR.
+    /// the input's row-count estimate and the edge statistics (`Csr` and no
+    /// estimate without them); the `ExpandPolicy` says what the run may do.
     fn expand_mode(
         &mut self,
         input: LogicalId,
@@ -1747,7 +2193,7 @@ impl Lowering<'_> {
         direction: Direction,
         min_hops: u32,
         max_hops: Option<u32>,
-    ) -> (ExpandMode, Option<u64>, Option<ExpandCostInputs>) {
+    ) -> (ExpandMode, Option<u64>, ExpandPolicy) {
         let forced = match self.source.traversal() {
             Traversal::Indexed => Some(ExpandMode::IndexedScan),
             Traversal::Csr => Some(ExpandMode::Csr),
@@ -1768,19 +2214,19 @@ impl Lowering<'_> {
                 csr_cached: self.csr_cached,
                 probe_factor: direction_probe_factor(direction),
             });
-        let mode = match (forced, &cost) {
-            (Some(mode), _) => mode,
+        let frontier_estimate = cost.as_ref().and(input_rows);
+        let (mode, policy) = match (forced, cost) {
+            (Some(mode), _) => (mode, ExpandPolicy::Pinned),
             (None, Some(inputs)) => {
                 self.expand_mode = true;
-                choose_expand_mode(inputs)
+                (choose_expand_mode(&inputs), ExpandPolicy::Costed { inputs })
             }
-            (None, None) => ExpandMode::Csr,
+            (None, None) => (ExpandMode::Csr, ExpandPolicy::Uncosted),
         };
         if mode == ExpandMode::Csr {
             self.csr_cached = true;
         }
-        let frontier_estimate = cost.as_ref().and(input_rows);
-        (mode, frontier_estimate, cost)
+        (mode, frontier_estimate, policy)
     }
 
     /// Pass 9, the access path of a dependent scan: the cost model over the
@@ -2035,18 +2481,40 @@ fn variable_offset_width(data_type: &DataType) -> u64 {
     }
 }
 
-/// The ordering a search node's scan carries: `nearest` ranks by ascending
-/// `_distance`, `bm25` by descending `_score`, `rrf` by the fused rank.
+/// The candidates a nearest arm of an `rrf()` asks for when the query has
+/// no limit.
+const RRF_NEAREST_ARM_K: usize = 100;
+
+/// The ordering a ranked scan or a fusion carries: `nearest` ranks by
+/// ascending `_distance`, `bm25` by descending `_score`, `rrf` by the fused rank.
 fn search_ordering(node: &PhysicalNode) -> Option<Vec<String>> {
     match node {
-        PhysicalNode::Nearest { binding, .. } => Some(vec![format!("${binding}._distance asc")]),
-        PhysicalNode::TextSearch { binding, .. } => Some(vec![format!("${binding}._score desc")]),
-        PhysicalNode::RankFuse { targets, .. } => {
-            let targets: Vec<String> = targets.iter().map(|target| format!("${target}")).collect();
+        PhysicalNode::Scan {
+            spec,
+            ranked: Some(ranked),
+            ..
+        } => {
+            let binding = spec.binding.as_deref()?;
+            Some(vec![ordering_text(&ranked.ordering(binding))])
+        }
+        PhysicalNode::RankFuse { arms, .. } => {
+            let targets: Vec<String> = arms.iter().map(|arm| format!("${}", arm.binding)).collect();
             Some(vec![format!("rrf({}) desc", targets.join(", "))])
         }
         _ => None,
     }
+}
+
+/// `keys` appended to `input`'s ordering, each key once: a sort's ordering
+/// is its keys, and a ranked input's score key leads them already.
+fn sorted_ordering(input: Option<Vec<String>>, keys: &[IROrdering]) -> Vec<String> {
+    let mut ordering = input.unwrap_or_default();
+    for key in keys.iter().map(ordering_text) {
+        if !ordering.contains(&key) {
+            ordering.push(key);
+        }
+    }
+    ordering
 }
 
 /// The ordering a node declares by construction, in logical column names.
@@ -2056,6 +2524,11 @@ pub fn declared_ordering(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<String>>
             source: ScanInput::Dependent { input, .. },
             ..
         } => declared_ordering(plan, *input),
+        node @ PhysicalNode::Scan {
+            source: ScanInput::Table,
+            ranked: Some(_),
+            ..
+        } => search_ordering(node),
         PhysicalNode::Scan {
             source: ScanInput::Table,
             ordered: true,
@@ -2067,22 +2540,17 @@ pub fn declared_ordering(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<String>>
             ..
         } => None,
         PhysicalNode::SortMergeJoin { on, .. } => Some(vec![on.clone()]),
+        PhysicalNode::HashJoin { probe, .. } => declared_ordering(plan, *probe),
         PhysicalNode::HydrateByAddress { input, .. }
         | PhysicalNode::RowCompare { input, .. }
         | PhysicalNode::ClassifyThreeWay { input }
         | PhysicalNode::Page { input, .. }
         | PhysicalNode::Limit { input, .. }
         | PhysicalNode::Projection { input, .. } => declared_ordering(plan, *input),
-        node @ (PhysicalNode::Nearest { .. }
-        | PhysicalNode::TextSearch { .. }
-        | PhysicalNode::RankFuse { .. }) => search_ordering(node),
+        node @ PhysicalNode::RankFuse { .. } => search_ordering(node),
         PhysicalNode::Sort {
             input, order_by, ..
-        } => {
-            let mut ordering = declared_ordering(plan, *input).unwrap_or_default();
-            ordering.extend(order_by.iter().map(ordering_text));
-            Some(ordering)
-        }
+        } => Some(sorted_ordering(declared_ordering(plan, *input), order_by)),
         PhysicalNode::MetadataCount { .. }
         | PhysicalNode::CrossJoin { .. }
         | PhysicalNode::OuterReference { .. }
@@ -2118,7 +2586,8 @@ fn derive_properties(
             PhysicalNode::Scan {
                 source: ScanInput::Dependent { input, .. },
                 ..
-            } => {
+            }
+            | PhysicalNode::HashJoin { probe: input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
@@ -2162,12 +2631,16 @@ fn derive_properties(
                 spec,
                 ordered,
                 keys_only: false,
-                ..
+                ranked,
             } => {
                 let (rows, sources) = if spec.binding.is_some() {
                     query_scan_rows(spec, source)
                 } else {
                     scan_rows(spec, source)
+                };
+                let rows = match ranked.as_ref().and_then(|ranked| ranked.fetch) {
+                    Some(fetch) => rows.capped(u64::try_from(fetch).unwrap_or(u64::MAX)),
+                    None => rows,
                 };
                 let schema = scan_schema(spec, source)?;
                 let schema = match &spec.projection {
@@ -2183,7 +2656,8 @@ fn derive_properties(
                 };
                 Properties {
                     schema,
-                    ordering: ordered.then(|| vec![LOGICAL_ID.to_string()]),
+                    ordering: search_ordering(&node)
+                        .or_else(|| ordered.then(|| vec![LOGICAL_ID.to_string()])),
                     rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -2329,11 +2803,9 @@ fn derive_properties(
                 input, order_by, ..
             } => {
                 let input = props(plan, *input)?;
-                let mut ordering = input.ordering.clone().unwrap_or_default();
-                ordering.extend(order_by.iter().map(ordering_text));
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: Some(ordering),
+                    ordering: Some(sorted_ordering(input.ordering.clone(), order_by)),
                     rows: input.rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
@@ -2354,15 +2826,29 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
-            PhysicalNode::Projection { input, .. }
-            | PhysicalNode::Nearest { input, .. }
-            | PhysicalNode::TextSearch { input, .. }
-            | PhysicalNode::RankFuse { input, .. } => {
+            PhysicalNode::Projection { input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: search_ordering(&node).or_else(|| input.ordering.clone()),
+                    ordering: input.ordering.clone(),
                     rows: input.rows,
+                    work_bytes: Estimate::Unknown,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
+            PhysicalNode::RankFuse { arms, limit, .. } => {
+                let input = props(plan, arms[0].input)?;
+                let rows = match (input.rows, limit) {
+                    (Estimate::Known(rows), Some(limit)) => {
+                        Estimate::Known(rows.min(*limit as u64))
+                    }
+                    (rows, _) => rows,
+                };
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: search_ordering(&node),
+                    rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
                     sources: Vec::new(),

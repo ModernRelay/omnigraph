@@ -520,6 +520,62 @@ impl WorkMemory {
         batch: &RecordBatch,
         indices: &UInt32Array,
     ) -> DfResult<RecordBatch> {
+        self.take_named(batch, indices, "graph take output")
+    }
+
+    /// The rows of `batch` at `indices` (a reordering, or its first rows under
+    /// a fetch): the copy is admitted at the input's size while it is built,
+    /// then only the result is held.
+    pub(in crate::engine) fn permute(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+    ) -> DfResult<RecordBatch> {
+        let admitted = self.resources.reservation(
+            "sort permute",
+            batch.get_array_memory_size().saturating_add(128),
+        )?;
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| arrow_select::take::take(column.as_ref(), indices, None))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let result = RecordBatch::try_new(batch.schema(), columns)?;
+        drop(admitted);
+        self.hold(&result)?;
+        Ok(result)
+    }
+
+    /// `take` with the admission reservation named `name`, the refusal an
+    /// operator reports for its own output.
+    pub(in crate::engine) fn take_named(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+        name: &str,
+    ) -> DfResult<RecordBatch> {
+        self.take_admitted(batch, indices, name, 2)
+    }
+
+    /// `take_named` admitting the picked bytes once, for a join's output rows:
+    /// the admission covers the copy while it is built; the holds the output
+    /// then carries (the join's, the queue's, the consumer's) follow it.
+    pub(in crate::engine) fn take_once(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+        name: &str,
+    ) -> DfResult<RecordBatch> {
+        self.take_admitted(batch, indices, name, 1)
+    }
+
+    fn take_admitted(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+        name: &str,
+        factor: usize,
+    ) -> DfResult<RecordBatch> {
         let mut bytes = 0usize;
         let mut scratch_bytes = 0usize;
         for column in batch.columns() {
@@ -542,8 +598,8 @@ impl WorkMemory {
             bytes = bytes.saturating_add(picked).saturating_add(128);
         }
         let admitted = self.resources.reservation(
-            "graph take output",
-            bytes.saturating_mul(2).saturating_add(scratch_bytes),
+            name,
+            bytes.saturating_mul(factor).saturating_add(scratch_bytes),
         )?;
         let columns = batch
             .columns()

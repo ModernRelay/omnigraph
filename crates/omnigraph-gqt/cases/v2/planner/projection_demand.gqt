@@ -1,5 +1,5 @@
 # issue: none
-# notes: Projection demand follows returns, filters, search ordering, correlated negation, and traversal.
+# notes: Projection demand follows returns, filters, search ordering, correlated negation, and traversal; the id column follows identity demand (a declared tie-break, a traversal, a negation's outer rows, a ranked scan, a whole entity), so a plain scan reads none.
 
 --- runner
 timeout_ms: 10000
@@ -36,7 +36,7 @@ query plain() {
 --- expect shape
 c.state: String
 --- expect plan
-scan T as $c: columns [__id, slug, state]
+scan T as $c: columns [slug, state]
 pass projection_pushdown
 
 --- query
@@ -52,7 +52,7 @@ query contribute() {
 c.rank: I64
 n: I64
 --- expect plan
-scan T as $c: columns [__id, slug, state, rank]
+scan T as $c: columns [slug, state, rank]
 
 --- query
 set engine = v2;
@@ -95,7 +95,7 @@ query negated() {
 c.slug: String
 --- expect plan
 scan T as $c: columns [__id, slug, kind_ref]
-scan T as $x: columns [__id, slug, kind]
+scan T as $x: columns [slug, kind]
 
 --- query
 set engine = v2;
@@ -127,5 +127,5 @@ query unused_binding() {
 --- expect shape
 c.slug: String
 --- expect plan
-scan T as $c: columns [__id, slug]
+scan T as $c: columns [slug]
 scan T as $d: columns [__id, slug, state, rank, kind, kind_ref]

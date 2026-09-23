@@ -322,11 +322,9 @@ fn unregistered_diff_and_merge_shapes_stay_on_the_executor_under_every_override(
     }
 }
 
-/// GQT sees rows and plan assertions, but cannot select registry overrides.
-#[test]
-fn read_queries_build_an_engine_plan_without_a_registry_entry() {
+fn doc_source() -> MemorySource {
     let side = side(1);
-    let source = MemorySource::default().with_node_type(
+    MemorySource::default().with_node_type(
         "Doc",
         NodeTypeSpec {
             table: side.table,
@@ -337,8 +335,11 @@ fn read_queries_build_an_engine_plan_without_a_registry_entry() {
             object_columns: vec!["id".to_string()],
             row_count: None,
         },
-    );
-    let op = Operation::Query(Box::new(QueryIR {
+    )
+}
+
+fn documents_query() -> Operation {
+    Operation::Query(Box::new(QueryIR {
         name: "documents".to_string(),
         params: Vec::new(),
         pipeline: vec![IROp::NodeScan {
@@ -352,7 +353,14 @@ fn read_queries_build_an_engine_plan_without_a_registry_entry() {
         }],
         order_by: Vec::new(),
         limit: None,
-    }));
+    }))
+}
+
+/// GQT sees rows and plan assertions, but cannot select registry overrides.
+#[test]
+fn read_queries_build_an_engine_plan_without_a_registry_entry() {
+    let source = doc_source();
+    let op = documents_query();
     for override_ in [
         RouteOverride::Registry,
         RouteOverride::ForceExecutor,
@@ -372,6 +380,36 @@ fn read_queries_build_an_engine_plan_without_a_registry_entry() {
         assert!(explain.entry.is_none());
         assert!(explain.physical_plan.is_some());
     }
+}
+
+fn physical_ids(node: &serde_json::Value, out: &mut Vec<u64>) {
+    out.push(node["id"].as_u64().expect("a physical node carries its id"));
+    for input in node["inputs"].as_array().into_iter().flatten() {
+        physical_ids(input, out);
+    }
+}
+
+/// Pins a wire constant and a wire key that no query result shows: readers
+/// refuse any `explain_version` but 1 and join report rows on the node `id`.
+#[test]
+fn explain_version_is_one_and_every_physical_node_carries_its_id() {
+    assert_eq!(omnigraph_planner::explain::EXPLAIN_VERSION, 1);
+    let Decision::Engine { plan, explain, .. } = route(
+        &documents_query(),
+        &doc_source(),
+        RouteOverride::Registry,
+        &BOUNDS,
+    ) else {
+        panic!("read query did not build an engine plan");
+    };
+    let document = explain.to_value();
+    assert_eq!(document["explain_version"], 1);
+    let mut ids = Vec::new();
+    physical_ids(&document["physical_plan"], &mut ids);
+    ids.sort_unstable();
+    let mut planned: Vec<u64> = plan.post_order().into_iter().map(|id| id as u64).collect();
+    planned.sort_unstable();
+    assert_eq!(ids, planned);
 }
 
 /// Census rendering is a planner diagnostic, not a GQ result surface.

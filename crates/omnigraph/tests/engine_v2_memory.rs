@@ -4,7 +4,7 @@
 mod helpers;
 
 use arrow_array::{Array, Float64Array, Int64Array, StringArray};
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::instrumentation::{
     QueryMemoryProbes, with_query_memory_limit, with_query_memory_probes,
@@ -744,8 +744,9 @@ async fn hash_join_output_is_the_refusing_reservation() {
     let mut pending = vec![&explain["physical_plan"]];
     let mut saw_hash_join = false;
     while let Some(node) = pending.pop() {
-        if node["node"] == "Scan" && node["id_restriction"] == "input" {
-            assert_eq!(node["access"], "hash_join", "{explain}");
+        assert_ne!(node["id_restriction"], "input", "{explain}");
+        if node["node"] == "HashJoin" {
+            assert_eq!(node["fallback"], "id_lookup", "{explain}");
             saw_hash_join = true;
         }
         pending.extend(node["inputs"].as_array().into_iter().flatten());
@@ -825,8 +826,9 @@ async fn underestimated_hash_build_retries_id_lookup() {
     let mut pending = vec![&explain["physical_plan"]];
     let mut saw_hash = false;
     while let Some(node) = pending.pop() {
-        if node["node"] == "Scan" && node["id_restriction"] == "input" {
-            assert_eq!(node["access"], "hash_join", "{explain}");
+        assert_ne!(node["id_restriction"], "input", "{explain}");
+        if node["node"] == "HashJoin" {
+            assert_eq!(node["fallback"], "id_lookup", "{explain}");
             saw_hash = true;
         }
         pending.extend(node["inputs"].as_array().into_iter().flatten());
@@ -867,6 +869,44 @@ async fn underestimated_hash_build_retries_id_lookup() {
             .any(|metric| metric.values.get("hash_build_fallbacks") == Some(&1))
     );
     assert_released(&probes);
+
+    let run = with_query_memory_limit(
+        limit,
+        v2.query_inspected(
+            ReadTarget::branch("main"),
+            JOIN_OUTPUT_QUERY,
+            "joined_payloads",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.result.concat_batches().unwrap().num_rows(), 8);
+    let report = serde_json::to_value(&run.report).unwrap();
+    let sides: Vec<&serde_json::Value> = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["operator"] == "HashJoinExec")
+        .map(|row| &row["attempts"][0]["ran"])
+        .collect();
+    assert_eq!(
+        sides,
+        [&serde_json::json!("id_lookup")],
+        "the declared switch's row names the side that ran: {report}"
+    );
+    let profile = run.profile().unwrap().concat_batches().unwrap();
+    let trees = profile
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(trees.iter().all(|tree| tree == Some("profile")));
+    assert_eq!(
+        profile.num_rows(),
+        report["rows"].as_array().unwrap().len(),
+        "one profile row per report row"
+    );
 }
 
 /// A source payload is repeated by fanout before an aggregate discards it.

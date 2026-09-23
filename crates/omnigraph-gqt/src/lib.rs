@@ -61,6 +61,7 @@ use omnigraph::storage::StorageAdapter;
 use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
 
 mod plan;
+mod report;
 mod shape;
 use plan::{PlanExpect, parse_plan_body, plan_mismatch, validate_plan_columns};
 
@@ -827,14 +828,9 @@ fn walk_clauses(
     Ok(())
 }
 
-/// Why `expect ordered` is refused for this declaration, if it is. The
-/// engine's order is total only where `apply_ordering` appends the `<var>.id`
-/// tie-breaks (RFC 0045, Comparison semantics): no `order` clause, an
-/// `rrf()`-led one (fusion sorts by score alone), or an aggregate in the
-/// `return` list (group rows carry no `<var>.id`) each fail that condition.
-/// The tie-break is stable within a run only (ids are minted per load), so
-/// a case's `order` keys must be total over its rows: an authoring rule the
-/// parser cannot check.
+/// Why `expect ordered` is refused for this declaration, if it is: the order
+/// is total only where a sort appends `<var>.id` tie-breaks (RFC 0045), so no
+/// `order`, an `rrf()`-led one, or an aggregate `return` each refuse it.
 fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
     if decl.order_clause.is_empty() {
         return Some("`expect ordered` is refused for a query without an `order` clause".into());
@@ -2120,6 +2116,14 @@ fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Op
     None
 }
 
+/// What a v2 query step's `Executed` holds beyond its result: the explain
+/// document rendered from the bound plan the run executed, and its report
+/// rows.
+struct Inspection {
+    explain: Value,
+    rows: Result<Vec<report::Row>, String>,
+}
+
 async fn run_query_step(
     session: &Session,
     mode: Option<&'static str>,
@@ -2132,13 +2136,17 @@ async fn run_query_step(
         message,
         bless_lines: None,
     };
-    if step.plan.is_some()
-        && session
-            .effective(&step.source)
-            .map_err(|error| fail(format!("query settings failed: {error}")))?
-            .engine()
-            != Engine::V2
-    {
+    let settings = match session.effective(&step.source) {
+        Ok(settings) => Some(settings),
+        Err(error) if step.plan.is_some() => {
+            return Err(fail(format!("query settings failed: {error}")));
+        }
+        Err(_) => None,
+    };
+    let inspected = settings
+        .as_ref()
+        .is_some_and(|settings| settings.engine() == Engine::V2);
+    if step.plan.is_some() && !inspected {
         return Err(fail(
             "expect plan requires engine = v2; effective engine is v1, which produces no plan"
                 .into(),
@@ -2161,16 +2169,25 @@ async fn run_query_step(
             };
         }
     };
-    let (outcome, counts) = under_traversal(
-        mode,
-        session.query(
-            ReadTarget::branch(&step.branch),
-            &step.source,
-            &step.name,
-            &params,
-        ),
-    )
-    .await;
+    let target = ReadTarget::branch(&step.branch);
+    let (outcome, counts, inspection) = if inspected {
+        let door = session.query_inspected(target, &step.source, &step.name, &params);
+        let (outcome, counts) = under_traversal(mode, Box::pin(door)).await;
+        match outcome {
+            Ok(run) => {
+                let inspection = Inspection {
+                    explain: run.explain.to_value(),
+                    rows: report::report_rows(&run.report),
+                };
+                (Ok(run.result), counts, Some(inspection))
+            }
+            Err(error) => (Err(error), counts, None),
+        }
+    } else {
+        let query = session.query(target, &step.source, &step.name, &params);
+        let (outcome, counts) = under_traversal(mode, query).await;
+        (outcome, counts, None)
+    };
     dst_runner::observe_query(
         &outcome,
         matches!(step.expect, QueryExpect::Rows { ordered: true, .. }),
@@ -2180,6 +2197,9 @@ async fn run_query_step(
     if let Some(violation) = check_pin(mode, &counts, require_expand) {
         return Err(fail(violation));
     }
+    if let Some(run) = &inspection {
+        run.rows.as_ref().map_err(|error| fail(error.clone()))?;
+    }
     match &step.expect {
         QueryExpect::Rows {
             ordered,
@@ -2188,21 +2208,13 @@ async fn run_query_step(
             shape,
         } => {
             let result = outcome.map_err(|e| fail(format!("query failed: {e}")))?;
-            if let Some(plan) = &step.plan {
-                let explain = session
-                    .explain_query(
-                        ReadTarget::branch(&step.branch),
-                        &step.source,
-                        &step.name,
-                        &params,
-                    )
-                    .await
-                    .map_err(|e| fail(format!("explain failed: {e}")))?;
+            if let (Some(plan), Some(Inspection { explain, rows })) = (&step.plan, &inspection) {
                 validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
-                if let Some(mismatch) = plan_mismatch(&plan.lines, &explain) {
+                let report = rows.as_ref().ok().map(Vec::as_slice);
+                if let Some(mismatch) = plan_mismatch(&plan.lines, explain, report) {
                     return Err(fail(format!(
                         "{mismatch}\nexplain document:\n{}",
-                        serde_json::to_string_pretty(&explain).unwrap_or_default()
+                        serde_json::to_string_pretty(explain).unwrap_or_default()
                     )));
                 }
             }

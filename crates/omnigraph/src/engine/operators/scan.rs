@@ -15,13 +15,15 @@ use datafusion::physical_plan::{
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRFilter, ParamMap};
 
-use super::{breaker_properties, breaker_stream, conform, external};
+use super::{breaker_properties, breaker_stream, conform, external, polled};
 use crate::db::Snapshot;
 use crate::engine::scan::{execute_node_scan, prefix_batch, scan_output_schema};
 use crate::engine::search::{NeededColumns, ScanReport, SearchMode};
 use crate::error::Result;
 
 mod input;
+
+pub(super) use input::lookup_candidates;
 
 pub(crate) enum ScanSource {
     Table {
@@ -182,7 +184,9 @@ impl ExecutionPlan for ScanExec {
         assert_eq!(partition, 0, "ScanExec has one partition");
         let (mode, report) = match &self.source {
             ScanSource::Dependent { input } => {
-                return self.execute_input(input.execute(0, Arc::clone(&ctx))?, ctx);
+                return self
+                    .execute_input(input.execute(0, Arc::clone(&ctx))?, ctx)
+                    .map(|stream| polled(&self.metrics, stream));
             }
             ScanSource::Table { mode, report } => (mode.as_ref().clone(), Arc::clone(report)),
         };
@@ -195,7 +199,7 @@ impl ExecutionPlan for ScanExec {
         let snapshot = self.snapshot.clone();
         let catalog = Arc::clone(&self.catalog);
         let declared = Arc::clone(&schema);
-        Ok(breaker_stream(
+        let stream = breaker_stream(
             "ScanExec",
             schema,
             &ctx,
@@ -216,11 +220,7 @@ impl ExecutionPlan for ScanExec {
                 )
                 .await
                 .map_err(external)?;
-                if mode
-                    .bm25
-                    .as_ref()
-                    .is_some_and(|(variable, ..)| variable == &binding)
-                {
+                if mode.bm25.is_some() {
                     reservation.metric("bm25_scan_rows", batch.num_rows());
                 }
                 if let Some(nearest) = scan_report.nearest_scan {
@@ -241,6 +241,7 @@ impl ExecutionPlan for ScanExec {
                 let prefixed = prefix_batch(&batch, &binding).map_err(external)?;
                 conform(prefixed, &declared).map_err(external)
             },
-        ))
+        );
+        Ok(polled(&self.metrics, stream))
     }
 }

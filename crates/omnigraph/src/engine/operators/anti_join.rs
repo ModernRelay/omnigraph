@@ -18,7 +18,7 @@ use datafusion::physical_plan::{
 };
 use omnigraph_compiler::types::Direction;
 
-use super::{GraphEnv, breaker_properties, breaker_stream, drain, drain_one, external};
+use super::{GraphEnv, breaker_properties, breaker_stream, drain, drain_one, external, polled};
 use crate::engine::graph::bulk_anti_join_mask;
 use crate::error::{OmniError, Result};
 
@@ -110,7 +110,7 @@ impl ExecutionPlan for OuterReferenceExec {
         assert_eq!(partition, 0, "OuterReferenceExec has one partition");
         let schema: SchemaRef = self.schema();
         let slot = Arc::clone(&self.slot);
-        Ok(breaker_stream(
+        let stream = breaker_stream(
             "OuterReferenceExec",
             schema,
             &ctx,
@@ -122,7 +122,8 @@ impl ExecutionPlan for OuterReferenceExec {
                     ))
                 })
             },
-        ))
+        );
+        Ok(polled(&self.metrics, stream))
     }
 }
 
@@ -287,7 +288,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
         let bulk = self.bulk.clone();
         let env = Arc::clone(&self.env);
         let declared = Arc::clone(&schema);
-        Ok(breaker_stream(
+        let stream = breaker_stream(
             "AntiJoinMaskExec",
             schema,
             &ctx,
@@ -337,6 +338,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
                     })
                     .await
             },
-        ))
+        );
+        Ok(polled(&self.metrics, stream))
     }
 }

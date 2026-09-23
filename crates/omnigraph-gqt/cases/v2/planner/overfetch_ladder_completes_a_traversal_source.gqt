@@ -1,0 +1,45 @@
+# issue: none
+# notes: nearest on a traversal source: the three nearest docs have no edge, so the first fetch of 3 is empty after the traversal and the overfetch ladder must reach the three edged docs behind them.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","embedding":[2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","embedding":[3.0,0.0]}}
+{"type":"Doc","data":{"slug":"d4","embedding":[4.0,0.0]}}
+{"type":"Doc","data":{"slug":"d5","embedding":[5.0,0.0]}}
+{"edge":"Cites","from":"d3","to":"d4"}
+{"edge":"Cites","from":"d4","to":"d5"}
+{"edge":"Cites","from":"d5","to":"d0"}
+
+--- query
+set engine = v2;
+query nearest_citing_docs($q: Vector(2)) {
+    match { $d: Doc $d cites $t }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q": [0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d3"}
+{"d.slug":"d4"}
+{"d.slug":"d5"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 3

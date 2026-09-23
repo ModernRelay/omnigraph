@@ -126,9 +126,102 @@ impl Session {
             params,
             &catalog,
             &resolved.snapshot,
-            settings.traversal(),
+            &settings,
         )
         .await
+    }
+
+    /// The v2 inspection door of the GQT runner: [`Self::query`] answered as an
+    /// `Executed`, the run with its own plan, explain and report.
+    ///
+    /// # Errors
+    ///
+    /// Beside the errors of [`Self::query`], refuses a source whose effective
+    /// engine is not `v2`, and an `explain` statement, which runs nothing.
+    #[doc(hidden)]
+    pub async fn query_inspected(
+        &self,
+        target: impl Into<ReadTarget>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<engine::Executed> {
+        let settings = self.effective(query_source)?;
+        if settings.engine() != Engine::V2 {
+            return Err(OmniError::manifest(
+                "the inspection door runs engine = v2 only",
+            ));
+        }
+        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let CompiledRead::Query(ir) =
+            self.compile_named_query(&catalog, query_source, query_name)?
+        else {
+            return Err(OmniError::manifest(
+                "the inspection door runs no `explain` statement",
+            ));
+        };
+        let traverses = ir
+            .pipeline
+            .iter()
+            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let graph_index = if traverses {
+            engine::GraphIndexHandle::cached(
+                Arc::clone(&**self),
+                resolved.clone(),
+                engine::referenced_edge_types(&ir.pipeline, &catalog),
+                catalog.system_columns,
+            )
+        } else {
+            engine::GraphIndexHandle::none()
+        };
+        engine::execute_query_inspected(
+            &ir,
+            params,
+            &resolved.snapshot,
+            graph_index,
+            &catalog,
+            &engine::EmbeddingResolver::new(self.embedding_cell(), self.embedding_config_ref()),
+            &settings,
+        )
+        .await
+    }
+
+    /// The replay door of the plan-replay tests: executes `bound`, a plan the
+    /// inspection door returned and the test serialized and read back, with
+    /// nothing else about its query: no session setting, no `QueryIR`. It
+    /// builds the engine context `query_inspected` builds (the snapshot and
+    /// catalog of `target`, a graph index scoped to the plan's `Expand`s),
+    /// refuses a snapshot whose dataset versions are not the ones the plan's
+    /// scans, counts and traversals pinned, and calls the same `execute`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::query`] on the target, a snapshot the plan did
+    /// not pin, and every run-time error of the plan.
+    #[doc(hidden)]
+    pub async fn replay_bound_plan(
+        &self,
+        target: impl Into<ReadTarget>,
+        bound: omnigraph_planner::BoundPlan,
+    ) -> Result<engine::PlanRun> {
+        let (resolved, catalog) = self.capture_read_view(target).await?;
+        engine::plan_pins_snapshot(&bound.plan, &resolved.snapshot)?;
+        let graph_index = if engine::plan_traverses(&bound.plan) {
+            engine::GraphIndexHandle::cached(
+                Arc::clone(&**self),
+                resolved.clone(),
+                engine::plan_edge_types(&bound.plan, &catalog),
+                catalog.system_columns,
+            )
+        } else {
+            engine::GraphIndexHandle::none()
+        };
+        let context = engine::EngineContext {
+            snapshot: &resolved.snapshot,
+            catalog: &catalog,
+            graph_index: Arc::new(graph_index),
+        };
+        engine::execute(bound, &context).await
     }
 
     /// One compiled query on the route `settings.engine()` names. Each route

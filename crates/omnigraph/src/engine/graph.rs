@@ -7,8 +7,10 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use omnigraph_planner::{ExpandCostInputs, ExpandMode, choose_expand_mode, should_switch_to_csr};
 
-use super::operators::ExpandStep;
+use datafusion::physical_plan::metrics::Gauge;
+
 use super::operators::memory::WorkMemory;
+use super::operators::{ExpandStep, Switch};
 use super::*;
 
 /// Bundles the per-handle embedding client cell with the optional injected
@@ -426,6 +428,7 @@ pub(super) async fn execute_expand(
     snapshot: &Snapshot,
     catalog: &Catalog,
     step: &ExpandStep,
+    switch: &Gauge,
     memory: &WorkMemory,
 ) -> Result<ExpandedPairs> {
     let work = memory
@@ -443,11 +446,17 @@ pub(super) async fn execute_expand(
     )
     .await?;
     let (start_indexed, hop_policy) = match start {
-        ExpandStart::Csr => (None, HopPolicy::Off),
+        ExpandStart::Csr => {
+            Switch::Csr.record(switch);
+            (None, HopPolicy::Off)
+        }
         ExpandStart::Indexed {
             edge_ds,
             hop_policy,
-        } => (Some(*edge_ds), hop_policy),
+        } => {
+            Switch::IndexedScan.record(switch);
+            (Some(*edge_ds), hop_policy)
+        }
     };
     execute_expand_bfs(
         wide,
@@ -456,6 +465,7 @@ pub(super) async fn execute_expand(
         step,
         start_indexed,
         hop_policy,
+        switch,
         memory,
     )
     .await
@@ -921,6 +931,7 @@ pub(super) fn resolve_csr<'g>(
 /// absent from the CSR dictionary has no edges at all and is dropped as
 /// unreachable.
 ///
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs(
     wide: &RecordBatch,
     graph_index: &GraphIndexHandle,
@@ -928,6 +939,7 @@ pub(super) async fn execute_expand_bfs(
     step: &ExpandStep,
     start_indexed: Option<Dataset>,
     hop_policy: HopPolicy,
+    side: &Gauge,
     memory: &WorkMemory,
 ) -> Result<ExpandedPairs> {
     let src_var = &step.src;
@@ -1053,6 +1065,7 @@ pub(super) async fn execute_expand_bfs(
                 crate::instrumentation::record_traversal_mid_switch();
                 crate::instrumentation::record_expand_path(false);
                 memory.metric("expand_csr", 1);
+                Switch::Csr.record(side);
                 let gi = graph_index.get().await?.ok_or_else(|| {
                     OmniError::manifest("graph index required for CSR traversal".to_string())
                 })?;

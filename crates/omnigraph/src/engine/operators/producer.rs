@@ -158,7 +158,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
-    use crate::engine::context::QueryContext;
+    use crate::engine::context::{QueryContext, query_memory_limit};
     use crate::instrumentation::{
         QueryMemoryProbes, with_query_memory_limit, with_query_memory_probes,
     };
@@ -194,7 +194,7 @@ mod tests {
         with_query_memory_probes(
             probes.clone(),
             with_query_memory_limit(1024 * 1024, async {
-                let context = QueryContext::new().unwrap();
+                let context = QueryContext::new(query_memory_limit()).unwrap();
                 let memory =
                     Arc::new(WorkMemory::new(context.task_ctx(), "producer test").unwrap());
                 let completed = Arc::new(AtomicUsize::new(0));
@@ -259,7 +259,7 @@ mod tests {
         with_query_memory_probes(
             probes.clone(),
             with_query_memory_limit(4 * 1024 * 1024, async {
-                let context = QueryContext::new().unwrap();
+                let context = QueryContext::new(query_memory_limit()).unwrap();
                 let memory =
                     Arc::new(WorkMemory::new(context.task_ctx(), "compact producer").unwrap());
                 let target = memory.batch_bytes();
@@ -300,7 +300,7 @@ mod tests {
         let probes = QueryMemoryProbes::default();
         let pause = probes.pause_blocking_work();
         with_query_memory_probes(probes.clone(), async {
-            let context = QueryContext::new().unwrap();
+            let context = QueryContext::new(query_memory_limit()).unwrap();
             let memory =
                 Arc::new(WorkMemory::new(context.task_ctx(), "producer cancellation").unwrap());
             let stream =
@@ -334,7 +334,7 @@ mod tests {
         for panic in [false, true] {
             let probes = QueryMemoryProbes::default();
             with_query_memory_probes(probes.clone(), async {
-                let context = QueryContext::new().unwrap();
+                let context = QueryContext::new(query_memory_limit()).unwrap();
                 let memory =
                     Arc::new(WorkMemory::new(context.task_ctx(), "producer failure").unwrap());
                 let mut stream =

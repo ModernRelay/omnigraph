@@ -39,7 +39,7 @@ d.slug: String
 
 --- expect plan
 scan Doc as $d: filter reads [d.state]
-scan Doc as $d: columns [__id, slug, state]
+scan Doc as $d: columns [slug, state]
 pass predicate_pushdown
 pass projection_pushdown
 

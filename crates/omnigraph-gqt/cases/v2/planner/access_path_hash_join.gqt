@@ -1,8 +1,8 @@
 # issue: none
 # notes: A dense traversal (4 sources, 8 edges, 6 docs: the frontier estimate
 # notes: saturates at the table) reads the destination table once as the build
-# notes: side of a hash join; the scalar filter and the searches stay inside that
-# notes: one read, two searches conjoined. Rows and multiplicity are the
+# notes: side of a `HashJoin` node; the scalar filter and the searches stay
+# notes: inside that one read, two searches conjoined. Rows and multiplicity are the
 # notes: per-batch id lookup's. The last step is the same two searches on a
 # notes: root scan: the build side is a root scan, so it conjoins them too.
 
@@ -66,7 +66,7 @@ query open_needles() {
 s.slug: String
 d.slug: String
 --- expect plan
-scan Doc as $d: access hash_join
+hash join $d
 scan Doc as $d: filter reads [d.state, d.body]
 pass access_path
 
@@ -93,7 +93,7 @@ query every_link() {
 s.slug: String
 d.slug: String
 --- expect plan
-scan Doc as $d: access hash_join
+hash join $d
 scan Doc as $d: no filter
 pass access_path
 
@@ -118,7 +118,7 @@ query open_needle_beacons() {
 s.slug: String
 d.slug: String
 --- expect plan
-scan Doc as $d: access hash_join
+hash join $d
 scan Doc as $d: filter reads [d.state, d.body, d.summary]
 pass access_path
 

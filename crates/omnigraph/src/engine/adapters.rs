@@ -1,6 +1,6 @@
-//! GQ filters and return expressions as DataFusion `PhysicalExpr`s over the
-//! wide batch. Two adapters are equal when they print the same GQ text and
-//! belong to the same lowering.
+//! GQ return expressions as DataFusion `PhysicalExpr`s over the wide batch.
+//! Two adapters are equal when they print the same GQ text and belong to the
+//! same lowering.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, FieldRef, Schema};
+use arrow_schema::{Field, FieldRef, Schema};
 use datafusion::common::Result as DfResult;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ColumnarValue;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, ParamMap};
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
-use super::expr::{ProjectionContext, evaluate_filter, evaluate_projection, identity_column};
+use super::expr::{ProjectionContext, evaluate_projection, identity_column};
 use super::operators::external;
 use crate::error::{OmniError, Result};
 
@@ -27,79 +27,6 @@ pub(super) struct LoweringId(u64);
 impl LoweringId {
     pub(super) fn next() -> Self {
         Self(NEXT_LOWERING.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-/// A GQ filter as a boolean `PhysicalExpr`.
-pub(super) struct GqFilterExpr {
-    filter: IRFilter,
-    params: Arc<ParamMap>,
-    text: String,
-    lowering: LoweringId,
-}
-
-impl GqFilterExpr {
-    pub(super) fn new(filter: IRFilter, params: Arc<ParamMap>, lowering: LoweringId) -> Self {
-        let text = filter.to_string();
-        Self {
-            filter,
-            params,
-            text,
-            lowering,
-        }
-    }
-}
-
-impl fmt::Debug for GqFilterExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GqFilterExpr({})", self.text)
-    }
-}
-
-impl fmt::Display for GqFilterExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.text)
-    }
-}
-
-impl PartialEq for GqFilterExpr {
-    fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.lowering == other.lowering
-    }
-}
-
-impl Eq for GqFilterExpr {}
-
-impl Hash for GqFilterExpr {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text.hash(state);
-        self.lowering.hash(state);
-    }
-}
-
-impl PhysicalExpr for GqFilterExpr {
-    fn return_field(&self, _input_schema: &Schema) -> DfResult<FieldRef> {
-        Ok(Arc::new(Field::new(&self.text, DataType::Boolean, true)))
-    }
-
-    fn evaluate(&self, batch: &RecordBatch) -> DfResult<ColumnarValue> {
-        let mask = evaluate_filter(batch, &self.filter, &self.params).map_err(external)?;
-        Ok(ColumnarValue::Array(Arc::new(mask)))
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> DfResult<Arc<dyn PhysicalExpr>> {
-        Ok(self)
-    }
-
-    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.text)
     }
 }
 

@@ -102,6 +102,13 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = merge_lineage_schema)]
     pub merge_lineage: Option<MergeLineage>,
+    /// `ann_nprobes`: the partition cap per index delta of a `nearest` scan, `0`
+    /// is no cap. An `i64`, the settings model's integer: a value above its
+    /// range fails to decode, a negative one is refused by the settings
+    /// validation with its own spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = ann_nprobes_schema)]
+    pub ann_nprobes: Option<i64>,
 }
 
 impl SettingsRequest {
@@ -120,6 +127,9 @@ impl SettingsRequest {
                 SettingId::MergeLineage,
                 SettingValue::Ident(merge_lineage.as_str().to_string()),
             ));
+        }
+        if let Some(ann_nprobes) = self.ann_nprobes {
+            assignments.push((SettingId::AnnNprobes, SettingValue::Integer(ann_nprobes)));
         }
         assignments
     }
@@ -149,6 +159,10 @@ fn engine_schema() -> utoipa::openapi::schema::Object {
 
 fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::MergeLineage)
+}
+
+fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::AnnNprobes)
 }
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -1979,12 +1993,13 @@ mod tests {
         let populated = SettingsRequest {
             engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
+            ann_nprobes: Some(7),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\"}}",
-            request_rows[0], request_rows[1]
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7}}",
+            request_rows[0], request_rows[1], request_rows[2]
         );
-        assert_eq!(request_rows.len(), 2);
+        assert_eq!(request_rows.len(), 3);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated
@@ -2011,6 +2026,20 @@ mod tests {
             serde_json::from_str("{\"merge_lineage\": \"verify\"}").unwrap();
         assert_eq!(parsed.merge_lineage, Some(MergeLineage::Verify));
         assert!(serde_json::from_str::<SettingsRequest>("{\"merge_lineage\": \"both\"}").is_err());
+        let parsed: SettingsRequest = serde_json::from_str("{\"ann_nprobes\": 4}").unwrap();
+        assert_eq!(parsed.ann_nprobes, Some(4));
+        assert!(serde_json::from_str::<SettingsRequest>("{\"ann_nprobes\": \"many\"}").is_err());
+        assert!(
+            serde_json::from_str::<SettingsRequest>("{\"ann_nprobes\": 9223372036854775808}")
+                .is_err(),
+            "a cap above the settings model's integer range fails to decode, never saturates"
+        );
+        let negative: SettingsRequest = serde_json::from_str("{\"ann_nprobes\": -1}").unwrap();
+        assert_eq!(
+            negative.assignments(),
+            vec![(SettingId::AnnNprobes, SettingValue::Integer(-1))],
+            "a negative cap reaches the settings validation with its own spelling"
+        );
         assert!(serde_json::from_str::<SettingsRequest>("{\"traversal\": \"csr\"}").is_err());
     }
 

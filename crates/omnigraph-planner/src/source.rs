@@ -5,16 +5,17 @@ use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::IRFilter;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::types::Direction;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::PlanError;
 use crate::operation::TableRef;
+use crate::physical::{DatasetPin, GatePolicy};
 
 /// Which pinned image a scan reads. `Parent` is the before side (`from`),
 /// `Child` the after side (`to`); a three-way merge adds `Base`. A GQ query
 /// plan has one `Binding` side per `match` variable, numbered in pipeline
 /// order; the variable's name rides on the scan (`ScanSpec::binding`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SideId {
     Base,
@@ -52,6 +53,14 @@ pub struct NodeTypeSpec {
     /// the table is absent from the pinned snapshot.
     pub row_count: Option<u64>,
 }
+
+/// The environment variable behind `ExpandStatistics::max_frontier_cap`,
+/// recorded by name in the plan's assumptions.
+pub const EXPAND_INDEXED_MAX_FRONTIER_ENV: &str = "OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER";
+
+/// The environment variable behind `ExpandStatistics::max_hops_cap`,
+/// recorded by name in the plan's assumptions.
+pub const EXPAND_INDEXED_MAX_HOPS_ENV: &str = "OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS";
 
 /// The manifest-resident counts an `Expand` over one edge type in one
 /// direction is costed with. `src_node_count` is the keyed endpoint's node
@@ -147,10 +156,26 @@ pub trait PlanSource {
         None
     }
 
+    /// The pinned dataset of `edge:<edge_type>`, recorded in the plan so a
+    /// replay is refused unless the snapshot holds it; `None` for no such table.
+    fn edge_dataset(&self, edge_type: &str) -> Option<DatasetPin>;
+
     /// The session's harness-only traversal pin: `Indexed` or `Csr` forces
     /// every Expand's mode, `Auto` leaves it to the cost model.
     fn traversal(&self) -> Traversal {
         Traversal::Auto
+    }
+
+    /// The session's `ann_nprobes` setting, the probe cap a `nearest` scan
+    /// carries; `None` is no cap. The plan records the value it read.
+    fn ann_nprobes(&self) -> Option<usize> {
+        None
+    }
+
+    /// How the prefilter gates decide: the `rrf_plan` setting and the
+    /// admission thresholds. The plan carries it in its assumptions.
+    fn gate_policy(&self) -> GatePolicy {
+        GatePolicy::default()
     }
 }
 
@@ -162,7 +187,9 @@ pub struct MemorySource {
     proof: Option<AdjacencyProof>,
     node_types: HashMap<String, NodeTypeSpec>,
     expand_statistics: Vec<(String, Direction, ExpandStatistics)>,
+    edge_datasets: HashMap<String, DatasetPin>,
     traversal: Option<Traversal>,
+    ann_nprobes: Option<usize>,
     table_data_bytes: HashMap<String, u64>,
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
     query_memory_pool_bytes: u64,
@@ -203,8 +230,25 @@ impl MemorySource {
         self
     }
 
+    pub fn with_edge_version(mut self, edge_type: &str, version: u64) -> Self {
+        self.edge_datasets.insert(
+            edge_type.to_string(),
+            DatasetPin {
+                dataset_path: format!("edge:{edge_type}"),
+                native_branch: None,
+                version,
+            },
+        );
+        self
+    }
+
     pub fn with_traversal(mut self, traversal: Traversal) -> Self {
         self.traversal = Some(traversal);
+        self
+    }
+
+    pub fn with_ann_nprobes(mut self, nprobes: Option<usize>) -> Self {
+        self.ann_nprobes = nprobes;
         self
     }
 
@@ -258,8 +302,16 @@ impl PlanSource for MemorySource {
             .map(|(_, _, statistics)| *statistics)
     }
 
+    fn edge_dataset(&self, edge_type: &str) -> Option<DatasetPin> {
+        self.edge_datasets.get(edge_type).cloned()
+    }
+
     fn traversal(&self) -> Traversal {
         self.traversal.unwrap_or(Traversal::Auto)
+    }
+
+    fn ann_nprobes(&self) -> Option<usize> {
+        self.ann_nprobes
     }
 
     fn table_data_bytes(&self, type_key: &str) -> Option<u64> {
