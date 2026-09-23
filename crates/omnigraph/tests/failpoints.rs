@@ -6569,8 +6569,6 @@ async fn full_text_rebuild_first_touch_fork_failure_leaves_no_residue() {
 #[tokio::test]
 #[serial]
 async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
-    use omnigraph::loader::LoadMode;
-
     let Some(uri) = helpers::s3_test_graph_uri("failpoints") else {
         eprintln!(
             "skipping s3_write_pending_pin_is_promoted_by_the_next_write: \
@@ -6580,7 +6578,12 @@ async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
     };
 
     let _scenario = FailScenario::setup();
-    let db = helpers::session(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
+    assert_write_pending_pin_is_promoted_by_the_next_write(&uri).await;
+}
+
+/// The write pending-pin contract at `uri`, shared by the S3 and Azure cells.
+async fn assert_write_pending_pin_is_promoted_by_the_next_write(uri: &str) {
+    let db = helpers::session(Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap());
     {
         let _failpoint = catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.fire_always();
         db.load_jsonl(
@@ -6599,7 +6602,7 @@ async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
     assert_eq!(
         head.version().version + 1,
         person.published_dataset_version,
-        "the Person pin is pending on S3"
+        "the Person pin is pending"
     );
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
 
@@ -6618,7 +6621,7 @@ async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 1);
 
     drop(db);
-    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
 }
 
@@ -6631,8 +6634,6 @@ async fn s3_write_pending_pin_is_promoted_by_the_next_write() {
 #[tokio::test]
 #[serial]
 async fn s3_optimize_pending_pin_is_promoted_by_the_next_write() {
-    use omnigraph::loader::LoadMode;
-
     let Some(uri) = helpers::s3_test_graph_uri("failpoints") else {
         eprintln!(
             "skipping s3_optimize_pending_pin_is_promoted_by_the_next_write: \
@@ -6642,7 +6643,12 @@ async fn s3_optimize_pending_pin_is_promoted_by_the_next_write() {
     };
 
     let _scenario = FailScenario::setup();
-    let db = helpers::session(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
+    assert_optimize_pending_pin_is_promoted_by_the_next_write(&uri).await;
+}
+
+/// The Optimize pending-pin contract at `uri`, shared by the S3 and Azure cells.
+async fn assert_optimize_pending_pin_is_promoted_by_the_next_write(uri: &str) {
+    let db = helpers::session(Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap());
     db.load_jsonl(helpers::TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -6673,7 +6679,7 @@ async fn s3_optimize_pending_pin_is_promoted_by_the_next_write() {
     let (head, published) = person_head_and_published(&db, "main").await;
     assert!(
         head < published,
-        "the Person pin is pending on S3: head {head}, published {published}"
+        "the Person pin is pending: head {head}, published {published}"
     );
     assert_eq!(helpers::count_rows(&db, "node:Person").await, rows);
 
@@ -6683,14 +6689,63 @@ async fn s3_optimize_pending_pin_is_promoted_by_the_next_write() {
         LoadMode::Merge,
     )
     .await
-    .expect("the next write promotes the pending pin and lands on S3");
+    .expect("the next write promotes the pending pin and lands");
     assert_person_pin_promoted(&db, "main").await;
     assert_eq!(helpers::count_rows(&db, "node:Person").await, rows + 1);
 
     drop(db);
-    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
     assert_eq!(helpers::count_rows(&db, "node:Person").await, rows + 1);
     assert_person_pin_promoted(&db, "main").await;
+}
+
+/// A fresh `az://` graph root under the configured Azurite container, `None`
+/// when `OMNIGRAPH_AZURE_TEST_CONTAINER` is unset.
+fn azure_test_graph_uri(name: &str) -> Option<String> {
+    let container = std::env::var("OMNIGRAPH_AZURE_TEST_CONTAINER").ok()?;
+    Some(format!(
+        "az://{container}/engine-failpoints/{name}-{}",
+        ulid::Ulid::new()
+    ))
+}
+
+/// Deletes the graph at `uri` from the shared Azurite container.
+async fn delete_azure_graph(uri: &str) {
+    omnigraph_storage::storage_for_uri(uri)
+        .unwrap()
+        .delete_prefix(uri)
+        .await
+        .unwrap();
+}
+
+/// `s3_write_pending_pin_is_promoted_by_the_next_write` on Azure Blob Storage.
+/// Skips unless `OMNIGRAPH_AZURE_TEST_CONTAINER` is set; CI runs it against
+/// Azurite and deletes the graph prefix from the shared container afterwards.
+#[tokio::test]
+#[serial]
+async fn azure_write_pending_pin_is_promoted_by_the_next_write() {
+    let Some(uri) = azure_test_graph_uri("write-pending-pin") else {
+        eprintln!("skipping Azure write pending pin: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    assert_write_pending_pin_is_promoted_by_the_next_write(&uri).await;
+    delete_azure_graph(&uri).await;
+}
+
+/// `s3_optimize_pending_pin_is_promoted_by_the_next_write` on Azure Blob
+/// Storage. Skips unless `OMNIGRAPH_AZURE_TEST_CONTAINER` is set; CI runs it
+/// against Azurite and deletes the graph prefix from the shared container.
+#[tokio::test]
+#[serial]
+async fn azure_optimize_pending_pin_is_promoted_by_the_next_write() {
+    let Some(uri) = azure_test_graph_uri("optimize-pending-pin") else {
+        eprintln!("skipping Azure optimize pending pin: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    assert_optimize_pending_pin_is_promoted_by_the_next_write(&uri).await;
+    delete_azure_graph(&uri).await;
 }
 
 /// Person HEAD and published version on `branch`, with the linear HEAD read
