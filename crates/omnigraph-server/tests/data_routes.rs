@@ -4077,7 +4077,15 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
         let conflict = error
             .read_set_conflict
             .expect("strict OCC loser must include structured read-set authority");
-        assert_eq!(conflict.member, "graph_head:main");
+        assert!(
+            matches!(
+                conflict.member.as_str(),
+                "graph_head:main" | "published_dataset_version:node:Person"
+            ),
+            "a strict loser is refused by the branch head, or by the table pin when it \
+             revalidates between the winner's detached table commit and its publish; got {}",
+            conflict.member
+        );
         assert_ne!(conflict.actual, conflict.expected);
         assert!(error.published_dataset_version_conflict.is_none());
         assert!(error.recovery_required.is_none());
