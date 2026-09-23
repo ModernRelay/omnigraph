@@ -1,0 +1,48 @@
+# issue: none
+# notes: nearest on the source of a traversal the planner joins: the ranked scan is the source's, the destination is the join's build side, and the score sort above the join tie-breaks on both bindings.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    embedding: Vector(2) @index
+}
+node Doc {
+    slug: String @key
+}
+edge Knows: Person -> Doc
+
+--- seed
+{"type":"Person","data":{"name":"p0","embedding":[0.0,0.0]}}
+{"type":"Person","data":{"name":"p1","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"a"}}
+{"type":"Doc","data":{"slug":"b"}}
+{"edge":"Knows","from":"p0","to":"a"}
+{"edge":"Knows","from":"p0","to":"b"}
+{"edge":"Knows","from":"p1","to":"a"}
+
+--- query
+set engine = v2;
+query nearest_person_docs($q: Vector(2)) {
+    match { $p: Person $p knows $d }
+    return { $p.name, $d.slug }
+    order { nearest($p.embedding, $q) }
+    limit 2
+}
+--- params
+{"q": [0.0, 0.0]}
+--- expect unordered
+{"p.name":"p0","d.slug":"a"}
+{"p.name":"p0","d.slug":"b"}
+--- expect shape
+p.name: String
+d.slug: String
+--- expect plan
+scan Person as $p: ranked nearest fetch 2
+hash join $d
+sort tiebreak [$d, $p]

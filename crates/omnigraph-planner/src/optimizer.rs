@@ -210,7 +210,24 @@ fn resolve_query(
             descending: _,
         } in orderings
         {
-            order_keys(expr, &mut keys);
+            match expr {
+                IRExpr::PropAccess { .. }
+                | IRExpr::AliasRef(_)
+                | IRExpr::Nearest { .. }
+                | IRExpr::Search { .. }
+                | IRExpr::Fuzzy { .. }
+                | IRExpr::MatchText { .. }
+                | IRExpr::Bm25 { .. }
+                | IRExpr::Rrf { .. } => order_keys(expr, &mut keys),
+                IRExpr::Variable(_)
+                | IRExpr::Param(_)
+                | IRExpr::Literal(_)
+                | IRExpr::Aggregate { .. } => {
+                    return Err(PlanError::Unsupported {
+                        detail: "unsupported ordering expression".to_string(),
+                    });
+                }
+            }
         }
         let tiebreak = sort_tiebreak(
             &scope_bindings(plan, current),

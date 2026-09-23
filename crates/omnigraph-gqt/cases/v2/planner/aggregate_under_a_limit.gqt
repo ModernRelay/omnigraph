@@ -1,0 +1,33 @@
+# issue: none
+# notes: A limit above an ordered aggregate keeps the first group with its count.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"ann","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+{"type":"Person","data":{"name":"cyd","age":30}}
+
+--- query
+set engine = v2;
+query youngest_group() {
+    match { $p: Person }
+    return { count($p) as n, $p.age }
+    order { $p.age }
+    limit 1
+}
+--- expect unordered
+{"n":2,"p.age":30}
+--- expect shape
+n: I64
+p.age: I64
