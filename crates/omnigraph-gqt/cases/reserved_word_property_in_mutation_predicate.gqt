@@ -1,0 +1,63 @@
+# issue: none
+# notes: A property named like a SQL prefix keyword (`interval`, `exists`, `trim`)
+# notes: reads fine but cannot be the column of a `delete`/`update … where`
+# notes: predicate: the predicate reaches Lance as unquoted SQL text. The
+# notes: chained mutation sends each keyword to the pending-row scan as well.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Span {
+    name: String @key
+    interval: I32
+    exists: I32
+    trim: I32
+}
+
+--- seed
+{"type":"Span","data":{"name":"a","interval":1,"exists":1,"trim":1}}
+{"type":"Span","data":{"name":"b","interval":2,"exists":2,"trim":2}}
+{"type":"Span","data":{"name":"c","interval":3,"exists":3,"trim":3}}
+
+--- mutate
+query delete_by_interval() {
+    delete Span where interval = 1
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query delete_by_exists() {
+    delete Span where exists = 2
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query chained_updates() {
+    update Span set { exists: 5 } where trim = 3
+    update Span set { trim: 7 } where exists = 5
+    update Span set { interval: 8 } where trim = 7
+    update Span set { exists: 6 } where interval = 8
+}
+
+--- expect affected: nodes=4 edges=0
+
+--- query
+query survivors() {
+    match { $s: Span }
+    return { $s.name, $s.interval, $s.exists, $s.trim }
+}
+
+--- expect unordered
+{"s.name": "c", "s.interval": 8, "s.exists": 6, "s.trim": 7}
+
+--- expect shape
+s.name: String
+s.interval: I32
+s.exists: I32
+s.trim: I32

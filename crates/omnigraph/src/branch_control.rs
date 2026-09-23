@@ -459,8 +459,8 @@ decide_seam! {
     pub static BRANCH_CREATE_POST_NATIVE = ("branch_create.post_native", BranchCreate, [Fail]);
 }
 
-/// Create a fresh table fork once; the caller's persisted intent owns any effects.
-/// Errors retain recovery ownership until classification. Cleanup reclaims garbage.
+/// Create a fresh table fork once. A fork no manifest publication references is
+/// garbage that cleanup reclaims.
 pub(crate) async fn create_unique_table_fork(
     source: &mut Dataset,
     branch: &str,

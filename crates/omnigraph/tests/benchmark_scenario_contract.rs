@@ -49,13 +49,11 @@ fn benchmark_caps_match_production() {
         rfc023_limits::KEYED_WRITE_MAX_BYTES
     );
 
-    let recovery = include_str!("../src/db/manifest/recovery.rs");
+    let merge = include_str!("../src/exec/merge.rs");
     assert_eq!(
-        product_const(recovery, "MAX_BRANCH_MERGE_DATA_TRANSACTIONS"),
+        product_const(merge, "MAX_BRANCH_MERGE_DATA_TRANSACTIONS"),
         rfc023_limits::RECOVERY_MAX_TRANSACTIONS as u64
     );
-
-    let merge = include_str!("../src/exec/merge.rs");
     assert_eq!(
         product_const(merge, "PURE_INSERT_HISTORY_MAX_VERSIONS"),
         rfc023_limits::PURE_INSERT_HISTORY_MAX_VERSIONS as u64

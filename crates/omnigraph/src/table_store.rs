@@ -23,8 +23,11 @@ use datafusion::prelude::Expr;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
+use lance::dataset::optimize::{CompactionMetrics, CompactionOptions, plan_compaction};
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
-use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder, UpdateMode};
+use lance::dataset::transaction::{
+    Operation, RewriteGroup, Transaction, TransactionBuilder, UpdateMode,
+};
 use lance::dataset::write::merge_insert::inserted_rows::{KeyExistenceFilterBuilder, KeyValue};
 use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
@@ -34,8 +37,8 @@ use lance::dataset::{
     WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
+use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
-use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::{
     datatypes::BlobHandling,
     utils::{
@@ -551,12 +554,17 @@ pub enum IndexCoverage {
 /// Stable identity of one Lance transaction.
 ///
 /// Lance persists both fields in the transaction file referenced by the
-/// committed manifest. Recovery uses the pair, rather than a numeric table
-/// version alone, to prove that an observed HEAD was produced by the staged
-/// effect named in a recovery sidecar. The UUID distinguishes two writers that
-/// started from the same version. Lance may preserve both fields while
-/// rebasing, so enrolled callers must also require the achieved table version
-/// to be exactly `read_version + 1`.
+/// committed manifest. The pair, rather than a numeric table version alone,
+/// proves that an observed version was produced by a given staged effect.
+/// The UUID distinguishes two writers that started from the same version.
+/// Lance may preserve both fields while rebasing, so callers of the exact
+/// linear commit must also require the achieved table version to be exactly
+/// `read_version + 1`.
+///
+/// RFC 0067 reads the same pair from the transaction file name the manifest
+/// records (`{read_version}-{uuid}.txn`, pinned in `lance_surface_guards`),
+/// so identifying a pin's promoted twin or following a chain of detached
+/// commits costs no request beyond the manifest itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedTransactionIdentity {
     pub read_version: u64,
@@ -570,6 +578,37 @@ impl From<&Transaction> for StagedTransactionIdentity {
             uuid: transaction.uuid.clone(),
         }
     }
+}
+
+impl StagedTransactionIdentity {
+    /// The identity a manifest records, or `None` when it names no
+    /// transaction file or the name has an unrecognized shape.
+    pub(crate) fn recorded_by(dataset: &Dataset) -> Option<Self> {
+        let name = dataset.manifest().transaction_file.as_deref()?;
+        let (read_version, uuid) = name.strip_suffix(".txn")?.split_once('-')?;
+        Some(Self {
+            read_version: read_version.parse().ok()?,
+            uuid: uuid.to_string(),
+        })
+    }
+
+    /// Whether the transaction was staged on a detached version, which is
+    /// how a chain of detached commits links itself without manifest history.
+    pub(crate) fn base_is_detached(&self) -> bool {
+        TableStore::is_detached_version(self.read_version)
+    }
+}
+
+/// Outcome of replaying a detached transaction at its linear target.
+#[derive(Debug)]
+pub enum PromotionCommit {
+    /// The twin landed at the target with the expected uuid.
+    Landed(Box<Dataset>),
+    /// Lance's conflict pass refused the replay: a racing promoter landed
+    /// first, or a foreign commit occupies the target. The caller rechecks.
+    Refused,
+    /// The replay must not run or did not land where it should.
+    Unsafe(String),
 }
 
 /// A Lance write that has produced fragment files on object storage but is
@@ -596,6 +635,29 @@ impl From<&Transaction> for StagedTransactionIdentity {
 // Sealed storage surface: `new_fragments`/`removed_fragment_ids` record the
 // read-your-writes fragment delta of a staged effect.
 #[allow(dead_code)]
+/// One foldable index whose segments leave fragments uncovered.
+struct IndexLag {
+    name: String,
+    fields: Vec<i32>,
+    vector: bool,
+}
+
+/// A staged index fold: the `CreateIndex` to commit detached, if any index
+/// lagged and could be folded, and the columns whose vector delta could not
+/// be trained.
+#[derive(Default)]
+pub struct StagedIndexFold {
+    pub staged: Option<StagedWrite>,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// A staged compaction: the `Rewrite` to commit detached and the metrics its
+/// tasks reported.
+pub struct StagedCompaction {
+    pub staged: StagedWrite,
+    pub metrics: CompactionMetrics,
+}
+
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
     transaction: Transaction,
@@ -603,7 +665,6 @@ pub struct StagedWrite {
     /// Exact ids carried by a production strict-insert batch. Kept only until
     /// commit so an effect-free substrate conflict can be re-probed against
     /// fresh manifest authority before it is normalized to `KeyConflict`.
-    strict_source_ids: Option<Vec<String>>,
     /// Fragments to surface alongside the committed manifest in
     /// `Scanner::with_fragments(committed - removed + new)`. For
     /// `Operation::Append` these are the freshly-appended fragments. For
@@ -649,7 +710,6 @@ impl StagedWrite {
         Self {
             transaction,
             commit_metadata: StagedCommitMetadata::default(),
-            strict_source_ids: None,
             new_fragments,
             removed_fragment_ids,
         }
@@ -664,7 +724,6 @@ impl StagedWrite {
         Self {
             transaction,
             commit_metadata,
-            strict_source_ids: None,
             new_fragments,
             removed_fragment_ids,
         }
@@ -683,19 +742,9 @@ impl StagedWrite {
         StagedTransactionIdentity::from(&self.transaction)
     }
 
-    fn set_strict_source_ids(&mut self, source_ids: Vec<String>) {
-        self.strict_source_ids = Some(source_ids);
-    }
-
-    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
-        self.strict_source_ids.take()
-    }
-
-    /// Bind a pre-minted recovery identity to a transaction staged after a
+    /// Bind a pre-minted transaction identity to a transaction staged after a
     /// deferred branch fork. The operation and read version still come from
-    /// Lance; only its otherwise-random UUID is replaced so the sidecar can be
-    /// durable before the target ref (and its branch-local fragment paths)
-    /// exist.
+    /// Lance; only its otherwise-random UUID is replaced.
     pub(crate) fn bind_transaction_identity(
         &mut self,
         planned: &StagedTransactionIdentity,
@@ -1044,9 +1093,16 @@ pub struct TableStore {
 
 decide_seam! {
     /// After Lance durably creates a target table ref, before the caller can
-    /// reopen and verify it. An error here is post-effect and must retain the
-    /// recovery sidecar.
+    /// reopen and verify it. An error here leaves an unreferenced fork that
+    /// cleanup reclaims.
     pub static FORK_POST_CREATE_PRE_OPEN = ("fork.post_create_pre_open", AnyWrite, [Fail]);
+}
+
+decide_seam! {
+    /// After a promotion's existence check and before its linear replay
+    /// (RFC 0067). A decision here aligns two promoters on one pin,
+    /// or fails a promotion so the next writer inherits it.
+    pub static PROMOTION_PRE_REPLAY = ("promotion.pre_replay", Unreachable, [Fail]);
 }
 
 decide_seam! {
@@ -1073,7 +1129,7 @@ impl TableStore {
     }
 
     /// Authorize, normalize, deduplicate, and probe every URI before any
-    /// external payload read, recovery arm, target HEAD/ref movement, or
+    /// external payload read, target ref creation, table commit, or
     /// graph-visible effect. Scalar-only preparation may already have produced
     /// temporary in-memory or staged inputs. The graph session supplies the
     /// process-wide shared registry, so one operation does not create cold
@@ -1270,10 +1326,7 @@ impl TableStore {
         // failpoint seam simulates the e_tag-less-store configuration so tests
         // can prove the logical witness alone refuses a branch delete/recreate.
         let etag_witness_unavailable = skip(&CHANGE_FEED_ETAG_WITNESS);
-        if !etag_witness_unavailable
-            && let Some(expected) = entry.version_metadata.e_tag()
-            && dataset.manifest_location().e_tag.as_deref() != Some(expected)
-        {
+        if !etag_witness_unavailable && !entry.version_metadata.witnesses(&dataset) {
             return Err(OmniError::manifest(format!(
                 "change feed table '{}' has no persisted native-branch incarnation \
                  witness at the reopened dataset; the branch was deleted and \
@@ -1384,18 +1437,6 @@ impl TableStore {
         Ok(())
     }
 
-    pub async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        type_key: &str,
-        expected_version: u64,
-    ) -> Result<Dataset> {
-        let ds = self.open_dataset_head(dataset_uri, branch).await?;
-        self.ensure_expected_version(&ds, type_key, expected_version)?;
-        Ok(ds)
-    }
-
     pub async fn fork_branch_from_state(
         &self,
         dataset_uri: &str,
@@ -1419,14 +1460,14 @@ impl TableStore {
         )
         .await?;
 
-        // The ref is now independently durable. Any error from this point is an
-        // ambiguous/post-effect outcome to the caller and must retain an armed
-        // recovery intent rather than being treated as a safe pre-effect retry.
+        // The ref is now independently durable. Any error from this point
+        // leaves a fork no manifest publication references; cleanup reclaims it
+        // and the caller's retry forks under a fresh name.
         fail(&FORK_POST_CREATE_PRE_OPEN)?;
 
         // Re-open through the shared session for normal cache behavior. The
         // returned handle above is used only as proof that the matching branch
-        // dataset was openable during classification.
+        // dataset was openable after creation.
         drop(created);
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
@@ -1481,8 +1522,8 @@ impl TableStore {
 
     /// Explicitly batch-bounded variant used by RFC-023's branch-adopt chain.
     /// Unlike the environment-controlled default scanner size, this ceiling is
-    /// part of the recovery plan: one emitted batch becomes one pre-minted
-    /// strict keyed transaction.
+    /// part of the chunk plan: one emitted batch becomes one strict keyed
+    /// transaction.
     pub async fn scan_stream_for_rewrite_bounded(
         &self,
         ds: &Dataset,
@@ -1537,7 +1578,7 @@ impl TableStore {
             // `LANCE_DEFAULT_BATCH_SIZE` overrides Scanner::batch_size on the
             // pinned Lance revision. Split descriptor batches ourselves so an
             // environment setting cannot make one materialization read across
-            // writer-defined recovery chunks. `try_unfold` is sequential: at
+            // writer-defined transaction chunks. `try_unfold` is sequential: at
             // most one row's blob payload is read before downstream consumes it.
             let materialized = futures::stream::try_unfold(
                 (raw, None::<RecordBatch>, 0_usize, ds, self.clone()),
@@ -2441,49 +2482,186 @@ impl TableStore {
         !is_system_index(index) && index.index_details.is_some() && !Self::is_full_text_index(index)
     }
 
-    /// Coverage candidates for ordinary optimize. Scalar segments use Lance's
-    /// per-name union: collectively complete coverage is a scalar no-op.
-    /// Vectors retain per-segment candidacy because default optimize can
-    /// rebalance a partition even when the segment union covers every fragment.
+    /// Whether a foldable index is a vector index.
+    pub(crate) fn index_is_vector(index: &IndexMetadata) -> bool {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| IndexDetails(details.clone()).is_vector())
+    }
+
+    /// Coverage candidates for ordinary optimize: foldable index names whose
+    /// segments, taken together, leave a fragment uncovered, plus vector
+    /// indexes split into more than one segment (each segment costs a nearest
+    /// scan its own probe set). RFC 0067 folds a lagging index by rebuilding
+    /// it whole (`stage_index_fold`), which leaves one segment either way.
     pub(crate) async fn has_foldable_unindexed_fragments(ds: &Dataset) -> Result<bool> {
-        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-        let mut names = std::collections::BTreeSet::new();
-        for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
-            if index
-                .index_details
-                .as_ref()
-                .is_some_and(|details| IndexDetails(details.clone()).is_vector())
-            {
-                if index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                    ds.fragments()
-                        .iter()
-                        .any(|fragment| !bitmap.contains(fragment.id as u32))
-                }) {
-                    return Ok(true);
-                }
-            } else {
-                names.insert(index.name.as_str());
+        Ok(!Self::foldable_index_lag(ds).await?.is_empty())
+    }
+
+    /// The partition count Lance reports for a vector index, or one when the
+    /// statistics do not name it.
+    async fn vector_partition_count(ds: &Dataset, name: &str) -> usize {
+        fn first_num_partitions(value: &serde_json::Value) -> Option<usize> {
+            match value {
+                serde_json::Value::Object(map) => map
+                    .get("num_partitions")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .or_else(|| map.values().find_map(first_num_partitions)),
+                serde_json::Value::Array(items) => items.iter().find_map(first_num_partitions),
+                _ => None,
             }
         }
-        for name in names {
+        ds.index_statistics(name)
+            .await
+            .ok()
+            .and_then(|stats| serde_json::from_str::<serde_json::Value>(&stats).ok())
+            .and_then(|stats| first_num_partitions(&stats))
+            .filter(|partitions| *partitions >= 1)
+            .unwrap_or(1)
+    }
+
+    async fn foldable_index_lag(ds: &Dataset) -> Result<Vec<IndexLag>> {
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+        let mut by_name = std::collections::BTreeMap::<String, Vec<&IndexMetadata>>::new();
+        for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
+            by_name.entry(index.name.clone()).or_default().push(index);
+        }
+        let mut lag = Vec::new();
+        for (name, segments) in by_name {
             // As on the public coverage surface, unknown coverage is not
             // evidence of work. Such legacy inventory needs explicit handling.
-            if indices
+            if segments
                 .iter()
-                .any(|index| index.name == name && index.fragment_bitmap.is_none())
+                .any(|segment| segment.fragment_bitmap.is_none())
             {
                 continue;
             }
-            if !ds
-                .unindexed_fragments(name)
-                .await
-                .map_err(OmniError::storage)?
-                .is_empty()
-            {
-                return Ok(true);
+            let mut covered = std::collections::HashSet::<u32>::new();
+            for segment in &segments {
+                if let Some(bitmap) = segment.fragment_bitmap.as_ref() {
+                    covered.extend(bitmap.iter());
+                }
             }
+            let vector = Self::index_is_vector(segments[0]);
+            let complete = ds
+                .fragments()
+                .iter()
+                .all(|fragment| covered.contains(&(fragment.id as u32)));
+            // A scalar index whose segments together cover every fragment
+            // is current. A vector index split into segments (Lance's own
+            // fold left deltas, or a partial rebuild) is collapsed into one.
+            if complete && !(vector && segments.len() > 1) {
+                continue;
+            }
+            lag.push(IndexLag {
+                name,
+                fields: segments[0].fields.clone(),
+                vector,
+            });
         }
-        Ok(false)
+        Ok(lag)
+    }
+
+    /// RFC 0067: stage one `CreateIndex` that folds every lagging foldable
+    /// index, ready to commit detached. Lance's own fold (`optimize_indices`)
+    /// merges the delta and previous segments through a crate-private path
+    /// and commits linearly; this rebuilds each lagging index whole under its
+    /// name with the public builder, which leaves the same single segment
+    /// Lance's merge would. A vector index the builder cannot train (a column
+    /// with no non-null rows) is skipped and reported by column.
+    pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
+        let lag = Self::foldable_index_lag(ds).await?;
+        if lag.is_empty() {
+            return Ok(StagedIndexFold::default());
+        }
+        let existing = ds.load_indices().await.map_err(OmniError::storage)?;
+        let read_version = ds.manifest.version;
+        let mut new_indices = Vec::new();
+        let mut removed_indices = Vec::new();
+        let mut skipped = Vec::new();
+        for item in lag {
+            let Some(column) = item
+                .fields
+                .first()
+                .and_then(|id| ds.schema().field_by_id(*id))
+                .map(|field| field.name.clone())
+            else {
+                continue;
+            };
+            let mut ds_clone = ds.clone();
+            let columns = [column.as_str()];
+            let built = if item.vector {
+                // Keep the index's partition count: the engine builds one
+                // partition, but a partitioned index (Lance's split, or an
+                // explicit build) keeps its shape across folds.
+                let partitions = Self::vector_partition_count(ds, &item.name).await;
+                let params =
+                    lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+                ds_clone
+                    .create_index_builder(&columns, IndexType::Vector, &params)
+                    .name(item.name.clone())
+                    .replace(true)
+                    .execute_uncommitted()
+                    .await
+            } else {
+                let params = ScalarIndexParams::default();
+                ds_clone
+                    .create_index_builder(&columns, IndexType::BTree, &params)
+                    .name(item.name.clone())
+                    .replace(true)
+                    .execute_uncommitted()
+                    .await
+            };
+            let new_idx = match built {
+                Ok(index) => index,
+                Err(error) if item.vector => {
+                    tracing::warn!(
+                        index = item.name.as_str(),
+                        column = column.as_str(),
+                        error = %error,
+                        "vector index fold skipped: the column cannot train an index"
+                    );
+                    skipped.push((column, error.to_string()));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(OmniError::storage_context(
+                        format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
+                        error,
+                    ));
+                }
+            };
+            if new_idx.dataset_version != read_version {
+                return Err(OmniError::manifest_internal(format!(
+                    "folded index '{}' was built from dataset version {}, expected {}",
+                    new_idx.name, new_idx.dataset_version, read_version
+                )));
+            }
+            removed_indices.extend(
+                existing
+                    .iter()
+                    .filter(|index| index.name == item.name)
+                    .cloned(),
+            );
+            if item.vector {
+                crate::instrumentation::record_stage_vector_index();
+            }
+            new_indices.push(new_idx);
+        }
+        let staged = (!new_indices.is_empty()).then(|| {
+            let transaction = TransactionBuilder::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+            )
+            .build();
+            StagedWrite::new(transaction, Vec::new(), Vec::new())
+        });
+        Ok(StagedIndexFold { staged, skipped })
     }
 
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
@@ -2505,40 +2683,6 @@ impl TableStore {
             row_count: self.count_rows(ds, None).await? as u64,
             version_metadata: self.dataset_version_metadata(dataset_uri, ds)?,
         })
-    }
-
-    /// Legacy inline-commit append: writes fragments AND commits in one
-    /// call, advancing Lance HEAD as a side effect. Not on the
-    /// `TableStorage` trait surface — the staged primitive
-    /// `stage_append` + `commit_staged` is the engine write path. This
-    /// inherent method survives only for in-source recovery test setup,
-    /// so it is `#[cfg(test)]`-gated: engine code physically cannot call
-    /// it (which enforces "no new call sites" by construction and
-    /// silences the dead-code warning the non-test lib build would
-    /// otherwise emit).
-    #[cfg(test)]
-    pub(crate) async fn append_batch(
-        &self,
-        dataset_uri: &str,
-        ds: &mut Dataset,
-        batch: RecordBatch,
-    ) -> Result<TableState> {
-        if batch.num_rows() == 0 {
-            return self.table_state(dataset_uri, ds).await;
-        }
-        let schema = batch.schema();
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let params = WriteParams {
-            mode: WriteMode::Append,
-            allow_external_blob_outside_bases: true,
-            auto_cleanup: None,
-            skip_auto_cleanup: true,
-            ..Default::default()
-        };
-        ds.append(reader, Some(params))
-            .await
-            .map_err(OmniError::storage)?;
-        self.table_state(dataset_uri, ds).await
     }
 
     pub async fn append_or_create_batch(
@@ -2586,7 +2730,7 @@ impl TableStore {
 
     /// Stage a delete without advancing Lance HEAD — the two-phase analogue of
     /// `stage_merge_insert`. `DeleteBuilder::execute_uncommitted` writes the
-    /// per-fragment deletion files to object storage (Phase A) and returns an
+    /// per-fragment deletion files to object storage and returns an
     /// uncommitted `Operation::Delete` transaction; HEAD does NOT advance until
     /// `commit_staged`. A 0-row delete is a TRUE no-op: `None` (no transaction,
     /// no fragments, no version). For a non-empty delete the returned
@@ -3107,20 +3251,18 @@ impl TableStore {
         }
 
         crate::instrumentation::record_stage_fenced_insert(source_ids.len() as u64);
-        let mut staged = StagedWrite::with_commit_metadata(
+        Ok(StagedWrite::with_commit_metadata(
             transaction,
             StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
             visible_fragments,
             Vec::new(),
-        );
-        staged.set_strict_source_ids(source_ids);
-        Ok(staged)
+        ))
     }
 
     /// Resolve any URI-bearing logical blobs into a bounded in-memory keyed
     /// source batch without writing Lance files or advancing HEAD.
     ///
-    /// Deferred first-touch writes invoke this before arming recovery because
+    /// Deferred first-touch writes invoke this before their fork because
     /// their actual `MergeInsertBuilder` stage must wait until the target ref
     /// exists. Existing-table writes reach the same helper from
     /// [`Self::stage_keyed_write`].
@@ -3206,7 +3348,7 @@ impl TableStore {
     /// Validate one physical v6 graph-table batch without staging files or
     /// touching any Lance/manifest authority. This is deliberately separate
     /// from [`Self::stage_keyed_write`]: Overwrite and deferred first-touch
-    /// plans must fail before recovery arm / native-ref creation too.
+    /// plans must fail before native-ref creation too.
     pub fn validate_keyed_write_batch(
         &self,
         type_key: &str,
@@ -3484,7 +3626,7 @@ impl TableStore {
         // matched row. The one-row materialization shape is intentionally
         // conservative for blobs: it bounds payload allocation; the stream
         // normalizer below then coalesces those rows into ordinary bounded
-        // recovery-transaction chunks.
+        // transaction chunks.
         let raw = Self::scan_proven_insert_blob_row_ids(
             source,
             begin_version,
@@ -3811,7 +3953,8 @@ impl TableStore {
             .map(|(dataset, _)| dataset)
     }
 
-    /// Commit an RFC-022-enrolled staged effect with no commit-conflict retry.
+    /// Commit a staged effect on the linear history with no commit-conflict
+    /// retry.
     ///
     /// `CommitBuilder::with_max_retries(0)` gives Lance one commit attempt. It
     /// can still perform its initial conflict-resolution pass before that
@@ -3820,8 +3963,8 @@ impl TableStore {
     /// [`StagedWrite::transaction_identity`] AND require the returned dataset
     /// version to equal `read_version + 1`: Lance's preflight rebase can
     /// preserve the transaction fields while committing at a later version.
-    /// Either mismatch is a post-effect recovery case, not permission to widen
-    /// the prepared plan.
+    /// Either mismatch is a durable post-effect outcome, not permission to
+    /// widen the prepared plan.
     pub async fn commit_staged_exact(
         &self,
         ds: Arc<Dataset>,
@@ -3836,6 +3979,125 @@ impl TableStore {
             )
         })?;
         Ok((dataset, committed_identity))
+    }
+
+    /// RFC 0067: commit a staged effect as a Lance detached
+    /// version of its base. No conflict pass runs, nothing at HEAD moves, and
+    /// the result is invisible until a manifest pin references it.
+    pub async fn commit_staged_detached(
+        &self,
+        ds: Arc<Dataset>,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        let mut builder = CommitBuilder::new(ds)
+            .with_skip_auto_cleanup(true)
+            .with_detached(true);
+        if let Some(affected_rows) = staged.commit_metadata.affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+        let dataset = builder
+            .execute(staged.transaction)
+            .await
+            .map_err(OmniError::storage)?;
+        let identity = self.transaction_identity(&dataset)?;
+        Ok((dataset, identity))
+    }
+
+    /// Whether a Lance version id names a detached version (RFC 0067).
+    pub(crate) fn is_detached_version(version: u64) -> bool {
+        version & lance_table::format::DETACHED_VERSION_MASK != 0
+    }
+
+    /// The identity of the transaction a version records (RFC 0067), read
+    /// from the manifest alone.
+    pub fn transaction_identity(&self, ds: &Dataset) -> Result<StagedTransactionIdentity> {
+        StagedTransactionIdentity::recorded_by(ds).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "version {} of {} records no transaction file",
+                ds.version().version,
+                ds.uri()
+            ))
+        })
+    }
+
+    /// Replay the transaction recorded in `staged` linearly on `base`, so the
+    /// linear history gains an identical twin at `target` (RFC 0067). The
+    /// replay runs with zero retries; a twin that a racing promoter already
+    /// landed is refused by Lance's conflict pass for every kind the engine
+    /// stages detached (the self-conflict rule pinned in
+    /// `lance_surface_guards`) and reported as `Refused` for the caller to
+    /// recheck. A bare `Append` never replays: it would rebase over its twin
+    /// and duplicate rows.
+    pub async fn promote_detached(
+        &self,
+        base: Arc<Dataset>,
+        staged: &Dataset,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionCommit> {
+        let mut transaction = match staged
+            .read_transaction()
+            .await
+            .map_err(OmniError::storage)?
+        {
+            Some(transaction) if transaction.uuid == expected_uuid => transaction,
+            _ => {
+                return Ok(PromotionCommit::Unsafe(
+                    "staged version carries no matching transaction".to_string(),
+                ));
+            }
+        };
+        // Refuse the operation kinds whose replay would rebase over an
+        // existing twin (landing a stray duplicate commit) instead of
+        // conflicting with it, plus the kinds that must never be replayed onto
+        // linear history at all. The engine stages none of these detached
+        // (merge-insert/keyed writes are `Update`, deletes `Delete`, index
+        // builds `CreateIndex`, compaction `Rewrite`, first-touch `Overwrite`,
+        // renames `Project` — every one self-conflicts with its twin). Rejecting
+        // them BEFORE the commit executes keeps a corrupt or hand-crafted pin
+        // from landing a stray effect that the post-commit landed==target
+        // backstop would only catch after the fact.
+        if let Some(kind) = match transaction.operation {
+            Operation::Append { .. } => Some("Append"),
+            Operation::ReserveFragments { .. } => Some("ReserveFragments"),
+            Operation::UpdateConfig { .. } => Some("UpdateConfig"),
+            Operation::Restore { .. } => Some("Restore"),
+            Operation::Clone { .. } => Some("Clone"),
+            _ => None,
+        } {
+            return Ok(PromotionCommit::Unsafe(format!(
+                "operation {kind} is not replay-safe; the engine never stages one detached"
+            )));
+        }
+        if base.version().version + 1 != target {
+            return Ok(PromotionCommit::Unsafe(format!(
+                "base {} is not the predecessor of target {target}",
+                base.version().version
+            )));
+        }
+        transaction.read_version = target - 1;
+        fail(&PROMOTION_PRE_REPLAY)?;
+        match CommitBuilder::new(base)
+            .with_max_retries(0)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+        {
+            Ok(dataset) => {
+                let landed = dataset.version().version;
+                let uuid_matches = StagedTransactionIdentity::recorded_by(&dataset)
+                    .is_some_and(|identity| identity.uuid == expected_uuid);
+                if landed == target && uuid_matches {
+                    Ok(PromotionCommit::Landed(Box::new(dataset)))
+                } else {
+                    Ok(PromotionCommit::Unsafe(format!(
+                        "replay landed at {landed} for target {target} (uuid match {uuid_matches})"
+                    )))
+                }
+            }
+            Err(lance::Error::RetryableCommitConflict { .. }) => Ok(PromotionCommit::Refused),
+            Err(error) => Err(OmniError::storage(error)),
+        }
     }
 
     /// Commit a staged first-touch dataset creation with no conflict retry.
@@ -3941,13 +4203,73 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
+    /// RFC 0067: plan and execute Lance compaction against a pinned base and
+    /// stage the result as one `Rewrite` transaction. The new fragments take
+    /// ids above the base's high-water mark, so the commit needs no
+    /// `ReserveFragments` (whose replay would not conflict with its twin). A
+    /// stable-row-id rewrite carries every index's coverage over to the new
+    /// fragments when Lance applies it. `None` when the plan has no task.
+    pub async fn stage_compaction(
+        &self,
+        ds: &Dataset,
+        options: &CompactionOptions,
+    ) -> Result<Option<StagedCompaction>> {
+        let plan = plan_compaction(ds, options)
+            .await
+            .map_err(OmniError::storage)?;
+        if plan.num_tasks() == 0 {
+            return Ok(None);
+        }
+        let mut results = Vec::with_capacity(plan.num_tasks());
+        for task in plan.compaction_tasks() {
+            results.push(task.execute(ds).await.map_err(OmniError::storage)?);
+        }
+        if results.iter().any(|result| result.row_addrs.is_some()) {
+            return Err(OmniError::manifest_internal(format!(
+                "compaction of {} produced an address-style rewrite; graph tables use stable row ids",
+                ds.uri()
+            )));
+        }
+        let mut next_id = ds.manifest().max_fragment_id().map_or(0, |id| id + 1);
+        let mut metrics = CompactionMetrics::default();
+        let mut groups = Vec::with_capacity(results.len());
+        let mut new_fragments = Vec::new();
+        let mut removed_fragment_ids = Vec::new();
+        for result in results {
+            metrics += result.metrics;
+            let mut fresh = result.new_fragments;
+            for fragment in &mut fresh {
+                fragment.id = next_id;
+                next_id += 1;
+            }
+            removed_fragment_ids.extend(result.original_fragments.iter().map(|f| f.id));
+            new_fragments.extend(fresh.iter().cloned());
+            groups.push(RewriteGroup {
+                old_fragments: result.original_fragments,
+                new_fragments: fresh,
+            });
+        }
+        let transaction = Transaction::new(
+            ds.version().version,
+            Operation::Rewrite {
+                groups,
+                rewritten_indices: Vec::new(),
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        Ok(Some(StagedCompaction {
+            staged: StagedWrite::new(transaction, new_fragments, removed_fragment_ids),
+            metrics,
+        }))
+    }
+
     /// Stage creation of a new dataset without publishing its first manifest.
     ///
     /// Lance models creation as an `Operation::Overwrite` transaction based on
     /// version 0. Data files may be written by this call, but the dataset is not
     /// readable until [`Self::commit_staged_create_exact`] atomically creates
-    /// version 1. The transaction UUID can therefore be bound to a recovery
-    /// identity before that first visible effect.
+    /// version 1.
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
@@ -3986,7 +4308,7 @@ impl TableStore {
     /// The dataset schema with `renames` applied in place: each source field
     /// keeps its id, nullability, metadata (the unenforced primary key marker
     /// included) and indexes; only its name changes. Shared by the staged
-    /// rename primitive and the writer's pre-arm dry run so both build one shape.
+    /// rename primitive and the writer's preflight dry run so both build one shape.
     pub(crate) fn renamed_schema(
         ds: &Dataset,
         renames: &[(String, String)],
@@ -5138,15 +5460,7 @@ async fn scan_pending_batches(
     filter: Option<&str>,
 ) -> Result<Vec<RecordBatch>> {
     let schema = pending_schema.unwrap_or_else(|| pending_batches[0].schema());
-    // #283: disable SQL identifier normalization so an unquoted camelCase
-    // column in `filter` (e.g. `repoName = 'acme'`, emitted unquoted by
-    // `predicate_to_sql` because the committed Lance scan needs it unquoted)
-    // is matched case-preserving against the case-sensitive MemTable schema.
-    // Without this, DataFusion lowercases `repoName` → `reponame` and fails to
-    // resolve. Quoted identifiers (the projection list below) are unaffected.
-    let mut config = datafusion::execution::context::SessionConfig::new();
-    config.options_mut().sql_parser.enable_ident_normalization = false;
-    let ctx = datafusion::execution::context::SessionContext::new_with_config(config);
+    let ctx = datafusion::execution::context::SessionContext::new();
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![pending_batches.to_vec()])
         .map_err(OmniError::datafusion_internal)?;
     ctx.register_table("pending", Arc::new(mem))
@@ -5874,7 +6188,7 @@ fn transaction_exact_id_filter<'a>(
 /// can be overridden by process configuration, and blob materialization emits
 /// one safe row at a time. This layer therefore splits oversized emissions,
 /// compacts retained-parent slices, and coalesces small emissions before the
-/// recovery planner observes any boundary.
+/// chunk planner observes any boundary.
 fn bounded_proven_insert_stream(
     schema: SchemaRef,
     raw: SendableRecordBatchStream,

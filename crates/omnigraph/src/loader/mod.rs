@@ -258,8 +258,8 @@ impl Session {
     /// unknown or physical fields, noncanonical supplied ids, and compatibility
     /// coercions. Omitted ids retain ordinary loader semantics: node `@key`
     /// values derive canonical ids and other entities receive generated ids. The
-    /// operation otherwise uses the same transaction, validation, recovery,
-    /// and graph-level publication path as the ordinary loader.
+    /// operation otherwise uses the same transaction, validation, and
+    /// graph-level publication path as the ordinary loader.
     pub async fn load_graph_batch_as(
         &self,
         branch: &str,
@@ -356,16 +356,9 @@ impl Omnigraph {
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
     ) -> Result<LoadReceipt> {
-        // Stage A precedes both an implicit target-branch fork and data staging.
-        // The target branch and an explicit base are read/write authority for the
-        // operation, so an unresolved intent on either closes the barrier. The
-        // helper folds `Some("main")` to main's canonical `None` identity.
-        let mut recovery_branches = vec![requested.as_deref()];
-        if base_branch.is_some() {
-            recovery_branches.push(base_branch.as_deref());
-        }
-        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
-            .await?;
+        // The pending schema-contract install precedes both an implicit
+        // target-branch fork and data staging.
+        self.settle_pending_schema_install().await?;
 
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
@@ -794,6 +787,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.full_path,
             opened.table_branch,
             opened.pinned_native_ref,
+            opened.entry,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
@@ -847,6 +841,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.full_path,
             opened.table_branch,
             opened.pinned_native_ref,
+            opened.entry,
             opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
@@ -902,29 +897,19 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
     // `_queue_guards` holds the root-shared schema → branch → sorted-table
     // gates across manifest publication. This closes same-process
-    // interleaving across the v3 sidecar/effect lifetime. The exact publisher
-    // token and durable sidecar remain persistent correctness authorities, but
-    // these local gates do not expand the documented single-writer-process
-    // recovery boundary.
+    // interleaving across the effect lifetime. The exact publisher token
+    // remains the persistent correctness authority; these local gates do not
+    // expand the documented single-writer-process boundary.
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
-        sidecar_handle,
+        promotions,
         guards: _queue_guards,
-    } = staged
-        .commit_all(
-            db,
-            branch,
-            crate::db::manifest::SidecarKind::Load,
-            actor_id,
-            &txn,
-            &lineage_intent,
-        )
-        .await?;
-    // Same confirmed-effects → publisher boundary as mutations: table HEADs
-    // have advanced and the v3 sidecar contains their exact transaction
-    // identities, but the graph manifest has not published the result. Reuse
-    // the mutation failpoint name so one failpoint pins the shared boundary.
+    } = staged.commit_all(db, branch, &txn, &lineage_intent).await?;
+    // Same detached-effects → publisher boundary as mutations: every table
+    // effect is committed detached, but the graph manifest has not published
+    // the result. Reuse the mutation failpoint name so one failpoint pins the
+    // shared boundary.
     fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
     let publish_result = db
         .commit_updates_on_branch_with_expected(
@@ -936,35 +921,18 @@ async fn load_jsonl_reader_once<R: BufRead>(
             lineage_intent,
         )
         .await;
-    let commit = match publish_result {
-        Ok(commit) => commit,
-        Err(err) => {
-            // Empty loads can still publish lineage but have no table effect and
-            // therefore no recovery sidecar. Preserve that publish error instead
-            // of manufacturing an "unknown" recovery operation.
-            return match sidecar_handle.as_ref() {
-                Some(handle) => Err(OmniError::recovery_required(
-                    handle.operation_id.clone(),
-                    err.to_string(),
-                )),
-                None => Err(err),
-            };
-        }
-    };
-    // The v3 recovery sidecar protects every independently durable table effect
-    // through the one manifest visibility point. Phase C succeeded — clean up
-    // best-effort: failing the user here would error out a write that already
-    // landed durably; a leftover fixed outcome is idempotently finalized later.
-    if let Some(handle) = sidecar_handle {
-        if let Err(err) =
-            crate::db::manifest::delete_sidecar_after_publish(&handle, db.storage_adapter()).await
-        {
-            tracing::warn!(
-                error = %err,
-                operation_id = handle.operation_id.as_str(),
-                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-            );
-        }
+    // RFC 0067: every effect is a detached commit of its pinned base, so a
+    // publish failure leaves the graph unchanged and the error is returned as
+    // is. Promotion then lands each pin's linear twin from the held handles;
+    // the load is durable already, so a failure there is logged and left for
+    // the next writer.
+    let commit = publish_result?;
+    match fail(&catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION) {
+        Ok(()) => db.promote_held_all(promotions).await,
+        Err(error) => tracing::warn!(
+            error = %error,
+            "promotion skipped after publication; the next writer promotes"
+        ),
     }
 
     Ok(LoadReceipt { result, commit })

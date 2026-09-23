@@ -41,16 +41,17 @@ issue and implementation PR are usually enough.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-### Numbered RFCs 0001 to 0066
+### Numbered RFCs 0001 to 0068
 
-RFCs 0001 to 0066 use `NNNN-kebab-title.md`, the heading
+RFCs 0001 to 0068 use `NNNN-kebab-title.md`, the heading
 `# RFC NNNN: Title`, and the reference label `RFC NNNN`. That namespace is
-closed at 0066: no new number is allocated, and `scripts/check-docs.py`
+closed at 0068: no new number is allocated, and `scripts/check-docs.py`
 rejects any numbered filename outside the allocated and reserved numbers it
 lists. Numbers reserved by PRs that were open
 when the namespace closed (0047 and 0048 by PR #606; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0059 by PR #675;
-0060 by PR #677) may still land under their reserved numbers. Every other gap
+0060 by PR #677; 0067 and 0068 by PR #725) may still land under their
+reserved numbers. Every other gap
 is historical and is never reused or backfilled.
 
 The numbered scheme allocated an identifier only at merge, so every draft
@@ -211,6 +212,8 @@ then dated RFCs by date.
 | [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | accepted | in-progress |
 | [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |
 | [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |
+| [0067](0067-detached-table-commits.md) | Detached table commits | maintainer | accepted | complete |
+| [0068](0068-graph-commit-record.md) | Graph commit record | maintainer | draft | not-started |
 | [2026-09-09](2026-09-09-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | accepted | complete |
 | [2026-09-14](2026-09-14-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
 | [2026-09-16](2026-09-16-session-settings.md) | Session settings | maintainer | draft | in-progress |

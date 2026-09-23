@@ -38,8 +38,7 @@
 //! `schema_apply` onto the staged surface). Phase 1b (call-site
 //! conversion) and Phase 9 landed in MR-854, which made `db.storage()`
 //! staged-only. The exact EnsureIndices adapter later retired the final
-//! inline-commit residual. Phase 7 (recovery reconciler) shipped as MR-847;
-//! Phase 8 (index reconciler) is tracked as MR-848.
+//! inline-commit residual. Phase 8 (index reconciler) is tracked as MR-848.
 
 pub(crate) mod lance_clone;
 
@@ -220,6 +219,15 @@ impl ProvenInsertChunk {
 
 // ─── opaque handles ────────────────────────────────────────────────────────
 
+/// Outcome of replaying a detached transaction at its linear target, in the
+/// storage boundary's own terms (RFC 0067).
+#[derive(Debug)]
+pub enum PromotionOutcome {
+    Landed(SnapshotHandle),
+    Refused,
+    Unsafe(String),
+}
+
 /// Opaque handle to a snapshot of a single sub-table dataset at a
 /// specific version.
 ///
@@ -318,14 +326,7 @@ impl StagedHandle {
         self.inner.transaction_identity()
     }
 
-    /// Remove the exact strict-insert ids before the staged transaction is
-    /// consumed by commit. They are retained only for the fresh-authority
-    /// conflict re-probe; Lance's commit packet does not consume them.
-    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
-        self.inner.take_strict_source_ids()
-    }
-
-    /// Replace Lance's random transaction UUID with the identity durably armed
+    /// Replace Lance's random transaction UUID with the identity minted
     /// before a deferred first-touch fork. The read version must still match.
     pub(crate) fn bind_transaction_identity(
         &mut self,
@@ -335,11 +336,11 @@ impl StagedHandle {
     }
 }
 
-/// Result of the no-conflict-retry commit path used by RFC-022-enrolled
-/// writers. `is_exact` checks both transaction identity and achieved version:
-/// Lance's initial conflict-resolution pass can preserve `(read_version, uuid)`
-/// while committing at a later version. The table effect is durable when that
-/// happens, so the caller must leave its recovery sidecar armed.
+/// Result of the no-conflict-retry linear commit path. `is_exact` checks both
+/// transaction identity and achieved version: Lance's initial
+/// conflict-resolution pass can preserve `(read_version, uuid)` while
+/// committing at a later version. The table effect is durable when that
+/// happens, so the caller must not treat the outcome as effect-free.
 #[derive(Debug)]
 pub struct ExactCommitOutcome {
     snapshot: SnapshotHandle,
@@ -351,18 +352,6 @@ impl ExactCommitOutcome {
     pub fn is_exact(&self) -> bool {
         self.planned_transaction == self.committed_transaction
             && self.snapshot.version() == self.planned_transaction.read_version + 1
-    }
-
-    pub fn planned_transaction(&self) -> &StagedTransactionIdentity {
-        &self.planned_transaction
-    }
-
-    pub fn committed_transaction(&self) -> &StagedTransactionIdentity {
-        &self.committed_transaction
-    }
-
-    pub fn committed_version(&self) -> u64 {
-        self.snapshot.version()
     }
 
     pub fn into_snapshot(self) -> SnapshotHandle {
@@ -414,9 +403,9 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
 
-    /// Native identity of the branch backing an already-open snapshot. Used
-    /// by recovery-enrolled first-touch effects to confirm the exact ref they
-    /// created, closing delete/recreate ABA during later recovery.
+    /// Native identity of the branch backing an already-open snapshot. Branch
+    /// merge uses it to bind a proven source interval and its target to the
+    /// exact native ref incarnation, closing delete/recreate ABA.
     async fn branch_identifier(
         &self,
         snapshot: &SnapshotHandle,
@@ -445,14 +434,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// branch set to find orphaned per-table forks. `main`/default is not a
     /// named branch and never appears here.
     async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>>;
-
-    async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        table_key: &str,
-        expected_version: u64,
-    ) -> Result<SnapshotHandle>;
 
     fn ensure_expected_version(
         &self,
@@ -553,6 +534,23 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// [`Self::commit_staged_create_exact`] succeeds.
     async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
 
+    /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
+    /// base, or `None` when there is nothing to compact.
+    async fn stage_compaction(
+        &self,
+        snapshot: &SnapshotHandle,
+        options: &lance::dataset::optimize::CompactionOptions,
+    ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
+
+    /// RFC 0067: stage one detached-ready fold of every foldable index whose
+    /// coverage lags the fragments, each rebuilt whole under its name; `None`
+    /// when every index is current. The second value names the vector
+    /// columns whose index could not be trained.
+    async fn stage_index_fold(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
+
     /// Atomically create version 1 from a staged read-version-0 transaction.
     /// Lance conflict retries are disabled so a concurrently-created dataset
     /// is rejected rather than overwritten.
@@ -566,7 +564,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Resolve bounded keyed-source inputs that require pre-stage I/O (today,
     /// absolute blob URIs) without writing Lance files or advancing HEAD.
-    /// Deferred first-touch writers call this before recovery arm because the
+    /// Deferred first-touch writers call this before their fork because the
     /// target ref needed by `stage_keyed_write` does not exist yet.
     async fn prepare_keyed_write_batch(
         &self,
@@ -602,7 +600,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// Validate the physical key contract shared by every v6 graph-table
     /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
     /// batch. Callers preparing a deferred first-touch or Overwrite plan must
-    /// invoke this before recovery is armed or a native branch ref is created.
+    /// invoke this before a native branch ref is created.
     fn validate_keyed_write_batch(
         &self,
         table_key: &str,
@@ -675,8 +673,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<StagedHandle>;
 
     /// Blob-aware full-row stream with an explicit batch ceiling. Branch
-    /// adoption uses this to turn a large all-new delta into an exact recovery
-    /// chain of bounded fenced writes instead of one delta-wide hash join.
+    /// adoption uses this to turn a large all-new delta into an exact chain of
+    /// bounded fenced writes instead of one delta-wide hash join.
     async fn scan_stream_for_rewrite_bounded(
         &self,
         source: &SnapshotHandle,
@@ -718,13 +716,39 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<SnapshotHandle>;
 
     /// Commit one staged effect with Lance conflict retries disabled and expose
-    /// the transaction identity that actually landed. Legacy callers retain
-    /// `commit_staged`; RFC-022 adapters opt into this method explicitly.
+    /// the transaction identity that actually landed. Other linear callers
+    /// retain `commit_staged`.
     async fn commit_staged_exact(
         &self,
         snapshot: SnapshotHandle,
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
+
+    /// RFC 0067: commit one staged effect as a detached version.
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )>;
+
+    /// RFC 0067: the identity of the transaction a version records.
+    fn transaction_identity(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<crate::table_store::StagedTransactionIdentity>;
+
+    /// RFC 0067: replay the transaction recorded in `staged` on `base` so the
+    /// linear history gains its twin at `target`.
+    async fn promote_detached(
+        &self,
+        base: SnapshotHandle,
+        staged: &SnapshotHandle,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionOutcome>;
 
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
@@ -870,18 +894,6 @@ impl TableStorage for TableStore {
 
     async fn list_native_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
         TableStore::list_native_branches(self, dataset_uri).await
-    }
-
-    async fn reopen_for_mutation(
-        &self,
-        dataset_uri: &str,
-        branch: Option<&str>,
-        table_key: &str,
-        expected_version: u64,
-    ) -> Result<SnapshotHandle> {
-        TableStore::reopen_for_mutation(self, dataset_uri, branch, table_key, expected_version)
-            .await
-            .map(SnapshotHandle::new)
     }
 
     fn ensure_expected_version(
@@ -1034,6 +1046,26 @@ impl TableStorage for TableStore {
         TableStore::stage_create(self, dataset_uri, batch)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_compaction(
+        &self,
+        snapshot: &SnapshotHandle,
+        options: &lance::dataset::optimize::CompactionOptions,
+    ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
+        Ok(
+            TableStore::stage_compaction(self, snapshot.dataset(), options)
+                .await?
+                .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
+        )
+    }
+
+    async fn stage_index_fold(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
+        let fold = TableStore::stage_index_fold(self, snapshot.dataset()).await?;
+        Ok((fold.staged.map(StagedHandle::new), fold.skipped))
     }
 
     async fn commit_staged_create_exact(
@@ -1235,6 +1267,50 @@ impl TableStorage for TableStore {
         TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
+    }
+
+    async fn commit_staged_detached(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )> {
+        let ds_arc = snapshot.into_arc();
+        let (dataset, identity) =
+            TableStore::commit_staged_detached(self, ds_arc, staged.into_staged()).await?;
+        Ok((SnapshotHandle::new(dataset), identity))
+    }
+
+    fn transaction_identity(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<crate::table_store::StagedTransactionIdentity> {
+        TableStore::transaction_identity(self, snapshot.dataset())
+    }
+
+    async fn promote_detached(
+        &self,
+        base: SnapshotHandle,
+        staged: &SnapshotHandle,
+        target: u64,
+        expected_uuid: &str,
+    ) -> Result<PromotionOutcome> {
+        let base = base.into_arc();
+        Ok(
+            match TableStore::promote_detached(self, base, staged.dataset(), target, expected_uuid)
+                .await?
+            {
+                crate::table_store::PromotionCommit::Landed(dataset) => {
+                    PromotionOutcome::Landed(SnapshotHandle::new(*dataset))
+                }
+                crate::table_store::PromotionCommit::Refused => PromotionOutcome::Refused,
+                crate::table_store::PromotionCommit::Unsafe(reason) => {
+                    PromotionOutcome::Unsafe(reason)
+                }
+            },
+        )
     }
 
     async fn commit_staged_exact(

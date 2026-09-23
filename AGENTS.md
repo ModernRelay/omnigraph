@@ -98,8 +98,9 @@ working memory:
 2. A query or write attempt uses one coherent accepted snapshot. A retry starts
    fresh rather than mixing old and new authority.
 3. A mutation, load, schema apply, merge, or maintenance batch publishes once.
-4. Independently durable pre-publication effects require enough recovery
-   identity and authority to converge safely; ambiguity fails closed.
+4. Pre-publication durable effects stay unreachable (detached commits, staged
+   files); what is published carries the identity that finishes it (pins,
+   the staged contract's publishing commit); ambiguity fails closed.
 5. Stable schema identity survives supported renames, not drop/re-add. Never
    infer identity from names, paths, versions, field IDs, or branch refs.
 6. Indexes, caches, topology, fragment layout, and compaction are derived

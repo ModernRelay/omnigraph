@@ -28,7 +28,9 @@ use helpers::cost::{
     IoCounts, assert_flat, assert_grows, cost_harness, last_manifest_reads, local_graph, measure,
     measure_insert, measure_insert_as, measure_with_staged,
 };
-use helpers::{MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params};
+use helpers::{
+    MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params, mutate_main,
+};
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
@@ -112,6 +114,177 @@ async fn ensure_indices_manifest_reads_are_flat_in_history() {
         );
     })
     .await;
+}
+
+/// RFC 0067: the index writer arms no recovery sidecar either. A pass with
+/// work on one table writes and deletes no control object.
+#[tokio::test]
+async fn ensure_indices_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+    db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index"))
+        .await
+        .unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.ensure_indices().await.unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached index batch arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached index batch has no sidecar to delete after publication"
+    );
+}
+
+/// RFC 0067: schema apply arms no recovery sidecar. A property addition
+/// rewrites one table detached; the only control objects written are the
+/// three staged contract files and the three live ones, and the only deletes
+/// retire the staging.
+#[tokio::test]
+async fn schema_apply_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String?"))
+        .await
+        .unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        6,
+        "a detached schema apply writes the staged and live contract files and no sidecar"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        3,
+        "a detached schema apply deletes only its three staging files"
+    );
+    assert!(
+        !dir.path().join("__recovery").exists()
+            || std::fs::read_dir(dir.path().join("__recovery"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "no recovery sidecar may exist after a schema apply"
+    );
+}
+
+/// RFC 0067: a branch merge arms no recovery sidecar either. A fast-forward
+/// merge with one table effect writes and deletes no control object.
+#[tokio::test]
+async fn branch_merge_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "merged")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached merge chain arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached merge has no sidecar to delete after publication"
+    );
+}
+
+/// RFC 0067: Optimize arms no recovery sidecar. A run with compaction work on
+/// one table stages the rewrite detached, publishes and promotes it, and
+/// writes and deletes no control object (the adjacency artifact is a bytes
+/// object written only when an edge table advances).
+#[tokio::test]
+async fn optimize_writes_no_control_object() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    for (name, age) in [("opt-a", 41), ("opt-b", 42), ("opt-c", 43)] {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+    drop(db);
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = helpers::session(
+        omnigraph::db::Omnigraph::open_with_storage(uri, adapter)
+            .await
+            .unwrap(),
+    );
+
+    let before_write_text = counts.write_text();
+    let before_delete = counts.delete();
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed),
+        "Person must compact: {stats:?}"
+    );
+    assert_eq!(
+        counts.write_text() - before_write_text,
+        0,
+        "a detached compaction arms no recovery sidecar: no control-object write"
+    );
+    assert_eq!(
+        counts.delete() - before_delete,
+        0,
+        "a detached compaction has no sidecar to delete after publication"
+    );
 }
 
 /// Optimize is now one graph-wide writer rather than one writer per productive
@@ -262,10 +435,14 @@ async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
         curve.push((d, io));
     }
 
-    assert!(
-        curve[0].1.data_opener_reads > 0,
-        "opener reads must be > 0 — the classifier missed version-resolution reads, \
-         so a flat opener assertion would be vacuous"
+    // RFC 0067: a write on a warm handle opens nothing. The writer stages on
+    // the handle the previous write landed in the read-handle cache, so the
+    // opener term is zero at every depth; the flat assertion below therefore
+    // pins zero, and a non-zero opener read here means a write-side open
+    // stopped going through the held handle.
+    assert_eq!(
+        curve[0].1.data_opener_reads, 0,
+        "a write on a warm handle stages on the held pin and opens nothing"
     );
     assert_flat(
         &curve,
@@ -457,7 +634,7 @@ async fn keyed_insert_routes_through_fenced_adapter_only() {
 /// and one full validation under the pre-effect gates (7 `read_text` + 4 `exists`
 /// total). Per-table resolves must not add more validation. The gate read is
 /// correctness work: it arbitrates schema identity after preparation and before
-/// the recovery sidecar or any Lance HEAD movement. The shape is
+/// any detached table effect; no recovery sidecar is written (RFC 0067). The shape is
 /// the write twin of `warm_read_cost.rs::warm_query_validates_schema_contract_once`,
 /// built with ZERO production change via the counting storage adapter.
 #[tokio::test]
@@ -504,12 +681,12 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
         "a write must probe contract-file existence at capture + pre-effect revalidation (4 probes)",
     );
     assert_eq!(
-        write_text_delta, 2,
-        "an enrolled write must write its recovery sidecar exactly twice (arm + exact confirmation)",
+        write_text_delta, 0,
+        "a detached write arms no recovery sidecar (RFC 0067): no control-object write",
     );
     assert_eq!(
-        delete_delta, 1,
-        "a successful enrolled write must delete its confirmed sidecar once",
+        delete_delta, 0,
+        "a detached write has no sidecar to delete after publication",
     );
 }
 

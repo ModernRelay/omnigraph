@@ -1,8 +1,9 @@
 # issue: 694
 # red_on: fb6ed452 (2026-09-12), cleanup disabled: step 8 rejects the unrelated write with pending BranchMerge on branch 'target'
-# notes: Target inherits donor without owning a table fork. Fail the merge
-# notes: after table effects but before confirmation; compensation must permit an
-# notes: unrelated write and a merge retry without reopening.
+# notes: Source and donor diverge; target inherits donor without owning a table fork.
+# notes: The fault fires after the first table's detached chain, including the created first-touch fork, and before publication.
+# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
+# notes: The failed merge's detached chain and fork on the named target are reclaimable garbage, so step 8 succeeds and the merge retry lands.
 
 --- runner
 timeout_ms: 10000
@@ -54,7 +55,7 @@ query add_source_row() {
 --- expect affected: nodes=1 edges=0
 
 --- seam
-at: branch_merge.post_effects_pre_confirm
+at: branch_merge.post_table_effect
 occurrence: 1
 action: fail
 scope: next_step
@@ -62,7 +63,7 @@ scope: next_step
 --- mutate
 branch merge source into target
 
---- expect error: injected failpoint triggered: branch_merge.post_effects_pre_confirm
+--- expect error: injected failpoint triggered: branch_merge.post_table_effect
 
 --- query branch: target
 query read_after_failure() {

@@ -1065,15 +1065,12 @@ fn merge_phase_metrics(probes: &MergeWriteProbes) -> serde_json::Value {
         "proven_insert_plan_scan": probes.proven_insert_plan_scan_us(),
         "candidate_validation": probes.candidate_validation_us(),
         "final_revalidation": probes.final_revalidation_us(),
-        "recovery_arm": probes.recovery_arm_us(),
         "physical_publish": probes.physical_publish_us(),
         "keyed_stage_total": probes.keyed_stage_total_us(),
         "keyed_stage_max": probes.keyed_stage_max_us(),
         "keyed_commit_total": probes.keyed_commit_total_us(),
         "keyed_commit_max": probes.keyed_commit_max_us(),
-        "recovery_confirm": probes.recovery_confirm_us(),
         "manifest_publish": probes.manifest_publish_us(),
-        "recovery_cleanup": probes.recovery_cleanup_us(),
         "outer_restore_refresh": probes.outer_restore_refresh_us(),
     })
 }

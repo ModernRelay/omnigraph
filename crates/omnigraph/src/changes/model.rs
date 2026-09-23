@@ -159,7 +159,7 @@ pub struct ChangeCause {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
     /// Authorship time in Unix epoch microseconds. Minted before dataset
-    /// effects and stable across retries and recovery — deliberately not
+    /// effects and stable across publisher retries — deliberately not
     /// labeled a commit or publication time.
     pub authored_at: i64,
 }

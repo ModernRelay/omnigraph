@@ -244,10 +244,11 @@ def list_ids(value: str) -> list[str]:
 RFC_FILENAME = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md")
 # The numbered namespace closed on 2026-09-15 with these numbers allocated
 # (files on main) or reserved (PRs open at closure: 0047, 0048, 0050, 0056,
-# 0059, 0060). The set is final; every other number was never allocated.
+# 0059, 0060, and 0067/0068 by PR #725). The set is final; every other
+# number was never allocated.
 NUMBERED_RFCS = frozenset(
     f"{number:04d}"
-    for number in (*range(1, 14), 15, 18, 19, *range(22, 67))
+    for number in (*range(1, 14), 15, 18, 19, *range(22, 69))
 )
 
 

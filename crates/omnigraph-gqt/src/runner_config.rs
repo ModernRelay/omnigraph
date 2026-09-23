@@ -107,25 +107,6 @@ pub(crate) struct SeamDirective {
     pub(crate) subject: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct KnownFailure {
-    pub(crate) step: usize,
-    #[serde(rename = "match")]
-    pub(crate) matcher: ErrorMatch,
-}
-
-/// The typed failure a known-failure marker names: a `RecoveryRequired`
-/// returned by a mutate step with its exact reason, or an `Internal`
-/// manifest refusal from a restart whose message opens with `reason_prefix`
-/// (the rest of that message carries a per-run operation id).
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "error", deny_unknown_fields)]
-pub(crate) enum ErrorMatch {
-    RecoveryRequired { reason: String },
-    Internal { reason_prefix: String },
-}
-
 /// What the site does when the installed decision fires; must match an
 /// effect the seam declares in the engine's catalog, or, for a store action,
 /// a store effect the entry declares or an action the store place admits.
@@ -280,21 +261,6 @@ pub(crate) fn parse_seam(body: &str) -> Result<SeamDirective, String> {
     Ok(seam)
 }
 
-pub(crate) fn parse_known_failure(body: &str) -> Result<KnownFailure, String> {
-    let known_failure: KnownFailure = yaml(body)?;
-    let text = match &known_failure.matcher {
-        ErrorMatch::RecoveryRequired { reason } => reason,
-        ErrorMatch::Internal { reason_prefix } => reason_prefix,
-    };
-    if known_failure.step == 0
-        || text.trim().is_empty()
-        || text.len() > omnigraph_dst::store_places::SUBJECT_MAX_BYTES
-    {
-        return Err("invalid_case: known_failure requires a positive step and a nonempty RecoveryRequired reason or Internal reason_prefix (at most 2048 bytes)".into());
-    }
-    Ok(known_failure)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,20 +393,5 @@ mod tests {
         let subject = "{".repeat(300) + "x" + &"}".repeat(300);
         let error = parse_seam(&format!("{store}subject: \"{subject}\"\n")).unwrap_err();
         assert!(error.starts_with("invalid_case:"), "{error}");
-    }
-
-    #[test]
-    fn known_failure_accepts_both_matchers() {
-        assert!(
-            parse_known_failure(
-                "step: 4\nmatch:\n  error: Internal\n  reason_prefix: \"OCC recovery sidecar '\""
-            )
-            .is_ok()
-        );
-        assert!(
-            parse_known_failure("step: 4\nmatch:\n  error: Internal\n  reason_prefix: \"\"")
-                .is_err()
-        );
-        assert!(parse_known_failure("step: 4\nmatch:\n  error: Unknown\n  reason: \"x\"").is_err());
     }
 }

@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 
 /// The upstream commit whose bytes the frozen files hold; `exec/query.rs`
 /// differs from it by one hunk, the door block moved to `exec/query_doors.rs`
-/// behind a `#[path]` line.
+/// behind a `#[path]` line. The search fixture includes RFC 0067's explicit
+/// four-partition IVF setup because Optimize now preserves partition counts;
+/// its query assertions and the frozen executors are unchanged.
 const BASELINE: &str = "8281807b";
 
 /// (path under the crate, SHA-256 of the file's bytes).
@@ -37,7 +39,7 @@ const FROZEN: &[(&str, &str)] = &[
     ),
     (
         "tests/search.rs",
-        "98ca0d18335922f8f1dc0245f8b3061912a436bc787d264360f5dbe9e43b0fb0",
+        "1a8be0d56aef638d8e614ea1721a0bebb13e0d7c357c15cc293c404c80fc0fc9",
     ),
 ];
 

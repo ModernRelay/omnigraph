@@ -813,9 +813,9 @@ pub(crate) fn record_probe() {
 }
 
 /// Internal/system table directory names. An open of one of these is a metadata
-/// open (publisher CAS, recovery audit), NOT a data-table open. Kept in sync with
-/// the dir constants in `db/manifest/layout.rs` and `db/recovery_audit.rs`.
-const INTERNAL_TABLE_DIRS: [&str; 2] = ["__manifest", "_graph_commit_recoveries.lance"];
+/// open (publisher CAS), NOT a data-table open. Kept in sync with the dir
+/// constants in `db/manifest/layout.rs`.
+const INTERNAL_TABLE_DIRS: [&str; 1] = ["__manifest"];
 
 /// True when `uri`'s last path segment names an internal/system table.
 fn open_is_internal(uri: &str) -> bool {
@@ -1120,18 +1120,15 @@ pub(crate) enum MergeTimingPhase {
     TableWalk,
     CandidateValidation,
     FinalRevalidation,
-    RecoveryArm,
     PhysicalPublish,
     KeyedStage,
     KeyedCommit,
-    RecoveryConfirm,
     ManifestPublish,
-    RecoveryCleanup,
     OuterRestoreRefresh,
 }
 
 impl MergeTimingPhase {
-    const COUNT: usize = 14;
+    const COUNT: usize = 11;
 
     const fn index(self) -> usize {
         self as usize
@@ -1144,13 +1141,10 @@ impl MergeTimingPhase {
         Self::TableWalk,
         Self::CandidateValidation,
         Self::FinalRevalidation,
-        Self::RecoveryArm,
         Self::PhysicalPublish,
         Self::KeyedStage,
         Self::KeyedCommit,
-        Self::RecoveryConfirm,
         Self::ManifestPublish,
-        Self::RecoveryCleanup,
         Self::OuterRestoreRefresh,
     ];
 
@@ -1162,13 +1156,10 @@ impl MergeTimingPhase {
             Self::TableWalk => "TableWalk",
             Self::CandidateValidation => "CandidateValidation",
             Self::FinalRevalidation => "FinalRevalidation",
-            Self::RecoveryArm => "RecoveryArm",
             Self::PhysicalPublish => "PhysicalPublish",
             Self::KeyedStage => "KeyedStage",
             Self::KeyedCommit => "KeyedCommit",
-            Self::RecoveryConfirm => "RecoveryConfirm",
             Self::ManifestPublish => "ManifestPublish",
-            Self::RecoveryCleanup => "RecoveryCleanup",
             Self::OuterRestoreRefresh => "OuterRestoreRefresh",
         }
     }
@@ -1438,9 +1429,6 @@ impl MergeWriteProbes {
     pub fn final_revalidation_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::FinalRevalidation)
     }
-    pub fn recovery_arm_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryArm)
-    }
     pub fn physical_publish_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::PhysicalPublish)
     }
@@ -1456,14 +1444,8 @@ impl MergeWriteProbes {
     pub fn keyed_commit_max_us(&self) -> u64 {
         self.merge_timing_max_us(MergeTimingPhase::KeyedCommit)
     }
-    pub fn recovery_confirm_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryConfirm)
-    }
     pub fn manifest_publish_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::ManifestPublish)
-    }
-    pub fn recovery_cleanup_us(&self) -> u64 {
-        self.merge_timing_total_us(MergeTimingPhase::RecoveryCleanup)
     }
     pub fn outer_restore_refresh_us(&self) -> u64 {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
@@ -1746,6 +1728,102 @@ pub(crate) enum VersionResolution {
     At(u64),
 }
 
+/// Open a table pin (RFC 0067). A pin without a staged version is an exact
+/// open of its target. A pin with one opens the linear target when it exists
+/// and carries the pin's transaction uuid, and otherwise the staged detached
+/// version: either the pin is pending promotion, or its promotion is blocked
+/// by a foreign commit at the target. An absent target counts as pending only
+/// while the table's linear head has not reached it; once the head is at or
+/// past the target, the twin was promoted and later pruned, and the staged
+/// manifest must not resurrect pruned history.
+pub(crate) async fn open_pinned_dataset(
+    uri: &str,
+    target_version: u64,
+    staged_version: Option<u64>,
+    transaction_uuid: Option<&str>,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let Some(staged) = staged_version else {
+        return open_dataset(uri, VersionResolution::At(target_version), session, wrapper).await;
+    };
+    match open_dataset(
+        uri,
+        VersionResolution::At(target_version),
+        session,
+        wrapper.clone(),
+    )
+    .await
+    {
+        Ok(dataset) => {
+            let ours = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)
+                .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+            if ours {
+                return Ok(dataset);
+            }
+            tracing::warn!(
+                uri,
+                target_version,
+                staged,
+                "pin target carries a foreign or unreadable transaction; resolving the staged version"
+            );
+            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+        }
+        Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
+            let latest = open_dataset(uri, VersionResolution::Latest, session, wrapper.clone())
+                .await?
+                .version()
+                .version;
+            if latest < target_version {
+                // The twin is not promoted yet, so serve the staged version —
+                // but a concurrent cleanup can promote this pin and reap its
+                // staged tip between the Latest probe above and this open. If
+                // the staged version is gone, fall through to the target
+                // re-check below rather than reporting reclaimed history, the
+                // same recovery the `latest >= target` arm performs.
+                match open_dataset(uri, VersionResolution::At(staged), session, wrapper.clone())
+                    .await
+                {
+                    Ok(dataset) => return Ok(dataset),
+                    Err(OmniError::HistoricalVersionReclaimed { .. }) => {}
+                    Err(other) => return Err(other),
+                }
+            }
+            // HEAD reached the target between the two reads (or a racing
+            // promotion landed the twin and reaped the staged tip), so a
+            // promotion may have landed the twin after the first probe missed
+            // it. Read the exact target once more before reporting reclaimed
+            // history.
+            match open_dataset(
+                uri,
+                VersionResolution::At(target_version),
+                session,
+                wrapper.clone(),
+            )
+            .await
+            {
+                Ok(dataset) => {
+                    let ours = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)
+                        .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
+                    if ours {
+                        return Ok(dataset);
+                    }
+                    tracing::warn!(
+                        uri,
+                        target_version,
+                        staged,
+                        "pin target carries a foreign or unreadable transaction; resolving the staged version"
+                    );
+                    open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+                }
+                Err(OmniError::HistoricalVersionReclaimed { .. }) => Err(error),
+                Err(other) => Err(other),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// THE dataset-open chokepoint. Every engine `Dataset` open routes through
 /// here so three things hold uniformly, on every path:
 ///
@@ -1757,7 +1835,7 @@ pub(crate) enum VersionResolution {
 ///    store). No wrapper (production) adds nothing.
 /// 3. A caller-provided graph data `Session` warms Lance's metadata/index
 ///    caches across data-table opens. When absent (for example a detached
-///    historical snapshot or recovery helper), the process-wide zero-cache
+///    historical snapshot), the process-wide zero-cache
 ///    control session is attached instead. Every open therefore reuses the
 ///    shared object-store registry/client pool without letting mutable control
 ///    metadata become stale in a session cache.

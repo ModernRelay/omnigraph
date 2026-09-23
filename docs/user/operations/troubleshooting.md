@@ -25,7 +25,7 @@ Do not parse human-readable error text when a structured field is present.
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
 | 429 | Per-actor admission limit reached | Honor `Retry-After` and retry later |
 | 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success |
-| 503 | An interrupted write requires recovery | Reopen read-write or restart the server, then retry |
+| 503 | A schema change was published but its schema files were not installed | Reopen read-write or restart the server, then retry |
 
 A graph-head `412` includes `precondition_failure` with `expected` and, when
 available, `actual`. A change-feed `410` includes `change_feed_gap`; retrying
@@ -51,8 +51,8 @@ A `409` is not one universal retry signal:
 
 Writes are atomic at the graph-commit boundary. A normal validation, conflict,
 or limit error does not mean that a subset became visible. A recovery-required
-error is different: durable effects may exist but remain hidden until recovery
-finishes, so do not work around it with repair or cleanup.
+error is different: a schema change is already published and only its schema
+files remain to be installed, so reopen read-write rather than retrying it.
 
 ## Storage-format mismatch
 
@@ -80,13 +80,35 @@ See [Operating a cluster](../clusters/index.md).
 
 ## Maintenance failures
 
-- Pending recovery: reopen the graph read-write or restart its server.
+- Recovery required: reopen the graph read-write or restart its server. A
+  graph carrying a sidecar from a release before 0.12 must first be opened
+  read-write with that release.
 - Uncovered drift: preview with `repair`; publish only classifications you have
   verified.
-- Cleanup refusal: resolve recovery/drift and verify all live branches before
+- Cleanup refusal: resolve drift and verify all live branches before
   retrying.
 - Azure admission failure: inspect the lease owner before using the admission
   tool's break-glass flow.
+
+### Blocked pin
+
+A pin is blocked when a foreign commit occupies the linear version its
+published write was meant to take. The condition is per table.
+
+- From a write: a branch merge, index build, schema apply, system-column
+  upgrade, optimize, or a branch's first write to that table returns a
+  conflict that names the table and says the published pin at that version
+  cannot be promoted. Retrying returns the same error.
+- From `cleanup`: the table's result row says version GC was skipped for it.
+  Other tables are collected and the command exits 0.
+- From `repair`: the table is classified `blocked_promotion` with action
+  `refused`, on every live branch that carries the pin, and the command exits
+  non-zero. `--force --confirm` refuses the same way.
+
+Reads, mutations and loads on that table keep working, and every acknowledged
+row stays readable. The table's old versions are not reclaimed while the block
+stands. No command resolves a blocked pin yet. To move the data off the blocked
+table, export the graph and load it into a new one.
 
 See [Maintenance](maintenance.md) and [Deployment](../deployment.md).
 

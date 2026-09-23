@@ -63,31 +63,6 @@ pub(crate) enum Admitted {
     ),
 }
 
-impl Admitted {
-    /// The spelling a delivery record's `effect` carries.
-    pub(crate) fn effect_name(&self) -> &'static str {
-        match self {
-            Admitted::Code(_, effect) => effect.as_str(),
-            Admitted::CodeStore(_, effect) => effect.as_str(),
-            Admitted::Store(_, action, _) => action.as_str(),
-        }
-    }
-
-    /// The store place row whose methods a delivery's hit must name, or
-    /// `None` for an engine effect.
-    pub(crate) fn store_row(
-        &self,
-    ) -> Option<&'static omnigraph_dst::store_places::StorePlaceEntry> {
-        match self {
-            Admitted::Code(..) => None,
-            Admitted::CodeStore(_, effect) => Some(omnigraph_dst::store_places::entry_of(
-                omnigraph_dst::store_places::effect_target(*effect).0,
-            )),
-            Admitted::Store(row, ..) => Some(row),
-        }
-    }
-}
-
 /// Resolve `at` by exact name, the engine catalog first and `STORE_PLACES`
 /// second, and check the action against what the entry or row declares.
 /// The step check is `admit_seam`'s; the known-failure classifier resolves

@@ -163,7 +163,9 @@ fn dst_hunt_crash_window_sweep() {
                     // Wide only where its ops are the ONLY route (load.*) —
                     // the wide die dilutes branch-verb frequency and measured
                     // as all merge windows going dark in an all-wide pass.
+                    // The schema face is scoped the same way.
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 };
                 let root = format!("shared-memory://dst-hunt-{w}-{seed}-{skip}");
@@ -203,6 +205,7 @@ fn dst_hunt_crash_window_sweep() {
                     crash_on_match: Some((window, skip)),
                     probe_only: true,
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 };
                 let root = format!("shared-memory://dst-probe-{w}-{seed}-{skip}");
@@ -235,49 +238,6 @@ fn dst_hunt_crash_window_sweep() {
     assert!(
         !hit.is_empty(),
         "coverage assertion: the hunt must actually reach SOME windows"
-    );
-}
-
-/// REOPEN-HEALS DISCOVERY pin — the targeted-scheduling hunt's first catch
-/// (2026-08-10, hunt cell window=recovery.sidecar_delete seed=10 skip=1,
-/// minimized to 3 ops): a mutation whose Phase-D sidecar delete fails
-/// SWALLOWS the failure by design (recovery.rs `delete_sidecar`: the write
-/// already published; heal on next write or open) and reports success —
-/// leaving a stale-but-confirmed sidecar. An immediately following
-/// `optimize` refuses with "optimize requires a clean recovery state;
-/// reopen the graph..." (optimize.rs fast-path probe refuses on ANY
-/// sidecar — it cannot cheaply tell stale-confirmed from partial). The
-/// harness treats that refusal as a legal rejection and reopens (the
-/// documented heal); this test pins the whole shape end to end, including
-/// that the universe replays identically.
-#[cfg(feature = "failpoints")]
-#[test]
-#[serial]
-fn dst_discovery5_stale_sidecar_blocks_maintenance_until_reopen() {
-    let _scenario = omnigraph::seams::FailScenario::setup();
-    let sc = Scenario {
-        seed: 10,
-        ops: 24,
-        // Arm on the 2nd mutation-class op: its Phase-D delete fails
-        // (swallowed — so this universe records ZERO crashes), the 3rd
-        // sampled op is `optimize` and trips the barrier.
-        crash_on_match: Some(("recovery.sidecar_delete", 1)),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-disc5-a", &sc);
-    assert_eq!(
-        a.crashes, 0,
-        "phase-D delete failure must be SWALLOWED (op succeeds; no crash observable)"
-    );
-    assert!(
-        a.legal_rejections >= 1,
-        "the follow-up maintenance op should trip the recovery barrier"
-    );
-    let b = run_universe("shared-memory://dst-disc5-b", &sc);
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &b,
-        "discovery-5 universe must replay identically",
     );
 }
 
@@ -581,43 +541,6 @@ fn dst_sessions_agree_and_replay() {
         &b,
         "session-oracle universe must replay identically",
     );
-}
-
-/// Faulted merges and separately confirmed retries need raw-row arbitration.
-#[test]
-#[serial]
-fn dst_failed_attempts_arbitrate_on_bound_rows() {
-    for (seed, op, expected) in [(228_316u64, 8, "NotApplied"), (228_319, 14, "AppliedTwice")] {
-        let sc = Scenario {
-            seed,
-            ops: 30,
-            faults: Some(omnigraph_dst::harness::FaultPlan {
-                seed: seed.wrapping_mul(103),
-                error_pct: 0,
-                read_error_pct: 0,
-                latency_pct: 0,
-                max_latency_ms: 1,
-                lance_realm: false,
-                ack_loss_pct: 15,
-                client_retry: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let report = run_universe(&format!("shared-memory://dst-pin-failed-bound-{seed}"), &sc);
-        assert!(
-            report
-                .reconcile_verdicts
-                .iter()
-                .any(|(tag, outcome, channel)| {
-                    tag == &format!("fault@op{op}")
-                        && outcome == expected
-                        && channel == "query+bound"
-                }),
-            "seed {seed} must be ruled on raw rows: {:?}",
-            report.reconcile_verdicts
-        );
-    }
 }
 
 #[test]
@@ -1183,11 +1106,16 @@ fn dst_v11_fault_injection_atomicity_and_replay() {
 #[test]
 #[serial]
 fn dst_staleness_bite_and_replay() {
+    // Seed 278 since RFC 0067 moved the storage-action schedule three times
+    // (the detached writers, the detached index writer, then the removal of
+    // the per-write `__recovery/` listing): each earlier pin then met a stale
+    // absence of a schema contract file, which the engine refuses as manual
+    // coordination. `dst_staleness_seed_search` lists the green seeds.
     let sc = Scenario {
-        seed: 251,
+        seed: 278,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 25_100,
+            seed: 27_800,
             stale_read_pct: 15,
             stale_list_pct: 15,
             max_lag_ticks: 4,
@@ -1218,6 +1146,66 @@ fn dst_staleness_bite_and_replay() {
         a.commit_ids.len(),
         a.legal_rejections
     );
+}
+
+/// SEARCH INSTRUMENT for the bounded-staleness pin above: enumerate seeds
+/// and print which universes bite, replay identically, keep every oracle
+/// green and make progress, so the pin can be re-chosen when the engine's
+/// storage-action schedule shifts. Not part of the suite.
+#[test]
+#[serial]
+#[ignore = "instrument: bounded-staleness seed search — run explicitly"]
+fn dst_staleness_seed_search() {
+    for seed in 251u64..291 {
+        let sc = Scenario {
+            seed,
+            ops: 30,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed * 100,
+                stale_read_pct: 15,
+                stale_list_pct: 15,
+                max_lag_ticks: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let a = match omnigraph_dst::harness::run_universe_caught(
+            &format!("shared-memory://dst-s25-search-{seed}-a"),
+            &sc,
+        ) {
+            Ok(report) => report,
+            Err(panic) => {
+                println!(
+                    "seed {seed}: RED {}",
+                    omnigraph_dst::harness::panic_message(&*panic)
+                );
+                continue;
+            }
+        };
+        let b = match omnigraph_dst::harness::run_universe_caught(
+            &format!("shared-memory://dst-s25-search-{seed}-b"),
+            &sc,
+        ) {
+            Ok(report) => report,
+            Err(panic) => {
+                println!(
+                    "seed {seed}: RED on replay {}",
+                    omnigraph_dst::harness::panic_message(&*panic)
+                );
+                continue;
+            }
+        };
+        let replays = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            omnigraph_dst::harness::assert_strict_replay(&a, &b, "search")
+        }))
+        .is_ok();
+        println!(
+            "seed {seed}: bite={} commits={} replay={}",
+            a.stale_reads_served + a.stale_lists_served,
+            a.commit_ids.len(),
+            replays
+        );
+    }
 }
 
 /// the UNBOUNDED-staleness probe (instrument): every read and
@@ -1307,210 +1295,47 @@ fn dst_lance_realm_faults_bite_and_oracles_hold() {
     assert!(a.verified > 0);
 }
 
-/// ONE spelling of the keep-serving scenario shared by the panel, the
-/// widened-arbitration regression, and the seed search — the panel's
-/// re-pin protocol ("screen at THIS test's parameters") holds by
-/// construction, not copy discipline.
-fn keep_serving_scenario(seed: u64, ops: usize, error_pct: u64) -> Scenario {
-    Scenario {
-        seed,
-        ops,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: seed * 100,
-            error_pct,
-            lance_realm: true,
-            ..Default::default()
-        }),
-        keep_serving_ops: 3,
-        ..Default::default()
-    }
-}
-
-/// The rendered detector tag a wedge red carries — built from the detector
-/// const, never hand-spelled.
-fn wedge_detector_tag() -> String {
-    format!(
-        "detector={}",
-        omnigraph_dst::harness::DET_LIVE_WRITE_AVAILABILITY
-    )
-}
-
-/// Keep-serving defer rows in a report (the wedge-shape evidence the
-/// panel's and the regression's shape asserts count).
-fn keep_serving_defer_rows(report: &omnigraph_dst::harness::UniverseReport) -> usize {
-    report
-        .known_issues
-        .iter()
-        .filter(|row| row.starts_with(omnigraph_dst::harness::KEEP_SERVING_DEFER_PREFIX))
-        .count()
-}
-
-/// Defer-implies-resolution invariant: a universe that deferred must also
-/// have resolved — the watch never outlives its universe unjudged. Keyed
-/// on the producer's exported prefixes, one spelling.
-fn assert_resolution_row(report: &omnigraph_dst::harness::UniverseReport, seed: u64) {
-    assert!(
-        report.known_issues.iter().any(|row| {
-            row.starts_with(omnigraph_dst::harness::KEEP_SERVING_HEALED_PREFIX)
-                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_INTERRUPTED_PREFIX)
-                || row.starts_with(omnigraph_dst::harness::KEEP_SERVING_EXPIRED_PREFIX)
-        }),
-        "seed {seed}: defer rows without a resolution row"
-    );
-}
-
-/// Exercises live retirement of effect-free Armed mutation/load intents with a short fault panel.
-/// Seed 21 strands Optimize, which lacks exact transaction ownership and requires Full recovery.
-/// Every eligible seed must stay available, and at least one must exercise deferred recovery.
+/// Availability panel under a short, harsh fault plan (issue #554's
+/// descendant). The 13 seeds once wedged a live handle on its own failed
+/// attempt's recovery sidecar; since RFC 0067 no writer arms a recovery
+/// operation, so nothing can wedge and every seed must run green under the
+/// same weather — any red here is a genuine availability or oracle
+/// regression. ops is deliberately SHORT and error_pct HIGH so retry
+/// chains die instead of rescuing a commit.
 #[test]
 #[serial]
-fn dst_keep_serving_wedge_issue_554() {
-    // ops is deliberately SHORT: the panel seeds strand early — a longer
-    // life under this fault plan eventually strands an EFFECTFUL Armed
-    // intent (partial multi-table commit), which the engine CORRECTLY
-    // refuses to retire live; the detector's effect-free precision is
-    // enforced by scenario construction (verifying effect-freedom in the
-    // oracle itself is future work). error_pct is HIGH so retry chains
-    // die instead of rescuing the commit.
-    // Every member is a verified FLIP seed: wedges (or strands harmlessly)
-    // at engine HEAD and heals under the issue-554 engine fix. Seeds 12 and
-    // 18 were screened OUT — their strands stay wedged under the fix
-    // (effectful / excluded-class intents the engine correctly refuses to
-    // retire live — the detector's precision boundary, observed in the
-    // wild; not panel material).
+fn dst_availability_panel_survives_harsh_faults_issue_554() {
     const PANEL: [u64; 13] = [0, 4, 10, 11, 14, 15, 17, 20, 22, 23, 25, 26, 28];
-    let mut wedged: Vec<String> = Vec::new();
-    let mut defer_rows = 0usize;
     for seed in PANEL {
-        let sc = keep_serving_scenario(seed, 10, 80);
+        let sc = Scenario {
+            seed,
+            ops: 10,
+            faults: Some(omnigraph_dst::harness::FaultPlan {
+                seed: seed * 100,
+                error_pct: 80,
+                lance_realm: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let root = format!("shared-memory://dst-keep-serving-554-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                if defers > 0 {
-                    assert_resolution_row(&report, seed);
-                }
-                defer_rows += defers;
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                if message.contains(&wedge_detector_tag()) {
-                    wedged.push(format!("seed {seed}: {message}"));
-                } else {
-                    // A non-wedge red on a panel seed is a different bug —
-                    // surface it with its seed rather than folding it into
-                    // the wedge verdict.
-                    panic!("seed {seed}: {message}");
-                }
-            }
-        }
+        omnigraph_dst::harness::run_universe_caught(&root, &sc).unwrap_or_else(|panic| {
+            panic!(
+                "seed {seed}: {}",
+                omnigraph_dst::harness::panic_message(panic.as_ref())
+            )
+        });
     }
-    assert!(
-        wedged.is_empty(),
-        "ISSUE-554 PANEL RED: live handles wedged on {} of {} panel seeds.\n\
-         Orientation for a CI reader: at engine HEAD WITHOUT the #554 live-heal \
-         engine fix this red is DESIGNED and expected to flip green when that \
-         fix merges. If that fix is already on this branch's base, this is a \
-         REGRESSION in the live retirement of effect-free Armed intents.\n{}",
-        wedged.len(),
-        PANEL.len(),
-        wedged.join("\n")
-    );
-    assert!(
-        defer_rows > 0,
-        "no panel seed entered the wedge shape (a deferred RecoveryRequired \
-         refusal) — re-pin the panel via dst_keep_serving_wedge_seed_search"
-    );
 }
 
-/// ARBITRATION-WIDENING REGRESSION (#559, "arbitration uses future
-/// state"): a keep-serving resolution judges TWO unjudged ops — the
-/// deferred op and the interrupting op — so its legal set is every
-/// composition and order of the pair (`reconcile_watch_resolution`), never
-/// the one-op set. CANONICAL record of the three proven break shapes:
-/// before the widening these seeds fired false `CrashContract` reds on a
-/// correct engine because (1) the write-entry heal rolled the deferred
-/// op's strand forward mid-watch (the store outran the model), (2) a
-/// state-derived success baked the wrong composition ORDER into the model
-/// (seed 24: the fork copied model-main without the rolled-forward write),
-/// and (3) the resolution's own reopen healed the interrupting op's strand
-/// (seed 47: the after-state held an op no hypothesis contained).
-///
-/// The assert is shape-typed, not outcome-pinned: lance-realm strands are
-/// process-context-sensitive (the panel's lesson), so each seed may end
-/// green or wedge-red (`LiveWriteAvailability` — the pin's designed red at
-/// engine HEAD). Any OTHER red — `CrashContract`, `ArbitrationPhysical`, a
-/// bare panic — is the arbitration bug regressing. The defer-row shape
-/// assert makes total strand evaporation a loud re-pin signal instead of a
-/// vacuous green, and gives the resolution rows a mechanical reader.
-#[test]
-#[serial]
-fn dst_keep_serving_widened_arbitration_no_false_reds() {
-    // The identified false-red class members from the 0..60 search: the two
-    // instrumented specimens (24, 47) plus the other four CrashContract
-    // reds observed under the pre-widening arbitration (8, 16, 46, 51).
-    // The search totals implied a seventh; it never re-fired identifiably
-    // across contexts (lance-realm jitter) and is not individually pinned.
-    const SPECIMENS: [u64; 6] = [8, 16, 24, 46, 47, 51];
-    let mut defer_rows = 0usize;
-    for seed in SPECIMENS {
-        let sc = keep_serving_scenario(seed, 30, 15);
-        let root = format!("shared-memory://dst-keep-serving-widened-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                if defers > 0 {
-                    assert_resolution_row(&report, seed);
-                }
-                defer_rows += defers;
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                assert!(
-                    message.contains(&wedge_detector_tag()),
-                    "seed {seed}: non-wedge red on a widened-arbitration specimen \
-                     (a legal composition is missing from the arbitration's set): {message}"
-                );
-                // A wedge red proves the deferral shape was entered.
-                defer_rows += 1;
-            }
-        }
-    }
-    assert!(
-        defer_rows > 0,
-        "no specimen entered the keep-serving shape — the regression pin is \
-         vacuous; re-pick specimens via dst_keep_serving_wedge_seed_search"
-    );
-}
-
-/// SEARCH INSTRUMENT for the issue-554 catch: enumerate seeds 0..60,
-/// printing each seed's outcome (green with defer counts, or RED with the
-/// rendered violation), so the panel above can be (re)chosen — see the
-/// panel's two-step re-pin protocol.
-/// Not part of the suite — run explicitly with `-- --ignored --nocapture`.
-#[test]
-#[serial]
-#[ignore = "search: enumerate seeds for the issue-554 keep-serving wedge pin"]
-fn dst_keep_serving_wedge_seed_search() {
-    for seed in 0..60u64 {
-        let sc = keep_serving_scenario(seed, 30, 15);
-        let root = format!("shared-memory://dst-keep-serving-search-{seed}");
-        match omnigraph_dst::harness::run_universe_caught(&root, &sc) {
-            Ok(report) => {
-                let defers = keep_serving_defer_rows(&report);
-                println!("seed {seed}: green (defer rows: {defers})");
-            }
-            Err(panic) => {
-                let message = omnigraph_dst::harness::panic_message(panic.as_ref());
-                let hit = message.contains(&wedge_detector_tag());
-                println!(
-                    "seed {seed}: RED{} — {message}",
-                    if hit { " (WEDGE)" } else { "" }
-                );
-            }
-        }
-    }
-}
+// The arbitration-widening regression pin
+// (`dst_keep_serving_widened_arbitration_no_false_reds` and its seed
+// search) retired with RFC 0067's last sidecar writer: a keep-serving
+// deferral needs a live handle refused on a pending recovery operation,
+// and no writer the workload reaches arms one any more (the 0..60 search
+// found no seed entering the shape). The keep-serving machinery itself
+// (`Scenario::keep_serving_ops`, the watch, the widened two-op
+// arbitration) followed once every sidecar writer was gone.
 
 /// ACK-LOSS: the inverse fault direction — the write HAPPENED, but you're
 /// told it failed (a dropped S3 200). Injected AFTER delegation on every
@@ -1557,47 +1382,114 @@ fn dst_ack_loss_bite_and_replay() {
     assert!(a.verified > 0);
 }
 
-/// Both ack-lost insert attempts may survive; the row-count oracle and
-/// strict replay must agree with the model for both pinned failure signatures.
+// The ack-loss client-retry pin (`dst_ack_loss_client_retry` and its seed
+// search) retired with RFC 0067's last sidecar writer: the standard
+// workload's only adapter-realm write whose lost acknowledgement failed an
+// op was the recovery sidecar, so no fault seed can exercise a client
+// retry any more (the search enumerated 80 schedules with zero retries).
+// The lost-acknowledgement contract of the manifest CAS itself is owned by
+// the failpoint suite (`GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT` cells per
+// writer); the Lance-realm ack-loss verb below brings the shape back under
+// seeded schedules.
+
+/// LANCE-REALM ACK-LOSS: the follow-up the retirement note above names.
+/// Write-class calls of Lance's own table IO — data files, txn files, and
+/// the `__manifest` dataset's commit puts, the graph-publication door
+/// itself — have their acknowledgement lost AFTER the store applied them.
+/// Under RFC 0067 nothing becomes graph-visible before the manifest
+/// commit, a failed attempt is presumed aborted, and a promotion replay is
+/// refused over its own twin, so every schedule must land in a state the
+/// arbitration accepts ("reconcile arbitrates which picture holds"): an
+/// op whose publication landed durably arbitrates Applied, one that died
+/// staging arbitrates NotApplied, and a client retry runs against its own
+/// durable-but-denied commits and must converge. Green oracles here ARE
+/// the presumed-abort verdict under seeded weather. Replay identity is
+/// deliberately not asserted (the lance-realm replay-envelope note above).
 #[test]
 #[serial]
-fn dst_ack_loss_client_retry() {
-    for (seed, fault_seed, ack_loss_pct, ops) in [(226251, 23303853, 15, 1), (79, 7912, 20, 30)] {
-        let sc = Scenario {
-            seed,
-            ops,
-            faults: Some(omnigraph_dst::harness::FaultPlan {
-                seed: fault_seed,
-                error_pct: 0,
-                read_error_pct: 0,
-                latency_pct: 0,
-                max_latency_ms: 1,
-                lance_realm: false,
-                ack_loss_pct,
-                client_retry: true,
-                ..Default::default()
-            }),
+fn dst_lance_realm_ack_loss_bites_and_oracles_hold() {
+    let sc = Scenario {
+        seed: 89,
+        ops: 30,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: 8900,
+            lance_realm: true,
+            ack_loss_pct: 18,
+            client_retry: true,
             ..Default::default()
-        };
-        let a = run_universe(&format!("shared-memory://dst-ackretry-{seed}-a"), &sc);
-        let b = run_universe(&format!("shared-memory://dst-ackretry-{seed}-b"), &sc);
-        omnigraph_dst::harness::assert_strict_replay(
-            &a,
-            &b,
-            "client-retry universes must replay identically",
-        );
-        assert!(
-            a.client_retries > 0,
-            "seed {seed} must exercise a client retry"
-        );
-        assert!(
-            a.reconcile_verdicts
-                .iter()
-                .any(|(_, verdict, channel)| verdict == "AppliedTwice" && channel == "query+bound"),
-            "seed {seed} must account for both inserts using physical rows: {:?}",
-            a.reconcile_verdicts,
-        );
-    }
+        }),
+        ..Default::default()
+    };
+    let r = run_universe("shared-memory://dst-lance-ackloss", &sc);
+    println!(
+        "dst lance ack-loss: {} lance acks lost, {} adapter acks lost, {} client retries, {} legal rejections, {} checks",
+        r.lance_acks_lost, r.acks_lost, r.client_retries, r.legal_rejections, r.verified
+    );
+    assert!(
+        r.lance_acks_lost > 0,
+        "lance-realm acknowledgements should actually be lost (lance_acks_lost={})",
+        r.lance_acks_lost
+    );
+    // The client-retry path must actually be exercised, not merely enabled: a
+    // lost ack of a staging (data/txn) write fails its op and the harness
+    // replays it against its own durable success, which must converge. (Lost
+    // acks of the `__manifest` commit itself instead read back as success in
+    // the engine and never reach a retry — the publisher's ambiguity arm.)
+    assert!(
+        r.client_retries > 0,
+        "the client-retry path should actually fire (client_retries={})",
+        r.client_retries
+    );
+    assert!(r.verified > 0);
+}
+
+/// GENERALIZED LIVENESS (the successor of the retired RecoveryRequired-
+/// specific keep-serving checks): one live handle rides out an entire
+/// adapter-realm fault storm — clean errors, lost acknowledgements, client
+/// retries — and is NEVER reopened (`keep_handle`; `reopens == 0` is the
+/// proof). Every failed op's aftermath is judged through the same handle a
+/// real client would keep, ops keep landing between faults, and the full
+/// oracle stack holds. Adapter realm only ⇒ strict replay identity.
+#[test]
+#[serial]
+fn dst_fault_storm_on_one_live_handle_keeps_writing() {
+    let sc = Scenario {
+        seed: 103,
+        ops: 30,
+        keep_handle: true,
+        faults: Some(omnigraph_dst::harness::FaultPlan {
+            seed: 10300,
+            error_pct: 12,
+            read_error_pct: 6,
+            latency_pct: 10,
+            max_latency_ms: 3,
+            ack_loss_pct: 12,
+            client_retry: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-live-handle-a", &sc);
+    let b = run_universe("shared-memory://dst-live-handle-b", &sc);
+    println!(
+        "dst live handle: {} reopens, {} legal rejections, {} acks lost, {} client retries, {} checks",
+        a.reopens, a.legal_rejections, a.acks_lost, a.client_retries, a.verified
+    );
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &b,
+        "live-handle universes must replay identically",
+    );
+    assert_eq!(
+        a.reopens, 0,
+        "the whole storm must run on one never-reopened handle"
+    );
+    assert!(
+        a.legal_rejections > 0,
+        "the storm should actually fail ops on the live handle (legal_rejections={})",
+        a.legal_rejections
+    );
+    assert!(a.verified > 0);
 }
 
 /// CORRUPTION AXIS (read tier): the store LIES (read-time bit rot,
@@ -1703,167 +1595,186 @@ fn dst_corruption_detections_attributed() {
     );
 }
 
-/// CORRUPTION AXIS (persisted tier) — SIDECAR WEATHER, self-healing verbs: lost writes
-/// (success fabricated, effect absent — the claim channel's
-/// claimed-but-invisible shape, inverse of ack-loss) and misdirected writes
-/// (landed at a wrong key in the same keyspace), riding the 08-13 write
-/// census: a standard universe's adapter-realm content writes are exactly
-/// the `__recovery/` sidecars. `error_pct` forces deaths so damaged
-/// sidecar states MEET recovery. Contract under judgment: the two-picture
-/// crash arbitration holds with recovery's own metadata sabotaged, and
-/// injected residue (a lost disarm's stale sidecar, a `dstm-` foreign
-/// file) must HEAL on reopen — recorded pre-reopen in
-/// `attributed_residue`, asserted empty after (the reopen-heals contract
-/// extended over injected residue). Persisted damage flows through
-/// SUSPENDED reads (stored bytes ignore call-path gates), so recovery
-/// genuinely consumes it — no unsuspension knob needed. Strict replay.
-#[test]
-#[serial]
-fn dst_sidecar_weather_lost_and_misdirected() {
-    let sc = Scenario {
-        seed: 97,
-        ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 9700,
-            error_pct: 12,
-            lose_write_pct: 15,
-            misdirect_write_pct: 10,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-s11b-a", &sc);
-    let b = run_universe("shared-memory://dst-s11b-b", &sc);
-    println!(
-        "dst sidecar-weather: {} lost, {} misdirected, {} consumed, {} residue rows, {} legal rejections",
-        a.writes_lost,
-        a.writes_misdirected,
-        a.persisted_consumed,
-        a.attributed_residue.len(),
-        a.legal_rejections
-    );
-    for row in &a.attributed_residue {
-        println!("dst sidecar-weather residue: {row}");
-    }
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &b,
-        "sidecar-weather universes must replay identically",
-    );
-    assert!(
-        a.writes_lost + a.writes_misdirected > 0,
-        "the persisted verbs should actually bite (lost={} misdirected={})",
-        a.writes_lost,
-        a.writes_misdirected
-    );
-    assert!(a.verified > 0);
-}
+// The sidecar-weather pin (`dst_sidecar_weather_lost_and_misdirected`)
+// retired with the recovery sidecars (RFC 0067 step 5): the lost-write and
+// misdirected-write verbs act on adapter-realm content writes, which in a
+// standard universe were exactly the `__recovery/` sidecars, so they could
+// no longer bite. The `schema_ops` workload writes control objects again
+// (the schema contract files), and `dst_schema_weather_persisted_write_verbs`
+// below is that pin's successor.
 
-/// CORRUPTION AXIS (persisted tier) — FINDING PIN, FLIPPED by #602: a lost
-/// sidecar-UPDATE write beside its visible manifest commit bricked the reopen
-/// (seed 103 first contact 2026-08-13; seed 100 since the 2026-09-01 re-pin).
+/// SCHEMA-OP REQUALIFICATION (the deferred half of the roll-12 quarantine):
+/// the sampler's schema face live under clean storage. Monotone additive
+/// applies interleave the standard mix on seeded schedules; the model
+/// ignores them by construction, so every oracle judges the surrounding
+/// workload across real staged-contract applies (RFC 0067's schema
+/// staging). The face's first seed scan discovered the engine's mono-branch
+/// restriction ("schema apply requires a graph with only main"), now a
+/// model-predicted legal refusal — so branchy schedules validate the typed
+/// refusal while branchless intervals run real applies. Clean IO in both
+/// realms ⇒ strict replay identity is asserted. Seed 7 emits three applies.
 #[test]
 #[serial]
-fn dst_stale_sidecar_heals_on_reopen() {
+fn dst_schema_ops_randomized_oracles_hold_and_replay() {
     let sc = Scenario {
-        seed: 100,
+        seed: 7,
         ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 10000,
-            error_pct: 10,
-            lose_write_pct: 25,
-            ..Default::default()
-        }),
+        schema_ops: true,
         ..Default::default()
     };
-    let a = run_universe("shared-memory://dst-s11b-lost-a", &sc);
-    let b = run_universe("shared-memory://dst-s11b-lost-b", &sc);
+    let a = run_universe("shared-memory://dst-schema-ops-a", &sc);
+    let b = run_universe("shared-memory://dst-schema-ops-b", &sc);
     println!(
-        "dst stale-sidecar heal: {} lost, {} consumed, {} residue rows, {} verified",
-        a.writes_lost,
-        a.persisted_consumed,
-        a.attributed_residue.len(),
-        a.verified
+        "dst schema ops: {} applies sampled, {} legal rejections, {} checks",
+        a.schema_applies, a.legal_rejections, a.verified
     );
     omnigraph_dst::harness::assert_strict_replay(
         &a,
         &b,
-        "stale-sidecar universes must replay identically",
+        "schema-op universes must replay identically",
     );
     assert!(
-        a.writes_lost > 0,
-        "the lost-write verb should actually bite (lost={})",
-        a.writes_lost
-    );
-    let healed_from_armed = a.persisted_consumed_reads.iter().any(|read| {
-        let armed = read.ends_with(" phase=Armed");
-        let operation_id = read
-            .split("__recovery/")
-            .nth(1)
-            .and_then(|rest| rest.split(".json").next());
-        armed
-            && operation_id.is_some_and(|operation_id| {
-                a.recovery_audit
-                    .contains(&format!("RolledForward {operation_id}"))
-            })
-    });
-    assert!(
-        healed_from_armed,
-        "the pin holds only while recovery reads a sidecar still Armed after a lost write AND \
-         finalizes that operation RolledForward (a confirmed residual is the older roll-forward \
-         path; an Armed sidecar without its commit rolls back); re-pin the seed if the fault \
-         schedule drifted (consumed reads: {:?}, audit: {:?})",
-        a.persisted_consumed_reads, a.recovery_audit
+        a.schema_applies > 0,
+        "the schema face should actually emit (schema_applies={})",
+        a.schema_applies
     );
     assert!(a.verified > 0);
 }
 
-/// Pins consumed persisted corruption and an attributed refusal, with strict replay.
-/// Malformed sidecars can stop recovery; this specimen is not a fleet availability guarantee.
+/// SCHEMA-APPLY CRASH WINDOWS under the randomized workload: inject a
+/// failure into the staged apply at each publication-shaped window
+/// (detached table commit, staged contract written,
+/// published-but-unpromoted), then let reconcile, recovery reopen, and the
+/// full oracle stack judge the aftermath — the windows the quarantine kept
+/// dark, now with the same bite-and-replay contract as the maintenance
+/// cells above. The post-publish window is ABSORBING by design (RFC 0067:
+/// promotion is advisory after publication — the injected error skips
+/// promotion and leaves a pending pin the next writer promotes), so its
+/// bite evidence is the persistent probe's crossing, not a death.
+#[cfg(feature = "failpoints")]
 #[test]
 #[serial]
-fn dst_corrupt_write_first_contact() {
+fn dst_schema_apply_crash_windows_bite_and_replay() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let cells: [(&str, u64, usize, bool); 3] = [
+        ("schema_apply.post_table_commit", 7, 30, true),
+        ("schema_apply.after_staging_write", 7, 30, true),
+        ("schema_apply.post_publish_pre_promotion", 7, 30, false),
+    ];
+    for (window, seed, ops, dies) in cells {
+        // Crossing proof first: same seed, record-only callback on the seam
+        // (`probe_only` swaps the injection for observation — same-seam
+        // probe_window + crash_on_match would double-install the seam).
+        let probe = Scenario {
+            seed,
+            ops,
+            schema_ops: true,
+            crash_on_match: Some((window, 0)),
+            probe_only: true,
+            ..Default::default()
+        };
+        let probed = run_universe(
+            &format!("shared-memory://dst-schema-probe-{window}"),
+            &probe,
+        );
+        assert!(
+            probed.crossed,
+            "schema cell {window}: the seam must actually be walked"
+        );
+        let sc = Scenario {
+            seed,
+            ops,
+            schema_ops: true,
+            crash_on_match: Some((window, 0)),
+            ..Default::default()
+        };
+        let first = run_universe(&format!("shared-memory://dst-schema-crash-{window}-a"), &sc);
+        assert_eq!(
+            first.crashes > 0,
+            dies,
+            "schema cell {window}: dying vs absorbing shape (crashes={})",
+            first.crashes
+        );
+        let second = run_universe(&format!("shared-memory://dst-schema-crash-{window}-b"), &sc);
+        omnigraph_dst::harness::assert_strict_replay(&first, &second, "schema cell: strict replay");
+    }
+}
+
+/// PERSISTED-TIER WRITE VERBS, revived (the successor of the retired
+/// sidecar-weather pin above): with the schema face on, the adapter realm's
+/// content writes are the schema contract files, and the write-time
+/// corruption / lost-write / misdirected-write verbs have live subjects
+/// again. These verbs are STORE LIES (success acknowledged, wrong or no
+/// bytes durable), so the contract is the violation tier's
+/// detected-or-harmless: either the damage only ever grazes writes whose
+/// loss the apply absorbs (universe completes, oracles green), or the
+/// engine detects the lie on the schema control plane and refuses LOUDLY,
+/// which fails the universe's own observation reads — a caught, typed,
+/// deterministic death, never silent acceptance. Seed 101 empirically takes
+/// the refusal arm (a misdirected `__schema_state.json` install); both arms
+/// assert pairwise determinism.
+#[test]
+#[serial]
+fn dst_schema_weather_persisted_lies_detected_or_harmless() {
     let sc = Scenario {
-        seed: 112,
+        seed: 101,
         ops: 30,
+        schema_ops: true,
         faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 11204,
-            error_pct: 12,
-            corrupt_write_pct: 25,
+            seed: 10100,
+            corrupt_write_pct: 10,
+            lose_write_pct: 8,
+            misdirect_write_pct: 8,
             ..Default::default()
         }),
         ..Default::default()
     };
-    let a = run_universe("shared-memory://dst-s11b-corrupt", &sc);
-    println!(
-        "dst sidecar-weather corrupt-write: {} corrupted, {} consumed, {} detections, {} legal rejections",
-        a.writes_corrupted,
-        a.persisted_consumed,
-        a.corruption_detections.len(),
-        a.legal_rejections
-    );
-    for row in &a.corruption_detections {
-        println!("dst sidecar-weather detection: {row}");
+    let a =
+        omnigraph_dst::harness::run_universe_caught("shared-memory://dst-schema-weather-a", &sc);
+    let b =
+        omnigraph_dst::harness::run_universe_caught("shared-memory://dst-schema-weather-b", &sc);
+    match (a, b) {
+        (Err(a), Err(b)) => {
+            let ma = omnigraph_dst::harness::panic_message(a.as_ref());
+            let mb = omnigraph_dst::harness::panic_message(b.as_ref());
+            for message in [&ma, &mb] {
+                // Require the engine's exact control-plane refusal string. A
+                // looser `contains("schema")` would also pass on a genuine
+                // DET_LEGAL_CLAIM oracle violation (whose text names "schema
+                // apply"), masking a real red as the intended refusal arm.
+                assert!(
+                    message.contains("does not match the recorded schema state"),
+                    "the death must be the engine's typed control-plane refusal, \
+                     not an oracle violation, got: {message}"
+                );
+            }
+            assert_eq!(ma, mb, "the refusal arm must be deterministic");
+            println!(
+                "dst schema weather: refusal arm — {}",
+                ma.lines().next().unwrap_or("")
+            );
+        }
+        (Ok(a), Ok(b)) => {
+            println!(
+                "dst schema weather: harmless arm — {} applies, {} corrupted, {} lost, {} misdirected",
+                a.schema_applies, a.writes_corrupted, a.writes_lost, a.writes_misdirected
+            );
+            omnigraph_dst::harness::assert_strict_replay(
+                &a,
+                &b,
+                "schema-weather universes must replay identically",
+            );
+            assert!(
+                a.writes_corrupted + a.writes_lost + a.writes_misdirected > 0,
+                "the persisted-tier write verbs should actually bite again \
+                 (corrupted={} lost={} misdirected={})",
+                a.writes_corrupted,
+                a.writes_lost,
+                a.writes_misdirected
+            );
+        }
+        _ => panic!("the two same-seed universes took different arms — nondeterministic outcome"),
     }
-    assert!(
-        a.writes_corrupted > 0,
-        "corrupt-write should actually bite (writes_corrupted={})",
-        a.writes_corrupted
-    );
-    assert!(
-        a.persisted_consumed > 0,
-        "an engine read must consume persisted damage, not merely leave an unobserved write"
-    );
-    assert!(
-        !a.corruption_detections.is_empty(),
-        "the first-contact specimen must record a refusal attributed to consumed corruption"
-    );
-    let replay = run_universe("shared-memory://dst-s11b-corrupt-replay", &sc);
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &replay,
-        "adapter-realm persisted corruption must strictly replay",
-    );
 }
 
 /// CRASH-STATE ENUMERATION (sampled; ALICE-style crash-state
@@ -2067,8 +1978,8 @@ fn dst_maintenance_obligations_bite_and_replay() {
     let _s = omnigraph::seams::FailScenario::setup();
     let cells: [(&str, u64, usize); 3] = [
         ("optimize.before_compact", 7, 24),
-        ("cleanup.post_recovery_check_pre_gates", 7, 24),
-        ("ensure_indices.post_effects_pre_confirm", 9, 24),
+        ("cleanup.pre_gates", 7, 24),
+        ("ensure_indices.post_table_effect", 9, 24),
     ];
     for (window, seed, ops) in cells {
         let sc = Scenario {
@@ -2145,7 +2056,7 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
 /// - recovery.* internals: each executes only during a recovery pass of the
 ///   matching SHAPE — primary picked from the ledger's commit-point map
 ///   (post_phase_b merge = roll-forward; post_table_commit mutation =
-///   rollback+restore; post_sidecar_pre_fork = zero-effect orphan discard;
+///   rollback+restore; post_fork_pre_commit = zero-effect orphan discard;
 ///   post_finalize = any recovery pass for the list/audit steps).
 fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
     match window {
@@ -2197,6 +2108,7 @@ fn dst_predict_triage() {
                 probe_window: Some(window),
                 reach_target: Some(window),
                 wide: omnigraph_dst::harness::window_needs_wide(window),
+                schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                 ..Default::default()
             };
             let root = format!("shared-memory://dst-law8-{idx}-{base}");
@@ -2301,6 +2213,30 @@ fn dst_milestone_never_remerges_merged_branch() {
 /// A SnapshotId read opens one pinned dataset to detect the image's
 /// system-column vintage (RFC 0040 historical reads); the audit's first such
 /// read is a cold open: _audit l.get 1220 -> 1228.
+/// RFC 0067 (detached mutation and load): every mutation-class op loses its
+/// sidecar adapter PUT and DELETE calls and the ref LISTs its sidecar arm paid
+/// (AddFriend a.put 8 -> 0, a.delete 4 -> 0, l.list 65 -> 59) and pays one
+/// more Lance manifest PUT per touched table for the detached commit's twin
+/// (AddFriend l.put 30 -> 38); Cleanup now reaps the promoted detached
+/// manifests (a.delete 0 -> 8, l.get 345 -> 353).
+/// The detached index writer opens each productive table at its pin and
+/// promotes the twin it lands (EnsureIndices l.get 11 -> 15; the closing
+/// pass reads the promoted twins, _close l.get 31 -> 35, _verify 2071 -> 2069).
+/// Detached schema apply: a read-write open lists the branch refs once to
+/// reclaim a stale schema-apply sentinel (_setup/_audit l.list 37/65 ->
+/// 38/66, _audit l.get 1228 -> 1230) and a read-only open probes the staged
+/// schema state once for its coherence proof (_audit a.exists 79 -> 81,
+/// _verify 376 -> 389).
+/// Conservative detached reclamation reads historical published pins and
+/// verifies UUID-matching linear twins before deleting any detached copy.
+/// Cleanup l.get rises 353 -> 515; the complete pass's l.list falls 168 -> 158.
+/// This keep-only fixture now also reaps proven historical copies, moving
+/// Cleanup a.delete 8 -> 14. Every other count is unchanged; this is the
+/// measured cost of the reclamation proof, not a general performance claim.
+/// Reclamation then reads each pinned table's linear head once, so a copy
+/// whose twin was pruned behind the head is reclaimable and a fork is judged
+/// by its owner's liveness: Cleanup l.list 158 -> 206, l.get 515 -> 529, and
+/// the pruned-twin copies this fixture leaves move a.delete 14 -> 20.
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
@@ -3038,7 +2974,8 @@ fn dst_predict_born_on_both_person_probe() {
 /// `crash_on_match` probe_only (record-only crossing). Reports per-window
 /// crossed/not and the tally. Success target: every milestone-reachable
 /// window crosses in its single universe; the residue (recovery internals,
-/// schema quarantine, init/open) is expected dark for NAMED reasons.
+/// init/open) is expected dark for NAMED reasons. (The schema families
+/// left the dark list when the `schema_ops` face requalified them.)
 ///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
@@ -3065,6 +3002,7 @@ fn dst_window_reach_probe() {
                 reach_target: Some(window),
                 wide: omnigraph_dst::harness::window_needs_wide(window)
                     || setup.is_some_and(|(w, _)| omnigraph_dst::harness::window_needs_wide(w)),
+                schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                 ..Default::default()
             };
             let root = format!("shared-memory://dst-reach-{idx}-{attempt}");
@@ -3097,11 +3035,12 @@ fn dst_window_reach_probe() {
         errored.len()
     );
     // Non-regression floor: the census measured 50/66 on 2026-08-12; the
-    // 16 non-crossing windows all carry NAMED reasons (schema quarantine,
-    // birth-owned init, #473-blocked adopts, chunk thresholds,
-    // branch-from-branch first-touch shapes, kill-territory orphan
-    // discard). Floor 48 leaves margin for benign seed sensitivity; a
-    // bigger drop = a recipe-mechanism regression.
+    // then-16 non-crossing windows all carried NAMED reasons (schema
+    // quarantine — since requalified by the `schema_ops` face, whose
+    // windows now cross — birth-owned init, #473-blocked adopts, chunk
+    // thresholds, branch-from-branch first-touch shapes, kill-territory
+    // orphan discard). Floor 48 leaves margin for benign seed sensitivity;
+    // a bigger drop = a recipe-mechanism regression.
     assert!(
         crossed.len() >= 48,
         "milestone reach regressed below the measured 50 ({} crossed)",
@@ -3287,6 +3226,7 @@ fn dst_fleet() {
                     crash_on_match: Some((window, 0)),
                     reach_target: Some(window),
                     wide: omnigraph_dst::harness::window_needs_wide(window),
+                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                     ..Default::default()
                 },
                 &mut failures,
@@ -3579,10 +3519,12 @@ fn dst_v11_conservation_transfers() {
     assert_eq!(a, b, "conservation universes must replay identically");
 }
 
-/// DOUBLE-FAULT lever — CRASH-DURING-RECOVERY: die in a workload window,
-/// then die AGAIN inside the recovery sweep, then let a clean reopen finish.
-/// "Does recovery recover from its own death?" — the least-tested code in any
-/// storage engine. Must still land atomically and replay identically.
+/// DOUBLE-FAULT lever — CRASH-DURING-REOPEN: die in a workload window after a
+/// detached table commit, then die AGAIN inside the reopen, then let a clean
+/// reopen finish. Since RFC 0067 the reopen runs no recovery sweep over table
+/// effects (the unpublished detached commit is garbage), so the second fault
+/// lands on the open path itself, which every reopen crosses. Must still land
+/// atomically and replay identically.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
@@ -3594,9 +3536,7 @@ fn dst_lever1_crash_during_recovery() {
             6,
             omnigraph::seams::catalog::MUTATION_POST_TABLE_COMMIT.name(),
         )),
-        recovery_crash: Some(
-            omnigraph::seams::catalog::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH.name(),
-        ),
+        recovery_crash: Some(omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ.name()),
         ..Default::default()
     };
     let a = run_universe("shared-memory://dst-l1-a", &sc);

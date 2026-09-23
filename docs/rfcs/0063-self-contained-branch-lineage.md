@@ -550,7 +550,7 @@ The merge recovery sidecar's `RecoveryLineageIntent` gains the source pin:
 A roll-forward then publishes rows it did not before, computed from the pin,
 which is the ownership change that versioning.md §Recovery step 1 bumps for: `SIDECAR_SCHEMA_VERSION` and
 `IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION` in
-[recovery.rs](../../crates/omnigraph/src/db/manifest/recovery.rs) move from
+`crates/omnigraph/src/db/manifest/recovery.rs` (removed by RFC 0067) move from
 9 to 10 together, every writer's constructor and the shape validator follow,
 every kind emits the v10 outer version, and only the branch-merge payload
 changes. A v9 reader refuses a v10 sidecar before classification, as it

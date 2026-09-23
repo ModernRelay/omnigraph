@@ -58,10 +58,7 @@ pub use dst_runner::{
     replay_report, report_cli_refusal, run_corpus_case, run_selected, run_worker_if_requested,
 };
 use omnigraph::storage::StorageAdapter;
-use runner_config::{
-    Execution, KnownFailure, RunnerConfig, SeamDirective, parse_known_failure, parse_runner,
-    parse_seam,
-};
+use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
 
 mod plan;
 mod report;
@@ -88,7 +85,6 @@ pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 struct Case {
     input_text: String,
     runner: RunnerConfig,
-    known_failure: Option<KnownFailure>,
     seams: BTreeMap<usize, Vec<SeamDirective>>,
     source_lines: BTreeMap<usize, usize>,
     schema: String,
@@ -1322,17 +1318,6 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 .into(),
         );
     };
-    let (known_failure, sections) = if sections.first().is_some_and(|s| s.name == "known_failure") {
-        let body = sections[0]
-            .body
-            .iter()
-            .map(|(_, line)| *line)
-            .collect::<Vec<_>>()
-            .join("\n");
-        (Some(parse_known_failure(&body)?), &sections[1..])
-    } else {
-        (None, sections)
-    };
     if sections.first().map(|s| s.name.as_str()) != Some("schema") {
         return Err("the first section must be `--- schema`".into());
     }
@@ -1820,7 +1805,6 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let case = Case {
         input_text: text.into(),
         runner,
-        known_failure,
         seams,
         source_lines,
         schema,
@@ -1829,7 +1813,6 @@ fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         items,
         needs_indices,
     };
-    dst_runner::validate_known_failure(&case)?;
     Ok(case)
 }
 
