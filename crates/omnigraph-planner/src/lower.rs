@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
@@ -127,7 +127,7 @@ pub trait Lower {
     fn filter(
         &mut self,
         id: NodeId,
-        filters: &[IRFilter],
+        filters: &[IRExpr],
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 

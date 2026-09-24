@@ -11,8 +11,9 @@ use crate::registry::{Entry, Route};
 use crate::route::RouteOverride;
 
 /// Incremented when a field's meaning changes, or when a node kind is added
-/// or removed; additive keys do not bump it.
-pub const EXPLAIN_VERSION: u32 = 1;
+/// or removed; additive keys do not bump it. Version 2: the logical `Filter`
+/// node's `predicate` key became `conjuncts`, one entry per conjunct.
+pub const EXPLAIN_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {

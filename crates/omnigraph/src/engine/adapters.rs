@@ -48,6 +48,9 @@ impl Projected {
                 IRExpr::Literal(_) => Ok("literal".to_string()),
                 IRExpr::Param(name) => Ok(name.clone()),
                 IRExpr::Variable(name) => Ok(name.clone()),
+                IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
+                    Ok(expr.to_string())
+                }
                 _ => Err(OmniError::manifest(format!(
                     "unsupported projection expression: {:?}",
                     expr

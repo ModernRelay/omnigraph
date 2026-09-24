@@ -157,11 +157,11 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
     ];
     for (expression, pushed) in expressions {
         for embedded in [false, true] {
-            let filter = IRFilter {
-                left: expression.clone(),
-                op: CompOp::Eq,
-                right: IRExpr::Literal(Literal::Bool(true)),
-            };
+            let filter = IRExpr::comparison(
+                expression.clone(),
+                CompOp::Eq,
+                IRExpr::Literal(Literal::Bool(true)),
+            );
             let mut pipeline = vec![
                 scan("a"),
                 expand(
@@ -210,11 +210,11 @@ fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
         inner: vec![
             expand("a", "x", vec![]),
-            IROp::Filter(IRFilter {
-                left: prop("x", "state"),
-                op: CompOp::Eq,
-                right: IRExpr::Literal(Literal::String(value.to_string())),
-            }),
+            IROp::Filter(IRExpr::comparison(
+                prop("x", "state"),
+                CompOp::Eq,
+                IRExpr::Literal(Literal::String(value.to_string())),
+            )),
         ],
     };
     let (plan, _) = planned(&ir(
@@ -231,7 +231,9 @@ fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
         {
             let filters = spec.filter.as_ref().expect("scoped predicate").gq_filters();
             assert_eq!(filters.len(), 1);
-            let IRExpr::Literal(Literal::String(value)) = &filters[0].right else {
+            let Some((_, _, IRExpr::Literal(Literal::String(value)))) =
+                filters[0].comparison_parts()
+            else {
                 panic!("literal state")
             };
             values.insert(value.clone());
@@ -255,14 +257,14 @@ fn a_search_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
         vec![
             scan("a"),
             scan("b"),
-            IROp::Filter(IRFilter {
-                left: IRExpr::Search {
+            IROp::Filter(IRExpr::comparison(
+                IRExpr::Search {
                     field: Box::new(prop("b", "text")),
                     query: Box::new(prop("a", "probe")),
                 },
-                op: CompOp::Eq,
-                right: IRExpr::Literal(Literal::Bool(true)),
-            }),
+                CompOp::Eq,
+                IRExpr::Literal(Literal::Bool(true)),
+            )),
         ],
         vec![prop("b", "slug")],
         vec![],
@@ -295,7 +297,7 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
         fn node_type(&self, name: &str) -> Result<NodeTypeSpec, PlanError> {
             self.0.node_type(name)
         }
-        fn filter_pushable(&self, _: &IRFilter) -> bool {
+        fn filter_pushable(&self, _: &IRExpr) -> bool {
             false
         }
         fn edge_dataset(&self, _: &str) -> Option<omnigraph_planner::DatasetPin> {
@@ -308,11 +310,11 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
                 continue;
             }
             let binding = if dependent { "b" } else { "a" };
-            let filter = IRFilter {
-                left: prop(binding, "state"),
-                op: CompOp::Eq,
-                right: IRExpr::Literal(Literal::String("open".into())),
-            };
+            let filter = IRExpr::comparison(
+                prop(binding, "state"),
+                CompOp::Eq,
+                IRExpr::Literal(Literal::String("open".into())),
+            );
             let mut pipeline = if dependent {
                 vec![
                     scan("a"),

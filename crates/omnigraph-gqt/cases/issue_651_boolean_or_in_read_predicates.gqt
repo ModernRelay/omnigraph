@@ -1,0 +1,88 @@
+# issue: 651
+# red_on: 545176bd; admission refuses the case, the first `--- query` section does not parse at `or` (`filter` admits one comparison), so no step runs.
+# notes: Boolean `or` in a read filter: same-property alternatives, cross-property alternatives, nested
+# notes: grouping with `and` and `not`, and parameters in both arms. A row matching both alternatives is returned once.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    age: I64?
+    stage: String
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alice","name":"Alice","age":40,"stage":"open"}}
+{"type":"Person","data":{"slug":"bob","name":"Bob","age":20,"stage":"paused"}}
+{"type":"Person","data":{"slug":"carol","name":"Carol","age":55,"stage":"closed"}}
+{"type":"Person","data":{"slug":"dave","name":"Dave","stage":"open"}}
+
+--- query
+set engine = v2;
+query same_property_or() {
+    match { $p: Person  $p.name = "Alice" or $p.name = "Bob" }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "alice"}
+{"p.slug": "bob"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query cross_property_or_returns_a_double_match_once() {
+    match { $p: Person  $p.name = "Alice" or $p.age > 30 }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "alice"}
+{"p.slug": "carol"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query nested_grouping($cut: I64) {
+    match {
+        $p: Person
+        ($p.stage = "open" or $p.stage = "paused") and not $p.age < $cut
+    }
+    return { $p.slug }
+}
+
+--- params
+{"cut": 35}
+
+--- expect unordered
+{"p.slug": "alice"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query parameters_in_both_arms($first: String, $second: String) {
+    match { $p: Person  $p.name = $first or $p.name = $second }
+    return { $p.slug }
+}
+
+--- params
+{"first": "Alice", "second": "Carol"}
+
+--- expect unordered
+{"p.slug": "alice"}
+{"p.slug": "carol"}
+
+--- expect shape
+p.slug: String

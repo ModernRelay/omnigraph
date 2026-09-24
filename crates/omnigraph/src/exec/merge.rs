@@ -335,7 +335,8 @@ impl DeleteIdChunks {
 }
 
 impl DeleteIdChunk {
-    fn filter(&self, id_col: &str) -> Result<String> {
+    /// The chunk's row and byte bounds, checked before it reaches Lance.
+    fn check_bounds(&self) -> Result<()> {
         if self.ids.is_empty() || self.ids.len() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::manifest_internal(format!(
                 "branch merge delete chunk contains {} ids",
@@ -348,6 +349,19 @@ impl DeleteIdChunk {
                 self.filter_bytes
             )));
         }
+        Ok(())
+    }
+
+    /// `id_col IN (ids)` as the typed expression `stage_delete` takes. The
+    /// byte plan (`filter_bytes`) bounds the chunk as the SQL rendering of
+    /// this list (`filter`, the candidate cursor's form) measures it.
+    fn expr(&self, id_col: &str) -> Result<datafusion::prelude::Expr> {
+        self.check_bounds()?;
+        Ok(crate::engine::id_in_list_expr(&self.ids, id_col))
+    }
+
+    fn filter(&self, id_col: &str) -> Result<String> {
+        self.check_bounds()?;
         let capacity = usize::try_from(self.filter_bytes).map_err(|_| {
             OmniError::manifest_internal("branch merge delete filter capacity exceeds usize")
         })?;
@@ -4689,10 +4703,10 @@ async fn commit_staged_delete_chunks(
     chain: &mut MergeChain,
 ) -> Result<SnapshotHandle> {
     for (chunk_index, chunk) in deleted_ids.chunks.iter().enumerate() {
-        let filter = chunk.filter(deleted_ids.id_col)?;
+        let filter = chunk.expr(deleted_ids.id_col)?;
         let staged_delete = target_db
             .storage()
-            .stage_delete(&current, &filter)
+            .stage_delete(&current, filter)
             .await?
             .ok_or_else(|| {
                 OmniError::manifest_internal(format!(

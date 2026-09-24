@@ -97,29 +97,105 @@ pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String,
     }
 }
 
-/// Evaluate a filter predicate against a batch, producing a boolean mask.
+/// Evaluate a Boolean expression against a batch, producing a mask: `and`,
+/// `or` and `not` under Arrow's three-valued Kleene kernels, a null test
+/// through `is_null`/`is_not_null`, a comparison through `evaluate_comparison`,
+/// and any other expression as a Boolean column.
 pub(super) fn evaluate_filter(
     batch: &RecordBatch,
-    filter: &IRFilter,
+    filter: &IRExpr,
     params: &ParamMap,
 ) -> Result<BooleanArray> {
-    let left = evaluate_expr(batch, &filter.left, params)?;
-    let right = evaluate_expr(batch, &filter.right, params)?;
+    use datafusion::arrow::compute::kernels::boolean;
+    match filter {
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::Compare(op),
+            right,
+        } => evaluate_comparison(batch, left, *op, right, params),
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            let left = evaluate_filter(batch, left, params)?;
+            let right = evaluate_filter(batch, right, params)?;
+            boolean::and_kleene(&left, &right).map_err(OmniError::arrow_internal)
+        }
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => {
+            let left = evaluate_filter(batch, left, params)?;
+            let right = evaluate_filter(batch, right, params)?;
+            boolean::or_kleene(&left, &right).map_err(OmniError::arrow_internal)
+        }
+        IRExpr::Not(inner) => {
+            let inner = evaluate_filter(batch, inner, params)?;
+            boolean::not(&inner).map_err(OmniError::arrow_internal)
+        }
+        IRExpr::IsNull { expr, negated } => {
+            let values = evaluate_expr(batch, expr, params)?;
+            if *negated {
+                boolean::is_not_null(&values)
+            } else {
+                boolean::is_null(&values)
+            }
+            .map_err(OmniError::arrow_internal)
+        }
+        other => boolean_mask(evaluate_expr(batch, other, params)?, other),
+    }
+}
 
-    if filter.op == CompOp::Contains {
+/// A Boolean column as the mask it is; the untyped null `literal_to_array`
+/// broadcasts for `Literal::Null` (a nullable parameter bound to null) is cast
+/// to Boolean, so `$p.enabled and $flag` follows the null rules.
+fn boolean_mask(values: ArrayRef, expr: &IRExpr) -> Result<BooleanArray> {
+    if let Some(mask) = values.as_any().downcast_ref::<BooleanArray>() {
+        return Ok(mask.clone());
+    }
+    if values.null_count() == values.len() {
+        let mask = arrow_cast::cast::cast(&values, &DataType::Boolean)
+            .map_err(OmniError::arrow_internal)?;
+        return Ok(arrow_array::cast::as_boolean_array(&mask).clone());
+    }
+    Err(OmniError::manifest(format!(
+        "filter `{expr}` is not Boolean: got {}",
+        values.data_type()
+    )))
+}
+
+/// `left <op> right` over a batch: the operands through `evaluate_expr`, two
+/// numbers on their common type (`common_numeric_type`), any other pair with
+/// the right cast to the left's type, then Arrow's comparison kernels.
+fn evaluate_comparison(
+    batch: &RecordBatch,
+    left: &IRExpr,
+    op: CompOp,
+    right: &IRExpr,
+    params: &ParamMap,
+) -> Result<BooleanArray> {
+    let left = evaluate_expr(batch, left, params)?;
+    let right = evaluate_expr(batch, right, params)?;
+
+    if op == CompOp::Contains {
         return evaluate_contains_filter(&left, &right);
     }
-    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
-        return evaluate_string_match_filter(filter.op, &left, &right);
+    if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
+        return evaluate_string_match_filter(op, &left, &right);
     }
-    let right = if left.data_type() != right.data_type() {
-        arrow_cast::cast::cast(&right, left.data_type()).map_err(OmniError::arrow_internal)?
-    } else {
-        right
+    let (left, right) = match common_numeric_type(left.data_type(), right.data_type()) {
+        Some(common) => (cast_to(&left, &common)?, cast_to(&right, &common)?),
+        None if left.data_type() != right.data_type() => {
+            let right = cast_to(&right, left.data_type())?;
+            (left, right)
+        }
+        None => (left, right),
     };
 
     use arrow_ord::cmp;
-    let result = match filter.op {
+    let result = match op {
         CompOp::Eq => cmp::eq(&left, &right),
         CompOp::Ne => cmp::neq(&left, &right),
         CompOp::Gt => cmp::gt(&left, &right),
@@ -135,13 +211,39 @@ pub(super) fn evaluate_filter(
     Ok(result)
 }
 
-/// Evaluate an IR expression against a wide batch, producing an array.
+/// The type two numeric operands of different types are both cast to, so
+/// neither is truncated toward the other (`2 = 2.7` is false, as in
+/// `fold::evaluate`); `None` for one type or a non-numeric operand.
+fn common_numeric_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    if left == right || !left.is_numeric() || !right.is_numeric() {
+        return None;
+    }
+    Some(if left.is_floating() || right.is_floating() {
+        DataType::Float64
+    } else if left.is_unsigned_integer() && right.is_unsigned_integer() {
+        DataType::UInt64
+    } else if matches!(left, DataType::UInt64) || matches!(right, DataType::UInt64) {
+        DataType::Decimal128(20, 0)
+    } else {
+        DataType::Int64
+    })
+}
+
+fn cast_to(values: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
+    arrow_cast::cast::cast(values, data_type).map_err(OmniError::arrow_internal)
+}
+
+/// Evaluate an IR expression against a wide batch, producing an array; a
+/// Boolean expression produces its mask as the array.
 pub(super) fn evaluate_expr(
     batch: &RecordBatch,
     expr: &IRExpr,
     params: &ParamMap,
 ) -> Result<ArrayRef> {
     match expr {
+        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
+            Ok(Arc::new(evaluate_filter(batch, expr, params)?) as ArrayRef)
+        }
         IRExpr::PropAccess { variable, property } => {
             let col_name = format!("{}.{}", variable, property);
             batch.column_by_name(&col_name).cloned().ok_or_else(|| {
@@ -182,16 +284,31 @@ pub(super) fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRe
     })
 }
 
+/// List membership per row, null where the list or the needle is null; the
+/// untyped all-null column `literal_to_array` broadcasts for a nullable list
+/// parameter bound to null is that null list. A numeric needle and a numeric
+/// element type meet on their `common_numeric_type`, as `=` does.
 pub(super) fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Result<BooleanArray> {
     let DataType::List(field) = left.data_type() else {
+        if left.null_count() == left.len() {
+            return Ok(BooleanArray::new_null(left.len()));
+        }
         return Err(OmniError::manifest(
             "contains requires a list property on the left".to_string(),
         ));
     };
-    let right = if right.data_type() != field.data_type() {
-        arrow_cast::cast::cast(right, field.data_type()).map_err(OmniError::arrow_internal)?
-    } else {
-        Arc::clone(right)
+    let (left, right) = match common_numeric_type(field.data_type(), right.data_type()) {
+        Some(common) => {
+            let item = Arc::new(Field::new(field.name(), common.clone(), true));
+            (
+                cast_to(left, &DataType::List(item))?,
+                cast_to(right, &common)?,
+            )
+        }
+        None if right.data_type() != field.data_type() => {
+            (Arc::clone(left), cast_to(right, field.data_type())?)
+        }
+        None => (Arc::clone(left), Arc::clone(right)),
     };
     let list = left
         .as_any()
@@ -201,7 +318,7 @@ pub(super) fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Res
     let mut values = Vec::with_capacity(list.len());
     for row in 0..list.len() {
         if list.is_null(row) || right.is_null(row) {
-            values.push(Some(false));
+            values.push(None);
             continue;
         }
         let items = list.value(row);
@@ -218,7 +335,8 @@ pub(super) fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Res
 }
 
 /// Evaluate exact, case-sensitive string predicates using Arrow's string kernels.
-/// NULL on either side produces false, matching pushed filters' WHERE semantics.
+/// A null on either side is null, as on the pushed arm, so `not` over the
+/// result agrees across the arms.
 pub(super) fn evaluate_string_match_filter(
     op: CompOp,
     left: &ArrayRef,
@@ -230,16 +348,11 @@ pub(super) fn evaluate_string_match_filter(
         Arc::clone(right)
     };
     let (left_dyn, right_dyn): (&dyn Array, &dyn Array) = (left.as_ref(), right.as_ref());
-    let matches = match op {
+    match op {
         CompOp::StartsWith => arrow_string::like::starts_with(&left_dyn, &right_dyn),
         _ => arrow_string::like::contains(&left_dyn, &right_dyn),
     }
-    .map_err(|e| OmniError::manifest(format!("{op} requires String operands: {e}")))?;
-    if matches.nulls().is_some() {
-        Ok(arrow_select::filter::prep_null_mask_filter(&matches))
-    } else {
-        Ok(matches)
-    }
+    .map_err(|e| OmniError::manifest(format!("{op} requires String operands: {e}")))
 }
 
 pub(super) fn array_value_eq(
@@ -408,7 +521,9 @@ pub(super) fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {
     }
 }
 
-/// Evaluate a single projection expression against a wide batch.
+/// Evaluate a single projection expression against a wide batch; a Boolean
+/// expression projects its `evaluate_filter` mask under its GQ text, and the
+/// lowering names the column by the alias T43 requires.
 pub(super) fn evaluate_projection(
     wide_batch: &RecordBatch,
     expr: &IRExpr,
@@ -461,6 +576,10 @@ pub(super) fn evaluate_projection(
             let node = StructArray::try_new(Fields::from(fields), columns, None)
                 .map_err(OmniError::arrow_internal)?;
             Ok((name.clone(), Arc::new(node) as ArrayRef))
+        }
+        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
+            let mask = evaluate_filter(wide_batch, expr, params)?;
+            Ok((expr.to_string(), Arc::new(mask) as ArrayRef))
         }
         _ => Err(OmniError::manifest(format!(
             "unsupported projection expression: {}",

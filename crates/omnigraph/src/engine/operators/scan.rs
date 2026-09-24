@@ -13,7 +13,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRFilter, ParamMap};
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
 use super::{breaker_properties, breaker_stream, conform, external, polled};
 use crate::db::Snapshot;
@@ -39,7 +39,7 @@ pub(crate) struct ScanExec {
     source: ScanSource,
     type_name: String,
     binding: String,
-    filters: Vec<IRFilter>,
+    filters: Vec<IRExpr>,
     projection: Option<NeededColumns>,
     params: Arc<ParamMap>,
     snapshot: Snapshot,
@@ -54,7 +54,7 @@ impl ScanExec {
         source: ScanSource,
         type_name: String,
         binding: String,
-        filters: Vec<IRFilter>,
+        filters: Vec<IRExpr>,
         projection: Option<NeededColumns>,
         params: Arc<ParamMap>,
         snapshot: Snapshot,

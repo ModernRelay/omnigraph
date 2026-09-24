@@ -1,0 +1,71 @@
+# issue: none
+# notes: `contains` over an I64 list parameter compares numbers by value, so `1.0` is a member and `2.0`
+# notes: is not, the same in an assignment constant, a projection and the compile-time fold; a null needle is null.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    adult: Bool
+    maybe: Bool?
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","adult":false}}
+
+--- mutate
+query assign($xs: [I64]) {
+    update Person set { adult: $xs contains 1.0 } where slug = "a"
+}
+
+--- params
+{"xs": [1]}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+set engine = v2;
+query read($xs: [I64]) {
+    match { $p: Person }
+    return { $p.adult, $xs contains 1.0 as projected, $xs contains 2.0 as absent, [1] contains 1.0 as folded }
+}
+
+--- params
+{"xs": [1]}
+
+--- expect unordered
+{"p.adult": true, "projected": true, "absent": false, "folded": true}
+
+--- expect shape
+p.adult: Bool
+projected: Bool
+absent: Bool
+folded: Bool
+
+--- mutate
+query assign_null_needle($xs: [I64], $needle: F64?) {
+    update Person set { maybe: $xs contains $needle } where slug = "a"
+}
+
+--- params
+{"xs": [1], "needle": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query stored_null() {
+    match { $p: Person }
+    return { $p.slug, $p.maybe }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+p.maybe: Bool?

@@ -1731,11 +1731,11 @@ return { $d.name }
                 nullable: false,
             },
         ],
-        match_clause: vec![Clause::Filter(Filter {
-            left: Expr::Variable("xs".to_string()),
-            op: CompOp::Contains,
-            right: Expr::Variable("x".to_string()),
-        })],
+        match_clause: vec![Clause::Filter(Expr::comparison(
+            Expr::Variable("xs".to_string()),
+            CompOp::Contains,
+            Expr::Variable("x".to_string()),
+        ))],
         return_clause: vec![Projection {
             expr: Expr::Literal(Literal::String("unreachable".to_string())),
             alias: None,
@@ -1904,4 +1904,352 @@ return { $w }
     let msg = err.to_string();
     assert!(msg.contains("T23"), "{msg}");
     assert!(msg.contains("propert"), "points at property access: {msg}");
+}
+
+/// Person with a Bool, a nullable String, a list and a property named `and`.
+fn setup_expressions() -> Catalog {
+    let schema = parse_schema(
+        r#"
+node Person {
+name: String
+email: String?
+age: I32?
+active: Bool
+tags: [String]?
+and: I32?
+payload: Blob?
+}
+edge Knows: Person -> Person {
+since: Date?
+}
+"#,
+    )
+    .unwrap();
+    build_catalog(&schema).unwrap()
+}
+
+/// The error text of `query` under `setup_expressions`, read or mutation.
+fn refusal(catalog: &Catalog, query: &str) -> String {
+    let qf = parse_query(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+    typecheck_query_decl(catalog, qf.single_decl())
+        .err()
+        .unwrap_or_else(|| panic!("expected a refusal for {query}"))
+        .to_string()
+}
+
+fn accepted(catalog: &Catalog, query: &str) {
+    let qf = parse_query(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+    typecheck_query_decl(catalog, qf.single_decl())
+        .unwrap_or_else(|error| panic!("{query}: {error}"));
+}
+
+fn read(filter: &str) -> String {
+    format!(
+        "query q($q: String, $n: I32, $flag: Bool) {{ match {{ $p: Person  {filter} }} return {{ $p.name }} }}"
+    )
+}
+
+#[test]
+fn test_boolean_operators_need_bool_operands() {
+    let catalog = setup_expressions();
+    for filter in [
+        "$p.active and not $p.email is null",
+        "($p.age > 30 or $p.name = $q) and $flag",
+        "not $p.active or $p.tags contains \"x\"",
+        "$p.age is null",
+        "$p.tags is not null",
+        "$p.active = true and $p.age > $n",
+        "($p.age > 30) is null",
+        "($p.age > 30) = $flag",
+        "$p.and > 1",
+    ] {
+        accepted(&catalog, &read(filter));
+    }
+    assert_eq!(
+        refusal(&catalog, &read("$p.age and $p.name")),
+        "type error: T41: `and` needs Bool operands, got I32? and String"
+    );
+    assert_eq!(
+        refusal(&catalog, &read("not $p.age")),
+        "type error: T41: `not` needs a Bool operand, got I32?"
+    );
+    assert_eq!(
+        refusal(&catalog, &read("$p")),
+        "type error: T41: a filter must be Boolean, got node `Person`"
+    );
+    assert_eq!(
+        refusal(&catalog, &read("$p.payload is null")),
+        "type error: T7: blob comparisons in filters are not supported"
+    );
+    assert_eq!(
+        refusal(&catalog, &read("$p.age > age")),
+        "type error: T7: filter comparisons require scalar operands, got I32? and aggregate"
+    );
+    assert_eq!(
+        refusal(&catalog, &read("@id = \"x\"")),
+        "type error: T7: filter comparisons require scalar operands, got aggregate and String"
+    );
+    assert_eq!(
+        refusal(&catalog, &read("count($p) > 1 and $p.active")),
+        "type error: T7: filter comparisons require scalar operands, got aggregate and I64"
+    );
+}
+
+#[test]
+fn test_boolean_expressions_are_nullable_when_an_operand_is() {
+    let catalog = setup_expressions();
+    let qf = parse_query(
+        "query q($n: I32) { match { $p: Person } return { $p.age > 30 as adult, $p.name = \"x\" as named, $p.email is null as unreachable, $p.active and $p.age > $n as both, not $p.active as idle } }",
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let schema = infer_query_result_schema(&catalog, qf.single_decl(), &ctx).unwrap();
+    let shapes: Vec<(&str, bool)> = schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.is_nullable()))
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![
+            ("adult", true),
+            ("named", false),
+            ("unreachable", false),
+            ("both", true),
+            ("idle", false),
+        ]
+    );
+    assert!(
+        schema
+            .fields()
+            .iter()
+            .all(|field| *field.data_type() == arrow_schema::DataType::Boolean)
+    );
+}
+
+#[test]
+fn test_boolean_projection_needs_an_alias() {
+    let catalog = setup_expressions();
+    for projection in ["not $p.active", "$p.email is null"] {
+        assert_eq!(
+            refusal(
+                &catalog,
+                &format!("query q() {{ match {{ $p: Person }} return {{ {projection} }} }}")
+            ),
+            "type error: T43: a comparison in return needs an alias; write `… as <name>`",
+            "{projection}"
+        );
+    }
+    assert!(
+        refusal(
+            &catalog,
+            "query q($q: String) { match { $p: Person } return { search($p.name, $q) = true as hit } }"
+        )
+        .contains("T35")
+    );
+}
+
+#[test]
+fn test_search_predicate_stands_only_as_a_top_level_conjunct() {
+    let catalog = setup_expressions();
+    let expected = "type error: T38: search predicates require a standalone call or `= true`, alone or joined by and";
+    for filter in [
+        "not search($p.name, $q)",
+        "search($p.name, $q) = false",
+        "(search($p.name, $q) = true) or $p.active",
+        "search($p.name, $q) is null",
+        "$p.active and (fuzzy($p.name, $q) or $p.active)",
+        "$p.active and not match_text($p.name, $q)",
+    ] {
+        assert_eq!(refusal(&catalog, &read(filter)), expected, "{filter}");
+    }
+    for filter in [
+        "search($p.name, $q)",
+        "search($p.name, $q) = true",
+        "search($p.name, $q) and $p.active",
+        "$p.active and fuzzy($p.name, $q) = true and match_text($p.name, $q)",
+    ] {
+        accepted(&catalog, &read(filter));
+    }
+}
+
+#[test]
+fn test_mutation_where_resolves_under_the_target_scope() {
+    let catalog = setup_expressions();
+    for query in [
+        "query q() { delete Person where age > 30 and not name = \"x\" }",
+        "query q($q: String) { delete Person where name contains $q or name starts_with \"a\" }",
+        "query q() { delete Person where email is null or (active and age is not null) }",
+        "query q() { delete Knows where @src = \"a\" and @dst = \"b\" }",
+        "query q() { delete Knows where from = \"a\" and to = \"b\" and since is null }",
+        "query q() { delete Person where @id = \"a\" or @id = \"b\" }",
+        "query q($n: I32) { update Person set { active: false } where age > $n and email is not null }",
+        "query q() { delete Person where tags contains \"rust\" }",
+        "query q() { delete Person where name = \"x\" and now() > now() }",
+    ] {
+        accepted(&catalog, query);
+    }
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { delete Person where active and $p.age > 3 }"
+        ),
+        "type error: T14: mutation variable `$p` must be a declared query parameter"
+    );
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Person where age > $n }"),
+        "type error: T14: mutation variable `$n` must be a declared query parameter"
+    );
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Person where salary > 1 }"),
+        "type error: T11: type `Person` has no property `salary`"
+    );
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Person where id = \"x\" }"),
+        "type error: T11: type `Person` has no property `id`; the system identity is `@id`"
+    );
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Person where @src = \"x\" }"),
+        "type error: T11: type `Person` has no meta-field `@src`; the meta-fields of this type are `@id`"
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { delete Person where payload is null }"
+        ),
+        "type error: T11: blob property `payload` cannot be used in WHERE predicates"
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q($n: I32) { delete Person where @id = $n }"
+        ),
+        "type error: T7: cannot assign/compare I32 with String for property `@id`"
+    );
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Person where age = \"old\" }"),
+        "type error: T3: property `age` has type I32? but got String"
+    );
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Person where age and active }"),
+        "type error: T41: `and` needs Bool operands, got I32? and Bool"
+    );
+}
+
+#[test]
+fn test_boolean_literal_refused_where_a_property_shadows_it() {
+    let schema = parse_schema(
+        "node Flag { slug: String  false: Bool  on: Bool }\nnode Switch { slug: String  flag: Bool }",
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let shadowed = |word: &str| {
+        format!(
+            "type error: T46: `{word}` is a Boolean literal here; the property named `false` of `Flag` cannot be named bare in a mutation `where`; rename it in the schema (`@rename_from`)"
+        )
+    };
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Flag where false = false }"),
+        shadowed("false")
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { update Flag set { on: true } where slug = \"a\" or not on = false }"
+        ),
+        shadowed("false")
+    );
+    assert_eq!(
+        refusal(&catalog, "query q() { delete Flag where on = true }"),
+        shadowed("true")
+    );
+    for query in [
+        "query q() { delete Flag where slug = \"a\" }",
+        "query q($on: Bool) { delete Flag where on = $on }",
+        "query q() { update Flag set { false: true, on: false } where slug = \"a\" }",
+        "query q() { delete Switch where flag = false }",
+        "query q() { delete Switch where true }",
+    ] {
+        accepted(&catalog, query);
+    }
+}
+
+#[test]
+fn test_assignments_and_binding_matches_take_constants() {
+    let catalog = setup_expressions();
+    for query in [
+        "query q($flag: Bool, $n: I32) { insert Person { name: \"x\", active: $flag or $n > 3 } }",
+        "query q($n: I32) { insert Person { name: \"x\", active: not $n > 3 and true } }",
+        "query q($n: I32) { update Person set { active: $n is null } where name = \"x\" }",
+        "query q($flag: Bool, $n: I32) { match { $p: Person { active: $flag and $n > 3 } } return { $p.name } }",
+        "query q() { match { $p: Person { active: 1 = 1, and: 2 } } return { $p.and } }",
+        "query q() { insert Person { name: \"x\", active: true, and: 1 } }",
+        "query q($t: String) { match { $p: Person { tags: $t } } return { $p.name } }",
+    ] {
+        accepted(&catalog, query);
+    }
+    let constants = "assignments and binding matches are constants per invocation";
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { insert Person { name: @id, active: true } }"
+        ),
+        format!("type error: T45: `@id` cannot appear in an assignment value; {constants}")
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { update Person set { name: $p.name } where active }"
+        ),
+        format!("type error: T45: `$p.name` cannot appear in an assignment value; {constants}")
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { match { $p: Person { name: $p.name } } return { $p.name } }"
+        ),
+        format!("type error: T45: `$p.name` cannot appear in an assignment value; {constants}")
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { match { $p: Person { name: search(1, 2) } } return { $p.name } }"
+        ),
+        format!("type error: T44: `search` cannot appear in an assignment value; {constants}")
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { insert Person { name: 1 = 1, active: true } }"
+        ),
+        "type error: T7: cannot assign/compare Bool with String for property `name`"
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { match { $p: Person { name: 1 = 1 } } return { $p.name } }"
+        ),
+        "type error: T7: cannot assign/compare Bool with String for property `name`"
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { match { $p: Person { tags: 1 = 1 } } return { $p.name } }"
+        ),
+        "type error: T7: cannot compare Bool membership against [String]? for property `tags`"
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { insert Person { name: $missing, active: true } }"
+        ),
+        "type error: T14: mutation variable `$missing` must be a declared query parameter"
+    );
+    assert_eq!(
+        refusal(
+            &catalog,
+            "query q() { match { $p: Person { active: $missing or true } } return { $p.name } }"
+        ),
+        "type error: T3: match variable `$missing` must be a declared query parameter"
+    );
 }

@@ -244,7 +244,9 @@ pub struct Param {
 pub enum Clause {
     Binding(Binding),
     Traversal(Traversal),
-    Filter(Filter),
+    /// A condition the type checker proves Boolean: a comparison today, any
+    /// Boolean expression once the grammar admits one.
+    Filter(Expr),
     Subquery(Subquery),
 }
 
@@ -311,17 +313,12 @@ pub struct Binding {
     pub prop_matches: Vec<PropMatch>,
 }
 
+/// `{ name: "x" }` inside a binding: `value` is a constant, a `Literal`, a
+/// `Variable` naming a declared parameter, or `Now`.
 #[derive(Debug, Clone)]
 pub struct PropMatch {
     pub prop_name: String,
-    pub value: MatchValue,
-}
-
-#[derive(Debug, Clone)]
-pub enum MatchValue {
-    Literal(Literal),
-    Variable(String),
-    Now,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone)]
@@ -339,14 +336,7 @@ pub struct Traversal {
     pub edge_binding: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct Filter {
-    pub left: Expr,
-    pub op: CompOp,
-    pub right: Expr,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompOp {
     Eq,
     Ne,
@@ -381,7 +371,29 @@ impl std::fmt::Display for CompOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// The operator of an [`Expr::Binary`] node: a comparison, or a Boolean
+/// combination of two Boolean operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinaryOp {
+    Compare(CompOp),
+    And,
+    Or,
+}
+
+impl std::fmt::Display for BinaryOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compare(op) => write!(f, "{op}"),
+            Self::And => f.write_str("and"),
+            Self::Or => f.write_str("or"),
+        }
+    }
+}
+
+/// One expression type for every clause; the clause's type check decides
+/// which node kinds it admits. Two trees are equal node by node, `Literal`
+/// by its own rule.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expr {
     Now,
     PropAccess {
@@ -422,6 +434,204 @@ pub enum Expr {
         arg: Box<Expr>,
     },
     AliasRef(String),
+    Binary {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+    },
+    Not(Box<Expr>),
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+}
+
+impl Expr {
+    /// `left <op> right` as one comparison node.
+    pub fn comparison(left: Expr, op: CompOp, right: Expr) -> Self {
+        Expr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Compare(op),
+            right: Box::new(right),
+        }
+    }
+
+    /// The operands and operator of a comparison-rooted expression; `None`
+    /// for every other node.
+    pub fn comparison_parts(&self) -> Option<(&Expr, CompOp, &Expr)> {
+        match self {
+            Expr::Binary {
+                left,
+                op: BinaryOp::Compare(op),
+                right,
+            } => Some((left, *op, right)),
+            _ => None,
+        }
+    }
+
+    /// The top-level `and` chain as its conjuncts, in written order; an
+    /// `or`, a `not` or a comparison is one conjunct.
+    pub fn conjuncts(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                let mut conjuncts = left.conjuncts();
+                conjuncts.extend(right.conjuncts());
+                conjuncts
+            }
+            other => vec![other],
+        }
+    }
+
+    /// Whether `self` is a `search`, `fuzzy` or `match_text` call.
+    pub fn is_search_call(&self) -> bool {
+        matches!(
+            self,
+            Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. }
+        )
+    }
+
+    /// Whether `self` is a search predicate in the one shape it lowers to:
+    /// a bare search call, or that call `= true`.
+    pub fn is_search_predicate(&self) -> bool {
+        self.is_search_call()
+            || matches!(
+                self.comparison_parts(),
+                Some((call, CompOp::Eq, Expr::Literal(Literal::Bool(true)))) if call.is_search_call()
+            )
+    }
+
+    /// The filter with every bare search call among its top-level conjuncts
+    /// spelled `call = true`, so both spellings reach the type checker and the
+    /// lowering as one shape.
+    pub fn with_search_predicates_spelled(self) -> Expr {
+        match self {
+            call if call.is_search_call() => {
+                Expr::comparison(call, CompOp::Eq, Expr::Literal(Literal::Bool(true)))
+            }
+            Expr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => Expr::Binary {
+                left: Box::new(left.with_search_predicates_spelled()),
+                op: BinaryOp::And,
+                right: Box::new(right.with_search_predicates_spelled()),
+            },
+            other => other,
+        }
+    }
+}
+
+/// Binding strength of an expression's root, for printing with minimal
+/// parentheses: `or` < `and` < `not` < comparison and null test < atom.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Precedence {
+    Or,
+    And,
+    Not,
+    Comparison,
+    Atom,
+}
+
+impl Expr {
+    fn precedence(&self) -> Precedence {
+        match self {
+            Expr::Binary {
+                op: BinaryOp::Or, ..
+            } => Precedence::Or,
+            Expr::Binary {
+                op: BinaryOp::And, ..
+            } => Precedence::And,
+            Expr::Not(_) => Precedence::Not,
+            Expr::Binary {
+                op: BinaryOp::Compare(_),
+                ..
+            }
+            | Expr::IsNull { .. } => Precedence::Comparison,
+            _ => Precedence::Atom,
+        }
+    }
+
+    /// Print `self` as an operand of a node with `parent` precedence, in
+    /// parentheses when it binds looser, when both are comparisons or null tests,
+    /// or as the right operand of an `and`/`or` it repeats (left-nested prints bare).
+    fn fmt_operand(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        parent: Precedence,
+        right_operand: bool,
+    ) -> std::fmt::Result {
+        let own = self.precedence();
+        let parenthesized =
+            own < parent || (own == parent && (parent == Precedence::Comparison || right_operand));
+        if parenthesized {
+            write!(f, "({self})")
+        } else {
+            write!(f, "{self}")
+        }
+    }
+}
+
+/// The expression as GQ text, the spelling the parser accepts, with a system
+/// field as written (`$p.@id`) and the minimal parentheses (`fmt_operand`),
+/// never the user's; the text an error quotes back.
+impl std::fmt::Display for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expr::Binary { left, op, right } => {
+                let precedence = self.precedence();
+                left.fmt_operand(f, precedence, false)?;
+                write!(f, " {op} ")?;
+                right.fmt_operand(f, precedence, true)
+            }
+            Expr::Not(operand) => {
+                f.write_str("not ")?;
+                operand.fmt_operand(f, Precedence::Not, false)
+            }
+            Expr::IsNull { expr, negated } => {
+                expr.fmt_operand(f, Precedence::Comparison, false)?;
+                f.write_str(if *negated { " is not null" } else { " is null" })
+            }
+            Expr::Now => f.write_str("now()"),
+            Expr::PropAccess { variable, property } => write!(f, "${variable}.{property}"),
+            Expr::Nearest {
+                variable,
+                property,
+                query,
+            } => write!(f, "nearest(${variable}.{property}, {query})"),
+            Expr::Search { field, query } => write!(f, "search({field}, {query})"),
+            Expr::Fuzzy {
+                field,
+                query,
+                max_edits: None,
+            } => write!(f, "fuzzy({field}, {query})"),
+            Expr::Fuzzy {
+                field,
+                query,
+                max_edits: Some(max_edits),
+            } => write!(f, "fuzzy({field}, {query}, {max_edits})"),
+            Expr::MatchText { field, query } => write!(f, "match_text({field}, {query})"),
+            Expr::Bm25 { field, query } => write!(f, "bm25({field}, {query})"),
+            Expr::Rrf {
+                primary,
+                secondary,
+                k: None,
+            } => write!(f, "rrf({primary}, {secondary})"),
+            Expr::Rrf {
+                primary,
+                secondary,
+                k: Some(k),
+            } => write!(f, "rrf({primary}, {secondary}, {k})"),
+            Expr::Variable(name) => write!(f, "${name}"),
+            Expr::Literal(literal) => write!(f, "{literal}"),
+            Expr::Aggregate { func, arg } => write!(f, "{func}({arg})"),
+            Expr::AliasRef(alias) => f.write_str(alias),
+        }
+    }
 }
 
 /// Lance's search output columns, appended under the target's prefix
@@ -448,7 +658,7 @@ impl Expr {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggFunc {
     Count,
     Sum,
@@ -469,7 +679,7 @@ impl std::fmt::Display for AggFunc {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Literal {
     Null,
     String(String),
@@ -479,6 +689,43 @@ pub enum Literal {
     Date(String),
     DateTime(String),
     List(Vec<Literal>),
+}
+
+/// Equality and hashing by value, with `Float` compared through
+/// `f64::to_bits`: `0.0` and `-0.0` are distinct and `NaN` equals itself, so
+/// the derived `Eq` and `Hash` of every expression type hold.
+impl PartialEq for Literal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Literal::Null, Literal::Null) => true,
+            (Literal::String(a), Literal::String(b)) => a == b,
+            (Literal::Integer(a), Literal::Integer(b)) => a == b,
+            (Literal::Float(a), Literal::Float(b)) => a.to_bits() == b.to_bits(),
+            (Literal::Bool(a), Literal::Bool(b)) => a == b,
+            (Literal::Date(a), Literal::Date(b)) => a == b,
+            (Literal::DateTime(a), Literal::DateTime(b)) => a == b,
+            (Literal::List(a), Literal::List(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Literal {}
+
+impl std::hash::Hash for Literal {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Literal::Null => {}
+            Literal::String(text) | Literal::Date(text) | Literal::DateTime(text) => {
+                text.hash(state)
+            }
+            Literal::Integer(value) => value.hash(state),
+            Literal::Float(value) => value.to_bits().hash(state),
+            Literal::Bool(value) => value.hash(state),
+            Literal::List(items) => items.hash(state),
+        }
+    }
 }
 
 /// The literal as explain text. It is the spelling the parser accepts except
@@ -566,28 +813,38 @@ pub struct InsertMutation {
     pub assignments: Vec<MutationAssignment>,
 }
 
+/// `update T set { … } where <predicate>`. The predicate names the target's
+/// properties as `Expr::PropAccess { variable: <type name>, property }`
+/// (the parser spells a bare `name` that way; see [`Expr::mutation_property`]).
 #[derive(Debug, Clone)]
 pub struct UpdateMutation {
     pub type_name: String,
     pub assignments: Vec<MutationAssignment>,
-    pub predicate: MutationPredicate,
+    pub predicate: Expr,
 }
 
+/// `delete T where <predicate>`, the predicate shaped as in [`UpdateMutation`].
 #[derive(Debug, Clone)]
 pub struct DeleteMutation {
     pub type_name: String,
-    pub predicate: MutationPredicate,
+    pub predicate: Expr,
 }
 
+/// `property: value` in an insert or update; `value` is a constant as in
+/// [`PropMatch`].
 #[derive(Debug, Clone)]
 pub struct MutationAssignment {
     pub property: String,
-    pub value: MatchValue,
+    pub value: Expr,
 }
 
-#[derive(Debug, Clone)]
-pub struct MutationPredicate {
-    pub property: String,
-    pub op: CompOp,
-    pub value: MatchValue,
+impl Expr {
+    /// A bare property in a mutation `where`, bound to the mutation's target
+    /// type: the type name stands where a read has a binding variable.
+    pub fn mutation_property(type_name: &str, property: &str) -> Self {
+        Expr::PropAccess {
+            variable: type_name.to_string(),
+            property: property.to_string(),
+        }
+    }
 }

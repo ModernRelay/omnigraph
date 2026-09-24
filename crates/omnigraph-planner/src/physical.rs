@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_schema::SchemaRef;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, SubqueryPredicate};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -412,11 +412,11 @@ pub enum PhysicalNode {
         left: NodeId,
         right: NodeId,
     },
-    /// The in-memory arm of a GQ filter: the ones the placement pass left
-    /// where the query wrote them.
+    /// The in-memory arm of a GQ filter: the conjuncts the placement pass
+    /// left where the query wrote them, each evaluated on its own.
     Filter {
         input: NodeId,
-        filters: Vec<IRFilter>,
+        filters: Vec<IRExpr>,
     },
     /// A traversal: the mode the cost model chose (or the session pinned), the
     /// estimate it was chosen for, the policy for taking the other mode, and

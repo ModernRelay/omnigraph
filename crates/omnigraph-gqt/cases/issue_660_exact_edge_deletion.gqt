@@ -1,0 +1,136 @@
+# issue: 660
+# red_on: 545176bd; admission refuses the case, the first `--- mutate` section does not parse at `and` (`mutation_predicate` admits one comparison), so no step runs.
+# notes: A compound mutation `where` selects the intersection: on four `Knows` edges (`ab1`, `ab2` from `a` to `b`, `ac`, `db`), `delete … where @src = "a" and @dst = "b"`
+# notes: removes exactly the two parallel edges (`edges=2`) and `ac`, `db` remain, across branch create, merge and restart; a compound `update` sets one property on exactly the intersected node rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    rank: I64
+    group: String?
+}
+edge Knows: Person -> Person {}
+
+--- seed
+{"type":"Person","data":{"name":"a","rank":1}}
+{"type":"Person","data":{"name":"b","rank":2}}
+{"type":"Person","data":{"name":"c","rank":3}}
+{"type":"Person","data":{"name":"d","rank":4}}
+{"edge":"Knows","id":"ab1","from":"a","to":"b"}
+{"edge":"Knows","id":"ab2","from":"a","to":"b"}
+{"edge":"Knows","id":"ac","from":"a","to":"c"}
+{"edge":"Knows","id":"db","from":"d","to":"b"}
+
+--- mutate
+query group_the_middle_ranks() {
+    update Person set { group: "middle" } where rank > 1 and rank < 4
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query groups() {
+    match { $p: Person }
+    return { $p.name, $p.group }
+}
+
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "b", "p.group": "middle"}
+{"p.name": "c", "p.group": "middle"}
+{"p.name": "d"}
+
+--- expect shape
+p.name: String
+p.group: String?
+
+--- mutate
+branch create exact
+
+--- expect ok
+
+--- mutate branch: exact
+query delete_the_pair() {
+    delete Knows where @src = "a" and @dst = "b"
+}
+
+--- expect affected: nodes=0 edges=2
+
+--- query branch: exact
+query edges_on_the_branch() {
+    match { $p: Person  $p $e:knows $q }
+    return { $e.@id as id }
+}
+
+--- expect unordered
+{"id": "ac"}
+{"id": "db"}
+
+--- expect shape
+id: String
+
+--- query branch: main
+query edges_on_main_before_merge() {
+    match { $p: Person  $p $e:knows $q }
+    return { $e.@id as id }
+}
+
+--- expect unordered
+{"id": "ab1"}
+{"id": "ab2"}
+{"id": "ac"}
+{"id": "db"}
+
+--- expect shape
+id: String
+
+--- mutate
+branch merge exact
+
+--- expect ok
+
+--- restart
+
+--- query branch: main
+query edges_on_main_after_merge_and_restart() {
+    match { $p: Person  $p $e:knows $q }
+    return { $e.@id as id }
+}
+
+--- expect unordered
+{"id": "ac"}
+{"id": "db"}
+
+--- expect shape
+id: String
+
+--- mutate branch: main
+query delete_by_parameters($src: String, $dst: String) {
+    delete Knows where @src = $src and @dst = $dst
+}
+
+--- params
+{"src": "d", "dst": "b"}
+
+--- expect affected: nodes=0 edges=1
+
+--- query branch: main
+query the_last_edge() {
+    match { $p: Person  $p $e:knows $q }
+    return { $e.@id as id }
+}
+
+--- expect unordered
+{"id": "ac"}
+
+--- expect shape
+id: String

@@ -1,25 +1,37 @@
 use super::*;
 
-use super::query::literal_to_sql;
+use crate::engine::{evaluate_constant, id_in_list_expr, ir_expr_to_df_expr};
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::PendingScanBudget;
+use datafusion::prelude::Expr;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
-/// Resolve an IRExpr to a concrete Literal value at runtime.
-fn resolve_expr_value(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
-    match expr {
-        IRExpr::Literal(lit) => Ok(lit.clone()),
-        IRExpr::Param(name) => params
-            .get(name)
-            .cloned()
-            .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name))),
-        other => Err(OmniError::manifest(format!(
-            "unsupported expression in mutation: {:?}",
-            other
-        ))),
+/// The assignments evaluated per attempt over the invocation's fixed parameter
+/// map (`now()` bound before the retry loop, so every attempt gets one value); a
+/// null result on a non-nullable property, `Blob` included, is refused before any batch.
+fn resolve_assignments(
+    type_name: &str,
+    schema: &Schema,
+    assignments: &[IRAssignment],
+    params: &ParamMap,
+) -> Result<HashMap<String, Literal>> {
+    let mut resolved = HashMap::with_capacity(assignments.len());
+    for assignment in assignments {
+        let value = evaluate_constant(&assignment.value, params)?;
+        let non_nullable = schema
+            .field_with_name(&assignment.property)
+            .is_ok_and(|field| !field.is_nullable());
+        if non_nullable && matches!(value, Literal::Null) {
+            return Err(OmniError::manifest(format!(
+                "cannot assign null to non-nullable property '{}' of {type_name}",
+                assignment.property
+            )));
+        }
+        resolved.insert(assignment.property.clone(), value);
     }
+    Ok(resolved)
 }
 
 /// Create a single-element or N-element array from a Literal, matching the target DataType.
@@ -386,56 +398,35 @@ fn build_insert_batch(
     RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
-/// Convert an IRMutationPredicate to a Lance SQL filter string.
-fn predicate_to_sql(
-    predicate: &IRMutationPredicate,
-    params: &ParamMap,
-    is_edge: bool,
-    system_columns: SystemColumns,
-) -> Result<String> {
-    let column = if is_edge {
-        match predicate.property.as_str() {
-            "from" | "@src" => system_columns.src.to_string(),
-            "to" | "@dst" => system_columns.dst.to_string(),
-            "@id" => system_columns.id.to_string(),
-            other => other.to_string(),
-        }
-    } else if predicate.property == "@id" {
-        system_columns.id.to_string()
-    } else if predicate.property.starts_with('@') {
+/// The mutation `where` as the typed DataFusion expression Lance evaluates,
+/// through the lowering a read scan uses; the compiler already put every
+/// property leaf on its physical column, and `schema` types the literals.
+fn mutation_predicate_expr(predicate: &IRExpr, params: &ParamMap, schema: &Schema) -> Result<Expr> {
+    if let Some(name) = first_unbound_param(predicate, params) {
         return Err(OmniError::manifest(format!(
-            "unsupported node meta-field '{}' in mutation predicate",
-            predicate.property
+            "parameter '{name}' not provided"
         )));
-    } else {
-        predicate.property.clone()
-    };
+    }
+    ir_expr_to_df_expr(predicate, params, Some(schema)).ok_or_else(|| {
+        OmniError::manifest(format!(
+            "unsupported expression in mutation predicate: {predicate}"
+        ))
+    })
+}
 
-    let value = resolve_expr_value(&predicate.value, params)?;
-    let value_sql = literal_to_sql(&value);
-
-    let op = match predicate.op {
-        CompOp::Eq => "=",
-        CompOp::Ne => "!=",
-        CompOp::Gt => ">",
-        CompOp::Lt => "<",
-        CompOp::Ge => ">=",
-        CompOp::Le => "<=",
-        // The mutation grammar only admits comparison ops; these arms are
-        // defense in depth for IR built outside the parser.
-        CompOp::Contains | CompOp::StringContains => {
-            return Err(OmniError::manifest(
-                "contains predicate not supported in mutations".to_string(),
-            ));
+/// The first parameter of a mutation predicate, in written order, that
+/// `params` does not bind: the lowering answers `None` for it, indistinguishable
+/// from an inexpressible shape, so the name is checked before lowering.
+fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a str> {
+    match expr {
+        IRExpr::Param(name) => (!params.contains_key(name)).then_some(name.as_str()),
+        IRExpr::Binary { left, right, .. } => {
+            first_unbound_param(left, params).or_else(|| first_unbound_param(right, params))
         }
-        CompOp::StartsWith => {
-            return Err(OmniError::manifest(
-                "starts_with predicate not supported in mutations".to_string(),
-            ));
-        }
-    };
-
-    Ok(format!("`{}` {} {}", column, op, value_sql))
+        IRExpr::Not(inner) => first_unbound_param(inner, params),
+        IRExpr::IsNull { expr, .. } => first_unbound_param(expr, params),
+        _ => None,
+    }
 }
 
 /// Replace specific columns in a RecordBatch with new literal values.
@@ -589,16 +580,10 @@ async fn open_table_for_mutation(
 /// cascade, or — if it is the only match — leaves the node undeleted). Only
 /// rows a prior predicate matched as definitely TRUE should be excluded:
 /// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
-fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
-    if prior.is_empty() {
-        base.to_string()
-    } else {
-        let excluded = prior
-            .iter()
-            .map(|p| format!("({p})"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        format!("({base}) AND (({excluded}) IS NOT TRUE)")
+fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
+    match prior.iter().cloned().reduce(Expr::or) {
+        None => base.clone(),
+        Some(excluded) => base.clone().and(excluded.is_not_true()),
     }
 }
 
@@ -1103,7 +1088,7 @@ impl Omnigraph {
             }
         }
 
-        let ir = lower_mutation_query(&query_decl)?;
+        let ir = lower_mutation_query(catalog, &query_decl)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
         Ok(ir)
@@ -1166,11 +1151,6 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let mut resolved: HashMap<String, Literal> = HashMap::new();
-        for a in assignments {
-            resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
-        }
-
         let catalog = &txn.catalog;
         let is_node = catalog.node_types.contains_key(type_name);
         let is_edge = catalog.edge_types.contains_key(type_name);
@@ -1178,6 +1158,7 @@ impl Omnigraph {
         if is_node {
             let node_type = &catalog.node_types[type_name];
             let schema = node_type.arrow_schema.clone();
+            let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
             let blob_props = node_type.blob_properties.clone();
             let id = if let Some(key_properties) = node_type.key.as_ref() {
                 let mut typed_keys = Vec::with_capacity(key_properties.len());
@@ -1243,6 +1224,7 @@ impl Omnigraph {
         } else if is_edge {
             let edge_type = &catalog.edge_types[type_name];
             let schema = edge_type.arrow_schema.clone();
+            let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
             let blob_props = edge_type.blob_properties.clone();
             let id = if let Some(key_columns) = edge_type.key.as_ref() {
                 let system_columns = catalog.system_columns;
@@ -1334,7 +1316,7 @@ impl Omnigraph {
         &self,
         type_name: &str,
         assignments: &[IRAssignment],
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -1364,8 +1346,8 @@ impl Omnigraph {
             }
         }
 
-        let pred_sql = predicate_to_sql(predicate, params, false, catalog.system_columns)?;
         let schema = catalog.node_types[type_name].arrow_schema.clone();
+        let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
         let blob_props = catalog.node_types[type_name].blob_properties.clone();
 
         let table_key = format!("node:{}", type_name);
@@ -1409,7 +1391,7 @@ impl Omnigraph {
                     pending_batches,
                     pending_schema,
                     None,
-                    Some(&pred_sql),
+                    Some(pred_expr),
                     Some(catalog.system_columns.id),
                     scan_budget,
                 )
@@ -1420,7 +1402,7 @@ impl Omnigraph {
                     &ds,
                     pending_batches,
                     pending_schema,
-                    Some(&pred_sql),
+                    Some(pred_expr),
                     Some(catalog.system_columns.id),
                     scan_budget,
                 )
@@ -1441,10 +1423,7 @@ impl Omnigraph {
 
         let affected_count = matched.num_rows();
 
-        let mut resolved: HashMap<String, Literal> = HashMap::new();
-        for a in assignments {
-            resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
-        }
+        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
@@ -1465,7 +1444,7 @@ impl Omnigraph {
     async fn execute_delete(
         &self,
         type_name: &str,
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -1484,13 +1463,17 @@ impl Omnigraph {
     async fn execute_delete_node(
         &self,
         type_name: &str,
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_sql = predicate_to_sql(predicate, params, false, txn.catalog.system_columns)?;
+        let pred_expr = mutation_predicate_expr(
+            predicate,
+            params,
+            &txn.catalog.node_types[type_name].arrow_schema,
+        )?;
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1505,24 +1488,11 @@ impl Omnigraph {
         // Delete is a STRICT op, so collapse #1 never skips its open.
         let ds = handle.expect("strict Delete op always opens its dataset");
 
-        // Scan matching IDs for cascade. Per D₂ this never overlaps with
-        // staged inserts (mixed insert/delete in one query is rejected at
-        // parse time), so we scan committed only. Exclude IDs a prior delete
-        // statement on this table already scheduled (deletes stage, so the
-        // committed snapshot is unchanged across statements): without this,
-        // overlapping predicates would double-count `affected_nodes` AND
-        // re-cascade already-deleted nodes' edges. The combined staged delete
-        // still removes the union, so we record the original `pred_sql` below.
         let scan_filter =
-            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
+            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
         let batches = self
             .storage()
-            .scan(
-                &ds,
-                Some(&[txn.catalog.system_columns.id]),
-                Some(&scan_filter),
-                None,
-            )
+            .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), scan_filter)
             .await?;
 
         let deleted_ids: Vec<String> = ids_from_batches(&batches);
@@ -1545,14 +1515,9 @@ impl Omnigraph {
         // path/version/op-kind via `ensure_path`.
         fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
         staging.record_deleted_ids(&table_key, &deleted_ids);
-        staging.record_delete(&table_key, pred_sql.clone());
+        staging.record_delete(&table_key, pred_expr.clone());
 
         let mut affected_edges = 0usize;
-        let escaped: Vec<String> = deleted_ids
-            .iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
-            .collect();
-        let id_list = escaped.join(", ");
 
         let edge_info: Vec<(String, String, String)> = txn
             .catalog
@@ -1564,23 +1529,22 @@ impl Omnigraph {
         for (edge_name, from_type, to_type) in &edge_info {
             let mut cascade_filters = Vec::new();
             if from_type == type_name {
-                cascade_filters.push(format!(
-                    "{} IN ({})",
-                    txn.catalog.system_columns.src, id_list
+                cascade_filters.push(id_in_list_expr(
+                    &deleted_ids,
+                    txn.catalog.system_columns.src,
                 ));
             }
             if to_type == type_name {
-                cascade_filters.push(format!(
-                    "{} IN ({})",
-                    txn.catalog.system_columns.dst, id_list
+                cascade_filters.push(id_in_list_expr(
+                    &deleted_ids,
+                    txn.catalog.system_columns.dst,
                 ));
             }
-            if cascade_filters.is_empty() {
+            let Some(cascade_filter) = cascade_filters.into_iter().reduce(Expr::or) else {
                 continue;
-            }
+            };
 
             let edge_table_key = format!("edge:{}", edge_name);
-            let cascade_filter = cascade_filters.join(" OR ");
             let (edge_handle, _edge_full_path, _edge_table_branch) = open_table_for_mutation(
                 self,
                 staging,
@@ -1613,11 +1577,10 @@ impl Omnigraph {
             let matched_ids = ids_from_batches(
                 &self
                     .storage()
-                    .scan(
+                    .scan_filtered(
                         &edge_ds,
                         Some(&[txn.catalog.system_columns.id]),
-                        Some(&count_filter),
-                        None,
+                        count_filter,
                     )
                     .await?,
             );
@@ -1643,13 +1606,17 @@ impl Omnigraph {
     async fn execute_delete_edge(
         &self,
         type_name: &str,
-        predicate: &IRMutationPredicate,
+        predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_sql = predicate_to_sql(predicate, params, true, txn.catalog.system_columns)?;
+        let pred_expr = mutation_predicate_expr(
+            predicate,
+            params,
+            &txn.catalog.edge_types[type_name].arrow_schema,
+        )?;
 
         let table_key = format!("edge:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1671,7 +1638,7 @@ impl Omnigraph {
         // ORIGINAL predicate below (the combined staged delete removes the
         // union); only record when something NEW matches.
         let count_filter =
-            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
+            dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
         // Scan the matched edge ids (not just count): the ids feed validation so
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
@@ -1679,19 +1646,14 @@ impl Omnigraph {
         let deleted_ids = ids_from_batches(
             &self
                 .storage()
-                .scan(
-                    &ds,
-                    Some(&[txn.catalog.system_columns.id]),
-                    Some(&count_filter),
-                    None,
-                )
+                .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), count_filter)
                 .await?,
         );
         let affected = deleted_ids.len();
 
         if affected > 0 {
             staging.record_deleted_ids(&table_key, &deleted_ids);
-            staging.record_delete(&table_key, pred_sql.clone());
+            staging.record_delete(&table_key, pred_expr.clone());
             self.invalidate_graph_index().await;
         }
 
@@ -1756,30 +1718,8 @@ fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
 }
 
 #[cfg(test)]
-mod predicate_sql_tests {
+mod literal_narrowing_tests {
     use super::*;
-
-    #[test]
-    fn predicate_to_sql_backtick_quotes_column_case_preserved() {
-        for (property, expected) in [
-            ("repoName", "`repoName` = 'acme'"),
-            ("interval", "`interval` = 'acme'"),
-        ] {
-            let predicate = IRMutationPredicate {
-                property: property.to_string(),
-                op: CompOp::Eq,
-                value: IRExpr::Literal(Literal::String("acme".into())),
-            };
-            let sql = predicate_to_sql(
-                &predicate,
-                &ParamMap::new(),
-                false,
-                omnigraph_compiler::SYSTEM_COLUMNS_V3,
-            )
-            .unwrap();
-            assert_eq!(sql, expected);
-        }
-    }
 
     #[test]
     fn scalar_narrowing_accepts_boundaries_and_rejects_wraparound() {

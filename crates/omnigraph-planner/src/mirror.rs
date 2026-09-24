@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, SubqueryPredicate};
-use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
+use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::{
     SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_META, SYSTEM_COLUMNS_V3, SystemColumns,
@@ -184,7 +184,7 @@ pub enum NodeMirror {
     },
     Filter {
         input: NodeId,
-        filters: Vec<FilterMirror>,
+        filters: Vec<ExprMirror>,
     },
     Expand {
         input: NodeId,
@@ -315,7 +315,7 @@ impl From<&PhysicalNode> for NodeMirror {
             },
             PhysicalNode::Filter { input, filters } => Self::Filter {
                 input: *input,
-                filters: filters.iter().map(FilterMirror::from).collect(),
+                filters: filters.iter().map(ExprMirror::from).collect(),
             },
             PhysicalNode::Expand {
                 input,
@@ -466,7 +466,7 @@ impl TryFrom<NodeMirror> for PhysicalNode {
             NodeMirror::CrossJoin { left, right } => Self::CrossJoin { left, right },
             NodeMirror::Filter { input, filters } => Self::Filter {
                 input,
-                filters: filters.into_iter().map(IRFilter::from).collect(),
+                filters: filters.into_iter().map(IRExpr::from).collect(),
             },
             NodeMirror::Expand {
                 input,
@@ -758,7 +758,7 @@ pub enum PredicateMirror {
     Gq {
         reads: Vec<ColumnRef>,
         text: String,
-        filter: FilterMirror,
+        filter: ExprMirror,
     },
 }
 
@@ -781,7 +781,7 @@ impl From<&Predicate> for PredicateMirror {
             } => Self::Gq {
                 reads: reads.clone(),
                 text: text.clone(),
-                filter: FilterMirror::from(&filter.0),
+                filter: ExprMirror::from(&filter.0),
             },
         }
     }
@@ -803,35 +803,36 @@ impl From<PredicateMirror> for Predicate {
             } => Self::Gq {
                 reads,
                 text,
-                filter: GqFilter(IRFilter::from(filter)),
+                filter: GqFilter(IRExpr::from(filter)),
             },
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FilterMirror {
-    pub left: ExprMirror,
-    pub op: CompOpMirror,
-    pub right: ExprMirror,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryOpMirror {
+    Compare(CompOpMirror),
+    And,
+    Or,
 }
 
-impl From<&IRFilter> for FilterMirror {
-    fn from(filter: &IRFilter) -> Self {
-        Self {
-            left: ExprMirror::from(&filter.left),
-            op: CompOpMirror::from(filter.op),
-            right: ExprMirror::from(&filter.right),
+impl From<BinaryOp> for BinaryOpMirror {
+    fn from(op: BinaryOp) -> Self {
+        match op {
+            BinaryOp::Compare(op) => Self::Compare(CompOpMirror::from(op)),
+            BinaryOp::And => Self::And,
+            BinaryOp::Or => Self::Or,
         }
     }
 }
 
-impl From<FilterMirror> for IRFilter {
-    fn from(mirror: FilterMirror) -> Self {
-        Self {
-            left: IRExpr::from(mirror.left),
-            op: CompOp::from(mirror.op),
-            right: IRExpr::from(mirror.right),
+impl From<BinaryOpMirror> for BinaryOp {
+    fn from(mirror: BinaryOpMirror) -> Self {
+        match mirror {
+            BinaryOpMirror::Compare(op) => Self::Compare(CompOp::from(op)),
+            BinaryOpMirror::And => Self::And,
+            BinaryOpMirror::Or => Self::Or,
         }
     }
 }
@@ -1067,6 +1068,18 @@ pub enum ExprMirror {
     AliasRef {
         alias: String,
     },
+    Binary {
+        left: Box<ExprMirror>,
+        op: BinaryOpMirror,
+        right: Box<ExprMirror>,
+    },
+    Not {
+        operand: Box<ExprMirror>,
+    },
+    IsNull {
+        operand: Box<ExprMirror>,
+        negated: bool,
+    },
 }
 
 fn boxed(expr: &IRExpr) -> Box<ExprMirror> {
@@ -1135,6 +1148,18 @@ impl From<&IRExpr> for ExprMirror {
             IRExpr::AliasRef(alias) => Self::AliasRef {
                 alias: alias.clone(),
             },
+            IRExpr::Binary { left, op, right } => Self::Binary {
+                left: boxed(left),
+                op: BinaryOpMirror::from(*op),
+                right: boxed(right),
+            },
+            IRExpr::Not(operand) => Self::Not {
+                operand: boxed(operand),
+            },
+            IRExpr::IsNull { expr, negated } => Self::IsNull {
+                operand: boxed(expr),
+                negated: *negated,
+            },
         }
     }
 }
@@ -1192,6 +1217,16 @@ impl From<ExprMirror> for IRExpr {
                 arg: unboxed(*arg),
             },
             ExprMirror::AliasRef { alias } => Self::AliasRef(alias),
+            ExprMirror::Binary { left, op, right } => Self::Binary {
+                left: unboxed(*left),
+                op: BinaryOp::from(op),
+                right: unboxed(*right),
+            },
+            ExprMirror::Not { operand } => Self::Not(unboxed(*operand)),
+            ExprMirror::IsNull { operand, negated } => Self::IsNull {
+                expr: unboxed(*operand),
+                negated,
+            },
         }
     }
 }

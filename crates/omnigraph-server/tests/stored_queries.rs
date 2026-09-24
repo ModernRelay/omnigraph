@@ -3,8 +3,10 @@
 
 use axum::body::Body;
 use axum::http::StatusCode;
-use omnigraph_server::AppState;
+use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
+use omnigraph_server::{AppState, ProcessDefaults};
 use serde_json::{Value, json};
+use serial_test::serial;
 
 mod support;
 use support::*;
@@ -718,4 +720,241 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["affected_nodes"], 1, "body: {body}");
     assert_receipt_commit_matches_get(&app, &body, "t-full").await;
+}
+
+const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person  $p.age > 30 or $p.name = $name } return { $p.name } }";
+
+/// [`app_with_stored_queries`] with the process defaults every invocation's
+/// session starts from, seeded here instead of the process environment.
+async fn app_with_stored_queries_on_process_defaults(
+    specs: &[(&str, &str, bool)],
+    defaults: ProcessDefaults,
+) -> (tempfile::TempDir, axum::Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(&policy_path, INVOKE_POLICY_YAML).unwrap();
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![("act-invoke".to_string(), "t-invoke".to_string())],
+        Some(&policy_path),
+        stored_query_registry(specs),
+    )
+    .await
+    .unwrap()
+    .with_process_defaults(defaults);
+    (temp, omnigraph_server::build_app(state))
+}
+
+/// A stored query carries no `set engine`, so a compound predicate in it follows the
+/// process default: the gate error under the v1 default, rows under `OMNIGRAPH_ENGINE=v2`.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_read_with_a_compound_predicate_follows_the_process_engine() {
+    let specs: &[(&str, &str, bool)] = &[("older_or_named", OLDER_OR_NAMED_GQ, false)];
+    let params = json!({ "params": { "name": "Bob" } });
+
+    let (_temp, app) =
+        app_with_stored_queries_on_process_defaults(specs, ProcessDefaults::default()).await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request("older_or_named", "t-invoke", params.clone()),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "body: {body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error
+            .contains("compound predicates (and, or, not, is null) are not supported on engine v1"),
+        "body: {body}"
+    );
+    assert!(
+        error.contains(
+            "add \"set engine = v2;\" before the query, or start the server with OMNIGRAPH_ENGINE=v2"
+        ),
+        "body: {body}"
+    );
+
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string())
+    })
+    .unwrap();
+    let (_temp, app) =
+        app_with_stored_queries_on_process_defaults(specs, ProcessDefaults { settings, sources })
+            .await;
+    let (status, body) =
+        json_response(&app, invoke_request("older_or_named", "t-invoke", params)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["row_count"], 2,
+        "Charlie is older than 30 and Bob is named; body: {body}"
+    );
+    let mut names: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["p.name"].as_str().unwrap_or_default())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Bob", "Charlie"], "body: {body}");
+}
+
+fn spec(name: &str, source: &str) -> RegistrySpec {
+    RegistrySpec {
+        name: name.to_string(),
+        source: source.to_string(),
+        expose: true,
+        tool_name: None,
+    }
+}
+
+fn cluster_invoke(graph_id: &str, name: &str, body: Value) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .uri(format!("/graphs/{graph_id}/queries/{name}"))
+        .method(axum::http::Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+/// A stored `where and = 1` or `as and` no longer parses, the registry refusal the cluster
+/// boot quarantines on and the import refuses; rewritten to `conj`, the registry imports,
+/// applies, boots under strict `require_all_graphs` with no quarantine, and serves.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn registry_rewritten_away_from_reserved_words_reloads_without_quarantine() {
+    let reserved_where = "query clear_flag() { update Person set { and: 0 } where and = 1 }";
+    let reserved_alias =
+        "query by_and() { match { $p: Person } return { $p.slug, $p.and as and } order { and } }";
+    let errors = QueryRegistry::from_specs(vec![
+        spec("clear_flag", reserved_where),
+        spec("by_and", reserved_alias),
+    ])
+    .expect_err("reserved-word sources must not load");
+    let details: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("stored query 'clear_flag'")
+                && detail.contains("`and` is a reserved word; a property of that name is written `$p.and` in a read and cannot be named bare in a mutation `where`")
+        }),
+        "{details:?}"
+    );
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("stored query 'by_and'")
+                && detail.contains("`and` is a reserved word and cannot be a return alias")
+        }),
+        "{details:?}"
+    );
+
+    let cluster_yaml = r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      add_person:
+        file: ./mutations.gq
+      clear_flag:
+        file: ./mutations.gq
+      by_conj:
+        file: ./reads.gq
+"#;
+
+    let reserved = tempfile::tempdir().unwrap();
+    std::fs::write(
+        reserved.path().join("people.pg"),
+        "\nnode Person {\n  slug: String @key\n  and: I64\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        reserved.path().join("mutations.gq"),
+        format!(
+            "query add_person($slug: String, $n: I64) {{ insert Person {{ slug: $slug, and: $n }} }}\n{reserved_where}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        reserved.path().join("reads.gq"),
+        reserved_alias.replace("by_and", "by_conj"),
+    )
+    .unwrap();
+    std::fs::write(reserved.path().join("cluster.yaml"), cluster_yaml).unwrap();
+    let import = omnigraph_cluster::import_config_dir(reserved.path()).await;
+    assert!(!import.ok, "{:?}", import.diagnostics);
+    let parse_errors: Vec<&str> = import
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "query_parse_error")
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert!(
+        parse_errors
+            .iter()
+            .any(|message| message.contains("cannot be named bare in a mutation `where`"))
+            && parse_errors
+                .iter()
+                .any(|message| message.contains("cannot be a return alias")),
+        "both reserved-word sources are refused at import: {:?}",
+        import.diagnostics
+    );
+
+    let rewritten = tempfile::tempdir().unwrap();
+    std::fs::write(
+        rewritten.path().join("people.pg"),
+        "\nnode Person {\n  slug: String @key\n  conj: I64\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        rewritten.path().join("mutations.gq"),
+        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { update Person set { conj: 0 } where conj = 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        rewritten.path().join("reads.gq"),
+        "query by_conj() { match { $p: Person } return { $p.slug, $p.conj as conj } order { conj } }\n",
+    )
+    .unwrap();
+    std::fs::write(rewritten.path().join("cluster.yaml"), cluster_yaml).unwrap();
+    let import = omnigraph_cluster::import_config_dir(rewritten.path()).await;
+    assert!(import.ok, "{:?}", import.diagnostics);
+    let apply = omnigraph_cluster::apply_config_dir(rewritten.path()).await;
+    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+
+    let settings = cluster_settings(rewritten.path()).await.unwrap();
+    let omnigraph_server::ServerConfigMode::Multi {
+        graphs,
+        config_path,
+        server_policy,
+    } = settings.mode;
+    assert_eq!(graphs.len(), 1, "the one graph is served, none quarantined");
+    let state = omnigraph_server::open_multi_graph_state(
+        graphs,
+        Vec::new(),
+        server_policy.as_ref(),
+        config_path,
+        true,
+    )
+    .await
+    .unwrap();
+    let app = omnigraph_server::build_app(state);
+
+    let (status, body) = json_response(
+        &app,
+        cluster_invoke(
+            "knowledge",
+            "add_person",
+            json!({ "params": { "slug": "one", "n": 1 } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (status, body) =
+        json_response(&app, cluster_invoke("knowledge", "clear_flag", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["affected_nodes"], 1, "body: {body}");
+    let (status, body) =
+        json_response(&app, cluster_invoke("knowledge", "by_conj", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["row_count"], 1, "body: {body}");
+    assert_eq!(body["rows"][0]["conj"], 0, "body: {body}");
 }

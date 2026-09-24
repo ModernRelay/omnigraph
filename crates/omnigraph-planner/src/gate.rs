@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use arrow_schema::SchemaRef;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, QueryIR};
 use omnigraph_compiler::settings::{SettingId, Traversal};
 use omnigraph_compiler::types::Direction;
 use serde_json::{Value, json};
@@ -92,10 +92,9 @@ impl PlanSource for Recorded<'_> {
         Ok(spec)
     }
 
-    fn filter_pushable(&self, filter: &IRFilter) -> bool {
+    fn filter_pushable(&self, filter: &IRExpr) -> bool {
         let mut read = self.read.borrow_mut();
-        params_of_expr(&filter.left, &mut read.params);
-        params_of_expr(&filter.right, &mut read.params);
+        params_of_expr(filter, &mut read.params);
         drop(read);
         self.source.filter_pushable(filter)
     }
@@ -183,6 +182,11 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             }
         }
         IRExpr::Aggregate { arg, .. } => params_of_expr(arg, out),
+        IRExpr::Binary { left, right, .. } => {
+            params_of_expr(left, out);
+            params_of_expr(right, out);
+        }
+        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => params_of_expr(inner, out),
         IRExpr::PropAccess { .. }
         | IRExpr::Variable(_)
         | IRExpr::Literal(_)

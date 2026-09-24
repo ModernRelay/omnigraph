@@ -13,11 +13,11 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
                 dst_type: "T".to_string(),
                 min_hops: 1,
                 max_hops: Some(1),
-                dst_filters: vec![IRFilter {
-                    left: prop("b", "state"),
-                    op: CompOp::Eq,
-                    right: IRExpr::Literal(Literal::String("open".into())),
-                }],
+                dst_filters: vec![IRExpr::comparison(
+                    prop("b", "state"),
+                    CompOp::Eq,
+                    IRExpr::Literal(Literal::String("open".into())),
+                )],
                 edge_binding: None,
             },
         ],

@@ -23,7 +23,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRFilter, ParamMap};
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use omnigraph_planner::AccessPath;
 
 use super::memory::WorkMemory;
@@ -45,7 +45,7 @@ const OUTPUT: &str = "hash join output";
 pub(crate) struct LookupSpec {
     pub(crate) type_name: String,
     pub(crate) binding: String,
-    pub(crate) filters: Vec<IRFilter>,
+    pub(crate) filters: Vec<IRExpr>,
     pub(crate) projection: Option<NeededColumns>,
     pub(crate) params: Arc<ParamMap>,
     pub(crate) snapshot: Snapshot,

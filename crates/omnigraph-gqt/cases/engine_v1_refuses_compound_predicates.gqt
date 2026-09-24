@@ -1,0 +1,211 @@
+# issue: none
+# notes: Engine v1 evaluates one comparison over property, literal and parameter operands, or a search call, per filter
+# notes: position, and no comparison in return or order; every other shape is the gate error naming the construct and both switches, the same text runs under v2, a type fault is the plain type error under both, and mutations are not gated.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    age: I64?
+    enabled: Bool
+    embedding: Vector(2) @index
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","name":"alice","age":40,"enabled":true,"embedding":[1.0,0.0]}}
+{"type":"Person","data":{"slug":"b","name":"bob","age":20,"enabled":false,"embedding":[0.0,1.0]}}
+{"type":"Person","data":{"slug":"c","name":"carol","enabled":true,"embedding":[1.0,1.0]}}
+
+--- query
+set engine = v1;
+query disjunction() {
+    match { $p: Person  $p.age > 30 or $p.name = "bob" }
+    return { $p.slug }
+}
+
+--- expect error: plan error: compound predicates (and, or, not, is null) are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v2;
+query disjunction() {
+    match { $p: Person  $p.age > 30 or $p.name = "bob" }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v1;
+query negation() {
+    match { $p: Person  not ($p.age > 30) }
+    return { $p.slug }
+}
+
+--- expect error: plan error: compound predicates (and, or, not, is null) are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v1;
+query null_test() {
+    match { $p: Person  $p.age is null }
+    return { $p.slug }
+}
+
+--- expect error: plan error: compound predicates (and, or, not, is null) are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v1;
+query comparison_in_return() {
+    match { $p: Person }
+    return { $p.slug, $p.age > 30 as adult }
+}
+
+--- expect error: plan error: comparisons in return or order are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v1;
+query null_test_in_return() {
+    match { $p: Person }
+    return { $p.slug, $p.age is null as missing }
+}
+
+--- expect error: plan error: comparisons in return or order are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v1;
+query leading_nearest_runs($q: Vector(2)) {
+    match { $p: Person  $p.enabled = true }
+    return { $p.slug }
+    order { nearest($p.embedding, $q) }
+    limit 1
+}
+
+--- params
+{"q": [1.0, 0.0]}
+
+--- expect ordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v1;
+query bare_boolean_property() {
+    match { $p: Person  $p.enabled }
+    return { $p.slug }
+}
+
+--- expect error: plan error: filters other than one comparison or search call are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v2;
+query bare_boolean_property() {
+    match { $p: Person  $p.enabled }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v1;
+query bare_boolean_parameter($flag: Bool) {
+    match { $p: Person  $flag }
+    return { $p.slug }
+}
+
+--- params
+{"flag": true}
+
+--- expect error: plan error: filters other than one comparison or search call are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v2;
+query bare_boolean_parameter($flag: Bool) {
+    match { $p: Person  $flag }
+    return { $p.slug }
+}
+
+--- params
+{"flag": true}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v1;
+query comparison_of_comparisons() {
+    match {
+        $p: Person
+        $q: Person { slug: "b" }
+        ($p.age > 30) = ($q.age > 30)
+    }
+    return { $p.slug }
+}
+
+--- expect error: plan error: filters other than one comparison or search call are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v2;
+query comparison_of_comparisons() {
+    match {
+        $p: Person
+        $q: Person { slug: "b" }
+        ($p.age > 30) = ($q.age > 30)
+    }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v1;
+query type_fault_inside_compound() {
+    match { $p: Person  $p.enabled and $p.name }
+    return { $p.slug }
+}
+
+--- expect error: T41: `and` needs Bool operands, got Bool and String
+
+--- query
+set engine = v2;
+query type_fault_inside_compound() {
+    match { $p: Person  $p.enabled and $p.name }
+    return { $p.slug }
+}
+
+--- expect error: T41: `and` needs Bool operands, got Bool and String
+
+--- mutate
+query compound_where_is_not_gated($cut: I64) {
+    update Person set { enabled: false } where age < $cut or name = "carol"
+}
+
+--- params
+{"cut": 30}
+
+--- expect affected: nodes=2 edges=0

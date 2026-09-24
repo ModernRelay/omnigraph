@@ -1,9 +1,10 @@
+pub mod fold;
 pub(crate) mod lower;
 pub(crate) mod validate;
 
 use std::collections::HashMap;
 
-use crate::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME, Param};
+use crate::query::ast::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Param, Precedence};
 use crate::types::Direction;
 
 #[derive(Debug, Clone)]
@@ -29,27 +30,23 @@ pub enum MutationOpIR {
         type_name: String,
         assignments: Vec<IRAssignment>,
     },
+    /// `predicate` is Boolean over the target's properties, each spelled
+    /// `IRExpr::PropAccess { variable: <type name>, property: <physical column> }`,
+    /// and the declared parameters.
     Update {
         type_name: String,
         assignments: Vec<IRAssignment>,
-        predicate: IRMutationPredicate,
+        predicate: IRExpr,
     },
     Delete {
         type_name: String,
-        predicate: IRMutationPredicate,
+        predicate: IRExpr,
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IRAssignment {
     pub property: String,
-    pub value: IRExpr,
-}
-
-#[derive(Debug, Clone)]
-pub struct IRMutationPredicate {
-    pub property: String,
-    pub op: CompOp,
     pub value: IRExpr,
 }
 
@@ -61,7 +58,8 @@ pub enum IROp {
     NodeScan {
         variable: String,
         type_name: String,
-        filters: Vec<IRFilter>,
+        /// Boolean expressions over `variable`, one per inline binding match.
+        filters: Vec<IRExpr>,
     },
     Expand {
         src_var: String,
@@ -74,14 +72,15 @@ pub enum IROp {
         /// Filters from a deferred destination binding, pushed into the
         /// Expand so the executor can apply them during hydration (Lance
         /// SQL pushdown) rather than as a separate post-expand pass.
-        dst_filters: Vec<IRFilter>,
+        dst_filters: Vec<IRExpr>,
         /// Variable bound to the matched edge row (`$p $w:knows $f`), if any.
         /// Changes the op's contract: one output row per matching edge ROW
         /// (not per distinct endpoint pair), edge property columns carried
         /// under this prefix. Always single-hop (typecheck T23).
         edge_binding: Option<String>,
     },
-    Filter(IRFilter),
+    /// A Boolean expression the type checker proved, as written.
+    Filter(IRExpr),
     /// A correlated subquery, decorrelated: `inner` runs once over the outer
     /// rows and `predicate` decides per outer row on the aggregate of its
     /// matches. `not { … }` is the anti-join case, `count = 0`.
@@ -96,7 +95,7 @@ pub enum IROp {
 
 /// The HAVING predicate of a correlated subquery: `func` over the inner
 /// matches of one outer row, compared with `right` (a literal or parameter).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SubqueryPredicate {
     pub func: AggFunc,
     /// `None` counts the matched rows.
@@ -158,25 +157,113 @@ impl std::fmt::Display for SubqueryPredicate {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct IRFilter {
-    pub left: IRExpr,
-    pub op: CompOp,
-    pub right: IRExpr,
-}
+impl IRExpr {
+    /// `left <op> right` as one comparison node.
+    pub fn comparison(left: IRExpr, op: CompOp, right: IRExpr) -> Self {
+        IRExpr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Compare(op),
+            right: Box::new(right),
+        }
+    }
 
-/// The filter as GQ text, `$p.age > 30`: what a plan prints for it.
-impl std::fmt::Display for IRFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {} {}", self.left, self.op, self.right)
+    /// The operands and operator of a comparison-rooted expression; `None`
+    /// for every other node.
+    pub fn comparison_parts(&self) -> Option<(&IRExpr, CompOp, &IRExpr)> {
+        match self {
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::Compare(op),
+                right,
+            } => Some((left, *op, right)),
+            _ => None,
+        }
+    }
+
+    /// The top-level `and` chain split into its conjuncts, in written order;
+    /// an `or`, a `not` or a comparison is one conjunct.
+    pub fn into_conjuncts(self) -> Vec<IRExpr> {
+        match self {
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                let mut conjuncts = left.into_conjuncts();
+                conjuncts.extend(right.into_conjuncts());
+                conjuncts
+            }
+            other => vec![other],
+        }
+    }
+
+    /// The conjunction of `conjuncts`, left-nested; `None` when empty.
+    pub fn and_all(conjuncts: impl IntoIterator<Item = IRExpr>) -> Option<IRExpr> {
+        conjuncts.into_iter().reduce(|left, right| IRExpr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+        })
+    }
+
+    fn precedence(&self) -> Precedence {
+        match self {
+            IRExpr::Binary {
+                op: BinaryOp::Or, ..
+            } => Precedence::Or,
+            IRExpr::Binary {
+                op: BinaryOp::And, ..
+            } => Precedence::And,
+            IRExpr::Not(_) => Precedence::Not,
+            IRExpr::Binary {
+                op: BinaryOp::Compare(_),
+                ..
+            }
+            | IRExpr::IsNull { .. } => Precedence::Comparison,
+            _ => Precedence::Atom,
+        }
+    }
+
+    /// Print `self` as an operand of a node with `parent` precedence, in
+    /// parentheses when it binds looser, when both are comparisons or null tests,
+    /// or as the right operand of an `and`/`or` it repeats (left-nested prints bare).
+    fn fmt_operand(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        parent: Precedence,
+        right_operand: bool,
+    ) -> std::fmt::Result {
+        let own = self.precedence();
+        let parenthesized =
+            own < parent || (own == parent && (parent == Precedence::Comparison || right_operand));
+        if parenthesized {
+            write!(f, "({self})")
+        } else {
+            write!(f, "{self}")
+        }
     }
 }
 
 /// The expression as GQ text, the spelling the parser accepts; the `now()`
-/// parameter prints as the call it came from.
+/// parameter prints as the call it came from. Parentheses are the minimal
+/// ones (`fmt_operand`), never the user's.
 impl std::fmt::Display for IRExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            IRExpr::Binary { left, op, right } => {
+                let precedence = self.precedence();
+                left.fmt_operand(f, precedence, false)?;
+                write!(f, " {op} ")?;
+                right.fmt_operand(f, precedence, true)
+            }
+            IRExpr::Not(operand) => {
+                f.write_str("not ")?;
+                operand.fmt_operand(f, Precedence::Not, false)
+            }
+            IRExpr::IsNull { expr, negated } => {
+                expr.fmt_operand(f, Precedence::Comparison, false)?;
+                f.write_str(if *negated { " is not null" } else { " is null" })
+            }
             IRExpr::PropAccess { variable, property } => write!(f, "${variable}.{property}"),
             IRExpr::Nearest {
                 variable,
@@ -227,38 +314,54 @@ mod render_tests {
         }
     }
 
+    fn int(value: i64) -> IRExpr {
+        IRExpr::Literal(Literal::Integer(value))
+    }
+
+    fn and(left: IRExpr, right: IRExpr) -> IRExpr {
+        IRExpr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+        }
+    }
+
+    fn or(left: IRExpr, right: IRExpr) -> IRExpr {
+        IRExpr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::Or,
+            right: Box::new(right),
+        }
+    }
+
     #[test]
     fn filters_and_expressions_print_as_gq() {
-        let filter = IRFilter {
-            left: prop("p", "age"),
-            op: CompOp::Gt,
-            right: IRExpr::Literal(Literal::Integer(30)),
-        };
+        let filter = IRExpr::comparison(prop("p", "age"), CompOp::Gt, int(30));
         assert_eq!(filter.to_string(), "$p.age > 30");
-        let filter = IRFilter {
-            left: prop("d", "slug"),
-            op: CompOp::StartsWith,
-            right: IRExpr::Param("prefix".to_string()),
-        };
+        let filter = IRExpr::comparison(
+            prop("d", "slug"),
+            CompOp::StartsWith,
+            IRExpr::Param("prefix".to_string()),
+        );
         assert_eq!(filter.to_string(), "$d.slug starts_with $prefix");
-        let filter = IRFilter {
-            left: prop("d", "tags"),
-            op: CompOp::Contains,
-            right: IRExpr::Literal(Literal::List(vec![
+        let filter = IRExpr::comparison(
+            prop("d", "tags"),
+            CompOp::Contains,
+            IRExpr::Literal(Literal::List(vec![
                 Literal::String("a\"b".to_string()),
                 Literal::Bool(true),
                 Literal::Float(1.5),
             ])),
-        };
+        );
         assert_eq!(
             filter.to_string(),
             "$d.tags contains [\"a\\\"b\", true, 1.5]"
         );
-        let filter = IRFilter {
-            left: prop("e", "since"),
-            op: CompOp::Le,
-            right: IRExpr::Param(NOW_PARAM_NAME.to_string()),
-        };
+        let filter = IRExpr::comparison(
+            prop("e", "since"),
+            CompOp::Le,
+            IRExpr::Param(NOW_PARAM_NAME.to_string()),
+        );
         assert_eq!(filter.to_string(), "$e.since <= now()");
         let nearest = IRExpr::Nearest {
             variable: "d".to_string(),
@@ -331,6 +434,75 @@ mod render_tests {
     }
 
     #[test]
+    fn boolean_trees_print_with_minimal_parentheses() {
+        let a = IRExpr::comparison(prop("p", "a"), CompOp::Eq, int(1));
+        let b = IRExpr::comparison(prop("p", "b"), CompOp::Eq, int(2));
+        let c = IRExpr::comparison(prop("p", "c"), CompOp::Eq, int(3));
+        assert_eq!(
+            or(a.clone(), and(b.clone(), c.clone())).to_string(),
+            "$p.a = 1 or $p.b = 2 and $p.c = 3"
+        );
+        assert_eq!(
+            and(or(a.clone(), b.clone()), c.clone()).to_string(),
+            "($p.a = 1 or $p.b = 2) and $p.c = 3"
+        );
+        assert_eq!(
+            IRExpr::Not(Box::new(and(a.clone(), b.clone()))).to_string(),
+            "not ($p.a = 1 and $p.b = 2)"
+        );
+        assert_eq!(
+            and(IRExpr::Not(Box::new(a.clone())), b.clone()).to_string(),
+            "not $p.a = 1 and $p.b = 2"
+        );
+        assert_eq!(
+            and(and(a.clone(), b.clone()), c.clone()).to_string(),
+            "$p.a = 1 and $p.b = 2 and $p.c = 3"
+        );
+        assert_eq!(
+            and(a.clone(), and(b.clone(), c.clone())).to_string(),
+            "$p.a = 1 and ($p.b = 2 and $p.c = 3)"
+        );
+        assert_eq!(
+            or(a.clone(), or(b.clone(), c.clone())).to_string(),
+            "$p.a = 1 or ($p.b = 2 or $p.c = 3)"
+        );
+        let age = IRExpr::comparison(prop("p", "age"), CompOp::Gt, int(30));
+        assert_eq!(
+            IRExpr::comparison(
+                age.clone(),
+                CompOp::Eq,
+                IRExpr::Literal(Literal::Bool(true))
+            )
+            .to_string(),
+            "($p.age > 30) = true"
+        );
+        assert_eq!(
+            IRExpr::IsNull {
+                expr: Box::new(age.clone()),
+                negated: false,
+            }
+            .to_string(),
+            "($p.age > 30) is null"
+        );
+        assert_eq!(
+            IRExpr::IsNull {
+                expr: Box::new(prop("p", "age")),
+                negated: true,
+            }
+            .to_string(),
+            "$p.age is not null"
+        );
+        assert_eq!(
+            and(and(a.clone(), b.clone()), c.clone()).into_conjuncts(),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(
+            IRExpr::and_all([a.clone(), b.clone(), c.clone()]),
+            Some(and(and(a, b), c))
+        );
+    }
+
+    #[test]
     fn floats_print_in_fixed_notation_with_a_decimal_point() {
         for (value, text) in [
             (1e-7, "0.0000001"),
@@ -352,7 +524,11 @@ mod render_tests {
     }
 }
 
-#[derive(Debug, Clone)]
+/// The bound expression: one type for filters, projections, order keys,
+/// assignments and mutation predicates. Equal when the trees are equal node
+/// by node (`Literal::Float` by bits), the equality the planner's filter
+/// deduplication and the `Predicate` hash rely on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IRExpr {
     PropAccess {
         variable: String,
@@ -393,15 +569,25 @@ pub enum IRExpr {
         arg: Box<IRExpr>,
     },
     AliasRef(String),
+    Binary {
+        left: Box<IRExpr>,
+        op: BinaryOp,
+        right: Box<IRExpr>,
+    },
+    Not(Box<IRExpr>),
+    IsNull {
+        expr: Box<IRExpr>,
+        negated: bool,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IRProjection {
     pub expr: IRExpr,
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IROrdering {
     pub expr: IRExpr,
     pub descending: bool,

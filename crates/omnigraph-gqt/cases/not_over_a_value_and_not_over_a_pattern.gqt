@@ -1,0 +1,57 @@
+# issue: none
+# notes: `not` before a value negates a Boolean expression; `not { }` before a
+# notes: pattern is the anti-join over a sub-pattern. Both stand in one match
+# notes: block and each keeps its own rows: the value form drops the rows whose
+# notes: comparison is true, the pattern form drops the rows with a match.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I64
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"a","age":40}}
+{"type":"Person","data":{"slug":"b","age":20}}
+{"type":"Person","data":{"slug":"c","age":50}}
+{"type":"Person","data":{"slug":"d","age":30}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"d","to":"c"}
+
+--- query
+set engine = v2;
+query not_over_a_value() {
+    match { $p: Person  not $p.age > 35 }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+{"p.slug": "d"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query both_in_one_block() {
+    match {
+        $p: Person
+        not $p.age > 35
+        not { $p knows $q }
+    }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String

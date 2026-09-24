@@ -1,6 +1,6 @@
 # issue: none
-# notes: An aggregate expression inside order is refused. Order by its
-# notes: return alias instead.
+# notes: An order key other than a property binds against the return list: an aggregate or a node binding equal to a return item sorts by that
+# notes: item's column on engine v2 and is refused at engine v1's door naming the accepted keys; `T42` under v1 proves the compile runs before the gate (`issue_566_order_key_binds_to_return_item.gqt` holds the v2 `T42`).
 
 --- runner
 timeout_ms: 10000
@@ -11,25 +11,68 @@ environments:
 --- schema
 node Person {
     name: String @key
+    age: I64
 }
 
 --- seed
-{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob","age":20}}
+{"type":"Person","data":{"name":"alice","age":40}}
 
 --- query
+set engine = v1;
 query count_ordered() {
     match { $p: Person }
     return { count($p) as total }
     order { count($p) }
 }
 
---- expect error: unsupported ordering expression
+--- expect error: plan error: order keys other than a property, a system field, an alias or the leading search key are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
 
 --- query
+set engine = v1;
 query meta_aggregate_order_refused() {
     match { $p: Person }
     return { $p.name, count($p.@id) }
     order { max($p.@id) }
 }
 
---- expect error: unsupported ordering expression
+--- expect error: T42: order key `max($p.@id)` does not appear in return; add it to return or order by its alias
+
+--- query
+set engine = v2;
+query count_ordered() {
+    match { $p: Person }
+    return { count($p) as total }
+    order { count($p) }
+}
+
+--- expect unordered
+{"total": 2}
+
+--- expect shape
+total: I64
+
+--- query
+set engine = v1;
+query order_by_a_node() {
+    match { $p: Person }
+    return { $p }
+    order { $p }
+}
+
+--- expect error: plan error: order keys other than a property, a system field, an alias or the leading search key are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2
+
+--- query
+set engine = v2;
+query order_by_a_node() {
+    match { $p: Person }
+    return { $p }
+    order { $p }
+}
+
+--- expect ordered
+{"p": {"@id": "alice", "name": "alice", "age": 40}}
+{"p": {"@id": "bob", "name": "bob", "age": 20}}
+
+--- expect shape
+p: Person

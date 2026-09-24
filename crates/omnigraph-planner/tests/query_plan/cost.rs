@@ -363,11 +363,11 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
                 IROp::NodeScan {
                     variable: "a".to_string(),
                     type_name: "T".to_string(),
-                    filters: vec![IRFilter {
-                        left: prop("a", property),
-                        op: CompOp::Eq,
-                        right: IRExpr::Literal(Literal::String("x".into())),
-                    }],
+                    filters: vec![IRExpr::comparison(
+                        prop("a", property),
+                        CompOp::Eq,
+                        IRExpr::Literal(Literal::String("x".into())),
+                    )],
                 },
                 expand("a", "b", vec![]),
             ],

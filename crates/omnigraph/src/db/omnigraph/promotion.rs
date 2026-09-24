@@ -778,7 +778,10 @@ mod tests {
     ) -> (SnapshotHandle, StagedTransactionIdentity) {
         let staged = db
             .storage()
-            .stage_delete(&base, &format!("name = '{name}'"))
+            .stage_delete(
+                &base,
+                datafusion::prelude::ident("name").eq(datafusion::prelude::lit(name)),
+            )
             .await
             .unwrap()
             .expect("the row exists");

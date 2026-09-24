@@ -10,7 +10,7 @@ use crate::engine::operators::memory::WorkMemory;
 use crate::engine::operators::producer::{BatchSender, producer_stream};
 use crate::engine::scan::{
     ScanColumns, SearchColumns, add_null_blob_columns, conjoin_fts_queries, hconcat_batches,
-    id_in_list_expr, ir_filter_to_expr,
+    id_in_list_expr, ir_expr_to_df_expr,
 };
 use crate::engine::search::search_filter_query;
 use crate::error::OmniError;
@@ -134,7 +134,7 @@ async fn read_candidates(
     candidates: &RecordBatch,
     type_name: &str,
     binding: &str,
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     projection: Option<&NeededColumns>,
     params: &ParamMap,
     snapshot: &Snapshot,
@@ -224,7 +224,7 @@ async fn hydrate_nodes(
     catalog: &Catalog,
     type_name: &str,
     ids: &[String],
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     projection: Option<&NeededColumns>,
     params: &ParamMap,
     memory: &WorkMemory,
@@ -263,7 +263,7 @@ async fn hydrate_nodes(
     for filter in dst_filters {
         if let Some(query) = search_filter_query(filter, params)? {
             queries.push(query);
-        } else if let Some(expr) = ir_filter_to_expr(filter, params, Some(&node_type.arrow_schema))
+        } else if let Some(expr) = ir_expr_to_df_expr(filter, params, Some(&node_type.arrow_schema))
         {
             crate::instrumentation::record_pushed_filter_exprs(1);
             filter_expr = filter_expr.and(expr);

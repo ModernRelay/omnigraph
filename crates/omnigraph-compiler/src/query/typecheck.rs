@@ -45,6 +45,101 @@ pub struct TypeContext {
     pub traversals: Vec<ResolvedTraversal>,
 }
 
+impl TypeContext {
+    /// No bindings, no aliases: the read context of a mutation scope, where
+    /// every name resolves through the scope instead.
+    fn empty() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            aliases: HashMap::new(),
+            traversals: Vec::new(),
+        }
+    }
+}
+
+/// Where an expression stands. Every scope resolves through the one
+/// `resolve_expr_type`; the scope decides what a bare name means and which
+/// node kinds are refused, one binder per clause over one expression type.
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    /// A read clause over the match bindings.
+    Read,
+    /// A mutation `where`: a bare name is a property of the target.
+    MutationWhere(&'a MutationTarget),
+    /// An assignment value or an inline binding match on `type_name`:
+    /// constants only.
+    Constant {
+        clause: ConstantClause,
+        type_name: &'a str,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ConstantClause {
+    Assignment,
+    BindingMatch,
+}
+
+impl Scope<'_> {
+    /// The refusal of an aggregate, search or ranking call in this scope, the
+    /// call's keyword in front (T44); `None` in a read.
+    fn call_refusal(self, keyword: &str) -> Option<CompilerError> {
+        match self {
+            Scope::Read => None,
+            Scope::MutationWhere(_) => Some(CompilerError::Type(format!(
+                "T44: `{keyword}` cannot appear in a mutation where; a where compares the row's own properties, parameters and now()"
+            ))),
+            Scope::Constant { .. } => Some(CompilerError::Type(format!(
+                "T44: `{keyword}` cannot appear in an assignment value; assignments and binding matches are constants per invocation"
+            ))),
+        }
+    }
+
+    /// The refusal of a variable that names no declared parameter outside a
+    /// read: T14 in a mutation statement, T3 in a binding match.
+    fn undeclared_parameter(self, name: &str) -> CompilerError {
+        match self {
+            Scope::Constant {
+                clause: ConstantClause::BindingMatch,
+                ..
+            } => CompilerError::Type(format!(
+                "T3: match variable `${name}` must be a declared query parameter"
+            )),
+            _ => CompilerError::Type(format!(
+                "T14: mutation variable `${name}` must be a declared query parameter"
+            )),
+        }
+    }
+}
+
+/// A property, `@id`, `@src` or `@dst` leaf where only a constant may stand
+/// (T45); a bare name of the clause's own type prints bare.
+fn constant_leaf_refusal(type_name: &str, variable: &str, property: &str) -> CompilerError {
+    let leaf = if variable == type_name {
+        property.to_string()
+    } else {
+        format!("${variable}.{property}")
+    };
+    CompilerError::Type(format!(
+        "T45: `{leaf}` cannot appear in an assignment value; assignments and binding matches are constants per invocation"
+    ))
+}
+
+/// The keyword of an aggregate, search or ranking call; `None` for every
+/// other node.
+fn call_keyword(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Aggregate { func, .. } => Some(func.to_string()),
+        Expr::Nearest { .. }
+        | Expr::Search { .. }
+        | Expr::Fuzzy { .. }
+        | Expr::MatchText { .. }
+        | Expr::Bm25 { .. }
+        | Expr::Rrf { .. } => Some(rank_keyword(expr).to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedTraversal {
     pub src: String,
@@ -83,6 +178,18 @@ impl ResolvedType {
 pub enum MutationTarget {
     Node { type_name: String },
     Edge { type_name: String },
+}
+
+impl MutationTarget {
+    pub fn type_name(&self) -> &str {
+        match self {
+            Self::Node { type_name } | Self::Edge { type_name } => type_name,
+        }
+    }
+
+    pub fn is_edge(&self) -> bool {
+        matches!(self, Self::Edge { .. })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -208,9 +315,9 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     // Typecheck return projections
     let mut result_columns: HashSet<String> = HashSet::new();
     for proj in &query.return_clause {
-        let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
+        let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params, Scope::Read)?;
         reject_blob_read_value(&resolved, &proj.expr)?;
-        check_projection(&proj.expr, &query.order_clause)?;
+        check_projection(&proj.expr, proj.alias.as_deref(), &query.order_clause)?;
         // T25: one result column per name. The executor emits a batch with
         // every projection's column under its executed name; two columns of
         // one name survive the batch (Arrow allows it) and every reader that
@@ -228,9 +335,10 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     }
 
     // Typecheck order expressions
-    for ord in &query.order_clause {
-        let resolved = resolve_expr_type(catalog, &ord.expr, &ctx, &params)?;
+    for (index, ord) in query.order_clause.iter().enumerate() {
+        let resolved = resolve_expr_type(catalog, &ord.expr, &ctx, &params, Scope::Read)?;
         reject_blob_read_value(&resolved, &ord.expr)?;
+        bind_order_key(index, &ord.expr, &query.return_clause, &ctx)?;
     }
 
     let has_standalone_nearest = query
@@ -289,6 +397,35 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     Ok(ctx)
 }
 
+/// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the
+/// return list"): a property key sorts through the hidden column, the leading
+/// rank key is the search node's; every other key is a return alias or item.
+fn bind_order_key(
+    index: usize,
+    key: &Expr,
+    return_clause: &[Projection],
+    ctx: &TypeContext,
+) -> Result<()> {
+    let exempt = match key {
+        Expr::PropAccess { .. } => true,
+        Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => index == 0,
+        _ => false,
+    };
+    if exempt {
+        return Ok(());
+    }
+    let bound = match key {
+        Expr::AliasRef(name) => ctx.aliases.contains_key(name),
+        other => return_clause.iter().any(|item| &item.expr == other),
+    };
+    if bound {
+        return Ok(());
+    }
+    Err(CompilerError::Type(format!(
+        "T42: order key `{key}` does not appear in return; add it to return or order by its alias"
+    )))
+}
+
 fn typecheck_mutation(
     catalog: &Catalog,
     mutation: &Mutation,
@@ -320,11 +457,12 @@ fn typecheck_mutation(
                                     identity_assignment_hint(&assignment.property)
                                 ))
                             })?;
-                    check_match_value_type(
-                        &assignment.value,
+                    typecheck_assignment(
+                        catalog,
+                        assignment,
                         &param_types,
                         prop_type,
-                        &assignment.property,
+                        &insert.type_name,
                     )?;
                 }
 
@@ -366,45 +504,35 @@ fn typecheck_mutation(
                 let mut has_to = false;
 
                 for assignment in &insert.assignments {
-                    match assignment.property.as_str() {
+                    let prop_type = match assignment.property.as_str() {
                         "from" => {
                             has_from = true;
-                            check_match_value_type(
-                                &assignment.value,
-                                &param_types,
-                                &meta_field_type(),
-                                "from",
-                            )?;
+                            meta_field_type()
                         }
                         "to" => {
                             has_to = true;
-                            check_match_value_type(
-                                &assignment.value,
-                                &param_types,
-                                &meta_field_type(),
-                                "to",
-                            )?;
+                            meta_field_type()
                         }
-                        _ => {
-                            let prop_type = edge_type
-                                .properties
-                                .get(&assignment.property)
-                                .ok_or_else(|| {
-                                    CompilerError::Type(format!(
-                                        "T11: type `{}` has no property `{}`{}",
-                                        insert.type_name,
-                                        assignment.property,
-                                        identity_assignment_hint(&assignment.property)
-                                    ))
-                                })?;
-                            check_match_value_type(
-                                &assignment.value,
-                                &param_types,
-                                prop_type,
-                                &assignment.property,
-                            )?;
-                        }
-                    }
+                        _ => edge_type
+                            .properties
+                            .get(&assignment.property)
+                            .ok_or_else(|| {
+                                CompilerError::Type(format!(
+                                    "T11: type `{}` has no property `{}`{}",
+                                    insert.type_name,
+                                    assignment.property,
+                                    identity_assignment_hint(&assignment.property)
+                                ))
+                            })?
+                            .clone(),
+                    };
+                    typecheck_assignment(
+                        catalog,
+                        assignment,
+                        &param_types,
+                        &prop_type,
+                        &insert.type_name,
+                    )?;
                 }
 
                 if !has_from {
@@ -476,51 +604,38 @@ fn typecheck_mutation(
                                 identity_assignment_hint(&assignment.property)
                             ))
                         })?;
-                check_match_value_type(
-                    &assignment.value,
+                typecheck_assignment(
+                    catalog,
+                    assignment,
                     &param_types,
                     prop_type,
-                    &assignment.property,
+                    &update.type_name,
                 )?;
             }
 
-            typecheck_mutation_predicate(
-                &update.type_name,
-                &update.predicate,
-                node_type,
-                &param_types,
-            )?;
-            Ok(MutationTarget::Node {
+            let target = MutationTarget::Node {
                 type_name: update.type_name.clone(),
-            })
+            };
+            typecheck_mutation_where(catalog, &target, &update.predicate, &param_types)?;
+            Ok(target)
         }
         Mutation::Delete(delete) => {
-            if let Some(node_type) = catalog.node_types.get(&delete.type_name) {
-                typecheck_mutation_predicate(
-                    &delete.type_name,
-                    &delete.predicate,
-                    node_type,
-                    &param_types,
-                )?;
-                Ok(MutationTarget::Node {
+            let target = if catalog.node_types.contains_key(&delete.type_name) {
+                MutationTarget::Node {
                     type_name: delete.type_name.clone(),
-                })
-            } else if let Some(edge_type) = catalog.edge_types.get(&delete.type_name) {
-                typecheck_edge_mutation_predicate(
-                    &delete.type_name,
-                    &delete.predicate,
-                    edge_type,
-                    &param_types,
-                )?;
-                Ok(MutationTarget::Edge {
+                }
+            } else if catalog.edge_types.contains_key(&delete.type_name) {
+                MutationTarget::Edge {
                     type_name: delete.type_name.clone(),
-                })
+                }
             } else {
-                Err(CompilerError::Type(format!(
+                return Err(CompilerError::Type(format!(
                     "T10: unknown node/edge type `{}`",
                     delete.type_name
-                )))
-            }
+                )));
+            };
+            typecheck_mutation_where(catalog, &target, &delete.predicate, &param_types)?;
+            Ok(target)
         }
     }
 }
@@ -581,138 +696,176 @@ fn identity_assignment_hint(property: &str) -> &'static str {
     }
 }
 
-/// A meta-field in a mutation predicate: `@id` on a node, `@id`/`@src`/`@dst`
-/// on an edge, typed as the endpoint strings `from`/`to` already are.
-fn typecheck_meta_field_predicate(
-    type_name: &str,
-    predicate: &MutationPredicate,
-    is_edge: bool,
-    param_types: &HashMap<String, PropType>,
-) -> Result<()> {
-    let admitted = match meta_field_role(&predicate.property) {
-        Some(Some(SystemFieldRole::Id)) => true,
-        Some(Some(SystemFieldRole::Src | SystemFieldRole::Dst)) => is_edge,
-        _ => false,
-    };
-    if !admitted {
-        let known = if is_edge {
-            "`@id`, `@src`, `@dst`"
-        } else {
-            "`@id`"
-        };
+/// The type of a bare name in a mutation `where` on `target`: the legacy
+/// `from`/`to` endpoints and the admitted meta-fields are the endpoint
+/// strings; a user property keeps its declared type; Blob is refused.
+fn mutation_property_type(
+    catalog: &Catalog,
+    target: &MutationTarget,
+    variable: &str,
+    property: &str,
+) -> Result<PropType> {
+    let type_name = target.type_name();
+    if variable != type_name {
         return Err(CompilerError::Type(format!(
-            "T11: type `{}` has no meta-field `{}`; the meta-fields of this type are {known}",
-            type_name, predicate.property
+            "T14: mutation variable `${variable}` must be a declared query parameter"
         )));
     }
-    check_match_value_type(
-        &predicate.value,
-        param_types,
-        &meta_field_type(),
-        &predicate.property,
+    let is_edge = target.is_edge();
+    if is_edge && (property == "from" || property == "to") {
+        return Ok(meta_field_type());
+    }
+    if let Some(role) = meta_field_role(property) {
+        let admitted = match role {
+            Some(SystemFieldRole::Id) => true,
+            Some(SystemFieldRole::Src | SystemFieldRole::Dst) => is_edge,
+            None => false,
+        };
+        if !admitted {
+            let known = if is_edge {
+                "`@id`, `@src`, `@dst`"
+            } else {
+                "`@id`"
+            };
+            return Err(CompilerError::Type(format!(
+                "T11: type `{type_name}` has no meta-field `{property}`; the meta-fields of this type are {known}"
+            )));
+        }
+        return Ok(meta_field_type());
+    }
+    let prop_type = declared_property(catalog, target, property).ok_or_else(|| {
+        CompilerError::Type(format!(
+            "T11: type `{type_name}` has no property `{property}`{}",
+            system_field_hint(property, None, is_edge)
+        ))
+    })?;
+    if matches!(prop_type.scalar, ScalarType::Blob) {
+        return Err(CompilerError::Type(format!(
+            "T11: blob property `{property}` cannot be used in WHERE predicates"
+        )));
+    }
+    Ok(prop_type.clone())
+}
+
+/// The user property `property` of the mutation target's own namespace.
+fn declared_property<'c>(
+    catalog: &'c Catalog,
+    target: &MutationTarget,
+    property: &str,
+) -> Option<&'c PropType> {
+    let type_name = target.type_name();
+    match target {
+        MutationTarget::Node { .. } => catalog
+            .node_types
+            .get(type_name)
+            .and_then(|node_type| node_type.properties.get(property)),
+        MutationTarget::Edge { .. } => catalog
+            .edge_types
+            .get(type_name)
+            .and_then(|edge_type| edge_type.properties.get(property)),
+    }
+}
+
+/// A mutation `where` is an expression the checker proves Boolean under the
+/// target's scope; a Boolean literal on a target that declares a property named
+/// `true` or `false` is refused (T46), since the bare word can no longer reach it.
+fn typecheck_mutation_where(
+    catalog: &Catalog,
+    target: &MutationTarget,
+    predicate: &Expr,
+    params: &HashMap<String, PropType>,
+) -> Result<()> {
+    let shadowed: Vec<&str> = ["true", "false"]
+        .into_iter()
+        .filter(|name| declared_property(catalog, target, name).is_some())
+        .collect();
+    if let Some(literal) = first_boolean_literal(predicate)
+        && let Some(first) = shadowed.first()
+    {
+        let word = if literal { "true" } else { "false" };
+        let property = shadowed.iter().find(|name| **name == word).unwrap_or(first);
+        return Err(CompilerError::Type(format!(
+            "T46: `{word}` is a Boolean literal here; the property named `{property}` of `{}` cannot be named bare in a mutation `where`; rename it in the schema (`@rename_from`)",
+            target.type_name()
+        )));
+    }
+    let resolved = resolve_expr_type(
+        catalog,
+        predicate,
+        &TypeContext::empty(),
+        params,
+        Scope::MutationWhere(target),
+    )?;
+    if boolean_scalar(&resolved).is_none() {
+        return Err(CompilerError::Type(format!(
+            "T41: a mutation `where` must be Boolean, got {}",
+            resolved.display_name()
+        )));
+    }
+    Ok(())
+}
+
+/// The first bare `true` or `false` in written order, through the Boolean
+/// structure; a list literal's elements are not bare words.
+fn first_boolean_literal(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Literal(Literal::Bool(value)) => Some(*value),
+        Expr::Binary { left, right, .. } => {
+            first_boolean_literal(left).or_else(|| first_boolean_literal(right))
+        }
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => first_boolean_literal(inner),
+        _ => None,
+    }
+}
+
+fn typecheck_assignment(
+    catalog: &Catalog,
+    assignment: &MutationAssignment,
+    params: &HashMap<String, PropType>,
+    expected: &PropType,
+    type_name: &str,
+) -> Result<()> {
+    typecheck_constant(
+        catalog,
+        &assignment.value,
+        params,
+        expected,
+        &assignment.property,
+        ConstantClause::Assignment,
+        type_name,
     )
 }
 
-fn typecheck_mutation_predicate(
-    type_name: &str,
-    predicate: &MutationPredicate,
-    node_type: &crate::catalog::NodeType,
-    param_types: &HashMap<String, PropType>,
-) -> Result<()> {
-    if predicate.property.starts_with('@') {
-        return typecheck_meta_field_predicate(type_name, predicate, false, param_types);
-    }
-    let prop_type = node_type
-        .properties
-        .get(&predicate.property)
-        .ok_or_else(|| {
-            CompilerError::Type(format!(
-                "T11: type `{}` has no property `{}`{}",
-                type_name,
-                predicate.property,
-                system_field_hint(&predicate.property, None, false)
-            ))
-        })?;
-    if matches!(prop_type.scalar, ScalarType::Blob) {
-        return Err(CompilerError::Type(format!(
-            "T11: blob property `{}` cannot be used in WHERE predicates",
-            predicate.property
-        )));
-    }
-    check_match_value_type(
-        &predicate.value,
-        param_types,
-        prop_type,
-        &predicate.property,
-    )?;
-    Ok(())
-}
-
-fn typecheck_edge_mutation_predicate(
-    type_name: &str,
-    predicate: &MutationPredicate,
-    edge_type: &crate::catalog::EdgeType,
-    param_types: &HashMap<String, PropType>,
-) -> Result<()> {
-    if predicate.property == "from" || predicate.property == "to" {
-        return check_match_value_type(
-            &predicate.value,
-            param_types,
-            &meta_field_type(),
-            &predicate.property,
-        );
-    }
-    if predicate.property.starts_with('@') {
-        return typecheck_meta_field_predicate(type_name, predicate, true, param_types);
-    }
-
-    let prop_type = edge_type
-        .properties
-        .get(&predicate.property)
-        .ok_or_else(|| {
-            CompilerError::Type(format!(
-                "T11: type `{}` has no property `{}`{}",
-                type_name,
-                predicate.property,
-                system_field_hint(&predicate.property, None, true)
-            ))
-        })?;
-    if matches!(prop_type.scalar, ScalarType::Blob) {
-        return Err(CompilerError::Type(format!(
-            "T11: blob property `{}` cannot be used in WHERE predicates",
-            predicate.property
-        )));
-    }
-    check_match_value_type(
-        &predicate.value,
-        param_types,
-        prop_type,
-        &predicate.property,
-    )?;
-    Ok(())
-}
-
-fn check_match_value_type(
-    value: &MatchValue,
+/// A constant against the property it is assigned to or matched with: the
+/// scope refuses every non-constant leaf, then the clause types the result
+/// (the property's type; a binding match on a list property, its element type).
+fn typecheck_constant(
+    catalog: &Catalog,
+    value: &Expr,
     params: &HashMap<String, PropType>,
     expected: &PropType,
     property: &str,
+    clause: ConstantClause,
+    type_name: &str,
 ) -> Result<()> {
-    match value {
-        MatchValue::Literal(lit) => check_literal_type(lit, expected, property),
-        MatchValue::Variable(v) => {
-            let Some(actual) = params.get(v) else {
-                return Err(CompilerError::Type(format!(
-                    "T14: mutation variable `${}` must be a declared query parameter",
-                    v
-                )));
-            };
-            // Allow String param → Blob property (URI assignment)
-            let compatible = types_compatible(actual, expected)
-                || (matches!(expected.scalar, ScalarType::Blob)
-                    && matches!(actual.scalar, ScalarType::String)
-                    && !actual.list);
-            if !compatible {
+    let scope = Scope::Constant { clause, type_name };
+    let resolved = resolve_expr_type(catalog, value, &TypeContext::empty(), params, scope)?;
+    let ResolvedType::Scalar(actual) = &resolved else {
+        return Err(CompilerError::Type(format!(
+            "T7: the value for property `{property}` must be a scalar, got {}",
+            resolved.display_name()
+        )));
+    };
+    match (clause, value) {
+        (ConstantClause::Assignment, Expr::Literal(lit)) => {
+            check_literal_type(lit, expected, property)
+        }
+        (ConstantClause::BindingMatch, Expr::Literal(lit)) => {
+            check_binding_literal_type(lit, expected, property)
+        }
+        (_, Expr::Now) => check_now_match_value_type(expected, property),
+        (ConstantClause::Assignment, _) => {
+            if !assignment_compatible(actual, expected) {
                 return Err(CompilerError::Type(format!(
                     "T7: cannot assign/compare {} with {} for property `{}`",
                     actual.display_name(),
@@ -722,7 +875,9 @@ fn check_match_value_type(
             }
             Ok(())
         }
-        MatchValue::Now => check_now_match_value_type(expected, property),
+        (ConstantClause::BindingMatch, _) => {
+            check_binding_variable_type(actual, expected, property)
+        }
     }
 }
 
@@ -775,9 +930,7 @@ fn typecheck_clauses(
 fn block_references_outer(clauses: &[Clause], outer_vars: &[String]) -> bool {
     clauses.iter().any(|clause| match clause {
         Clause::Traversal(t) => outer_vars.contains(&t.src) || outer_vars.contains(&t.dst),
-        Clause::Filter(f) => {
-            expr_references_any(&f.left, outer_vars) || expr_references_any(&f.right, outer_vars)
-        }
+        Clause::Filter(f) => expr_references_any(f, outer_vars),
         Clause::Binding(b) => outer_vars.contains(&b.variable),
         Clause::Subquery(_) => false,
     })
@@ -797,7 +950,7 @@ fn typecheck_subquery_predicate(
     let result = match &subquery.arg {
         None => PropType::scalar(ScalarType::I64, false),
         Some(arg) => {
-            let arg_type = resolve_expr_type(catalog, arg, inner_ctx, params)?;
+            let arg_type = resolve_expr_type(catalog, arg, inner_ctx, params, Scope::Read)?;
             reject_blob_read_value(&arg_type, arg)?;
             check_aggregate_argument(&func, arg, &arg_type)?;
             match (func, &arg_type) {
@@ -825,7 +978,7 @@ fn typecheck_subquery_predicate(
             "T40: {func} over a block compares with a literal, now() or a parameter"
         )));
     }
-    let right = resolve_expr_type(catalog, &subquery.right, ctx, params)?;
+    let right = resolve_expr_type(catalog, &subquery.right, ctx, params, Scope::Read)?;
     let ResolvedType::Scalar(r) = &right else {
         return Err(CompilerError::Type(format!(
             "T40: {func} over a block compares with a scalar, got {}",
@@ -883,22 +1036,15 @@ fn typecheck_binding(
             )));
         }
 
-        // T3: check value type matches property type
-        match &pm.value {
-            MatchValue::Literal(lit) => {
-                check_binding_literal_type(lit, prop, &pm.prop_name)?;
-            }
-            MatchValue::Variable(v) => {
-                let Some(actual) = params.get(v) else {
-                    return Err(CompilerError::Type(format!(
-                        "T3: match variable `${}` must be a declared query parameter",
-                        v
-                    )));
-                };
-                check_binding_variable_type(actual, prop, &pm.prop_name)?;
-            }
-            MatchValue::Now => check_now_match_value_type(prop, &pm.prop_name)?,
-        }
+        typecheck_constant(
+            catalog,
+            &pm.value,
+            params,
+            prop,
+            &pm.prop_name,
+            ConstantClause::BindingMatch,
+            &binding.type_name,
+        )?;
     }
 
     // Don't overwrite if already bound to the same node type (re-binding the
@@ -1162,32 +1308,126 @@ fn bind_traversal_endpoint(
     Ok(())
 }
 
+/// A match filter is an expression the checker proves Boolean; a search
+/// call stands only as a top-level conjunct, bare or `= true` (T38).
 fn typecheck_filter(
     catalog: &Catalog,
-    filter: &Filter,
+    filter: &Expr,
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
 ) -> Result<()> {
-    let left_type = resolve_expr_type(catalog, &filter.left, ctx, params)?;
-    let right_type = resolve_expr_type(catalog, &filter.right, ctx, params)?;
-
-    let is_search_predicate = |expr: &Expr| {
-        matches!(
-            expr,
-            Expr::Search { .. } | Expr::MatchText { .. } | Expr::Fuzzy { .. }
-        )
-    };
-    if (is_search_predicate(&filter.left) || is_search_predicate(&filter.right))
-        && !(is_search_predicate(&filter.left)
-            && filter.op == CompOp::Eq
-            && matches!(filter.right, Expr::Literal(Literal::Bool(true))))
+    if filter
+        .conjuncts()
+        .into_iter()
+        .any(|conjunct| !conjunct.is_search_predicate() && contains_search_call(conjunct))
     {
-        return Err(CompilerError::Type(
-            "T38: search predicates require a standalone call or `= true`; other comparisons are not supported".to_string(),
+        return Err(CompilerError::Type(SEARCH_PREDICATE_SHAPE.to_string()));
+    }
+    let resolved = resolve_expr_type(catalog, filter, ctx, params, Scope::Read)?;
+    if boolean_scalar(&resolved).is_none() {
+        return Err(CompilerError::Type(format!(
+            "T41: a filter must be Boolean, got {}",
+            resolved.display_name()
+        )));
+    }
+    Ok(())
+}
+
+const SEARCH_PREDICATE_SHAPE: &str =
+    "T38: search predicates require a standalone call or `= true`, alone or joined by and";
+
+/// Whether a `search`, `fuzzy` or `match_text` call stands anywhere in `expr`.
+fn contains_search_call(expr: &Expr) -> bool {
+    expr.is_search_call()
+        || match expr {
+            Expr::Binary { left, right, .. } => {
+                contains_search_call(left) || contains_search_call(right)
+            }
+            Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => contains_search_call(inner),
+            Expr::Aggregate { arg, .. } => contains_search_call(arg),
+            Expr::Nearest { query, .. } => contains_search_call(query),
+            Expr::Bm25 { field, query } => {
+                contains_search_call(field) || contains_search_call(query)
+            }
+            Expr::Rrf {
+                primary,
+                secondary,
+                k,
+            } => {
+                contains_search_call(primary)
+                    || contains_search_call(secondary)
+                    || k.as_deref().is_some_and(contains_search_call)
+            }
+            Expr::Now
+            | Expr::PropAccess { .. }
+            | Expr::Search { .. }
+            | Expr::Fuzzy { .. }
+            | Expr::MatchText { .. }
+            | Expr::Variable(_)
+            | Expr::Literal(_)
+            | Expr::AliasRef(_) => false,
+        }
+}
+
+/// The type when `resolved` is a scalar, non-list `Bool`.
+fn boolean_scalar(resolved: &ResolvedType) -> Option<&PropType> {
+    match resolved {
+        ResolvedType::Scalar(t) if !t.list && t.scalar == ScalarType::Bool => Some(t),
+        _ => None,
+    }
+}
+
+/// `left <op> right`: the operand rules of a comparison (T7, T38) and its
+/// type, `Bool`, nullable when an operand is; in a mutation `where`, a target
+/// property against a literal, a parameter or `now()` keeps the T3/T7 texts.
+fn typecheck_comparison(
+    catalog: &Catalog,
+    left: &Expr,
+    op: CompOp,
+    right: &Expr,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+    scope: Scope<'_>,
+) -> Result<PropType> {
+    let left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
+    let right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+
+    if (left.is_search_call() || right.is_search_call())
+        && !(left.is_search_call()
+            && op == CompOp::Eq
+            && matches!(right, Expr::Literal(Literal::Bool(true))))
+    {
+        return Err(CompilerError::Type(SEARCH_PREDICATE_SHAPE.to_string()));
+    }
+
+    if let Scope::MutationWhere(target) = scope
+        && let Expr::PropAccess { variable, property } = left
+        && variable == target.type_name()
+        && !matches!(
+            op,
+            CompOp::Contains | CompOp::StartsWith | CompOp::StringContains
+        )
+        && matches!(right, Expr::Literal(_) | Expr::Variable(_) | Expr::Now)
+        && let (ResolvedType::Scalar(expected), ResolvedType::Scalar(actual)) =
+            (&left_type, &right_type)
+    {
+        typecheck_constant(
+            catalog,
+            right,
+            params,
+            expected,
+            property,
+            ConstantClause::Assignment,
+            target.type_name(),
+        )?;
+        return Ok(PropType::scalar(
+            ScalarType::Bool,
+            expected.nullable || actual.nullable,
         ));
     }
 
     if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
+        let result = PropType::scalar(ScalarType::Bool, l.nullable || r.nullable);
         // Blob values never participate in `.gq` filters. Keep this ahead of
         // every operator-specific early return so public-AST callers cannot
         // bypass containment with a list-membership shape such as
@@ -1198,7 +1438,7 @@ fn typecheck_filter(
             ));
         }
 
-        if filter.op == CompOp::Contains {
+        if op == CompOp::Contains {
             // Overloaded on the left operand: list → membership, scalar
             // String → exact substring. Lowering resolves the String form to
             // `StringContains` so execution never re-derives the dispatch.
@@ -1209,7 +1449,7 @@ fn typecheck_filter(
                         r.display_name()
                     )));
                 }
-                return Ok(());
+                return Ok(result);
             }
             if !l.list {
                 return Err(CompilerError::Type(format!(
@@ -1238,10 +1478,10 @@ fn typecheck_filter(
                     l.display_name()
                 )));
             }
-            return Ok(());
+            return Ok(result);
         }
 
-        if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+        if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
             // Exact, case-sensitive string predicates: scalar String on both
             // sides. (`StringContains` only exists post-lowering, but the
             // check is written over both ops so re-typechecking IR-shaped
@@ -1249,18 +1489,18 @@ fn typecheck_filter(
             if l.list || !matches!(l.scalar, ScalarType::String) {
                 return Err(CompilerError::Type(format!(
                     "T7: {} requires a String property on the left, got {}",
-                    filter.op,
+                    op,
                     l.display_name()
                 )));
             }
             if r.list || !matches!(r.scalar, ScalarType::String) {
                 return Err(CompilerError::Type(format!(
                     "T7: {} requires a String right operand, got {}",
-                    filter.op,
+                    op,
                     r.display_name()
                 )));
             }
-            return Ok(());
+            return Ok(result);
         }
 
         // T7: check type compatibility
@@ -1281,15 +1521,14 @@ fn typecheck_filter(
                 r.display_name()
             )));
         }
+        Ok(result)
     } else {
-        return Err(CompilerError::Type(format!(
+        Err(CompilerError::Type(format!(
             "T7: filter comparisons require scalar operands, got {} and {}",
             left_type.display_name(),
             right_type.display_name()
-        )));
+        )))
     }
-
-    Ok(())
 }
 
 /// Search/rank filters are hoisted onto the field variable's NodeScan; an
@@ -1312,85 +1551,108 @@ fn reject_edge_binding_search_field(ctx: &TypeContext, field: &Expr, func: &str)
     Ok(())
 }
 
+/// `$variable.property` in a read: the meta-field's type by role, or the
+/// declared property type of the node or edge the variable is bound to
+/// (T6). Blob is the caller's decision: T24 as a value, T7 under `is null`.
+fn read_property_type(
+    catalog: &Catalog,
+    ctx: &TypeContext,
+    variable: &str,
+    property: &str,
+) -> Result<PropType> {
+    let bv = ctx
+        .bindings
+        .get(variable)
+        .ok_or_else(|| CompilerError::Type(format!("T6: variable `${variable}` is not bound")))?;
+
+    if let Some(role) = meta_field_role(property) {
+        let admitted = match (bv, role) {
+            (_, Some(SystemFieldRole::Id)) => true,
+            (BoundVariable::Edge { .. }, Some(_)) => true,
+            (BoundVariable::Node { .. }, Some(_)) | (_, None) => false,
+        };
+        if !admitted {
+            let known = match bv {
+                BoundVariable::Node { .. } => "`@id`",
+                BoundVariable::Edge { .. } => "`@id`, `@src`, `@dst`",
+            };
+            return Err(CompilerError::Type(format!(
+                "T6: binding `${variable}` has no meta-field `{property}`; its meta-fields are {known}"
+            )));
+        }
+        return Ok(meta_field_type());
+    }
+
+    let prop = match bv {
+        BoundVariable::Node { type_name } => {
+            let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+                CompilerError::Type(format!("T6: type `{}` not found in catalog", type_name))
+            })?;
+            node_type.properties.get(property).ok_or_else(|| {
+                CompilerError::Type(format!(
+                    "T6: type `{}` has no property `{}`{}",
+                    type_name,
+                    property,
+                    system_field_hint(property, Some(variable), false)
+                ))
+            })?
+        }
+        BoundVariable::Edge { type_name } => {
+            let edge_type = catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
+                CompilerError::Type(format!(
+                    "T6: edge type `{}` not found in catalog",
+                    type_name
+                ))
+            })?;
+            edge_type.properties.get(property).ok_or_else(|| {
+                CompilerError::Type(format!(
+                    "T6: edge `{}` has no property `{}`{}",
+                    type_name,
+                    property,
+                    system_field_hint(property, Some(variable), true)
+                ))
+            })?
+        }
+    };
+    Ok(prop.clone())
+}
+
 fn resolve_expr_type(
     catalog: &Catalog,
     expr: &Expr,
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
+    scope: Scope<'_>,
 ) -> Result<ResolvedType> {
+    if let Some(keyword) = call_keyword(expr)
+        && let Some(refusal) = scope.call_refusal(&keyword)
+    {
+        return Err(refusal);
+    }
     match expr {
         Expr::Now => Ok(ResolvedType::Scalar(PropType::scalar(
             ScalarType::DateTime,
             false,
         ))),
-        Expr::PropAccess { variable, property } => {
-            // T6: variable must be bound and property must exist
-            let bv = ctx.bindings.get(variable).ok_or_else(|| {
-                CompilerError::Type(format!("T6: variable `${}` is not bound", variable))
-            })?;
-
-            if let Some(role) = meta_field_role(property) {
-                let admitted = match (bv, role) {
-                    (_, Some(SystemFieldRole::Id)) => true,
-                    (BoundVariable::Edge { .. }, Some(_)) => true,
-                    (BoundVariable::Node { .. }, Some(_)) | (_, None) => false,
-                };
-                if !admitted {
-                    let known = match bv {
-                        BoundVariable::Node { .. } => "`@id`",
-                        BoundVariable::Edge { .. } => "`@id`, `@src`, `@dst`",
-                    };
+        Expr::PropAccess { variable, property } => match scope {
+            Scope::Read => {
+                let prop = read_property_type(catalog, ctx, variable, property)?;
+                if matches!(prop.scalar, ScalarType::Blob) {
                     return Err(CompilerError::Type(format!(
-                        "T6: binding `${variable}` has no meta-field `{property}`; its meta-fields are {known}"
+                        "T24: Blob property `${}.{}` is not available as a .gq read value; Blob values require a dedicated API",
+                        variable, property
                     )));
                 }
-                return Ok(ResolvedType::Scalar(meta_field_type()));
+                Ok(ResolvedType::Scalar(prop))
             }
-
-            let prop = match bv {
-                BoundVariable::Node { type_name } => {
-                    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
-                        CompilerError::Type(format!(
-                            "T6: type `{}` not found in catalog",
-                            type_name
-                        ))
-                    })?;
-                    node_type.properties.get(property).ok_or_else(|| {
-                        CompilerError::Type(format!(
-                            "T6: type `{}` has no property `{}`{}",
-                            type_name,
-                            property,
-                            system_field_hint(property, Some(variable), false)
-                        ))
-                    })?
-                }
-                BoundVariable::Edge { type_name } => {
-                    let edge_type = catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
-                        CompilerError::Type(format!(
-                            "T6: edge type `{}` not found in catalog",
-                            type_name
-                        ))
-                    })?;
-                    edge_type.properties.get(property).ok_or_else(|| {
-                        CompilerError::Type(format!(
-                            "T6: edge `{}` has no property `{}`{}",
-                            type_name,
-                            property,
-                            system_field_hint(property, Some(variable), true)
-                        ))
-                    })?
-                }
-            };
-
-            if matches!(prop.scalar, ScalarType::Blob) {
-                return Err(CompilerError::Type(format!(
-                    "T24: Blob property `${}.{}` is not available as a .gq read value; Blob values require a dedicated API",
-                    variable, property
-                )));
+            Scope::MutationWhere(target) => {
+                mutation_property_type(catalog, target, variable, property)
+                    .map(ResolvedType::Scalar)
             }
-
-            Ok(ResolvedType::Scalar(prop.clone()))
-        }
+            Scope::Constant { type_name, .. } => {
+                Err(constant_leaf_refusal(type_name, variable, property))
+            }
+        },
         Expr::Nearest {
             variable,
             property,
@@ -1457,7 +1719,7 @@ fn resolve_expr_type(
                 )));
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
             match query_type {
                 ResolvedType::Scalar(s) if matches!(s.scalar, ScalarType::Vector(_)) && !s.list => {
                     let qdim = match s.scalar {
@@ -1495,7 +1757,7 @@ fn resolve_expr_type(
         }
         Expr::Search { field, query } => {
             reject_edge_binding_search_field(ctx, field, "search")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1511,7 +1773,7 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1538,7 +1800,7 @@ fn resolve_expr_type(
             max_edits,
         } => {
             reject_edge_binding_search_field(ctx, field, "fuzzy")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1554,7 +1816,7 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1571,7 +1833,8 @@ fn resolve_expr_type(
             }
 
             if let Some(max_edits_expr) = max_edits {
-                let max_edits_type = resolve_expr_type(catalog, max_edits_expr, ctx, params)?;
+                let max_edits_type =
+                    resolve_expr_type(catalog, max_edits_expr, ctx, params, scope)?;
                 match max_edits_type {
                     ResolvedType::Scalar(s)
                         if !s.list
@@ -1603,7 +1866,7 @@ fn resolve_expr_type(
         }
         Expr::MatchText { field, query } => {
             reject_edge_binding_search_field(ctx, field, "match_text")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1619,7 +1882,7 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1642,7 +1905,7 @@ fn resolve_expr_type(
         }
         Expr::Bm25 { field, query } => {
             reject_edge_binding_search_field(ctx, field, "bm25")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1658,7 +1921,7 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
             match query_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
@@ -1695,8 +1958,8 @@ fn resolve_expr_type(
                 ));
             }
 
-            let primary_ty = resolve_expr_type(catalog, primary, ctx, params)?;
-            let secondary_ty = resolve_expr_type(catalog, secondary, ctx, params)?;
+            let primary_ty = resolve_expr_type(catalog, primary, ctx, params, scope)?;
+            let secondary_ty = resolve_expr_type(catalog, secondary, ctx, params, scope)?;
 
             for ty in [primary_ty, secondary_ty] {
                 match ty {
@@ -1717,7 +1980,7 @@ fn resolve_expr_type(
             }
 
             if let Some(k_expr) = k {
-                let k_type = resolve_expr_type(catalog, k_expr, ctx, params)?;
+                let k_type = resolve_expr_type(catalog, k_expr, ctx, params, scope)?;
                 match k_type {
                     ResolvedType::Scalar(s)
                         if !s.list
@@ -1758,6 +2021,8 @@ fn resolve_expr_type(
             // Could be a query parameter or a bound variable
             if let Some(prop_type) = params.get(name) {
                 Ok(ResolvedType::Scalar(prop_type.clone()))
+            } else if !matches!(scope, Scope::Read) {
+                Err(scope.undeclared_parameter(name))
             } else if let Some(bv) = ctx.bindings.get(name) {
                 match bv {
                     BoundVariable::Node { type_name } => Ok(ResolvedType::Node(type_name.clone())),
@@ -1775,20 +2040,82 @@ fn resolve_expr_type(
         }
         Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit)?)),
         Expr::Aggregate { func, arg } => {
-            let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
+            let arg_type = resolve_expr_type(catalog, arg, ctx, params, scope)?;
             reject_blob_read_value(&arg_type, arg)?;
             check_aggregate_argument(func, arg, &arg_type)?;
 
             Ok(ResolvedType::Aggregate)
         }
-        Expr::AliasRef(name) => {
-            // Check if it's a known alias from return clause
-            if let Some(resolved) = ctx.aliases.get(name) {
-                Ok(resolved.clone())
-            } else {
-                // Might be an alias not yet registered (forward reference in order)
-                Ok(ResolvedType::Aggregate)
+        Expr::AliasRef(name) => match scope {
+            Scope::Read => Ok(ctx
+                .aliases
+                .get(name)
+                .cloned()
+                .unwrap_or(ResolvedType::Aggregate)),
+            Scope::MutationWhere(target) => {
+                mutation_property_type(catalog, target, target.type_name(), name)
+                    .map(ResolvedType::Scalar)
             }
+            Scope::Constant { type_name, .. } => {
+                Err(constant_leaf_refusal(type_name, type_name, name))
+            }
+        },
+        Expr::Binary {
+            left,
+            op: BinaryOp::Compare(op),
+            right,
+        } => Ok(ResolvedType::Scalar(typecheck_comparison(
+            catalog, left, *op, right, ctx, params, scope,
+        )?)),
+        Expr::Binary { left, op, right } => {
+            let left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
+            let right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+            let (Some(l), Some(r)) = (boolean_scalar(&left_type), boolean_scalar(&right_type))
+            else {
+                return Err(CompilerError::Type(format!(
+                    "T41: `{op}` needs Bool operands, got {} and {}",
+                    left_type.display_name(),
+                    right_type.display_name()
+                )));
+            };
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::Bool,
+                l.nullable || r.nullable,
+            )))
+        }
+        Expr::Not(inner) => {
+            let inner_type = resolve_expr_type(catalog, inner, ctx, params, scope)?;
+            let Some(b) = boolean_scalar(&inner_type) else {
+                return Err(CompilerError::Type(format!(
+                    "T41: `not` needs a Bool operand, got {}",
+                    inner_type.display_name()
+                )));
+            };
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::Bool,
+                b.nullable,
+            )))
+        }
+        Expr::IsNull { expr: inner, .. } => {
+            if let Scope::Read = scope
+                && let Expr::PropAccess { variable, property } = inner.as_ref()
+                && read_property_type(catalog, ctx, variable, property)?.scalar == ScalarType::Blob
+            {
+                return Err(CompilerError::Type(
+                    "T7: blob comparisons in filters are not supported".to_string(),
+                ));
+            }
+            let inner_type = resolve_expr_type(catalog, inner, ctx, params, scope)?;
+            if !matches!(inner_type, ResolvedType::Scalar(_)) {
+                return Err(CompilerError::Type(format!(
+                    "T41: `is null` tests a scalar or list value, got {}",
+                    inner_type.display_name()
+                )));
+            }
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::Bool,
+                false,
+            )))
         }
     }
 }
@@ -1814,9 +2141,9 @@ fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
 }
 
 /// Exhaustive over `Expr`, so a new variant fails to compile here instead of
-/// reaching the executor's catch-all arm; a rank expression is projectable when
-/// it repeats the retrieval `order` executes (T33, `Expr::score_column`).
-fn check_projection(expr: &Expr, order_clause: &[Ordering]) -> Result<()> {
+/// reaching the executor's catch-all arm; a rank expression repeats the leading
+/// `order` retrieval (T33), a Boolean expression carries its `alias` (T43).
+fn check_projection(expr: &Expr, alias: Option<&str>, order_clause: &[Ordering]) -> Result<()> {
     match expr {
         Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::Literal(_) => Ok(()),
         Expr::Aggregate { func, arg } => match arg.as_ref() {
@@ -1826,7 +2153,7 @@ fn check_projection(expr: &Expr, order_clause: &[Ordering]) -> Result<()> {
                     rank_keyword(arg)
                 )))
             }
-            inner => check_projection(inner, order_clause),
+            inner => check_projection(inner, alias, order_clause),
         },
         Expr::Nearest { .. } | Expr::Bm25 { .. } => {
             let executed = order_clause.first().is_some_and(|lead| &lead.expr == expr);
@@ -1857,7 +2184,25 @@ fn check_projection(expr: &Expr, order_clause: &[Ordering]) -> Result<()> {
         Expr::AliasRef(name) => Err(CompilerError::Type(format!(
             "T36: `{name}` cannot be projected in `return`; an alias is resolved in `order`, not projected again"
         ))),
+        Expr::Binary { left, right, .. } => {
+            require_projection_alias(alias)?;
+            check_projection(left, alias, order_clause)?;
+            check_projection(right, alias, order_clause)
+        }
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => {
+            require_projection_alias(alias)?;
+            check_projection(inner, alias, order_clause)
+        }
     }
+}
+
+fn require_projection_alias(alias: Option<&str>) -> Result<()> {
+    if alias.is_none() {
+        return Err(CompilerError::Type(
+            "T43: a comparison in return needs an alias; write `… as <name>`".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn rank_keyword(expr: &Expr) -> &'static str {
@@ -1873,7 +2218,10 @@ fn rank_keyword(expr: &Expr) -> &'static str {
         | Expr::Variable(_)
         | Expr::Literal(_)
         | Expr::Aggregate { .. }
-        | Expr::AliasRef(_) => "expression",
+        | Expr::AliasRef(_)
+        | Expr::Binary { .. }
+        | Expr::Not(_)
+        | Expr::IsNull { .. } => "expression",
     }
 }
 
@@ -1892,10 +2240,10 @@ fn infer_projection_field(
             // not first passed through `typecheck_read_query`. In particular,
             // Count's output shape is fixed, but its argument may still be an
             // unsupported Blob value.
-            let resolved_arg = resolve_expr_type(catalog, arg, ctx, params)?;
+            let resolved_arg = resolve_expr_type(catalog, arg, ctx, params, Scope::Read)?;
             reject_blob_read_value(&resolved_arg, arg)?;
             check_aggregate_argument(func, arg, &resolved_arg)?;
-            check_projection(expr, order_clause)?;
+            check_projection(expr, alias, order_clause)?;
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
                 AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
@@ -1907,14 +2255,14 @@ fn infer_projection_field(
             Ok(Field::new(name, data_type, nullable))
         }
         Expr::Nearest { .. } | Expr::Bm25 { .. } => {
-            resolve_expr_type(catalog, expr, ctx, params)?;
-            check_projection(expr, order_clause)?;
+            resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
+            check_projection(expr, alias, order_clause)?;
             Ok(Field::new(name, DataType::Float32, false))
         }
         _ => {
-            let resolved = resolve_expr_type(catalog, expr, ctx, params)?;
+            let resolved = resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
             reject_blob_read_value(&resolved, expr)?;
-            check_projection(expr, order_clause)?;
+            check_projection(expr, alias, order_clause)?;
             let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
             Ok(Field::new(name, data_type, nullable))
         }
@@ -1964,6 +2312,7 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
         }
         Expr::Aggregate { func, .. } => func.to_string(),
         Expr::AliasRef(name) => name.clone(),
+        Expr::Binary { .. } | Expr::Not(_) | Expr::IsNull { .. } => "expression".to_string(),
     }
 }
 
@@ -2134,6 +2483,15 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
     Ok(())
 }
 
+/// `types_compatible`, plus a String parameter assigned to a Blob property
+/// (the blob's URI).
+fn assignment_compatible(actual: &PropType, expected: &PropType) -> bool {
+    types_compatible(actual, expected)
+        || (matches!(expected.scalar, ScalarType::Blob)
+            && matches!(actual.scalar, ScalarType::String)
+            && !actual.list)
+}
+
 fn types_compatible(a: &PropType, b: &PropType) -> bool {
     if a.list != b.list {
         return false;
@@ -2204,6 +2562,10 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
         }
         Expr::Variable(v) => vars.contains(v),
         Expr::Aggregate { arg, .. } => expr_references_any(arg, vars),
+        Expr::Binary { left, right, .. } => {
+            expr_references_any(left, vars) || expr_references_any(right, vars)
+        }
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_references_any(inner, vars),
         _ => false,
     }
 }
@@ -2233,6 +2595,12 @@ fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
         }
         // nearest() nested under rrf() is handled by T21 and should not trigger T17/T18 checks.
         Expr::Rrf { .. } => false,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_standalone_nearest(left) || expr_contains_standalone_nearest(right)
+        }
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => {
+            expr_contains_standalone_nearest(inner)
+        }
         _ => false,
     }
 }
@@ -2253,6 +2621,8 @@ fn expr_contains_rrf(expr: &Expr) -> bool {
                 || expr_contains_rrf(query)
                 || max_edits.as_deref().is_some_and(expr_contains_rrf)
         }
+        Expr::Binary { left, right, .. } => expr_contains_rrf(left) || expr_contains_rrf(right),
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_contains_rrf(inner),
         _ => false,
     }
 }

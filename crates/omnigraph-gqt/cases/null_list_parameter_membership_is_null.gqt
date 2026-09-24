@@ -1,0 +1,52 @@
+# issue: none
+# notes: `contains` over a nullable list parameter bound to null projects null, as `=` and
+# notes: `starts_with` over a null String or Bool parameter do; bound to a list it is membership.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a"}}
+
+--- query
+set engine = v2;
+query null_operands($tags: [String]?, $name: String?, $flag: Bool?) {
+    match { $p: Person }
+    return { $tags contains "a" as present, $name = "a" as same_name, $flag = true as same_flag, $name starts_with "a" as prefixed }
+}
+
+--- params
+{"tags": null, "name": null, "flag": null}
+
+--- expect unordered
+{}
+
+--- expect shape
+present: Bool?
+same_name: Bool?
+same_flag: Bool?
+prefixed: Bool?
+
+--- query
+set engine = v2;
+query bound_list($tags: [String]?) {
+    match { $p: Person }
+    return { $tags contains "a" as present }
+}
+
+--- params
+{"tags": ["a", "b"]}
+
+--- expect unordered
+{"present": true}
+
+--- expect shape
+present: Bool?

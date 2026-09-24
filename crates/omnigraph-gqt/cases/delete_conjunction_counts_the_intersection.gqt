@@ -1,0 +1,50 @@
+# issue: none
+# notes: An `update … where a and b` and a `delete … where a and b` touch the rows matching both comparisons and count only them,
+# notes: `starts_with` on a String and `contains` on a list property joined in one predicate; the rows matching one side survive.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    tags: [String]
+    note: String?
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","tags":["x","y"]}}
+{"type":"Person","data":{"name":"anna","tags":["y"]}}
+{"type":"Person","data":{"name":"adam","tags":["x"]}}
+{"type":"Person","data":{"name":"bob","tags":["x"]}}
+
+--- mutate
+query note_a_names_tagged_y() {
+    update Person set { note: "seen" } where name starts_with "a" and tags contains "y"
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query delete_a_names_tagged_x() {
+    delete Person where name starts_with "a" and tags contains "x"
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query survivors() {
+    match { $p: Person }
+    return { $p.name, $p.note }
+}
+
+--- expect unordered
+{"p.name": "anna", "p.note": "seen"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+p.note: String?

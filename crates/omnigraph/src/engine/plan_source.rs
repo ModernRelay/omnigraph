@@ -10,7 +10,7 @@ use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::datatypes::Field;
 use lance_file::version::ConcreteFileVersion;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRFilter, IROp, ParamMap, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
 use omnigraph_compiler::types::Direction;
@@ -22,7 +22,7 @@ use omnigraph_planner::{
 };
 
 use super::ResolvedParams;
-use super::scan::ir_filter_to_expr;
+use super::scan::ir_expr_to_df_expr;
 use super::search::check_param_date_literals;
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
@@ -89,6 +89,9 @@ fn gate_policy(settings: &SessionSettings) -> GatePolicy {
 /// The one gathered view a read plans from, shared by the run and by its
 /// explain: everything the planner reads, and the binding the run lowers with.
 pub(crate) struct QuerySource<'a> {
+    /// The compiled query with every constant of a filter position folded to
+    /// its bound value (`engine::constant`); the planner reads no other form.
+    pub ir: QueryIR,
     pub catalog: &'a Arc<Catalog>,
     pub snapshot: &'a Snapshot,
     pub params: ResolvedParams,
@@ -115,18 +118,22 @@ impl<'a> QuerySource<'a> {
         params: &ParamMap,
         settings: &'a SessionSettings,
     ) -> Result<QuerySource<'a>> {
+        let params = resolve_params(ir, params)?;
+        let ir = super::constant::fold_query_constants(ir, params.shared())?;
+        let table_stats = destination_table_statistics(&ir, snapshot).await?;
         let mut source = QuerySource {
+            ir,
             catalog,
             snapshot,
-            params: resolve_params(ir, params)?,
+            params,
             settings,
             memory_limit: super::context::query_memory_limit(),
             gate_policy: gate_policy(settings),
             expand_caps: ExpandCaps::from_env(),
-            table_stats: destination_table_statistics(ir, snapshot).await?,
+            table_stats,
         };
         source
-            .load_column_statistics(&Operation::Query(Box::new(ir.clone())))
+            .load_column_statistics(&Operation::Query(Box::new(source.ir.clone())))
             .await?;
         Ok(source)
     }
@@ -260,10 +267,10 @@ impl PlanSource for QuerySource<'_> {
         })
     }
 
-    /// The scan lowers exactly the filters `ir_filter_to_expr` can express;
+    /// The scan lowers exactly the conjuncts `ir_expr_to_df_expr` can express;
     /// the schema argument only types a literal, never the verdict.
-    fn filter_pushable(&self, filter: &IRFilter) -> bool {
-        ir_filter_to_expr(filter, self.params.shared(), None).is_some()
+    fn filter_pushable(&self, filter: &IRExpr) -> bool {
+        ir_expr_to_df_expr(filter, self.params.shared(), None).is_some()
     }
 
     /// The manifest's `entity_count` of the edge type and its two endpoint
@@ -351,8 +358,8 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
 }
 
 /// Build the physical plan for execution without explain diagnostics.
-pub(crate) fn plan_query(ir: &QueryIR, source: &QuerySource<'_>) -> Result<PhysicalPlan> {
-    omnigraph_planner::plan_query(ir, source, &source.bounds())
+pub(crate) fn plan_query(source: &QuerySource<'_>) -> Result<PhysicalPlan> {
+    omnigraph_planner::plan_query(&source.ir, source, &source.bounds())
         .map_err(|reason| no_plan(reason.to_json()))
 }
 
@@ -365,8 +372,8 @@ pub(crate) struct ExplainedQuery {
 
 /// A read query always gets a plan; a gate answer other than `Engine` is a
 /// planner defect, never a fallback.
-pub(crate) fn explain_query(ir: &QueryIR, source: &QuerySource<'_>) -> Result<ExplainedQuery> {
-    let operation = Operation::Query(Box::new(ir.clone()));
+pub(crate) fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQuery> {
+    let operation = Operation::Query(Box::new(source.ir.clone()));
     match omnigraph_planner::route(
         &operation,
         source,
@@ -517,7 +524,7 @@ query people() { match { $p: Person } return { count($p) as n } }
                 QuerySource::gather(&ir, &catalog, &view.snapshot, &ParamMap::new(), &settings)
                     .await
                     .unwrap();
-            let plan = plan_query(&ir, &source).unwrap();
+            let plan = plan_query(&source).unwrap();
             let mut from_ir = HashMap::new();
             collect_node_bindings(&ir.pipeline, &mut from_ir);
             assert_eq!(from_ir.len(), bound, "{name}");
@@ -553,7 +560,7 @@ query people() { match { $p: Person } return { count($p) as n } }
         with_query_memory_limit(2 * CAPTURED, async {
             assert_eq!(source.bounds().query_memory_pool_bytes, CAPTURED);
             assert_eq!(source.query_memory_pool_bytes(), CAPTURED);
-            let plan = plan_query(&ir, &source).unwrap();
+            let plan = plan_query(&source).unwrap();
             assert_eq!(plan.assumptions().memory_limit, CAPTURED);
             let bound = crate::engine::bind::bind(plan, &source, &EmbeddingResolver::explain())
                 .await

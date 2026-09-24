@@ -32,6 +32,113 @@ impl FreshNames {
     }
 }
 
+/// What every expression site shares: the parameters, the physical column
+/// spellings and where a `contains` left operand's type lives. Every emitted
+/// expression lowers through one, so `contains` resolution and `fold` apply everywhere.
+struct LowerCtx<'a> {
+    catalog: &'a Catalog,
+    param_names: &'a HashSet<String>,
+    param_types: &'a HashMap<String, PropType>,
+    bindings: Bindings<'a>,
+}
+
+/// The binding a variable names.
+enum Bindings<'a> {
+    /// A read: the clause list's own bindings and traversal endpoints first
+    /// (a negation's inner clauses are typechecked into a discarded context
+    /// clone, so the outer `TypeContext` never sees them), then the query's.
+    Read {
+        local: &'a HashMap<&'a str, BoundVariable>,
+        type_ctx: &'a TypeContext,
+    },
+    /// A mutation: the target type, whose bare name stands where a read has
+    /// a binding variable (`Expr::mutation_property`).
+    Mutation(BoundVariable),
+}
+
+impl LowerCtx<'_> {
+    fn system_columns(&self) -> SystemColumns {
+        self.catalog.system_columns
+    }
+
+    fn binding(&self, variable: &str) -> Option<&BoundVariable> {
+        match &self.bindings {
+            Bindings::Read { local, type_ctx } => local
+                .get(variable)
+                .or_else(|| type_ctx.bindings.get(variable)),
+            Bindings::Mutation(target) => match target {
+                BoundVariable::Node { type_name } | BoundVariable::Edge { type_name } => {
+                    (variable == type_name).then_some(target)
+                }
+            },
+        }
+    }
+
+    /// The physical column a property leaf reads: `@id` through
+    /// `physical_property` as a read does, a mutation target edge's `from`
+    /// and `to` to the system endpoint columns.
+    fn physical_column(&self, variable: &str, property: &str) -> String {
+        let system_columns = self.system_columns();
+        if let Some(BoundVariable::Edge { .. }) = self.binding(variable)
+            && matches!(self.bindings, Bindings::Mutation(_))
+        {
+            match property {
+                "from" => return system_columns.src.to_string(),
+                "to" => return system_columns.dst.to_string(),
+                _ => {}
+            }
+        }
+        physical_property(property, system_columns)
+    }
+
+    /// Whether a lowered left operand is a non-list String: a String literal,
+    /// a String parameter, a system column, or a scalar String property of
+    /// the binding its variable names. The test that resolves `contains`.
+    fn is_scalar_string(&self, expr: &IRExpr) -> bool {
+        let scalar_string =
+            |prop: &PropType| !prop.list && matches!(prop.scalar, ScalarType::String);
+        match expr {
+            IRExpr::Literal(Literal::String(_)) => true,
+            IRExpr::Param(name) => self.param_types.get(name).is_some_and(scalar_string),
+            IRExpr::PropAccess { variable, property } => {
+                let system_columns = self.system_columns();
+                if [system_columns.id, system_columns.src, system_columns.dst]
+                    .contains(&property.as_str())
+                {
+                    return true;
+                }
+                let declared = match self.binding(variable) {
+                    Some(BoundVariable::Node { type_name }) => self
+                        .catalog
+                        .node_types
+                        .get(type_name)
+                        .and_then(|node_type| node_type.properties.get(property)),
+                    Some(BoundVariable::Edge { type_name }) => self
+                        .catalog
+                        .lookup_edge_by_name(type_name)
+                        .and_then(|edge_type| edge_type.properties.get(property)),
+                    None => None,
+                };
+                declared.is_some_and(scalar_string)
+            }
+            _ => false,
+        }
+    }
+
+    /// `left <op> right`: `contains` over a scalar String left operand becomes
+    /// `StringContains`, so execution dispatches on the IR op alone and never
+    /// re-derives operand types; a literal-only node folds.
+    fn binary(&self, left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
+        let op = match op {
+            BinaryOp::Compare(CompOp::Contains) if self.is_scalar_string(&left) => {
+                BinaryOp::Compare(CompOp::StringContains)
+            }
+            other => other,
+        };
+        fold::binary(left, op, right)
+    }
+}
+
 pub fn lower_query(
     catalog: &Catalog,
     query: &QueryDecl,
@@ -43,15 +150,7 @@ pub fn lower_query(
         ));
     }
     let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
-    // Param types were validated during typecheck; unknown names simply
-    // don't participate in `contains` overload resolution below.
-    let param_types: HashMap<String, PropType> = query
-        .params
-        .iter()
-        .filter_map(|p| {
-            PropType::from_param_type_name(&p.type_name, p.nullable).map(|t| (p.name.clone(), t))
-        })
-        .collect();
+    let param_types = declared_param_types(query);
 
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
@@ -68,11 +167,21 @@ pub fn lower_query(
         &mut fresh,
     )?;
 
+    let no_local_bindings = HashMap::new();
+    let ctx = LowerCtx {
+        catalog,
+        param_names: &param_names,
+        param_types: &param_types,
+        bindings: Bindings::Read {
+            local: &no_local_bindings,
+            type_ctx,
+        },
+    };
     let return_exprs: Vec<IRProjection> = query
         .return_clause
         .iter()
         .map(|p| IRProjection {
-            expr: lower_projection(&p.expr, &param_names, catalog.system_columns),
+            expr: lower_projection(&p.expr, &ctx),
             alias: p.alias.clone().or_else(|| meta_field_result_key(&p.expr)),
         })
         .collect();
@@ -96,7 +205,7 @@ pub fn lower_query(
                 .filter(|_| matches!(&o.expr, Expr::PropAccess { .. }))
                 .filter(|name| aggregate_meta_columns.contains(name))
                 .map(IRExpr::AliasRef)
-                .unwrap_or_else(|| lower_expr(&o.expr, &param_names, catalog.system_columns)),
+                .unwrap_or_else(|| lower_expr(&o.expr, &ctx)),
             descending: o.descending,
         })
         .collect();
@@ -113,18 +222,19 @@ pub fn lower_query(
     Ok(ir)
 }
 
-pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
+pub fn lower_mutation_query(catalog: &Catalog, query: &QueryDecl) -> Result<MutationIR> {
     if query.mutations.is_empty() {
         return Err(crate::error::CompilerError::Plan(
             "query does not contain a mutation body".to_string(),
         ));
     }
     let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
+    let param_types = declared_param_types(query);
 
     let ops = query
         .mutations
         .iter()
-        .map(|m| lower_single_mutation(m, &param_names))
+        .map(|m| lower_single_mutation(catalog, m, &param_names, &param_types))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(MutationIR {
@@ -134,45 +244,68 @@ pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
     })
 }
 
+/// Param types were validated during typecheck; unknown names simply don't
+/// participate in `contains` overload resolution.
+fn declared_param_types(query: &QueryDecl) -> HashMap<String, PropType> {
+    query
+        .params
+        .iter()
+        .filter_map(|p| {
+            PropType::from_param_type_name(&p.type_name, p.nullable).map(|t| (p.name.clone(), t))
+        })
+        .collect()
+}
+
+/// One mutation statement; its target is the node type of that name, else
+/// the edge type, the order the type checker resolves it in.
 fn lower_single_mutation(
+    catalog: &Catalog,
     mutation: &Mutation,
     param_names: &HashSet<String>,
+    param_types: &HashMap<String, PropType>,
 ) -> Result<MutationOpIR> {
+    let type_name = match mutation {
+        Mutation::Insert(insert) => &insert.type_name,
+        Mutation::Update(update) => &update.type_name,
+        Mutation::Delete(delete) => &delete.type_name,
+    };
+    let target = if catalog.node_types.contains_key(type_name) {
+        BoundVariable::Node {
+            type_name: type_name.clone(),
+        }
+    } else {
+        BoundVariable::Edge {
+            type_name: type_name.clone(),
+        }
+    };
+    let ctx = LowerCtx {
+        catalog,
+        param_names,
+        param_types,
+        bindings: Bindings::Mutation(target),
+    };
+    let lower_assignments = |assignments: &[MutationAssignment]| {
+        assignments
+            .iter()
+            .map(|a| IRAssignment {
+                property: a.property.clone(),
+                value: lower_expr(&a.value, &ctx),
+            })
+            .collect()
+    };
     match mutation {
         Mutation::Insert(insert) => Ok(MutationOpIR::Insert {
             type_name: insert.type_name.clone(),
-            assignments: insert
-                .assignments
-                .iter()
-                .map(|a| IRAssignment {
-                    property: a.property.clone(),
-                    value: lower_match_value(&a.value, param_names),
-                })
-                .collect(),
+            assignments: lower_assignments(&insert.assignments),
         }),
         Mutation::Update(update) => Ok(MutationOpIR::Update {
             type_name: update.type_name.clone(),
-            assignments: update
-                .assignments
-                .iter()
-                .map(|a| IRAssignment {
-                    property: a.property.clone(),
-                    value: lower_match_value(&a.value, param_names),
-                })
-                .collect(),
-            predicate: IRMutationPredicate {
-                property: update.predicate.property.clone(),
-                op: update.predicate.op,
-                value: lower_match_value(&update.predicate.value, param_names),
-            },
+            assignments: lower_assignments(&update.assignments),
+            predicate: lower_expr(&update.predicate, &ctx),
         }),
         Mutation::Delete(delete) => Ok(MutationOpIR::Delete {
             type_name: delete.type_name.clone(),
-            predicate: IRMutationPredicate {
-                property: delete.predicate.property.clone(),
-                op: delete.predicate.op,
-                value: lower_match_value(&delete.predicate.value, param_names),
-            },
+            predicate: lower_expr(&delete.predicate, &ctx),
         }),
     }
 }
@@ -191,26 +324,56 @@ fn lower_clauses(
     let mut bindings = Vec::new();
     let mut traversals = Vec::new();
     let mut filters = Vec::new();
-    let mut subqueries: Vec<(&[Clause], SubqueryPredicate)> = Vec::new();
+    let mut subqueries: Vec<&Subquery> = Vec::new();
 
     for clause in clauses {
         match clause {
             Clause::Binding(b) => bindings.push(b),
             Clause::Traversal(t) => traversals.push(t),
             Clause::Filter(f) => filters.push(f),
-            Clause::Subquery(subquery) => {
-                subqueries.push((
-                    subquery.clauses.as_slice(),
-                    SubqueryPredicate {
-                        func: subquery.func,
-                        arg: subquery_argument(subquery, param_names, catalog.system_columns),
-                        op: subquery.op,
-                        right: lower_expr(&subquery.right, param_names, catalog.system_columns),
-                    },
-                ));
+            Clause::Subquery(subquery) => subqueries.push(subquery),
+        }
+    }
+
+    let mut local_bindings: HashMap<&str, BoundVariable> = HashMap::new();
+    for t in &traversals {
+        if let Some(edge) = catalog.lookup_edge_by_name(&t.edge_name) {
+            local_bindings
+                .entry(t.src.as_str())
+                .or_insert_with(|| BoundVariable::Node {
+                    type_name: edge.from_type.clone(),
+                });
+            local_bindings
+                .entry(t.dst.as_str())
+                .or_insert_with(|| BoundVariable::Node {
+                    type_name: edge.to_type.clone(),
+                });
+            if let Some(eb) = &t.edge_binding {
+                local_bindings
+                    .entry(eb.as_str())
+                    .or_insert_with(|| BoundVariable::Edge {
+                        type_name: edge.name.clone(),
+                    });
             }
         }
     }
+    for b in &bindings {
+        local_bindings.insert(
+            b.variable.as_str(),
+            BoundVariable::Node {
+                type_name: b.type_name.clone(),
+            },
+        );
+    }
+    let ctx = LowerCtx {
+        catalog,
+        param_names,
+        param_types,
+        bindings: Bindings::Read {
+            local: &local_bindings,
+            type_ctx,
+        },
+    };
 
     // ── Determine which bindings are "deferred" ─────────────────────────
     //
@@ -246,7 +409,7 @@ fn lower_clauses(
     let mut component_visited: HashSet<&str> = HashSet::new();
     let searched: HashSet<&str> = filters
         .iter()
-        .filter_map(|f| text_search_subject(&f.left).or_else(|| text_search_subject(&f.right)))
+        .filter_map(|f| text_search_subject(f))
         .collect();
 
     for binding in &bindings {
@@ -291,13 +454,13 @@ fn lower_clauses(
     }
 
     // Build deferred filters map for variables introduced by traversals
-    let mut deferred_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+    let mut deferred_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
 
     // A variable bound again after its first binding (`$p: Person` twice in
     // one match, or inside `not { }` over an outer `$p`): the typechecker
     // admits it as the same type, so it is a constraint on the existing
     // rows, not a second scan. Its inline filters become plain Filter ops.
-    let mut rebind_filters: Vec<IRFilter> = Vec::new();
+    let mut rebind_filters: Vec<IRExpr> = Vec::new();
 
     // Lower bindings into NodeScan ops (skip deferred ones)
     for binding in &bindings {
@@ -306,7 +469,7 @@ fn lower_clauses(
             .get(&binding.type_name)
             .expect("binding type was validated during typecheck");
 
-        let binding_filters = build_binding_filters(binding, node_type, param_names);
+        let binding_filters = build_binding_filters(binding, node_type, &ctx);
 
         // A variable the outer pattern already bound (a negation's inner
         // clauses run over the outer batch) is never deferred, whatever its
@@ -411,17 +574,17 @@ fn lower_clauses(
                         .filter(|binding| *binding != "_")
                         .map(str::to_string),
                 });
-                pipeline.push(IROp::Filter(IRFilter {
-                    left: IRExpr::PropAccess {
+                pipeline.push(IROp::Filter(IRExpr::comparison(
+                    IRExpr::PropAccess {
                         variable: temp_var,
                         property: catalog.system_columns.id.to_string(),
                     },
-                    op: CompOp::Eq,
-                    right: IRExpr::PropAccess {
+                    CompOp::Eq,
+                    IRExpr::PropAccess {
                         variable: traversal.dst.clone(),
                         property: catalog.system_columns.id.to_string(),
                     },
-                }));
+                )));
             } else if !src_bound && dst_bound {
                 // Reverse expand: dst is bound, src is not.
                 let reverse_dir = match direction {
@@ -496,45 +659,6 @@ fn lower_clauses(
         remaining = next_remaining;
     }
 
-    // Clause-local variable types for filter-op resolution: negation inners
-    // are typechecked into a discarded context clone (same asymmetry the
-    // `direction` fallback above documents), so `type_ctx` alone cannot
-    // resolve variables introduced inside `not { }`. Bindings declare their
-    // type; traversal endpoints take the edge's declared endpoint types
-    // (bindings win when both name a variable).
-    let mut local_bindings: HashMap<&str, BoundVariable> = HashMap::new();
-    for t in &traversals {
-        if let Some(edge) = catalog.lookup_edge_by_name(&t.edge_name) {
-            local_bindings
-                .entry(t.src.as_str())
-                .or_insert_with(|| BoundVariable::Node {
-                    type_name: edge.from_type.clone(),
-                });
-            local_bindings
-                .entry(t.dst.as_str())
-                .or_insert_with(|| BoundVariable::Node {
-                    type_name: edge.to_type.clone(),
-                });
-            // An edge binding (`$p $w:knows $f`) names the edge type, whose
-            // String properties are addressable in filters (`$w.note contains …`).
-            if let Some(eb) = &t.edge_binding {
-                local_bindings
-                    .entry(eb.as_str())
-                    .or_insert_with(|| BoundVariable::Edge {
-                        type_name: edge.name.clone(),
-                    });
-            }
-        }
-    }
-    for b in &bindings {
-        local_bindings.insert(
-            b.variable.as_str(),
-            BoundVariable::Node {
-                type_name: b.type_name.clone(),
-            },
-        );
-    }
-
     // Re-binding filters run after every variable is introduced, like the
     // explicit filters below; the executor hoists the pushable ones onto the
     // introducing scan.
@@ -542,14 +666,20 @@ fn lower_clauses(
 
     // Lower explicit filters
     for filter in &filters {
-        pipeline.push(IROp::Filter(IRFilter {
-            left: lower_expr(&filter.left, param_names, catalog.system_columns),
-            op: resolve_filter_op(catalog, type_ctx, param_types, &local_bindings, filter),
-            right: lower_expr(&filter.right, param_names, catalog.system_columns),
-        }));
+        pipeline.push(IROp::Filter(lower_expr(
+            &(*filter).clone().with_search_predicates_spelled(),
+            &ctx,
+        )));
     }
 
-    for (block_clauses, predicate) in subqueries {
+    for subquery in subqueries {
+        let block_clauses = subquery.clauses.as_slice();
+        let predicate = SubqueryPredicate {
+            func: subquery.func,
+            arg: subquery_argument(subquery, &ctx),
+            op: subquery.op,
+            right: lower_expr(&subquery.right, &ctx),
+        };
         let outer_var = find_outer_var(block_clauses, bound_vars);
 
         let mut inner_pipeline = Vec::new();
@@ -575,67 +705,12 @@ fn lower_clauses(
     Ok(())
 }
 
-/// Whether `binding.property` is a non-list scalar String. Every meta-field is
-/// one (typecheck admitted it); otherwise the binding discriminant selects the
-/// one independent catalog namespace that may define the property.
-fn is_scalar_string_property(catalog: &Catalog, binding: &BoundVariable, property: &str) -> bool {
-    if property.starts_with('@') {
-        return true;
-    }
-    match binding {
-        BoundVariable::Node { type_name } => catalog
-            .node_types
-            .get(type_name)
-            .and_then(|nt| nt.properties.get(property)),
-        BoundVariable::Edge { type_name } => catalog
-            .lookup_edge_by_name(type_name)
-            .and_then(|et| et.properties.get(property)),
-    }
-    .is_some_and(|p| !p.list && matches!(p.scalar, ScalarType::String))
-}
-
-/// Resolve the overloaded `contains` keyword to its String-substring form
-/// (`StringContains`) when the left operand is a scalar String, so execution
-/// dispatches on the IR op alone and never re-derives operand types.
-///
-/// Variable bindings come from `local_bindings` (this clause list's node and
-/// edge bindings + traversal endpoints) first, then the outer `TypeContext`
-/// — negation inners never reach the outer context, while outer variables
-/// referenced inside a negation only exist there.
-fn resolve_filter_op(
-    catalog: &Catalog,
-    type_ctx: &TypeContext,
-    param_types: &HashMap<String, PropType>,
-    local_bindings: &HashMap<&str, BoundVariable>,
-    filter: &Filter,
-) -> CompOp {
-    if filter.op != CompOp::Contains {
-        return filter.op;
-    }
-    let left_is_scalar_string = match &filter.left {
-        Expr::PropAccess { variable, property } => local_bindings
-            .get(variable.as_str())
-            .or_else(|| type_ctx.bindings.get(variable))
-            .is_some_and(|binding| is_scalar_string_property(catalog, binding, property)),
-        Expr::Literal(Literal::String(_)) => true,
-        Expr::Variable(v) => param_types
-            .get(v)
-            .is_some_and(|t| !t.list && matches!(t.scalar, ScalarType::String)),
-        _ => false,
-    };
-    if left_is_scalar_string {
-        CompOp::StringContains
-    } else {
-        CompOp::Contains
-    }
-}
-
 /// Build IR filters from a binding's inline property matches.
 fn build_binding_filters(
     binding: &Binding,
     node_type: &crate::catalog::NodeType,
-    param_names: &HashSet<String>,
-) -> Vec<IRFilter> {
+    ctx: &LowerCtx<'_>,
+) -> Vec<IRExpr> {
     let mut filters = Vec::new();
     for pm in &binding.prop_matches {
         let prop = node_type
@@ -647,41 +722,28 @@ fn build_binding_filters(
         } else {
             CompOp::Eq
         };
-        let right = match &pm.value {
-            MatchValue::Literal(lit) => IRExpr::Literal(lit.clone()),
-            MatchValue::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
-            MatchValue::Variable(v) => {
-                if param_names.contains(v) {
-                    IRExpr::Param(v.clone())
-                } else {
-                    IRExpr::Variable(v.clone())
-                }
-            }
-        };
-        filters.push(IRFilter {
-            left: IRExpr::PropAccess {
+        filters.push(IRExpr::comparison(
+            IRExpr::PropAccess {
                 variable: binding.variable.clone(),
                 property: pm.prop_name.clone(),
             },
             op,
-            right,
-        });
+            lower_expr(&pm.value, ctx),
+        ));
     }
     filters
 }
 
 /// The aggregate's argument; `count($m) { … }` over a binding counts rows,
 /// as `count($m)` in a return counts the binding.
-fn subquery_argument(
-    subquery: &Subquery,
-    param_names: &HashSet<String>,
-    system_columns: SystemColumns,
-) -> Option<IRExpr> {
+fn subquery_argument(subquery: &Subquery, ctx: &LowerCtx<'_>) -> Option<IRExpr> {
     match &subquery.arg {
-        Some(Expr::Variable(v)) if subquery.func == AggFunc::Count && !param_names.contains(v) => {
+        Some(Expr::Variable(v))
+            if subquery.func == AggFunc::Count && !ctx.param_names.contains(v) =>
+        {
             None
         }
-        Some(arg) => Some(lower_expr(arg, param_names, system_columns)),
+        Some(arg) => Some(lower_expr(arg, ctx)),
         None => None,
     }
 }
@@ -701,7 +763,8 @@ fn scan_root(
     }
 }
 
-/// The variable a `search`, `fuzzy` or `match_text` call reads.
+/// The variable a `search`, `fuzzy` or `match_text` call reads, anywhere in
+/// the expression.
 fn text_search_subject(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Search { field, .. } | Expr::Fuzzy { field, .. } | Expr::MatchText { field, .. } => {
@@ -710,6 +773,10 @@ fn text_search_subject(expr: &Expr) -> Option<&str> {
                 _ => None,
             }
         }
+        Expr::Binary { left, right, .. } => {
+            text_search_subject(left).or_else(|| text_search_subject(right))
+        }
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => text_search_subject(inner),
         _ => None,
     }
 }
@@ -726,14 +793,7 @@ fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<S
                 }
             }
             Clause::Filter(f) => {
-                if let Some(v) = expr_var(&f.left)
-                    && outer_bound.contains(&v)
-                {
-                    return Some(v);
-                }
-                if let Some(v) = expr_var(&f.right)
-                    && outer_bound.contains(&v)
-                {
+                if let Some(v) = outer_var_in_expr(f, outer_bound) {
                     return Some(v);
                 }
             }
@@ -746,9 +806,25 @@ fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<S
     None
 }
 
+/// The first outer-bound variable an expression's leaves read, operand by
+/// operand in written order.
+fn outer_var_in_expr(expr: &Expr, outer_bound: &HashSet<String>) -> Option<String> {
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            outer_var_in_expr(left, outer_bound).or_else(|| outer_var_in_expr(right, outer_bound))
+        }
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => {
+            outer_var_in_expr(inner, outer_bound)
+        }
+        leaf => expr_var(leaf).filter(|v| outer_bound.contains(v)),
+    }
+}
+
 fn expr_var(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Now => None,
+        Expr::Binary { left, right, .. } => expr_var(left).or_else(|| expr_var(right)),
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_var(inner),
         Expr::PropAccess { variable, .. } => Some(variable.clone()),
         Expr::Variable(v) => Some(v.clone()),
         Expr::Nearest { variable, .. } => Some(variable.clone()),
@@ -774,20 +850,25 @@ fn expr_var(expr: &Expr) -> Option<String> {
     }
 }
 
-/// A projected rank expression lowers to the score column the retrieval
-/// appends under its binding (`Expr::score_column`); typecheck's T33 has
-/// already required `order` to execute that retrieval.
-fn lower_projection(
-    expr: &Expr,
-    param_names: &HashSet<String>,
-    system_columns: SystemColumns,
-) -> IRExpr {
-    match expr.score_column() {
-        Some((variable, property)) => IRExpr::PropAccess {
-            variable: variable.to_string(),
-            property: property.to_string(),
+/// A projected rank expression, at the root or inside the Boolean structure
+/// (`bm25($p.name, "x") > 0.0 as hit`), lowers to the score column the
+/// retrieval appends (`Expr::score_column`); T33 required `order` to execute it.
+fn lower_projection(expr: &Expr, ctx: &LowerCtx<'_>) -> IRExpr {
+    match expr {
+        Expr::Binary { left, op, right } => ctx.binary(
+            lower_projection(left, ctx),
+            *op,
+            lower_projection(right, ctx),
+        ),
+        Expr::Not(inner) => fold::not(lower_projection(inner, ctx)),
+        Expr::IsNull { expr, negated } => fold::is_null(lower_projection(expr, ctx), *negated),
+        _ => match expr.score_column() {
+            Some((variable, property)) => IRExpr::PropAccess {
+                variable: variable.to_string(),
+                property: property.to_string(),
+            },
+            None => lower_expr(expr, ctx),
         },
-        None => lower_expr(expr, param_names, system_columns),
     }
 }
 
@@ -815,13 +896,16 @@ fn meta_field_result_key(expr: &Expr) -> Option<String> {
     }
 }
 
-fn lower_expr(expr: &Expr, param_names: &HashSet<String>, system_columns: SystemColumns) -> IRExpr {
-    let lower = |expr: &Expr| lower_expr(expr, param_names, system_columns);
+/// Every expression the compiler emits lowers through here: property leaves
+/// on their physical columns (`LowerCtx::physical_column`), comparisons and
+/// Boolean nodes through `LowerCtx::binary` and `fold`.
+fn lower_expr(expr: &Expr, ctx: &LowerCtx<'_>) -> IRExpr {
+    let lower = |expr: &Expr| lower_expr(expr, ctx);
     match expr {
         Expr::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
         Expr::PropAccess { variable, property } => IRExpr::PropAccess {
             variable: variable.clone(),
-            property: physical_property(property, system_columns),
+            property: ctx.physical_column(variable, property),
         },
         Expr::Nearest {
             variable,
@@ -863,7 +947,7 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>, system_columns: System
             k: k.as_ref().map(|expr| Box::new(lower(expr))),
         },
         Expr::Variable(v) => {
-            if param_names.contains(v) {
+            if ctx.param_names.contains(v) {
                 IRExpr::Param(v.clone())
             } else {
                 IRExpr::Variable(v.clone())
@@ -875,20 +959,9 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>, system_columns: System
             arg: Box::new(lower(arg)),
         },
         Expr::AliasRef(name) => IRExpr::AliasRef(name.clone()),
-    }
-}
-
-fn lower_match_value(value: &MatchValue, param_names: &HashSet<String>) -> IRExpr {
-    match value {
-        MatchValue::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
-        MatchValue::Literal(l) => IRExpr::Literal(l.clone()),
-        MatchValue::Variable(v) => {
-            if param_names.contains(v) {
-                IRExpr::Param(v.clone())
-            } else {
-                IRExpr::Variable(v.clone())
-            }
-        }
+        Expr::Binary { left, op, right } => ctx.binary(lower(left), *op, lower(right)),
+        Expr::Not(inner) => fold::not(lower(inner)),
+        Expr::IsNull { expr, negated } => fold::is_null(lower(expr), *negated),
     }
 }
 

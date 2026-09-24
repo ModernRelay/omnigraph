@@ -1,0 +1,64 @@
+# issue: none
+# notes: Three deletes in one query whose predicates overlap remove the union
+# notes: of their matches and count each node and each cascaded edge once: the
+# notes: staging ledger excludes rows a prior predicate already matched.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+    team: String
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30,"team":"red"}}
+{"type":"Person","data":{"name":"Bob","age":40,"team":"red"}}
+{"type":"Person","data":{"name":"Carol","age":50,"team":"blue"}}
+{"type":"Person","data":{"name":"Dave","age":20,"team":"blue"}}
+{"edge": "Knows", "from": "Alice", "to": "Bob"}
+{"edge": "Knows", "from": "Bob", "to": "Carol"}
+{"edge": "Knows", "from": "Carol", "to": "Dave"}
+{"edge": "Knows", "from": "Dave", "to": "Alice"}
+
+--- mutate
+query delete_three_overlapping($threshold: I32) {
+    delete Person where team = "red"
+    delete Person where age > $threshold
+    delete Person where name = "Alice"
+}
+
+--- params
+{"threshold": 35}
+
+--- expect affected: nodes=3 edges=4
+
+--- query
+query survivors() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Dave"}
+
+--- expect shape
+p.name: String
+
+--- query
+query remaining_edges() {
+    match { $a: Person  $a knows $b }
+    return { $a.name, $b.name }
+}
+
+--- expect unordered
+
+--- expect shape
+a.name: String
+b.name: String

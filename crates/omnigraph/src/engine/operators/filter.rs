@@ -13,7 +13,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
-use omnigraph_compiler::ir::{IRFilter, ParamMap};
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
 use super::memory::WorkMemory;
 use super::{external, polled, streaming_properties};
@@ -24,7 +24,7 @@ const OUTPUT: &str = "filter output";
 
 pub(crate) struct FilterExec {
     input: Arc<dyn ExecutionPlan>,
-    filters: Vec<IRFilter>,
+    filters: Vec<IRExpr>,
     params: Arc<ParamMap>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -33,7 +33,7 @@ pub(crate) struct FilterExec {
 impl FilterExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
-        filters: Vec<IRFilter>,
+        filters: Vec<IRExpr>,
         params: Arc<ParamMap>,
     ) -> Self {
         let properties = streaming_properties(input.schema());

@@ -19,8 +19,8 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
+use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::Direction;
@@ -41,6 +41,7 @@ use crate::instrumentation::{
 
 mod adapters;
 mod bind;
+mod constant;
 mod context;
 mod explain;
 mod expr;
@@ -65,6 +66,7 @@ use scan::*;
 use search::*;
 
 use bind::bind;
+pub(crate) use constant::evaluate_constant;
 use context::QueryContext;
 pub(crate) use explain::{explain_document, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
@@ -74,6 +76,7 @@ use plan_source::{ExplainedQuery, QuerySource, explain_query, plan_query};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
+pub(crate) use scan::{id_in_list_expr, ir_expr_to_df_expr};
 pub(crate) use search::referenced_edge_types;
 
 /// What `execute` takes beside the bound plan, each member data and not a
@@ -276,7 +279,7 @@ pub(crate) async fn execute_query(
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
     let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let physical = plan_query(ir, &source)?;
+    let physical = plan_query(&source)?;
     let bound = bind(physical, &source, embedding).await?;
     let context = EngineContext {
         snapshot,
@@ -301,7 +304,7 @@ pub(crate) async fn execute_query_inspected(
     settings: &SessionSettings,
 ) -> Result<Executed> {
     let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let ExplainedQuery { explain, physical } = explain_query(ir, &source)?;
+    let ExplainedQuery { explain, physical } = explain_query(&source)?;
     let bound = bind(physical, &source, embedding).await?;
     let context = EngineContext {
         snapshot,

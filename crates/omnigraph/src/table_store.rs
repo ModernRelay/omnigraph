@@ -2741,8 +2741,8 @@ impl TableStore {
     /// Like `stage_merge_insert`, this must carry Lance's `affected_rows`
     /// metadata through to `commit_staged`; otherwise a staged transaction loses
     /// the row-level conflict information Lance's rebase path needs.
-    pub async fn stage_delete(&self, ds: &Dataset, filter: &str) -> Result<Option<StagedWrite>> {
-        let uncommitted = DeleteBuilder::new(Arc::new(ds.clone()), filter)
+    pub async fn stage_delete(&self, ds: &Dataset, filter: Expr) -> Result<Option<StagedWrite>> {
+        let uncommitted = DeleteBuilder::from_expr(Arc::new(ds.clone()), filter)
             .execute_uncommitted()
             .await
             .map_err(OmniError::storage)?;
@@ -4680,7 +4680,7 @@ impl TableStore {
         pending_batches: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
         projection: Option<&[&str]>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
@@ -4713,7 +4713,8 @@ impl TableStore {
         let pending = if pending_batches.is_empty() {
             Vec::new()
         } else {
-            scan_pending_batches(pending_batches, pending_schema, projection, filter).await?
+            scan_pending_batches(pending_batches, pending_schema, projection, filter.clone())
+                .await?
         };
         let mut account = PendingScanAccount::new(budget)?;
         account.add_batches(&pending)?;
@@ -4721,7 +4722,10 @@ impl TableStore {
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
         let mut stream =
-            Self::scan_stream_with(committed_ds, projection, filter, None, false, |scanner| {
+            Self::scan_stream_with(committed_ds, projection, None, None, false, |scanner| {
+                if let Some(filter) = filter {
+                    scanner.filter_expr(filter);
+                }
                 // Scanner byte batches are approximate, so correctness comes
                 // from the per-emission accounting below. These values keep a
                 // normal scan from decoding the entire match set before that
@@ -4780,7 +4784,7 @@ impl TableStore {
         committed_ds: &Dataset,
         pending_batches: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
@@ -4827,7 +4831,7 @@ impl TableStore {
         let pending = if pending_batches.is_empty() {
             Vec::new()
         } else {
-            scan_pending_batches(pending_batches, pending_schema, None, filter).await?
+            scan_pending_batches(pending_batches, pending_schema, None, filter.clone()).await?
         };
         let mut account = PendingScanAccount::new(budget)?;
         account.add_batches(&pending)?;
@@ -4837,10 +4841,13 @@ impl TableStore {
         let mut matched = Self::scan_stream_with(
             committed_ds,
             Some(&non_blob_columns),
-            filter,
+            None,
             None,
             true,
             |scanner| {
+                if let Some(filter) = filter {
+                    scanner.filter_expr(filter);
+                }
                 scanner.batch_size(scan_rows);
                 scanner.batch_size_bytes(scan_bytes);
                 Ok(())
@@ -5062,14 +5069,24 @@ impl TableStore {
     pub async fn first_row_id_for_filter(
         &self,
         ds: &Dataset,
-        filter: &str,
+        filter: Expr,
         system_columns: SystemColumns,
     ) -> Result<Option<u64>> {
-        let batches = Self::scan_stream(ds, Some(&[system_columns.id]), Some(filter), None, true)
-            .await?
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .map_err(OmniError::storage)?;
+        let batches = Self::scan_stream_with(
+            ds,
+            Some(&[system_columns.id]),
+            None,
+            None,
+            true,
+            |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            },
+        )
+        .await?
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(OmniError::storage)?;
         Ok(batches.iter().find_map(|batch| {
             batch
                 .column_by_name("_rowid")
@@ -5438,26 +5455,14 @@ fn filter_out_rows_where_string_in(
     Ok(out)
 }
 
-/// Apply `projection` and `filter` to in-memory pending batches via a
-/// fresh DataFusion `SessionContext`. Used by `scan_with_pending` for
-/// the read-your-writes side of the in-memory staging accumulator.
-///
-/// `pending_batches` must be non-empty (the caller short-circuits on
-/// empty).
-///
-/// **SQL dialect contract.** `filter` is also passed to Lance's scanner
-/// on the committed side. Lance and DataFusion both accept standard
-/// SQL comparison predicates (`col op literal`) and OmniGraph's
-/// `predicate_to_sql` only emits those shapes today (`=`, `!=`, `>`,
-/// `<`, `>=`, `<=`). If a future caller introduces a Lance-specific
-/// scanner extension (vector search, FTS, `_rowid` references) into
-/// the filter, this function will need explicit translation — DataFusion
-/// won't recognize those operators against the in-memory `MemTable`.
+/// `filter`, the typed expression Lance's scanner evaluates on the committed
+/// side, then `projection` over the non-empty pending batches through a fresh
+/// DataFusion `SessionContext`: `scan_with_pending`'s read-your-writes side.
 async fn scan_pending_batches(
     pending_batches: &[RecordBatch],
     pending_schema: Option<SchemaRef>,
     projection: Option<&[&str]>,
-    filter: Option<&str>,
+    filter: Option<Expr>,
 ) -> Result<Vec<RecordBatch>> {
     let schema = pending_schema.unwrap_or_else(|| pending_batches[0].schema());
     let ctx = datafusion::execution::context::SessionContext::new();
@@ -5466,20 +5471,18 @@ async fn scan_pending_batches(
     ctx.register_table("pending", Arc::new(mem))
         .map_err(OmniError::datafusion_internal)?;
 
-    let proj = projection
-        .map(|cols| {
-            cols.iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_else(|| "*".to_string());
-    let where_clause = filter.map(|f| format!("WHERE {f}")).unwrap_or_default();
-    let sql = format!("SELECT {proj} FROM pending {where_clause}");
-    let df = ctx
-        .sql(&sql)
+    let mut df = ctx
+        .table("pending")
         .await
         .map_err(OmniError::datafusion_internal)?;
+    if let Some(filter) = filter {
+        df = df.filter(filter).map_err(OmniError::datafusion_internal)?;
+    }
+    if let Some(columns) = projection {
+        df = df
+            .select_columns(columns)
+            .map_err(OmniError::datafusion_internal)?;
+    }
     df.collect().await.map_err(OmniError::datafusion_internal)
 }
 

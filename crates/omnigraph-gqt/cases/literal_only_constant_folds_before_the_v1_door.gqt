@@ -1,0 +1,44 @@
+# issue: none
+# notes: A literal-only constant folds at compile time, so `{ adult: true or false }` reaches
+# notes: engine v1's door as `adult = true` and runs; a parameter-bearing constant does not fold there.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    adult: Bool
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","adult":false}}
+{"type":"Person","data":{"slug":"b","adult":true}}
+
+--- query
+set engine = v1;
+query folded_inline_match() {
+    match { $p: Person { adult: true or false } }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v1;
+query parameter_bearing_inline_match($flag: Bool) {
+    match { $p: Person { adult: true or $flag } }
+    return { $p.slug }
+}
+
+--- params
+{"flag": false}
+
+--- expect error: plan error: filters other than one comparison or search call are not supported on engine v1; engine v2 runs them: add "set engine = v2;" before the query, or start the server with OMNIGRAPH_ENGINE=v2

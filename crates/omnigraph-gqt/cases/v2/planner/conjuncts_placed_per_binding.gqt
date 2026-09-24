@@ -1,0 +1,73 @@
+# issue: none
+# notes: One filter's `and` chain is split into conjuncts and each is placed on
+# notes: its own: the single-binding conjunct is pushed into that binding's
+# notes: scan, the two-binding conjunct stays a residual filter. Two match
+# notes: clauses spell the same conjunct list and get the same plan and rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","age":40}}
+{"type":"Person","data":{"slug":"b","age":20}}
+{"type":"Person","data":{"slug":"c","age":35}}
+
+--- query
+set engine = v2;
+query joined_with_and() {
+    match {
+        $p: Person
+        $q: Person
+        $p.age > 30 and $p.age > $q.age
+    }
+    return { $p.slug, $q.slug }
+}
+
+--- expect unordered
+{"p.slug": "a", "q.slug": "b"}
+{"p.slug": "a", "q.slug": "c"}
+{"p.slug": "c", "q.slug": "b"}
+
+--- expect shape
+p.slug: String
+q.slug: String
+
+--- expect plan
+pass predicate_pushdown
+scan Person as $p: filter reads [p.age]
+filter reads [p.age, q.age]
+
+--- query
+set engine = v2;
+query two_clauses() {
+    match {
+        $p: Person
+        $q: Person
+        $p.age > 30
+        $p.age > $q.age
+    }
+    return { $p.slug, $q.slug }
+}
+
+--- expect unordered
+{"p.slug": "a", "q.slug": "b"}
+{"p.slug": "a", "q.slug": "c"}
+{"p.slug": "c", "q.slug": "b"}
+
+--- expect shape
+p.slug: String
+q.slug: String
+
+--- expect plan
+pass predicate_pushdown
+scan Person as $p: filter reads [p.age]
+filter reads [p.age, q.age]

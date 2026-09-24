@@ -696,34 +696,45 @@ pub(super) enum NearestGatePlan {
     ProvenEmpty,
 }
 
-/// Whether a filter's left operand is a full-text search call.
-pub(super) fn is_search_filter(filter: &IRFilter) -> bool {
-    matches!(
-        &filter.left,
-        IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }
-    )
+/// The full-text search call a conjunct compares: the left operand of a
+/// comparison-rooted conjunct when it is `search`, `fuzzy` or `match_text`.
+/// The compiler lowers a bare call and `call = true` to that one shape.
+pub(super) fn search_call(filter: &IRExpr) -> Option<&IRExpr> {
+    match filter.comparison_parts()?.0 {
+        call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }) => {
+            Some(call)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a conjunct's left operand is a full-text search call.
+pub(super) fn is_search_filter(filter: &IRExpr) -> bool {
+    search_call(filter).is_some()
 }
 
 /// Whether `filter` is a full-text search call compared to `true`: the one
 /// search shape a scan answers, as membership in the call's matches.
-pub(crate) fn is_positive_search_filter(filter: &IRFilter) -> bool {
-    is_search_filter(filter)
-        && filter.op == CompOp::Eq
-        && matches!(filter.right, IRExpr::Literal(Literal::Bool(true)))
+pub(crate) fn is_positive_search_filter(filter: &IRExpr) -> bool {
+    matches!(
+        filter.comparison_parts(),
+        Some((call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true))))
+            if matches!(call, IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. })
+    )
 }
 
-/// The full-text query of a scan's search filter; `None` for every other
-/// filter. A search call in any other comparison, or one whose property or
+/// The full-text query of a scan's search conjunct; `None` for every other
+/// conjunct. A search call in any other comparison, or one whose property or
 /// query text does not resolve, is refused by the root and dependent scans alike.
 pub(crate) fn search_filter_query(
-    filter: &IRFilter,
+    filter: &IRExpr,
     params: &ParamMap,
 ) -> Result<Option<lance_index::scalar::FullTextSearchQuery>> {
-    if !is_search_filter(filter) {
+    let Some(call) = search_call(filter) else {
         return Ok(None);
-    }
+    };
     is_positive_search_filter(filter)
-        .then(|| build_fts_query(&filter.left, params))
+        .then(|| build_fts_query(call, params))
         .flatten()
         .map(Some)
         .ok_or_else(|| {

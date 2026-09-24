@@ -6,7 +6,150 @@
 use super::*;
 use crate::engine;
 use crate::runtime_cache::CompiledRead;
+use omnigraph_compiler::error::CompilerError;
+use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
 use omnigraph_compiler::settings::Engine;
+
+/// The tail of every refusal of a query v1 cannot run and v2 can, the
+/// construct named in front (RFC 2026-09-24-shared-expression-model, "Engine
+/// setting").
+const V1_SWITCHES: &str = " are not supported on engine v1; engine v2 runs them: add \"set \
+                           engine = v2;\" before the query, or start the server with \
+                           OMNIGRAPH_ENGINE=v2";
+
+/// What the v1 door refuses in a compiled read: each variant names the
+/// construct in front of `V1_SWITCHES`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V1Refusal {
+    CompoundPredicate,
+    ReturnOrOrderComparison,
+    FilterShape,
+    OrderKey,
+}
+
+impl V1Refusal {
+    fn construct(self) -> &'static str {
+        match self {
+            Self::CompoundPredicate => "compound predicates (and, or, not, is null)",
+            Self::ReturnOrOrderComparison => "comparisons in return or order",
+            Self::FilterShape => "filters other than one comparison or search call",
+            Self::OrderKey => {
+                "order keys other than a property, a system field, an alias or the leading \
+                 search key"
+            }
+        }
+    }
+
+    fn error(self) -> OmniError {
+        CompilerError::Plan(format!("{}{V1_SWITCHES}", self.construct())).into()
+    }
+}
+
+/// The first shape of `ir` engine v1 does not evaluate: a filter beyond one
+/// comparison over property, literal and parameter operands or the search call,
+/// a Boolean node in `return` or `order`, or an order key of another shape.
+fn v1_refusal(ir: &QueryIR) -> Option<V1Refusal> {
+    if let Some(refusal) = pipeline_refusal(&ir.pipeline) {
+        return Some(refusal);
+    }
+    if ir
+        .return_exprs
+        .iter()
+        .any(|projection| has_boolean_node(&projection.expr))
+    {
+        return Some(V1Refusal::ReturnOrOrderComparison);
+    }
+    for (index, key) in ir.order_by.iter().enumerate() {
+        if has_boolean_node(&key.expr) {
+            return Some(V1Refusal::ReturnOrOrderComparison);
+        }
+        let accepted = match &key.expr {
+            IRExpr::PropAccess { .. } | IRExpr::AliasRef(_) => true,
+            IRExpr::Nearest { .. } | IRExpr::Bm25 { .. } | IRExpr::Rrf { .. } => index == 0,
+            _ => false,
+        };
+        if !accepted {
+            return Some(V1Refusal::OrderKey);
+        }
+    }
+    None
+}
+
+fn pipeline_refusal(pipeline: &[IROp]) -> Option<V1Refusal> {
+    pipeline.iter().find_map(|op| match op {
+        IROp::NodeScan { filters, .. }
+        | IROp::Expand {
+            dst_filters: filters,
+            ..
+        } => filters.iter().find_map(filter_refusal),
+        IROp::Filter(filter) => filter_refusal(filter),
+        IROp::AntiJoin { inner, .. } => pipeline_refusal(inner),
+    })
+}
+
+fn filter_refusal(filter: &IRExpr) -> Option<V1Refusal> {
+    let v1_operand = |expr: &IRExpr| {
+        matches!(
+            expr,
+            IRExpr::PropAccess { .. } | IRExpr::Literal(_) | IRExpr::Param(_)
+        )
+    };
+    match filter {
+        IRExpr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            ..
+        }
+        | IRExpr::Not(_)
+        | IRExpr::IsNull { .. } => Some(V1Refusal::CompoundPredicate),
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::Compare(op),
+            right,
+        } => {
+            let search_call = matches!(
+                **left,
+                IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }
+            ) && *op == CompOp::Eq
+                && **right == IRExpr::Literal(Literal::Bool(true));
+            (!search_call && !(v1_operand(left) && v1_operand(right)))
+                .then_some(V1Refusal::FilterShape)
+        }
+        _ => Some(V1Refusal::FilterShape),
+    }
+}
+
+fn has_boolean_node(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => true,
+        IRExpr::Aggregate { arg, .. } | IRExpr::Nearest { query: arg, .. } => has_boolean_node(arg),
+        IRExpr::Search { field, query }
+        | IRExpr::MatchText { field, query }
+        | IRExpr::Bm25 { field, query } => has_boolean_node(field) || has_boolean_node(query),
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            has_boolean_node(field)
+                || has_boolean_node(query)
+                || max_edits.as_deref().is_some_and(has_boolean_node)
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            has_boolean_node(primary)
+                || has_boolean_node(secondary)
+                || k.as_deref().is_some_and(has_boolean_node)
+        }
+        IRExpr::PropAccess { .. }
+        | IRExpr::Variable(_)
+        | IRExpr::Param(_)
+        | IRExpr::Literal(_)
+        | IRExpr::AliasRef(_) => false,
+    }
+}
 
 /// Where a route builds its CSR graph index when the query traverses:
 /// the cross-query `RuntimeCache` entry of a live target, or a build against
@@ -242,6 +385,9 @@ impl Session {
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         match settings.engine() {
             Engine::V1 => {
+                if let Some(refusal) = v1_refusal(ir) {
+                    return Err(refusal.error());
+                }
                 let graph_index = match (&index_source, needs_graph) {
                     (_, false) => GraphIndexHandle::none(),
                     (IndexSource::Cached(resolved), true) => GraphIndexHandle::cached(
