@@ -745,6 +745,15 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
         Expr::Aggregate { func: _, arg } => walk_expr(arg, params, needs_indices)?,
+        Expr::Binary { left, op: _, right } => {
+            walk_expr(left, params, needs_indices)?;
+            walk_expr(right, params, needs_indices)?;
+        }
+        Expr::Not(inner)
+        | Expr::IsNull {
+            expr: inner,
+            negated: _,
+        } => walk_expr(inner, params, needs_indices)?,
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
         | Expr::Bm25 { field, query } => {
@@ -818,10 +827,7 @@ fn walk_clauses(
     for clause in clauses {
         match clause {
             Clause::Binding(_) | Clause::Traversal(_) => {}
-            Clause::Filter(f) => {
-                walk_expr(&f.left, params, needs_indices)?;
-                walk_expr(&f.right, params, needs_indices)?;
-            }
+            Clause::Filter(f) => walk_expr(f, params, needs_indices)?,
             Clause::Subquery(subquery) => {
                 walk_clauses(&subquery.clauses, params, needs_indices)?;
                 if let Some(arg) = &subquery.arg {

@@ -1659,17 +1659,27 @@ fn build_fused_batch(
     arrow_select::concat::concat_batches(&schema, &row_slices).map_err(OmniError::arrow_internal)
 }
 
+/// The operands of a comparison-rooted filter; v1 evaluates comparisons only, and the
+/// query door refuses every other shape before a plan reaches this executor.
+fn comparison_parts_v1(filter: &IRExpr) -> (&IRExpr, CompOp, &IRExpr) {
+    filter
+        .comparison_parts()
+        .unwrap_or_else(|| panic!("engine v1 evaluates comparison filters only, got `{filter}`"))
+}
+
 /// Check if a filter is a text search filter that needs Lance SQL pushdown.
-fn is_search_filter(filter: &IRFilter) -> bool {
+fn is_search_filter(filter: &IRExpr) -> bool {
+    let (left, _, _) = comparison_parts_v1(filter);
     matches!(
-        &filter.left,
+        left,
         IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }
     )
 }
 
 /// Extract the variable name from a search filter's field expression.
-fn search_filter_variable(filter: &IRFilter) -> Option<&str> {
-    let field = match &filter.left {
+fn search_filter_variable(filter: &IRExpr) -> Option<&str> {
+    let (left, _, _) = comparison_parts_v1(filter);
+    let field = match left {
         IRExpr::Search { field, .. } => field,
         IRExpr::Fuzzy { field, .. } => field,
         IRExpr::MatchText { field, .. } => field,
@@ -1725,7 +1735,12 @@ fn collect_expr_variables(expr: &IRExpr, vars: &mut HashSet<String>) {
             vars.insert(v.clone());
         }
         IRExpr::Aggregate { arg, .. } => collect_expr_variables(arg, vars),
-        IRExpr::Param(_) | IRExpr::Literal(_) | IRExpr::AliasRef(_) => {}
+        IRExpr::Param(_)
+        | IRExpr::Literal(_)
+        | IRExpr::AliasRef(_)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_)
+        | IRExpr::IsNull { .. } => {}
     }
 }
 
@@ -1735,10 +1750,11 @@ fn collect_expr_variables(expr: &IRExpr, vars: &mut HashSet<String>) {
 /// equality, range, …) is hoisted onto the op that introduces that binding,
 /// where Lance can probe a covering index; a cross-variable filter references
 /// two bindings and stays in the in-memory arm on the joined batch.
-fn filter_variables(filter: &IRFilter) -> HashSet<String> {
+fn filter_variables(filter: &IRExpr) -> HashSet<String> {
+    let (left, _, right) = comparison_parts_v1(filter);
     let mut vars = HashSet::new();
-    collect_expr_variables(&filter.left, &mut vars);
-    collect_expr_variables(&filter.right, &mut vars);
+    collect_expr_variables(left, &mut vars);
+    collect_expr_variables(right, &mut vars);
     vars
 }
 
@@ -1868,8 +1884,8 @@ fn collect_pipeline_columns(pipeline: &[IROp], needed: &mut HashMap<String, Need
     }
 }
 
-fn collect_filter_columns(filter: &IRFilter, needed: &mut HashMap<String, NeededColumns>) {
-    let IRFilter { left, op: _, right } = filter;
+fn collect_filter_columns(filter: &IRExpr, needed: &mut HashMap<String, NeededColumns>) {
+    let (left, _, right) = comparison_parts_v1(filter);
     collect_expr_columns(left, needed);
     collect_expr_columns(right, needed);
 }
@@ -1932,7 +1948,12 @@ fn collect_expr_columns(expr: &IRExpr, needed: &mut HashMap<String, NeededColumn
         IRExpr::Aggregate { func: _, arg } => collect_expr_columns(arg, needed),
         // AliasRef resolves to another RETURN item, whose expression this
         // walk already visits directly; Param/Literal carry no columns.
-        IRExpr::AliasRef(_) | IRExpr::Param(_) | IRExpr::Literal(_) => {}
+        IRExpr::AliasRef(_)
+        | IRExpr::Param(_)
+        | IRExpr::Literal(_)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_)
+        | IRExpr::IsNull { .. } => {}
     }
 }
 
@@ -2003,9 +2024,9 @@ fn execute_pipeline<'a>(
             }
         }
 
-        let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
-        let mut hoisted_scan_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
-        let mut hoisted_dst_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+        let mut hoisted_search_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
+        let mut hoisted_scan_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
+        let mut hoisted_dst_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
         let mut hoisted_indices: HashSet<usize> = HashSet::new();
         for (i, op) in pipeline.iter().enumerate() {
             let IROp::Filter(filter) = op else { continue };
@@ -2062,7 +2083,7 @@ fn execute_pipeline<'a>(
                     filters,
                 } => {
                     // Merge inline filters with hoisted search + scalar filters
-                    let mut all_filters: Vec<IRFilter> = filters.clone();
+                    let mut all_filters: Vec<IRExpr> = filters.clone();
                     if let Some(extra) = hoisted_search_filters.get(variable) {
                         all_filters.extend(extra.iter().cloned());
                     }
@@ -2104,7 +2125,7 @@ fn execute_pipeline<'a>(
                     edge_binding,
                 } => {
                     // Merge lowered destination filters with hoisted ones
-                    let mut all_dst_filters: Vec<IRFilter> = dst_filters.clone();
+                    let mut all_dst_filters: Vec<IRExpr> = dst_filters.clone();
                     if let Some(extra) = hoisted_dst_filters.get(dst_var) {
                         all_dst_filters.extend(extra.iter().cloned());
                     }
@@ -2755,7 +2776,7 @@ async fn execute_expand(
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     edge_binding: Option<&str>,
     params: &ParamMap,
     emit_cap: Option<usize>,
@@ -2859,7 +2880,7 @@ async fn execute_expand_dispatch(
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     edge_binding: Option<&str>,
     params: &ParamMap,
     emit_cap: Option<usize>,
@@ -3104,7 +3125,7 @@ async fn execute_expand_bound(
     edge_type: &str,
     direction: Direction,
     dst_type: &str,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     edge_binding: &str,
     params: &ParamMap,
     edge_ds: Dataset,
@@ -3412,7 +3433,7 @@ async fn execute_expand_bfs(
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     params: &ParamMap,
     start_indexed: Option<Dataset>,
     hop_policy: HopPolicy,
@@ -3722,7 +3743,7 @@ async fn expand_hydrate_and_align(
     catalog: &Catalog,
     dst_type: &str,
     dst_var: &str,
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     params: &ParamMap,
     edge_attach: Option<(String, RecordBatch)>,
 ) -> Result<()> {
@@ -3730,7 +3751,7 @@ async fn expand_hydrate_and_align(
     // (`ir_filter_to_expr` → None) are applied in memory after hconcat. The
     // schema arg only affects a pushable literal's TYPE, never Some-vs-None, so
     // `None` here yields the same pushable/non-pushable split as `hydrate_nodes`.
-    let non_pushable: Vec<&IRFilter> = dst_filters
+    let non_pushable: Vec<&IRExpr> = dst_filters
         .iter()
         .filter(|f| ir_filter_to_expr(f, params, None).is_none())
         .collect();
@@ -3840,7 +3861,7 @@ async fn hydrate_nodes(
     catalog: &Catalog,
     type_name: &str,
     ids: &[String],
-    dst_filters: &[IRFilter],
+    dst_filters: &[IRExpr],
     params: &ParamMap,
 ) -> Result<RecordBatch> {
     let node_type = catalog
@@ -4098,7 +4119,7 @@ async fn execute_anti_join(
 async fn execute_node_scan(
     type_name: &str,
     variable: &str,
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     params: &ParamMap,
     snapshot: &Snapshot,
     catalog: &Catalog,
@@ -4153,7 +4174,7 @@ async fn execute_node_scan(
     let hoisted_fts_queries: Vec<lance_index::scalar::FullTextSearchQuery> = filters
         .iter()
         .filter(|filter| is_search_filter(filter))
-        .filter_map(|filter| build_fts_query(&filter.left, params))
+        .filter_map(|filter| build_fts_query(comparison_parts_v1(filter).0, params))
         .collect();
     let scores_fts = search_mode
         .bm25
@@ -4581,6 +4602,9 @@ fn resolve_to_int(expr: &IRExpr, params: &ParamMap) -> Option<i64> {
     }
 }
 
+/// v1's SQL literal renderer; its last caller, the mutation predicate, now
+/// hands Lance a typed expression, and the frozen file keeps the function.
+#[allow(dead_code)]
 pub(super) fn literal_to_sql(lit: &Literal) -> String {
     match lit {
         Literal::Null => "NULL".to_string(),
@@ -4619,7 +4643,7 @@ pub(super) fn literal_to_sql(lit: &Literal) -> String {
 /// Convert IR filters to a single DataFusion `Expr` (AND-joined), or
 /// `None` if no filter is pushable.
 pub(super) fn build_lance_filter_expr(
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
@@ -4650,7 +4674,7 @@ pub(super) fn build_lance_filter_expr(
 /// search-mode filters (handled via `scanner.full_text_search`) or any
 /// expression shape we can't pushdown.
 pub(super) fn ir_filter_to_expr(
-    filter: &IRFilter,
+    filter: &IRExpr,
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
@@ -4659,15 +4683,16 @@ pub(super) fn ir_filter_to_expr(
     if is_search_filter(filter) {
         return None;
     }
+    let (left, op, right) = comparison_parts_v1(filter);
 
     // List-contains: `prop CONTAINS value` lowers to `array_has(prop, value)`.
     // This is the case the old SQL-string pushdown had to return None for
     // ("Can't pushdown list contains"); with structured Expr it pushes down fine.
     // (Element-type coercion for the contained value is deferred — list columns
     // are not scalar-indexed, so the index-eligibility concern below does not apply.)
-    if matches!(filter.op, CompOp::Contains) {
-        let left = ir_expr_to_expr(&filter.left, params, None)?;
-        let right = ir_expr_to_expr(&filter.right, params, None)?;
+    if matches!(op, CompOp::Contains) {
+        let left = ir_expr_to_expr(left, params, None)?;
+        let right = ir_expr_to_expr(right, params, None)?;
         return Some(array_has(left, right));
     }
 
@@ -4677,11 +4702,11 @@ pub(super) fn ir_filter_to_expr(
     // LikePrefix) or an NGRAM index (`contains` → StringContains + recheck)
     // when one covers the column, and falls back to a plain filtered scan
     // when none does — correct either way.
-    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+    if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
         use datafusion::functions::expr_fn::{contains, starts_with};
-        let left = ir_expr_to_expr(&filter.left, params, None)?;
-        let right = ir_expr_to_expr(&filter.right, params, None)?;
-        return Some(match filter.op {
+        let left = ir_expr_to_expr(left, params, None)?;
+        let right = ir_expr_to_expr(right, params, None)?;
+        return Some(match op {
             CompOp::StartsWith => starts_with(left, right),
             _ => contains(left, right),
         });
@@ -4691,11 +4716,11 @@ pub(super) fn ir_filter_to_expr(
     // the predicate stays a direct `col OP literal` and the scalar index is used.
     // Without this, DataFusion widens a narrow column (`CAST(col AS Int64)`),
     // which defeats the BTREE (validated by `probe_scalar_index_use_under_literal_type`).
-    let left_col_type = prop_data_type(&filter.left, schema);
-    let right_col_type = prop_data_type(&filter.right, schema);
-    let left = ir_expr_to_expr(&filter.left, params, right_col_type.as_ref())?;
-    let right = ir_expr_to_expr(&filter.right, params, left_col_type.as_ref())?;
-    Some(match filter.op {
+    let left_col_type = prop_data_type(left, schema);
+    let right_col_type = prop_data_type(right, schema);
+    let left = ir_expr_to_expr(left, params, right_col_type.as_ref())?;
+    let right = ir_expr_to_expr(right, params, left_col_type.as_ref())?;
+    Some(match op {
         CompOp::Eq => left.eq(right),
         CompOp::Ne => left.not_eq(right),
         CompOp::Gt => left.gt(right),
@@ -5404,14 +5429,14 @@ mod referenced_edge_types_tests {
         let pipeline = vec![
             node_scan("x", "ExternalID"),
             expand("identifiesPerson"),
-            IROp::Filter(IRFilter {
-                left: IRExpr::PropAccess {
+            IROp::Filter(IRExpr::comparison(
+                IRExpr::PropAccess {
                     variable: "p".into(),
                     property: "name".into(),
                 },
-                op: omnigraph_compiler::query::ast::CompOp::Eq,
-                right: IRExpr::Literal(Literal::String("a".into())),
-            }),
+                omnigraph_compiler::query::ast::CompOp::Eq,
+                IRExpr::Literal(Literal::String("a".into())),
+            )),
             expand("identifiesPerson"),
         ];
         assert_eq!(names(&pipeline), vec!["identifiesPerson".to_string()]);
@@ -5641,11 +5666,11 @@ mod literal_lowering_tests {
     #[test]
     fn ir_filter_coerces_literal_for_range_op() {
         let schema = int32_schema();
-        let filter = IRFilter {
-            left: count_prop(),
-            op: CompOp::Ge,
-            right: IRExpr::Literal(Literal::Integer(2)),
-        };
+        let filter = IRExpr::comparison(
+            count_prop(),
+            CompOp::Ge,
+            IRExpr::Literal(Literal::Integer(2)),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert!(
             binary_has_int32_literal(&expr),
@@ -5658,11 +5683,11 @@ mod literal_lowering_tests {
     #[test]
     fn ir_filter_coerces_literal_when_column_is_on_the_right() {
         let schema = int32_schema();
-        let filter = IRFilter {
-            left: IRExpr::Literal(Literal::Integer(2)),
-            op: CompOp::Lt,
-            right: count_prop(),
-        };
+        let filter = IRExpr::comparison(
+            IRExpr::Literal(Literal::Integer(2)),
+            CompOp::Lt,
+            count_prop(),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert!(
             binary_has_int32_literal(&expr),
@@ -5688,14 +5713,14 @@ mod literal_lowering_tests {
     fn ir_filter_preserves_camelcase_column_name() {
         use arrow_schema::{DataType, Field};
         let schema = arrow_schema::Schema::new(vec![Field::new("repoName", DataType::Utf8, true)]);
-        let filter = IRFilter {
-            left: IRExpr::PropAccess {
+        let filter = IRExpr::comparison(
+            IRExpr::PropAccess {
                 variable: "d".into(),
                 property: "repoName".into(),
             },
-            op: CompOp::Eq,
-            right: IRExpr::Literal(Literal::String("acme".into())),
-        };
+            CompOp::Eq,
+            IRExpr::Literal(Literal::String("acme".into())),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert_eq!(
             binary_left_column_name(&expr).as_deref(),
@@ -5712,14 +5737,14 @@ mod literal_lowering_tests {
         use arrow_schema::{DataType, Field};
         let schema =
             arrow_schema::Schema::new(vec![Field::new("itemCount", DataType::Int32, true)]);
-        let filter = IRFilter {
-            left: IRExpr::PropAccess {
+        let filter = IRExpr::comparison(
+            IRExpr::PropAccess {
                 variable: "m".into(),
                 property: "itemCount".into(),
             },
-            op: CompOp::Eq,
-            right: IRExpr::Literal(Literal::Integer(2)),
-        };
+            CompOp::Eq,
+            IRExpr::Literal(Literal::Integer(2)),
+        );
         let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
         assert!(
             binary_has_int32_literal(&expr),
@@ -5799,11 +5824,11 @@ mod needed_columns_tests {
         let q = ir(
             vec![
                 scan("c"),
-                IROp::Filter(IRFilter {
-                    left: prop("c", "state"),
-                    op: CompOp::Eq,
-                    right: IRExpr::Literal(Literal::String("open".into())),
-                }),
+                IROp::Filter(IRExpr::comparison(
+                    prop("c", "state"),
+                    CompOp::Eq,
+                    IRExpr::Literal(Literal::String("open".into())),
+                )),
             ],
             vec![IRExpr::Aggregate {
                 func: AggFunc::Count,
@@ -5836,11 +5861,11 @@ mod needed_columns_tests {
         // filter compares against.
         let inner = vec![
             scan("x"),
-            IROp::Filter(IRFilter {
-                left: prop("x", "kind"),
-                op: CompOp::Eq,
-                right: prop("c", "kind_ref"),
-            }),
+            IROp::Filter(IRExpr::comparison(
+                prop("x", "kind"),
+                CompOp::Eq,
+                prop("c", "kind_ref"),
+            )),
         ];
         let q = ir(
             vec![
@@ -5916,11 +5941,11 @@ mod needed_columns_tests {
                     dst_type: "T".to_string(),
                     min_hops: 1,
                     max_hops: Some(1),
-                    dst_filters: vec![IRFilter {
-                        left: prop("b", "state"),
-                        op: CompOp::Eq,
-                        right: IRExpr::Literal(Literal::String("open".into())),
-                    }],
+                    dst_filters: vec![IRExpr::comparison(
+                        prop("b", "state"),
+                        CompOp::Eq,
+                        IRExpr::Literal(Literal::String("open".into())),
+                    )],
                     edge_binding: None,
                 },
             ],

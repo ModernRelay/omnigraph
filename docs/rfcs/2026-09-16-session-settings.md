@@ -70,7 +70,10 @@ crosses requests. A setting marked `process` in the definition is refused
 when it arrives in a request, so a remote caller cannot widen a resource
 knob or switch a diagnostic on.
 
-Every `request` setting except `ann_nprobes` is answer-preserving: the same statement under any
+Every `request` setting except `ann_nprobes` is answer-preserving, `engine`
+only for a statement both engines accept (a statement only engine v2 accepts
+is a typed gate error under v1 whose message shows both fixes; Decision log,
+2026-09-24): the same statement under any
 assignment of them returns the same result rows in the same order where the
 statement orders them, the same row count, the same typed error outcome, and
 for a merge the same conflict list or the same published content. The
@@ -1173,3 +1176,8 @@ routed) follows step 2.
   wrong-kind message names the offending spelling and an overflowing digit
   run is refused as out of range naming it; the stored-query refusal reads
   `a stored query carries no settings; it runs under the process defaults`.
+- 2026-09-24: `engine` is answer-preserving only for a statement both
+  engines accept; a statement only engine v2 accepts is a typed gate error
+  under v1 whose message shows both fixes. The narrowing comes from the
+  shared expression model RFC
+  ([2026-09-24-shared-expression-model.md](2026-09-24-shared-expression-model.md)).

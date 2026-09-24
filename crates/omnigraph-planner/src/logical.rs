@@ -1,14 +1,15 @@
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, SubqueryPredicate};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::operation::TableRef;
+use crate::optimizer::gq_conjunct;
 use crate::physical::RankKind;
 use crate::source::SideId;
 
@@ -24,7 +25,9 @@ impl fmt::Display for LogicalId {
 
 /// Bumped when the hashed shape of a node changes; the structural hash
 /// covers node kinds and join kinds, not filters or block predicates.
-pub const LOGICAL_PLAN_VERSION: u32 = 1;
+/// Version 2: a `Filter` node holds a conjunct list and every filter is built
+/// as a node before placement.
+pub const LOGICAL_PLAN_VERSION: u32 = 2;
 
 /// The logical name of the id column; each scan binds it to its own
 /// spelling through its [`SystemColumns`].
@@ -104,9 +107,9 @@ pub enum Predicate {
         left: Box<Predicate>,
         right: Box<Predicate>,
     },
-    /// One GQ filter as the query wrote it: the bound values it reads, for the
-    /// projection pass, its GQ text, for explain, and the `IRFilter` itself,
-    /// which the engine's scan lowers.
+    /// One GQ conjunct as the query wrote it: the bound values it reads, for
+    /// the projection pass, its GQ text, for explain, and the expression
+    /// itself, which the engine's scan lowers.
     Gq {
         reads: Vec<ColumnRef>,
         text: String,
@@ -115,34 +118,19 @@ pub enum Predicate {
     },
 }
 
-/// The `IRFilter` behind a `Predicate::Gq`; equal and hashed by its `Debug`
-/// form, since the IR derives neither.
-#[derive(Debug, Clone)]
-pub struct GqFilter(pub IRFilter);
-
-impl PartialEq for GqFilter {
-    fn eq(&self, other: &Self) -> bool {
-        format!("{:?}", self.0) == format!("{:?}", other.0)
-    }
-}
-
-impl Eq for GqFilter {}
-
-impl Hash for GqFilter {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        format!("{:?}", self.0).hash(state);
-    }
-}
+/// The Boolean `IRExpr` behind a `Predicate::Gq`, one conjunct.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GqFilter(pub IRExpr);
 
 impl Predicate {
-    /// Every GQ filter in the conjunction, in the order the query wrote them.
-    pub fn gq_filters(&self) -> Vec<IRFilter> {
+    /// Every GQ conjunct in the conjunction, in the order the query wrote them.
+    pub fn gq_filters(&self) -> Vec<IRExpr> {
         let mut out = Vec::new();
         self.collect_gq_filters(&mut out);
         out
     }
 
-    fn collect_gq_filters(&self, out: &mut Vec<IRFilter>) {
+    fn collect_gq_filters(&self, out: &mut Vec<IRExpr>) {
         match self {
             Self::Gq { filter, .. } => out.push(filter.0.clone()),
             Self::And { left, right } => {
@@ -153,8 +141,8 @@ impl Predicate {
         }
     }
 
-    /// The one GQ filter this predicate is, when it is no conjunction.
-    pub fn single_gq(&self) -> Option<&IRFilter> {
+    /// The one GQ conjunct this predicate is, when it is no conjunction.
+    pub fn single_gq(&self) -> Option<&IRExpr> {
         match self {
             Self::Gq { filter, .. } => Some(&filter.0),
             _ => None,
@@ -322,9 +310,12 @@ pub enum LogicalNode {
         spec: Box<ScanSpec>,
         return_exprs: Vec<IRProjection>,
     },
+    /// The in-memory arm of GQ filters: the top-level `and` chain as written,
+    /// split once into conjuncts when the node is built, each proven `Bool` by
+    /// the type checker; the placement pass moves what it can into a scan.
     Filter {
         input: LogicalId,
-        predicate: Predicate,
+        conjuncts: Vec<IRExpr>,
     },
     /// The query's return expressions and their typed column demand.
     Projection {
@@ -685,9 +676,9 @@ impl LogicalPlan {
             LogicalNode::MetadataCount { spec, return_exprs } => {
                 metadata_count_json(spec, return_exprs)
             }
-            LogicalNode::Filter { predicate, .. } => json!({
+            LogicalNode::Filter { conjuncts, .. } => json!({
                 "node": "Filter",
-                "predicate": predicate,
+                "conjuncts": conjuncts.iter().map(gq_conjunct).collect::<Vec<_>>(),
             }),
             LogicalNode::Projection { reads, .. } => json!({
                 "node": "Projection",
@@ -843,7 +834,7 @@ pub(crate) fn scan_json(name: &str, spec: &ScanSpec) -> Value {
     })
 }
 
-pub(crate) fn filters_json(filters: &[IRFilter]) -> Vec<String> {
+pub(crate) fn filters_json(filters: &[IRExpr]) -> Vec<String> {
     filters.iter().map(ToString::to_string).collect()
 }
 

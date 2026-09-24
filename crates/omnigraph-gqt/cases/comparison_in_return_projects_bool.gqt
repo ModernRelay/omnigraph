@@ -1,0 +1,64 @@
+# issue: none
+# notes: A comparison in return projects a Bool column under its alias on
+# notes: engine v2, null where an operand is null, and the inferred shape is
+# notes: `Bool?` when an operand is nullable. `is not null` in the filter keeps
+# notes: only the rows with an email. Engine v1 refuses the projection at the
+# notes: query door (engine_v1_refuses_compound_predicates.gqt).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    email: String?
+    age: I64?
+    enabled: Bool
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","email":"a@example.com","age":40,"enabled":true}}
+{"type":"Person","data":{"slug":"b","email":"b@example.com","age":20,"enabled":false}}
+{"type":"Person","data":{"slug":"c","email":"c@example.com","enabled":true}}
+{"type":"Person","data":{"slug":"d","age":50,"enabled":false}}
+
+--- query
+set engine = v2;
+query contactable($min: I64) {
+    match { $p: Person  $p.email is not null }
+    return { $p.slug, $p.age > $min as adult }
+}
+
+--- params
+{"min": 30}
+
+--- expect unordered
+{"p.slug": "a", "adult": true}
+{"p.slug": "b", "adult": false}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String
+adult: Bool?
+
+--- query
+set engine = v2;
+query boolean_combination() {
+    match { $p: Person }
+    return { $p.slug, $p.enabled and $p.age > 30 as active_adult, $p.email is null as unreachable, not $p.enabled as idle }
+}
+
+--- expect unordered
+{"p.slug": "a", "active_adult": true, "unreachable": false, "idle": false}
+{"p.slug": "b", "active_adult": false, "unreachable": false, "idle": true}
+{"p.slug": "c", "unreachable": false, "idle": false}
+{"p.slug": "d", "active_adult": false, "unreachable": true, "idle": true}
+
+--- expect shape
+p.slug: String
+active_adult: Bool?
+unreachable: Bool
+idle: Bool

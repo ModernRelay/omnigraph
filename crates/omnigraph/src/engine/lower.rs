@@ -60,7 +60,7 @@ pub(super) struct Lowered {
     pub(super) operators: HashMap<NodeId, Plan>,
     /// What the ranked scan reported in this pass, for the overfetch ladder.
     pub(super) report: Arc<Mutex<ScanReport>>,
-    /// The in-memory filter applications of the tree, one per `IRFilter`.
+    /// The in-memory filter applications of the tree, one per conjunct.
     in_memory_filters: usize,
 }
 
@@ -482,7 +482,7 @@ impl Lower for Walk<'_, '_> {
         Ok(self.built(id, join))
     }
 
-    fn filter(&mut self, id: NodeId, filters: &[IRFilter], input: Plan) -> Lowers<Plan> {
+    fn filter(&mut self, id: NodeId, filters: &[IRExpr], input: Plan) -> Lowers<Plan> {
         if !self.proven_empty {
             self.in_memory_filters += filters.len();
         }

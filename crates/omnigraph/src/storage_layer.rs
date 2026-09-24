@@ -49,6 +49,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::prelude::Expr;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 #[cfg(test)]
@@ -461,6 +462,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         with_row_id: bool,
     ) -> Result<Vec<RecordBatch>>;
 
+    /// `scan` under a typed DataFusion filter, the form the mutation path
+    /// builds from a GQ `where`; no SQL text is rendered.
+    async fn scan_filtered(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Expr,
+    ) -> Result<Vec<RecordBatch>>;
+
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
 
     async fn scan_batches_for_rewrite(&self, snapshot: &SnapshotHandle)
@@ -489,7 +499,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
         projection: Option<&[&str]>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
@@ -504,7 +514,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: &SnapshotHandle,
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
@@ -512,7 +522,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn first_row_id_for_filter(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
         system_columns: SystemColumns,
     ) -> Result<Option<u64>>;
 
@@ -765,13 +775,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         renames: &[(String, String)],
     ) -> Result<StagedHandle>;
 
-    /// Stage a delete (two-phase, no HEAD advance). `None` when 0 rows match —
-    /// the table is not touched (no transaction, no version). See
-    /// `TableStore::stage_delete`.
+    /// Stage a delete (two-phase, no HEAD advance) of the rows `filter`, a typed
+    /// DataFusion expression, selects; `None` when 0 rows match and the table is
+    /// not touched (no transaction, no version). See `TableStore::stage_delete`.
     async fn stage_delete(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
     ) -> Result<Option<StagedHandle>>;
 
     /// Stage every requested full-table index in one Lance transaction.
@@ -935,6 +945,27 @@ impl TableStorage for TableStore {
         .await
     }
 
+    async fn scan_filtered(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Expr,
+    ) -> Result<Vec<RecordBatch>> {
+        TableStore::scan_with(
+            self,
+            snapshot.dataset(),
+            projection,
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            },
+        )
+        .await
+    }
+
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>> {
         TableStore::scan_batches(self, snapshot.dataset()).await
     }
@@ -978,7 +1009,7 @@ impl TableStorage for TableStore {
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
         projection: Option<&[&str]>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
@@ -1000,7 +1031,7 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
         pending: &[RecordBatch],
         pending_schema: Option<SchemaRef>,
-        filter: Option<&str>,
+        filter: Option<Expr>,
         key_column: Option<&str>,
         budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
@@ -1019,7 +1050,7 @@ impl TableStorage for TableStore {
     async fn first_row_id_for_filter(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
         system_columns: SystemColumns,
     ) -> Result<Option<u64>> {
         TableStore::first_row_id_for_filter(self, snapshot.dataset(), filter, system_columns).await
@@ -1352,7 +1383,7 @@ impl TableStorage for TableStore {
     async fn stage_delete(
         &self,
         snapshot: &SnapshotHandle,
-        filter: &str,
+        filter: Expr,
     ) -> Result<Option<StagedHandle>> {
         Ok(TableStore::stage_delete(self, snapshot.dataset(), filter)
             .await?

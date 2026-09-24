@@ -1,0 +1,71 @@
+# issue: none
+# notes: An `or` whose sides read two bindings is one conjunct reading both, so
+# notes: it stays a residual filter and neither scan takes a pushed filter; an
+# notes: `or` whose sides read one binding is pushed into that scan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    x: I64
+    y: I64
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","x":1,"y":1}}
+{"type":"Person","data":{"slug":"b","x":2,"y":2}}
+{"type":"Person","data":{"slug":"c","x":3,"y":3}}
+
+--- query
+set engine = v2;
+query cross_binding_or() {
+    match {
+        $p: Person
+        $q: Person
+        $p.x = 1 or $q.y = 2
+    }
+    return { $p.slug, $q.slug }
+}
+
+--- expect unordered
+{"p.slug": "a", "q.slug": "a"}
+{"p.slug": "a", "q.slug": "b"}
+{"p.slug": "a", "q.slug": "c"}
+{"p.slug": "b", "q.slug": "b"}
+{"p.slug": "c", "q.slug": "b"}
+
+--- expect shape
+p.slug: String
+q.slug: String
+
+--- expect plan
+filter reads [p.x, q.y]
+scan Person as $p: no filter
+scan Person as $q: no filter
+not pass predicate_pushdown
+
+--- query
+set engine = v2;
+query single_binding_or() {
+    match {
+        $p: Person
+        $p.x = 1 or $p.y = 3
+    }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String
+
+--- expect plan
+scan Person as $p: filter reads [p.x, p.y]
+pass predicate_pushdown

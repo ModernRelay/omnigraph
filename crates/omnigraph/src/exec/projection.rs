@@ -62,7 +62,7 @@ fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
 
 pub(super) fn apply_filter(
     batch: &mut RecordBatch,
-    filter: &IRFilter,
+    filter: &IRExpr,
     params: &ParamMap,
 ) -> Result<()> {
     crate::instrumentation::record_in_memory_filter();
@@ -73,20 +73,29 @@ pub(super) fn apply_filter(
     Ok(())
 }
 
+/// The operands of a comparison-rooted filter; v1 evaluates comparisons only, and the
+/// query door refuses every other shape before a plan reaches this executor.
+fn comparison_parts_v1(filter: &IRExpr) -> (&IRExpr, CompOp, &IRExpr) {
+    filter
+        .comparison_parts()
+        .unwrap_or_else(|| panic!("engine v1 evaluates comparison filters only, got `{filter}`"))
+}
+
 /// Evaluate a filter predicate against a batch, producing a boolean mask.
 fn evaluate_filter(
     batch: &RecordBatch,
-    filter: &IRFilter,
+    filter: &IRExpr,
     params: &ParamMap,
 ) -> Result<BooleanArray> {
-    let left = evaluate_expr(batch, &filter.left, params)?;
-    let right = evaluate_expr(batch, &filter.right, params)?;
+    let (left, op, right) = comparison_parts_v1(filter);
+    let left = evaluate_expr(batch, left, params)?;
+    let right = evaluate_expr(batch, right, params)?;
 
-    if filter.op == CompOp::Contains {
+    if op == CompOp::Contains {
         return evaluate_contains_filter(&left, &right);
     }
-    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
-        return evaluate_string_match_filter(filter.op, &left, &right);
+    if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
+        return evaluate_string_match_filter(op, &left, &right);
     }
 
     // Cast right to match left's type if needed (e.g. Int64 literal vs Int32 column)
@@ -97,7 +106,7 @@ fn evaluate_filter(
     };
 
     use arrow_ord::cmp;
-    let result = match filter.op {
+    let result = match op {
         CompOp::Eq => cmp::eq(&left, &right),
         CompOp::Ne => cmp::neq(&left, &right),
         CompOp::Gt => cmp::gt(&left, &right),

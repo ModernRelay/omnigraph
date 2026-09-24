@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::IRFilter;
+use omnigraph_compiler::ir::IRExpr;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
@@ -138,10 +138,10 @@ pub trait PlanSource {
         })
     }
 
-    /// Whether the source's scanner can evaluate this GQ filter itself, so
+    /// Whether the source's scanner can evaluate this GQ conjunct itself, so
     /// the placement pass may move it out of the in-memory arm. The engine
     /// answers from its lowering; a test source pushes everything.
-    fn filter_pushable(&self, _filter: &IRFilter) -> bool {
+    fn filter_pushable(&self, _filter: &IRExpr) -> bool {
         true
     }
 

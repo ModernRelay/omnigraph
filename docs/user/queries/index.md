@@ -80,6 +80,51 @@ edge `WorksAt`); edge lookup itself is case-insensitive.
 
 Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
 
+### Boolean expressions and nulls
+
+Filters combine with `and`, `or`, `not` and parentheses. `or` binds loosest,
+then `and`, then `not`, then comparison, so `not $p.email is null` reads as
+`not ($p.email is null)`. Comparisons do not chain: `$a < $b < $c` is a parse
+error. `not {` stays the pattern negation. Operands of `and`, `or` and `not`
+must be `Bool` (`T41`), as in
+`($d.stage = "open" or $d.stage = "paused") and not $d.amount < $cut`.
+
+A comparison (`contains` and `starts_with` included) with a null operand is
+null, and `not null` is null. A filter or mutation `where` keeps only rows
+whose expression is true, so `not ($p.age > 30)` skips rows whose `age` is
+null.
+
+| `x` | `y` | `x and y` | `x or y` |
+|---|---|---|---|
+| `true` | null | null | `true` |
+| `false` | null | `false` | null |
+| null | null | null | null |
+| `true` | `false` | `false` | `true` |
+
+`x is null` and `x is not null` are always `Bool` and are the only null tests:
+GQ has no `null` literal, so `$p.x = null` is a parse error.
+`not ($p.age > 30) or $p.age is null` selects every row the comparison did
+not. A parameter bound to `null` makes every comparison on it null. `is null`
+refuses a `Blob`.
+
+`and`, `or`, `not`, `is` and `null` are reserved words: none is a bare operand
+or a return alias. `$p.and` after a dot and `and: 1` in an assignment or
+binding match stay legal; `nothing` and `android` are ordinary identifiers.
+
+A mutation `where` takes the same expressions over the target type's
+properties, `@id`, `@src`, `@dst`, literals, parameters and `now()`, never a
+binding variable, aggregate or search call:
+`delete Knows where @src = "a" and @dst = "b"`. Assignment values and binding
+matches take constants evaluated once per invocation, such as
+`adult: true or $flag`; a property or system field there is `T45`. See
+[Mutations](../mutations/index.md).
+
+A read with a compound filter (`and`, `or`, `not`, a null test, a bare `Bool`
+operand), or a comparison in `return` or `order`, runs on engine v2: add
+`set engine = v2;` before it, or start the server with `OMNIGRAPH_ENGINE=v2`,
+the one fix for a stored query. Under the default `v1` it is refused with a
+`plan error` that shows both fixes. Mutations run under either engine.
+
 ### Correlated blocks
 
 `not { ... }`, `exists { ... }`, `count { ... } op value` and
@@ -170,7 +215,9 @@ other aggregates take a property, not a bare node binding (`T8`). Each
 projection produces one result column, named by its alias or, without one,
 by its expression (`$p.name` gives `p.name`, `$p.@id` gives `p.@id`). Two projections that would
 produce the same column name are refused at compile time (`T25`); give each
-its own alias.
+its own alias. A comparison or Boolean expression gives a `Bool` column and
+needs an alias (`T43`), `$p.age > 30 as adult`; it is `Bool?` when an operand is
+nullable (`is null` and `is not null` are always `Bool`), and refused in an aggregated `return` (`T9`).
 Search expressions are documented in [Search](../search/index.md).
 
 An explicit order is total and deterministic: OmniGraph adds entity ids as a
@@ -179,6 +226,15 @@ the ids can change the visible order (when every returned expression is an
 order key, equal rows are indistinguishable and no id is read); `v1` appends
 every `<var>.id`, and the rows are the same either way. Ascending order places nulls first;
 descending order places them last. `nearest(...)` ordering requires a `limit`.
+
+An order key that is a property access or a system field sorts as before,
+returned or not. Any other key except the leading search key (an aggregate,
+a comparison, a call) must be a return alias or an expression written in
+`return`, as in `return { count($d) as deals } order { count($d) desc }`;
+otherwise it is ``T42: order key `max($d.amount)` does not appear in return;
+add it to return or order by its alias``, with the key as written.
+Engine v1 accepts only a property, a system field, an alias or the leading
+search key.
 
 Search orderings share that contract: `nearest(...)` ranks by ascending vector
 distance and `bm25(...)` by descending relevance score, so the score (never

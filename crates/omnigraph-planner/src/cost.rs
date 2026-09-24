@@ -5,7 +5,7 @@
 //! and keeps two runtime corrections (degraded index coverage, the mid-flight
 //! switch of issue #533), both computed with the functions below.
 
-use omnigraph_compiler::ir::{IRExpr, IRFilter};
+use omnigraph_compiler::ir::IRExpr;
 use omnigraph_compiler::query::ast::CompOp;
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
@@ -305,10 +305,12 @@ pub fn scan_row_estimate(spec: &ScanSpec, source: &dyn PlanSource) -> Option<u64
     })
 }
 
-/// The property of `binding` a filter equates with a literal or a parameter.
-fn equated_property<'a>(filter: &'a IRFilter, binding: &str) -> Option<&'a str> {
-    let IRFilter { left, op, right } = filter;
-    if *op != CompOp::Eq {
+/// The property of `binding` a conjunct equates with a literal or a
+/// parameter. Only a comparison root is inspected: an `or`, a `not` or a
+/// null test gives no estimate and the row count stands.
+fn equated_property<'a>(filter: &'a IRExpr, binding: &str) -> Option<&'a str> {
+    let (left, op, right) = filter.comparison_parts()?;
+    if op != CompOp::Eq {
         return None;
     }
     let constant = |expr: &IRExpr| matches!(expr, IRExpr::Literal(_) | IRExpr::Param(_));

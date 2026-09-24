@@ -29,6 +29,7 @@ use crate::storage_layer::{
 use crate::table_store::{StagedWrite, TableStore};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{ident, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, UpdateMode};
@@ -2697,7 +2698,7 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
     // Stage a delete of alice — writes the deletion file but does NOT advance
     // HEAD.
     let staged = store
-        .stage_delete(&ds, "id = 'alice'")
+        .stage_delete(&ds, ident("id").eq(lit("alice")))
         .await
         .unwrap()
         .expect("alice matches → Some(StagedWrite)");
@@ -2729,7 +2730,7 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
 
     // A 0-row delete is a true no-op: None, no version, no fragments.
     let none = store
-        .stage_delete(&committed, "id = 'nobody'")
+        .stage_delete(&committed, ident("id").eq(lit("nobody")))
         .await
         .unwrap();
     assert!(none.is_none(), "a 0-row delete must stage nothing");
@@ -2745,7 +2746,7 @@ async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
         .await
         .unwrap();
     let staged = store
-        .stage_delete(&ds, "age < 10")
+        .stage_delete(&ds, ident("age").lt(lit(10)))
         .await
         .unwrap()
         .expect("delete should match rows");

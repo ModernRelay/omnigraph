@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::SYSTEM_COLUMNS_V3;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROp, IROrdering, IRProjection, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::types::Direction;
@@ -142,7 +142,7 @@ fn object_columns() -> BTreeSet<String> {
     columns
 }
 
-fn expand(src: &str, dst: &str, dst_filters: Vec<IRFilter>) -> IROp {
+fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> IROp {
     IROp::Expand {
         src_var: src.to_string(),
         dst_var: dst.to_string(),

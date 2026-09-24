@@ -1,0 +1,66 @@
+# issue: none
+# notes: An inline binding match on a `[String]` property takes the scalar
+# notes: element type and selects by membership, with a literal and with a
+# notes: parameter; a list value there keeps its refusal, T3 for a literal and
+# notes: T7 for a parameter.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    tags: [String]
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","tags":["rust","go"]}}
+{"type":"Person","data":{"slug":"b","tags":["go"]}}
+{"type":"Person","data":{"slug":"c","tags":[]}}
+
+--- query
+query literal_membership() {
+    match { $p: Person { tags: "rust" } }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query parameter_membership($tag: String) {
+    match { $p: Person { tags: $tag } }
+    return { $p.slug }
+}
+
+--- params
+{"tag": "go"}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query list_literal_refused() {
+    match { $p: Person { tags: ["rust"] } }
+    return { $p.slug }
+}
+
+--- expect error: T3: list equality is not supported for property `tags`; use a scalar value to match list membership
+
+--- query
+query list_parameter_refused($tags: [String]) {
+    match { $p: Person { tags: $tags } }
+    return { $p.slug }
+}
+
+--- expect error: T7: list equality is not supported for property `tags`; use a scalar parameter for membership matching

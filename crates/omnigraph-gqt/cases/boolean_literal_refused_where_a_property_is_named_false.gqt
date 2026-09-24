@@ -1,0 +1,65 @@
+# issue: none
+# notes: In a mutation `where` a bare `false` is the literal, so on a type that declares
+# notes: a property named `false` it is refused (T46); on a plain type `flag = false` selects the false row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Flag {
+    slug: String @key
+    false: Bool
+}
+
+node Switch {
+    slug: String @key
+    flag: Bool
+}
+
+--- seed
+{"type":"Flag","data":{"slug":"keep","false":true}}
+{"type":"Flag","data":{"slug":"delete","false":false}}
+{"type":"Switch","data":{"slug":"on","flag":true}}
+{"type":"Switch","data":{"slug":"off","flag":false}}
+
+--- mutate
+query shadowed_property() {
+    delete Flag where false = false
+}
+
+--- expect error: T46: `false` is a Boolean literal here; the property named `false` of `Flag` cannot be named bare in a mutation `where`; rename it in the schema (`@rename_from`)
+
+--- query
+query flags_untouched() {
+    match { $f: Flag }
+    return { $f.slug }
+}
+
+--- expect unordered
+{"f.slug": "keep"}
+{"f.slug": "delete"}
+
+--- expect shape
+f.slug: String
+
+--- mutate
+query literal_on_a_plain_type() {
+    delete Switch where flag = false
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query switches_after() {
+    match { $s: Switch }
+    return { $s.slug }
+}
+
+--- expect unordered
+{"s.slug": "on"}
+
+--- expect shape
+s.slug: String

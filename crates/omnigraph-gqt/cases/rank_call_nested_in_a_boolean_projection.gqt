@@ -1,0 +1,60 @@
+# issue: none
+# notes: A `bm25` or `nearest` call nested inside a Boolean projection reads the score column
+# notes: the leading `order` retrieval computed, as the bare projected call does (T33).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","text":"needle","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","text":"needle filler","embedding":[0.0,1.0]}}
+
+--- query
+set engine = v2;
+query bm25_threshold($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.text, $q) > 0.0 as hit }
+    order { bm25($d.text, $q) desc }
+    limit 2
+}
+
+--- params
+{"q": "needle"}
+
+--- expect unordered
+{"d.slug": "a", "hit": true}
+{"d.slug": "b", "hit": true}
+
+--- expect shape
+d.slug: String
+hit: Bool
+
+--- query
+set engine = v2;
+query nearest_threshold($v: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $v) < 1.0 as close }
+    order { nearest($d.embedding, $v) }
+    limit 2
+}
+
+--- params
+{"v": [1.0, 0.0]}
+
+--- expect unordered
+{"d.slug": "a", "close": true}
+{"d.slug": "b", "close": false}
+
+--- expect shape
+d.slug: String
+close: Bool

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use crate::error::{CompilerError, Result};
 
-use super::{IRExpr, IRFilter, IROp, QueryIR};
+use super::{IRExpr, IROp, QueryIR};
 
 /// Checks a lowered read query. A negation's inner pipeline runs over the
 /// outer batch, so it sees the outer variables and may not introduce one of
@@ -61,7 +61,7 @@ fn validate_pipeline(pipeline: &[IROp], introduced: &mut HashSet<String>) -> Res
                 }
                 check_filters(dst_filters, introduced)?;
             }
-            IROp::Filter(filter) => check_filter(filter, introduced)?,
+            IROp::Filter(filter) => check_expr(filter, introduced)?,
             IROp::AntiJoin {
                 outer_var,
                 inner,
@@ -103,13 +103,8 @@ fn check_reference(variable: &str, introduced: &HashSet<String>) -> Result<()> {
     Ok(())
 }
 
-fn check_filters(filters: &[IRFilter], introduced: &HashSet<String>) -> Result<()> {
-    filters.iter().try_for_each(|f| check_filter(f, introduced))
-}
-
-fn check_filter(filter: &IRFilter, introduced: &HashSet<String>) -> Result<()> {
-    check_expr(&filter.left, introduced)?;
-    check_expr(&filter.right, introduced)
+fn check_filters(filters: &[IRExpr], introduced: &HashSet<String>) -> Result<()> {
+    filters.iter().try_for_each(|f| check_expr(f, introduced))
 }
 
 /// Exhaustive over `IRExpr`, so a new variant that carries a variable is a
@@ -151,6 +146,11 @@ fn check_expr(expr: &IRExpr, introduced: &HashSet<String>) -> Result<()> {
             k.as_deref().map_or(Ok(()), |e| check_expr(e, introduced))
         }
         IRExpr::Aggregate { arg, .. } => check_expr(arg, introduced),
+        IRExpr::Binary { left, right, .. } => {
+            check_expr(left, introduced)?;
+            check_expr(right, introduced)
+        }
+        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => check_expr(inner, introduced),
         IRExpr::Param(_) | IRExpr::Literal(_) | IRExpr::AliasRef(_) => Ok(()),
     }
 }
@@ -223,11 +223,11 @@ mod tests {
     #[test]
     fn refuses_a_reference_before_introduction() {
         assert!(refusal(vec![expand("p", "q")]).contains("`p` before"));
-        let filter = IROp::Filter(IRFilter {
-            left: prop("q"),
-            op: CompOp::Eq,
-            right: IRExpr::Literal(crate::query::ast::Literal::String("x".to_string())),
-        });
+        let filter = IROp::Filter(IRExpr::comparison(
+            prop("q"),
+            CompOp::Eq,
+            IRExpr::Literal(crate::query::ast::Literal::String("x".to_string())),
+        ));
         assert!(refusal(vec![scan("p"), filter]).contains("`q` before"));
     }
 

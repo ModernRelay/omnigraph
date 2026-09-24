@@ -24,7 +24,7 @@ use lance_index::scalar::FullTextSearchQuery;
 /// gate's id-count cap (`GatePolicy::max_ids`, set where in-list
 /// evaluation starts losing) ever shows up as the bottleneck: a mask built
 /// from a cached id→addr mapping would lift both.
-pub(super) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelude::Expr {
+pub(crate) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelude::Expr {
     let id_list: Vec<Expr> = ids.iter().map(|id| df_lit(id.clone())).collect();
     col(id_col).in_list(id_list, false)
 }
@@ -35,7 +35,7 @@ pub(super) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelu
 pub(super) async fn execute_node_scan(
     type_name: &str,
     variable: &str,
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     params: &ParamMap,
     snapshot: &Snapshot,
     catalog: &Catalog,
@@ -369,13 +369,13 @@ pub(super) async fn execute_node_scan(
 }
 
 fn search_filter_is_ranking(
-    filter: &IRFilter,
+    filter: &IRExpr,
     property: &str,
     text: &str,
     params: &ParamMap,
 ) -> bool {
-    match &filter.left {
-        IRExpr::Search { field, query } | IRExpr::MatchText { field, query } => {
+    match search_call(filter) {
+        Some(IRExpr::Search { field, query } | IRExpr::MatchText { field, query }) => {
             extract_property(field).as_deref() == Some(property)
                 && resolve_to_string(query, params).as_deref() == Some(text)
         }
@@ -556,7 +556,7 @@ impl<'n> ScanColumns<'n> {
 pub(super) fn scan_output_schema(
     type_name: &str,
     variable: &str,
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     params: &ParamMap,
     catalog: &Catalog,
     search_mode: &SearchMode,
@@ -570,8 +570,8 @@ pub(super) fn scan_output_schema(
     let scores_fts = search_mode.bm25.is_some()
         || filters
             .iter()
-            .filter(|filter| is_search_filter(filter))
-            .any(|filter| build_fts_query(&filter.left, params).is_some());
+            .filter_map(search_call)
+            .any(|call| build_fts_query(call, params).is_some());
     let columns = ScanColumns::new(
         node_type,
         SearchColumns {
@@ -711,7 +711,7 @@ pub(super) fn resolve_to_int(expr: &IRExpr, params: &ParamMap) -> Option<i64> {
 /// Convert IR filters to a single DataFusion `Expr` (AND-joined), or
 /// `None` if no filter is pushable.
 pub(super) fn build_lance_filter_expr(
-    filters: &[IRFilter],
+    filters: &[IRExpr],
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
@@ -721,7 +721,7 @@ pub(super) fn build_lance_filter_expr(
     let mut acc: Option<Expr> = None;
     let mut pushed = 0u64;
     for f in filters {
-        let Some(e) = ir_filter_to_expr(f, params, schema) else {
+        let Some(e) = ir_expr_to_df_expr(f, params, schema) else {
             continue;
         };
         pushed += 1;
@@ -738,41 +738,90 @@ pub(super) fn build_lance_filter_expr(
     acc
 }
 
-/// Lower a pushable filter, matching scalar literals to the opposing column
-/// type when known so the column remains indexable. The schema affects literal
-/// types only; return `None` for search-mode filters and unsupported expressions.
-pub(super) fn ir_filter_to_expr(
-    filter: &IRFilter,
+/// Lower a pushable Boolean expression to a DataFusion `Expr`: `and`, `or`
+/// and `not` structurally, a null test to `IS [NOT] NULL`, a comparison
+/// through `comparison_to_df_expr`, any other node as a Boolean column. The
+/// schema affects literal types only; `None` for a search conjunct and for
+/// every shape the scan cannot express, anywhere in the tree.
+pub(crate) fn ir_expr_to_df_expr(
+    expr: &IRExpr,
+    params: &ParamMap,
+    schema: Option<&Schema>,
+) -> Option<datafusion::prelude::Expr> {
+    if is_search_filter(expr) {
+        return None;
+    }
+    match expr {
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::Compare(op),
+            right,
+        } => comparison_to_df_expr(left, *op, right, params, schema),
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            let left = ir_expr_to_df_expr(left, params, schema)?;
+            let right = ir_expr_to_df_expr(right, params, schema)?;
+            Some(left.and(right))
+        }
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => {
+            let left = ir_expr_to_df_expr(left, params, schema)?;
+            let right = ir_expr_to_df_expr(right, params, schema)?;
+            Some(left.or(right))
+        }
+        IRExpr::Not(inner) => Some(datafusion::logical_expr::not(ir_expr_to_df_expr(
+            inner, params, schema,
+        )?)),
+        IRExpr::IsNull { expr, negated } => {
+            let operand = ir_expr_to_df_expr(expr, params, schema)?;
+            Some(if *negated {
+                operand.is_not_null()
+            } else {
+                operand.is_null()
+            })
+        }
+        leaf => ir_expr_to_expr(leaf, params, None),
+    }
+}
+
+/// Lower a pushable comparison, matching scalar literals to the opposing
+/// column type when known so the column remains indexable.
+fn comparison_to_df_expr(
+    left: &IRExpr,
+    op: CompOp,
+    right: &IRExpr,
     params: &ParamMap,
     schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
     use datafusion::functions_nested::expr_fn::array_has;
 
-    if is_search_filter(filter) {
-        return None;
-    }
-
-    if matches!(filter.op, CompOp::Contains) {
-        let left = ir_expr_to_expr(&filter.left, params, None)?;
-        let right = ir_expr_to_expr(&filter.right, params, None)?;
+    if matches!(op, CompOp::Contains) {
+        let left = ir_expr_to_expr(left, params, None)?;
+        let right = ir_expr_to_expr(right, params, None)?;
         return Some(array_has(left, right));
     }
 
-    if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+    if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
         use datafusion::functions::expr_fn::{contains, starts_with};
-        let left = ir_expr_to_expr(&filter.left, params, None)?;
-        let right = ir_expr_to_expr(&filter.right, params, None)?;
-        return Some(match filter.op {
+        let left = ir_expr_to_expr(left, params, None)?;
+        let right = ir_expr_to_expr(right, params, None)?;
+        return Some(match op {
             CompOp::StartsWith => starts_with(left, right),
             _ => contains(left, right),
         });
     }
 
-    let left_col_type = prop_data_type(&filter.left, schema);
-    let right_col_type = prop_data_type(&filter.right, schema);
-    let left = ir_expr_to_expr(&filter.left, params, right_col_type.as_ref())?;
-    let right = ir_expr_to_expr(&filter.right, params, left_col_type.as_ref())?;
-    Some(match filter.op {
+    let left_col_type = prop_data_type(left, schema);
+    let right_col_type = prop_data_type(right, schema);
+    let left = comparison_operand_to_df_expr(left, params, schema, right_col_type.as_ref())?;
+    let right = comparison_operand_to_df_expr(right, params, schema, left_col_type.as_ref())?;
+    Some(match op {
         CompOp::Eq => left.eq(right),
         CompOp::Ne => left.not_eq(right),
         CompOp::Gt => left.gt(right),
@@ -783,6 +832,23 @@ pub(super) fn ir_filter_to_expr(
             unreachable!("handled above")
         }
     })
+}
+
+/// One side of an ordering comparison: a Boolean subtree (`(age > 30) = true`)
+/// through `ir_expr_to_df_expr`, a leaf through `ir_expr_to_expr` with its
+/// literal typed toward the opposing column.
+fn comparison_operand_to_df_expr(
+    expr: &IRExpr,
+    params: &ParamMap,
+    schema: Option<&Schema>,
+    target: Option<&arrow_schema::DataType>,
+) -> Option<datafusion::prelude::Expr> {
+    match expr {
+        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
+            ir_expr_to_df_expr(expr, params, schema)
+        }
+        leaf => ir_expr_to_expr(leaf, params, target),
+    }
 }
 
 /// Lower a property, literal or parameter for pushdown, preserving property case.

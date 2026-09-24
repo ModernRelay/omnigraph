@@ -1,0 +1,136 @@
+# issue: none
+# notes: Three-valued `and`/`or` over a nullable property and a null parameter: `null or true` is true, `null or false` is null, `null and true` is null,
+# notes: `null and false` is false, and a filter keeps only the true rows; `not ($p.x = 1)` never selects the null row, `$p.x is null` selects exactly it, `is not null` on a non-nullable property selects every row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    x: I64?
+    flag: Bool
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"slug":"null_true","flag":true,"age":1}}
+{"type":"Person","data":{"slug":"null_false","flag":false,"age":2}}
+{"type":"Person","data":{"slug":"one_true","x":1,"flag":true,"age":3}}
+{"type":"Person","data":{"slug":"one_false","x":1,"flag":false,"age":4}}
+{"type":"Person","data":{"slug":"two_false","x":2,"flag":false,"age":5}}
+{"type":"Person","data":{"slug":"two_true","x":2,"flag":true,"age":6}}
+
+--- query
+set engine = v2;
+query truth_table() {
+    match { $p: Person }
+    return { $p.slug, $p.x = 1 or $p.flag as either, $p.x = 1 and $p.flag as both }
+}
+
+--- expect unordered
+{"p.slug": "null_true", "either": true}
+{"p.slug": "null_false", "both": false}
+{"p.slug": "one_true", "either": true, "both": true}
+{"p.slug": "one_false", "either": true, "both": false}
+{"p.slug": "two_false", "either": false, "both": false}
+{"p.slug": "two_true", "either": true, "both": false}
+
+--- expect shape
+p.slug: String
+either: Bool?
+both: Bool?
+
+--- query
+set engine = v2;
+query and_keeps_only_true() {
+    match { $p: Person  $p.x = 1 and $p.flag }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "one_true"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query null_parameter_selects_no_row($v: I64?) {
+    match { $p: Person  $p.x = $v or $p.x = 1 and $p.flag }
+    return { $p.slug }
+}
+
+--- params
+{"v": null}
+
+--- expect unordered
+{"p.slug": "one_true"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query not_excludes_the_null_row() {
+    match { $p: Person  not ($p.x = 1) }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "two_false"}
+{"p.slug": "two_true"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query is_null_selects_exactly_the_null_rows() {
+    match { $p: Person  $p.x is null }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "null_true"}
+{"p.slug": "null_false"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query is_not_null_on_non_nullable_selects_every_row() {
+    match { $p: Person  $p.age is not null }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "null_true"}
+{"p.slug": "null_false"}
+{"p.slug": "one_true"}
+{"p.slug": "one_false"}
+{"p.slug": "two_false"}
+{"p.slug": "two_true"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query null_partition_completes_the_negation() {
+    match { $p: Person  not ($p.x = 1) or $p.x is null }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "null_true"}
+{"p.slug": "null_false"}
+{"p.slug": "two_false"}
+{"p.slug": "two_true"}
+
+--- expect shape
+p.slug: String

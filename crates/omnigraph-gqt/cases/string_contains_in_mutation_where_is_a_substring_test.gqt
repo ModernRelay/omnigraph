@@ -1,0 +1,92 @@
+# issue: none
+# notes: `contains` on a String property in a mutation `where`, and on a String parameter in an
+# notes: assignment value, is the substring test; on a list property or list parameter it stays membership.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    tags: [String]?
+    hit: Bool?
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","name":"Alice","tags":["rust"]}}
+{"type":"Person","data":{"slug":"b","name":"Bob","tags":["go"]}}
+{"type":"Person","data":{"slug":"c","name":"Carol","tags":["rust","go"]}}
+
+--- mutate
+query mark_by_substring($needle: String) {
+    update Person set { hit: $needle contains "li" } where name contains "o"
+}
+
+--- params
+{"needle": "alice"}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query hits_after_substring() {
+    match { $p: Person }
+    return { $p.slug, $p.hit }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b", "p.hit": true}
+{"p.slug": "c", "p.hit": true}
+
+--- expect shape
+p.slug: String
+p.hit: Bool?
+
+--- mutate
+query mark_by_membership($tags: [String]) {
+    update Person set { hit: $tags contains "go" } where tags contains "rust"
+}
+
+--- params
+{"tags": ["rust"]}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query hits_after_membership() {
+    match { $p: Person }
+    return { $p.slug, $p.hit }
+}
+
+--- expect unordered
+{"p.slug": "a", "p.hit": false}
+{"p.slug": "b", "p.hit": true}
+{"p.slug": "c", "p.hit": false}
+
+--- expect shape
+p.slug: String
+p.hit: Bool?
+
+--- mutate
+query delete_by_substring() {
+    delete Person where name contains "ar"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query remaining() {
+    match { $p: Person }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String

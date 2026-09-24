@@ -1,0 +1,137 @@
+# issue: none
+# notes: The context rules of the shared expression model as typed errors: a non-Boolean operand of `and`/`or`/`not`, a non-Boolean filter or
+# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in a mutation `where` or an assignment (T44), a property leaf in an assignment or inline match (T45).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    age: I64
+    text: String @index
+    adult: Bool
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","name":"alice","age":40,"text":"hello","adult":true}}
+
+--- query
+set engine = v2;
+query and_over_non_boolean() {
+    match { $p: Person  $p.age and $p.name }
+    return { $p.slug }
+}
+
+--- expect error: T41: `and` needs Bool operands, got I64 and String
+
+--- query
+set engine = v2;
+query not_over_non_boolean() {
+    match { $p: Person  not $p.age }
+    return { $p.slug }
+}
+
+--- expect error: T41: `not` needs a Bool operand, got I64
+
+--- query
+set engine = v2;
+query aggregate_in_a_filter() {
+    match { $p: Person  count($p) > 1 }
+    return { $p.slug }
+}
+
+--- expect error: T7: filter comparisons require scalar operands, got aggregate and I64
+
+--- query
+set engine = v2;
+query search_under_or() {
+    match { $p: Person  search($p.text, "hello") or $p.age > 30 }
+    return { $p.slug }
+}
+
+--- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+
+--- query
+set engine = v2;
+query unaliased_comparison_in_return() {
+    match { $p: Person }
+    return { $p.slug, $p.age > 30 }
+}
+
+--- expect error: T43: a comparison in return needs an alias; write `… as <name>`
+
+--- mutate
+query count_in_a_mutation_where() {
+    update Person set { adult: true } where count(age) > 1
+}
+
+--- expect error: T44: `count` cannot appear in a mutation where; a where compares the row's own properties, parameters and now()
+
+--- mutate
+query property_leaf_in_an_assignment() {
+    update Person set { adult: age > 30 } where slug = "a"
+}
+
+--- expect error: T45: `age` cannot appear in an assignment value; assignments and binding matches are constants per invocation
+
+--- query
+set engine = v2;
+query property_leaf_in_an_inline_match() {
+    match { $p: Person { adult: age > 30 } }
+    return { $p.slug }
+}
+
+--- expect error: T45: `age` cannot appear in an assignment value; assignments and binding matches are constants per invocation
+
+--- mutate
+query search_in_a_mutation_where() {
+    delete Person where search(text, "hello")
+}
+
+--- expect error: T44: `search` cannot appear in a mutation where; a where compares the row's own properties, parameters and now()
+
+--- mutate
+query count_in_an_assignment() {
+    insert Person { slug: "b", name: "b", age: 1, text: "t", adult: count(1) > 3 }
+}
+
+--- expect error: T44: `count` cannot appear in an assignment value; assignments and binding matches are constants per invocation
+
+--- query
+set engine = v2;
+query or_over_non_boolean() {
+    match { $p: Person  $p.adult or $p.name }
+    return { $p.slug }
+}
+
+--- expect error: T41: `or` needs Bool operands, got Bool and String
+
+--- query
+set engine = v2;
+query string_as_a_filter() {
+    match { $p: Person  $p.name }
+    return { $p.slug }
+}
+
+--- expect error: T41: a filter must be Boolean, got String
+
+--- mutate
+query string_as_a_mutation_where() {
+    delete Person where name
+}
+
+--- expect error: T41: a mutation `where` must be Boolean, got String
+
+--- query
+set engine = v2;
+query boolean_item_in_an_aggregate_return() {
+    match { $p: Person }
+    return { $p.name, count($p) as n, $p.age > 30 as adult }
+}
+
+--- expect error: T9: non-aggregate expressions in an aggregate query must be property accesses or variables

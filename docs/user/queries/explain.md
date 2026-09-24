@@ -125,7 +125,7 @@ operator of a declared switch it is the side that ran: `hash_join` or
 on the `ExpandExec` of an `Expand`, the mode the traversal ended on. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 1.
+`Executed::profile`). The row schema is `explain_version` 2.
 
 An `explain` statement is served by `omnigraph query` and `POST /query`. It
 takes the same `--branch`/`--snapshot` target and `--params` as the query

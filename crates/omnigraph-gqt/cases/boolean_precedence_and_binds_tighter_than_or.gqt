@@ -1,0 +1,114 @@
+# issue: none
+# notes: The expression ladder binds `not` tighter than `and`, and `and` tighter than `or`, in a filter and in a
+# notes: mutation `where` alike: `a or b and c` is `a or (b and c)`, `not a and c` is `(not a) and c`; moved parentheses select a different set of the same four rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Row {
+    slug: String @key
+    a: Bool
+    b: Bool
+    c: Bool
+}
+
+--- seed
+{"type":"Row","data":{"slug":"r1","a":true,"b":false,"c":false}}
+{"type":"Row","data":{"slug":"r2","a":false,"b":true,"c":true}}
+{"type":"Row","data":{"slug":"r3","a":false,"b":true,"c":false}}
+{"type":"Row","data":{"slug":"r4","a":true,"b":false,"c":true}}
+
+--- query
+set engine = v2;
+query bare_or_and() {
+    match { $r: Row  $r.a or $r.b and $r.c }
+    return { $r.slug }
+}
+
+--- expect unordered
+{"r.slug": "r1"}
+{"r.slug": "r2"}
+{"r.slug": "r4"}
+
+--- expect shape
+r.slug: String
+
+--- query
+set engine = v2;
+query explicit_or_over_and() {
+    match { $r: Row  $r.a or ($r.b and $r.c) }
+    return { $r.slug }
+}
+
+--- expect unordered
+{"r.slug": "r1"}
+{"r.slug": "r2"}
+{"r.slug": "r4"}
+
+--- expect shape
+r.slug: String
+
+--- query
+set engine = v2;
+query parenthesized_or_under_and() {
+    match { $r: Row  ($r.a or $r.b) and $r.c }
+    return { $r.slug }
+}
+
+--- expect unordered
+{"r.slug": "r2"}
+{"r.slug": "r4"}
+
+--- expect shape
+r.slug: String
+
+--- query
+set engine = v2;
+query bare_not_and() {
+    match { $r: Row  not $r.a and $r.c }
+    return { $r.slug }
+}
+
+--- expect unordered
+{"r.slug": "r2"}
+
+--- expect shape
+r.slug: String
+
+--- query
+set engine = v2;
+query parenthesized_and_under_not() {
+    match { $r: Row  not ($r.a and $r.c) }
+    return { $r.slug }
+}
+
+--- expect unordered
+{"r.slug": "r1"}
+{"r.slug": "r2"}
+{"r.slug": "r3"}
+
+--- expect shape
+r.slug: String
+
+--- mutate
+query delete_bare_or_and() {
+    delete Row where a or b and c
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- query
+query the_survivor_fails_a_or_b_and_c() {
+    match { $r: Row }
+    return { $r.slug }
+}
+
+--- expect unordered
+{"r.slug": "r3"}
+
+--- expect shape
+r.slug: String

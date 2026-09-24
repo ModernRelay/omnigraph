@@ -32,6 +32,11 @@ pub use catalog::schema_shape::{
 };
 pub use catalog::{CatalogIdentity, build_catalog, build_catalog_from_ir};
 pub use ir::ParamMap;
+
+/// The GQ grammar's version, major when it accepts less or a produced shape
+/// changes, minor when it only accepts more (`docs/rfcs/2026-09-14-compatibility-surfaces.md`);
+/// `(2, 0)` reserves `and`, `or`, `not`, `is`, `null` (`docs/rfcs/2026-09-24-shared-expression-model.md`).
+pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 0);
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;

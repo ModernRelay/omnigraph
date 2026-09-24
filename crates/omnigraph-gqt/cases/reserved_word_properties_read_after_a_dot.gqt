@@ -1,0 +1,95 @@
+# issue: none
+# notes: `and`, `or`, `not`, `is` and `null` are reserved in operand position and as a return alias, but a `.pg` schema may still name a property so: after a dot
+# notes: it reads as any other (`$p.and = 1`, `$p.is is not null`), an assignment or inline match names it bare (`and: 1`). `where and = 1` and `as and` are parse errors, pinned in `parser_tests.rs::test_parse_reserved_words`; the harness refuses a step that does not parse.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    and: I64
+    is: I64
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","and":1,"is":2}}
+{"type":"Person","data":{"slug":"b","and":2,"is":1}}
+
+--- query
+query read_and_after_a_dot() {
+    match { $p: Person  $p.and = 1 }
+    return { $p.slug, $p.and }
+}
+
+--- expect unordered
+{"p.slug": "a", "p.and": 1}
+
+--- expect shape
+p.slug: String
+p.and: I64
+
+--- query
+query read_is_after_a_dot() {
+    match { $p: Person  $p.is = 1 }
+    return { $p.slug, $p.is }
+}
+
+--- expect unordered
+{"p.slug": "b", "p.is": 1}
+
+--- expect shape
+p.slug: String
+p.is: I64
+
+--- query
+set engine = v2;
+query both_in_one_expression() {
+    match { $p: Person  $p.and = 1 or $p.is = 1 }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- mutate
+query assign_bare() {
+    insert Person { slug: "c", and: 1, is: 1 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query inline_match_bare() {
+    match { $p: Person { and: 1 } }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query is_property_before_is_null() {
+    match { $p: Person  $p.is is not null }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+{"p.slug": "c"}
+
+--- expect shape
+p.slug: String

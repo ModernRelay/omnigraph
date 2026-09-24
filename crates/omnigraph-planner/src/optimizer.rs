@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROp, IROrdering, IRProjection, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::AggFunc;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::types::Direction;
@@ -204,30 +204,16 @@ fn resolve_query(
         )
     };
     if ranked || !orderings.is_empty() {
+        let bound: Vec<IROrdering> = orderings
+            .iter()
+            .map(|ordering| IROrdering {
+                expr: bind_order_key(&ordering.expr, return_exprs),
+                descending: ordering.descending,
+            })
+            .collect();
         let mut keys = Vec::new();
-        for IROrdering {
-            expr,
-            descending: _,
-        } in orderings
-        {
-            match expr {
-                IRExpr::PropAccess { .. }
-                | IRExpr::AliasRef(_)
-                | IRExpr::Nearest { .. }
-                | IRExpr::Search { .. }
-                | IRExpr::Fuzzy { .. }
-                | IRExpr::MatchText { .. }
-                | IRExpr::Bm25 { .. }
-                | IRExpr::Rrf { .. } => order_keys(expr, &mut keys),
-                IRExpr::Variable(_)
-                | IRExpr::Param(_)
-                | IRExpr::Literal(_)
-                | IRExpr::Aggregate { .. } => {
-                    return Err(PlanError::Unsupported {
-                        detail: "unsupported ordering expression".to_string(),
-                    });
-                }
-            }
+        for ordering in &bound {
+            order_keys(&ordering.expr, &mut keys);
         }
         let tiebreak = sort_tiebreak(
             &scope_bindings(plan, current),
@@ -239,7 +225,7 @@ fn resolve_query(
             LogicalNode::Sort {
                 input: current,
                 keys,
-                order_by: orderings.to_vec(),
+                order_by: bound,
                 fetch: limit.and_then(|limit| usize::try_from(limit).ok()),
                 tiebreak,
             },
@@ -296,14 +282,15 @@ fn resolve_pipeline(
                             columns,
                             fragments: None,
                             projection: None,
-                            filter: gq_predicate(filters),
+                            filter: None,
                             binding: Some(variable.clone()),
                         }),
                     },
                     schema.clone(),
                 );
+                let filtered = filter_over(plan, scan, filters, schema.clone());
                 match current {
-                    None => scan,
+                    None => filtered,
                     Some(left) => {
                         let joined = join_schema(
                             &schema_of(plan, left)?,
@@ -311,16 +298,20 @@ fn resolve_pipeline(
                             &schema,
                             Some(variable.as_str()),
                         );
-                        plan.add(LogicalNode::CrossJoin { left, right: scan }, joined)
+                        plan.add(
+                            LogicalNode::CrossJoin {
+                                left,
+                                right: filtered,
+                            },
+                            joined,
+                        )
                     }
                 }
             }
             IROp::Filter(filter) => {
                 let input = bound(current, "filter")?;
                 let schema = schema_of(plan, input)?;
-                let predicate = gq_predicate(std::slice::from_ref(filter))
-                    .ok_or_else(|| PlanError::Internal("a filter op carries one filter".into()))?;
-                plan.add(LogicalNode::Filter { input, predicate }, schema)
+                filter_over(plan, input, std::slice::from_ref(filter), schema)
             }
             IROp::Expand {
                 src_var,
@@ -357,10 +348,6 @@ fn resolve_pipeline(
                     },
                     schema.clone(),
                 );
-                let (pushed, residual): (Vec<_>, Vec<_>) = dst_filters
-                    .iter()
-                    .cloned()
-                    .partition(|filter| dependent_scan_filter_pushable(filter, dst_var, source));
                 let destination = plan.add(
                     LogicalNode::TableScan {
                         input: Some(expand),
@@ -371,22 +358,13 @@ fn resolve_pipeline(
                             columns,
                             fragments: None,
                             projection: None,
-                            filter: gq_predicate(&pushed),
+                            filter: None,
                             binding: Some(dst_var.clone()),
                         }),
                     },
                     schema.clone(),
                 );
-                match gq_predicate(&residual) {
-                    Some(predicate) => plan.add(
-                        LogicalNode::Filter {
-                            input: destination,
-                            predicate,
-                        },
-                        schema,
-                    ),
-                    None => destination,
-                }
+                filter_over(plan, destination, dst_filters, schema)
             }
             IROp::AntiJoin {
                 outer_var,
@@ -428,26 +406,46 @@ fn schema_of(plan: &LogicalPlan, id: LogicalId) -> Result<SchemaRef, PlanError> 
         .ok_or_else(|| PlanError::Internal(format!("logical node {id} has no schema")))
 }
 
+/// `filters` as one `Filter` node over `input`, its conjunct list in written
+/// order; `input` itself when there is none. Where each conjunct runs is the
+/// placement pass's decision, not this builder's.
+fn filter_over(
+    plan: &mut LogicalPlan,
+    input: LogicalId,
+    filters: &[IRExpr],
+    schema: SchemaRef,
+) -> LogicalId {
+    let conjuncts: Vec<IRExpr> = filters
+        .iter()
+        .cloned()
+        .flat_map(IRExpr::into_conjuncts)
+        .collect();
+    if conjuncts.is_empty() {
+        input
+    } else {
+        plan.add(LogicalNode::Filter { input, conjuncts }, schema)
+    }
+}
+
+/// The binding a root scan carries, looked at through the `Filter` nodes the
+/// builder stacks on it.
 fn binding_of(plan: &LogicalPlan, id: LogicalId) -> Option<String> {
     match plan.node(id) {
         Some(LogicalNode::TableScan { input: None, spec }) => spec.binding.clone(),
+        Some(LogicalNode::Filter { input, .. }) => binding_of(plan, *input),
         _ => None,
     }
 }
 
-fn gq_predicate(filters: &[IRFilter]) -> Option<Predicate> {
-    filters
-        .iter()
-        .map(|filter| {
-            let mut reads = Vec::new();
-            reads_of_filter(filter, &mut reads);
-            Predicate::Gq {
-                reads,
-                text: filter.to_string(),
-                filter: GqFilter(filter.clone()),
-            }
-        })
-        .reduce(Predicate::and)
+/// One conjunct as a scan predicate: its reads, its GQ text and itself.
+pub(crate) fn gq_conjunct(conjunct: &IRExpr) -> Predicate {
+    let mut reads = Vec::new();
+    reads_of_expr(conjunct, &mut reads);
+    Predicate::Gq {
+        reads,
+        text: conjunct.to_string(),
+        filter: GqFilter(conjunct.clone()),
+    }
 }
 
 /// The node a leading `order` search function becomes; `None` leaves the
@@ -541,6 +539,39 @@ fn search_arm_reads(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
         IRExpr::Nearest { query, .. } | IRExpr::Bm25 { query, .. } => reads_of_expr(query, out),
         other => reads_of_expr(other, out),
     }
+}
+
+/// A key the type checker bound to a `return` item (T42, RFC
+/// 2026-09-24-shared-expression-model, "Order key binding") as the `AliasRef`
+/// of that item's column; a property or alias key as written.
+fn bind_order_key(key: &IRExpr, return_exprs: &[IRProjection]) -> IRExpr {
+    if matches!(key, IRExpr::PropAccess { .. } | IRExpr::AliasRef(_)) {
+        return key.clone();
+    }
+    return_exprs
+        .iter()
+        .find(|projection| projection.expr == *key)
+        .and_then(result_column)
+        .map_or_else(|| key.clone(), IRExpr::AliasRef)
+}
+
+/// The column a `return` item lands under, as `engine/lower.rs` `return_name`
+/// spells it: the alias, else the expression's own name, an aggregate its
+/// argument's; `None` for the shapes the engine has no name for.
+fn result_column(projection: &IRProjection) -> Option<String> {
+    fn column(expr: &IRExpr) -> Option<String> {
+        match expr {
+            IRExpr::PropAccess { variable, property } => Some(format!("{variable}.{property}")),
+            IRExpr::Variable(name) | IRExpr::Param(name) => Some(name.clone()),
+            IRExpr::Literal(_) => Some("literal".to_string()),
+            IRExpr::Aggregate { arg, .. } => column(arg),
+            _ => None,
+        }
+    }
+    projection
+        .alias
+        .clone()
+        .or_else(|| column(&projection.expr))
 }
 
 fn order_keys(expr: &IRExpr, out: &mut Vec<String>) {
@@ -640,16 +671,15 @@ fn sort_tiebreak(
         .collect()
 }
 
-fn reads_of_filter(filter: &IRFilter, out: &mut Vec<ColumnRef>) {
-    let IRFilter { left, op: _, right } = filter;
-    reads_of_expr(left, out);
-    reads_of_expr(right, out);
-}
-
 /// Every column an expression reads. `count($v)` reads the identity alone;
 /// an alias, a parameter and a literal read nothing.
-fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
+pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
     match expr {
+        IRExpr::Binary { left, right, .. } => {
+            reads_of_expr(left, out);
+            reads_of_expr(right, out);
+        }
+        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => reads_of_expr(inner, out),
         IRExpr::PropAccess { variable, property } => {
             out.push(ColumnRef::property(variable, property));
         }
@@ -1077,8 +1107,8 @@ fn and_filter(existing: Option<Predicate>, added: Predicate) -> Predicate {
 }
 
 /// Stage 1, pass 2 on a query plan, per scope (the top-level tree and each
-/// `not { … }` inner tree on its own): every filter `placement_target`
-/// places moves into its scan; the rest stay where the query wrote them.
+/// `not { … }` inner tree): adjacent `Filter` nodes coalesce into one, each
+/// conjunct `placement_target` places moves into its scan, an emptied node goes.
 fn place_query_filters(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool {
     let mut fired = false;
     let mut scopes = vec![plan.root()];
@@ -1112,34 +1142,67 @@ fn place_query_filters(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool 
             }
         }
         filters.sort_unstable();
+        coalesce_filters(plan, &filters);
         for filter_id in filters {
-            let Some(LogicalNode::Filter { input, predicate }) = plan.node(filter_id).cloned()
+            let Some(LogicalNode::Filter { input, conjuncts }) = plan.node(filter_id).cloned()
             else {
                 continue;
             };
-            let Some(filter) = predicate.single_gq() else {
-                continue;
-            };
-            let target = match placement_target(filter, &scans, &dependent_scans, source) {
-                Some(target) => target,
-                None => continue,
-            };
-            let Some(LogicalNode::TableScan { spec, .. }) = plan.node_mut(target) else {
-                continue;
-            };
-            spec.filter = Some(and_filter(spec.filter.take(), predicate.clone()));
-            plan.splice_out(filter_id, input);
-            fired = true;
+            let mut residual = Vec::with_capacity(conjuncts.len());
+            for conjunct in conjuncts {
+                let target = placement_target(&conjunct, &scans, &dependent_scans, source);
+                match target.and_then(|target| plan.node_mut(target)) {
+                    Some(LogicalNode::TableScan { spec, .. }) => {
+                        spec.filter = Some(and_filter(spec.filter.take(), gq_conjunct(&conjunct)));
+                        fired = true;
+                    }
+                    _ => residual.push(conjunct),
+                }
+            }
+            if residual.is_empty() {
+                plan.splice_out(filter_id, input);
+            } else if let Some(LogicalNode::Filter { conjuncts, .. }) = plan.node_mut(filter_id) {
+                *conjuncts = residual;
+            }
         }
     }
     fired
 }
 
-/// Where one filter of a scope goes, if anywhere: a search filter to the scan
-/// of its field's binding, including exact membership on dependent scans;
-/// a scalar filter on one binding goes to the read that can evaluate it.
+/// Adjacent `Filter` nodes of one scope become one node, the lower node's
+/// conjuncts first as the match block wrote them, a repeated conjunct kept
+/// once; `filters` is in ascending id order, so a chain collapses bottom-up.
+fn coalesce_filters(plan: &mut LogicalPlan, filters: &[LogicalId]) {
+    for &filter_id in filters {
+        while let Some(LogicalNode::Filter { input: child, .. }) = plan.node(filter_id) {
+            let child = *child;
+            let Some(LogicalNode::Filter {
+                input: grandchild,
+                conjuncts: lower,
+            }) = plan.node(child).cloned()
+            else {
+                break;
+            };
+            let Some(LogicalNode::Filter { conjuncts, .. }) = plan.node_mut(filter_id) else {
+                break;
+            };
+            let mut merged: Vec<IRExpr> = Vec::with_capacity(lower.len() + conjuncts.len());
+            for conjunct in lower.into_iter().chain(std::mem::take(conjuncts)) {
+                if !merged.contains(&conjunct) {
+                    merged.push(conjunct);
+                }
+            }
+            *conjuncts = merged;
+            plan.splice_out(child, grandchild);
+        }
+    }
+}
+
+/// Where one conjunct of a scope goes, if anywhere: a search conjunct to the
+/// scan of its field's binding (exact membership on dependent scans too), a
+/// scalar conjunct on one binding to the read that can evaluate it.
 fn placement_target(
-    filter: &IRFilter,
+    filter: &IRExpr,
     scans: &HashMap<String, LogicalId>,
     dependent_scans: &HashMap<String, LogicalId>,
     source: &dyn PlanSource,
@@ -1149,7 +1212,7 @@ fn placement_target(
             return None;
         };
         let mut reads = Vec::new();
-        reads_of_filter(filter, &mut reads);
+        reads_of_expr(filter, &mut reads);
         if reads.iter().any(|read| read.binding != *variable) {
             return None;
         }
@@ -1160,7 +1223,7 @@ fn placement_target(
         });
     }
     let mut reads = Vec::new();
-    reads_of_filter(filter, &mut reads);
+    reads_of_expr(filter, &mut reads);
     let mut bindings: Vec<&str> = reads.iter().map(|read| read.binding.as_str()).collect();
     bindings.sort_unstable();
     bindings.dedup();
@@ -1179,28 +1242,25 @@ fn placement_target(
 /// A dependent scan evaluates one-binding scalar predicates and exact text
 /// membership. Fuzzy and ranked retrieval retain their existing execution
 /// contract; a dependent read must not create a top-k window per input batch.
-fn dependent_scan_filter_pushable(
-    filter: &IRFilter,
-    binding: &str,
-    source: &dyn PlanSource,
-) -> bool {
+fn dependent_scan_filter_pushable(filter: &IRExpr, binding: &str, source: &dyn PlanSource) -> bool {
     let mut reads = Vec::new();
-    reads_of_filter(filter, &mut reads);
+    reads_of_expr(filter, &mut reads);
     if reads.iter().any(|read| read.binding != binding) {
         return false;
     }
-    match &filter.left {
-        IRExpr::Search { field, .. } | IRExpr::MatchText { field, .. } => {
+    match filter.comparison_parts().map(|(left, _, _)| left) {
+        Some(IRExpr::Search { field, .. } | IRExpr::MatchText { field, .. }) => {
             matches!(field.as_ref(), IRExpr::PropAccess { variable, .. } if variable == binding)
         }
-        IRExpr::Fuzzy { .. } => false,
+        Some(IRExpr::Fuzzy { .. }) => false,
         _ => source.filter_pushable(filter),
     }
 }
 
-/// The field of a full-text filter (`search`, `fuzzy`, `match_text`).
-fn search_filter_field(filter: &IRFilter) -> Option<&IRExpr> {
-    match &filter.left {
+/// The field of a full-text conjunct (`search`, `fuzzy`, `match_text`), the
+/// call as the left operand of the `= true` comparison the compiler builds.
+fn search_filter_field(filter: &IRExpr) -> Option<&IRExpr> {
+    match filter.comparison_parts()?.0 {
         IRExpr::Search { field, .. }
         | IRExpr::Fuzzy { field, .. }
         | IRExpr::MatchText { field, .. } => Some(field.as_ref()),
@@ -1403,8 +1463,12 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
         }
         LogicalNode::Filter {
             input: _,
-            predicate,
-        } => predicate_reads(predicate, &mut out),
+            conjuncts,
+        } => {
+            for conjunct in conjuncts {
+                reads_of_expr(conjunct, &mut out);
+            }
+        }
         LogicalNode::Projection {
             input: _,
             reads,
@@ -1841,11 +1905,11 @@ impl Lowering<'_> {
                     right: right_lowered,
                 }))
             }
-            LogicalNode::Filter { input, predicate } => {
+            LogicalNode::Filter { input, conjuncts } => {
                 let lowered = self.lower(*input)?;
                 Ok(self.physical.add(PhysicalNode::Filter {
                     input: lowered,
-                    filters: predicate.gq_filters(),
+                    filters: conjuncts.clone(),
                 }))
             }
             LogicalNode::Projection {
@@ -3436,15 +3500,16 @@ mod tests {
         assert_eq!(crate::gate::over_bound(&optimized.physical, &BOUNDS), None);
     }
 
-    /// FNV-1a over kind names and input counts: the literal holds on every
-    /// toolchain, and a node's input count is part of the shape.
+    /// FNV-1a over the plan version, kind names and input counts: the literal
+    /// holds on every toolchain, and a node's input count is part of the
+    /// shape. The literal moves with `LOGICAL_PLAN_VERSION`.
     #[test]
     fn structural_hash_is_a_fixed_function_of_the_shape() {
         let source = source(false);
         let plan = resolve(&commit_diff(None), &source).expect("resolves");
         assert_eq!(
             format!("{:016x}", plan.structural_hash()),
-            "2ff59b16c5f2d308"
+            "8b194d960cfb490d"
         );
         let resumed = resolve(&commit_diff(Some("k")), &source).expect("resolves");
         assert_eq!(plan.structural_hash(), resumed.structural_hash());

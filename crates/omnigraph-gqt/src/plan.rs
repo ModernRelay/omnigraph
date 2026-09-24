@@ -586,10 +586,17 @@ fn planned_nodes(node: &Value, out: &mut PlannedNodes) -> Result<(), String> {
                 .transpose()?,
         }),
         Some("Filter") => {
-            let predicate = node
-                .get("predicate")
-                .ok_or_else(|| "expect plan: Filter has no predicate".to_string())?;
-            out.filters.push(predicate_reads(predicate)?);
+            let conjuncts = node
+                .get("conjuncts")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "expect plan: Filter has no conjuncts".to_string())?;
+            let mut reads: Vec<String> = Vec::new();
+            for conjunct in conjuncts {
+                reads.extend(predicate_reads(conjunct)?);
+            }
+            reads.sort();
+            reads.dedup();
+            out.filters.push(reads);
         }
         _ => {}
     }
@@ -1028,14 +1035,14 @@ mod tests {
                 "node": "Aggregate",
                 "inputs": [{
                     "node": "Filter",
-                    "predicate": {
+                    "conjuncts": [{
                         "kind": "gq",
                         "reads": [
                             {"binding": "d", "property": "rank"},
                             {"binding": "e", "property": "rank"},
                         ],
                         "text": "d.rank = e.rank",
-                    },
+                    }],
                     "inputs": [{
                         "node": "Join",
                         "kind": "Cross",

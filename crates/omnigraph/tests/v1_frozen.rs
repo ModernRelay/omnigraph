@@ -25,11 +25,11 @@ const BASELINE: &str = "8281807b";
 const FROZEN: &[(&str, &str)] = &[
     (
         "src/exec/query.rs",
-        "aaf9412eceff11b54abdcdedbf5148429c85066ae723ba17d2f1c75f595fc55e",
+        "eafe1395d8bfb870cf00892538de69fad90ed826f715876dff49bd942de6e07b",
     ),
     (
         "src/exec/projection.rs",
-        "1e545e10397e1727708c6ba9880225370c6c8e87007832350a4f3a4c780760d7",
+        "0b645a65c338d28d4fcbe5408e0852368d57f12660c6ff8c463a2b062b6c4413",
     ),
     (
         "tests/traversal.rs",

@@ -31,6 +31,7 @@ use crate::storage_layer::{
 };
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
+use datafusion::prelude::Expr;
 use futures::stream::StreamExt;
 use omnigraph_compiler::SystemColumns;
 
@@ -61,7 +62,7 @@ enum DeferredStagePlan {
         batch: RecordBatch,
     },
     Delete {
-        predicate: String,
+        predicate: Expr,
     },
 }
 
@@ -139,7 +140,7 @@ pub(crate) struct MutationStaging {
     /// table is write-XOR-delete within one query, so this never overlaps
     /// `pending`. Staged as one combined `stage_delete` per table at
     /// end-of-query (no inline HEAD advance) — see `stage_delete_table`.
-    pub(crate) delete_predicates: HashMap<String, Vec<String>>,
+    pub(crate) delete_predicates: HashMap<String, Vec<Expr>>,
     /// Ids removed per table, captured by the delete ops as they scan their
     /// matched rows (so validation recounts the srcs a delete empties without
     /// re-resolving the predicates). Disjoint from `pending` by D₂; flows into
@@ -329,7 +330,7 @@ impl MutationStaging {
     /// path/version/op-kind are captured. D₂ guarantees a delete-touched table
     /// has no pending write batches, so the predicates are staged as one
     /// combined `stage_delete` at end-of-query — no inline HEAD advance.
-    pub(crate) fn record_delete(&mut self, table_key: &str, predicate: String) {
+    pub(crate) fn record_delete(&mut self, table_key: &str, predicate: Expr) {
         self.delete_predicates
             .entry(table_key.to_string())
             .or_default()
@@ -356,7 +357,7 @@ impl MutationStaging {
     /// already scheduled for deletion (deletes stage, so the committed snapshot
     /// is unchanged across statements — without this, overlapping predicates
     /// would double-count). `&[]` if none.
-    pub(crate) fn recorded_delete_predicates(&self, table_key: &str) -> &[String] {
+    pub(crate) fn recorded_delete_predicates(&self, table_key: &str) -> &[Expr] {
         self.delete_predicates
             .get(table_key)
             .map(|v| v.as_slice())
@@ -609,14 +610,8 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
-            let combined = if predicates.len() == 1 {
-                predicates.into_iter().next().unwrap()
-            } else {
-                predicates
-                    .iter()
-                    .map(|p| format!("({})", p))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
+            let Some(combined) = predicates.into_iter().reduce(Expr::or) else {
+                continue;
             };
             if let Some(entry) = stage_delete_table(db, table_key, combined, path, expected).await?
             {
@@ -822,7 +817,7 @@ async fn stage_pending_table(
 async fn stage_delete_table(
     db: &crate::db::Omnigraph,
     table_key: String,
-    predicate: String,
+    predicate: Expr,
     path: StagedTablePath,
     expected: u64,
 ) -> Result<Option<StagedTableEntry>> {
@@ -842,7 +837,7 @@ async fn stage_delete_table(
         // target branch tree after `commit_all` creates that ref.
         if db
             .storage()
-            .first_row_id_for_filter(&ds, &predicate, db.catalog().system_columns)
+            .first_row_id_for_filter(&ds, predicate.clone(), db.catalog().system_columns)
             .await?
             .is_none()
         {
@@ -858,7 +853,7 @@ async fn stage_delete_table(
             planned_transaction: pre_minted_transaction_identity(expected),
         }));
     }
-    match db.storage().stage_delete(&ds, &predicate).await? {
+    match db.storage().stage_delete(&ds, predicate).await? {
         Some(staged) => Ok(Some(StagedTableEntry {
             table_key,
             path,
@@ -954,7 +949,7 @@ async fn stage_deferred_plan(
         },
         DeferredStagePlan::Delete { predicate } => db
             .storage()
-            .stage_delete(&target, &predicate)
+            .stage_delete(&target, predicate)
             .await?
             .ok_or_else(|| {
                 OmniError::manifest_read_set_changed(

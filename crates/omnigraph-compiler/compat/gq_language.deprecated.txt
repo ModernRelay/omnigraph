@@ -1,0 +1,7 @@
+# GQ grammar units deprecated in this release and removed in the next
+# (docs/rfcs/2026-09-14-compatibility-surfaces.md, "Deprecate before remove";
+# docs/rfcs/2026-09-24-shared-expression-model.md, phase 1). One unit key per
+# line; the floor reads this list in place of a marker the grammar has no
+# place for.
+rule:match_value
+rule:text_search_clause

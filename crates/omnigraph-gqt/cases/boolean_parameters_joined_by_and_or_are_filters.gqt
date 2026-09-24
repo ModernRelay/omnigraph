@@ -1,0 +1,64 @@
+# issue: none
+# notes: `$a and $b` and `$a or $b` over Boolean parameters are filters, not traversals
+# notes: over an edge named `and` or `or`: a reserved word is never an edge name.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a"}}
+
+--- query
+set engine = v2;
+query conjunction($a: Bool, $b: Bool) {
+    match { $p: Person  $a and $b }
+    return { $p.slug }
+}
+
+--- params
+{"a": true, "b": true}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query conjunction_with_a_false_side($a: Bool, $b: Bool) {
+    match { $p: Person  $a and $b }
+    return { $p.slug }
+}
+
+--- params
+{"a": true, "b": false}
+
+--- expect unordered
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query disjunction($a: Bool, $b: Bool) {
+    match { $p: Person  $a or $b }
+    return { $p.slug }
+}
+
+--- params
+{"a": false, "b": true}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String

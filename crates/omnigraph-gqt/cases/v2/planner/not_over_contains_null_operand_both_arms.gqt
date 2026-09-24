@@ -1,0 +1,135 @@
+# issue: none
+# notes: `contains` (substring and list membership) and `starts_with` are null on a null operand, property or parameter, on the pushed-down arm and
+# notes: on the in-memory arm alike, so `not` over them never selects the null row; `expect plan` pins that a single-binding filter ran in the scan and a two-binding filter ran as the residual.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String?
+    tags: [String]?
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","name":"alice","tags":["rust"]}}
+{"type":"Person","data":{"slug":"b","name":"bob","tags":["go"]}}
+{"type":"Person","data":{"slug":"c"}}
+
+--- query
+set engine = v2;
+query pushed_not_contains() {
+    match { $p: Person  not ($p.name contains "li") }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- expect plan
+pass predicate_pushdown
+scan Person as $p: filter reads [p.name]
+
+--- query
+set engine = v2;
+query pushed_not_starts_with() {
+    match { $p: Person  not ($p.name starts_with "a") }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query pushed_not_list_contains() {
+    match { $p: Person  not ($p.tags contains "rust") }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query null_parameter_needle($needle: String?) {
+    match { $p: Person  not ($p.name contains $needle) }
+    return { $p.slug }
+}
+
+--- params
+{"needle": null}
+
+--- expect unordered
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query residual_not_contains() {
+    match {
+        $p: Person
+        $q: Person { slug: "a" }
+        not ($p.name contains $q.name)
+    }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- expect plan
+scan Person as $p: no filter
+filter reads [p.name, q.name]
+
+--- query
+set engine = v2;
+query residual_not_starts_with() {
+    match {
+        $p: Person
+        $q: Person { slug: "b" }
+        not ($p.name starts_with $q.name)
+    }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+
+--- query
+set engine = v2;
+query residual_not_list_contains() {
+    match {
+        $p: Person
+        $q: Person { slug: "a" }
+        not ($p.tags contains $q.name)
+    }
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String

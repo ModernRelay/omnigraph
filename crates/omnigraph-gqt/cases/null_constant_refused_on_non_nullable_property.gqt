@@ -1,0 +1,93 @@
+# issue: none
+# notes: A constant whose result is null (`$age > 30` with `$age` null) writes a null to a nullable property and
+# notes: selects no row as an inline match; assigned to a non-nullable property it is the typed error naming the property, raised before the batch.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    adult: Bool
+    maybe: Bool?
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","adult":false}}
+{"type":"Person","data":{"slug":"b","adult":true}}
+
+--- mutate
+query null_comparison_on_non_nullable($slug: String, $age: I64?) {
+    update Person set { adult: $age > 30 } where slug = $slug
+}
+
+--- params
+{"slug": "a", "age": null}
+
+--- expect error: cannot assign null to non-nullable property 'adult' of Person
+
+--- mutate
+query comparison_on_nullable($slug: String, $age: I64?) {
+    update Person set { maybe: $age > 30 } where slug = $slug
+}
+
+--- params
+{"slug": "a", "age": 40}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query maybe_of_a() {
+    match { $p: Person { slug: "a" } }
+    return { $p.slug, $p.maybe }
+}
+
+--- expect unordered
+{"p.slug": "a", "p.maybe": true}
+
+--- expect shape
+p.slug: String
+p.maybe: Bool?
+
+--- mutate
+query null_comparison_on_nullable($slug: String, $age: I64?) {
+    update Person set { maybe: $age > 30 } where slug = $slug
+}
+
+--- params
+{"slug": "a", "age": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query refused_write_left_adult_unchanged_and_maybe_is_null() {
+    match { $p: Person }
+    return { $p.slug, $p.adult, $p.maybe }
+}
+
+--- expect unordered
+{"p.slug": "a", "p.adult": false}
+{"p.slug": "b", "p.adult": true}
+
+--- expect shape
+p.slug: String
+p.adult: Bool
+p.maybe: Bool?
+
+--- query
+set engine = v2;
+query inline_match_null_selects_no_row($age: I64?) {
+    match { $p: Person { adult: $age > 30 } }
+    return { $p.slug }
+}
+
+--- params
+{"age": null}
+
+--- expect unordered
+
+--- expect shape
+p.slug: String

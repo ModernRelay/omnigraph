@@ -1,7 +1,7 @@
 //! The order and totality of `PhysicalPlan::lower`. Rust and not `.gqt`: the
 //! claim is the call sequence an engine sees, which no query result shows.
 
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::{
     ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Prefilter,
     RankArm, RankKind, RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
@@ -111,7 +111,7 @@ impl Lower for Trace {
         self.call("cross_join", id, &[&left, &right])
     }
 
-    fn filter(&mut self, id: NodeId, _: &[IRFilter], input: String) -> Result<String, PlanError> {
+    fn filter(&mut self, id: NodeId, _: &[IRExpr], input: String) -> Result<String, PlanError> {
         self.call("filter", id, &[&input])
     }
 
