@@ -267,19 +267,30 @@ every cache key, so the pin is what keeps caches warm across Rust releases.
 The release and publish workflows still build on the floating `stable`
 action and save their caches from the tag ref; they are outside this rule.
 
-The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; three of them, the format fence, the RustFS S3 integration, and the AWS feature build, also run on pull requests:
+The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; four of them, the format fence, the RustFS S3 integration, the Azurite Azure integration, and the AWS feature build, also run on pull requests:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
 - **V5 ↔ V10 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every pull request that changes engine input, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
-- **Azurite Azure integration** runs only after merge, on tags, or by manual
-  dispatch: its 90-minute ceiling would outrun `Test Workspace` on a pull
-  request. It exercises configured storage, admission-lease, recovery,
-  cluster, server, and CLI owners against a digest-pinned Azurite image, then
-  verifies that control objects, Lance data, and the admission object use the
-  declared container.
+- **Azurite Azure integration** exercises configured storage, admission-lease,
+  recovery, cluster, server, and CLI owners against a digest-pinned Azurite
+  image, then verifies that control objects, Lance data, and the admission
+  object use the declared container. A configured test that skips is a
+  failure, and every owner it runs by name must report `ok`, so a deleted or
+  renamed owner fails the job rather than passing vacuously;
+  `scripts/check-ci-cells.py`, a step of `Check Workflow Action Pins`, refuses
+  such a name on the pull request without building any Rust. The job
+  runs on every pull request that changes engine input, as a reporting
+  context, and after merge, on tags, and by manual dispatch: the configured
+  Azure owners run nowhere else, so a change that removes or renames one
+  reports on the pull request instead of first appearing on `main`; wait for
+  it before clicking Merge when ready. Its 90-minute ceiling is the cold-cache
+  envelope; a warm run takes minutes. A red run on a pull request that touched
+  no object-store code, or one that names no test (the image pull, Azurite
+  readiness), is inherited from `main` or from infrastructure: compare with
+  the latest `main` run before reading it as the pull request's.
 - **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request, as a required context.
 
 Azure remains a qualification preview. Emulator coverage and the completed
@@ -346,6 +357,7 @@ python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-storage-upgrade-ci.py --self-test
 python3 scripts/check-merge-group-triggers.py --self-test
+python3 scripts/check-ci-cells.py --self-test
 python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
 python3 scripts/check-azure-admission-boundary.py
