@@ -45,8 +45,10 @@ table view.
 
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. It preserves incoming row/rank order and carries a
-deterministic edge tie-break. `not { ... }` is an anti-join over its typed
-inner pipeline.
+deterministic edge tie-break. A correlated block (`not { ... }`,
+`exists { ... }`, `count { ... } > 2`, `sum($d.size) { ... } > 100`) is one
+anti-join over its typed inner pipeline, keeping each outer row by a
+`SubqueryPredicate` on the aggregate of its matches.
 
 Do not replace these shapes with eager cross-products. Keep intermediate rows
 factorized and flatten only where the result contract needs it.
@@ -127,7 +129,7 @@ prefilters remain on the same scanner as the search operation. Multi-binding
 or unsupported expressions stay in the engine at their lowered position. On
 `V2` the same placement is a planner decision, the `predicate_pushdown` pass
 on a query plan (`place_query_filters`, per scope: the top-level tree and
-each `not { … }` inner tree on its own): a search filter moves to the scan of
+each correlated block's inner tree on its own): a search filter moves to the scan of
 its field's binding; a scalar filter on exactly one binding that
 `QuerySource::filter_pushable` accepts moves to that binding's scan
 (`ScanSpec.filter`, a `Predicate::Gq` carrying the `IRFilter`), including
@@ -223,7 +225,7 @@ by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 | `CrossJoin` | `CrossJoinExec`: the left input collected under the query pool, every left row paired with each right batch, output charged as `cross join output`; an empty left executes nothing on the right | omnigraph |
 | `Filter` | `FilterExec`: every `IRFilter` of the node as one conjunction over the wide batch (`evaluate_filter`), so a filter over two bindings reads two columns | omnigraph |
 | `Expand` | `ExpandExec`: a single unbound hop streams, one vectorized walk per input batch (`operators/single_hop.rs`); bound edges run the bounded pair producer, spillable pair ordering and incremental hydration per input batch; multi-hop drains its frontier into the BFS breaker `execute_expand` without an early limit | omnigraph |
-| `AntiJoin` | `AntiJoinMaskExec` over the outer plan and the lowered inner plan: the bulk CSR mask when the inner is one single-hop, filter-free expand over the `OuterReference`; else the outer rows are tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext`, and the surviving tags mask the outer rows | omnigraph |
+| `AntiJoin` | `AntiJoinMaskExec` over the outer plan and the lowered inner plan: the bulk CSR degree mask when the predicate counts rows and the inner is one single-hop, filter-free, unbound expand over the `OuterReference`; else the outer rows are tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext`, and `SubqueryAggregate` folds the tagged inner rows per outer row and applies the predicate | omnigraph |
 | `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; when a `Sort` consumes it, every column the sort reads and every declared tie-break id follow the return columns under the hidden prefix `~`, which the sort drops | omnigraph |
 | `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by`, `nulls_first = !descending`, then the `<binding>.<id>` columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::sort_tiebreak`) declares every binding in scope, name-sorted, and none where ids cannot change the visible order: group rows, a `return` whose every expression is an order key, a binding whose `@id` is a key; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion plans no `Sort`, and an aggregate under a search order plans none | omnigraph |
 | `Limit` (`Page` in explain JSON) | `LimitExec`: passes batches and cuts the last one at the bound; a limit of zero executes nothing below it | omnigraph |

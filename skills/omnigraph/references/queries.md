@@ -171,13 +171,27 @@ Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
 typecheck (T22) — use the directional form there.
 
-### Negation
+### Correlated blocks
+
+A block matches its pattern once per outer row and keeps the row by a
+comparison on the aggregate of its matches: `not { ... }` (no match),
+`exists { ... }` (at least one), `count { ... } > 2`, and
+`sum($d.size) { ... } > 100` (also `min`, `max`, `avg`). The block must read
+at least one outer variable; the right side is a literal, `now()` or a parameter.
 
 ```gq
 query orphan_signals() {
     match {
         $s: Signal
         not { $s formsPattern $_ }
+    }
+    return { $s.slug }
+}
+
+query busy_signals($least: I64) {
+    match {
+        $s: Signal
+        count { $s formsPattern $p } >= $least
     }
     return { $s.slug }
 }

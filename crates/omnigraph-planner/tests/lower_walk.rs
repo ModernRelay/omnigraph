@@ -312,6 +312,7 @@ fn an_anti_join_hands_over_its_outer_input_before_the_inner_tree_is_lowered() {
         input: outer,
         inner,
         outer_var: "o".to_string(),
+        predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
     });
     plan.set_root(anti);
 

@@ -13,7 +13,7 @@ deployment.
 ## Model and data
 
 - [Schema language](schema/index.md)
-- [Query language](queries/index.md) and [explain](queries/explain.md)
+- [Query language](queries/index.md), [session settings](queries/settings.md), and [explain](queries/explain.md)
 - [Mutations and loading](mutations/index.md)
 - [Search](search/index.md) and [embeddings](search/embeddings.md)
 - [Blob values](blobs.md)

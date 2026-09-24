@@ -16,22 +16,20 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-/// The upstream commit whose bytes the frozen files hold; `exec/query.rs`
-/// differs from it by one hunk, the door block moved to `exec/query_doors.rs`
-/// behind a `#[path]` line. The search fixture includes RFC 0067's explicit
-/// four-partition IVF setup because Optimize now preserves partition counts;
-/// its query assertions and the frozen executors are unchanged.
+/// The upstream commit whose bytes the frozen files hold. The two executors differ
+/// from it by the query-door extraction and by the correlated-block change (the
+/// `SubqueryPredicate` on `IROp::AntiJoin`); the search fixture adds RFC 0067's IVF setup.
 const BASELINE: &str = "8281807b";
 
 /// (path under the crate, SHA-256 of the file's bytes).
 const FROZEN: &[(&str, &str)] = &[
     (
         "src/exec/query.rs",
-        "7597fc366ef041cabbcd244a68f156b6fbe5fcc62e185b3551da35b4faac92bf",
+        "aaf9412eceff11b54abdcdedbf5148429c85066ae723ba17d2f1c75f595fc55e",
     ),
     (
         "src/exec/projection.rs",
-        "738c1f6cef6d867116500e4dc685576af9bbf70fa76cd3c78bc8b2198b8cb4e1",
+        "1e545e10397e1727708c6ba9880225370c6c8e87007832350a4f3a4c780760d7",
     ),
     (
         "tests/traversal.rs",

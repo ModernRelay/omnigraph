@@ -388,7 +388,11 @@ fn resolve_pipeline(
                     None => destination,
                 }
             }
-            IROp::AntiJoin { outer_var, inner } => {
+            IROp::AntiJoin {
+                outer_var,
+                inner,
+                predicate,
+            } => {
                 let input = bound(current, "anti-join")?;
                 let schema = schema_of(plan, input)?;
                 let outer = plan.add(
@@ -403,6 +407,7 @@ fn resolve_pipeline(
                         input,
                         inner,
                         outer_var: outer_var.clone(),
+                        predicate: predicate.clone(),
                     },
                     schema,
                 )
@@ -1448,6 +1453,17 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             out.extend(arms.iter().map(|arm| ColumnRef::entity(&arm.binding)));
             out.extend(reads.iter().cloned());
         }
+        LogicalNode::AntiJoin {
+            input: _,
+            inner: _,
+            outer_var: _,
+            predicate,
+        } => {
+            if let Some(arg) = &predicate.arg {
+                reads_of_expr(arg, &mut out);
+            }
+            reads_of_expr(&predicate.right, &mut out);
+        }
         LogicalNode::MetadataCount {
             spec: _,
             return_exprs: _,
@@ -1462,11 +1478,6 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             min_hops: _,
             max_hops: _,
             edge_binding: _,
-        }
-        | LogicalNode::AntiJoin {
-            input: _,
-            inner: _,
-            outer_var: _,
         }
         | LogicalNode::OuterReference { outer_var: _ }
         | LogicalNode::Join {
@@ -1894,6 +1905,7 @@ impl Lowering<'_> {
                 input,
                 inner,
                 outer_var,
+                predicate,
             } => {
                 let lowered = self.lower(*input)?;
                 let inner_lowered = self.lower(*inner)?;
@@ -1902,6 +1914,7 @@ impl Lowering<'_> {
                     input: lowered,
                     inner: inner_lowered,
                     outer_var: outer_var.clone(),
+                    predicate: predicate.clone(),
                 }))
             }
             LogicalNode::OuterReference { outer_var } => {

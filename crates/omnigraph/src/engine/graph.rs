@@ -10,7 +10,7 @@ use omnigraph_planner::{ExpandCostInputs, ExpandMode, choose_expand_mode, should
 use datafusion::physical_plan::metrics::Gauge;
 
 use super::operators::memory::WorkMemory;
-use super::operators::{ExpandStep, Switch};
+use super::operators::{ExpandStep, RowCountPredicate, Switch};
 use super::*;
 
 /// Bundles the per-handle embedding client cell with the optional injected
@@ -1231,8 +1231,9 @@ pub(super) async fn execute_expand_bfs(
     })
 }
 
-/// The bulk anti-join mask for one edge: a CSR existence check per outer row
-/// (`Lowering::bulk_negation` names the edge from the plan).
+/// The bulk mask of a row-count block over one edge (`Lowering::bulk_row_count`
+/// picks the shape): the CSR degree per outer row, or only its existence when
+/// the predicate asks no more.
 pub(super) fn bulk_anti_join_mask(
     wide: &RecordBatch,
     edge_type: &str,
@@ -1240,8 +1241,10 @@ pub(super) fn bulk_anti_join_mask(
     graph_index: Option<&GraphIndex>,
     catalog: &Catalog,
     outer_var: &str,
+    row_count: &RowCountPredicate,
     memory: &WorkMemory,
 ) -> Result<Option<BooleanArray>> {
+    let existence_only = row_count.existence_only();
     let prepared = (|| {
         let gi = graph_index?;
         let edge_def = catalog.edge_types.get(edge_type)?;
@@ -1275,16 +1278,24 @@ pub(super) fn bulk_anti_join_mask(
         .entries::<bool>(outer_ids.len())
         .map_err(|error| memory.error(error))?;
     let mut keep_mask = Vec::with_capacity(outer_ids.len());
+    let mut targets = Vec::new();
     for i in 0..outer_ids.len() {
         memory.check().map_err(|error| memory.error(error))?;
-        let keep = match type_idx.to_dense(outer_ids.value(i)) {
+        let matches = match type_idx.to_dense(outer_ids.value(i)) {
+            Some(dense) if existence_only => u64::from(
+                adj.has_neighbors(dense)
+                    || adj_rev.map(|a| a.has_neighbors(dense)).unwrap_or(false),
+            ),
             Some(dense) => {
-                !adj.has_neighbors(dense)
-                    && !adj_rev.map(|a| a.has_neighbors(dense)).unwrap_or(false)
+                targets.clear();
+                targets.extend_from_slice(adj.neighbors(dense));
+                targets.sort_unstable();
+                targets.dedup();
+                targets.len() as u64
             }
-            None => true,
+            None => 0,
         };
-        keep_mask.push(keep);
+        keep_mask.push(row_count.holds(matches)?);
     }
     Ok(Some(BooleanArray::from(keep_mask)))
 }

@@ -69,6 +69,7 @@ use context::QueryContext;
 pub(crate) use explain::{explain_document, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
+pub(crate) use operators::{SubqueryAggregate, absorb_inner_batches};
 use plan_source::{ExplainedQuery, QuerySource, explain_query, plan_query};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};

@@ -95,7 +95,9 @@ physical tree lowered to operators, every read operator omnigraph's own
 `MetadataCountExec`) except the aggregate, DataFusion's `AggregateExec`, one
 row per operator with `depth` from
 its nesting and `detail` the operator's own text (a filter's predicate, a
-sort's keys, a scan's columns). It is the tree of the query's first pass; a
+sort's keys, a scan's columns; `AntiJoinMaskExec` serves every correlated
+block, `not`, `exists`, `count` and the column aggregates, and prints its
+predicate). It is the tree of the query's first pass; a
 search that widens its scan after a short answer lowers it again. An
 `explain` runs nothing, so when the lowering would need the embedding client
 (a `nearest()` whose query is a string), the tree is left out and one `plan`

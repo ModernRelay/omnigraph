@@ -207,6 +207,7 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
 fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
     let negation = |value: &str| IROp::AntiJoin {
         outer_var: "a".to_string(),
+        predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
         inner: vec![
             expand("a", "x", vec![]),
             IROp::Filter(IRFilter {

@@ -81,7 +81,7 @@ base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32"
 
 match_clause = { "match" ~ "{" ~ clause+ ~ "}" }
 
-clause = { negation | binding | traversal | filter | text_search_clause }
+clause = { negation | subquery_predicate | exists_block | binding | traversal | filter | text_search_clause }
 text_search_clause = { search_call | fuzzy_call | match_text_call }
 
 // Binding: $p: Person { name: "Alice" }
@@ -106,6 +106,13 @@ filter = { expr ~ filter_op ~ expr }
 
 // Negation: not { ... }
 negation = { "not" ~ "{" ~ clause+ ~ "}" }
+
+// Correlated subquery predicates: the aggregate over the block's matches
+// per outer row, compared with a scalar. `count { ... } > 2`,
+// `sum($m.size) { ... } > 100`, and `exists { ... }` (`count { ... } > 0`).
+subquery_predicate = { agg_func ~ ("(" ~ expr ~ ")")? ~ subquery_block ~ comp_op ~ expr }
+exists_block = { "exists" ~ subquery_block }
+subquery_block = { "{" ~ clause+ ~ "}" }
 
 // Return clause — projections separated by commas or newlines
 return_clause = { "return" ~ "{" ~ projection+ ~ "}" }

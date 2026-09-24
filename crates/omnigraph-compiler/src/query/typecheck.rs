@@ -186,7 +186,7 @@ fn refuse_reserved_variable_names(clauses: &[Clause]) -> Result<()> {
                 }
             }
             Clause::Filter(_) => {}
-            Clause::Negation(inner) => refuse_reserved_variable_names(inner)?,
+            Clause::Subquery(subquery) => refuse_reserved_variable_names(&subquery.clauses)?,
         }
     }
     Ok(())
@@ -749,43 +749,95 @@ fn typecheck_clauses(
             Clause::Binding(b) => typecheck_binding(catalog, b, ctx, params)?,
             Clause::Traversal(t) => typecheck_traversal(catalog, t, ctx)?,
             Clause::Filter(f) => typecheck_filter(catalog, f, ctx, params)?,
-            Clause::Negation(inner) => {
-                // T9: at least one variable in the negation block must be bound outside
+            Clause::Subquery(subquery) => {
                 let outer_vars: Vec<String> = ctx.bindings.keys().cloned().collect();
-
-                // Typecheck inner clauses in a copy of ctx
                 let mut inner_ctx = ctx.clone();
-                typecheck_clauses(catalog, inner, &mut inner_ctx, params, true)?;
-
-                // Check T9
-                let mut has_outer = false;
-                for clause in inner {
-                    match clause {
-                        Clause::Traversal(t)
-                            if outer_vars.contains(&t.src) || outer_vars.contains(&t.dst) =>
-                        {
-                            has_outer = true;
-                        }
-                        Clause::Filter(f)
-                            if expr_references_any(&f.left, &outer_vars)
-                                || expr_references_any(&f.right, &outer_vars) =>
-                        {
-                            has_outer = true;
-                        }
-                        Clause::Binding(b) if outer_vars.contains(&b.variable) => {
-                            has_outer = true;
-                        }
-                        _ => {}
-                    }
+                typecheck_clauses(catalog, &subquery.clauses, &mut inner_ctx, params, true)?;
+                if !block_references_outer(&subquery.clauses, &outer_vars) {
+                    let rule = match subquery.keyword {
+                        BlockKeyword::Not => "T9",
+                        BlockKeyword::Exists | BlockKeyword::Aggregate => "T39",
+                    };
+                    return Err(CompilerError::Type(format!(
+                        "{rule}: {} block must reference at least one outer-bound variable",
+                        subquery.block_name()
+                    )));
                 }
-                if !has_outer {
-                    return Err(CompilerError::Type(
-                        "T9: negation block must reference at least one outer-bound variable"
-                            .to_string(),
-                    ));
+                typecheck_subquery_predicate(catalog, subquery, &inner_ctx, ctx, params)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a block's own clauses read a variable bound outside it: the
+/// correlation a `not { … }` or `count { … }` block needs.
+fn block_references_outer(clauses: &[Clause], outer_vars: &[String]) -> bool {
+    clauses.iter().any(|clause| match clause {
+        Clause::Traversal(t) => outer_vars.contains(&t.src) || outer_vars.contains(&t.dst),
+        Clause::Filter(f) => {
+            expr_references_any(&f.left, outer_vars) || expr_references_any(&f.right, outer_vars)
+        }
+        Clause::Binding(b) => outer_vars.contains(&b.variable),
+        Clause::Subquery(_) => false,
+    })
+}
+
+/// The comparison of a subquery predicate: the aggregate's result type from
+/// the block's scope (the argument rule of a `return` aggregate), the right
+/// operand from the outer scope, compatible under the filter rule.
+fn typecheck_subquery_predicate(
+    catalog: &Catalog,
+    subquery: &Subquery,
+    inner_ctx: &TypeContext,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Result<()> {
+    let func = subquery.func;
+    let result = match &subquery.arg {
+        None => PropType::scalar(ScalarType::I64, false),
+        Some(arg) => {
+            let arg_type = resolve_expr_type(catalog, arg, inner_ctx, params)?;
+            reject_blob_read_value(&arg_type, arg)?;
+            check_aggregate_argument(&func, arg, &arg_type)?;
+            match (func, &arg_type) {
+                (AggFunc::Count, _) => PropType::scalar(ScalarType::I64, false),
+                (AggFunc::Sum | AggFunc::Avg, _) => PropType::scalar(ScalarType::F64, false),
+                (AggFunc::Min | AggFunc::Max, ResolvedType::Scalar(s)) => {
+                    PropType::scalar(s.scalar, false)
+                }
+                (_, other) => {
+                    return Err(CompilerError::Type(format!(
+                        "T40: {func} over a block requires a scalar argument, got {}",
+                        other.display_name()
+                    )));
                 }
             }
         }
+    };
+    let bound = match &subquery.right {
+        Expr::Literal(_) | Expr::Now => true,
+        Expr::Variable(name) => params.contains_key(name),
+        _ => false,
+    };
+    if !bound {
+        return Err(CompilerError::Type(format!(
+            "T40: {func} over a block compares with a literal, now() or a parameter"
+        )));
+    }
+    let right = resolve_expr_type(catalog, &subquery.right, ctx, params)?;
+    let ResolvedType::Scalar(r) = &right else {
+        return Err(CompilerError::Type(format!(
+            "T40: {func} over a block compares with a scalar, got {}",
+            right.display_name()
+        )));
+    };
+    if !types_compatible(&result, r) {
+        return Err(CompilerError::Type(format!(
+            "T40: cannot compare {func} over a block ({}) with {}",
+            result.display_name(),
+            r.display_name()
+        )));
     }
     Ok(())
 }

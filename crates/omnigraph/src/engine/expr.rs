@@ -91,6 +91,7 @@ pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String,
             IROp::AntiJoin {
                 outer_var: _,
                 inner,
+                predicate: _,
             } => collect_node_bindings(inner, out),
         }
     }

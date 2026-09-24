@@ -114,11 +114,11 @@ return { $f.name }
         c => panic!("expected Traversal, got {c:?}"),
     }
     match &q.match_clause[3] {
-        Clause::Negation(inner) => match &inner[0] {
+        Clause::Subquery(block) => match &block.clauses[0] {
             Clause::Traversal(t) => assert!(t.undirected, "undirected inside not{{}}"),
             c => panic!("expected Traversal in not, got {c:?}"),
         },
-        c => panic!("expected Negation, got {c:?}"),
+        c => panic!("expected a not block, got {c:?}"),
     }
 }
 
@@ -163,9 +163,11 @@ return { $p.name }
     let q = qf.single_decl();
     assert_eq!(q.match_clause.len(), 2);
     match &q.match_clause[1] {
-        Clause::Negation(clauses) => {
-            assert_eq!(clauses.len(), 1);
-            match &clauses[0] {
+        Clause::Subquery(block) => {
+            assert_eq!(block.keyword, BlockKeyword::Not);
+            assert_eq!((block.func, block.op), (AggFunc::Count, CompOp::Eq));
+            assert_eq!(block.clauses.len(), 1);
+            match &block.clauses[0] {
                 Clause::Traversal(t) => {
                     assert_eq!(t.src, "p");
                     assert_eq!(t.edge_name, "worksAt");
@@ -176,7 +178,7 @@ return { $p.name }
                 _ => panic!("expected Traversal inside negation"),
             }
         }
-        _ => panic!("expected Negation"),
+        _ => panic!("expected a not block"),
     }
 }
 

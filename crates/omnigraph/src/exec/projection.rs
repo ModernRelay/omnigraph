@@ -54,6 +54,7 @@ fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
             IROp::AntiJoin {
                 outer_var: _,
                 inner,
+                predicate: _,
             } => collect_node_bindings(inner, out),
         }
     }
@@ -113,7 +114,11 @@ fn evaluate_filter(
 }
 
 /// Evaluate an IR expression against a wide batch, producing an array.
-fn evaluate_expr(batch: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> Result<ArrayRef> {
+pub(super) fn evaluate_expr(
+    batch: &RecordBatch,
+    expr: &IRExpr,
+    params: &ParamMap,
+) -> Result<ArrayRef> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
             let col_name = format!("{}.{}", variable, property);

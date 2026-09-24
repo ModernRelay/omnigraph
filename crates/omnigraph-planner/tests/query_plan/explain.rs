@@ -158,6 +158,64 @@ fn physical_expand_carries_its_pinned_edge_version() {
     assert_eq!(back, bound);
 }
 
+/// An `AntiJoin`'s predicate with a column argument and a parameter bound
+/// survives the bound plan's serde round trip. Rust and not `.gqt`: the
+/// replay boundary's bytes are what no query result shows.
+#[test]
+fn physical_anti_join_predicate_reads_back_equal() {
+    let predicate = omnigraph_compiler::ir::SubqueryPredicate {
+        func: AggFunc::Max,
+        arg: Some(prop("x", "rank")),
+        op: CompOp::Gt,
+        right: IRExpr::Param("since".to_string()),
+    };
+    let op = ir(
+        vec![
+            scan("a"),
+            IROp::AntiJoin {
+                outer_var: "a".to_string(),
+                inner: vec![expand("a", "x", vec![])],
+                predicate: predicate.clone(),
+            },
+        ],
+        vec![prop("a", "slug")],
+        vec![],
+    );
+    let (physical, _) = physical(&op, &source());
+    let printed = physical
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::AntiJoin { predicate, .. } => Some(predicate.to_string()),
+            _ => None,
+        })
+        .expect("an AntiJoin");
+    assert_eq!(printed, predicate.to_string());
+    let bound = omnigraph_planner::BoundPlan {
+        plan: physical,
+        values: omnigraph_planner::ValueTable {
+            params: Arc::new(
+                [("since".to_string(), Literal::Integer(3))]
+                    .into_iter()
+                    .collect(),
+            ),
+            vectors: Default::default(),
+        },
+    };
+    let text = serde_json::to_string(&bound).expect("the bound plan serializes");
+    let back: omnigraph_planner::BoundPlan =
+        serde_json::from_str(&text).expect("the bound plan deserializes");
+    assert_eq!(back, bound);
+    let restored = back
+        .plan
+        .live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::AntiJoin { predicate, .. } => Some(predicate.to_string()),
+            _ => None,
+        })
+        .expect("the AntiJoin reads back");
+    assert_eq!(restored, printed);
+}
+
 /// A plan's words are GQ: `Sort` keys carry their direction, a leading search
 /// function leads the declared ordering with its score column, and a query
 /// node prints no `schema` and the root scan its pinned version.
