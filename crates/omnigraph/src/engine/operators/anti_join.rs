@@ -1,23 +1,26 @@
-//! `AntiJoinMaskExec`: `not { … }` as a pipeline breaker over the outer wide
-//! batch. A single-hop, filter-free expand from the outer binding is answered
-//! by the bulk CSR existence check (`bulk_anti_join_mask`); any other inner
-//! tree runs once as a lowered plan whose leaf, `OuterReferenceExec`, reads
-//! the tagged outer batch from a slot this operator fills before executing it.
+//! `AntiJoinMaskExec`: a correlated block (`not { … }`, `count { … } > 2`,
+//! `sum($m.size) { … } > 100`) as a pipeline breaker over the outer wide
+//! batch. The inner tree runs once as a lowered plan whose leaf,
+//! `OuterReferenceExec`, reads the tagged outer batch from a slot this
+//! operator fills before executing it; `SubqueryAggregate` then decides per
+//! outer row. The shapes `Lowering::bulk_row_count` selects are answered by
+//! the bulk CSR degree check instead (`bulk_anti_join_mask`).
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
+use omnigraph_compiler::ir::{ParamMap, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
 
+use super::subquery_aggregate::{RowCountPredicate, SubqueryAggregate, absorb_inner_batches};
 use super::{GraphEnv, breaker_properties, breaker_stream, drain, drain_one, external, polled};
 use crate::engine::graph::bulk_anti_join_mask;
 use crate::error::{OmniError, Result};
@@ -131,10 +134,11 @@ pub(crate) struct AntiJoinMaskExec {
     outer: Arc<dyn ExecutionPlan>,
     inner: Arc<dyn ExecutionPlan>,
     outer_var: String,
+    predicate: SubqueryPredicate,
+    params: Arc<ParamMap>,
     tag_column: String,
     slot: Arc<OuterSlot>,
-    /// The edge of a negation the bulk CSR check answers: one single-hop,
-    /// filter-free expand from the outer binding over `OuterReference`.
+    /// The edge the bulk CSR check answers (`Lowering::bulk_row_count`).
     bulk: Option<(String, Direction)>,
     env: Arc<GraphEnv>,
     properties: Arc<PlanProperties>,
@@ -147,6 +151,8 @@ impl AntiJoinMaskExec {
         outer: Arc<dyn ExecutionPlan>,
         inner: Arc<dyn ExecutionPlan>,
         outer_var: String,
+        predicate: SubqueryPredicate,
+        params: Arc<ParamMap>,
         tag_column: String,
         slot: Arc<OuterSlot>,
         bulk: Option<(String, Direction)>,
@@ -157,6 +163,8 @@ impl AntiJoinMaskExec {
             outer,
             inner,
             outer_var,
+            predicate,
+            params,
             tag_column,
             slot,
             bulk,
@@ -195,28 +203,11 @@ fn tag_batch(wide: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
 }
 
-fn matched_tags(batches: &[RecordBatch], tag_column: &str) -> Result<HashSet<u32>> {
-    let mut matched = HashSet::new();
-    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
-        let tags = batch
-            .column_by_name(tag_column)
-            .ok_or_else(|| {
-                OmniError::manifest(
-                    "anti-join inner pipeline dropped the correlation column".to_string(),
-                )
-            })?
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| OmniError::manifest(format!("'{}' column is not UInt32", tag_column)))?;
-        matched.extend(tags.iter().flatten());
-    }
-    Ok(matched)
-}
-
 impl fmt::Debug for AntiJoinMaskExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AntiJoinMaskExec")
             .field("outer_var", &self.outer_var)
+            .field("predicate", &self.predicate.to_string())
             .field("bulk", &self.bulk)
             .finish_non_exhaustive()
     }
@@ -224,7 +215,11 @@ impl fmt::Debug for AntiJoinMaskExec {
 
 impl DisplayAs for AntiJoinMaskExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "AntiJoinMaskExec: ${}", self.outer_var)?;
+        write!(
+            f,
+            "AntiJoinMaskExec: ${} {}",
+            self.outer_var, self.predicate
+        )?;
         if let Some((edge_type, direction)) = &self.bulk {
             write!(f, ", bulk={edge_type} {direction:?}")?;
         }
@@ -264,6 +259,8 @@ impl ExecutionPlan for AntiJoinMaskExec {
             outer,
             inner,
             self.outer_var.clone(),
+            self.predicate.clone(),
+            Arc::clone(&self.params),
             self.tag_column.clone(),
             Arc::clone(&self.slot),
             self.bulk.clone(),
@@ -282,6 +279,8 @@ impl ExecutionPlan for AntiJoinMaskExec {
         let inner = Arc::clone(&self.inner);
         let inner_ctx = Arc::clone(&ctx);
         let outer_var = self.outer_var.clone();
+        let predicate = self.predicate.clone();
+        let params = Arc::clone(&self.params);
         let tag_column = self.tag_column.clone();
         let tagged = tagged_schema(&schema, &tag_column);
         let slot = Arc::clone(&self.slot);
@@ -298,7 +297,14 @@ impl ExecutionPlan for AntiJoinMaskExec {
                 reservation
                     .blocking(move |reservation| async move {
                         reservation.entries::<u32>(wide.num_rows())?;
-                        if let Some((edge_type, direction)) = &bulk {
+                        let num_rows = wide.num_rows();
+                        if num_rows == 0 {
+                            return Ok(wide);
+                        }
+                        if let Some((edge_type, direction)) = &bulk
+                            && let Some(row_count) =
+                                RowCountPredicate::resolve(&predicate, &params).map_err(external)?
+                        {
                             let gi = env.graph_index.get().await.map_err(external)?;
                             if let Some(mask) = bulk_anti_join_mask(
                                 &wide,
@@ -307,16 +313,13 @@ impl ExecutionPlan for AntiJoinMaskExec {
                                 gi,
                                 &env.catalog,
                                 &outer_var,
+                                &row_count,
                                 &reservation,
                             )
                             .map_err(external)?
                             {
                                 return reservation.filter(&wide, &mask);
                             }
-                        }
-                        let num_rows = wide.num_rows();
-                        if num_rows == 0 {
-                            return Ok(wide);
                         }
                         let tagged_batch = tag_batch(&wide, tagged).map_err(external)?;
                         reservation.hold(&tagged_batch)?;
@@ -326,14 +329,22 @@ impl ExecutionPlan for AntiJoinMaskExec {
                             async { drain(inner.execute(0, inner_ctx)?, &reservation).await }.await;
                         drop(filled);
                         let inner_batches = result?;
-                        reservation.entries::<u32>(
-                            inner_batches.iter().map(RecordBatch::num_rows).sum(),
-                        )?;
-                        let matched =
-                            matched_tags(&inner_batches, &tag_column).map_err(external)?;
-                        let keep: BooleanArray = (0..num_rows as u32)
-                            .map(|row| Some(!matched.contains(&row)))
-                            .collect();
+                        reservation.entries::<u64>(num_rows)?;
+                        if SubqueryAggregate::tracks_values(predicate.func) {
+                            reservation
+                                .entries::<super::subquery_aggregate::ValueAccumulator>(num_rows)?;
+                        }
+                        let mut aggregate = SubqueryAggregate::new(&predicate, &params, num_rows)
+                            .map_err(external)?;
+                        absorb_inner_batches(
+                            &mut aggregate,
+                            &inner_batches,
+                            &tag_column,
+                            predicate.arg.as_ref(),
+                            &|batch, arg| crate::engine::expr::evaluate_expr(batch, arg, &params),
+                        )
+                        .map_err(external)?;
+                        let keep = aggregate.keep_mask().map_err(external)?;
                         reservation.filter(&wide, &keep)
                     })
                     .await

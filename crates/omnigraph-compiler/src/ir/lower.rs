@@ -191,14 +191,24 @@ fn lower_clauses(
     let mut bindings = Vec::new();
     let mut traversals = Vec::new();
     let mut filters = Vec::new();
-    let mut negations = Vec::new();
+    let mut subqueries: Vec<(&[Clause], SubqueryPredicate)> = Vec::new();
 
     for clause in clauses {
         match clause {
             Clause::Binding(b) => bindings.push(b),
             Clause::Traversal(t) => traversals.push(t),
             Clause::Filter(f) => filters.push(f),
-            Clause::Negation(inner) => negations.push(inner),
+            Clause::Subquery(subquery) => {
+                subqueries.push((
+                    subquery.clauses.as_slice(),
+                    SubqueryPredicate {
+                        func: subquery.func,
+                        arg: subquery_argument(subquery, param_names, catalog.system_columns),
+                        op: subquery.op,
+                        right: lower_expr(&subquery.right, param_names, catalog.system_columns),
+                    },
+                ));
+            }
         }
     }
 
@@ -234,6 +244,10 @@ fn lower_clauses(
     // Walk components to find deferred binding variables
     let mut deferred_set: HashSet<String> = HashSet::new();
     let mut component_visited: HashSet<&str> = HashSet::new();
+    let searched: HashSet<&str> = filters
+        .iter()
+        .filter_map(|f| text_search_subject(&f.left).or_else(|| text_search_subject(&f.right)))
+        .collect();
 
     for binding in &bindings {
         if component_visited.contains(binding.variable.as_str()) {
@@ -243,11 +257,13 @@ fn lower_clauses(
         let mut queue = VecDeque::new();
         queue.push_back(binding.variable.as_str());
         let mut component_bindings: Vec<&str> = Vec::new();
+        let mut component_vars: Vec<&str> = Vec::new();
 
         while let Some(var) = queue.pop_front() {
             if !component_visited.insert(var) {
                 continue;
             }
+            component_vars.push(var);
             if binding_set.contains(var) {
                 component_bindings.push(var);
             }
@@ -260,9 +276,17 @@ fn lower_clauses(
             }
         }
 
-        // First binding in the component is the root; defer the rest.
-        for var in component_bindings.into_iter().skip(1) {
-            deferred_set.insert(var.to_string());
+        let reaches_outer = component_vars.iter().any(|var| bound_vars.contains(*var));
+        let inner_bindings: Vec<&str> = component_bindings
+            .iter()
+            .copied()
+            .filter(|var| !bound_vars.contains(*var))
+            .collect();
+        let root = scan_root(&inner_bindings, reaches_outer, &searched);
+        for (index, var) in inner_bindings.into_iter().enumerate() {
+            if Some(index) != root {
+                deferred_set.insert(var.to_string());
+            }
         }
     }
 
@@ -525,16 +549,14 @@ fn lower_clauses(
         }));
     }
 
-    // Lower negations into AntiJoin ops
-    for neg_clauses in &negations {
-        // Find outer-bound variable referenced in the negation
-        let outer_var = find_outer_var(neg_clauses, bound_vars);
+    for (block_clauses, predicate) in subqueries {
+        let outer_var = find_outer_var(block_clauses, bound_vars);
 
         let mut inner_pipeline = Vec::new();
         let mut inner_bound = bound_vars.clone();
         lower_clauses(
             catalog,
-            neg_clauses,
+            block_clauses,
             type_ctx,
             &mut inner_pipeline,
             &mut inner_bound,
@@ -546,6 +568,7 @@ fn lower_clauses(
         pipeline.push(IROp::AntiJoin {
             outer_var: outer_var.unwrap_or_default(),
             inner: inner_pipeline,
+            predicate,
         });
     }
 
@@ -645,6 +668,50 @@ fn build_binding_filters(
         });
     }
     filters
+}
+
+/// The aggregate's argument; `count($m) { … }` over a binding counts rows,
+/// as `count($m)` in a return counts the binding.
+fn subquery_argument(
+    subquery: &Subquery,
+    param_names: &HashSet<String>,
+    system_columns: SystemColumns,
+) -> Option<IRExpr> {
+    match &subquery.arg {
+        Some(Expr::Variable(v)) if subquery.func == AggFunc::Count && !param_names.contains(v) => {
+            None
+        }
+        Some(arg) => Some(lower_expr(arg, param_names, system_columns)),
+        None => None,
+    }
+}
+
+/// The index of the component binding that keeps its `NodeScan`: the first one, or,
+/// when the component reaches an outer-bound variable (#763), a searched binding
+/// only, since every other binding is expanded from the outer row.
+fn scan_root(
+    inner_bindings: &[&str],
+    reaches_outer: bool,
+    searched: &HashSet<&str>,
+) -> Option<usize> {
+    if reaches_outer {
+        inner_bindings.iter().position(|var| searched.contains(var))
+    } else {
+        inner_bindings.first().map(|_| 0)
+    }
+}
+
+/// The variable a `search`, `fuzzy` or `match_text` call reads.
+fn text_search_subject(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Search { field, .. } | Expr::Fuzzy { field, .. } | Expr::MatchText { field, .. } => {
+            match field.as_ref() {
+                Expr::PropAccess { variable, .. } => Some(variable.as_str()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<String> {

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_schema::SchemaRef;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection};
+use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -440,6 +440,7 @@ pub enum PhysicalNode {
         input: NodeId,
         inner: NodeId,
         outer_var: String,
+        predicate: SubqueryPredicate,
     },
     /// The enclosing rows, the leaf of an `AntiJoin` inner tree.
     OuterReference {
@@ -819,8 +820,16 @@ impl PhysicalPlan {
                 "frontier_estimate": frontier_estimate,
                 "version": version,
             }),
-            PhysicalNode::AntiJoin { outer_var, .. }
-            | PhysicalNode::OuterReference { outer_var } => json!({
+            PhysicalNode::AntiJoin {
+                outer_var,
+                predicate,
+                ..
+            } => json!({
+                "node": node.name(),
+                "outer_var": outer_var,
+                "predicate": predicate.to_string(),
+            }),
+            PhysicalNode::OuterReference { outer_var } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
             }),

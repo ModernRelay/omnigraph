@@ -1,8 +1,10 @@
 use super::*;
 
 use super::projection::{
-    apply_filter, apply_ordering, project_return, projections_have_aggregates,
+    apply_filter, apply_ordering, evaluate_expr, project_return, projections_have_aggregates,
 };
+use crate::engine::{SubqueryAggregate, absorb_inner_batches};
+use omnigraph_compiler::ir::SubqueryPredicate;
 
 use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
@@ -1854,7 +1856,14 @@ fn collect_pipeline_columns(pipeline: &[IROp], needed: &mut HashMap<String, Need
             IROp::AntiJoin {
                 outer_var: _,
                 inner,
-            } => collect_pipeline_columns(inner, needed),
+                predicate,
+            } => {
+                collect_pipeline_columns(inner, needed);
+                if let Some(arg) = &predicate.arg {
+                    collect_expr_columns(arg, needed);
+                }
+                collect_expr_columns(&predicate.right, needed);
+            }
         }
     }
 }
@@ -2136,12 +2145,17 @@ fn execute_pipeline<'a>(
                         .await?;
                     }
                 }
-                IROp::AntiJoin { outer_var, inner } => {
+                IROp::AntiJoin {
+                    outer_var,
+                    inner,
+                    predicate,
+                } => {
                     let gi = graph_index;
                     if let Some(batch) = wide.as_mut() {
                         execute_anti_join(
                             batch,
                             inner,
+                            predicate,
                             params,
                             snapshot,
                             gi,
@@ -3897,7 +3911,7 @@ async fn hydrate_nodes(
 fn bulk_anti_join_applies(inner_pipeline: &[IROp], outer_var: &str) -> bool {
     matches!(
         inner_pipeline,
-        [IROp::Expand { src_var, dst_filters, min_hops, max_hops, .. }]
+        [IROp::Expand { src_var, dst_filters, min_hops, max_hops, edge_binding: None, .. }]
             if src_var == outer_var
                 && dst_filters.is_empty()
                 // `has_neighbors` is a ONE-hop existence test, so the fast path
@@ -3973,10 +3987,12 @@ fn try_bulk_anti_join_mask(
     Some(BooleanArray::from(keep_mask))
 }
 
-/// Execute an AntiJoin: remove rows from wide batch where the inner pipeline finds matches.
+/// Execute a correlated block: keep the wide batch's rows whose aggregate
+/// over the inner pipeline's matches satisfies `predicate`.
 async fn execute_anti_join(
     wide: &mut RecordBatch,
     inner_pipeline: &[IROp],
+    predicate: &SubqueryPredicate,
     params: &ParamMap,
     snapshot: &Snapshot,
     graph_index: &GraphIndexHandle<'_>,
@@ -3989,13 +4005,16 @@ async fn execute_anti_join(
     // chooses its own access path. Realize the O(|E|) graph index ONLY when the
     // inner-pipeline shape qualifies for the bulk check — a filtered/nested
     // anti-join over a large graph must not pay a whole-graph build it won't use.
-    let gi = if bulk_anti_join_applies(inner_pipeline, outer_var) {
+    let bulk_shape = predicate.is_not_exists() && bulk_anti_join_applies(inner_pipeline, outer_var);
+    let gi = if bulk_shape {
         graph_index.get().await?
     } else {
         None
     };
     // Fast path: bulk CSR existence check (O(N), zero Lance I/O)
-    if let Some(mask) = try_bulk_anti_join_mask(wide, inner_pipeline, gi, catalog, outer_var) {
+    if bulk_shape
+        && let Some(mask) = try_bulk_anti_join_mask(wide, inner_pipeline, gi, catalog, outer_var)
+    {
         *wide = arrow_select::filter::filter_record_batch(wide, &mask)
             .map_err(OmniError::arrow_internal)?;
         return Ok(());
@@ -4060,34 +4079,16 @@ async fn execute_anti_join(
     )
     .await?;
 
-    // Outer rows whose tag survived have >= 1 match. A produced-but-untagged
-    // batch means the inner pipeline dropped the correlation column — fail loudly
-    // rather than silently keeping every row (which would corrupt the anti-join).
-    let mut matched: HashSet<u32> = HashSet::new();
-    if let Some(batch) = inner_wide {
-        if batch.num_rows() > 0 {
-            let tags = batch
-                .column_by_name(tag_col.as_str())
-                .ok_or_else(|| {
-                    OmniError::manifest(
-                        "anti-join inner pipeline dropped the correlation column".to_string(),
-                    )
-                })?
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| {
-                    OmniError::manifest(format!("'{}' column is not UInt32", tag_col))
-                })?;
-            for i in 0..tags.len() {
-                matched.insert(tags.value(i));
-            }
-        }
-    }
-
-    let keep_mask: Vec<bool> = (0..num_rows as u32)
-        .map(|i| !matched.contains(&i))
-        .collect();
-    let mask = BooleanArray::from(keep_mask);
+    let mut aggregate = SubqueryAggregate::new(predicate, params, num_rows)?;
+    let inner_batches: Vec<RecordBatch> = inner_wide.into_iter().collect();
+    absorb_inner_batches(
+        &mut aggregate,
+        &inner_batches,
+        tag_col.as_str(),
+        predicate.arg.as_ref(),
+        &|batch, arg| evaluate_expr(batch, arg, params),
+    )?;
+    let mask = aggregate.keep_mask()?;
     *wide = arrow_select::filter::filter_record_batch(wide, &mask)
         .map_err(OmniError::arrow_internal)?;
     Ok(())
@@ -5426,6 +5427,7 @@ mod referenced_edge_types_tests {
             IROp::AntiJoin {
                 outer_var: "p".into(),
                 inner: vec![expand("worksAt")],
+                predicate: SubqueryPredicate::not_exists(),
             },
         ];
         assert_eq!(
@@ -5441,7 +5443,9 @@ mod referenced_edge_types_tests {
             inner: vec![IROp::AntiJoin {
                 outer_var: "c".into(),
                 inner: vec![expand("deepEdge")],
+                predicate: SubqueryPredicate::not_exists(),
             }],
+            predicate: SubqueryPredicate::not_exists(),
         }];
         assert_eq!(names(&pipeline), vec!["deepEdge".to_string()]);
     }
@@ -5453,6 +5457,7 @@ mod referenced_edge_types_tests {
         let pipeline = vec![IROp::AntiJoin {
             outer_var: "p".into(),
             inner: vec![node_scan("c", "Company")],
+            predicate: SubqueryPredicate::not_exists(),
         }];
         assert!(names(&pipeline).is_empty());
     }
@@ -5843,6 +5848,7 @@ mod needed_columns_tests {
                 IROp::AntiJoin {
                     outer_var: "c".to_string(),
                     inner,
+                    predicate: SubqueryPredicate::not_exists(),
                 },
             ],
             vec![prop("c", "slug")],

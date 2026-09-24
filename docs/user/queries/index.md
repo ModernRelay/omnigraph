@@ -55,6 +55,9 @@ Inside `match { ... }`:
 | `$a $rel:related $b` | Bind a single-hop edge instance so its properties can be used. |
 | `$p.age >= 18` | Apply a filter expression. |
 | `not { $p Blocked $other }` | Keep rows for which the inner pattern has no match. |
+| `exists { $p Blocked $other }` | Keep rows for which the inner pattern has at least one match. |
+| `count { $a authored $p } > 2` | Keep rows whose inner pattern matches more than two times. |
+| `sum($d.size) { $p owns $d } > 100` | Aggregate a property over the inner matches, then compare. |
 
 Hop counts are shortest-path distances from the start node: `{2,2}` returns the
 nodes exactly two hops away. A node is never re-reached through its own
@@ -76,6 +79,45 @@ Traversal spelling begins with a lowercase letter (`worksAt` for the declared
 edge `WorksAt`); edge lookup itself is case-insensitive.
 
 Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
+
+### Correlated blocks
+
+`not { ... }`, `exists { ... }`, `count { ... } op value` and
+`sum(expr) { ... } op value` (also `min`, `max`, `avg`) each hold a pattern
+that is matched once per outer row. The block must read at least one variable
+bound outside it; that variable correlates the block with the row. The row is
+kept when the aggregate over the block's matches satisfies the comparison:
+`not` is `count = 0`, `exists` is `count > 0`. The comparison's right side is a
+literal, `now()` or a parameter of the aggregate's type. The aggregate's
+argument is a scalar expression over the block's scope, usually a property of
+a variable bound inside it: numeric for `sum` and `avg`;
+numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and `max`, as in a
+`return`. A row with no match has no `sum`, `min`, `max` or `avg`, so it
+satisfies no comparison on them; its `count` is `0`.
+
+The block narrows the rows before `order` and `limit`, so a paged listing
+filtered by a relationship count is exact. A binding the block's traversal
+connects to the outer row is reached through that traversal, never scanned as
+a whole table, however many rows the outer pattern has; a binding correlated
+only through a filter, or read by a text search, is scanned. On engine v2 a
+single-hop, filter-free `count { ... }` over a directed, unbound edge is
+answered from the graph index's degree. A bare aggregate in `match`,
+`count($d) > 2` without a block, is refused: it names no row to group by.
+
+```
+query prolific($least: I64) {
+    match {
+        $a: Author
+        count {
+            $p: Post { published: true }
+            $a authored $p
+        } >= $least
+    }
+    return { $a.name }
+    order { $a.name }
+    limit 20
+}
+```
 
 ### Strings and lists
 

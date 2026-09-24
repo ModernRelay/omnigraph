@@ -392,6 +392,7 @@ impl PhysicalPlan {
                 input,
                 inner,
                 outer_var,
+                ..
             } => {
                 let outer = self.lower_node(*input, l)?;
                 l.anti_join_outer(id, outer_var, &outer)?;

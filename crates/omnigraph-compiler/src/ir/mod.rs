@@ -82,12 +82,80 @@ pub enum IROp {
         edge_binding: Option<String>,
     },
     Filter(IRFilter),
+    /// A correlated subquery, decorrelated: `inner` runs once over the outer
+    /// rows and `predicate` decides per outer row on the aggregate of its
+    /// matches. `not { … }` is the anti-join case, `count = 0`.
     AntiJoin {
         /// The outer variable whose id is used for the join key
         outer_var: String,
         /// The inner pipeline that produces rows to anti-join against
         inner: Vec<IROp>,
+        predicate: SubqueryPredicate,
     },
+}
+
+/// The HAVING predicate of a correlated subquery: `func` over the inner
+/// matches of one outer row, compared with `right` (a literal or parameter).
+#[derive(Debug, Clone)]
+pub struct SubqueryPredicate {
+    pub func: AggFunc,
+    /// `None` counts the matched rows.
+    pub arg: Option<IRExpr>,
+    pub op: CompOp,
+    pub right: IRExpr,
+}
+
+impl SubqueryPredicate {
+    /// `count = 0`: what `not { … }` lowers to.
+    pub fn not_exists() -> Self {
+        Self {
+            func: AggFunc::Count,
+            arg: None,
+            op: CompOp::Eq,
+            right: IRExpr::Literal(Literal::Integer(0)),
+        }
+    }
+
+    pub fn is_row_count(&self) -> bool {
+        self.func == AggFunc::Count && self.arg.is_none()
+    }
+
+    /// What a row-count predicate on a literal asks when it only asks whether
+    /// any row matched: `Some(false)` for none (`= 0`, `< 1`, `<= 0`),
+    /// `Some(true)` for any (`> 0`, `!= 0`, `>= 1`), `None` otherwise.
+    pub fn existence(&self) -> Option<bool> {
+        let IRExpr::Literal(Literal::Integer(bound)) = self.right else {
+            return None;
+        };
+        if !self.is_row_count() {
+            return None;
+        }
+        match (self.op, bound) {
+            (CompOp::Eq | CompOp::Le, 0) | (CompOp::Lt, 1) => Some(false),
+            (CompOp::Ne | CompOp::Gt, 0) | (CompOp::Ge, 1) => Some(true),
+            _ => None,
+        }
+    }
+
+    /// An existence check answers the predicate.
+    pub fn is_existence_test(&self) -> bool {
+        self.existence().is_some()
+    }
+
+    /// `count = 0`, the anti-join.
+    pub fn is_not_exists(&self) -> bool {
+        self.existence() == Some(false)
+    }
+}
+
+/// `count > 2`, `sum($m.size) > 100`: what a plan prints for it.
+impl std::fmt::Display for SubqueryPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.arg {
+            None => write!(f, "{} {} {}", self.func, self.op, self.right),
+            Some(arg) => write!(f, "{}({}) {} {}", self.func, arg, self.op, self.right),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

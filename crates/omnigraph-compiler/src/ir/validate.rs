@@ -62,14 +62,22 @@ fn validate_pipeline(pipeline: &[IROp], introduced: &mut HashSet<String>) -> Res
                 check_filters(dst_filters, introduced)?;
             }
             IROp::Filter(filter) => check_filter(filter, introduced)?,
-            IROp::AntiJoin { outer_var, inner } => {
+            IROp::AntiJoin {
+                outer_var,
+                inner,
+                predicate,
+            } => {
                 // Lowering leaves `outer_var` empty when the negation shares
                 // no variable with the outer pattern.
                 if !outer_var.is_empty() {
                     check_reference(outer_var, introduced)?;
                 }
+                check_expr(&predicate.right, introduced)?;
                 let mut inner_scope = introduced.clone();
                 validate_pipeline(inner, &mut inner_scope)?;
+                if let Some(arg) = &predicate.arg {
+                    check_expr(arg, &inner_scope)?;
+                }
             }
         }
     }
@@ -238,6 +246,7 @@ mod tests {
         let anti = |inner: Vec<IROp>| IROp::AntiJoin {
             outer_var: "p".to_string(),
             inner,
+            predicate: crate::ir::SubqueryPredicate::not_exists(),
         };
         // The inner pipeline may expand from the outer variable.
         run(vec![scan("p"), anti(vec![expand("p", "q")])]).unwrap();

@@ -42,6 +42,7 @@ mod rank_fuse;
 mod scan;
 mod single_hop;
 mod sort;
+mod subquery_aggregate;
 
 pub(super) use anti_join::{
     AntiJoinMaskExec, OuterReferenceExec, OuterSlot, fresh_tag_column, tagged_schema,
@@ -56,6 +57,7 @@ pub(super) use projection::ProjectionExec;
 pub(super) use rank_fuse::{ArmOrder, RankFuseExec};
 pub(super) use scan::{ScanExec, ScanSource};
 pub(super) use sort::{SortExec, SortKey};
+pub(crate) use subquery_aggregate::{RowCountPredicate, SubqueryAggregate, absorb_inner_batches};
 
 /// The `polls` counter: one per `poll_next` of any stream the operator handed
 /// out, so a zero says no consumer ever asked the operator for a batch.

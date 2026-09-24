@@ -20,6 +20,7 @@ use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use omnigraph_compiler::ir::SubqueryPredicate;
 use omnigraph_planner::{
     BoundPlan, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
     Predicate, RankArm, RankKind, RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
@@ -211,10 +212,18 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// The edge of a negation the bulk check can answer: one single-hop,
-    /// filter-free expand from the outer binding, directly over the outer
-    /// rows, whether the destination is reached by id lookup or a hash join.
-    fn bulk_negation(&self, inner: NodeId, outer_var: &str) -> Result<Option<(String, Direction)>> {
+    /// The edge the bulk CSR degree answers for a row-count block: one
+    /// single-hop, filter-free, unbound expand from the outer binding (by id
+    /// lookup or hash join); an undirected edge only for an existence test.
+    fn bulk_row_count(
+        &self,
+        inner: NodeId,
+        outer_var: &str,
+        predicate: &SubqueryPredicate,
+    ) -> Result<Option<(String, Direction)>> {
+        if !predicate.is_row_count() {
+            return Ok(None);
+        }
         let inner = match self.node(inner)? {
             PhysicalNode::Scan {
                 source: ScanInput::Dependent { input },
@@ -239,10 +248,12 @@ impl<'a> Lowering<'a> {
                 direction,
                 min_hops,
                 max_hops,
+                edge_binding: None,
                 ..
             } if src == outer_var
                 && *min_hops == 1
                 && max_hops.unwrap_or(1) == 1
+                && (*direction != Direction::Both || predicate.is_existence_test())
                 && matches!(self.node(*input)?, PhysicalNode::OuterReference { .. }) =>
             {
                 Some((edge_type.clone(), *direction))
@@ -515,16 +526,22 @@ impl Lower for Walk<'_, '_> {
             OmniError::manifest_internal("AntiJoin closed with no outer scope open".to_string())
         })?;
         let PhysicalNode::AntiJoin {
-            inner: inner_id, ..
+            inner: inner_id,
+            predicate,
+            ..
         } = self.lowering.node(id)?
         else {
             return Err(Self::not_a_pipeline_node("AntiJoin"));
         };
-        let bulk = self.lowering.bulk_negation(*inner_id, outer_var)?;
+        let bulk = self
+            .lowering
+            .bulk_row_count(*inner_id, outer_var, predicate)?;
         let mask = AntiJoinMaskExec::new(
             outer,
             inner,
             outer_var.to_string(),
+            predicate.clone(),
+            Arc::clone(self.lowering.params()),
             scope.tag_column,
             scope.slot,
             bulk,

@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection};
+use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,7 +22,8 @@ impl fmt::Display for LogicalId {
     }
 }
 
-/// Bumped when a node's meaning changes; part of the structural hash.
+/// Bumped when the hashed shape of a node changes; the structural hash
+/// covers node kinds and join kinds, not filters or block predicates.
 pub const LOGICAL_PLAN_VERSION: u32 = 1;
 
 /// The logical name of the id column; each scan binds it to its own
@@ -388,12 +389,14 @@ pub enum LogicalNode {
         max_hops: Option<u32>,
         edge_binding: Option<String>,
     },
-    /// `not { … }`: input rows with no match in the inner tree, whose leaf
-    /// is an `OuterReference` to those same rows.
+    /// A correlated block (`not { … }`, `count { … } > 2`): input rows kept
+    /// by `predicate` over their matches in the inner tree, whose leaf is an
+    /// `OuterReference` to those same rows.
     AntiJoin {
         input: LogicalId,
         inner: LogicalId,
         outer_var: String,
+        predicate: SubqueryPredicate,
     },
     /// The leaf of a `not { … }` inner tree: the enclosing pipeline's rows,
     /// correlated on `outer_var`. A node of its own, not the outer node, so
@@ -755,9 +758,14 @@ impl LogicalPlan {
                 "max_hops": max_hops,
                 "edge_binding": edge_binding,
             }),
-            LogicalNode::AntiJoin { outer_var, .. } => json!({
+            LogicalNode::AntiJoin {
+                outer_var,
+                predicate,
+                ..
+            } => json!({
                 "node": "AntiJoin",
                 "outer_var": outer_var,
+                "predicate": predicate.to_string(),
             }),
             LogicalNode::OuterReference { outer_var } => json!({
                 "node": "OuterReference",

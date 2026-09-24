@@ -478,18 +478,80 @@ fn parse_clause(pair: pest::iterators::Pair<Rule>) -> Result<Clause> {
         Rule::traversal => Ok(Clause::Traversal(parse_traversal(inner)?)),
         Rule::filter => Ok(Clause::Filter(parse_filter(inner)?)),
         Rule::text_search_clause => Ok(parse_text_search_clause(inner)?),
-        Rule::negation => {
-            let mut clauses = Vec::new();
-            for c in inner.into_inner() {
-                if let Rule::clause = c.as_rule() {
-                    clauses.push(parse_clause(c)?);
-                }
-            }
-            Ok(Clause::Negation(clauses))
+        Rule::negation => Ok(Clause::Subquery(Subquery::not_block(parse_block_clauses(
+            inner,
+        )?))),
+        Rule::subquery_predicate => Ok(Clause::Subquery(parse_subquery_predicate(inner)?)),
+        Rule::exists_block => {
+            let block = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::subquery_block)
+                .ok_or_else(|| CompilerError::Parse("exists block is empty".to_string()))?;
+            Ok(Clause::Subquery(Subquery::exists_block(
+                parse_block_clauses(block)?,
+            )))
         }
         _ => Err(CompilerError::Parse(format!(
             "unexpected clause rule: {:?}",
             inner.as_rule()
+        ))),
+    }
+}
+
+/// The `clause` children of a braced block (`not { … }`, `count { … }`).
+fn parse_block_clauses(pair: pest::iterators::Pair<Rule>) -> Result<Vec<Clause>> {
+    let mut clauses = Vec::new();
+    for c in pair.into_inner() {
+        if let Rule::clause = c.as_rule() {
+            clauses.push(parse_clause(c)?);
+        }
+    }
+    Ok(clauses)
+}
+
+fn parse_subquery_predicate(pair: pest::iterators::Pair<Rule>) -> Result<Subquery> {
+    let mut func = None;
+    let mut arg = None;
+    let mut clauses = None;
+    let mut op = None;
+    let mut right = None;
+    for part in pair.into_inner() {
+        match part.as_rule() {
+            Rule::agg_func => func = Some(parse_agg_func(part.as_str())?),
+            Rule::expr if clauses.is_none() => arg = Some(parse_expr(part)?),
+            Rule::expr => right = Some(parse_expr(part)?),
+            Rule::subquery_block => clauses = Some(parse_block_clauses(part)?),
+            Rule::comp_op => op = Some(parse_comp_op(part)?),
+            other => {
+                return Err(CompilerError::Parse(format!(
+                    "unexpected subquery predicate rule: {:?}",
+                    other
+                )));
+            }
+        }
+    }
+    let missing =
+        |what: &str| CompilerError::Parse(format!("subquery predicate is missing its {what}"));
+    Ok(Subquery {
+        keyword: BlockKeyword::Aggregate,
+        clauses: clauses.ok_or_else(|| missing("block"))?,
+        func: func.ok_or_else(|| missing("aggregate"))?,
+        arg,
+        op: op.ok_or_else(|| missing("comparison"))?,
+        right: right.ok_or_else(|| missing("right operand"))?,
+    })
+}
+
+fn parse_agg_func(name: &str) -> Result<AggFunc> {
+    match name {
+        "count" => Ok(AggFunc::Count),
+        "sum" => Ok(AggFunc::Sum),
+        "avg" => Ok(AggFunc::Avg),
+        "min" => Ok(AggFunc::Min),
+        "max" => Ok(AggFunc::Max),
+        other => Err(CompilerError::Parse(format!(
+            "unknown aggregate: {}",
+            other
         ))),
     }
 }
@@ -753,19 +815,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
         Rule::literal => Ok(Expr::Literal(parse_literal(inner)?)),
         Rule::agg_call => {
             let mut parts = inner.into_inner();
-            let func = match parts.next().unwrap().as_str() {
-                "count" => AggFunc::Count,
-                "sum" => AggFunc::Sum,
-                "avg" => AggFunc::Avg,
-                "min" => AggFunc::Min,
-                "max" => AggFunc::Max,
-                other => {
-                    return Err(CompilerError::Parse(format!(
-                        "unknown aggregate: {}",
-                        other
-                    )));
-                }
-            };
+            let func = parse_agg_func(parts.next().unwrap().as_str())?;
             let arg = parse_expr(parts.next().unwrap())?;
             Ok(Expr::Aggregate {
                 func,

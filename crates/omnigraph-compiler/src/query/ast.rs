@@ -245,7 +245,63 @@ pub enum Clause {
     Binding(Binding),
     Traversal(Traversal),
     Filter(Filter),
-    Negation(Vec<Clause>),
+    Subquery(Subquery),
+}
+
+/// A correlated block: `not { … }`, `exists { … }`, `count { … } > 2`,
+/// `sum($m.size) { … } > 100`. The block's clauses match per outer row; the
+/// aggregate over those matches is compared with `right`.
+#[derive(Debug, Clone)]
+pub struct Subquery {
+    /// The surface spelling, for error messages.
+    pub keyword: BlockKeyword,
+    pub clauses: Vec<Clause>,
+    pub func: AggFunc,
+    /// `None` counts the matched rows (`not`, `exists`, `count { … }`).
+    pub arg: Option<Expr>,
+    pub op: CompOp,
+    pub right: Expr,
+}
+
+impl Subquery {
+    /// `not { … }`: `count = 0`.
+    pub fn not_block(clauses: Vec<Clause>) -> Self {
+        Self::row_count(BlockKeyword::Not, clauses, CompOp::Eq)
+    }
+
+    /// `exists { … }`: `count > 0`.
+    pub fn exists_block(clauses: Vec<Clause>) -> Self {
+        Self::row_count(BlockKeyword::Exists, clauses, CompOp::Gt)
+    }
+
+    fn row_count(keyword: BlockKeyword, clauses: Vec<Clause>, op: CompOp) -> Self {
+        Self {
+            keyword,
+            clauses,
+            func: AggFunc::Count,
+            arg: None,
+            op,
+            right: Expr::Literal(Literal::Integer(0)),
+        }
+    }
+
+    /// The block as an error message names it: `negation`, `exists`, `count`, `sum`, …
+    pub fn block_name(&self) -> String {
+        match self.keyword {
+            BlockKeyword::Not => "negation".to_string(),
+            BlockKeyword::Exists => "exists".to_string(),
+            BlockKeyword::Aggregate => self.func.to_string(),
+        }
+    }
+}
+
+/// How a correlated block was spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKeyword {
+    Not,
+    Exists,
+    /// `count`, `sum`, `avg`, `min` or `max`, followed by a comparison.
+    Aggregate,
 }
 
 #[derive(Debug, Clone)]

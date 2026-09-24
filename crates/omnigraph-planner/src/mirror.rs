@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection};
+use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::{
@@ -205,6 +205,7 @@ pub enum NodeMirror {
         input: NodeId,
         inner: NodeId,
         outer_var: String,
+        predicate: SubqueryPredicateMirror,
     },
     OuterReference {
         outer_var: String,
@@ -349,10 +350,12 @@ impl From<&PhysicalNode> for NodeMirror {
                 input,
                 inner,
                 outer_var,
+                predicate,
             } => Self::AntiJoin {
                 input: *input,
                 inner: *inner,
                 outer_var: outer_var.clone(),
+                predicate: SubqueryPredicateMirror::from(predicate),
             },
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
@@ -498,10 +501,12 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 input,
                 inner,
                 outer_var,
+                predicate,
             } => Self::AntiJoin {
                 input,
                 inner,
                 outer_var,
+                predicate: SubqueryPredicate::from(predicate),
             },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
             NodeMirror::RankFuse {
@@ -825,6 +830,36 @@ impl From<FilterMirror> for IRFilter {
     fn from(mirror: FilterMirror) -> Self {
         Self {
             left: IRExpr::from(mirror.left),
+            op: CompOp::from(mirror.op),
+            right: IRExpr::from(mirror.right),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubqueryPredicateMirror {
+    pub func: AggFuncMirror,
+    pub arg: Option<ExprMirror>,
+    pub op: CompOpMirror,
+    pub right: ExprMirror,
+}
+
+impl From<&SubqueryPredicate> for SubqueryPredicateMirror {
+    fn from(predicate: &SubqueryPredicate) -> Self {
+        Self {
+            func: AggFuncMirror::from(predicate.func),
+            arg: predicate.arg.as_ref().map(ExprMirror::from),
+            op: CompOpMirror::from(predicate.op),
+            right: ExprMirror::from(&predicate.right),
+        }
+    }
+}
+
+impl From<SubqueryPredicateMirror> for SubqueryPredicate {
+    fn from(mirror: SubqueryPredicateMirror) -> Self {
+        Self {
+            func: AggFunc::from(mirror.func),
+            arg: mirror.arg.map(IRExpr::from),
             op: CompOp::from(mirror.op),
             right: IRExpr::from(mirror.right),
         }

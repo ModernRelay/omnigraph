@@ -172,7 +172,7 @@ fn collect_clause_reads(
                 reads.insert(node_fact(&edge.from_type));
                 reads.insert(node_fact(&edge.to_type));
             }
-            Clause::Negation(inner) => collect_clause_reads(catalog, inner, reads)?,
+            Clause::Subquery(subquery) => collect_clause_reads(catalog, &subquery.clauses, reads)?,
             Clause::Filter(_) => {}
         }
     }

@@ -822,7 +822,13 @@ fn walk_clauses(
                 walk_expr(&f.left, params, needs_indices)?;
                 walk_expr(&f.right, params, needs_indices)?;
             }
-            Clause::Negation(inner) => walk_clauses(inner, params, needs_indices)?,
+            Clause::Subquery(subquery) => {
+                walk_clauses(&subquery.clauses, params, needs_indices)?;
+                if let Some(arg) = &subquery.arg {
+                    walk_expr(arg, params, needs_indices)?;
+                }
+                walk_expr(&subquery.right, params, needs_indices)?;
+            }
         }
     }
     Ok(())
@@ -2058,16 +2064,13 @@ fn check_pin(
     )
 }
 
-/// Whether a match clause list runs at least one Expand: a traversal
-/// without an edge binding, outside `not { }`. A bound edge scans the edge
-/// dataset on a path of its own that no mode pins, and a single-hop
-/// negation runs as a CSR existence check that never reaches the expand
-/// dispatch; a multi-hop negation does expand, and the other-path check
-/// still covers it.
+/// Whether a match clause list runs at least one Expand: an unbound traversal
+/// outside a correlated block (a bound edge and a block take paths of their
+/// own that the other-path check covers).
 fn expects_expand(clauses: &[Clause]) -> bool {
     clauses.iter().any(|c| match c {
         Clause::Traversal(t) => t.edge_binding.is_none(),
-        Clause::Negation(_) | Clause::Binding(_) | Clause::Filter(_) => false,
+        Clause::Subquery(_) | Clause::Binding(_) | Clause::Filter(_) => false,
     })
 }
 

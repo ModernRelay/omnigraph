@@ -1,0 +1,155 @@
+# issue: 763
+# red_on: e588815a; `invalid_case: --- query section starting at line 53 does not parse: expected comp_op` at `exists {`, so no step runs.
+# notes: `exists { … }` keeps each outer row once, however many inner rows match: a semi-join, never a product.
+# notes: A binding declared inside the block is introduced by the expand from the outer row, never by a scan of its table, whatever the declaration order; a binding under a text search keeps its scan so the search runs.
+# notes: Shared row/error steps inherit the CI engine baseline; only plan assertions select v2.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Actor {
+    slug: String @key
+}
+node Artifact {
+    slug: String @key
+    kind: String
+    text: String @index
+}
+edge ArtifactOwnedByActor: Artifact -> Actor {}
+
+--- seed
+{"type":"Actor","data":{"slug":"zero"}}
+{"type":"Actor","data":{"slug":"one"}}
+{"type":"Actor","data":{"slug":"three"}}
+{"type":"Artifact","data":{"slug":"a1","kind":"doc","text":"quarterly report"}}
+{"type":"Artifact","data":{"slug":"a4","kind":"doc","text":"meeting notes"}}
+{"type":"Artifact","data":{"slug":"a5","kind":"image","text":"team photo"}}
+{"type":"Artifact","data":{"slug":"a6","kind":"image","text":"office photo"}}
+{"edge":"ArtifactOwnedByActor","from":"a1","to":"one"}
+{"edge":"ArtifactOwnedByActor","from":"a4","to":"three"}
+{"edge":"ArtifactOwnedByActor","from":"a5","to":"three"}
+{"edge":"ArtifactOwnedByActor","from":"a6","to":"three"}
+
+--- query
+query exists_preserves_outer_duplicates() {
+    match {
+        $n: Actor
+        $m: Artifact
+        $m artifactOwnedByActor $n
+        exists {
+            $image: Artifact { kind: "image" }
+            $image artifactOwnedByActor $n
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"three"}
+{"n.slug":"three"}
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query has_any_artifact() {
+    match {
+        $n: Actor
+        exists {
+            $m artifactOwnedByActor $n
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"one"}
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query has_any_image_filtered_after() {
+    match {
+        $n: Actor
+        exists {
+            $m artifactOwnedByActor $n
+            $m.kind = "image"
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+set engine = v2;
+query outer_variable_rebound_after_the_inner_binding() {
+    match {
+        $n: Actor
+        exists {
+            $m: Artifact { kind: "image" }
+            $n: Actor
+            $m artifactOwnedByActor $n
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+--- expect plan
+scan Actor as $n: columns [__id, slug]
+pass projection_pushdown
+
+--- query
+query search_inside_the_block_runs_after_a_rebinding() {
+    match {
+        $n: Actor
+        exists {
+            $n: Actor
+            $m: Artifact
+            search($m.text, "photo")
+            $m artifactOwnedByActor $n
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query search_inside_the_block_runs() {
+    match {
+        $n: Actor
+        exists {
+            $m: Artifact
+            search($m.text, "photo")
+            $m artifactOwnedByActor $n
+        }
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
+
+--- query
+query block_must_read_an_outer_variable() {
+    match {
+        $n: Actor
+        exists {
+            $a: Artifact { kind: "image" }
+        }
+    }
+    return { $n.slug }
+}
+--- expect error: T39: exists block must reference at least one outer-bound variable

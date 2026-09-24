@@ -937,10 +937,8 @@ return { $p.name }
     }
 }
 
-/// Negation with inner binding: inner binding is NOT deferred because
-/// bound_vars (from outer scope) is not in binding_set for the inner call.
-/// This documents current behavior — the inner pipeline uses a NodeScan +
-/// cycle-closing, which is correct but less efficient than deferral.
+/// A block binding whose component reaches the outer variable is deferred
+/// onto the expand from `$p`, its inline filter a destination filter (#763).
 #[test]
 fn test_lower_negation_with_inner_binding() {
     let catalog = setup();
@@ -968,10 +966,21 @@ return { $p.name }
     let IROp::AntiJoin { inner, .. } = &ir.pipeline[1] else {
         panic!("expected AntiJoin");
     };
-    // Inner pipeline: $c is NOT deferred (it's the only binding in the
-    // inner scope), so it gets a NodeScan + cycle-closing (3 ops).
-    assert_eq!(inner.len(), 3);
-    assert!(matches!(&inner[0], IROp::NodeScan { variable, .. } if variable == "c"));
-    assert!(matches!(&inner[1], IROp::Expand { .. }));
-    assert!(matches!(&inner[2], IROp::Filter(_)));
+    assert_eq!(inner.len(), 1);
+    let IROp::Expand {
+        src_var,
+        dst_var,
+        dst_filters,
+        ..
+    } = &inner[0]
+    else {
+        panic!("expected the block to expand from the outer variable");
+    };
+    assert_eq!(src_var, "p");
+    assert_eq!(dst_var, "c");
+    assert_eq!(dst_filters.len(), 1);
+    assert!(matches!(
+        &dst_filters[0].left,
+        IRExpr::PropAccess { variable, property } if variable == "c" && property == "name"
+    ));
 }
