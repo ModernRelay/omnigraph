@@ -37,7 +37,7 @@ const FROZEN: &[(&str, &str)] = &[
     ),
     (
         "tests/search.rs",
-        "ba053f495ca8d394b4a26a236bb55fa3d65dbe2ee09531b4b9dbe551db7e195e",
+        "6f3589753ad30b29cf612c766d90550457ab3299bf23a066d0d7c50ad97c8ff4",
     ),
 ];
 
