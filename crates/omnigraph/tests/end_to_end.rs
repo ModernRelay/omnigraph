@@ -5,6 +5,8 @@ use base64::Engine as _;
 use futures::TryStreamExt;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
+#[cfg(feature = "failpoints")]
+use omnigraph::db::{UpgradeOptions, UpgradeOutcome, upgrade_storage};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
@@ -1489,6 +1491,57 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
         .await,
         b"Old",
         "an unmarked upgraded table remains readable at its exact current physical entry"
+    );
+
+    let before_upgrade = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let physical_version = before_upgrade
+        .dataset("node:Document")
+        .unwrap()
+        .published_dataset_version;
+    drop(db);
+    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+        .await
+        .unwrap();
+    manifest
+        .update_schema_metadata([("omnigraph:internal_schema_version", "10")])
+        .await
+        .unwrap();
+    drop(manifest);
+    let upgraded = upgrade_storage(uri, UpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let after_upgrade = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        after_upgrade
+            .dataset("node:Document")
+            .unwrap()
+            .published_dataset_version,
+        physical_version,
+        "recording the linear boundary must preserve the physical Blob version"
+    );
+    assert!(
+        !after_upgrade
+            .open_dataset("node:Document")
+            .await
+            .unwrap()
+            .schema()
+            .field("content")
+            .unwrap()
+            .metadata
+            .contains_key("omnigraph.stable_property_id"),
+        "storage upgrade must not invent a historical property-lifetime witness"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::snapshot(exact_current_snapshot.clone()),
+            legacy_cell.clone(),
+        )
+        .await,
+        b"Old",
+        "metadata-only upgrade keeps the exact physical Blob snapshot readable"
     );
 
     // A schema-preserving Append must not pretend to retrofit physical field

@@ -1514,6 +1514,15 @@ query vectors($q: Vector(4)) {
     assert_eq!(check["target_format"], 8);
     assert_eq!(check["target_defaulted"], false);
     assert_eq!(check["route"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        check["work"]["historical_blob_identity_limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field.as_str().unwrap().ends_with(":payload")),
+        !has_property_lifetime_metadata,
+        "preflight must report the legacy Blob property-lifetime limitation"
+    );
     assert!(
         !check["work"]["deferred_checks"]
             .as_array()

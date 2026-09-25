@@ -170,6 +170,28 @@ impl TableVersionMetadata {
         }
     }
 
+    /// Compare read evidence; the linear boundary affects only staged pins.
+    pub(crate) fn same_read_witness(&self, other: &Self) -> bool {
+        let Self {
+            manifest_path,
+            manifest_size,
+            e_tag,
+            naming_scheme,
+            table_fork_owner,
+            staged_version,
+            transaction_uuid,
+            last_linear_version,
+        } = self;
+        manifest_path == &other.manifest_path
+            && manifest_size == &other.manifest_size
+            && e_tag == &other.e_tag
+            && naming_scheme == &other.naming_scheme
+            && table_fork_owner == &other.table_fork_owner
+            && staged_version == &other.staged_version
+            && transaction_uuid == &other.transaction_uuid
+            && (staged_version.is_none() || last_linear_version == &other.last_linear_version)
+    }
+
     pub(crate) fn table_fork_owner(&self) -> Option<&str> {
         self.table_fork_owner.as_deref()
     }
@@ -408,6 +430,58 @@ mod tests {
     const OWNER: &str = "source.01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const TARGET: &str = "target.01ARZ3NDEKTSV4RRFFQ69G5FAW";
     const FORK: &str = "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAX";
+
+    /// GQT cannot vary persisted registration metadata independently of table bytes.
+    #[test]
+    fn unstaged_blob_read_witness_ignores_only_linear_boundary() {
+        let legacy = TableVersionMetadata::from_json_str(LEGACY_JSON).unwrap();
+        let upgraded = legacy.clone().with_last_linear_version(Some(7));
+        assert_ne!(legacy, upgraded);
+        assert!(legacy.same_read_witness(&upgraded));
+        assert!(upgraded.same_read_witness(&legacy));
+        for changed in [
+            TableVersionMetadata {
+                manifest_path: "other/7.manifest".to_string(),
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                manifest_size: None,
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                e_tag: None,
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                naming_scheme: None,
+                ..upgraded.clone()
+            },
+            upgraded.clone().with_table_fork_owner(Some(OWNER)),
+            TableVersionMetadata {
+                staged_version: Some(9_223_372_036_854_775_815),
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                transaction_uuid: Some("different-transaction".to_string()),
+                ..upgraded.clone()
+            },
+        ] {
+            assert!(!legacy.same_read_witness(&changed), "{changed:?}");
+            assert!(!changed.same_read_witness(&legacy), "{changed:?}");
+        }
+    }
+
+    /// Staged resolution can choose a detached pin or its linear twin.
+    #[test]
+    fn staged_blob_read_witness_keeps_linear_boundary() {
+        let staged = TableVersionMetadata::from_json_str(LEGACY_JSON)
+            .unwrap()
+            .with_staged(9_223_372_036_854_775_815, "staged-transaction".to_string());
+        assert!(staged.same_read_witness(&staged));
+        let changed = staged.clone().with_last_linear_version(Some(7));
+        assert!(!staged.same_read_witness(&changed));
+        assert!(!changed.same_read_witness(&staged));
+    }
 
     /// GQT cannot inject absent owner metadata or inspect its serialized omission.
     #[test]
