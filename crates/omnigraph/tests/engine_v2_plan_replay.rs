@@ -489,3 +489,104 @@ async fn an_insert_after_planning_refuses_the_replay_of_a_count() {
         "{refused}"
     );
 }
+
+async fn sibling_plan_replay_is_refused(
+    table_key: &str,
+    query_name: &str,
+    left_write: &str,
+    right_write: &str,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    for (branch, batch) in [("left", left_write), ("right", right_write)] {
+        db.branch_create(branch).await.unwrap();
+        db.load_with_receipt(branch, batch, LoadMode::Append)
+            .await
+            .unwrap();
+    }
+    let left = db.snapshot_of(ReadTarget::branch("left")).await.unwrap();
+    let right = db.snapshot_of(ReadTarget::branch("right")).await.unwrap();
+    let left_entry = left.dataset(table_key).unwrap();
+    let right_entry = right.dataset(table_key).unwrap();
+    assert_eq!(left_entry.dataset_path, right_entry.dataset_path);
+    assert_eq!(
+        left_entry.native_dataset_branch,
+        right_entry.native_dataset_branch
+    );
+    assert_eq!(
+        left_entry.published_dataset_version, right_entry.published_dataset_version,
+        "sibling writes share a lineage counter"
+    );
+    assert_ne!(
+        left.open_dataset(table_key)
+            .await
+            .unwrap()
+            .published_dataset_version(),
+        right
+            .open_dataset(table_key)
+            .await
+            .unwrap()
+            .published_dataset_version(),
+        "the actual detached versions are distinct"
+    );
+    let run = db
+        .query_inspected(
+            ReadTarget::branch("left"),
+            PEOPLE_QUERIES,
+            query_name,
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    let other = db
+        .query_inspected(
+            ReadTarget::branch("right"),
+            PEOPLE_QUERIES,
+            query_name,
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(rows_of(&run.result), rows_of(&other.result));
+    let bound: omnigraph_planner::BoundPlan =
+        serde_json::from_value(serde_json::to_value(&run.plan).unwrap()).unwrap();
+    let same = db
+        .replay_bound_plan(ReadTarget::branch("left"), bound.clone())
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&same.result), rows_of(&run.result));
+    let refused = db
+        .replay_bound_plan(ReadTarget::branch("right"), bound)
+        .await
+        .err()
+        .expect("equal lineage counters must not admit a different detached pin");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("`{table_key}` was planned at dataset version")),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn sibling_detached_node_pins_refuse_count_plan_replay() {
+    sibling_plan_replay_is_refused(
+        "node:Person",
+        "count_people",
+        r#"{"type":"Person","data":{"name":"dee","age":60}}"#,
+        r#"{"type":"Person","data":{"name":"eve","age":70}}
+{"type":"Person","data":{"name":"fox","age":80}}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sibling_detached_edge_pins_refuse_traversal_plan_replay() {
+    sibling_plan_replay_is_refused(
+        "edge:Likes",
+        "liked",
+        r#"{"edge":"Likes","from":"cyd","to":"d0"}"#,
+        r#"{"edge":"Likes","from":"cyd","to":"d1"}"#,
+    )
+    .await;
+}

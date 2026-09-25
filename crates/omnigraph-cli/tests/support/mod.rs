@@ -545,7 +545,10 @@ pub fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
     })
 }
 
-pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
+/// A foreign commit on the Person table's Lance linear history (a config
+/// upsert, which commits on the empty linear HEAD a detached-only table
+/// keeps). Returns (published version, Lance HEAD after the commit).
+pub fn forge_person_foreign_commit(graph: &std::path::Path) -> (u64, u64) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let uri = graph.to_string_lossy();
         let db = Omnigraph::open(uri.as_ref()).await.unwrap();
@@ -553,10 +556,12 @@ pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
         let entry = snap.dataset("node:Person").unwrap();
         let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.dataset_path);
         let mut ds = Dataset::open(&full_path).await.unwrap();
-        let deleted = ds.delete("name = 'Alice'").await.unwrap();
-        assert_eq!(deleted.num_deleted_rows, 1);
-        let head = deleted.new_dataset.version().version;
-        assert!(head > entry.published_dataset_version);
+        let linear_head_before = ds.version().version;
+        ds.update_config(vec![("forged_by", Some("cli_data test"))])
+            .await
+            .unwrap();
+        let head = ds.version().version;
+        assert!(head > linear_head_before);
         (entry.published_dataset_version, head)
     })
 }

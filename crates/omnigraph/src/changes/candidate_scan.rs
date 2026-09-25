@@ -12,16 +12,21 @@
 //! that optimization is available; the caller falls back to the exact full
 //! merge on any doubt.
 //!
-//! **Why the pruned path needs no delete handling.** Eligibility first requires
-//! one graph-visible dataset interval to advance by exactly one Lance version.
-//! The parse-time D2 rule keeps inserts/updates and deletes out of the same
-//! mutation, so an engine-authored adjacent transaction is either a
-//! row-set-preserving insert/update or a delete — never both. If that one
-//! transaction is an `Append` or a **provably** row-set-preserving merge
-//! `Update`, no live logical id can disappear and the candidate scan is
-//! complete. Any wider interval or operation that can remove, reuse, or
-//! re-stamp rows (`Delete`, `Overwrite`, `Restore`, compaction `Rewrite`, …)
-//! falls back to the exact merge, which classifies deletes correctly.
+//! **Two proofs admit an interval** ([`IntervalProof`]). On the stamp path the
+//! endpoints are linear versions one apart and the `_row_last_updated_at_version`
+//! window drops the rows a fragment rewrite carried along. On the commit path
+//! (RFC "Detached-only tables", Change discovery) the `to` side is a detached
+//! pin whose recorded transaction names the `from` side's opened version as its
+//! base; every row of a new fragment was written by that commit, so no window
+//! is needed, and a `Delete` whose transaction records the removed ids
+//! (`omnigraph.deleted_ids`) is derived from those ids and the parent
+//! fragments it touched. The parse-time D2 rule keeps inserts/updates and
+//! deletes out of the same mutation, so one engine-authored transaction is
+//! either a row-set-preserving insert/update or a delete, never both. Any
+//! wider interval, a delete without the record, or an operation that can
+//! remove, reuse, or re-stamp rows (`Overwrite`, `Restore`, compaction
+//! `Rewrite`, …) falls back to the exact merge, which classifies deletes
+//! correctly.
 //!
 //! A `RewriteRows` `Update` is trusted as row-set-preserving only with a
 //! **durable per-transaction provenance proof** — the `omnigraph.no_by_source_delete`
@@ -35,18 +40,27 @@
 //! authenticates the *persisted* transaction. An unproven `Update` falls back.
 //! See [`transaction_is_row_set_preserving`].
 
-use datafusion::prelude::{col, lit};
+use std::collections::HashSet;
+
+use datafusion::prelude::{Expr, col, lit};
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance_table::format::Fragment;
 
 use super::enumerate::{Emit, next_emit};
-use super::model::ChangeFeedScope;
+use super::model::{ChangeFeedScope, ChangeOpKind};
 use super::row_compare::{OrderedRows, ScanTargets, rows_equal_across_vintages};
 use crate::db::DatasetEntry;
 use crate::error::Result;
-use crate::table_store::{has_insert_absence_certificate, has_no_by_source_delete_marker};
+use crate::table_store::{
+    StagedTransactionIdentity, TableStore, has_insert_absence_certificate,
+    has_no_by_source_delete_marker, load_deleted_ids,
+};
 use omnigraph_compiler::SystemColumns;
+
+/// Above this many recorded ids the delete emitter relies on its id set alone
+/// instead of also pushing an `IN` list into the parent scan.
+const DELETE_ID_FILTER_MAX: usize = 1024;
 
 /// Whether one Lance transaction's operation preserves the live logical row set
 /// — i.e. can only add or modify rows in place, never remove, reuse, or re-stamp
@@ -120,24 +134,56 @@ pub(crate) fn transaction_is_row_set_preserving(transaction: &Transaction) -> bo
     }
 }
 
-/// Immutable physical plan for a proven adjacent candidate interval. Both
-/// vectors are bounded by the one transaction's touched-fragment footprint;
-/// neither is a copy of the full manifest.
+/// One adjacent transaction's candidate interval: touched fragments or
+/// deleted IDs admitted under the encoded record limit.
 #[derive(Debug, Clone)]
-pub(crate) struct CandidatePlan {
-    child_fragments: Vec<Fragment>,
-    parent_fragments: Vec<Fragment>,
+pub(crate) enum CandidatePlan {
+    /// A row-set-preserving insert/update: candidate rows from the new child
+    /// fragments, before-images from the touched parent fragments.
+    Upserts {
+        child_fragments: Vec<Fragment>,
+        parent_fragments: Vec<Fragment>,
+        /// The `_row_last_updated_at_version` window `(from, to]` of the stamp
+        /// path; `None` on the commit path, where every row of a new fragment
+        /// was written by the commit.
+        stamp_window: Option<(u64, u64)>,
+    },
+    /// A delete whose transaction records the removed ids: before-images by
+    /// id from the parent fragments the delete touched.
+    Deletes {
+        parent_fragments: Vec<Fragment>,
+        ids: Vec<String>,
+    },
 }
 
-/// Return the candidate plan for one adjacent, row-set-preserving Lance
-/// transaction, or `None` to use the exact ordered merge.
+/// How an interval is proven before its one transaction is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntervalProof {
+    /// Linear endpoints one Lance version apart.
+    Stamp { from: u64, to: u64 },
+    /// A detached `to` opened at its pin's staged version whose recorded
+    /// transaction names the `from` side's opened version as its base.
+    Commit,
+}
+
+impl IntervalProof {
+    fn stamp_window(self) -> Option<(u64, u64)> {
+        match self {
+            Self::Stamp { from, to } => Some((from, to)),
+            Self::Commit => None,
+        }
+    }
+}
+
+/// Return the candidate plan for one adjacent Lance transaction, or `None`
+/// to use the exact ordered merge.
 ///
 /// The adjacency requirement is deliberate. A stateless page may be resumed
 /// many times; walking up to 1,024 historical transactions on every page would
-/// multiply history work by page count. An interval wider than one version now
+/// multiply history work by page count. An interval wider than one version
 /// falls back *before any transaction read*. For the accepted shape we read
 /// only the already-open child's one transaction and require its `read_version`
-/// to name the pinned parent exactly.
+/// to name the opened parent exactly.
 ///
 /// Fragment discovery uses Lance's manifest invariants: fragments are sorted
 /// by id, ids never recycle, and one Append/Update assigns every new fragment
@@ -149,7 +195,7 @@ pub(crate) struct CandidatePlan {
 ///
 /// `read_transaction` follows the transaction reference already captured in
 /// the pinned child manifest; Lance transaction objects are UUID-named. The
-/// sole caller nevertheless stores the complete plan before the final
+/// feed caller nevertheless stores the complete plan before the final
 /// named-branch head witness, and emission performs no later history lookup.
 pub(crate) async fn interval_candidate_plan(
     from_entry: &DatasetEntry,
@@ -159,43 +205,127 @@ pub(crate) async fn interval_candidate_plan(
 ) -> Result<Option<CandidatePlan>> {
     if from_entry.native_dataset_branch != to_entry.native_dataset_branch
         || from_entry.identity != to_entry.identity
-    {
-        return Ok(None);
-    }
-    if from_entry.published_dataset_version.checked_add(1)
-        != Some(to_entry.published_dataset_version)
-    {
-        return Ok(None);
-    }
-    if to_dataset.version().version != to_entry.published_dataset_version
-        || from_dataset.version().version != from_entry.published_dataset_version
         || !to_dataset.manifest.uses_stable_row_ids()
         || !from_dataset.manifest.uses_stable_row_ids()
     {
         return Ok(None);
     }
+    let from_opened = from_dataset.version().version;
+    let to_opened = to_dataset.version().version;
+    let Some(proof) = interval_proof(from_entry, to_entry, from_opened, to_opened, to_dataset)
+    else {
+        return Ok(None);
+    };
 
     crate::instrumentation::record_candidate_transaction_read();
     let Ok(Some(transaction)) = to_dataset.read_transaction().await else {
         return Ok(None);
     };
-    if transaction.read_version != from_entry.published_dataset_version
-        || !transaction_is_row_set_preserving(&transaction)
-    {
+    if transaction.read_version != from_opened {
         return Ok(None);
     }
-
-    Ok(candidate_plan_from_transaction(
-        &transaction.operation,
+    if transaction_is_row_set_preserving(&transaction) {
+        return Ok(upsert_plan_from_transaction(
+            &transaction.operation,
+            from_dataset,
+            to_dataset,
+            proof.stamp_window(),
+        ));
+    }
+    if proof != IntervalProof::Commit {
+        return Ok(None);
+    }
+    let Operation::Delete {
+        updated_fragments,
+        deleted_fragment_ids,
+        ..
+    } = &transaction.operation
+    else {
+        return Ok(None);
+    };
+    let Some(ids) = load_deleted_ids(to_dataset, &transaction).await? else {
+        return Ok(None);
+    };
+    Ok(delete_plan(
         from_dataset,
-        to_dataset,
+        updated_fragments,
+        deleted_fragment_ids,
+        ids,
     ))
 }
 
-fn candidate_plan_from_transaction(
+/// The proof an interval offers from its registrations and the opened
+/// manifests alone, before any transaction read.
+fn interval_proof(
+    from_entry: &DatasetEntry,
+    to_entry: &DatasetEntry,
+    from_opened: u64,
+    to_opened: u64,
+    to_dataset: &Dataset,
+) -> Option<IntervalProof> {
+    if TableStore::is_detached_version(to_opened) {
+        if to_entry.version_metadata.staged_version() != Some(to_opened) {
+            return None;
+        }
+        let recorded = StagedTransactionIdentity::recorded_by(to_dataset)?;
+        if Some(recorded.uuid.as_str()) != to_entry.version_metadata.transaction_uuid()
+            || recorded.read_version != from_opened
+        {
+            return None;
+        }
+        return Some(IntervalProof::Commit);
+    }
+    if from_entry.published_dataset_version.checked_add(1)
+        != Some(to_entry.published_dataset_version)
+        || to_opened != to_entry.published_dataset_version
+        || from_opened != from_entry.published_dataset_version
+    {
+        return None;
+    }
+    Some(IntervalProof::Stamp {
+        from: from_entry.published_dataset_version,
+        to: to_entry.published_dataset_version,
+    })
+}
+
+/// The delete plan over the parent fragments a recorded delete touched, or
+/// `None` when the base manifest lacks one of them.
+fn delete_plan(
+    from_dataset: &Dataset,
+    updated_fragments: &[Fragment],
+    deleted_fragment_ids: &[u64],
+    ids: Vec<String>,
+) -> Option<CandidatePlan> {
+    let mut parent_fragment_ids: Vec<u64> = updated_fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .chain(deleted_fragment_ids.iter().copied())
+        .collect();
+    parent_fragment_ids.sort_unstable();
+    parent_fragment_ids.dedup();
+    let mut metadata_steps = 0u64;
+    let mut parent_fragments = Vec::with_capacity(parent_fragment_ids.len());
+    for fragment_id in parent_fragment_ids {
+        let (fragment, steps) = find_fragment(from_dataset.fragments(), fragment_id);
+        metadata_steps = metadata_steps.saturating_add(steps);
+        let Some(fragment) = fragment else {
+            crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+            return None;
+        };
+        parent_fragments.push(fragment.clone());
+    }
+    crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
+    Some(CandidatePlan::Deletes {
+        parent_fragments,
+        ids,
+    })
+}
+
+fn upsert_plan_from_transaction(
     operation: &Operation,
     from_dataset: &Dataset,
     to_dataset: &Dataset,
+    stamp_window: Option<(u64, u64)>,
 ) -> Option<CandidatePlan> {
     let (new_fragment_count, mut parent_fragment_ids) = match operation {
         Operation::Append { fragments } => (fragments.len(), Vec::new()),
@@ -271,17 +401,19 @@ fn candidate_plan_from_transaction(
     // error. Require every changed fragment to carry loadable, structurally
     // valid last-updated metadata; any gap is a normal miss that falls back to
     // the exact ordered merge (which does not consume the version column).
-    if !child_fragments
-        .iter()
-        .all(fragment_version_metadata_is_loadable)
+    if stamp_window.is_some()
+        && !child_fragments
+            .iter()
+            .all(fragment_version_metadata_is_loadable)
     {
         crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
         return None;
     }
     crate::instrumentation::record_candidate_fragment_metadata_steps(metadata_steps);
-    Some(CandidatePlan {
+    Some(CandidatePlan::Upserts {
         child_fragments: child_fragments.to_vec(),
         parent_fragments,
+        stamp_window,
     })
 }
 
@@ -367,12 +499,14 @@ pub(crate) struct CandidateUpserts {
 }
 
 impl CandidateUpserts {
+    #[allow(clippy::too_many_arguments)]
     async fn open(
         from_entry: &DatasetEntry,
-        to_entry: &DatasetEntry,
         from_dataset: Dataset,
         to_dataset: Dataset,
-        plan: CandidatePlan,
+        child_fragments: Vec<Fragment>,
+        parent_fragments: Vec<Fragment>,
+        stamp_window: Option<(u64, u64)>,
         after_id: Option<&str>,
         scope: ChangeFeedScope,
         scan_targets: ScanTargets,
@@ -387,21 +521,21 @@ impl CandidateUpserts {
         // keep rows whose last update lands in (begin, end] — this drops the
         // carried-over rows a fragment rewrite pulled along, leaving exactly the
         // inserted and updated rows (the touched-parent merge classifies which).
-        let window = col("_row_last_updated_at_version")
-            .gt(lit(from_entry.published_dataset_version))
-            .and(
-                col("_row_last_updated_at_version").lt_eq(lit(to_entry.published_dataset_version)),
-            );
+        let window = stamp_window.map(|(from, to)| {
+            col("_row_last_updated_at_version")
+                .gt(lit(from))
+                .and(col("_row_last_updated_at_version").lt_eq(lit(to)))
+        });
         let candidates = OrderedRows::open_scan(
             to_dataset,
             after_id,
-            Some(window),
-            Some(plan.child_fragments),
+            window,
+            Some(child_fragments),
             scan_targets,
             to_columns.id,
         )
         .await?;
-        let parents = if plan.parent_fragments.is_empty() {
+        let parents = if parent_fragments.is_empty() {
             None
         } else {
             Some(
@@ -409,7 +543,7 @@ impl CandidateUpserts {
                     from_dataset.clone(),
                     after_id,
                     None,
-                    Some(plan.parent_fragments),
+                    Some(parent_fragments),
                     scan_targets,
                     from_columns.id,
                 )
@@ -490,10 +624,72 @@ impl CandidateUpserts {
     }
 }
 
+/// Emitter for a delete whose transaction records the removed ids (commit
+/// path): the parent fragments the delete touched are scanned in id order
+/// and each recorded id yields `Emit::Delete` with its before-image row.
+pub(crate) struct CandidateDeletes {
+    child_dataset: Dataset,
+    parents: OrderedRows,
+    ids: HashSet<String>,
+    scope: ChangeFeedScope,
+}
+
+impl CandidateDeletes {
+    async fn open(
+        from_dataset: Dataset,
+        to_dataset: Dataset,
+        parent_fragments: Vec<Fragment>,
+        ids: Vec<String>,
+        after_id: Option<&str>,
+        scope: ChangeFeedScope,
+        scan_targets: ScanTargets,
+        from_columns: SystemColumns,
+    ) -> Result<Self> {
+        crate::instrumentation::record_candidate_scan_targets(
+            scan_targets.rows(),
+            scan_targets.bytes(),
+        );
+        let membership: Option<Expr> = (ids.len() <= DELETE_ID_FILTER_MAX).then(|| {
+            col(from_columns.id).in_list(ids.iter().map(|id| lit(id.as_str())).collect(), false)
+        });
+        let parents = OrderedRows::open_scan(
+            from_dataset,
+            after_id,
+            membership,
+            Some(parent_fragments),
+            scan_targets,
+            from_columns.id,
+        )
+        .await?;
+        Ok(Self {
+            child_dataset: to_dataset,
+            parents,
+            ids: ids.into_iter().collect(),
+            scope,
+        })
+    }
+
+    async fn next(&mut self) -> Result<Option<Emit>> {
+        if !self.scope.wants_op(ChangeOpKind::Delete) {
+            return Ok(None);
+        }
+        loop {
+            let Some(row) = self.parents.pop().await? else {
+                return Ok(None);
+            };
+            crate::instrumentation::record_candidate_row_examined();
+            if self.ids.contains(&row.id) {
+                return Ok(Some(Emit::Delete(row)));
+            }
+        }
+    }
+}
+
 /// Per-interval change emitter: the touched-fragment candidate path when the
-/// interval is provably row-set-preserving, else the exact full ordered merge.
-/// Both yield the same id-ordered `Emit` stream; before-images come from the
-/// parent handle and after-images from the child handle.
+/// interval is provably row-set-preserving or a recorded delete, else the
+/// exact full ordered merge. All yield the same id-ordered `Emit` stream;
+/// before-images come from the parent handle and after-images from the child
+/// handle.
 pub(crate) struct FullMergeRows {
     from: OrderedRows,
     to: OrderedRows,
@@ -506,6 +702,7 @@ pub(crate) struct FullMergeRows {
 pub(crate) enum EmitSource {
     FullMerge(Box<FullMergeRows>),
     Pruned(Box<CandidateUpserts>),
+    Deleted(Box<CandidateDeletes>),
 }
 
 impl EmitSource {
@@ -514,9 +711,9 @@ impl EmitSource {
     /// (and therefore covered by) the final head witness. This constructor
     /// performs no live history read, so a branch delete/recreate after the
     /// witness cannot reroute the interval.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn plan(
         from_entry: &DatasetEntry,
-        to_entry: &DatasetEntry,
         from_dataset: Dataset,
         to_dataset: Dataset,
         candidate_plan: Option<CandidatePlan>,
@@ -526,14 +723,19 @@ impl EmitSource {
         from_columns: SystemColumns,
         to_columns: SystemColumns,
     ) -> Result<Self> {
-        if let Some(candidate_plan) = candidate_plan {
-            Ok(Self::Pruned(Box::new(
+        match candidate_plan {
+            Some(CandidatePlan::Upserts {
+                child_fragments,
+                parent_fragments,
+                stamp_window,
+            }) => Ok(Self::Pruned(Box::new(
                 CandidateUpserts::open(
                     from_entry,
-                    to_entry,
                     from_dataset,
                     to_dataset,
-                    candidate_plan,
+                    child_fragments,
+                    parent_fragments,
+                    stamp_window,
                     after_id,
                     scope.clone(),
                     scan_targets,
@@ -541,18 +743,35 @@ impl EmitSource {
                     to_columns,
                 )
                 .await?,
-            )))
-        } else {
-            let from = OrderedRows::open(from_dataset, after_id, from_columns.id).await?;
-            let to = OrderedRows::open(to_dataset, after_id, to_columns.id).await?;
-            Ok(Self::FullMerge(Box::new(FullMergeRows {
-                from,
-                to,
-                scope: scope.clone(),
-                from_columns,
-                to_columns,
-                is_edge: from_entry.type_key.starts_with("edge:"),
-            })))
+            ))),
+            Some(CandidatePlan::Deletes {
+                parent_fragments,
+                ids,
+            }) => Ok(Self::Deleted(Box::new(
+                CandidateDeletes::open(
+                    from_dataset,
+                    to_dataset,
+                    parent_fragments,
+                    ids,
+                    after_id,
+                    scope.clone(),
+                    scan_targets,
+                    from_columns,
+                )
+                .await?,
+            ))),
+            None => {
+                let from = OrderedRows::open(from_dataset, after_id, from_columns.id).await?;
+                let to = OrderedRows::open(to_dataset, after_id, to_columns.id).await?;
+                Ok(Self::FullMerge(Box::new(FullMergeRows {
+                    from,
+                    to,
+                    scope: scope.clone(),
+                    from_columns,
+                    to_columns,
+                    is_edge: from_entry.type_key.starts_with("edge:"),
+                })))
+            }
         }
     }
 
@@ -570,6 +789,7 @@ impl EmitSource {
                 .await
             }
             Self::Pruned(candidates) => candidates.next().await,
+            Self::Deleted(deletes) => deletes.next().await,
         }
     }
 
@@ -577,6 +797,7 @@ impl EmitSource {
         match self {
             Self::FullMerge(full) => full.from.dataset(),
             Self::Pruned(candidates) => candidates.parent_dataset(),
+            Self::Deleted(deletes) => deletes.parents.dataset(),
         }
     }
 
@@ -584,6 +805,7 @@ impl EmitSource {
         match self {
             Self::FullMerge(full) => full.to.dataset(),
             Self::Pruned(candidates) => candidates.child_dataset(),
+            Self::Deleted(deletes) => &deletes.child_dataset,
         }
     }
 }

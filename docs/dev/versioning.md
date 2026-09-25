@@ -15,19 +15,19 @@ version axes. Never derive one axis from another.
 
 ## Current storage contract
 
-The current binary serves **internal manifest schema v10**:
+The current binary serves **internal manifest schema v11**:
 `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` and `INTERNAL_MANIFEST_SCHEMA_VERSION`
-are both 10. v10 is the [RFC 0067](../rfcs/0067-detached-table-commits.md)
+are both 11. v10 is the [RFC 0067](../rfcs/0067-detached-table-commits.md)
 stamp: a table registration may name a detached Lance version whose linear
 target is published before it exists, which an older binary would open as
 reclaimed history, so the stamp refuses it before any open. Both system
 column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.md),
-`id`/`src`/`dst` and `__id`/`__src`/`__dst`, live under v10: the vintage is
+`id`/`src`/`dst` and `__id`/`__src`/`__dst`, live under v11: the vintage is
 read from the schema IR's feature set, never from the stamp, and
 `omnigraph schema upgrade-system-columns` converts it on a served graph
-without a stamp change. A v8 or v9 graph needs one explicit
-`omnigraph upgrade`, a metadata-only route that keeps its branches and its
-spellings, before this binary serves it.
+without a stamp change. A v8, v9 or v10 graph needs one explicit
+`omnigraph upgrade`, a route that keeps its branches and its spellings,
+before this binary serves it.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -61,6 +61,15 @@ spellings, before this binary serves it.
   replays at its linear target. Existing registrations without the keys are
   linear pins. Both system column vintages are stamped v10; the
   system-column upgrade no longer advances the stamp.
+- v11 preserves v10's layout and stops promoting pins (RFC "Detached-only
+  tables"): `published_dataset_version` names no Lance version, a table's
+  history is its chain of detached commits, and a registration carries
+  `omnigraph.last_linear_version`, the highest linear version a v10 pin
+  reached; rows at or below it resolve through their linear twin, rows above
+  it open their detached version directly. A v10 graph takes the step
+  `detached-only-v10-to-v11`, which promotes every pending pin once, reaps the
+  proven copies, records the key on every current registration of every live
+  branch, and restamps.
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
   and are not supported migration inputs. Reuse of a numeric stamp by another
   design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
@@ -69,14 +78,16 @@ spellings, before this binary serves it.
 
 Normal open refuses lower and higher stamps before recovery or table decoding;
 neither served stamp is rewritten on open.
-`omnigraph upgrade` defaults to v10: qualified standalone v6 graphs run the
-registered v6 → v7 → v8 → v10 route, qualified v7 graphs run v7 → v8 → v10,
-and v8 and v9 graphs run the v10 step alone (`detached-pins-v8-v9-to-v10`),
-which restamps main and every live branch under one intent and touches
-nothing else; retired ancestors keep their stamp. `--to-format 7` and
-`--to-format 8` retain those intermediate targets for a compatible older
-executable; the current binary refuses normal open of either result, and
-v9 is not a target. The system-column respelling is a separate operation on
+`omnigraph upgrade` defaults to v11: qualified standalone v6 graphs run the
+registered v6 → v7 → v8 → v10 → v11 route, qualified v7 graphs run
+v7 → v8 → v10 → v11, v8 and v9 graphs run v10 → v11, and v10 graphs run the
+v11 step alone. The v10 step (`detached-pins-v8-v9-to-v10`) restamps main and
+every live branch under one intent and touches nothing else; retired
+ancestors keep their stamp. The v11 step (`detached-only-v10-to-v11`) is
+engine-backed: it needs every writer stopped and runs on standalone roots
+only. `--to-format 7`, `--to-format 8` and `--to-format 10` retain those
+intermediate targets for a compatible older executable; the current binary
+refuses normal open of each result, and v9 is not a target. The system-column respelling is a separate operation on
 a served graph, `omnigraph schema upgrade-system-columns`. Original retained
 snapshots remain unchanged; historical v6 registrations use an explicit
 legacy decoder after main-root admission. A pending upgrade marker refuses
@@ -133,12 +144,13 @@ see the [admission limits](../user/operations/upgrade.md).
 
 | Source executable / format | Normal open | Default explicit route | Required coverage owner |
 |---|---|---|---|
-| 0.9.0 / v6 | Refused | v6 → v7 → v8 → v10 (`--to-format 8` stops at v8; branches are kept) | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history` (v8 stop, then the default route on its branched fixture); `upgrade/tests.rs::storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10` |
-| 0.10.0 / v6 | Refused | v6 → v7 → v8 → v10 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
-| Qualified development / v7 | Refused | v7 → v8 → v10 | Engine storage-upgrade tests: metadata-only conversion, history and retry (pinned to `--to-format 8`), plus the synthetic v6 default-route test above |
-| Legacy vintage / v8 | Refused | v8 → v10 (`detached-pins-v8-v9-to-v10`; `--to-format 8` is an already-current no-op) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10`, `storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_name`; `tests/system_column_upgrade.rs` (the respelling on a served graph, refusals, crash points) |
-| 0.11.x / v9 | Refused | v9 → v10 | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_v9_graph_to_v10` |
-| Current / v10 | Accepted | Already current; a lower target is refused | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
+| 0.9.0 / v6 | Refused | v6 → v7 → v8 → v10 → v11 (`--to-format 8` stops at v8; branches are kept) | `crossversion_upgrade.rs::genuine_v09_explicit_storage_upgrade_preserves_history` (v8 stop, then the default route on its branched fixture); `upgrade/tests.rs::storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11` |
+| 0.10.0 / v6 | Refused | v6 → v7 → v8 → v10 → v11 | `crossversion_upgrade.rs::genuine_v010_explicit_storage_upgrade_preserves_history` |
+| Qualified development / v7 | Refused | v7 → v8 → v10 → v11 | Engine storage-upgrade tests: metadata-only conversion, history and retry (pinned to `--to-format 8`), plus the synthetic v6 default-route test above |
+| Legacy vintage / v8 | Refused | v8 → v10 → v11 (`detached-pins-v8-v9-to-v10`, then `detached-only-v10-to-v11`; `--to-format 8` is an already-current no-op) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11`, `storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_name`; `tests/system_column_upgrade.rs` (the respelling on a served graph, refusals, crash points) |
+| 0.11.x / v9 | Refused | v9 → v10 → v11 | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_v9_graph_to_v11` |
+| 0.11.x (detached table commits) / v10 | Refused | v10 → v11 (`detached-only-v10-to-v11`) | `upgrade/tests.rs::storage_upgrade_default_route_takes_a_v10_graph_to_v11` |
+| Current / v11 | Accepted | Already current; a lower target is refused | `upgrade/tests.rs::storage_upgrade_current_vintage_is_already_current_without_a_route`; stamp tests in `migrations.rs` |
 | Older, future or unqualified experimental format | Refused | No route; source-compatible export/rebuild | Existing format fences and engine refusal tests |
 
 Source v6/v7 admission rejects any reserved native-ref retirement metadata.

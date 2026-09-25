@@ -2,14 +2,13 @@
 //! actor, one oracle over every cell.
 //!
 //! The windows are the seams a detached write crosses (after each table's
-//! detached effect, before and after publication, between and inside
-//! promotions, and before cleanup reaps a promoted pin's manifest); the
+//! detached effect, and before publication); the
 //! faults are an error return in this process, a process kill while parked,
 //! and a parked writer raced by a concurrent insert from this process; the
 //! recovery actors are the next write on the same handle, on a fresh handle,
 //! in another process, a cleanup, and nobody. The oracle checks the row
-//! model, no duplicate keys, the linear head never beyond any pin and never
-//! backwards, every pin linear once a recovery actor ran, no recovery
+//! model, no duplicate keys, every pin a detached version, the linear head
+//! never moving, every retained pin opening, no recovery
 //! sidecar, and a fresh handle agreeing with the writer's.
 //!
 //! The default run covers every writer × window × fault with the
@@ -60,7 +59,8 @@ enum Writer {
     Cleanup,
     /// The index writer: one detached `CreateIndex` on Person, no row change.
     EnsureIndices,
-    /// A fast-forward merge of a branch holding one Person insert into main.
+    /// A fast-forward merge of a branch holding one Person insert into main:
+    /// a pointer switch with no table effect, so only its pre-publish window.
     Merge,
     /// Schema apply adding a nullable Person property: one detached rewrite
     /// of Person, no row change, the contract staged and installed.
@@ -93,14 +93,6 @@ enum Window {
     PostDetached(usize),
     /// After every detached effect, before publication.
     PrePublish,
-    /// After publication, before the first promotion.
-    PostPublish,
-    /// After n pins were promoted, before the next.
-    PostPromotion(usize),
-    /// Inside the first promotion, after its checks and before its replay.
-    InPromotion,
-    /// In cleanup, after a pin was promoted and before its manifest is reaped.
-    CleanupPreReap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,31 +119,18 @@ impl Writer {
     fn windows(self) -> Vec<Window> {
         use Window::*;
         match self {
-            Writer::Insert => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
-            Writer::MultiTable => vec![
-                PostDetached(1),
-                PostDetached(2),
-                PrePublish,
-                PostPublish,
-                PostPromotion(1),
-                InPromotion,
-            ],
-            Writer::Cleanup => vec![InPromotion, CleanupPreReap],
-            Writer::EnsureIndices => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
-            Writer::Merge => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
-            Writer::SchemaApply => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
-            Writer::Optimize => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
-            Writer::Load => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
-            Writer::FtsRebuild => vec![PostDetached(1), PrePublish, PostPublish, InPromotion],
+            Writer::Insert => vec![PostDetached(1), PrePublish],
+            Writer::MultiTable => vec![PostDetached(1), PostDetached(2), PrePublish],
+            Writer::Cleanup => vec![],
+            Writer::EnsureIndices => vec![PostDetached(1), PrePublish],
+            Writer::Merge => vec![PrePublish],
+            Writer::SchemaApply => vec![PostDetached(1), PrePublish],
+            Writer::Optimize => vec![PostDetached(1), PrePublish],
+            Writer::Load => vec![PostDetached(1), PrePublish],
+            Writer::FtsRebuild => vec![PostDetached(1), PrePublish],
             // The upgrade stages one detached commit per table; park after
             // the first and the second to leave a half-staged tail.
-            Writer::SystemColumnUpgrade => vec![
-                PostDetached(1),
-                PostDetached(2),
-                PrePublish,
-                PostPublish,
-                InPromotion,
-            ],
+            Writer::SystemColumnUpgrade => vec![PostDetached(1), PostDetached(2), PrePublish],
         }
     }
 
@@ -167,17 +146,6 @@ impl Writer {
             Writer::Load => "load",
             Writer::FtsRebuild => "fts_rebuild",
             Writer::SystemColumnUpgrade => "system_column_upgrade",
-        }
-    }
-
-    /// Whether the writer's effect is visible to readers once it passed
-    /// `window`, even if it never returned.
-    fn published_at(self, window: Window) -> bool {
-        match window {
-            Window::PostDetached(_) | Window::PrePublish => false,
-            Window::PostPublish | Window::PostPromotion(_) => true,
-            Window::InPromotion => !matches!(self, Writer::Cleanup),
-            Window::CleanupPreReap => true,
         }
     }
 }
@@ -196,26 +164,14 @@ impl Window {
             Window::PrePublish if optimize => {
                 (catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(), 1)
             }
-            Window::PostPublish if optimize => {
-                (catalog::OPTIMIZE_POST_PUBLISH_PRE_PROMOTION.name(), 1)
-            }
             Window::PostDetached(n) if schema => {
                 (catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.name(), n as u64)
             }
             Window::PrePublish if schema => (catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.name(), 1),
-            Window::PostPublish if schema => {
-                (catalog::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION.name(), 1)
-            }
-            Window::PostDetached(n) if merge => {
-                (catalog::BRANCH_MERGE_POST_TABLE_EFFECT.name(), n as u64)
-            }
             Window::PrePublish if merge => (
                 catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
                 1,
             ),
-            Window::PostPublish if merge => {
-                (catalog::BRANCH_MERGE_POST_PUBLISH_PRE_PROMOTION.name(), 1)
-            }
             Window::PostDetached(n) if index => {
                 (catalog::ENSURE_INDICES_POST_TABLE_EFFECT.name(), n as u64)
             }
@@ -223,15 +179,8 @@ impl Window {
                 catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
                 1,
             ),
-            Window::PostPublish if index => {
-                (catalog::ENSURE_INDICES_POST_PUBLISH_PRE_PROMOTION.name(), 1)
-            }
             Window::PostDetached(n) => (catalog::MUTATION_POST_TABLE_COMMIT.name(), n as u64),
             Window::PrePublish => (catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.name(), 1),
-            Window::PostPublish => (catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.name(), 1),
-            Window::PostPromotion(n) => (catalog::PROMOTION_POST_LANDED.name(), n as u64),
-            Window::InPromotion => (catalog::PROMOTION_PRE_REPLAY.name(), 1),
-            Window::CleanupPreReap => (catalog::CLEANUP_PRE_REAP.name(), 1),
         }
     }
 }
@@ -270,12 +219,7 @@ async fn table_uri(db: &Omnigraph, table_key: &str) -> String {
 }
 
 async fn table_pin(db: &Omnigraph, table_key: &str) -> u64 {
-    db.snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .dataset(table_key)
-        .unwrap()
-        .published_dataset_version
+    helpers::pinned_version(db, "main", table_key).await
 }
 
 async fn linear_head(uri: &str) -> u64 {
@@ -283,6 +227,26 @@ async fn linear_head(uri: &str) -> u64 {
         .await
         .version()
         .version
+}
+
+/// A converging run leaves the Person pin a detached version that opens and
+/// the linear HEAD where the cell found it.
+async fn assert_pin_detached_and_head_unmoved(
+    cell: &str,
+    db: &Omnigraph,
+    person_uri: &str,
+    head_before: u64,
+) {
+    let pin = table_pin(db, "node:Person").await;
+    assert!(
+        helpers::is_detached_version(pin),
+        "{cell}: Person pin {pin} is not a detached version"
+    );
+    assert_eq!(
+        linear_head(person_uri).await,
+        head_before,
+        "{cell}: Person linear head moved"
+    );
 }
 
 async fn insert(db: &Session, name: &str) -> omnigraph::error::Result<()> {
@@ -457,10 +421,10 @@ fn finish_cleanup_child(mut child: std::process::Child) {
     }
 }
 
-/// GQT cannot run another process while the first-touch table commit is unpublished.
+/// GQT cannot run another process while a branch's detached table commit is unpublished.
 #[tokio::test]
 #[serial]
-async fn cleanup_retains_live_first_touch_fork_until_owner_recreation() {
+async fn cleanup_retains_live_branch_staging_until_owner_recreation() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
@@ -486,7 +450,7 @@ async fn cleanup_retains_live_first_touch_fork_until_owner_recreation() {
         finish_cleanup_child(spawn_child(
             &child_root,
             &child_barrier,
-            "first_touch_cleanup",
+            "staging_cleanup",
             "cleanup_keep",
             "none",
             1,
@@ -503,7 +467,7 @@ async fn cleanup_retains_live_first_touch_fork_until_owner_recreation() {
         .await;
     drop(seam);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-    outcome.expect("cleanup must preserve the unpublished first-touch fork");
+    outcome.expect("cleanup must preserve the unpublished branch staging");
     drop(db);
 
     let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
@@ -511,12 +475,21 @@ async fn cleanup_retains_live_first_touch_fork_until_owner_recreation() {
         .snapshot_of(ReadTarget::branch("feature"))
         .await
         .unwrap();
-    let former_fork = snapshot
-        .dataset("node:Person")
-        .unwrap()
-        .native_dataset_branch
-        .clone()
-        .unwrap();
+    let entry = snapshot.dataset("node:Person").unwrap();
+    assert_eq!(entry.native_dataset_branch, None);
+    assert_eq!(
+        entry.dataset_path,
+        fresh
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .dataset_path,
+        "the branch write stages on the inherited location"
+    );
+    let former_pin = helpers::pinned_version(&fresh, "feature", "node:Person").await;
+    assert!(helpers::is_detached_version(former_pin), "{former_pin}");
     assert_eq!(
         snapshot
             .open_dataset("node:Person")
@@ -539,14 +512,10 @@ async fn cleanup_retains_live_first_touch_fork_until_owner_recreation() {
         1,
     ));
     assert!(
-        !lance::Dataset::open(&person_uri)
+        !helpers::collector::detached_versions(&person_uri)
             .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key(&former_fork),
-        "a recreated logical owner must not retain its predecessor's fork",
+            .contains(&former_pin),
+        "a recreated logical owner must not retain its predecessor's pin",
     );
     let reopened = helpers::session(Omnigraph::open(&root).await.unwrap());
     assert_eq!(
@@ -595,12 +564,6 @@ async fn run_cell(
     let knows_uri = table_uri(&db, "edge:Knows").await;
     let write_name = format!("m{index}_w");
 
-    // A cleanup cell needs a pending pin to promote and reap: a write whose
-    // own promotion was skipped.
-    if writer == Writer::Cleanup {
-        let _skip = catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION.fire_always();
-        insert(&db, &format!("m{index}_pending")).await.unwrap();
-    }
     // An index cell needs index work: a declared BTREE the schema apply
     // records and leaves unbuilt.
     if writer == Writer::EnsureIndices {
@@ -649,6 +612,7 @@ async fn run_cell(
     }
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
+    let knows_head_before = linear_head(&knows_uri).await;
 
     // The writer under the fault.
     let (seam, hit) = window.seam(writer);
@@ -730,7 +694,7 @@ async fn run_cell(
             }
         }
     }
-    let visible = acknowledged || writer.published_at(window);
+    let visible = acknowledged;
     match writer {
         Writer::Insert | Writer::Merge if visible => {
             model.names.insert(write_name.clone());
@@ -812,75 +776,39 @@ async fn run_cell(
     let person_head = linear_head(&person_uri).await;
     let knows_head = linear_head(&knows_uri).await;
     assert!(
-        person_head <= person_pin,
-        "{cell}: Person head {person_head} beyond pin {person_pin}"
+        helpers::is_detached_version(person_pin),
+        "{cell}: Person pin {person_pin} is not a detached version"
     );
     assert!(
-        knows_head <= knows_pin,
-        "{cell}: Knows head {knows_head} beyond pin {knows_pin}"
+        helpers::is_detached_version(knows_pin),
+        "{cell}: Knows pin {knows_pin} is not a detached version"
     );
-    assert!(
-        person_head >= head_before,
-        "{cell}: Person head went backwards"
+    assert_eq!(person_head, head_before, "{cell}: Person linear head moved");
+    assert_eq!(
+        knows_head, knows_head_before,
+        "{cell}: Knows linear head moved"
     );
-    // A writer promotes the pending pins of the tables it touches; cleanup
-    // promotes every table's. A pin on a table nobody wrote stays pending,
-    // readable through its staged version, until one of them runs.
-    match recovery {
-        Recovery::ReadOnly => {}
-        Recovery::Cleanup => {
-            assert_eq!(
-                person_head, person_pin,
-                "{cell}: Person pin not promoted by cleanup"
-            );
-            assert_eq!(
-                knows_head, knows_pin,
-                "{cell}: Knows pin not promoted by cleanup"
-            );
-        }
-        _ => {
-            assert_eq!(
-                person_head, person_pin,
-                "{cell}: Person pin not promoted after recovery"
-            );
-        }
-    }
     assert!(
         sidecar_operation_ids(dir.path()).is_empty(),
         "{cell}: a recovery sidecar was written"
     );
     if writer == Writer::Optimize && recovery != Recovery::ReadOnly {
-        // Whatever the window left, the next runs re-plan from the current
-        // pins and leave every pin promoted. Lance bins neighbouring
-        // fragments only under the same index coverage, so a run that folds
-        // an index can make the next run's compaction plan non-empty; the
-        // contract here is promotion, not a single-run fixpoint.
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         for run in 1..=2 {
             fresh.optimize().await.unwrap_or_else(|error| {
                 panic!("{cell}: optimize run {run} after recovery failed: {error}")
             });
-            assert_eq!(
-                linear_head(&person_uri).await,
-                table_pin(&fresh, "node:Person").await,
-                "{cell}: optimize run {run} leaves Person promoted"
-            );
+            assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
         }
         drop(fresh);
     }
     if writer == Writer::EnsureIndices && recovery != Recovery::ReadOnly {
-        // Whatever the window left, the next pass converges: it builds what
-        // is missing, and a promoted batch leaves it nothing to publish.
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         fresh
             .ensure_indices()
             .await
             .unwrap_or_else(|error| panic!("{cell}: index pass after recovery failed: {error}"));
-        assert_eq!(
-            linear_head(&person_uri).await,
-            table_pin(&fresh, "node:Person").await,
-            "{cell}: the index pass leaves Person promoted"
-        );
+        assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
         fresh
             .ensure_indices()
             .await
@@ -888,8 +816,6 @@ async fn run_cell(
         drop(fresh);
     }
     if writer == Writer::FtsRebuild && recovery != Recovery::ReadOnly {
-        // Whatever the window left, an explicit rebuild converges and
-        // leaves every pin promoted; a second rebuild is equally fine.
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         for run in 1..=2 {
             let rebuilt = fresh
@@ -898,9 +824,6 @@ async fn run_cell(
                 .unwrap_or_else(|error| {
                     panic!("{cell}: full-text rebuild run {run} after recovery failed: {error}")
                 });
-            // The rebuild must actually name the full-text index it replaced,
-            // not silently publish an empty batch: an empty CreateIndex would
-            // pass every promotion/row assertion while leaving search broken.
             assert!(
                 rebuilt
                     .rebuilt_indexes
@@ -909,11 +832,7 @@ async fn run_cell(
                 "{cell}: rebuild run {run} named no Person/city full-text index: {:?}",
                 rebuilt.rebuilt_indexes
             );
-            assert_eq!(
-                linear_head(&person_uri).await,
-                table_pin(&fresh, "node:Person").await,
-                "{cell}: rebuild run {run} leaves Person promoted"
-            );
+            assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
         }
         drop(fresh);
     }

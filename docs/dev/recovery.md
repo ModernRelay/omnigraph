@@ -1,50 +1,47 @@
 # Graph recovery
 
 **Audience:** engine and storage contributors
-**Authority:** current crash-recovery model; the promotion reconciler in
-`crates/omnigraph/src/db/omnigraph/promotion.rs` and the staged-contract pass
-in `crates/omnigraph/src/db/schema_state.rs` are the exact authority
+**Authority:** current crash-recovery model; the staged-contract pass in
+`crates/omnigraph/src/db/schema_state.rs` is the exact authority for the one
+published effect that still has work to finish
 
 A graph write has one durable step that matters: the `__manifest` publication.
-Everything a writer does before it is invisible and needs no recovery; what is
-left after it is derived and finishes on its own. There is no recovery
+Everything a writer does before it is invisible and needs no recovery; a
+published table effect is complete at that step, and only a schema contract
+has work left after it. There is no recovery
 sidecar, classifier, roll-forward, rollback, `Restore` compensation or
-recovery audit ([RFC 0067](../rfcs/0067-detached-table-commits.md)).
+recovery audit ([RFC 0067](../rfcs/0067-detached-table-commits.md)), and no
+promotion of a table pin onto its linear history
+([RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)).
 
 ## What a crash can leave
 
 | Interrupted | What is on storage | Who finishes it |
 |---|---|---|
-| Before the manifest commit | Detached Lance versions nothing references, possibly an unregistered added-type dataset, possibly a staged schema contract whose publishing commit is not in lineage | Nobody has to. The caller retries from scratch. Cleanup retains detached manifests without a proven linear twin and defers that table's version GC, the next schema apply reclaims the leftover dataset under its sentinel, and the next read-write open discards the staging |
-| After the manifest commit, before promotion | A pending pin `(target linear version, staged detached version, transaction uuid)`: the published rows live in the staged version and the table's linear HEAD is still at the base | Reads resolve the pin through its staged version. The next writer of that table promotes it before it stages, and `cleanup` promotes every pending pin before it collects versions |
+| Before the manifest commit | Detached Lance versions nothing references, possibly an unregistered added-type dataset, possibly a staged schema contract whose publishing commit is not in lineage | Nobody has to. The caller retries from scratch. `cleanup`'s collector reclaims the detached versions once the branch incarnation and graph head their transaction properties record can no longer be published against, the next schema apply reclaims the leftover dataset under its sentinel, and the next read-write open discards the contract staging |
+| After the manifest commit | The pin `(published_dataset_version, staged_version, transaction_uuid)` in the branch's `__manifest`: the published rows live in the detached version, which is the table's version for its whole life | Nothing. Reads open `staged_version` |
 | After a schema apply's or system-column upgrade's manifest commit, before the contract files are installed | A staged contract whose publishing commit is in lineage, and possibly the schema-apply sentinel | The same handle's next write entry (`settle_pending_schema_install`), any handle's `refresh`, or the next read-write open installs it; the open also reclaims the sentinel. A read-only open refuses until then |
 
-## Pins and promotion
+## Pins
 
 Every table effect is a detached commit of the table's pinned base, and the
-manifest names it as a pin. Promotion replays the recorded transaction onto
-the linear HEAD so the linear history gains an identical twin at the pin's
-target version. It is derived, idempotent and order-preserving:
+branch's `__manifest` registration names it as the pin
+`(published_dataset_version, staged_version, transaction_uuid)`. The pin is
+final: readers open `staged_version` and check that its transaction file
+carries `transaction_uuid`, nothing replays the commit onto the table's
+linear history, and the linear HEAD stays at the table's creation version.
+Each registration records that stopping point as
+`omnigraph.last_linear_version` (`TableVersionMetadata`,
+`db/manifest/metadata.rs`); a row at or below it that names no
+`staged_version` is a linear pin and opens as before. A crash after the CAS
+leaves a table effect nothing to finish, so no writer, `cleanup` or open runs
+a reconciler over pins.
 
-- a promoter that finds the target version already carrying the pin's
-  transaction uuid is done;
-- two promoters racing on one pin replay the same transaction at the same
-  base, and Lance refuses the second (a keyed upsert, delete, index creation,
-  rewrite, overwrite and rename-only projection all conflict with their own
-  twin; the surface guards pin each kind);
-- a chain of detached links (a merge's chunks, optimize's rewrite, fold and
-  index build) promotes link by link from the base;
-- a promotion that fails never fails the write. The pin stays pending.
-
-A pin whose target version a foreign linear commit occupies is **blocked**.
-Mutations and loads keep writing behind it (they stage from the detached
-version); the writers that plan on the table's linear HEAD (branch merge,
-index builds, schema apply, the system-column upgrade, optimize, and a
-first-touch fork of that table) promote before they plan and refuse a blocked
-pin; `cleanup` skips version collection for that table because only the pin's
-detached version holds the acknowledged rows; `repair` reports it as
-`blocked_promotion` on every live branch and never adopts the foreign commit.
-Nothing resolves a blocked pin yet.
+A linear commit above `omnigraph.last_linear_version` is foreign: no read or
+write resolves it, `repair` reports the table as `foreign_drift` and never
+adopts it (`repair.rs`, `judge_against_last_linear_version`), and the
+collector deletes neither its manifest nor its files and lists it under
+`foreign_versions`.
 
 ## Staged schema contracts
 
@@ -57,11 +54,11 @@ must follow; its absence means the manifest never moved, so the staging is
 garbage. The writer installs the live files from memory right after its
 commit, so another process discarding the staging cannot tear the graph.
 
-- A read-write open promotes a published staging and discards an unpublished
+- A read-write open installs a published staging and discards an unpublished
   or incomplete one (the same one-mutation-process boundary as every other
   open-time decision: a live apply in another process loses its staging and
   then installs from memory).
-- `refresh` and the write-entry pass only promote; anything else may belong
+- `refresh` and the write-entry pass only install; anything else may belong
   to a live apply.
 - A read-only open writes nothing: it refuses a published-but-uninstalled
   contract and serves an unpublished staging as absent.
@@ -81,9 +78,9 @@ its own publication.
 
 ## Ordering and visibility
 
-Promotion and the contract pass use the same gate order as writers (schema,
-then branch, then sorted tables). Neither treats a warm coordinator or cache
-as current authority, and an installed contract invalidates derived handles
+The contract pass uses the same gate order as writers (schema, then branch,
+then sorted tables). It never treats a warm coordinator or cache as current
+authority, and an installed contract invalidates derived handles
 before later operations continue. A retried write is a new attempt with a new
 lineage commit; nothing is replayed on the caller's behalf.
 
@@ -91,8 +88,8 @@ lineage commit; nothing is replayed on the caller's behalf.
 
 A failed operation never wedges its own live handle: once the fault source
 stops, the same `Omnigraph` instance's next ordinary write succeeds without
-reopening. Failed attempts leave no handle-local poison — a pending pin is
-promoted by the next write, a published-but-uninstalled contract is installed
+reopening. Failed attempts leave no handle-local poison: a
+published-but-uninstalled contract is installed
 by `settle_pending_schema_install` at the next write entry, and a
 schema-apply sentinel this handle failed to release is retried there too
 (`note_failed_sentinel_release`). This generalizes the retired
@@ -131,33 +128,35 @@ schema contract or racing delayed cleanup.
 
 Native branch create/delete residue is different from a data-table effect.
 An unreferenced clone-only tree is reclaimable only when no physical
-`BranchContents` exists, including a logically retired native ref. A
-first-touch table fork is created without any intent record: a fork no
-manifest entry references is retained while the graph branch incarnation in
-its name is a live native graph branch, because its writer may not have
-published yet. Once that incarnation is gone it is garbage that explicit
-cleanup classifies, after
-proving that live table pins, tags and Lance ancestry no longer require it.
-An old owner's absence from the logical branch list alone is not proof.
+`BranchContents` exists, including a logically retired native ref. No table
+fork is created for a graph branch: a branch write stages detached on the
+dataset and native ref its inherited registration names. A fork a branch
+created before format v11 is garbage once no registration references it and
+the graph branch incarnation in its name is gone; explicit cleanup reclaims
+it after proving that live table pins, tags and Lance ancestry no longer
+require it. An old owner's absence from the logical branch list alone is not
+proof.
 
-Graph deletion writes the reserved `omnigraph.retired_manifest_branch`
-metadata value through Lance's public `Branches::replace_metadata`. That
-single native-ref update removes logical authority while preserving the exact
-physical ref and unrelated metadata. The versioned marker binds the native
-name and identifier; unknown fields, versions, or mismatched identity fail
-closed. A lost acknowledgement is classified by reading the same ref and
-validating its retirement marker. Absence is not proof of completed retirement.
-Native history remains readable for descendants, while branch-name reads and
-writes require an unretired ref. The existing process-local branch controls
-serialize this read/replace protocol; they are not distributed fencing.
-Explicit cleanup alone reclaims retired lifetimes after proving their native
-descendants, paths, tags and current table references no longer need them.
+Graph-branch deletion writes the reserved `omnigraph.retired_manifest_branch`
+metadata value through Lance's public `Branches::replace_metadata`, preserving
+unrelated metadata. The versioned marker binds the native name and identifier;
+unknown fields, versions, or mismatched identity fail closed. Retirement then
+archives the exact `BranchContents` inside the native tree before unlinking the
+active ref. A retry validates that identity in the ref or archive; bare absence
+is not proof of completed retirement. Required native history remains readable
+through the archive, while branch-name reads and writes require an unretired
+ref. Existing process-local branch controls serialize retirement; they are not
+distributed fencing. Explicit cleanup reclaims unneeded table forks and retired
+manifest trees with their archives after checking native dependencies, tags,
+table roots and historical merge-base providers. Delayed staging is classified
+from a complete post-list identity inventory and final capture validation.
 The v8 storage fence keeps older binaries from exposing retired branches.
 
 ## Test ownership
 
-- `crates/omnigraph/tests/failpoints.rs` owns writer crash windows: no residue
-  before publication, pending pins after it, per writer.
+- `crates/omnigraph/tests/failpoints.rs` owns writer crash windows: no
+  graph-visible residue before publication, the pin complete after it, per
+  writer.
 - `crates/omnigraph/tests/detached_commit_matrix.rs` owns the writer × window
   × fault × recovery-actor matrix under one oracle.
 - `crates/omnigraph/tests/schema_apply.rs` and `system_column_upgrade.rs` own
@@ -168,8 +167,8 @@ The v8 storage fence keeps older binaries from exposing retired branches.
   schema staging.
 - The initialization cells in `failpoints.rs` own exact-genesis recovery,
   committed-versus-indeterminate outcomes, and claim retention.
-- `crates/omnigraph/tests/lance_surface_guards.rs` owns the twin-replay rules
-  promotion depends on.
+- `crates/omnigraph/tests/lance_surface_guards.rs` owns the Lance
+  detached-commit facts the pin and the collector depend on.
 - `crates/omnigraph/tests/forbidden_apis.rs` guards durable-call and writer
   registration.
 - Cluster recovery has a separate control-plane protocol described in
@@ -177,4 +176,6 @@ The v8 storage fence keeps older binaries from exposing retired branches.
 
 The design rationale is [RFC 0067](../rfcs/0067-detached-table-commits.md),
 which supersedes the sidecar protocol of
-[RFC 0022](../rfcs/0022-unified-write-path.md).
+[RFC 0022](../rfcs/0022-unified-write-path.md), and
+[RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md),
+which removes RFC 0067's promotion.

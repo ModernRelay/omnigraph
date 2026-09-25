@@ -4,7 +4,7 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use base64::Engine as _;
 use futures::TryStreamExt;
 
-use omnigraph::db::{Omnigraph, ReadTarget, RepairOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
@@ -1431,6 +1431,7 @@ async fn blob_read_returns_bytes() {
     assert_eq!(etag.to_string(), edge_etag);
 }
 
+#[cfg(feature = "failpoints")]
 #[tokio::test]
 async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots() {
     let dir = tempfile::tempdir().unwrap();
@@ -1452,6 +1453,7 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
         .unwrap()
         .dataset_path
         .clone();
+    helpers::forge_linear_head_from_pin(&db, "main", "node:Document", 0).await;
     let mut table = lance::Dataset::open(dir.path().join(table_path).to_string_lossy().as_ref())
         .await
         .unwrap();
@@ -1468,12 +1470,9 @@ async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots(
         update = update.replace(name, metadata).unwrap();
     }
     update.await.unwrap();
-    db.repair(RepairOptions {
-        confirm: true,
-        force: true,
-    })
-    .await
-    .unwrap();
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
+        .await
+        .unwrap();
 
     let legacy_cell = node_blob_cell("Document", "legacy", "content");
     let exact_current_snapshot = db.resolve_snapshot("main").await.unwrap();

@@ -240,7 +240,12 @@ impl PlanSource for QuerySource<'_> {
                     dataset_path: entry.dataset_path.clone(),
                     native_branch: entry.native_dataset_branch.clone(),
                 },
-                Some(entry.published_dataset_version),
+                Some(
+                    entry
+                        .version_metadata
+                        .staged_version()
+                        .unwrap_or(entry.published_dataset_version),
+                ),
                 Some(entry.entity_count),
             ),
             None => (

@@ -254,7 +254,7 @@ fn source(proof: bool) -> MemorySource {
         source.with_proof(AdjacencyProof {
             child_fragments: vec![1],
             parent_fragments: vec![0],
-            version_window: (1, 2),
+            version_window: Some((1, 2)),
         })
     } else {
         source

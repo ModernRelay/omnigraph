@@ -161,7 +161,8 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
         entity_count: state.row_count,
         version_metadata: state
             .version_metadata
-            .with_table_fork_owner(table_fork_owner.as_deref()),
+            .with_table_fork_owner(table_fork_owner.as_deref())
+            .with_last_linear_version(entry.version_metadata.last_linear_version()),
     };
     let mut expected = crate::db::manifest::ExpectedTableVersions::new();
     expected.insert(
@@ -200,20 +201,9 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// Every first-touch fork exists, before the first detached index commit.
-    /// An unreferenced fork is reclaimable garbage that cleanup classifies.
-    pub static ENSURE_INDICES_POST_FORK_PRE_COMMIT = ("ensure_indices.post_fork_pre_commit", Unreachable, [Fail]);
-}
-
-decide_seam! {
     /// Every detached index commit exists, before the manifest publishes the
     /// pins: nothing is visible and no linear HEAD moved.
     pub static ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT = ("ensure_indices.post_phase_b_pre_manifest_commit", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    /// The pins are published, before the writer promotes them.
-    pub static ENSURE_INDICES_POST_PUBLISH_PRE_PROMOTION = ("ensure_indices.post_publish_pre_promotion", Unreachable, [Fail]);
 }
 
 decide_seam! {
@@ -231,7 +221,6 @@ struct IndexTarget {
     /// The native ref the effect lands on: the read ref, or the fork a first
     /// touch creates once the lineage intent names it.
     table_branch: Option<String>,
-    first_touch: bool,
 }
 
 async fn maintain_indices_for_branch(
@@ -280,33 +269,8 @@ async fn maintain_indices_for_branch(
         let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
         };
-        // Ordinary ensure preserves lazy main inheritance. Explicit rebuilding
-        // must fork inherited tables when their full-text indexes need work.
-        if mode == IndexMaintenanceMode::Ensure
-            && active_branch.is_some()
-            && entry.native_dataset_branch.is_none()
-        {
-            continue;
-        }
         let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
-        let first_touch = native_active.as_deref().is_some_and(|owner| {
-            !entry
-                .native_dataset_branch
-                .as_deref()
-                .is_some_and(|fork| entry.version_metadata.is_table_fork_of(fork, owner))
-        });
-        let ds = if first_touch {
-            // The inherited owner's HEAD may advance independently after this
-            // graph branch was cut. Plan from the exact inherited snapshot, not
-            // from that owner's current HEAD; a fork needs a linear source
-            // version, so a pending inherited pin is promoted first.
-            db.promote_inherited_pin(&table_key, &full_path, entry)
-                .await?;
-            db.storage().open_snapshot_at_entry(entry).await?
-        } else {
-            db.open_pinned_for_write(&table_key, &full_path, entry)
-                .await?
-        };
+        let ds = db.open_pinned_for_write(&full_path, entry).await?;
         let work = match mode {
             IndexMaintenanceMode::Ensure => {
                 plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?
@@ -327,11 +291,8 @@ async fn maintain_indices_for_branch(
                 expected_version: entry.published_dataset_version,
                 read_ref: entry.native_dataset_branch.clone(),
                 table_branch: entry.native_dataset_branch.clone(),
-                first_touch,
             });
-            if !first_touch {
-                existing_targets.insert(table_key.clone(), ds);
-            }
+            existing_targets.insert(table_key.clone(), ds);
             work_by_table.insert(table_key, work);
         }
     }
@@ -342,27 +303,8 @@ async fn maintain_indices_for_branch(
         let Some(entry) = snapshot.dataset(&table_key) else {
             continue;
         };
-        if mode == IndexMaintenanceMode::Ensure
-            && active_branch.is_some()
-            && entry.native_dataset_branch.is_none()
-        {
-            continue;
-        }
         let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
-        let first_touch = native_active.as_deref().is_some_and(|owner| {
-            !entry
-                .native_dataset_branch
-                .as_deref()
-                .is_some_and(|fork| entry.version_metadata.is_table_fork_of(fork, owner))
-        });
-        let ds = if first_touch {
-            db.promote_inherited_pin(&table_key, &full_path, entry)
-                .await?;
-            db.storage().open_snapshot_at_entry(entry).await?
-        } else {
-            db.open_pinned_for_write(&table_key, &full_path, entry)
-                .await?
-        };
+        let ds = db.open_pinned_for_write(&full_path, entry).await?;
         let work = match mode {
             IndexMaintenanceMode::Ensure => {
                 plan_index_work_edge_on_dataset(db, &ds, catalog.system_columns).await?
@@ -383,11 +325,8 @@ async fn maintain_indices_for_branch(
                 expected_version: entry.published_dataset_version,
                 read_ref: entry.native_dataset_branch.clone(),
                 table_branch: entry.native_dataset_branch.clone(),
-                first_touch,
             });
-            if !first_touch {
-                existing_targets.insert(table_key.clone(), ds);
-            }
+            existing_targets.insert(table_key.clone(), ds);
             work_by_table.insert(table_key, work);
         }
     }
@@ -497,85 +436,15 @@ async fn maintain_indices_for_branch(
         let lineage = db
             .new_lineage_intent_for_branch(active_branch.as_deref(), actor)
             .await?;
-        for target in &mut targets {
-            if target.first_touch {
-                let owner = native_active.as_deref().ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "first-touch index target '{}' has no native branch ref",
-                        target.table_key,
-                    ))
-                })?;
-                target.table_branch = Some(crate::branch_names::table_fork_name(
-                    owner,
-                    txn.base.graph_manifest_version(),
-                    &lineage.graph_commit_id,
-                ));
-            }
-        }
 
-        // RFC 0067: first-touch forks are created now, with no intent record.
-        // An unreferenced fork is reclaimable garbage that cleanup classifies,
-        // never a graph-visible effect. Their index batches stage on the fork.
-        let mut forked =
-            std::collections::HashMap::<String, crate::storage_layer::SnapshotHandle>::new();
+        let mut updates = Vec::with_capacity(targets.len());
         for target in &targets {
-            if !target.first_touch {
-                continue;
-            }
-            let entry = snapshot.dataset(&target.table_key).ok_or_else(|| {
-                OmniError::manifest(missing_graph_type_at_snapshot(&target.table_key))
-            })?;
-            let fork = target.table_branch.as_deref().ok_or_else(|| {
+            let ds = existing_targets.remove(&target.table_key).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
-                    "first-touch index target '{}' has no fork name",
-                    target.table_key,
+                    "missing index target for table '{}'",
+                    target.table_key
                 ))
             })?;
-            let ds = db
-                .fork_dataset_from_entry_state(
-                    &target.table_key,
-                    target.identity,
-                    &target.full_path,
-                    entry.native_dataset_branch.as_deref(),
-                    entry.published_dataset_version,
-                    fork,
-                )
-                .await?;
-            let work = &work_by_table[&target.table_key];
-            let staged = db
-                .storage()
-                .stage_create_indices(&ds, &work.specs)
-                .await
-                .map_err(|error| {
-                    error.with_context(format!(
-                        "stage first-touch index batch on {} ({:?})",
-                        target.table_key, work.specs
-                    ))
-                })?;
-            fail(&ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
-            existing_staged.insert(target.table_key.clone(), staged);
-            forked.insert(target.table_key.clone(), ds);
-        }
-        if !forked.is_empty() {
-            fail(&ENSURE_INDICES_POST_FORK_PRE_COMMIT)?;
-        }
-
-        // RFC 0067: every index batch is committed as a detached version of
-        // its pinned base. Nothing moves a linear HEAD and nothing is visible
-        // until the manifest publishes the pin `(expected + 1, staged, uuid)`;
-        // the writer promotes the pins after that.
-        let mut updates = Vec::with_capacity(targets.len());
-        let mut promotions = Vec::with_capacity(targets.len());
-        for target in &targets {
-            let ds = existing_targets
-                .remove(&target.table_key)
-                .or_else(|| forked.remove(&target.table_key))
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "missing index target for table '{}'",
-                        target.table_key
-                    ))
-                })?;
             let staged = existing_staged.remove(&target.table_key).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "missing staged index batch for table '{}'",
@@ -585,8 +454,11 @@ async fn maintain_indices_for_branch(
             let entry = snapshot.dataset(&target.table_key).ok_or_else(|| {
                 OmniError::manifest(missing_graph_type_at_snapshot(&target.table_key))
             })?;
-            let base = ds.clone();
-            let (detached, identity) = db.storage().commit_staged_detached(ds, staged).await?;
+            let witness = txn.authority.staging_witness()?;
+            let (detached, identity) = db
+                .storage()
+                .commit_staged_detached(ds, staged, &witness)
+                .await?;
             let state = db
                 .storage()
                 .table_state(&target.full_path, &detached)
@@ -595,19 +467,8 @@ async fn maintain_indices_for_branch(
             let version_metadata = state
                 .version_metadata
                 .with_table_fork_owner(native_active.as_deref())
-                .with_staged(state.version, identity.uuid.clone());
-            promotions.push(crate::db::HeldPromotion {
-                table_key: target.table_key.clone(),
-                dataset_path: entry.dataset_path.clone(),
-                full_path: target.full_path.clone(),
-                table_branch: target.table_branch.clone(),
-                base,
-                chain: Vec::new(),
-                detached,
-                target: published_dataset_version,
-                uuid: identity.uuid,
-                e_tag: version_metadata.e_tag().map(str::to_string),
-            });
+                .with_staged(state.version, identity.uuid.clone())
+                .with_last_linear_version(entry.version_metadata.last_linear_version());
             updates.push(crate::db::DatasetUpdate {
                 identity: target.identity,
                 type_key: target.table_key.clone(),
@@ -630,12 +491,6 @@ async fn maintain_indices_for_branch(
             lineage,
         )
         .await?;
-        match fail(&ENSURE_INDICES_POST_PUBLISH_PRE_PROMOTION) {
-            Ok(()) => db.promote_held_all(promotions).await,
-            Err(error) => {
-                tracing::warn!(error = %error, "index promotion interrupted; the next writer promotes")
-            }
-        }
         Some(published.graph_commit_id)
     };
 
@@ -1010,19 +865,9 @@ pub(crate) struct OpenedForMutation {
     pub(crate) table_branch: Option<String>,
     /// The ref the pin was read on, see `NativeRefPin`.
     pub(crate) pinned_native_ref: Option<String>,
-    /// The manifest registration the pin was read from (RFC 0067): the
-    /// staging reopen resolves it, promoting a pending predecessor first.
+    /// The manifest registration the pin was read from (RFC 0067), which the
+    /// staging reopen resolves.
     pub(crate) entry: crate::db::DatasetEntry,
-    /// RFC-022 first-touch named-branch writes stage against the inherited
-    /// source snapshot and defer the durable Lance ref creation until
-    /// `StagedMutation::commit_all` holds the gates.
-    pub(crate) deferred_fork: Option<DeferredTableFork>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DeferredTableFork {
-    pub(crate) source_entry: crate::db::DatasetEntry,
-    pub(crate) target_branch: String,
 }
 
 decide_seam! {
@@ -1097,15 +942,7 @@ pub(super) async fn open_for_mutation_on_branch(
     if txn.is_some() && !op_kind.strict_pre_stage_version_check() {
         match resolved_branch.as_deref() {
             // Non-strict, table already on the active branch → no open, no fork.
-            Some(_)
-                if entry
-                    .native_dataset_branch
-                    .as_deref()
-                    .zip(native_active.as_deref())
-                    .is_some_and(|(fork, owner)| {
-                        entry.version_metadata.is_table_fork_of(fork, owner)
-                    }) =>
-            {
+            Some(_) => {
                 return Ok(OpenedForMutation {
                     identity: entry.identity,
                     entry: entry.clone(),
@@ -1114,7 +951,6 @@ pub(super) async fn open_for_mutation_on_branch(
                     full_path,
                     table_branch: entry.native_dataset_branch.clone(),
                     pinned_native_ref: entry.native_dataset_branch.clone(),
-                    deferred_fork: None,
                 });
             }
             // Main branch, non-strict → no open. (Main never forks.)
@@ -1127,12 +963,8 @@ pub(super) async fn open_for_mutation_on_branch(
                     full_path,
                     table_branch: None,
                     pinned_native_ref: entry.native_dataset_branch.clone(),
-                    deferred_fork: None,
                 });
             }
-            // Non-strict but the table isn't on the active branch yet — falls
-            // through to fork below.
-            Some(_) => {}
         }
     }
 
@@ -1140,9 +972,7 @@ pub(super) async fn open_for_mutation_on_branch(
         None => {
             // RFC 0067: the pinned image, never HEAD. The manifest CAS at
             // publication is the read-set fence for every op kind.
-            let ds = db
-                .open_pinned_for_write(table_key, &full_path, entry)
-                .await?;
+            let ds = db.open_pinned_for_write(&full_path, entry).await?;
             Ok(OpenedForMutation {
                 identity: entry.identity,
                 entry: entry.clone(),
@@ -1151,7 +981,6 @@ pub(super) async fn open_for_mutation_on_branch(
                 full_path,
                 table_branch: None,
                 pinned_native_ref: entry.native_dataset_branch.clone(),
-                deferred_fork: None,
             })
         }
         Some(active_branch) => {
@@ -1160,42 +989,13 @@ pub(super) async fn open_for_mutation_on_branch(
             // inherited source entry now; `commit_all` creates the target ref,
             // then commits this transaction detached on the new ref. Legacy
             // writers retain the eager fork path below.
-            let native_active = native_active.as_deref().ok_or_else(|| {
+            native_active.as_deref().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "branch '{active_branch}' resolved without a native ref"
                 ))
             })?;
-            if txn.is_some()
-                && !entry.native_dataset_branch.as_deref().is_some_and(|fork| {
-                    entry.version_metadata.is_table_fork_of(fork, native_active)
-                })
-            {
-                let ds = db.storage().open_snapshot_at_entry(entry).await?;
-                return Ok(OpenedForMutation {
-                    identity: entry.identity,
-                    entry: entry.clone(),
-                    handle: Some(ds),
-                    expected_version: entry.published_dataset_version,
-                    full_path,
-                    table_branch: Some(native_active.to_string()),
-                    pinned_native_ref: entry.native_dataset_branch.clone(),
-                    deferred_fork: Some(DeferredTableFork {
-                        source_entry: entry.clone(),
-                        target_branch: native_active.to_string(),
-                    }),
-                });
-            }
-            let (ds, table_branch) = open_owned_dataset_for_branch_write(
-                db,
-                table_key,
-                entry,
-                &full_path,
-                active_branch,
-                native_active,
-                op_kind,
-                snapshot.graph_manifest_version(),
-            )
-            .await?;
+            let (ds, table_branch) =
+                open_owned_dataset_for_branch_write(db, entry, &full_path).await?;
             Ok(OpenedForMutation {
                 identity: entry.identity,
                 entry: entry.clone(),
@@ -1204,165 +1004,21 @@ pub(super) async fn open_for_mutation_on_branch(
                 full_path,
                 table_branch,
                 pinned_native_ref: entry.native_dataset_branch.clone(),
-                deferred_fork: None,
             })
         }
     }
 }
 
+/// A branch write stages detached on the dataset and native ref the
+/// inherited registration names, from that registration's pin (RFC
+/// "Detached-only tables", Branches: no table fork).
 pub(super) async fn open_owned_dataset_for_branch_write(
     db: &Omnigraph,
-    table_key: &str,
     entry: &crate::db::DatasetEntry,
     full_path: &str,
-    active_branch: &str,
-    native_active: &str,
-    op_kind: crate::db::MutationOpKind,
-    base_manifest_version: u64,
 ) -> Result<(SnapshotHandle, Option<String>)> {
-    let identity = entry.identity;
-    let entry_version = entry.published_dataset_version;
-    // `active_branch` is the logical branch (manifest reads, gates, lineage);
-    // `native_active` is its native ref (Lance opens, forks, entry names).
-    match entry.native_dataset_branch.as_deref() {
-        Some(branch)
-            if entry
-                .version_metadata
-                .is_table_fork_of(branch, native_active) =>
-        {
-            // RFC 0067: the pinned image on the branch's own ref.
-            let ds = db
-                .open_pinned_for_write(table_key, full_path, entry)
-                .await?;
-            Ok((ds, Some(branch.to_string())))
-        }
-        source_branch => {
-            fail(&FORK_BEFORE_CLASSIFY)?;
-            let live = db.snapshot_for_branch(Some(active_branch)).await?;
-            let current = live.dataset(table_key).ok_or_else(|| {
-                OmniError::manifest_read_set_changed(
-                    format!("dataset_binding:{identity}"),
-                    Some(format!("{identity}:{entry_version}:{source_branch:?}")),
-                    None,
-                )
-            })?;
-            if current.identity != identity
-                || current.published_dataset_version != entry_version
-                || current.native_dataset_branch.as_deref() != source_branch
-                || live.native_branch() != Some(native_active)
-            {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("dataset_binding:{identity}"),
-                    Some(format!("{identity}:{entry_version}:{source_branch:?}")),
-                    Some(format!(
-                        "{}:{}:{:?}",
-                        current.identity,
-                        current.published_dataset_version,
-                        current.native_dataset_branch,
-                    )),
-                ));
-            }
-            let target = crate::branch_names::table_fork_name(
-                native_active,
-                base_manifest_version,
-                &crate::dst_ids::new_ulid().to_string(),
-            );
-            // A pending pin on the inherited source is promoted first so the
-            // fork has a linear version to start from (RFC 0067).
-            db.promote_inherited_pin(table_key, full_path, entry)
-                .await?;
-            let ds = db
-                .fork_dataset_from_entry_state(
-                    table_key,
-                    identity,
-                    full_path,
-                    source_branch,
-                    entry_version,
-                    &target,
-                )
-                .await?;
-            if op_kind.strict_pre_stage_version_check() {
-                db.storage()
-                    .ensure_expected_version(&ds, table_key, entry_version)?;
-            }
-            Ok((ds, Some(target)))
-        }
-    }
-}
-
-pub(super) async fn fork_dataset_from_entry_state(
-    db: &Omnigraph,
-    table_key: &str,
-    full_path: &str,
-    source_branch: Option<&str>,
-    source_version: u64,
-    active_branch: &str,
-) -> Result<SnapshotHandle> {
-    db.storage()
-        .fork_branch_from_state(
-            full_path,
-            source_branch,
-            table_key,
-            source_version,
-            active_branch,
-        )
-        .await
-}
-
-/// Classify a table fork against fresh graph publication authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) enum ForkRefStatus {
-    /// The manifest places `T` on `B` — a legitimate fork. Never destroy.
-    Legitimate,
-    /// Another graph branch still pins this ref after its owner detached.
-    /// Re-forking would overwrite the borrower's immutable history.
-    Borrowed,
-    /// The manifest does not reference this fork (`T` not on `B`, or `B` absent
-    /// from the manifest entirely). Reclaimable.
-    Orphan,
-    /// Fresh authority could not be established (a transient read failure on a
-    /// live branch). Ambiguous — do not destroy; the caller retries / converges.
-    Indeterminate,
-}
-
-#[cfg(test)]
-async fn classify_fork_ref(
-    db: &Omnigraph,
-    _table_key: &str,
-    identity: crate::db::manifest::TableIdentity,
-    branch: &str,
-) -> ForkRefStatus {
-    let references =
-        match crate::db::manifest::ManifestCoordinator::native_fork_references_under_control_gates(
-            db.root_uri(),
-            &db.control_session(),
-        )
-        .await
-        {
-            Ok(references) => references,
-            Err(_) => return ForkRefStatus::Indeterminate,
-        };
-    classify_fork_ref_with_references(identity, branch, &references)
-}
-
-/// Use a graph-wide proof captured under the same held schema control gate.
-#[cfg(test)]
-pub(crate) fn classify_fork_ref_with_references(
-    identity: crate::db::manifest::TableIdentity,
-    branch: &str,
-    references: &crate::db::manifest::NativeForkReferences,
-) -> ForkRefStatus {
-    if fail(&crate::seams::catalog::CLASSIFY_FRESH_READ).is_err() {
-        return ForkRefStatus::Indeterminate;
-    }
-    if references.owner_contains(identity, branch) {
-        ForkRefStatus::Legitimate
-    } else if references.contains(identity, branch) {
-        ForkRefStatus::Borrowed
-    } else {
-        ForkRefStatus::Orphan
-    }
+    let ds = db.open_pinned_for_write(full_path, entry).await?;
+    Ok((ds, entry.native_dataset_branch.clone()))
 }
 
 /// Index work deferred on this pass. A vector property without trainable
@@ -1504,7 +1160,8 @@ async fn prepare_updates_for_commit(
             prepared_update.entity_count = state.row_count;
             prepared_update.version_metadata = state
                 .version_metadata
-                .with_table_fork_owner(prepared_update.version_metadata.table_fork_owner());
+                .with_table_fork_owner(prepared_update.version_metadata.table_fork_owner())
+                .with_last_linear_version(entry.version_metadata.last_linear_version());
         }
 
         prepared.push(prepared_update);
@@ -1722,191 +1379,4 @@ pub(super) async fn commit_updates_on_branch_with_expected(
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
     db.runtime_cache.invalidate_all().await;
-}
-
-#[cfg(test)]
-mod classify_fork_ref_tests {
-    //! Physical fork classification and stable table-identity guards.
-    use super::*;
-    use crate::db::Omnigraph;
-    use crate::loader::LoadMode;
-
-    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\n";
-
-    /// On-disk dataset path for a node table, taken from the manifest entry
-    /// (the same path the engine uses) so the test forges against the real ref.
-    async fn node_path(db: &Omnigraph, branch: &str, table_key: &str) -> String {
-        let snap = db.snapshot_for_branch(Some(branch)).await.unwrap();
-        let entry = snap.dataset(table_key).unwrap();
-        format!("{}/{}", db.root_uri, entry.dataset_path)
-    }
-
-    #[tokio::test]
-    async fn classify_distinguishes_legitimate_unreferenced_and_ghost() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::Session::from_defaults(
-            std::sync::Arc::new(
-                Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-                    .await
-                    .unwrap(),
-            ),
-            omnigraph_compiler::settings::SessionSettings::default(),
-        );
-        db.branch_create("feature").await.unwrap();
-
-        // Legitimate: a real write forks Company onto `feature`, and the
-        // manifest places Company on `feature`.
-        db.load_as(
-            "feature",
-            None,
-            r#"{"type":"Company","data":{"name":"Acme"}}"#,
-            LoadMode::Merge,
-            None,
-        )
-        .await
-        .unwrap();
-        let feature_snapshot = db.snapshot_for_branch(Some("feature")).await.unwrap();
-        let feature_native = db.native_branch_for("feature").await.unwrap();
-        let company_identity = feature_snapshot.dataset("node:Company").unwrap().identity;
-        let person_identity = feature_snapshot.dataset("node:Person").unwrap().identity;
-        assert_eq!(
-            classify_fork_ref(
-                &db,
-                "node:Company",
-                company_identity,
-                feature_snapshot
-                    .dataset("node:Company")
-                    .unwrap()
-                    .native_dataset_branch
-                    .as_deref()
-                    .unwrap(),
-            )
-            .await,
-            ForkRefStatus::Legitimate,
-            "a manifest-placed fork must classify as Legitimate (never destroyed)"
-        );
-
-        // Orphan (manifest-unreferenced): forge the live native `feature` ref
-        // on Person, which the manifest's `feature` snapshot still places on
-        // main.
-        let person = node_path(&db, "feature", "node:Person").await;
-        {
-            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
-            let mut ds = lance::Dataset::open(&person).await.unwrap();
-            let v = ds.version().version;
-            ds.create_branch(&feature_native, v, None).await.unwrap();
-        }
-        assert_eq!(
-            classify_fork_ref(&db, "node:Person", person_identity, &feature_native).await,
-            ForkRefStatus::Orphan,
-            "a ref the manifest does not place on the branch must classify as Orphan"
-        );
-
-        // Orphan (dead incarnation): a fork under the same logical name but a
-        // different incarnation suffix belongs to a deleted predecessor, even
-        // though the logical branch is live.
-        let dead_native = crate::branch_names::native_branch_name(
-            "feature",
-            &crate::branch_names::mint_incarnation(),
-        );
-        {
-            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
-            let mut ds = lance::Dataset::open(&person).await.unwrap();
-            let v = ds.version().version;
-            ds.create_branch(&dead_native, v, None).await.unwrap();
-        }
-        assert_eq!(
-            classify_fork_ref(&db, "node:Company", company_identity, &dead_native).await,
-            ForkRefStatus::Orphan,
-            "a fork of a dead incarnation must classify as Orphan while the logical name is live"
-        );
-
-        // Orphan (ghost): a ref for a branch the manifest does not have at all.
-        {
-            // forbidden-api-allow: test synthesizes a branch ref directly on the Lance dataset.
-            let mut ds = lance::Dataset::open(&person).await.unwrap();
-            let v = ds.version().version;
-            ds.create_branch("ghost", v, None).await.unwrap();
-        }
-        assert_eq!(
-            classify_fork_ref(&db, "node:Person", person_identity, "ghost").await,
-            ForkRefStatus::Orphan,
-            "a ref for a branch absent from the manifest must classify as Orphan"
-        );
-    }
-
-    #[tokio::test]
-    async fn classify_does_not_adopt_a_reused_alias_across_incarnations() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::Session::from_defaults(
-            std::sync::Arc::new(
-                Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-                    .await
-                    .unwrap(),
-            ),
-            omnigraph_compiler::settings::SessionSettings::default(),
-        );
-        let old_identity = db.snapshot().await.dataset("node:Person").unwrap().identity;
-
-        db.apply_schema("node Company { name: String @key }\n")
-            .await
-            .unwrap();
-        db.apply_schema(SCHEMA).await.unwrap();
-        let new_entry = db.snapshot().await.dataset("node:Person").unwrap().clone();
-        let new_identity = new_entry.identity;
-        assert_ne!(old_identity, new_identity);
-
-        db.branch_create("feature").await.unwrap();
-        db.load_as(
-            "feature",
-            None,
-            r#"{"type":"Person","data":{"name":"Ada"}}"#,
-            LoadMode::Merge,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let feature_snapshot = db.snapshot_for_branch(Some("feature")).await.unwrap();
-        let feature_native = feature_snapshot
-            .dataset("node:Person")
-            .unwrap()
-            .native_dataset_branch
-            .clone()
-            .unwrap();
-        assert_eq!(
-            classify_fork_ref(&db, "node:Person", new_identity, &feature_native).await,
-            ForkRefStatus::Legitimate
-        );
-        assert_eq!(
-            classify_fork_ref(&db, "node:Person", old_identity, &feature_native).await,
-            ForkRefStatus::Orphan,
-            "a live placement under the reused alias belongs only to the new incarnation"
-        );
-
-        let full_path = db.storage().dataset_uri(&new_entry.dataset_path);
-        let before = db
-            .storage()
-            .open_dataset_head(&full_path, Some(&feature_native))
-            .await
-            .unwrap();
-        let before_identifier = db.storage().branch_identifier(&before).await.unwrap();
-        db.fork_dataset_from_entry_state(
-            "node:Person",
-            old_identity,
-            &full_path,
-            None,
-            new_entry.published_dataset_version,
-            &feature_native,
-        )
-        .await
-        .expect_err("a stale identity must not authorize effects on the replacement path");
-        let after = db
-            .storage()
-            .open_dataset_head(&full_path, Some(&feature_native))
-            .await
-            .unwrap();
-        let after_identifier = db.storage().branch_identifier(&after).await.unwrap();
-        assert_eq!(before_identifier, after_identifier);
-    }
 }

@@ -377,6 +377,10 @@ impl GraphCoordinator {
         })
     }
 
+    pub(crate) async fn schema_apply_locked(&self) -> Result<bool> {
+        self.manifest.schema_apply_locked().await
+    }
+
     pub(crate) async fn all_branches(&self) -> Result<Vec<String>> {
         self.manifest.list_graph_branches().await
     }

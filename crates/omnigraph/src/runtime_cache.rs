@@ -33,6 +33,9 @@ struct GraphIndexTableState {
     identity: crate::db::manifest::TableIdentity,
     table_key: String,
     table_version: u64,
+    /// The detached pin the version resolves to: `table_version` is a
+    /// per-lineage counter, so two branches share it with different pins.
+    staged_version: Option<u64>,
     table_branch: Option<String>,
     /// Lance manifest incarnation token for this edge table version. Preserves the
     /// incarnation distinction the dropped synthetic snapshot id used to carry: a
@@ -314,6 +317,7 @@ fn graph_index_cache_key(
                     identity: entry.identity,
                     table_key,
                     table_version: entry.published_dataset_version,
+                    staged_version: entry.version_metadata.staged_version(),
                     table_branch: entry.native_dataset_branch.clone(),
                     e_tag: entry.version_metadata.e_tag().map(str::to_string),
                     endpoints: endpoints.clone(),
@@ -337,14 +341,17 @@ struct TableHandleKey {
     table_path: String,
     table_branch: Option<String>,
     version: u64,
+    /// The detached pin `version` resolves to; `version` alone is a
+    /// per-lineage counter two branches share.
+    staged_version: Option<u64>,
     e_tag: Option<String>,
 }
 
-/// Held open-`Dataset` handles keyed by `(table_path, branch, version, e_tag)` — the
-/// version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
+/// Held open-`Dataset` handles keyed by `(table_path, branch, version, pin,
+/// e_tag)` — the version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
 /// (`rust/lancedb/src/table/dataset.rs`). A warm read reuses a held handle with
 /// zero open IO (a cheap `Dataset` clone); a miss opens once at the location with
-/// the shared `Session`. Version plus e_tag are in the key, so a write (or a
+/// the shared `Session`. Version, pin and e_tag are in the key, so a write (or a
 /// delete/recreate that reuses a version number on object stores with e_tags) is
 /// simply a new key. A same-branch manifest refresh clears this cache as the
 /// fallback for e_tag-less table locations. Only read-path Data opens use this —
@@ -378,6 +385,7 @@ impl TableHandleCache {
         e_tag: Option<&str>,
         staged_version: Option<u64>,
         transaction_uuid: Option<&str>,
+        last_linear_version: Option<u64>,
         location: &str,
         session: Option<&Arc<Session>>,
     ) -> Result<Dataset> {
@@ -385,6 +393,7 @@ impl TableHandleCache {
             table_path: dataset_path.to_string(),
             table_branch: table_branch.map(str::to_string),
             version,
+            staged_version,
             e_tag: e_tag.map(str::to_string),
         };
         {
@@ -401,6 +410,7 @@ impl TableHandleCache {
             version,
             staged_version,
             transaction_uuid,
+            last_linear_version,
             session,
             crate::instrumentation::table_wrapper(),
         )
@@ -420,36 +430,18 @@ impl TableHandleCache {
         dataset_path: &str,
         table_branch: Option<&str>,
         version: u64,
+        staged_version: Option<u64>,
         e_tag: Option<&str>,
     ) -> Option<Dataset> {
         let key = TableHandleKey {
             table_path: dataset_path.to_string(),
             table_branch: table_branch.map(str::to_string),
             version,
+            staged_version,
             e_tag: e_tag.map(str::to_string),
         };
         let mut inner = self.inner.lock().await;
         inner.entries.get(&key).cloned()
-    }
-
-    /// Hold a handle the writer already opened or landed for this pin, so the
-    /// next open of the same pin costs no request (RFC 0067).
-    pub async fn insert(
-        &self,
-        dataset_path: &str,
-        table_branch: Option<&str>,
-        version: u64,
-        e_tag: Option<&str>,
-        dataset: Dataset,
-    ) {
-        let key = TableHandleKey {
-            table_path: dataset_path.to_string(),
-            table_branch: table_branch.map(str::to_string),
-            version,
-            e_tag: e_tag.map(str::to_string),
-        };
-        let mut inner = self.inner.lock().await;
-        inner.insert(key, dataset);
     }
 }
 
@@ -635,11 +627,53 @@ mod tests {
                 identity: crate::db::manifest::TableIdentity::new(id as u64 + 1, 1).unwrap(),
                 table_key: format!("edge:t{id}"),
                 table_version: 1,
+                staged_version: None,
                 table_branch: None,
                 e_tag: None,
                 endpoints: ("A".to_string(), "B".to_string()),
             }],
         }
+    }
+
+    /// Two branches write the same lineage counter to different detached pins
+    /// on one physical table; without e_tags (Windows local files) the pin is
+    /// the only thing that tells the two datasets apart, in both caches.
+    #[test]
+    fn same_counter_different_pin_splits_both_keys_without_etag() {
+        let on_main = GraphIndexTableState {
+            identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
+            table_key: "edge:Knows".to_string(),
+            table_version: 3,
+            staged_version: Some(1 << 63 | 3),
+            table_branch: None,
+            e_tag: None,
+            endpoints: ("Person".to_string(), "Person".to_string()),
+        };
+        let on_branch = GraphIndexTableState {
+            staged_version: Some(1 << 63 | 4),
+            ..on_main.clone()
+        };
+        assert_ne!(
+            GraphIndexCacheKey {
+                edge_tables: vec![on_main]
+            },
+            GraphIndexCacheKey {
+                edge_tables: vec![on_branch]
+            }
+        );
+
+        let handle_on_main = TableHandleKey {
+            table_path: "nodes/person".to_string(),
+            table_branch: None,
+            version: 3,
+            staged_version: Some(1 << 63 | 3),
+            e_tag: None,
+        };
+        let handle_on_branch = TableHandleKey {
+            staged_version: Some(1 << 63 | 4),
+            ..handle_on_main.clone()
+        };
+        assert_ne!(handle_on_main, handle_on_branch);
     }
 
     fn empty_index() -> Arc<GraphIndex> {
@@ -655,6 +689,7 @@ mod tests {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
             table_key: "edge:Knows".to_string(),
             table_version: 7,
+            staged_version: None,
             table_branch: None,
             e_tag: Some("etag".to_string()),
             endpoints: ("Person".to_string(), "Person".to_string()),
@@ -681,6 +716,7 @@ mod tests {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
             table_key: "edge:Knows".to_string(),
             table_version: 1,
+            staged_version: None,
             table_branch: None,
             e_tag: None,
             endpoints: ("Person".to_string(), "Person".to_string()),

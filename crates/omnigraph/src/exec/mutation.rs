@@ -544,7 +544,6 @@ async fn open_table_for_mutation(
         opened.table_branch.clone(),
         opened.pinned_native_ref.clone(),
         opened.entry.clone(),
-        opened.deferred_fork.clone(),
         opened.expected_version,
         op_kind,
     )?;
@@ -635,14 +634,6 @@ decide_seam! {
 
 decide_seam! {
     pub static MUTATION_POST_FINALIZE_PRE_PUBLISHER = ("mutation.post_finalize_pre_publisher", Mutation, [Fail]);
-}
-
-decide_seam! {
-    /// After the manifest published every pin and before the writer promotes
-    /// them from its held handles (RFC 0067). The write is durable and
-    /// visible; a failure here leaves the pins pending for the next writer
-    /// of each table or for cleanup.
-    pub static MUTATION_POST_PUBLISH_PRE_PROMOTION = ("mutation.post_publish_pre_promotion", Mutation, [Fail]);
 }
 
 decide_seam! {
@@ -1018,11 +1009,8 @@ impl Omnigraph {
                 let super::staging::CommittedMutation {
                     updates,
                     expected_versions,
-                    promotions,
                     guards: _queue_guards,
-                } = staged
-                    .commit_all(self, requested.as_deref(), &txn, &lineage_intent)
-                    .await?;
+                } = staged.commit_all(self, requested.as_deref(), &txn).await?;
                 // Failpoint for the detached-effects → publisher boundary:
                 // every table effect is committed detached but nothing is
                 // graph-visible. A failure here leaves the graph unchanged and
@@ -1043,16 +1031,6 @@ impl Omnigraph {
                 // so a publish failure leaves the graph unchanged; the error
                 // is returned as is (a moved head is `ReadSetChanged`).
                 let commit = publish_result?;
-                // Promotion lands each pin's linear twin from the handles this
-                // writer holds. The write is already durable and visible, so
-                // a failure here is logged and left for the next writer.
-                match fail(&MUTATION_POST_PUBLISH_PRE_PROMOTION) {
-                    Ok(()) => self.promote_held_all(promotions).await,
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "promotion skipped after publication; the next writer promotes"
-                    ),
-                }
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: Some(commit),

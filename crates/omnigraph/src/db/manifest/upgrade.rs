@@ -24,12 +24,16 @@ use super::{
 };
 use crate::seams::{decide_seam, fail};
 
+#[path = "upgrade/detached_only.rs"]
+mod detached_only;
+
 pub(super) const UPGRADE_PENDING_KEY: &str = "omnigraph:storage_upgrade_pending";
 const UPGRADE_RECEIPT_KEY: &str = "omnigraph:storage_upgrade_receipt";
 const HANDLER: &str = "registration-clocks-v6-to-v7";
 const RETIREMENT_HANDLER: &str = "native-retirement-v7-to-v8";
 const DETACHED_PINS_HANDLER: &str = "detached-pins-v8-v9-to-v10";
-const DEFAULT_TARGET: u32 = 10;
+const DETACHED_ONLY_HANDLER: &str = "detached-only-v10-to-v11";
+const DEFAULT_TARGET: u32 = 11;
 const RETIREMENT_KEY: &str = "omnigraph.retired_manifest_branch";
 const MAX_BRANCHES: usize = 1024;
 const MAX_VERSIONS: usize = 100_000;
@@ -227,7 +231,7 @@ fn intent_from(dataset: &Dataset) -> Result<Option<UpgradeIntent>> {
     let mut names = HashSet::new();
     if !matches!(
         (intent.protocol, intent.source_format, intent.target_format),
-        (1, 6, 7) | (2, 7, 8) | (3, 8, 10) | (3, 9, 10)
+        (1, 6, 7) | (2, 7, 8) | (3, 8, 10) | (3, 9, 10) | (4, 10, 11)
     ) || intent.attempt.parse::<ulid::Ulid>().is_err()
         || intent.graph_identity.is_empty()
         || intent.branches.is_empty()
@@ -264,13 +268,13 @@ async fn run(
     policy: Option<&dyn omnigraph_policy::PolicyChecker>,
     report: &mut UpgradeReport,
 ) -> Result<()> {
-    if !matches!(report.target_format, 7 | 8 | 10) {
+    if !matches!(report.target_format, 7 | 8 | 10 | 11) {
         if let Ok(main) = open(root, None).await {
             report.observed_format = read_stamp(&main);
         }
         report.finding(
             "unsupported_target",
-            "this binary has registered routes to formats 7, 8 and 10 only; v9 was the system-column vintage, which since v10 is converted on a served graph by `omnigraph schema upgrade-system-columns`",
+            "this binary has registered routes to formats 7, 8, 10 and 11 only; v9 was the system-column vintage, which since v10 is converted on a served graph by `omnigraph schema upgrade-system-columns`",
         );
         return Ok(());
     }
@@ -279,7 +283,7 @@ async fn run(
     } else {
         Some(crate::db::reserve_export_root_exclusion(root)?)
     };
-    for _ in 0..3 {
+    for _ in 0..4 {
         let main = open(root, None).await?;
         let stamp = read_stamp(&main);
         if report.observed_format.is_none() {
@@ -316,7 +320,8 @@ async fn run(
             .unwrap_or_else(|| match stamp {
                 Some(6) => 7,
                 Some(7) => report.target_format.min(8),
-                Some(stamp) if stamp >= 8 => report.target_format,
+                Some(8) | Some(9) => report.target_format.min(10),
+                Some(stamp) if stamp >= 10 => report.target_format,
                 _ => report.target_format.min(8),
             });
         let initial_step = pending
@@ -329,7 +334,7 @@ async fn run(
             report.route.push(RETIREMENT_HANDLER.into());
         }
         if matches!(initial_step, 6..=9)
-            && report.target_format == 10
+            && report.target_format >= 10
             && !report
                 .route
                 .iter()
@@ -337,14 +342,26 @@ async fn run(
         {
             report.route.push(DETACHED_PINS_HANDLER.into());
         }
+        if matches!(initial_step, 6..=10)
+            && report.target_format == 11
+            && !report
+                .route
+                .iter()
+                .any(|entry| entry == DETACHED_ONLY_HANDLER)
+        {
+            report.route.push(DETACHED_ONLY_HANDLER.into());
+        }
         run_step(root, options, actor, policy, report, step_target).await?;
         if options.check {
             if step_target < report.target_format && report.success() {
                 if step_target == 7 {
                     report.work.deferred_checks.insert("v7-to-v8 preflight must validate the converted v7 output before the second handler has effects".into());
                 }
-                if report.target_format == 10 {
+                if step_target < 10 && report.target_format >= 10 {
                     report.work.deferred_checks.insert("the v10 stamp step validates the converted v8 output's live branches before it has effects".into());
+                }
+                if report.target_format == 11 {
+                    report.work.deferred_checks.insert("the v11 step judges the converted v10 output's pins on every live branch before it has effects".into());
                 }
             }
             return Ok(());
@@ -355,7 +372,7 @@ async fn run(
         report.work.deferred_checks.clear();
     }
     Err(invalid(
-        "storage upgrade route exceeded its three registered steps",
+        "storage upgrade route exceeded its four registered steps",
     ))
 }
 
@@ -499,13 +516,14 @@ async fn run_step(
     if pending.is_none()
         && !matches!(
             (read_stamp(&main), step_target),
-            (Some(6), 7) | (Some(7), 8) | (Some(8), 10) | (Some(9), 10)
+            (Some(6), 7) | (Some(7), 8) | (Some(8), 10) | (Some(9), 10) | (Some(10), 11)
         )
     {
-        report.finding("unsupported_source", "only validated v6, v7, v8 and v9 graphs have conversion handlers; preserve the source and use its executable for export/import");
+        report.finding("unsupported_source", "only validated v6, v7, v8, v9 and v10 graphs have conversion handlers; preserve the source and use its executable for export/import");
         return Ok(());
     }
-    let intent = match pending {
+    let resumed = pending.is_some();
+    let mut intent = match pending {
         Some(intent) => {
             if intent.graph_identity != schema_state.schema_identity_domain {
                 return Err(invalid("upgrade schema identity changed"));
@@ -517,7 +535,8 @@ async fn run_step(
     let handler = match intent.source_format {
         6 => HANDLER,
         7 => RETIREMENT_HANDLER,
-        _ => DETACHED_PINS_HANDLER,
+        8 | 9 => DETACHED_PINS_HANDLER,
+        _ => DETACHED_ONLY_HANDLER,
     };
     if !report.route.iter().any(|entry| entry == handler) {
         report.route.push(handler.into());
@@ -541,6 +560,31 @@ async fn run_step(
                     actor,
                 )
                 .map_err(|e| OmniError::Policy(e.to_string()))?;
+        }
+    }
+    if handler == DETACHED_ONLY_HANDLER && !resumed {
+        let blocked = if options.check {
+            detached_only::preflight(root).await?
+        } else {
+            let work = detached_only::execute(root).await?;
+            tracing::info!(
+                promoted = work.promoted,
+                reaped = work.reaped,
+                recorded = work.recorded,
+                published_branches = work.published_branches,
+                "detached-only conversion: pins promoted, copies reaped, last linear versions recorded"
+            );
+            work.blocked
+        };
+        if !blocked.is_empty() {
+            for pin in blocked {
+                report.finding("blocked_promotion", pin);
+            }
+            return Ok(());
+        }
+        if !options.check {
+            let main = open(root, None).await?;
+            intent = inventory(&main, schema_state.schema_identity_domain.clone()).await?;
         }
     }
     verify_inventory(root, &intent, report.recovery.is_some()).await?;
@@ -686,14 +730,16 @@ async fn inventory(main: &Dataset, graph_identity: String) -> Result<UpgradeInte
         protocol: match source_format {
             6 => 1,
             7 => 2,
-            _ => 3,
+            8 | 9 => 3,
+            _ => 4,
         },
         attempt: ulid::Ulid::new().to_string(),
         source_format,
-        target_format: if source_format >= 8 {
-            DEFAULT_TARGET
-        } else {
-            source_format + 1
+        target_format: match source_format {
+            6 => 7,
+            7 => 8,
+            8 | 9 => 10,
+            _ => DEFAULT_TARGET,
         },
         graph_identity,
         branches: sources,
@@ -731,10 +777,6 @@ fn branch_completed(
                     && dataset.schema().metadata.contains_key(UPGRADE_PENDING_KEY),
             ))
             .ok_or_else(|| invalid("upgrade version overflow"))?;
-        // A receipt from an earlier, lower-protocol step of the same route
-        // (v6 -> v7 before v7 -> v8, either before v8 -> v10) marks a
-        // completed predecessor, not a foreign attempt: this step has not
-        // begun on the branch.
         if intent.protocol > found.protocol
             && found.attempt != intent.attempt
             && dataset.version().version == source_head
@@ -943,10 +985,6 @@ async fn preflight(root: &str, intent: &UpgradeIntent, work: &mut UpgradeWork) -
             }
         }
         work.metadata_rows += u64::try_from(count).map_err(|e| invalid(e.to_string()))?;
-        // A v8 or v9 source keeps every byte and every interpretation; the
-        // v10 handler only restamps live branches, so its retained history
-        // needs no qualification. The v6/v7 handlers rewrite or reinterpret
-        // registrations and qualify every retained snapshot first.
         if intent.source_format >= 8 {
             continue;
         }
@@ -1264,6 +1302,13 @@ async fn publish_activation(dataset: Dataset) -> Result<Dataset> {
 
 decide_seam! {
     pub static UPGRADE_AFTER_STAGE = ("upgrade.after_stage", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// Between two reaps of one promoted chain in the v11 step, oldest link
+    /// deleted first; a retry after a failure here rediscovers the rest from
+    /// the registered tip.
+    pub static UPGRADE_DETACHED_ONLY_BETWEEN_REAPS = ("upgrade.detached_only_between_reaps", Unreachable, [Fail]);
 }
 
 async fn publish_conversion(

@@ -34,6 +34,7 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
     .await
     .unwrap();
     drop(db);
+    settle_fixture_pins(root).await;
     let mut dataset = open(root, None).await.unwrap();
     dataset
         .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "6")])
@@ -58,10 +59,52 @@ async fn synthetic_v6_fixture_with_branch(root: &str, create_branch: bool) {
     }
 }
 
-/// The default route on a branch-free synthetic v6 graph runs all three
-/// steps and lands at v9; `--check` names both deferred preflights first.
+/// Replay every pin before a fixture is restamped as an older format: a
+/// genuine one names linear versions only, and the fixture's write leaves its
+/// pin pending.
+async fn settle_fixture_pins(root: &str) {
+    use crate::db::omnigraph::promotion::{Promotion, replay_pin};
+    let db = Omnigraph::open(root).await.unwrap();
+    for branch in crate::db::omnigraph::optimize::cleanup_graph_branches(&db)
+        .await
+        .unwrap()
+    {
+        let snapshot = db
+            .fresh_snapshot_for_branch(branch.as_deref())
+            .await
+            .unwrap();
+        for entry in snapshot.datasets() {
+            let (Some(staged), Some(uuid)) = (
+                entry.version_metadata.staged_version(),
+                entry.version_metadata.transaction_uuid(),
+            ) else {
+                continue;
+            };
+            let full_path = format!("{}/{}", db.uri(), entry.dataset_path);
+            let outcome = replay_pin(
+                &db,
+                &entry.type_key,
+                &full_path,
+                entry.native_dataset_branch.as_deref(),
+                entry.published_dataset_version,
+                staged,
+                uuid,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(outcome, Promotion::Promoted(_) | Promotion::AlreadyPromoted),
+                "{}: {outcome:?}",
+                entry.type_key
+            );
+        }
+    }
+}
+
+/// The default route on a branch-free synthetic v6 graph runs all four
+/// steps and lands at v11; `--check` names the deferred preflights first.
 #[tokio::test]
-async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10() {
+async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v11() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -80,9 +123,14 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10() {
     assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
     assert_eq!(
         check.route,
-        [HANDLER, RETIREMENT_HANDLER, DETACHED_PINS_HANDLER]
+        [
+            HANDLER,
+            RETIREMENT_HANDLER,
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER
+        ]
     );
-    assert_eq!(check.work.deferred_checks.len(), 2, "{check:?}");
+    assert_eq!(check.work.deferred_checks.len(), 3, "{check:?}");
     assert_eq!(stored_files(dir.path()), before);
 
     let upgraded = upgrade_storage(root, UpgradeOptions::default())
@@ -91,7 +139,12 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10() {
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
     assert_eq!(
         upgraded.completed_handlers,
-        [HANDLER, RETIREMENT_HANDLER, DETACHED_PINS_HANDLER]
+        [
+            HANDLER,
+            RETIREMENT_HANDLER,
+            DETACHED_PINS_HANDLER,
+            DETACHED_ONLY_HANDLER
+        ]
     );
     let reopened = Omnigraph::open(root).await.unwrap();
     assert_eq!(
@@ -99,7 +152,7 @@ async fn storage_upgrade_default_route_takes_a_synthetic_v6_graph_to_v10() {
             .internal_schema_version_of(crate::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10
+        11
     );
     // The storage route keeps the legacy spellings; the vintage is the
     // schema IR's, and `omnigraph schema upgrade-system-columns` converts it
@@ -338,7 +391,7 @@ async fn storage_upgrade_interruption_boundaries_retry_without_mixed_visibility(
             assert!(Omnigraph::open_read_only(root).await.is_ok(), "{boundary}");
             for branch in [None, Some("feature")] {
                 let dataset = open(root, branch).await.unwrap();
-                assert_eq!(read_stamp(&dataset), Some(10), "{boundary}");
+                assert_eq!(read_stamp(&dataset), Some(11), "{boundary}");
             }
         }
     }
@@ -806,7 +859,10 @@ async fn storage_upgrade_v7_to_v8_preserves_manifest_fragments_and_history() {
         .await
         .unwrap();
     assert_eq!(finished.outcome, UpgradeOutcome::Completed, "{finished:?}");
-    assert_eq!(finished.completed_handlers, [DETACHED_PINS_HANDLER]);
+    assert_eq!(
+        finished.completed_handlers,
+        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+    );
     assert!(Omnigraph::open(root).await.is_ok());
     let before = stored_files(dir.path());
     let downgrade = upgrade_storage(
@@ -972,7 +1028,7 @@ async fn storage_upgrade_preserves_prior_v6_to_v7_pending_intent_before_continui
         assert_eq!(forged_version, source_version + 1);
         let mut dataset = publish_activation(dataset).await.unwrap();
         dataset
-            .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "10")])
+            .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "11")])
             .await
             .unwrap();
         drop(dataset);
@@ -1015,6 +1071,29 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     db.branch_delete("parent").await.unwrap();
     db.branch_create("parent").await.unwrap();
     drop(db);
+    let main = open(root, None).await.unwrap();
+    let retired = crate::branch_control::list_archived_manifest_branches(&main)
+        .await
+        .unwrap();
+    assert_eq!(retired.len(), 1);
+    let store = main.object_store(None).await.unwrap();
+    let base = main.branch_location().find_main().unwrap().path;
+    for (native, contents) in retired {
+        store
+            .put(
+                &lance::dataset::refs::branch_contents_path(&base, &native),
+                &serde_json::to_vec(&contents).unwrap(),
+            )
+            .await
+            .unwrap();
+        let archive = main
+            .branch_location()
+            .find_branch(Some(&native))
+            .unwrap()
+            .path
+            .join(crate::branch_control::RETIRED_BRANCH_ARCHIVE);
+        store.delete(&archive).await.unwrap();
+    }
     restamp_all_manifests(root, 8).await;
     let main = open(root, None).await.unwrap();
     let physical = crate::branch_control::list_branch_contents(&main)
@@ -1042,14 +1121,14 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
         assert_eq!(result.outcome, UpgradeOutcome::AlreadyCurrent, "{result:?}");
         assert_eq!(stored_files(dir.path()), before);
     }
-    // The v10 route restamps main and the two live branches; the retired
-    // ancestor keeps its v8 stamp and its ancestry, and the recreated name
-    // stays distinct from it.
     let upgraded = upgrade_storage(root, UpgradeOptions::default())
         .await
         .unwrap();
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
-    assert_eq!(upgraded.completed_handlers, [DETACHED_PINS_HANDLER]);
+    assert_eq!(
+        upgraded.completed_handlers,
+        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+    );
     let reopened = Omnigraph::open(root).await.unwrap();
     assert_eq!(
         reopened.branch_list().await.unwrap(),
@@ -1061,7 +1140,7 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
                 .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
                 .await
                 .unwrap(),
-            10,
+            11,
             "live branch {branch} is restamped"
         );
     }
@@ -1101,10 +1180,9 @@ async fn storage_upgrade_current_v8_preserves_retired_ancestry_and_recreated_nam
     assert_eq!(stored_files(dir.path()), before);
 }
 
-/// A graph born at the current stamp (v10) already sits at the default route
+/// A graph born at the current stamp (v11) already sits at the default route
 /// target: the default and the served explicit target are already current
-/// and effect-free; a lower target is refused without effects, and v9, which
-/// was the system-column vintage marker, is no target at all.
+/// and effect-free; a lower target is refused without effects; v9 is no target.
 #[tokio::test]
 async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
     #[cfg(feature = "failpoints")]
@@ -1133,7 +1211,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
             Some(crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION)
         );
         assert_eq!(stored_files(dir.path()), before);
-        for to_format in [10] {
+        for to_format in [11] {
             let explicit_served = upgrade_storage(
                 root,
                 UpgradeOptions {
@@ -1154,7 +1232,8 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
             (7, "target_below_stamp"),
             (8, "target_below_stamp"),
             (9, "unsupported_target"),
-            (11, "unsupported_target"),
+            (10, "target_below_stamp"),
+            (12, "unsupported_target"),
         ] {
             let refused = upgrade_storage(
                 root,
@@ -1183,7 +1262,7 @@ async fn storage_upgrade_current_vintage_is_already_current_without_a_route() {
     }
     let mut dataset = open(root, None).await.unwrap();
     dataset
-        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "11")])
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY, "12")])
         .await
         .unwrap();
     drop(dataset);
@@ -1263,11 +1342,11 @@ async fn storage_upgrade_legacy_source_refuses_reserved_retirement_metadata_with
     }
 }
 
-/// The default route ends at v9: a legacy v8 graph with only main runs the
-/// system-column step, `--to-format 8` stays already current before and after,
-/// and a v8 graph with another branch is refused before any effect.
+/// The default route ends at v11: a legacy v8 graph with only main runs the
+/// v10 restamp and the v11 step, `--to-format 8` stays already current before
+/// and after, and a v8 graph with another branch is refused before any effect.
 #[tokio::test]
-async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10() {
+async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v11() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1306,9 +1385,9 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10() {
     .await
     .unwrap();
     assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
-    assert_eq!(check.target_format, 10);
+    assert_eq!(check.target_format, 11);
     assert!(check.target_defaulted);
-    assert_eq!(check.route, [DETACHED_PINS_HANDLER]);
+    assert_eq!(check.route, [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]);
     assert_eq!(stored_files(dir.path()), before, "check writes nothing");
 
     let upgraded = upgrade_storage(
@@ -1321,7 +1400,10 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10() {
     .await
     .unwrap();
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
-    assert_eq!(upgraded.completed_handlers, [DETACHED_PINS_HANDLER]);
+    assert_eq!(
+        upgraded.completed_handlers,
+        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+    );
     assert_eq!(
         upgraded.last_durable_completed_boundary.as_deref(),
         Some("activated")
@@ -1332,7 +1414,7 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10() {
             .internal_schema_version_of(crate::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10
+        11
     );
     let snapshot = reopened.snapshot().await;
     let person = reopened
@@ -1345,7 +1427,7 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10() {
         "the storage route keeps the legacy spellings"
     );
     drop(reopened);
-    for to_format in [None, Some(10)] {
+    for to_format in [None, Some(11)] {
         let again = upgrade_storage(
             root,
             UpgradeOptions {
@@ -1412,15 +1494,15 @@ async fn storage_upgrade_default_route_takes_a_legacy_v8_graph_to_v10() {
                 .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
                 .await
                 .unwrap(),
-            10
+            11
         );
     }
 }
 
-/// A v9 graph, the 0.11.x current vintage, takes the metadata-only route to
-/// v10 with every branch restamped and nothing else touched.
+/// A v9 graph, the 0.11.x current vintage, takes the v10 restamp and then the
+/// v11 step, with every branch restamped and no payload copied or rewritten.
 #[tokio::test]
-async fn storage_upgrade_default_route_takes_a_v9_graph_to_v10() {
+async fn storage_upgrade_default_route_takes_a_v9_graph_to_v11() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1447,8 +1529,8 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v10() {
     .unwrap();
     assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
     assert_eq!(check.observed_format, Some(9));
-    assert_eq!(check.target_format, 10);
-    assert_eq!(check.route, [DETACHED_PINS_HANDLER]);
+    assert_eq!(check.target_format, 11);
+    assert_eq!(check.route, [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]);
     assert_eq!(stored_files(dir.path()), before, "check writes nothing");
     let unsupported = upgrade_storage(
         root,
@@ -1471,7 +1553,10 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v10() {
         .await
         .unwrap();
     assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
-    assert_eq!(upgraded.completed_handlers, [DETACHED_PINS_HANDLER]);
+    assert_eq!(
+        upgraded.completed_handlers,
+        [DETACHED_PINS_HANDLER, DETACHED_ONLY_HANDLER]
+    );
     assert_eq!(upgraded.work.payload_bytes_copied, 0);
     assert_eq!(upgraded.work.payload_bytes_rewritten, 0);
     let reopened = Omnigraph::open(root).await.unwrap();
@@ -1482,7 +1567,7 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v10() {
                 .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
                 .await
                 .unwrap(),
-            10
+            11
         );
     }
     drop(reopened);
@@ -1490,4 +1575,327 @@ async fn storage_upgrade_default_route_takes_a_v9_graph_to_v10() {
         .await
         .unwrap();
     assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
+}
+
+/// A v10 graph takes the engine-backed route to v11: the check judges every
+/// pin and writes nothing; execution promotes the pending pin once, reaps its
+/// copy, records the last linear version on every live branch and restamps.
+#[tokio::test]
+async fn storage_upgrade_default_route_takes_a_v10_graph_to_v11() {
+    use crate::db::omnigraph::promotion::{open_at, table_location, walk_chain};
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let graph = std::sync::Arc::new(
+        Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap(),
+    );
+    let session = crate::Session::from_defaults(
+        std::sync::Arc::clone(&graph),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    for name in ["first", "second", "third"] {
+        session
+            .mutate(
+                "main",
+                "query seed($name: String) { insert Person { name: $name } }",
+                "seed",
+                &HashMap::from([(
+                    "name".to_string(),
+                    omnigraph_compiler::query::ast::Literal::String(name.to_string()),
+                )]),
+            )
+            .await
+            .unwrap();
+    }
+    drop(session);
+    graph.branch_create("feature").await.unwrap();
+    let pin = graph
+        .snapshot_for_branch(None)
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .clone();
+    let staged = pin
+        .version_metadata
+        .staged_version()
+        .expect("the insert published a pin");
+    let uuid = pin
+        .version_metadata
+        .transaction_uuid()
+        .expect("the pin names its transaction")
+        .to_string();
+    let full_path = format!("{}/{}", graph.uri(), pin.dataset_path);
+    let location = table_location(&full_path, pin.native_dataset_branch.as_deref());
+    let (_, chain) = walk_chain(&graph, &location, staged).await.unwrap();
+    assert_eq!(chain.len(), 3);
+    drop(graph);
+    restamp_all_manifests(root, 10).await;
+    let refused = match Omnigraph::open(root).await {
+        Ok(_) => panic!("a v10 graph is refused by normal open"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("reads only v11 to v11"),
+        "a v10 graph is refused by normal open: {refused}"
+    );
+
+    let before = stored_files(dir.path());
+    let check = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: true,
+            to_format: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(check.outcome, UpgradeOutcome::CheckPassed, "{check:?}");
+    assert_eq!(check.observed_format, Some(10));
+    assert_eq!(check.target_format, 11);
+    assert!(check.target_defaulted);
+    assert_eq!(check.route, [DETACHED_ONLY_HANDLER]);
+    assert_eq!(stored_files(dir.path()), before, "check writes nothing");
+
+    #[cfg(feature = "failpoints")]
+    {
+        let interrupted = {
+            let _fault = catalog::UPGRADE_DETACHED_ONLY_BETWEEN_REAPS.fire_always();
+            upgrade_storage(root, UpgradeOptions::default())
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            interrupted.outcome,
+            UpgradeOutcome::CheckFailed,
+            "{interrupted:?}"
+        );
+        assert!(
+            interrupted.findings.iter().any(|finding| finding
+                .message
+                .contains("upgrade.detached_only_between_reaps")),
+            "{interrupted:?}"
+        );
+        for (index, (version, _)) in chain.iter().enumerate() {
+            assert_eq!(
+                Path::new(&full_path)
+                    .join(format!("_versions/d{version}.manifest"))
+                    .exists(),
+                index < 2,
+                "only the oldest link is reaped before interruption"
+            );
+        }
+    }
+
+    let upgraded = upgrade_storage(root, UpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
+    assert_eq!(upgraded.completed_handlers, [DETACHED_ONLY_HANDLER]);
+    assert_eq!(
+        upgraded.last_durable_completed_boundary.as_deref(),
+        Some("activated")
+    );
+
+    let reopened = Omnigraph::open(root).await.unwrap();
+    assert_eq!(reopened.branch_list().await.unwrap(), ["main", "feature"]);
+    for branch in ["main", "feature"] {
+        assert_eq!(
+            reopened
+                .internal_schema_version_of(crate::db::ReadTarget::branch(branch))
+                .await
+                .unwrap(),
+            11,
+            "live branch {branch} is restamped"
+        );
+        let snapshot = reopened.snapshot_for_branch(Some(branch)).await.unwrap();
+        for entry in snapshot.datasets() {
+            assert_eq!(
+                entry.version_metadata.last_linear_version(),
+                Some(entry.published_dataset_version),
+                "{branch}: {} records the last linear version",
+                entry.type_key
+            );
+        }
+        let person = snapshot.dataset("node:Person").unwrap();
+        assert_eq!(
+            person.published_dataset_version,
+            pin.published_dataset_version
+        );
+        assert_eq!(
+            person.version_metadata.transaction_uuid(),
+            Some(uuid.as_str()),
+            "{branch}: the registration keeps its pin"
+        );
+    }
+    let twin = open_at(&reopened, &location, pin.published_dataset_version)
+        .await
+        .unwrap()
+        .expect("the pending pin was promoted once");
+    assert_eq!(
+        reopened.storage().transaction_identity(&twin).unwrap().uuid,
+        uuid,
+        "the twin carries the pin's transaction"
+    );
+    for (version, _) in &chain {
+        assert!(
+            open_at(&reopened, &location, *version)
+                .await
+                .unwrap()
+                .is_none(),
+            "every proven chain link is reaped after retry"
+        );
+    }
+    let cleanup = reopened
+        .cleanup(crate::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+    assert!(cleanup.iter().all(|row| row.error.is_none()), "{cleanup:?}");
+    let snapshot = reopened.snapshot().await;
+    let person = reopened
+        .storage()
+        .open_snapshot_at_table(&snapshot, "node:Person")
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.storage().count_rows(&person, None).await.unwrap(),
+        3,
+        "all rows resolve through the twin after an interrupted conversion"
+    );
+    drop(reopened);
+
+    for to_format in [None, Some(11)] {
+        let again = upgrade_storage(
+            root,
+            UpgradeOptions {
+                check: false,
+                to_format,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
+    }
+    let below = upgrade_storage(
+        root,
+        UpgradeOptions {
+            check: true,
+            to_format: Some(10),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(below.outcome, UpgradeOutcome::CheckFailed, "{below:?}");
+    assert!(
+        below
+            .findings
+            .iter()
+            .any(|finding| finding.code == "target_below_stamp"),
+        "{below:?}"
+    );
+}
+
+/// The `cleanup` consumer fixture on an upgraded v10 graph: the last linear
+/// version is a permanent root, the linear versions below it that only pruned
+/// `__manifest` versions name are swept, and nothing is deferred or foreign.
+#[tokio::test]
+async fn storage_upgrade_then_cleanup_sweeps_linear_history_below_the_last_linear_version() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let graph = std::sync::Arc::new(
+        Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap(),
+    );
+    let session = crate::Session::from_defaults(
+        std::sync::Arc::clone(&graph),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    session
+        .mutate(
+            "main",
+            "query seed($name: String) { insert Person { name: $name } }",
+            "seed",
+            &HashMap::from([(
+                "name".to_string(),
+                omnigraph_compiler::query::ast::Literal::String("before upgrade".to_string()),
+            )]),
+        )
+        .await
+        .unwrap();
+    drop(session);
+    graph.branch_create("feature").await.unwrap();
+    let twin = graph
+        .snapshot_for_branch(None)
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
+    drop(graph);
+    restamp_all_manifests(root, 10).await;
+    let upgraded = upgrade_storage(root, UpgradeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
+
+    let reopened = Omnigraph::open(root).await.unwrap();
+    let keep_one = crate::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    };
+    let before = reopened.cleanup_plan(keep_one.clone()).await.unwrap();
+    let plan = before
+        .tables
+        .iter()
+        .find(|plan| plan.table_key == "node:Person")
+        .unwrap();
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert_eq!(plan.last_linear_version, Some(twin));
+    assert!(plan.linear_roots.contains(&twin), "{:?}", plan.linear_roots);
+    assert_eq!(
+        plan.linear_sweep,
+        vec![1],
+        "the creation version, named only by pruned registrations, is swept"
+    );
+    let stats = reopened.cleanup(keep_one.clone()).await.unwrap();
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(row.error.is_none(), "{row:?}");
+    assert_eq!(row.old_versions_removed, 1, "{row:?}");
+    assert!(row.foreign_versions.is_empty(), "{row:?}");
+
+    let after = reopened.cleanup_plan(keep_one).await.unwrap();
+    let plan = after
+        .tables
+        .iter()
+        .find(|plan| plan.table_key == "node:Person")
+        .unwrap();
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert_eq!(
+        plan.linear_present,
+        std::collections::BTreeSet::from([twin])
+    );
+    assert!(plan.would_remove().is_empty(), "{:?}", plan.would_remove());
+    let snapshot = reopened.snapshot().await;
+    let person = reopened
+        .storage()
+        .open_snapshot_at_table(&snapshot, "node:Person")
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.storage().count_rows(&person, None).await.unwrap(),
+        1,
+        "the row still resolves through the permanent root"
+    );
 }

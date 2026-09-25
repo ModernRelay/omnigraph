@@ -1,9 +1,9 @@
 # issue: 694
 # red_on: fb6ed452 (2026-09-12), cleanup disabled: step 8 rejects the unrelated write with pending BranchMerge on branch 'target'
-# notes: Source and donor diverge; target inherits donor without owning a table fork.
-# notes: The fault fires after the first table's detached chain, including the created first-touch fork, and before publication.
-# notes: Reads and the next unrelated write use the same Omnigraph without reopening.
-# notes: The failed merge's detached chain and fork on the named target are reclaimable garbage, so step 8 succeeds and the merge retry lands.
+# notes: Source and donor diverge; target inherits donor's rows.
+# notes: The fault fires after the first detached table effect and before publication.
+# notes: Target rows stay unchanged, and an unrelated Marker write succeeds on the same handle without reopening.
+# notes: Source rows stay isolated, and retrying the merge succeeds.
 
 --- runner
 timeout_ms: 10000

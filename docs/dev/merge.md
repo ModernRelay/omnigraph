@@ -25,8 +25,7 @@ The table classifier chooses one of four routes:
 
 1. **No change:** source contributes nothing.
 2. **Pointer adoption:** target still equals the base and the exact source table
-   state can become the target's visible pointer without copying rows. A
-   first-touch lazy target stays on this ref-only route.
+   state can become the target's visible pointer without copying rows.
 3. **Proven insertion replay:** target still permits data replay and the
    complete retained source interval proves a contiguous sequence of exact-ID,
    insertion-only transactions.
@@ -37,18 +36,17 @@ An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
 
-On the adopt route, every named target selects the source's exact table ref,
-version, and metadata, including when the target already owns a fork. Main
-keeps its data-delta route for a source on a named ref. Numeric table versions
-are not compared across refs: the publication's manifest version orders the
-registration within the graph branch (RFC 0062).
+On the adopt route, every target, main included, selects the source's exact
+table ref, version and pin: the target's registration takes the source's
+`staged_version` in the same dataset, with no fenced insert, keyed update or
+payload copy, and external blob descriptors stay external. Numeric table
+versions are not compared across refs: the publication's manifest version
+orders the registration within the graph branch (RFC 0062).
 
-The source's owner metadata stays with an adopted pointer. A later target
-write creates a unique target-owned fork from the accepted source version.
-Old target forks remain available to other branches and native descendants;
-explicit cleanup reclaims only forks outside that protection set. Pointer
-adoption still computes any required validation delta and runs the shared
-constraint evaluator.
+The source's registration metadata stays with an adopted pointer. A later
+target write stages detached on that same dataset from the adopted pin; no
+table fork is created. Pointer adoption still computes any required
+validation delta and runs the shared constraint evaluator.
 
 ## Proven insertion route
 
@@ -238,18 +236,22 @@ structured result to its public 409 representation.
 
 ## Publication and recovery
 
-A merge with physical table effects chains each merged table's chunks as
-detached commits on the target's pin and publishes one pin per table (RFC
-0067); pointer-only siblings ride the same manifest CAS, and a merge
-containing only pointer changes stages nothing. A first-touch fork is created
-without an intent record.
+A merge into a named branch with physical table effects chains each merged
+table's chunks as detached commits on the target's pin and publishes one pin
+per table, `base + 1` as its `published_dataset_version` and the chain's
+tip as its `staged_version` (RFC 0067, detached-only). A merge onto main is
+a pointer switch: main's registration takes the source's pin, and the merge
+stages nothing; an empty source delta leaves main's registration untouched.
+Pointer-only siblings ride the same manifest CAS, and no table fork is
+created. The merge proofs walk the source's commit chain by `read_version`
+links from the source pin to the base pin (`try_proven_pure_insert_history`,
+`proven_chain_fragments`, `chain_reaches`, `plan_lineage_merge`).
 
 A failure anywhere before the CAS returns the original error and leaves the
-target untouched: the chunk chains and any fork the attempt created are
-reclaimable garbage, and a retry plans from scratch. A target that advanced
+target untouched: the chunk chains are unpublished staging that `cleanup`'s
+collector reclaims, and a retry plans from scratch. A target that advanced
 meanwhile makes the merge lose its CAS and return the ordinary conflict. After
-the CAS the merge is acknowledged, and any pin its promotion did not reach
-stays pending for the next writer or cleanup.
+the CAS the merge is complete; nothing follows the publication.
 
 ## Outcomes
 

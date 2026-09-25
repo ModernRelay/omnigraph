@@ -68,7 +68,7 @@ use crate::blob::{
 use crate::db::manifest::TableVersionMetadata;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
-use crate::seams::{decide_seam, fail, skip};
+use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
     IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
     PendingScanBudget, ProvenInsertChunk,
@@ -466,6 +466,95 @@ pub(crate) fn has_no_by_source_delete_marker(transaction: &Transaction) -> bool 
         .is_some_and(|value| value == NO_BY_SOURCE_DELETE_V1)
 }
 
+/// The ids a delete commit removed, recorded by the writer at staging time
+/// (RFC "Detached-only tables", change discovery): a JSON array inline under
+/// this key up to [`DELETED_IDS_INLINE_MAX_BYTES`], above that in the
+/// table-relative object [`DELETED_IDS_PATH_PROPERTY`] names.
+pub(crate) const DELETED_IDS_PROPERTY: &str = "omnigraph.deleted_ids";
+pub(crate) const DELETED_IDS_PATH_PROPERTY: &str = "omnigraph.deleted_ids_path";
+pub(crate) const DELETED_IDS_INLINE_MAX_BYTES: usize = 64 * 1024;
+
+/// Encoded limit for a complete deleted-ids record loaded by a feed page.
+/// Larger deletes omit the record and use the unpruned scan path.
+pub(crate) const DELETED_IDS_SPILL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Where a delete commit keeps its removed ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeletedIdsRecord {
+    Inline(Vec<String>),
+    /// A JSON array in this object, relative to the table location.
+    Spilled(String),
+}
+
+pub(crate) fn deleted_ids_record(transaction: &Transaction) -> Option<DeletedIdsRecord> {
+    let properties = transaction.transaction_properties.as_deref()?;
+    if let Some(relative) = properties.get(DELETED_IDS_PATH_PROPERTY) {
+        return Some(DeletedIdsRecord::Spilled(relative.clone()));
+    }
+    let inline = properties.get(DELETED_IDS_PROPERTY)?;
+    if inline.len() as u64 > DELETED_IDS_SPILL_MAX_BYTES {
+        return None;
+    }
+    serde_json::from_str::<Vec<String>>(inline)
+        .ok()
+        .map(DeletedIdsRecord::Inline)
+}
+
+fn deleted_ids_spill_path(transaction_uuid: &str) -> String {
+    format!("_omnigraph/deleted_ids/{transaction_uuid}.json")
+}
+
+/// The object-store path of a table-relative file, from the dataset's own
+/// `_versions/` location (`Dataset::base` is private).
+pub(crate) fn table_relative_object_path(
+    dataset: &Dataset,
+    relative: &str,
+) -> object_store::path::Path {
+    let versions_dir = dataset.versions_dir();
+    let mut parts: Vec<_> = versions_dir.parts().collect();
+    parts.pop();
+    parts
+        .into_iter()
+        .chain(object_store::path::Path::from(relative).parts())
+        .collect()
+}
+
+/// The ids a delete commit removed, or `None` when its transaction records
+/// none (a delete staged before the record, or a foreign transaction).
+pub(crate) async fn load_deleted_ids(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<Option<Vec<String>>> {
+    match deleted_ids_record(transaction) {
+        None => Ok(None),
+        Some(DeletedIdsRecord::Inline(ids)) => Ok(Some(ids)),
+        Some(DeletedIdsRecord::Spilled(relative)) => {
+            let store = dataset
+                .object_store(None)
+                .await
+                .map_err(OmniError::storage)?;
+            let path = table_relative_object_path(dataset, &relative);
+            let size = store.size(&path).await.map_err(OmniError::storage)?;
+            if size > DELETED_IDS_SPILL_MAX_BYTES {
+                return Ok(None);
+            }
+            let size = usize::try_from(size).map_err(|error| {
+                OmniError::manifest_internal(format!("deleted-ids record size is invalid: {error}"))
+            })?;
+            let bytes = store
+                .read_one_range(&path, 0..size)
+                .await
+                .map_err(OmniError::storage)?;
+            let ids: Vec<String> = serde_json::from_slice(&bytes).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "deleted-ids record {relative} is not a JSON array of ids: {error}"
+                ))
+            })?;
+            Ok(Some(ids))
+        }
+    }
+}
+
 /// Stamp [`NO_BY_SOURCE_DELETE_PROPERTY`] on a keyed-write transaction before it
 /// is committed. Unconditional: every OmniGraph keyed `merge_insert` is
 /// no-by-source-delete by construction. Mirrors `certify_insert_absence`'s
@@ -531,6 +620,53 @@ pub(crate) fn certified_insert_absence_rows(
     })
 }
 
+/// The source rows a pure-insert proof admits: the rows of the fragments a
+/// chain of detached commits added (RFC "Detached-only tables").
+#[derive(Debug, Clone)]
+pub enum ProvenInsertInterval {
+    Fragments {
+        source_version: u64,
+        fragments: Vec<Fragment>,
+    },
+}
+
+impl ProvenInsertInterval {
+    /// The version the source must be pinned at.
+    pub(crate) fn end_version(&self) -> u64 {
+        match self {
+            Self::Fragments { source_version, .. } => *source_version,
+        }
+    }
+
+    /// The proof's preconditions on `source`: pinned at its end, an exact-id
+    /// primary key.
+    fn validate(
+        &self,
+        source: &Dataset,
+        system_columns: SystemColumns,
+        context: &'static str,
+    ) -> Result<()> {
+        if source.version().version != self.end_version() {
+            return Err(OmniError::manifest_internal(format!(
+                "{context} received source version {}, expected pinned end version {}",
+                source.version().version,
+                self.end_version()
+            )));
+        }
+        exact_id_primary_key_field_id(source, system_columns, context)?;
+        Ok(())
+    }
+
+    /// Restrict a scan of the source to the proven rows.
+    fn select(&self, scanner: &mut ScanTuning<'_>) {
+        match self {
+            Self::Fragments { fragments, .. } => {
+                scanner.with_fragments(fragments.clone());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableState {
     pub version: u64,
@@ -563,7 +699,7 @@ pub enum IndexCoverage {
 ///
 /// RFC 0067 reads the same pair from the transaction file name the manifest
 /// records (`{read_version}-{uuid}.txn`, pinned in `lance_surface_guards`),
-/// so identifying a pin's promoted twin or following a chain of detached
+/// so identifying a pin's linear twin or following a chain of detached
 /// commits costs no request beyond the manifest itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedTransactionIdentity {
@@ -658,6 +794,99 @@ pub struct StagedCompaction {
     pub metrics: CompactionMetrics,
 }
 
+/// Transaction property naming the graph branch incarnation a detached
+/// commit was staged against (detached-only RFC §Garbage collection).
+pub(crate) const STAGED_AGAINST_BRANCH_INCARNATION: &str =
+    "omnigraph.staged_against_branch_incarnation";
+/// Transaction property naming the logical graph head a detached commit was
+/// staged against; empty when the branch had no materialized head.
+pub(crate) const STAGED_AGAINST_GRAPH_HEAD: &str = "omnigraph.staged_against_graph_head";
+
+/// The publication authority a detached commit was staged against: the
+/// branch incarnation and the logical graph head its publish compares and
+/// swaps on. Written into the staged transaction's properties so the
+/// collector reads a manifest's owner from the manifest alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingWitness {
+    branch_incarnation: String,
+    graph_head: Option<String>,
+}
+
+impl StagingWitness {
+    pub(crate) fn new(
+        identifier: &lance::dataset::refs::BranchIdentifier,
+        graph_head: Option<&str>,
+    ) -> Result<Self> {
+        let branch_incarnation = serde_json::to_string(identifier).map_err(|error| {
+            OmniError::manifest_internal(format!("branch identifier is not serializable: {error}"))
+        })?;
+        Ok(Self {
+            branch_incarnation,
+            graph_head: graph_head.map(str::to_string),
+        })
+    }
+
+    pub(crate) fn branch_incarnation(&self) -> &str {
+        &self.branch_incarnation
+    }
+
+    pub(crate) fn graph_head(&self) -> Option<&str> {
+        self.graph_head.as_deref()
+    }
+
+    /// The witness a manifest's transaction records; `None` when a writer
+    /// from before the witness staged it, or its authority is malformed.
+    pub(crate) fn from_transaction(transaction: &Transaction) -> Option<Self> {
+        let properties = transaction.transaction_properties.as_deref()?;
+        let branch_incarnation = properties.get(STAGED_AGAINST_BRANCH_INCARNATION)?.clone();
+        let identifier: lance::dataset::refs::BranchIdentifier =
+            serde_json::from_str(&branch_incarnation).ok()?;
+        if identifier == lance::dataset::refs::BranchIdentifier::missing_identifier_sentinel()
+            || serde_json::to_string(&identifier).ok()? != branch_incarnation
+            || identifier.version_mapping.iter().any(|(_, uuid)| {
+                uuid.len() != 32
+                    || uuid.bytes().all(|byte| byte == b'0')
+                    || !uuid
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            return None;
+        }
+        let recorded_head = properties.get(STAGED_AGAINST_GRAPH_HEAD)?;
+        let graph_head = if recorded_head.is_empty() {
+            None
+        } else {
+            let head = ulid::Ulid::from_string(recorded_head).ok()?;
+            if head.to_string() != *recorded_head {
+                return None;
+            }
+            Some(recorded_head.clone())
+        };
+        Some(Self {
+            branch_incarnation,
+            graph_head,
+        })
+    }
+
+    fn stamp(&self, transaction: &mut Transaction) {
+        let mut properties = transaction
+            .transaction_properties
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+        properties.insert(
+            STAGED_AGAINST_BRANCH_INCARNATION.to_string(),
+            self.branch_incarnation.clone(),
+        );
+        properties.insert(
+            STAGED_AGAINST_GRAPH_HEAD.to_string(),
+            self.graph_head.clone().unwrap_or_default(),
+        );
+        transaction.transaction_properties = Some(Arc::new(properties));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
     transaction: Transaction,
@@ -740,6 +969,45 @@ impl StagedWrite {
     /// Identity Lance assigned when this effect was staged.
     pub fn transaction_identity(&self) -> StagedTransactionIdentity {
         StagedTransactionIdentity::from(&self.transaction)
+    }
+
+    /// Record the ids this delete removes on its transaction: inline up to
+    /// [`DELETED_IDS_INLINE_MAX_BYTES`], above that in a table-relative object
+    /// written before the commit and named by the transaction's uuid, so a
+    /// rebound identity must be bound before this call; nothing above
+    /// [`DELETED_IDS_SPILL_MAX_BYTES`].
+    pub(crate) async fn record_deleted_ids(&mut self, ds: &Dataset, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let encoded = serde_json::to_string(ids).map_err(|error| {
+            OmniError::manifest_internal(format!("deleted ids are not serializable: {error}"))
+        })?;
+        if encoded.len() as u64 > DELETED_IDS_SPILL_MAX_BYTES {
+            return Ok(());
+        }
+        let mut properties = self
+            .transaction
+            .transaction_properties
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+        if encoded.len() <= DELETED_IDS_INLINE_MAX_BYTES {
+            properties.insert(DELETED_IDS_PROPERTY.to_string(), encoded);
+        } else {
+            let relative = deleted_ids_spill_path(&self.transaction.uuid);
+            let store = ds.object_store(None).await.map_err(OmniError::storage)?;
+            store
+                .put(
+                    &table_relative_object_path(ds, &relative),
+                    encoded.as_bytes(),
+                )
+                .await
+                .map_err(OmniError::storage)?;
+            properties.insert(DELETED_IDS_PATH_PROPERTY.to_string(), relative);
+        }
+        self.transaction.transaction_properties = Some(Arc::new(properties));
+        Ok(())
     }
 
     /// Bind a pre-minted transaction identity to a transaction staged after a
@@ -1092,20 +1360,6 @@ pub struct TableStore {
 }
 
 decide_seam! {
-    /// After Lance durably creates a target table ref, before the caller can
-    /// reopen and verify it. An error here leaves an unreferenced fork that
-    /// cleanup reclaims.
-    pub static FORK_POST_CREATE_PRE_OPEN = ("fork.post_create_pre_open", AnyWrite, [Fail]);
-}
-
-decide_seam! {
-    /// After a promotion's existence check and before its linear replay
-    /// (RFC 0067). A decision here aligns two promoters on one pin,
-    /// or fails a promotion so the next writer inherits it.
-    pub static PROMOTION_PRE_REPLAY = ("promotion.pre_replay", Unreachable, [Fail]);
-}
-
-decide_seam! {
     /// The e_tag comparison in `open_at_entry_verified`. Skipping it simulates
     /// a store whose persisted table version metadata carries no e_tag. Tests
     /// combine it with `CHANGE_FEED_PRE_TABLE_OPEN` + a branch delete/recreate
@@ -1435,45 +1689,6 @@ impl TableStore {
             ));
         }
         Ok(())
-    }
-
-    pub async fn fork_branch_from_state(
-        &self,
-        dataset_uri: &str,
-        source_branch: Option<&str>,
-        type_key: &str,
-        source_version: u64,
-        target_branch: &str,
-    ) -> Result<Dataset> {
-        let mut source_ds = self
-            .open_dataset_head(dataset_uri, source_branch)
-            .await?
-            .checkout_version(source_version)
-            .await
-            .map_err(OmniError::storage)?;
-        self.ensure_expected_version(&source_ds, type_key, source_version)?;
-
-        let created = crate::branch_control::create_unique_table_fork(
-            &mut source_ds,
-            target_branch,
-            source_version,
-        )
-        .await?;
-
-        // The ref is now independently durable. Any error from this point
-        // leaves a fork no manifest publication references; cleanup reclaims it
-        // and the caller's retry forks under a fresh name.
-        fail(&FORK_POST_CREATE_PRE_OPEN)?;
-
-        // Re-open through the shared session for normal cache behavior. The
-        // returned handle above is used only as proof that the matching branch
-        // dataset was openable after creation.
-        drop(created);
-        let ds = self
-            .open_dataset_head(dataset_uri, Some(target_branch))
-            .await?;
-        self.ensure_expected_version(&ds, type_key, source_version)?;
-        Ok(ds)
     }
 
     pub async fn scan_batches(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
@@ -3558,44 +3773,28 @@ impl TableStore {
     /// Stream a provenance-proven pure-insert source interval in the same
     /// 8,192-row / 32-MiB chunks accepted by [`Self::stage_keyed_write`].
     ///
-    /// The caller proves from Lance transaction history that every version in
-    /// `(begin_version, end_version]` is insertion-only. This adapter evaluates
-    /// the row-version predicate against the pinned source and exposes only
-    /// those rows; it neither writes files nor advances HEAD. Every emitted
-    /// batch is compacted away from a retained parent allocation when needed
-    /// and rechecked against both hard ceilings before it reaches the per-chunk
-    /// strict keyed writer.
+    /// The caller proves from Lance transaction history that every commit in
+    /// `interval` is insertion-only. This adapter selects the proven rows of
+    /// the pinned source and exposes only those; it neither writes files nor
+    /// advances HEAD. Every emitted batch is compacted away from a retained
+    /// parent allocation when needed and rechecked against both hard ceilings
+    /// before it reaches the per-chunk strict keyed writer.
     pub async fn scan_proven_insert_delta_bounded(
         &self,
         source: &Dataset,
         type_key: &str,
-        begin_version: u64,
-        end_version: u64,
+        interval: &ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream> {
-        use datafusion::prelude::{col, lit};
+        interval
+            .validate(
+                source,
+                system_columns,
+                "scan_proven_insert_delta_bounded source",
+            )
+            .map_err(|error| error.with_context(format!("proven insert scan of {type_key}")))?;
 
-        if begin_version >= end_version {
-            return Err(OmniError::manifest_internal(format!(
-                "scan_proven_insert_delta_bounded for {type_key} requires begin_version < end_version, got {begin_version}..={end_version}"
-            )));
-        }
-        if source.version().version != end_version {
-            return Err(OmniError::manifest_internal(format!(
-                "scan_proven_insert_delta_bounded for {type_key} received source version {}, expected pinned end version {end_version}",
-                source.version().version
-            )));
-        }
-        exact_id_primary_key_field_id(
-            source,
-            system_columns,
-            "scan_proven_insert_delta_bounded source",
-        )?;
-
-        let created_in_interval = col("_row_created_at_version")
-            .gt(lit(begin_version))
-            .and(col("_row_created_at_version").lt_eq(lit(end_version)));
         let output_schema: SchemaRef = Arc::new(source.schema().into());
         let has_blob_columns = source
             .schema()
@@ -3603,9 +3802,10 @@ impl TableStore {
             .any(|field| field.is_blob());
 
         if !has_blob_columns {
+            let selected = interval.clone();
             let raw: SendableRecordBatchStream =
                 Self::scan_stream_with(source, None, None, None, false, move |scanner| {
-                    scanner.filter_expr(created_in_interval);
+                    selected.select(scanner);
                     scanner.batch_size(KEYED_WRITE_MAX_ROWS);
                     scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
                     Ok(())
@@ -3627,13 +3827,7 @@ impl TableStore {
         // conservative for blobs: it bounds payload allocation; the stream
         // normalizer below then coalesces those rows into ordinary bounded
         // transaction chunks.
-        let raw = Self::scan_proven_insert_blob_row_ids(
-            source,
-            begin_version,
-            end_version,
-            system_columns,
-        )
-        .await?;
+        let raw = Self::scan_proven_insert_blob_row_ids(source, interval, system_columns).await?;
         let materialized = futures::stream::try_unfold(
             (
                 raw,
@@ -3722,36 +3916,23 @@ impl TableStore {
         &self,
         source: &Dataset,
         table_key: &str,
-        begin_version: u64,
-        end_version: u64,
+        interval: &ProvenInsertInterval,
         expected_rows: u64,
         selection: &mut PersistedBlobSelection,
         system_columns: SystemColumns,
     ) -> Result<()> {
-        if begin_version >= end_version {
-            return Err(OmniError::manifest_internal(format!(
-                "include_proven_insert_blob_selection for {table_key} requires begin_version < end_version, got {begin_version}..={end_version}"
-            )));
-        }
-        if source.version().version != end_version {
-            return Err(OmniError::manifest_internal(format!(
-                "include_proven_insert_blob_selection for {table_key} received source version {}, expected pinned end version {end_version}",
-                source.version().version
-            )));
-        }
-        exact_id_primary_key_field_id(
-            source,
-            system_columns,
-            "include_proven_insert_blob_selection source",
-        )?;
+        interval
+            .validate(
+                source,
+                system_columns,
+                "include_proven_insert_blob_selection source",
+            )
+            .map_err(|error| {
+                error.with_context(format!("proven insert blob selection of {table_key}"))
+            })?;
 
-        let mut raw = Self::scan_proven_insert_blob_row_ids(
-            source,
-            begin_version,
-            end_version,
-            system_columns,
-        )
-        .await?;
+        let mut raw =
+            Self::scan_proven_insert_blob_row_ids(source, interval, system_columns).await?;
         let mut observed_rows = 0_u64;
         while let Some(batch) = raw
             .try_next()
@@ -3789,20 +3970,11 @@ impl TableStore {
 
     async fn scan_proven_insert_blob_row_ids(
         source: &Dataset,
-        begin_version: u64,
-        end_version: u64,
+        interval: &ProvenInsertInterval,
         system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream> {
-        use datafusion::prelude::{col, lit};
-
-        let created_in_interval = col("_row_created_at_version")
-            .gt(lit(begin_version))
-            .and(col("_row_created_at_version").lt_eq(lit(end_version)));
-        // The interval predicate and stable row id are sufficient to identify
-        // the exact descriptor rows. Keep vectors and unrelated scalar values
-        // out of this planning scan; `take_rows` below fetches the selected
-        // full row only when descriptor classification/materialization needs it.
         let selector_columns = [system_columns.id];
+        let selected = interval.clone();
         let raw: SendableRecordBatchStream = Self::scan_stream_with(
             source,
             Some(&selector_columns),
@@ -3810,7 +3982,7 @@ impl TableStore {
             None,
             true,
             move |scanner| {
-                scanner.filter_expr(created_in_interval);
+                selected.select(scanner);
                 scanner.batch_size(KEYED_WRITE_MAX_ROWS);
                 scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
                 Ok(())
@@ -3987,8 +4159,10 @@ impl TableStore {
     pub async fn commit_staged_detached(
         &self,
         ds: Arc<Dataset>,
-        staged: StagedWrite,
+        mut staged: StagedWrite,
+        witness: &StagingWitness,
     ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        witness.stamp(&mut staged.transaction);
         let mut builder = CommitBuilder::new(ds)
             .with_skip_auto_cleanup(true)
             .with_detached(true);
@@ -4076,7 +4250,6 @@ impl TableStore {
             )));
         }
         transaction.read_version = target - 1;
-        fail(&PROMOTION_PRE_REPLAY)?;
         match CommitBuilder::new(base)
             .with_max_retries(0)
             .with_skip_auto_cleanup(true)
@@ -6623,6 +6796,147 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[test]
+    fn staging_witness_requires_complete_canonical_authority() {
+        use lance::dataset::refs::BranchIdentifier;
+        let head = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let identifier = BranchIdentifier {
+            version_mapping: vec![(0, "1234567890abcdef1234567890abcdef".to_string())],
+        };
+        for identifier in [BranchIdentifier::main(), identifier.clone()] {
+            for head in [None, Some(head)] {
+                let witness = StagingWitness::new(&identifier, head).unwrap();
+                let mut transaction =
+                    Transaction::new(1, Operation::Append { fragments: vec![] }, None);
+                witness.stamp(&mut transaction);
+                assert_eq!(
+                    StagingWitness::from_transaction(&transaction),
+                    Some(witness)
+                );
+            }
+        }
+        let mut transaction = Transaction::new(1, Operation::Append { fragments: vec![] }, None);
+        StagingWitness::new(&identifier, Some(head))
+            .unwrap()
+            .stamp(&mut transaction);
+        let original = transaction
+            .transaction_properties
+            .as_deref()
+            .unwrap()
+            .clone();
+        let malformed_identifiers = [
+            "foreign".to_string(),
+            "{\"version_mapping\":[],\"unknown\":true}".to_string(),
+            "{\"version_mapping\":[[0,\"invalid\"]]}".to_string(),
+            serde_json::to_string(&BranchIdentifier::missing_identifier_sentinel()).unwrap(),
+        ];
+        for (key, value) in [
+            (STAGED_AGAINST_BRANCH_INCARNATION, None),
+            (STAGED_AGAINST_GRAPH_HEAD, None),
+            (STAGED_AGAINST_GRAPH_HEAD, Some("not-a-head".to_string())),
+        ]
+        .into_iter()
+        .chain(
+            malformed_identifiers
+                .into_iter()
+                .map(|value| (STAGED_AGAINST_BRANCH_INCARNATION, Some(value))),
+        ) {
+            let mut properties = original.clone();
+            match value {
+                Some(value) => {
+                    properties.insert(key.to_string(), value);
+                }
+                None => {
+                    properties.remove(key);
+                }
+            }
+            transaction.transaction_properties = Some(Arc::new(properties));
+            assert_eq!(
+                StagingWitness::from_transaction(&transaction),
+                None,
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_ids_spill_is_bounded_before_download_and_inline_decode() {
+        use lance::dataset::builder::DatasetBuilder;
+        use lance_io::object_store::ObjectStoreParams;
+        use lance_io::utils::tracking_store::IOTracker;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let uri = format!("{root}/people.lance");
+        let dataset = TableStore::write_dataset(&uri, batch_with_ids(&["seed"]))
+            .await
+            .unwrap();
+        let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
+        let mut staged = store
+            .stage_delete(&dataset, datafusion::prelude::lit(true))
+            .await
+            .unwrap()
+            .unwrap();
+        let ids = vec!["x".repeat(DELETED_IDS_INLINE_MAX_BYTES)];
+        staged.record_deleted_ids(&dataset, &ids).await.unwrap();
+        let Some(DeletedIdsRecord::Spilled(relative)) = deleted_ids_record(&staged.transaction)
+        else {
+            panic!("a record larger than the inline limit must spill");
+        };
+        let tracker = IOTracker::default();
+        let tracked = DatasetBuilder::from_uri(&uri)
+            .with_store_params(ObjectStoreParams {
+                object_store_wrapper: Some(Arc::new(tracker.clone())),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        tracker.incremental_stats();
+        assert_eq!(
+            load_deleted_ids(&tracked, &staged.transaction)
+                .await
+                .unwrap(),
+            Some(ids)
+        );
+        assert!(tracker.incremental_stats().read_bytes > 0);
+
+        let spill = dir.path().join("people.lance").join(&relative);
+        std::fs::File::create(&spill)
+            .unwrap()
+            .set_len(DELETED_IDS_SPILL_MAX_BYTES + 1)
+            .unwrap();
+        assert!(
+            load_deleted_ids(&tracked, &staged.transaction)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            tracker.incremental_stats().read_iops,
+            1,
+            "oversized spills stop after the size request"
+        );
+
+        let oversized = "x".repeat(usize::try_from(DELETED_IDS_SPILL_MAX_BYTES).unwrap());
+        let mut inline = staged.transaction.clone();
+        inline.transaction_properties = Some(Arc::new(HashMap::from([(
+            DELETED_IDS_PROPERTY.to_string(),
+            serde_json::to_string(&[&oversized]).unwrap(),
+        )])));
+        assert!(load_deleted_ids(&tracked, &inline).await.unwrap().is_none());
+        let mut unrecorded = store
+            .stage_delete(&dataset, datafusion::prelude::lit(true))
+            .await
+            .unwrap()
+            .unwrap();
+        unrecorded
+            .record_deleted_ids(&dataset, &[oversized])
+            .await
+            .unwrap();
+        assert!(deleted_ids_record(&unrecorded.transaction).is_none());
     }
 
     /// `FtsFilterDemand::from_filter` names the columns a typed filter reads

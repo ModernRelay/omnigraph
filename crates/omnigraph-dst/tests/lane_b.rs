@@ -294,20 +294,16 @@ fn dst_lane_b_whitebox_kill() {
     }
 }
 
-/// INSTRUMENT — real kill-during-recovery. Every rung recreates its own
-/// mess (fresh root, fresh child #1 killed at its completion cut) and
-/// cuts THAT recovery at completion #j — a rung must never reuse a root
-/// an earlier recovery already healed, or it cuts clean-open
-/// housekeeping while reporting a recovery kill. A rung whose recovery
-/// completes below j ends the ladder. At least one real recovery kill
-/// is asserted — fail, not skip.
-/// Run: cargo test -p omnigraph-dst --test lane_b dst_lane_b_kill_during_recovery -- --ignored --nocapture
+/// Kill recovery at successive completion cuts of freshly killed workloads.
+/// Every completed recovery, including zero-write recovery, receives exact
+/// replay judgment before the ladder stops.
 #[test]
 #[serial]
 #[ignore = "instrument: lane B real kill-during-recovery (spawns child processes)"]
 fn dst_lane_b_kill_during_recovery() {
     let seed = 11u64;
     let mut recovery_kills = 0usize;
+    let mut completed_recovery = None;
     let mut j = 1usize;
     let mut rung_retries = 0usize;
     while j <= 8 {
@@ -369,28 +365,29 @@ fn dst_lane_b_kill_during_recovery() {
             let rec_n = oplog::parse(&read_log(&rec_log), &format!("recovery-done j={j} log"))
                 .recover_n
                 .expect("completed recovery child logs its recover-done N line");
-            println!(
-                "dst lane B recovery: j={j} recovery completed below the cut \
-                 (its own completion count: {rec_n}); ladder ends \
-                 ({recovery_kills} recovery kills)"
+            assert!(
+                rec_n < j,
+                "recovery completed past its armed cut: {rec_n} >= {j}"
             );
-            std::fs::remove_dir_all(&dir).ok();
-            break;
+            completed_recovery = Some(rec_n);
+            println!(
+                "dst lane B recovery: j={j} completed with {rec_n} writes; \
+                 judging the workload before ending the ladder ({recovery_kills} recovery kills)"
+            );
+        } else {
+            assert_eq!(
+                rec_status.signal(),
+                Some(9),
+                "j={j}: recovery child must be killed at its barrier"
+            );
+            let rec_summary = oplog::parse(&read_log(&rec_log), &format!("recovery-cut j={j} log"));
+            assert_eq!(
+                rec_summary.barrier_c,
+                Some(j),
+                "j={j}: recovery barrier records a different ordinal"
+            );
+            recovery_kills += 1;
         }
-        assert_eq!(
-            rec_status.signal(),
-            Some(9),
-            "j={j}: recovery child must be killed at its barrier"
-        );
-        // The recovery barrier line is evidence too: field-check it like
-        // the whitebox arm does (a garbled line must not count as a kill).
-        let rec_summary = oplog::parse(&read_log(&rec_log), &format!("recovery-cut j={j} log"));
-        assert_eq!(
-            rec_summary.barrier_c,
-            Some(j),
-            "j={j}: recovery barrier records a different ordinal"
-        );
-        recovery_kills += 1;
 
         // A clean recovery must now succeed, and the original workload log
         // must judge exactly against the doubly-recovered world.
@@ -411,17 +408,19 @@ fn dst_lane_b_kill_during_recovery() {
             )
             .await;
             println!(
-                "dst lane B recovery: j={j} workload cut #{k}, recovery killed at #{j}, \
-                 final world {verdict}, replay-exact"
+                "dst lane B recovery: j={j} workload cut #{k}, recovery kills={recovery_kills}, \
+                 completed={completed_recovery:?}, final world {verdict}, replay-exact"
             );
         });
         std::fs::remove_dir_all(&dir).ok();
+        if completed_recovery.is_some() {
+            break;
+        }
         j += 1;
     }
     assert!(
-        recovery_kills >= 1,
-        "the ladder performed zero real recovery kills — the cell tested nothing \
-         (every rung was a control); investigate recovery's completion count"
+        recovery_kills > 0 || completed_recovery == Some(0),
+        "the killed workload had neither a recovery kill nor a completed zero-write reopen"
     );
 }
 

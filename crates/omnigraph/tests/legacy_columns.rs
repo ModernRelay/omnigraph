@@ -57,8 +57,8 @@ async fn legacy_vintage_graph_works_end_to_end() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10,
-        "a legacy-vintage graph is born at the current `__manifest` stamp; the vintage lives in the schema IR (RFC 0040 Compatibility, RFC 0067)"
+        11,
+        "a legacy-vintage graph is born at the current `__manifest` stamp; the vintage lives in the schema IR (RFC 0040 Compatibility, RFC 0067, detached-only tables)"
     );
     let snap = snapshot_main(&db).await.unwrap();
     for table_key in ["node:Person", "node:Company", "edge:WorksAt"] {

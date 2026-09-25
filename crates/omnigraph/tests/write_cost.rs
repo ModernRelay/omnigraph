@@ -236,10 +236,9 @@ async fn branch_merge_writes_no_control_object() {
     );
 }
 
-/// RFC 0067: Optimize arms no recovery sidecar. A run with compaction work on
-/// one table stages the rewrite detached, publishes and promotes it, and
-/// writes and deletes no control object (the adjacency artifact is a bytes
-/// object written only when an edge table advances).
+/// RFC 0067: Optimize with compaction work on one table stages the rewrite
+/// detached, publishes its pin, and writes or deletes no control object (the
+/// adjacency artifact is written only when an edge table advances).
 #[tokio::test]
 async fn optimize_writes_no_control_object() {
     use omnigraph::instrumentation::CountingStorageAdapter;

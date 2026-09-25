@@ -22,10 +22,9 @@ use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use futures::TryStreamExt;
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_QUERIES, TEST_SCHEMA, count_rows, first_column_sorted,
-    init_and_load, mixed_params, mutate_branch, mutate_main, node_blob_cell, params, query_main,
-    read_managed_blob_bytes, snapshot_main,
+    init_and_load, mixed_params, mutate_branch, mutate_main, node_blob_cell,
+    open_pinned_dataset_for_test, params, query_main, read_managed_blob_bytes, snapshot_main,
 };
-use lance::Dataset;
 use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
@@ -222,6 +221,9 @@ async fn adopt_equality_does_not_hide_a_legal_row_prefix_property() {
     .await;
 }
 
+/// A branch write leaves the untouched managed row in main's own data file, so
+/// the adopt comparison reads it unchanged: the merge onto main switches the
+/// pin with no Blob payload read.
 #[tokio::test]
 async fn adopt_equality_resolves_inherited_managed_blob_file_identity() {
     const SCHEMA: &str = r#"
@@ -240,9 +242,6 @@ query set_note($title: String, $note: String) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
-    // Separate loads put the managed and scalar-only rows in distinct base
-    // fragments. Updating the latter on the branch must leave the managed row
-    // as a shallow-clone reference to the original main data file.
     main.load_jsonl(
         r#"{"type":"Document","data":{"title":"blob","content":"base64:U2hhcmVk","note":"stable"}}"#,
         LoadMode::Overwrite,
@@ -257,12 +256,7 @@ query set_note($title: String, $note: String) {
     .unwrap();
     let base = snapshot_main(&main).await.unwrap();
     let base_entry = base.dataset("node:Document").expect("base Document entry");
-    let base_table_uri = dir
-        .path()
-        .join(&base_entry.dataset_path)
-        .to_string_lossy()
-        .into_owned();
-    let base_dataset = Dataset::open(&base_table_uri).await.unwrap();
+    let base_dataset = open_pinned_dataset_for_test(&main, "main", "node:Document").await;
     assert!(
         base_dataset.get_fragments().len() >= 2,
         "fixture requires distinct managed and scalar fragments"
@@ -280,10 +274,6 @@ query set_note($title: String, $note: String) {
     .await
     .unwrap();
 
-    // Pin the exact Lance shallow-clone shape behind the regression: the
-    // untouched managed row scans from a branch fragment whose data file has a
-    // base_id resolving back to main, even though the Dataset URI is the branch
-    // root. Comparing raw Dataset URI + base_id would call this row changed.
     let source = main
         .snapshot_of(ReadTarget::branch("feature"))
         .await
@@ -292,13 +282,17 @@ query set_note($title: String, $note: String) {
         .dataset("node:Document")
         .expect("feature Document entry");
     assert_eq!(source_entry.dataset_path, base_entry.dataset_path);
-    helpers::assert_native_branch_of(source_entry.native_dataset_branch.as_deref(), "feature");
-    let source_table_uri = format!(
-        "{base_table_uri}/tree/{}",
-        source_entry.native_dataset_branch.as_deref().unwrap()
+    assert_eq!(source_entry.native_dataset_branch, None);
+    let source_dataset = open_pinned_dataset_for_test(&main, "feature", "node:Document").await;
+    assert_eq!(
+        source_dataset.uri(),
+        base_dataset.uri(),
+        "the branch write stages on the inherited dataset"
     );
-    let source_dataset = Dataset::open(&source_table_uri).await.unwrap();
-    assert_ne!(source_dataset.uri(), base_dataset.uri());
+    assert_ne!(
+        source_dataset.version().version,
+        base_dataset.version().version
+    );
     let mut scanner = source_dataset.scan();
     scanner.with_row_address();
     let batches = scanner
@@ -365,21 +359,12 @@ query set_note($title: String, $note: String) {
         .expect("base managed fixture data file");
     assert_eq!(base_blob_data_file.base_id, None);
     assert_eq!(blob_data_file.path, base_blob_data_file.path);
-    let inherited_base_id = blob_data_file
-        .base_id
-        .expect("untouched branch Blob file must be inherited");
-    let inherited_base = source_dataset
-        .manifest()
-        .base_paths
-        .get(&inherited_base_id)
-        .expect("inherited Blob base path");
-    assert!(inherited_base.is_dataset_root);
     assert_eq!(
-        omnigraph::storage::normalize_root_uri(&inherited_base.path).unwrap(),
-        omnigraph::storage::normalize_root_uri(base_dataset.uri()).unwrap(),
-        "inherited and local Blob files must resolve to the same physical base"
+        blob_data_file.base_id, None,
+        "the untouched managed row keeps main's own data file, no inherited base"
     );
 
+    let source_pin = helpers::pinned_version(&main, "feature", "node:Document").await;
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
@@ -387,13 +372,20 @@ query set_note($title: String, $note: String) {
     assert_eq!(outcome, MergeOutcome::FastForward);
     assert_eq!(
         probes.stage_known_present_update_rows(),
-        1,
-        "only the scalar row changed; the inherited managed row must be suppressed"
+        0,
+        "a merge onto an unadvanced main is a pointer switch and stages no row"
     );
+    assert_eq!(probes.stage_fenced_insert_calls(), 0);
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
     assert_eq!(
         probes.blob_payload_read_calls(),
         0,
         "suppressing the inherited managed row must avoid Blob selection/materialization"
+    );
+    assert_eq!(
+        helpers::pinned_version(&main, "main", "node:Document").await,
+        source_pin,
+        "main takes the source's pin"
     );
 
     let merged = snapshot_main(&main).await.unwrap();

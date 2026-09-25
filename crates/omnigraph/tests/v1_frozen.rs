@@ -16,9 +16,9 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-/// The upstream commit whose bytes the frozen files hold. The two executors differ
-/// from it by the query-door extraction and by the correlated-block change (the
-/// `SubqueryPredicate` on `IROp::AntiJoin`); the search fixture adds RFC 0067's IVF setup.
+/// The baseline predates query-door extraction and correlated AntiJoin support.
+/// The search fixture also has failpoints-gated four-partition IVF setup;
+/// its query assertions are unchanged.
 const BASELINE: &str = "8281807b";
 
 /// (path under the crate, SHA-256 of the file's bytes).
@@ -37,7 +37,7 @@ const FROZEN: &[(&str, &str)] = &[
     ),
     (
         "tests/search.rs",
-        "1a8be0d56aef638d8e614ea1721a0bebb13e0d7c357c15cc293c404c80fc0fc9",
+        "ba053f495ca8d394b4a26a236bb55fa3d65dbe2ee09531b4b9dbe551db7e195e",
     ),
 ];
 

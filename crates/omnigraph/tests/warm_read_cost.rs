@@ -328,6 +328,7 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
         Box::pin(assert_branch_control_source_incarnation(&db, &mut writer)).await;
         #[cfg(feature = "failpoints")]
         Box::pin(assert_cached_borrower_survives_branch_delete(
+            dir.path(),
             &db,
             &mut writer,
         ))
@@ -531,7 +532,11 @@ async fn assert_branch_control_source_incarnation(db: &Session, writer: &mut Ses
 }
 
 #[cfg(feature = "failpoints")]
-async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mut Session) {
+async fn assert_cached_borrower_survives_branch_delete(
+    graph_dir: &std::path::Path,
+    db: &Session,
+    writer: &mut Session,
+) {
     for branch in ["main_fresh", "review_recreated"] {
         writer.branch_delete(branch).await.unwrap();
     }
@@ -552,7 +557,12 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mu
     let source = db.snapshot_of("feature").await.unwrap();
     let source_entry = source.dataset("node:Person").unwrap();
     let source_native = helpers::graph_native_ref(db.uri(), "feature").await;
-    let source_fork = source_entry.native_dataset_branch.as_deref().unwrap();
+    assert_eq!(
+        source_entry.native_dataset_branch, None,
+        "a branch write stages on main's table, never a fork"
+    );
+    let source_pin = helpers::pinned_version(db, "feature", "node:Person").await;
+    assert!(helpers::is_detached_version(source_pin), "{source_pin}");
     let borrower = db.snapshot_of("binding_check").await.unwrap();
     let borrowed_entry = borrower.dataset("node:Person").unwrap();
     assert_eq!(
@@ -564,6 +574,11 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mu
         source_entry.published_dataset_version
     );
     assert_eq!(borrowed_entry.entity_count, source_entry.entity_count);
+    assert_eq!(
+        helpers::pinned_version(db, "binding_check", "node:Person").await,
+        source_pin,
+        "the merge hands the sibling the source's pin"
+    );
 
     let table_uri = format!("{}/{}", db.uri(), source_entry.dataset_path);
     let table = lance::Dataset::open(&table_uri).await.unwrap();
@@ -602,9 +617,14 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mu
             .contains_key("omnigraph.retired_manifest_branch")
     );
     let mut refs_after = manifest.list_branches().await.unwrap();
-    let retirement = refs_after
-        .get_mut(&source_native)
-        .expect("logical deletion retains the exact native ref")
+    assert!(!refs_after.contains_key(&source_native));
+    let archive_path = graph_dir
+        .join("__manifest/tree")
+        .join(&source_native)
+        .join("_omnigraph_retired_branch.json");
+    let mut archived: lance::dataset::refs::BranchContents =
+        serde_json::from_slice(&std::fs::read(archive_path).unwrap()).unwrap();
+    let retirement = archived
         .metadata
         .remove("omnigraph.retired_manifest_branch")
         .expect("logical deletion publishes retirement metadata");
@@ -617,10 +637,11 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mu
         }),
         "retirement must bind the exact captured native lifetime"
     );
+    refs_after.insert(source_native, archived);
     assert_eq!(
         serde_json::to_value(refs_after).unwrap(),
         serde_json::to_value(refs_before).unwrap(),
-        "deletion must change only the target's retirement metadata"
+        "deletion must archive the exact target and preserve every surviving ref"
     );
     assert!(
         helpers::native_ref_for(&manifest, "feature")
@@ -661,13 +682,10 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mu
     .await
     .unwrap();
     assert!(
-        lance::Dataset::open(&table_uri)
+        helpers::collector::detached_versions(&table_uri)
             .await
-            .unwrap()
-            .list_branches()
-            .await
-            .unwrap()
-            .contains_key(source_fork)
+            .contains(&source_pin),
+        "cleanup keeps the pin a live borrower names"
     );
     let reopened = Omnigraph::open(db.uri()).await.unwrap();
     let borrower_after = reopened.snapshot_of("binding_check").await.unwrap();
@@ -694,28 +712,17 @@ async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mu
         )
         .await
         .unwrap();
-    let recreated = writer.snapshot_of("feature").await.unwrap();
-    let recreated_fork = recreated
-        .dataset("node:Person")
-        .unwrap()
-        .native_dataset_branch
-        .as_deref()
-        .unwrap();
-    assert_ne!(recreated_fork, source_fork);
+    let recreated_pin = helpers::pinned_version(writer, "feature", "node:Person").await;
+    assert_ne!(recreated_pin, source_pin);
     db.cleanup(omnigraph::db::CleanupPolicyOptions {
         keep_versions: Some(1),
         older_than: None,
     })
     .await
     .unwrap();
-    let refs = lance::Dataset::open(&table_uri)
-        .await
-        .unwrap()
-        .list_branches()
-        .await
-        .unwrap();
-    assert!(refs.contains_key(source_fork));
-    assert!(refs.contains_key(recreated_fork));
+    let pins = helpers::collector::detached_versions(&table_uri).await;
+    assert!(pins.contains(&source_pin));
+    assert!(pins.contains(&recreated_pin));
     let reopened = Omnigraph::open(db.uri()).await.unwrap();
     let borrower_after = reopened.snapshot_of("binding_check").await.unwrap();
     assert!(
@@ -864,9 +871,9 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     );
 }
 
-/// Recreated non-main branches can reuse the same branch-owned table version.
-/// This forces the held table-handle cache to distinguish incarnations by the
-/// per-table Lance manifest e_tag, not just `(table_path, branch, version)`.
+/// A recreated branch's write stages a new detached pin on the same table at
+/// the same published version, so the held table-handle cache must key on the
+/// pin, not just `(table_path, branch, version)`, or it serves the old rows.
 #[tokio::test]
 async fn recreated_branch_owned_table_handle_uses_table_etag() {
     let dir = tempfile::tempdir().unwrap();
@@ -903,7 +910,12 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .dataset("node:Person")
         .unwrap()
         .clone();
-    helpers::assert_native_branch_of(old_entry.native_dataset_branch.as_deref(), "feature");
+    assert_eq!(
+        old_entry.native_dataset_branch, None,
+        "a branch write stages on main's table, never a fork"
+    );
+    let old_pin = helpers::pinned_version(&reader, "feature", "node:Person").await;
+    assert!(helpers::is_detached_version(old_pin), "{old_pin}");
 
     writer.branch_delete("feature").await.unwrap();
     writer.branch_create("feature").await.unwrap();
@@ -924,13 +936,18 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
         .unwrap()
         .clone();
     assert_eq!(new_entry.dataset_path, old_entry.dataset_path);
-    assert_ne!(
+    assert_eq!(
         new_entry.native_dataset_branch, old_entry.native_dataset_branch,
-        "a recreated branch owns a new incarnation-suffixed fork ref"
+        "both incarnations stage on main's table"
+    );
+    assert_ne!(
+        helpers::pinned_version(&writer, "feature", "node:Person").await,
+        old_pin,
+        "the recreated branch's write stages a new detached pin"
     );
     assert_eq!(
         new_entry.published_dataset_version, old_entry.published_dataset_version,
-        "test setup must force table handle identity to differ only by e_tag"
+        "test setup must force table handle identity to differ only by the pin"
     );
 
     let (new_person, io) = measure(reader.query(
@@ -1024,10 +1041,11 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .dataset("edge:Knows")
             .unwrap()
             .clone();
-        helpers::assert_native_branch_of(
-            old_edge_entry.native_dataset_branch.as_deref(),
-            "feature",
+        assert_eq!(
+            old_edge_entry.native_dataset_branch, None,
+            "a branch write stages on main's table, never a fork"
         );
+        let old_pin = helpers::pinned_version(&reader, "feature", "edge:Knows").await;
 
         writer.branch_delete("feature").await.unwrap();
         writer.branch_create("feature").await.unwrap();
@@ -1051,9 +1069,14 @@ async fn recreated_branch_traversal_uses_graph_index_incarnation() {
             .unwrap()
             .clone();
         assert_eq!(new_edge_entry.dataset_path, old_edge_entry.dataset_path);
-        assert_ne!(
+        assert_eq!(
             new_edge_entry.native_dataset_branch, old_edge_entry.native_dataset_branch,
-            "a recreated branch owns a new incarnation-suffixed fork ref"
+            "both incarnations stage on main's table"
+        );
+        assert_ne!(
+            helpers::pinned_version(&writer, "feature", "edge:Knows").await,
+            old_pin,
+            "the recreated branch's write stages a new detached pin"
         );
         assert_eq!(
             new_edge_entry.published_dataset_version, old_edge_entry.published_dataset_version,
@@ -1241,10 +1264,6 @@ async fn write_invalidates_table_cache_for_changed_table() {
     .await
     .unwrap();
 
-    // The next read serves Person at the new version from the handle the
-    // write landed in the cache (RFC 0067: the writer holds the twin it
-    // promoted), so no open happens and the new row is still observed: the
-    // version-keyed cache never serves a stale handle.
     let (out, io) = measure(db.query(
         ReadTarget::branch("main"),
         TEST_QUERIES,
@@ -1254,8 +1273,8 @@ async fn write_invalidates_table_cache_for_changed_table() {
     .await;
     out.unwrap();
     assert_eq!(
-        io.data_reads, 0,
-        "a read after a write on the same handle is served from the landed version's handle"
+        io.data_reads, 2,
+        "a read after a write re-opens the landed detached pin: the version-keyed cache misses"
     );
 
     let after = count_rows(&db, "node:Person").await;

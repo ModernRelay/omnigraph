@@ -32,8 +32,11 @@ mod legacy_sidecars;
 mod namespace;
 #[path = "manifest/publisher.rs"]
 pub(crate) mod publisher;
+#[path = "manifest/retention.rs"]
+pub(crate) mod retention;
 #[path = "manifest/state.rs"]
 mod state;
+pub(crate) use retention::is_merge_input_tag;
 #[path = "manifest/upgrade.rs"]
 pub(crate) mod upgrade;
 pub use upgrade::{
@@ -230,42 +233,6 @@ pub(crate) fn system_columns_at_image(
         )));
     }
     Ok(vintage)
-}
-
-/// Ephemeral native-table liveness proof derived from every live graph branch.
-/// Never persist or reuse this across the control-gate envelope that captured it.
-pub(crate) struct NativeForkReferences {
-    referenced: HashSet<(TableIdentity, String)>,
-    owned: HashSet<(TableIdentity, String)>,
-    live_incarnations: HashSet<String>,
-}
-
-impl NativeForkReferences {
-    pub(crate) fn retains_unpublished_fork(&self, native: &str) -> bool {
-        crate::branch_names::retain_unpublished_table_fork(native, |incarnation| {
-            self.live_incarnations.contains(incarnation)
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn contains(&self, identity: TableIdentity, native: &str) -> bool {
-        self.referenced.contains(&(identity, native.to_string()))
-    }
-
-    pub(crate) fn contains_tree(&self, identity: TableIdentity, tree: &str) -> bool {
-        self.referenced.iter().any(|(table, native)| {
-            *table == identity
-                && (native == tree
-                    || native
-                        .strip_prefix(tree)
-                        .is_some_and(|suffix| suffix.starts_with('/')))
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owner_contains(&self, identity: TableIdentity, native: &str) -> bool {
-        self.owned.contains(&(identity, native.to_string()))
-    }
 }
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
@@ -573,6 +540,7 @@ impl Snapshot {
                         entry.version_metadata.e_tag(),
                         entry.version_metadata.staged_version(),
                         entry.version_metadata.transaction_uuid(),
+                        entry.version_metadata.last_linear_version(),
                         &location,
                         Some(&caches.session),
                     )
@@ -800,6 +768,85 @@ pub(crate) struct TableTombstone {
     pub(crate) tombstone_version: u64,
 }
 
+/// A live graph branch's `__manifest` as the collector reads it: one open,
+/// every observation from that open, so a publication is visible to all of
+/// them or to none.
+#[derive(Clone)]
+pub(crate) struct CollectorBranch {
+    root_uri: String,
+    branch: Option<String>,
+    dataset: Dataset,
+    identifier: lance::dataset::refs::BranchIdentifier,
+}
+
+impl CollectorBranch {
+    pub(crate) fn head_version(&self) -> u64 {
+        self.dataset.version().version
+    }
+
+    pub(crate) fn identifier(&self) -> &lance::dataset::refs::BranchIdentifier {
+        &self.identifier
+    }
+
+    /// A fresh authority inventory; the held dataset caches no branch refs.
+    pub(crate) async fn live_identifiers(
+        &self,
+    ) -> Result<Vec<lance::dataset::refs::BranchIdentifier>> {
+        let mut identifiers =
+            crate::branch_control::list_live_manifest_branch_contents(&self.dataset)
+                .await?
+                .into_values()
+                .map(|contents| contents.identifier)
+                .collect::<Vec<_>>();
+        identifiers.push(lance::dataset::refs::BranchIdentifier::main());
+        Ok(identifiers)
+    }
+
+    pub(crate) fn dataset(&self) -> &Dataset {
+        &self.dataset
+    }
+
+    /// Capture lineage from the same immutable dataset as the table roots.
+    pub(crate) async fn commit_graph(&self) -> Result<crate::db::commit_graph::CommitGraph> {
+        let (rows, _) = read_graph_lineage(&self.dataset).await?;
+        Ok(crate::db::commit_graph::CommitGraph::from_manifest_rows(
+            &self.root_uri,
+            self.branch.as_deref(),
+            rows,
+        ))
+    }
+
+    /// The version history up to the opened version; a version published
+    /// after the open is listed by the store and dropped here.
+    pub(crate) async fn versions(&self) -> Result<Vec<lance::dataset::Version>> {
+        let head = self.head_version();
+        Ok(self
+            .dataset
+            .versions()
+            .await
+            .map_err(OmniError::storage)?
+            .into_iter()
+            .filter(|version| version.version <= head)
+            .collect())
+    }
+
+    /// Every registration row at the opened version, historical rows included.
+    pub(crate) async fn rows(&self) -> Result<Vec<DatasetEntry>> {
+        state::read_manifest_entries(&self.dataset).await
+    }
+
+    /// The snapshot at the opened version.
+    pub(crate) async fn snapshot(&self) -> Result<Snapshot> {
+        let mut snapshot = ManifestCoordinator::snapshot_from_state(
+            &self.root_uri,
+            read_manifest_state(&self.dataset).await?,
+        );
+        snapshot.graph_branch = self.branch.clone();
+        snapshot.native_branch = self.dataset.manifest().branch.clone();
+        Ok(snapshot)
+    }
+}
+
 /// Metadata-only rebinding of one live table identity to a new alias.
 ///
 /// `table_path` is the path the caller observed. The publisher requires it to
@@ -887,6 +934,7 @@ impl DatasetEntry {
             self.published_dataset_version,
             self.version_metadata.staged_version(),
             self.version_metadata.transaction_uuid(),
+            self.version_metadata.last_linear_version(),
             session,
             crate::instrumentation::table_wrapper(),
         )
@@ -1278,92 +1326,24 @@ impl ManifestCoordinator {
         Ok(snapshot)
     }
 
-    /// Read one exact native manifest ref for a control-plane liveness proof.
-    /// The caller must hold the schema-control gate (and the target's ordinary
-    /// branch/table gates before destroying it).
-    /// Native refs must come from a listing in that same envelope. This does
-    /// not capture a BranchIdentifier and must not serve general reads or OCC.
-    pub(crate) async fn snapshot_native_under_control_gates(
-        root_uri: &str,
-        candidate_native: Option<&str>,
-        control_session: &Arc<lance::session::Session>,
-    ) -> Result<Snapshot> {
-        let root = root_uri.trim_end_matches('/');
-        // The caller resolved every candidate from one listing; open the
-        // native ref directly rather than paying a listing per branch.
-        let dataset =
-            open_manifest_dataset_native_with_session(root, candidate_native, control_session)
-                .await?;
-        let mut snapshot = Self::snapshot_from_state(root, read_manifest_state(&dataset).await?);
-        snapshot.graph_branch = candidate_native
-            .filter(|branch| *branch != "main")
-            .map(crate::branch_names::logical_branch_name)
-            .map(str::to_string);
-        Ok(snapshot)
-    }
-
-    /// Prove native-table liveness from main and every live branch, including
-    /// lazy borrowers whose logical owner no longer uses the ref. Any unreadable
-    /// branch fails the entire proof closed. See the control-envelope contract
-    /// on `snapshot_native_under_control_gates`.
-    pub(crate) async fn native_fork_references_under_control_gates(
-        root_uri: &str,
-        control_session: &Arc<lance::session::Session>,
-    ) -> Result<NativeForkReferences> {
-        let root = root_uri.trim_end_matches('/');
-        let main = open_manifest_dataset_native_with_session(root, None, control_session).await?;
-        let mut branches: Vec<_> = list_live_manifest_branch_contents(&main)
-            .await?
-            .into_keys()
-            .filter(|name| name != "main")
-            .collect();
-        branches.sort();
-        let mut references = NativeForkReferences {
-            referenced: HashSet::new(),
-            owned: HashSet::new(),
-            live_incarnations: branches
-                .iter()
-                .filter_map(|native| crate::branch_names::split_native_branch_name(native).1)
-                .map(str::to_owned)
-                .collect(),
-        };
-        let mut add = |native: Option<&str>, snapshot: Snapshot| {
-            for entry in snapshot.datasets() {
-                if let Some(table_native) = entry.native_dataset_branch.as_deref() {
-                    let key = (entry.identity, table_native.to_string());
-                    references.referenced.insert(key.clone());
-                    if native.is_some_and(|owner| {
-                        entry.version_metadata.is_table_fork_of(table_native, owner)
-                    }) {
-                        references.owned.insert(key);
-                    }
-                }
-            }
-        };
-        add(
-            None,
-            Self::snapshot_from_state(root, read_manifest_state(&main).await?),
-        );
-        for native in branches {
-            add(
-                Some(&native),
-                Self::snapshot_native_under_control_gates(root, Some(&native), control_session)
-                    .await?,
-            );
-        }
-        Ok(references)
-    }
-
-    /// Historical table pins on one live graph branch, for cleanup's twin proof.
-    /// The caller holds the cleanup control gates; these are immutable published
-    /// records, never authority to publish new data or infer an abandoned writer.
-    pub(crate) async fn table_versions_under_control_gates(
+    /// One live graph branch's `__manifest` opened once for the collector,
+    /// under the cleanup control gates: every version, registration row and
+    /// head the run compares for that branch comes from this open.
+    pub(crate) async fn collector_branch_under_control_gates(
         root_uri: &str,
         branch: Option<&str>,
         control_session: &Arc<lance::session::Session>,
-    ) -> Result<Vec<DatasetEntry>> {
-        let dataset = open_manifest_dataset_with_session(root_uri, branch, control_session).await?;
-        state::read_manifest_entries(&dataset).await
+    ) -> Result<CollectorBranch> {
+        let (dataset, identifier, _native) =
+            open_manifest_branch_with_identifier(root_uri, branch, control_session).await?;
+        Ok(CollectorBranch {
+            root_uri: root_uri.trim_end_matches('/').to_string(),
+            branch: branch
+                .filter(|branch| *branch != "main")
+                .map(str::to_string),
+            dataset,
+            identifier,
+        })
     }
 
     /// Inventory registered table lifetimes, including soft-dropped tables, under cleanup's gates.
@@ -1847,15 +1827,7 @@ impl ManifestCoordinator {
     pub(crate) async fn create_branch(&mut self, name: &str) -> Result<()> {
         crate::branch_names::ensure_logical_branch_name(name)?;
         let mut ds = self.dataset.clone();
-        let live = list_live_manifest_branch_contents(&ds).await?;
-        if crate::branch_names::resolve_native_branch(live.keys().map(String::as_str), name)?
-            .is_some()
-        {
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' already exists",
-                name
-            )));
-        }
+        crate::branch_control::ensure_manifest_branch_create_namespace(&ds, name).await?;
         let native =
             crate::branch_names::native_branch_name(name, &crate::branch_names::mint_incarnation());
         match crate::branch_control::create_branch_recoverably(&mut ds, &native, self.version())
@@ -1913,6 +1885,10 @@ impl ManifestCoordinator {
         let ds = self.open_branch_control_dataset().await?;
         let native = resolve_native_manifest_branch(&ds, name).await?;
         crate::branch_control::retire_branch_recoverably(&ds, &native, expected_identifier).await
+    }
+
+    pub(crate) async fn schema_apply_locked(&self) -> Result<bool> {
+        crate::branch_control::schema_apply_locked(&self.dataset).await
     }
 
     /// Logical graph branches, `main` first. Each live native ref maps to

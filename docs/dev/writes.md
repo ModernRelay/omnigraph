@@ -7,7 +7,10 @@ finishes it is in [recovery.md](recovery.md)
 Every successful graph-content write has one visibility point: a conditional
 `__manifest` publication. Table effects happen earlier, but as detached Lance
 commits of the pinned base that nothing references until that publication
-([RFC 0067](../rfcs/0067-detached-table-commits.md)).
+([RFC 0067](../rfcs/0067-detached-table-commits.md)). A detached commit is
+the table's version for its whole life: nothing replays it onto the table's
+linear history, and a graph table's linear HEAD stays at its creation version
+([RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)).
 
 ## The protocol
 
@@ -22,15 +25,14 @@ acquire schema → branch → sorted-table gates, recheck the complete authority
         ↓
 commit each participant as a detached version of its pin
         ↓
-publish every pin (target, staged version, transaction uuid) + lineage in one manifest CAS
-        ↓
-promote each pin from the held handles (best effort; a pending pin is promoted later)
+publish every pin (published_dataset_version, staged_version, transaction_uuid) + lineage in one __manifest CAS
 ```
 
 An error before the manifest CAS leaves the graph unchanged: the detached
-versions are unreferenced staging, retained until reclamation can be proved.
-The caller retries from a fresh snapshot. A successful publication is
-acknowledged whether or not promotion ran. A lost acknowledgement is resolved
+versions are unpublished staging, which `cleanup`'s collector reclaims once
+their recorded publication authority is provably gone. The caller retries
+from a fresh snapshot. A successful publication is the whole write: no table
+effect has post-publication work. A lost acknowledgement is resolved
 against the exact attempted manifest; unavailable readback stays indeterminate.
 No writer arms a recovery record, and no write replans around a partial state, because
 no partial state is ever visible. Schema apply and the system-column upgrade
@@ -64,6 +66,26 @@ native branch lifetime; a stale or missing view takes the existing refresh/open
 path. Captures share immutable lineage and the Lance session, copy current
 table state, and leave the handle's active branch unchanged.
 
+Create admission lists native ref names and reads bodies only for the source,
+the target's incarnations and logical ancestors or descendants, and the
+schema-apply sentinel. Physical path checks include retired ref names. The
+exact target ref must be absent; an empty listing of its exact native tree
+allows creation without forced reclamation. A nonempty tree and clone-only
+recovery keep Lance's full dependency and tag checks.
+
+For a captured main source at a canonical attached V2 manifest, the clone
+handler reuses the known location, size and ETag while the clone call is
+active. Only default built-in object-store handlers use this path. Custom
+handlers, named sources, V1 or detached locations, and missing size or ETag
+keep normal resolution. Lance still reads the source manifest and checks its
+existence before publishing the new ref. This avoids repeated location HEADs;
+it does not protect an input from concurrent cleanup.
+
+Ref-name listing still grows with the physical ref inventory. Cold recreation
+of the same logical name reads its retained incarnations to validate retirement
+and liveness; source, hierarchy and sentinel incarnations also remain relevant.
+Unrelated retired ref bodies add no reads to an ordinary fresh create.
+
 After a content publication, the publisher returns the projection (the
 in-memory `__manifest` state folded from the journal) it already built from the
 successful attempt's freshly read base. The coordinator retains
@@ -95,8 +117,8 @@ physical-effect proofs:
 | Writer | Physical adapter | Publication |
 |---|---|---|
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
-| SchemaApply | Exact existing-table rewrites plus owned first-touch table creation and the complete schema/manifest delta | One main-branch graph commit |
-| BranchMerge | Pointer adoption, or a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (RFC 0067) | One target-branch graph commit |
+| SchemaApply | Exact existing-table rewrites plus new-type dataset creation (a linear `v1` create) and the complete schema/manifest delta | One main-branch graph commit |
+| BranchMerge | Onto main: a pointer switch, main's registration taking the source's pin. Into a named branch: a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (`exec/merge.rs`) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | One detached compaction `Rewrite` per productive table, chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
 
@@ -106,77 +128,73 @@ reclaimed only when its target is provable from that authority. It does not
 invent an alternate graph-content publisher. Each branch life owns a native ref
 named `{logical}.{ULID}` (see [RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md));
 a recreated branch therefore never shares a path with its dead predecessor, and
-the predecessor's forks are reclaimed by `cleanup` rather than healed in place.
+what the predecessor left (its unpublished stagings, and the table forks a
+pre-v11 branch owned) is reclaimed by `cleanup` rather than healed in place.
 
 ## Mutation and Load
 
 `MutationStaging` accumulates read-your-writes batches and delete predicates
 in memory. It performs all type, value, uniqueness, endpoint, cardinality, and
 resource validation before staging. `stage_all` opens each touched table at
-its pin through the read-handle cache, promoting a pending predecessor pin
-first, and produces one exact transaction per table without moving HEAD.
-`commit_all` enters the gates, revalidates the complete authority, and commits
-every participant as a detached version of its pinned base: no recovery
-sidecar is armed, a table's linear HEAD never moves, and nothing can rebase.
-The manifest then publishes every pin as `(base + 1, staged version,
-transaction uuid)` in one CAS; a publish that loses the CAS returns the plain
-`ReadSetChanged` and unproven detached staging is retained. After
-publication the writer promotes each pin from the handles it already holds,
-replaying the recorded transaction at `base` so the linear history gains an
-identical twin. A promotion that fails or is blocked never fails the write:
-the pin stays pending, readable through its staged version, and the next
-writer of that table or `cleanup` promotes it. A writer whose captured
-snapshot predates a promotion sees the linear HEAD one past its published
-version; the current manifest explains that HEAD, so the writer reprepares
-(`ReadSetChanged`) rather than reporting drift. Cleanup skips version GC on a
-table whose pin is blocked. Detached manifests are reclaimed only when a
-published pin and matching transaction UUID prove their linear twins, or when
-the target version is absent while the table head is at or past it (the
-resolution rule already refuses to serve such a copy). Age filters which
-proven copies a run reaps and never defers a table's version GC; it does not
-prove that an unpublished writer stopped. Cleanup retains a pending or unproven
-copy and defers version/file GC for its table, naming the retained versions in
-the reason, while continuing on unaffected tables. Historical pins and chain
-links use the same proof so successful writes do not leave redundant detached
-copies, and a chain's links are deleted oldest first so the tip that carries
-the proof goes last.
+its pin through the read-handle cache (the registration's `staged_version`
+when it carries one) and produces one exact transaction per table without
+moving HEAD. `commit_all` enters the gates, revalidates the complete
+authority, and commits every participant as a detached version of its pinned
+base: no recovery sidecar is armed, a table's linear HEAD never moves, and
+nothing can rebase. Every detached commit records the authority it was staged
+against in its transaction properties,
+`omnigraph.staged_against_branch_incarnation` and
+`omnigraph.staged_against_graph_head`, and a delete records the ids it
+removed under `omnigraph.deleted_ids` (inline up to 64 KiB) or
+`omnigraph.deleted_ids_path` (`table_store.rs`); the collector and change
+discovery read them. The manifest then publishes every pin as
+`(base + 1, staged_version, transaction_uuid)` in one CAS; a publish that
+loses the CAS returns the plain `ReadSetChanged`, and the staging it leaves
+is unpublished until the collector reclaims it. The published pin is final:
+readers open `staged_version` directly, and `published_dataset_version`
+keeps its number, `base + 1`, as the table's logical version inside its
+`__manifest` lineage without naming a Lance version. Every registration
+records `omnigraph.last_linear_version`, the highest linear version a pin
+ever reached (`1` for a table created under v11), and every writer that
+rebuilds the row copies it forward (`TableVersionMetadata`,
+`db/manifest/metadata.rs`). A writer whose captured snapshot predates another
+publication loses the CAS and reprepares (`ReadSetChanged`). No writer reads
+the linear HEAD: a foreign linear commit above
+`omnigraph.last_linear_version` is what `repair` reports as `foreign_drift`
+(`repair.rs`, `judge_against_last_linear_version`), never a writer's concern.
 
-A pin whose target version a
-foreign linear commit occupies is blocked: a later mutation or load stages
-from the detached version and its own promotion waits behind the block, while
-the writers that plan on the table's linear HEAD (branch merge, index builds,
-schema apply, the system-column upgrade, Optimize, and a first-touch fork of
-that table) promote every pending pin before they plan and refuse a blocked
-one. Optimize plans each table's
-compaction from its pin and stages the rewrite detached with fragment ids
-above the base's high-water mark, so it needs no `ReserveFragments`; a
-lagging scalar or vector index is rebuilt whole as a detached commit under
-its name (Lance 11 folds only through a linear commit), keeping a vector
-index's partition count; the batch publishes once with an exact CAS on every
-planned pin, and a pin a concurrent writer moved fails the run with a
-read-set conflict so the next run re-plans. A failure before publication
-leaves unproven detached versions that cleanup retains; one after it leaves
-pending pins the next writer or cleanup promotes. A strict mutation prepared
-before Optimize's publication reports the same read-set conflict as it would
-after any other writer. `omnigraph repair` reports blocked pins as
-`blocked_promotion` on every live branch and never adopts the foreign commit;
-nothing resolves a blocked pin yet. First-touch branch
-forks are created without an intent record; cleanup retains an unreferenced
-fork while the graph branch incarnation in its name is live, and classifies
-it as garbage once that incarnation is gone.
+Detached manifests are reclaimed by the tracing collector `cleanup` runs
+(`db/omnigraph/collector.rs`; `optimize.rs`, `cleanup_detached_only`). Its
+roots are the pins of every `__manifest` version the run's `--keep` and
+`--older-than` policy retains on every live branch; a detached manifest is
+swept when a `__manifest` version once named it and no retained version
+still does, or when no `__manifest` version ever named it and the authority
+its transaction properties record is provably gone. Nothing defers a table's
+collection; see [Maintenance](../user/operations/maintenance.md#cleanup).
+
+Optimize plans each table's compaction from its pin and stages the rewrite
+detached with fragment ids above the base's high-water mark, so it needs no
+`ReserveFragments`; a lagging scalar or vector index is rebuilt whole as a
+detached commit chained on the rewrite under its name (Lance 11 folds only
+through a linear commit), keeping a vector index's partition count; the batch
+publishes once with an exact CAS on every planned pin, and a pin a concurrent
+writer moved fails the run with a read-set conflict so the next run re-plans.
+A failure before publication leaves unpublished staging the collector
+reclaims once it is dead. A strict mutation prepared before Optimize's
+publication reports the same read-set conflict as it would after any other
+writer.
 
 The index writer (`ensure_indices` and the explicit full-text rebuild)
 follows the same protocol: it opens each productive table at its pin, stages
-the complete BTREE/FTS/vector batch before the gates (a first-touch fork on a
-branch is created under the gates, with no intent record), commits every
-batch as a detached version of the pin, publishes the pins once and promotes
-them. A failure before publication leaves no residue; one after publication
-leaves a pending pin that reads, including full-text search through the
-batch's certificate, serve from the staged version.
+the complete BTREE/FTS/vector batch before the gates, commits every batch as
+a detached version of the pin and publishes the pins once. A failure before
+publication leaves no graph-visible residue; after publication reads,
+including full-text search through the batch's certificate, serve from the
+staged version.
 
 Schema apply stages each existing-table rewrite as a detached Overwrite of
-the promoted HEAD, publishes it as a pin one past the published version and
-promotes it after the manifest commit. An added type is a linear
+the table's pin and publishes it as a pin one past the published version. An
+added type is a linear
 version-one create at its identity path; that path is a deterministic
 function of the accepted identity allocator, so an attempt that died after
 creating the dataset left it exactly where the retry creates it, and the
@@ -193,25 +211,31 @@ an unpublished staging as if it were absent. The open also reclaims a
 sentinel left by a crashed apply, under the same one-mutation-process
 boundary as every other open-time recovery decision.
 
-Branch merge follows it too. Each target table opens at its pin; every chunk
-of the proven insertion chain or the bounded ordered diff commits as a
+Branch merge follows it too. A merge onto main is a pointer switch: main's
+registration takes the source's pin, and the merge stages no fenced insert,
+no keyed update and no payload copy; external blob descriptors stay
+external, and an empty source delta leaves main's registration untouched. A
+merge into a named branch opens each target table at its pin, and every
+chunk of the proven insertion chain or the bounded ordered diff commits as a
 detached version of the previous chunk (one link per chunk, within the
-merge's transaction ceiling), a pointer adoption copies the source's entry
-including a pending pin, and a first-touch fork on a named target is created
-under the gates with no intent record. The target publishes once, with each
-chained table's pin naming its linear base plus the chain length and the
-tip as the staged version; the writer then promotes every link in order. A
-failure anywhere before publication leaves the target untouched and the
-chain as reclaimable garbage; a target that advanced meanwhile makes the
-merge lose its manifest CAS and return the ordinary conflict.
+merge's transaction ceiling); the target publishes once, with each chained
+table's pin naming `base + 1` as its `published_dataset_version` and the
+chain's tip as its `staged_version`, whatever the chain's length. The merge
+proofs walk the branch's commit chain by `read_version` links from the
+source pin back to the base pin (`try_proven_pure_insert_history`,
+`proven_chain_fragments`, `chain_reaches`, `plan_lineage_merge` in
+`exec/merge.rs`). A failure anywhere before publication leaves the target
+untouched and the chain as unpublished staging; a target that advanced
+meanwhile makes the merge lose its manifest CAS and return the ordinary
+conflict.
 
 Existing-table constructive transactions stage independently with bounded
 concurrency. The `stage_write_concurrency` session setting (`process` scope,
 range `1..=64`; process default `OMNIGRAPH_LOAD_CONCURRENCY`, an invalid or
 `0` value refusing startup instead of running the default) selects that
 width for both Load and
-ordinary insert/update mutations (default 8). Deferred first-touch branch
-effects and delete transactions remain serial. The setting changes only
+ordinary insert/update mutations (default 8). Delete transactions remain
+serial. The setting changes only
 fragment preparation: every participant still commits detached and crosses
 one graph-manifest publication.
 
@@ -241,49 +265,41 @@ capability, not an authenticity mechanism; unfamiliar or cleaned history falls
 back to the general merge.
 
 Full-text builds stage an artifact-scoped analyzer certificate before their
-CreateIndex metadata is published. The explicit rebuild uses this same writer,
-including first-touch branch ownership; it does not rewrite retained snapshots
-or add a separate migration publisher. See
+CreateIndex metadata is published. The explicit rebuild uses this same writer;
+it does not rewrite retained snapshots or add a separate migration publisher.
+See
 [full-text compatibility](lance.md#full-text-compatibility).
 
-## First-touch tables and lazy branches
+## Branch writes on inherited tables
 
-A named graph branch can read an exact table version owned by another branch.
-Its first write stages against that inherited snapshot and prepares a fresh
-native name, `fork.{owner incarnation ULID}.m{base manifest version}.{graph commit ULID}`.
-A legacy owner without an incarnation uses `legacy` in that position.
-The name has at most 80 ASCII bytes, independent of the logical branch name;
-the existing unique commit ID separates attempts across legacy owners.
-The base manifest version and graph commit ID already belong to the captured
-attempt. Name construction adds no storage request, version reservation, or
-rename. The fork is created from the captured source ref and version without
-any intent record. A fork no manifest entry references is unpublished, not
-abandoned: cleanup retains it while the owner incarnation in its name is a
-live native graph branch, retains a generated name it cannot parse (the
-`legacy` spelling included), and reclaims it once that incarnation is gone.
-The name only retains; it never establishes ownership.
+A named graph branch reads the exact table version its `__manifest` lineage
+inherited from its parent. Its writes stage detached on that inherited
+dataset and native ref, from the inherited pin; the registration's
+`native_dataset_branch` stays what it inherited, and no per-table fork is
+created for a graph branch. Two graph branches writing the same table
+produce two detached chains in one dataset; neither moves a HEAD, so they
+cannot conflict, and each branch's `__manifest` lineage names its own chain.
+Ownership of a table version is that lineage, never a native ref name.
 
-`TableVersionMetadata.table_fork_owner` records ownership in the existing
-manifest metadata. Existing owned writes retain the actual physical ref;
-pointer adoption preserves the source owner. Missing owner metadata uses only
-exact native-ref equality for legacy ownership. Parsing a name cannot establish
-ownership, because older legal names can resemble the new spelling.
+A table fork a branch created before v11 (native name
+`fork.{owner incarnation ULID}.m{base manifest version}.{graph commit ULID}`,
+or `legacy` in the incarnation position) stays valid: a registration that
+names it as `native_dataset_branch` opens there, a later write on that graph
+branch stages detached on the fork, and
+`TableVersionMetadata.table_fork_owner` still records its owner. `cleanup`
+reclaims a fork no registration references once the graph branch incarnation
+in its name is gone, and keeps a generated name it cannot parse.
 
-First-touch writes and merges leave old forks alone. A new attempt gets a new
-commit ID and therefore a new fork name. Correctness gates, exact effect
-identity, and baseline checks remain in place. The name's
-base version is preparation context; the successful manifest publication orders
-the new registration within that graph branch.
-
-Explicit `cleanup` protects every live table endpoint, pending pin chains,
-tags, and native ancestry before reclaiming unused forks. Branch deletion starts no
-background table reclamation. Branch deletion records retirement metadata on
-its exact native `__manifest` ref, so descendants keep their physical parent
-history while the logical name becomes unavailable. Cleanup reclaims unused
-retired leaves after proving their dependencies. Cached write admission checks
-the ref's identifier and retirement metadata through the existing lookup, with
-no additional storage request. Cold branch enumeration includes retained refs
-and filters retirement metadata; explicit cleanup reclaims unneeded refs.
+Branch deletion starts no background table reclamation. It records retirement
+metadata on the exact native `__manifest` ref, archives its `BranchContents`
+inside the native tree, then unlinks the active ref. Required physical parent
+history and imported merge-base records remain readable through the archive.
+Cleanup reclaims unneeded trees and archives after checking their dependencies.
+Delayed staging is judged by a complete live-identity inventory after the table
+listing, with final validation of the graph and tag capture before deletion.
+Cached write admission checks the ref's identifier and retirement metadata
+through the existing lookup, with no additional storage request. Cold branch
+enumeration reads active refs; creation does not scan retired histories.
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, or pointer belongs to the same lifetime.
@@ -310,10 +326,9 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
-| Any writer fails before publication, after any detached effect | Typed error; no graph movement; unproven detached staging is retained |
-| Any writer fails after publication, before promotion | Acknowledged; the pin stays pending, readable through its staged version, and the next writer of the table or cleanup promotes it |
+| Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
 | Schema apply or the system-column upgrade fails after publication, before its contract is installed | `RecoveryRequired` naming the published commit; the next read-write open, `refresh`, or that handle's next write installs the staged contract |
-| A foreign linear commit occupies a pin's target version | The pin is blocked: mutations and loads keep writing behind it; branch merge, index builds, schema apply, the system-column upgrade, Optimize and a first-touch fork refuse the table; `repair` reports `blocked_promotion` on every live branch and nothing resolves it yet |
+| A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
 | A sidecar from a build that predates detached commits is present | A read-write open and the storage upgrade refuse until that build has resolved it |
 
 An acknowledgement is returned only after the manifest commit is durable and
@@ -333,15 +348,16 @@ A new writer must:
 
 - declare its complete authority token and effect set;
 - use the shared gate order and publication primitive;
-- stage every table effect as a detached commit whose replay conflicts with
-  its own twin (see the surface guards), publish pins, and promote held
-  handles after the CAS;
+- stage every table effect as a detached commit of the pin, carrying the
+  staged-against properties (and `omnigraph.deleted_ids` on a delete), and
+  publish the pins in the one CAS; nothing follows the CAS;
 - add its windows to `detached_commit_matrix.rs` and its crash cells to
   `failpoints.rs`;
 - join the durable-call/source guards in `forbidden_apis.rs`;
 - prove bounds and crash windows at the owning layer.
 
 Design rationale and rejected alternatives live in
+[RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md),
 [RFC 0067](../rfcs/0067-detached-table-commits.md),
 [RFC 0022](../rfcs/0022-unified-write-path.md),
 [RFC 0023](../rfcs/0023-key-conflict-fencing.md), and

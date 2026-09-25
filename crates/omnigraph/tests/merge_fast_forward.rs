@@ -105,12 +105,68 @@ fn assert_single_physical_publish_encloses_keyed_work(probes: &MergeWriteProbes)
     );
 }
 
-/// THE structural gate. A one-chunk append-only source delta must use one
-/// exact-id fenced insert and zero bare appends. The storage adapter converts
-/// Lance's uncommitted data fragments into a filter-bearing `Update`, so the
-/// former append route cannot bypass same-key conflict detection.
+/// The pins `table_keys` hold on `branch`, with main's `dataset_path` for each.
+async fn source_pins(
+    db: &Omnigraph,
+    branch: &str,
+    table_keys: &[&'static str],
+) -> Vec<(&'static str, u64, String)> {
+    let main = snapshot_main(db).await.unwrap();
+    let mut pins = Vec::new();
+    for table_key in table_keys {
+        pins.push((
+            *table_key,
+            pinned_version(db, branch, table_key).await,
+            main.dataset(table_key).unwrap().dataset_path.clone(),
+        ));
+    }
+    pins
+}
+
+/// A merge onto an unadvanced main is a pointer switch: nothing is staged and
+/// main takes each source pin with its `dataset_path` unchanged.
+async fn assert_pointer_switch_onto_main(
+    db: &Omnigraph,
+    probes: &MergeWriteProbes,
+    pins: Vec<(&'static str, u64, String)>,
+) {
+    assert_eq!(probes.stage_append_calls(), 0);
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
+    assert_eq!(probes.stage_fenced_insert_calls(), 0);
+    assert_eq!(probes.stage_known_present_update_calls(), 0);
+    assert_eq!(probes.strict_insert_preflight_calls(), 0);
+    let main = snapshot_main(db).await.unwrap();
+    for (table_key, source_pin, dataset_path) in pins {
+        assert_eq!(main.dataset(table_key).unwrap().dataset_path, dataset_path);
+        assert_eq!(
+            pinned_version(db, "main", table_key).await,
+            source_pin,
+            "{table_key}: main takes the source's pin"
+        );
+    }
+}
+
+/// The `read_version` links from `dataset` down to `base_pin`; `None` when the
+/// chain leaves the recorded history without reaching it.
+async fn chain_links_to(dataset: &Dataset, base_pin: u64) -> Option<usize> {
+    let mut current = dataset.clone();
+    for links in 0..64 {
+        if current.version().version == base_pin {
+            return Some(links);
+        }
+        let transaction = current.read_transaction().await.ok()??;
+        current = current
+            .checkout_version(transaction.read_version)
+            .await
+            .ok()?;
+    }
+    None
+}
+
+/// A one-chunk append-only source delta merges onto main by pointer switch:
+/// no fenced insert, no bare append, no general table walk.
 #[tokio::test]
-async fn append_only_fast_forward_merge_uses_fenced_insert() {
+async fn append_only_fast_forward_merge_is_a_pointer_switch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
@@ -118,6 +174,7 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
 
     let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     append_new_persons(&feature, "feature", 5).await;
+    let pins = source_pins(&main, "feature", &["node:Person"]).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
@@ -128,31 +185,9 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
     assert_eq!(
         probes.table_walk_interval_count(),
         0,
-        "proven insert replay must bypass the general three-way table walk"
+        "a pointer switch must bypass the general three-way table walk"
     );
-
-    assert_eq!(
-        probes.stage_fenced_insert_calls(),
-        1,
-        "one-chunk fast-forward merge must stage one exact-id fenced insert; did {}",
-        probes.stage_fenced_insert_calls(),
-    );
-    assert_eq!(
-        probes.stage_merge_insert_calls(),
-        0,
-        "proven inserts must not pay the redundant target merge join"
-    );
-    assert_eq!(
-        probes.strict_insert_preflight_calls(),
-        0,
-        "durably proven source absence must make the target strict-insert preflight redundant"
-    );
-    assert_eq!(
-        probes.stage_append_calls(),
-        0,
-        "graph-visible rows must never route through bare stage_append; did {}",
-        probes.stage_append_calls(),
-    );
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(
         probes.scan_staged_combined_calls(),
         0,
@@ -160,16 +195,20 @@ async fn append_only_fast_forward_merge_uses_fenced_insert() {
          one batch via scan_staged_combined; did {}",
         probes.scan_staged_combined_calls(),
     );
+    assert_single_physical_publish(&probes);
+    assert_eq!(
+        count_rows_branch(&main, "main", "node:Person").await,
+        count_rows_branch(&main, "feature", "node:Person").await
+    );
     assert_eq!(
         probes.validation_scan_batches(),
         0,
         "exact pure-insert fast-forward with only identity-backed @key must not rescan its already accepted source rows for validation",
     );
-    assert_single_physical_publish_encloses_keyed_work(&probes);
 }
 
 /// A lazy target adopts the exact source endpoint after main advances.
-/// A subsequent target write must fork independently from that source pin.
+/// A subsequent target write stages its own pin and leaves the source's.
 #[tokio::test]
 async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
     let dir = tempfile::tempdir().unwrap();
@@ -212,6 +251,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
 
     let source_before = snapshot_branch(&source, "source").await.unwrap();
     let source_entry = source_before.dataset("node:Person").unwrap();
+    let source_pin = pinned_version(&source, "source", "node:Person").await;
     let merger = helpers::session(Omnigraph::open(uri).await.unwrap());
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge("source", "target"))
@@ -266,12 +306,18 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
         .await
         .unwrap();
     let written = snapshot_branch(&merger, "target").await.unwrap();
-    assert_ne!(
+    assert_eq!(
         written
             .dataset("node:Person")
             .unwrap()
             .native_dataset_branch,
-        source_entry.native_dataset_branch
+        None
+    );
+    let written_pin = pinned_version(&merger, "target", "node:Person").await;
+    assert!(is_detached_version(written_pin), "{written_pin}");
+    assert_ne!(
+        written_pin, source_pin,
+        "the target write stages its own pin"
     );
     let source_after = snapshot_branch(&merger, "source").await.unwrap();
     assert!(
@@ -297,7 +343,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
 
 /// The fast-forward validation shortcut is deliberately narrower than the
 /// provenance route. A row-local constraint still owns a projected ChangeSet
-/// scan even though physical publication can use the exact insert interval.
+/// scan even though publication is a pointer switch.
 #[tokio::test]
 async fn pure_insert_fast_forward_retains_value_constraint_validation() {
     const SCHEMA: &str = r#"
@@ -327,19 +373,14 @@ node Person {
         )
         .await
         .unwrap();
+    let pins = source_pins(&main, "feature", &["node:Person"]).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
-    assert_eq!(probes.stage_fenced_insert_calls(), 1);
-    assert_eq!(probes.stage_merge_insert_calls(), 0);
-    assert_eq!(
-        probes.strict_insert_preflight_calls(),
-        0,
-        "the all-new Upsert source transaction must be admitted by its automatically minted certificate"
-    );
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert!(
         probes.validation_scan_batches() > 0,
         "@range must keep the general logical validator on a pure-insert fast-forward"
@@ -347,7 +388,7 @@ node Person {
 }
 
 /// Pointer adoption preserves the complete certified insertion history.
-/// A later merge into main must still admit that history through the proven publisher.
+/// A later pointer switch onto main still admits that history by its chain.
 #[tokio::test]
 async fn proven_fast_forward_certificate_survives_pointer_adoption() {
     const SCHEMA: &str = r#"
@@ -432,20 +473,19 @@ node Person {
         base_count + 2
     );
 
+    let pins = source_pins(&main, "source", &["node:Person"]).await;
     let final_probes = MergeWriteProbes::default();
     let final_outcome =
         with_merge_write_probes(final_probes.clone(), main.branch_merge("source", "main"))
             .await
             .unwrap();
     assert_eq!(final_outcome, MergeOutcome::FastForward);
-    assert_eq!(final_probes.stage_fenced_insert_rows(), 2);
+    assert_pointer_switch_onto_main(&main, &final_probes, pins).await;
     assert_eq!(
         final_probes.proven_insert_history_read_calls(),
         2,
-        "each certified insertion must be read once from its owning native lineage"
+        "each certified insertion must be read once along the adopted commit chain"
     );
-    assert_eq!(final_probes.stage_merge_insert_calls(), 0);
-    assert_eq!(final_probes.strict_insert_preflight_calls(), 0);
     assert_eq!(
         final_probes.ordered_cursor_scan_calls(),
         0,
@@ -454,11 +494,10 @@ node Person {
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
 }
 
-/// Crossing the 8,192-row scanner-batch ceiling must produce two independently
-/// bounded filtered Lance transactions under one recovery envelope and one
-/// final graph publication.
+/// An 8,193-row source chain of two commits, past the 8,192-row scanner-batch
+/// ceiling, merges onto main by pointer switch after the chain walk proves it.
 #[tokio::test]
-async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
+async fn append_only_fast_forward_merge_of_a_commit_chain_is_a_pointer_switch() {
     const CHUNK_ROWS: usize = 8192;
 
     let dir = tempfile::tempdir().unwrap();
@@ -489,42 +528,25 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
         .await
         .unwrap();
 
-    let base_snapshot = snapshot_main(&main).await.unwrap();
-    let base_entry = base_snapshot.dataset("node:Person").unwrap();
-    let person_uri = format!(
-        "{}/{}",
-        main.uri().trim_end_matches('/'),
-        base_entry.dataset_path.trim_start_matches('/')
-    );
-    let base_table = Dataset::open(&person_uri).await.unwrap();
-    let source_table = helpers::open_published_dataset_head(&main, "feature", "node:Person").await;
-    let base_identifier = base_table.branch_identifier().await.unwrap();
-    let source_identifier = source_table.branch_identifier().await.unwrap();
+    let base_pin = pinned_version(&main, "main", "node:Person").await;
+    let source_table = open_pinned_dataset_for_test(&main, "feature", "node:Person").await;
     assert_eq!(
-        source_identifier.find_referenced_version(&base_identifier),
-        Some(base_entry.published_dataset_version),
-        "fixture must be a native descendant of the captured merge base"
+        chain_links_to(&source_table, base_pin).await,
+        Some(2),
+        "fixture must be two commits whose chain reaches the captured merge base"
     );
+    let pins = source_pins(&main, "feature", &["node:Person"]).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(
-        probes.stage_fenced_insert_calls(),
+        probes.proven_insert_history_read_calls(),
         2,
-        "8,193 provenance-proven all-new rows must use two bounded filtered transactions"
-    );
-    assert_eq!(
-        probes.stage_merge_insert_calls(),
-        0,
-        "proven insert chain must not run target merge joins"
-    );
-    assert_eq!(
-        probes.strict_insert_preflight_calls(),
-        0,
-        "the complete certified source chain must eliminate every per-chunk target probe"
+        "the chain walk reads each of the two source commits once"
     );
     assert_eq!(
         probes.ordered_cursor_scan_calls(),
@@ -532,20 +554,14 @@ async fn append_only_fast_forward_merge_uses_bounded_fenced_insert_chain() {
         "proven pure inserts must not scan and sort both base and source"
     );
     assert_eq!(
-        probes.stage_append_calls(),
-        0,
-        "large graph-visible adoption must never use bare Append"
-    );
-    assert_eq!(
         count_rows(&main, "node:Person").await,
         base_count + CHUNK_ROWS + 1
     );
 }
 
-/// A source table can be nested more than one native branch below the merge
-/// base. That is valid graph history, not a table-incarnation conflict. The
-/// optimization may prove the complete interval or fall back to the ordered
-/// diff, but the merge must never reject the deeper BranchIdentifier shape.
+/// A source two branch hops below the merge base is a two-link commit chain on
+/// the inherited dataset: valid history, not a table-incarnation conflict, so
+/// the merge onto main is a pointer switch.
 #[tokio::test]
 async fn nested_source_lineage_merges_without_false_read_set_conflict() {
     let dir = tempfile::tempdir().unwrap();
@@ -576,39 +592,21 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
         .await
         .unwrap();
 
-    let base_snapshot = snapshot_main(&main).await.unwrap();
-    let base_entry = base_snapshot.dataset("node:Person").unwrap();
-    let person_uri = format!(
-        "{}/{}",
-        main.uri().trim_end_matches('/'),
-        base_entry.dataset_path.trim_start_matches('/')
-    );
-    let base_identifier = Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .branch_identifier()
-        .await
-        .unwrap();
-    let source_identifier =
-        helpers::open_published_dataset_head(&main, "experiment", "node:Person")
-            .await
-            .branch_identifier()
-            .await
-            .unwrap();
-    assert!(
-        source_identifier.version_mapping.len() >= base_identifier.version_mapping.len() + 2,
-        "fixture must contain at least two native descendant hops"
-    );
+    let base_pin = pinned_version(&main, "main", "node:Person").await;
+    let source_table = open_pinned_dataset_for_test(&main, "experiment", "node:Person").await;
     assert_eq!(
-        source_identifier.find_referenced_version(&base_identifier),
-        Some(base_entry.published_dataset_version)
+        chain_links_to(&source_table, base_pin).await,
+        Some(2),
+        "fixture must hold one commit per branch hop between the base and experiment"
     );
+    let pins = source_pins(&main, "experiment", &["node:Person"]).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("experiment", "main"))
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
     let names = collect_column_strings(&read_table(&main, "node:Person").await, "name");
     assert!(names.iter().any(|name| name == "nested-feature"));
@@ -653,7 +651,8 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
             main.uri().trim_end_matches('/'),
             base_entry.dataset_path.trim_start_matches('/')
         );
-        let source = helpers::open_published_dataset_head(&main, "feature", "node:Person").await;
+        let base_pin = pinned_version(&main, "main", "node:Person").await;
+        let source = open_pinned_dataset_for_test(&main, "feature", "node:Person").await;
         if ancestor_history {
             feature
                 .branch_create_from(ReadTarget::branch("feature"), "leaf")
@@ -668,40 +667,35 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
                 .await
                 .unwrap();
             feature.branch_merge("leaf", "feature").await.unwrap();
-            let adopted =
-                helpers::open_published_dataset_head(&main, "feature", "node:Person").await;
-            assert_ne!(adopted.manifest.branch, source.manifest.branch);
+            let adopted = open_pinned_dataset_for_test(&main, "feature", "node:Person").await;
+            assert_ne!(adopted.version().version, source.version().version);
             assert_eq!(
-                adopted
-                    .branch_identifier()
-                    .await
-                    .unwrap()
-                    .find_referenced_version(&source.branch_identifier().await.unwrap()),
-                Some(source.version().version)
+                chain_links_to(&adopted, source.version().version).await,
+                Some(1),
+                "the adopted leaf commit reads the feature pin"
             );
         }
-        let missing_version = source
-            .version()
-            .version
-            .checked_sub(1)
-            .expect("source fixture must have an intermediate version");
-        assert!(
-            missing_version > base_entry.published_dataset_version,
-            "fixture needs at least two source transactions above the merge base"
+        assert_eq!(
+            chain_links_to(&source, base_pin).await,
+            Some(2),
+            "fixture needs two source transactions above the merge base"
         );
-        let versions_dir = std::path::Path::new(&person_uri)
-            .join("tree")
-            .join(source.manifest.branch.as_deref().unwrap())
-            .join("_versions");
-        let v1_path = versions_dir.join(format!("{missing_version}.manifest"));
-        let v2_path = versions_dir.join(format!("{:020}.manifest", u64::MAX - missing_version));
-        let manifest_path = [v1_path, v2_path]
-            .into_iter()
-            .find(|path| path.exists())
-            .expect("intermediate source manifest must exist before cleanup");
-        std::fs::remove_file(&manifest_path).unwrap();
+        let missing_version = source
+            .read_transaction()
+            .await
+            .unwrap()
+            .expect("a detached commit records its transaction")
+            .read_version;
+        assert!(is_detached_version(missing_version), "{missing_version}");
+        std::fs::remove_file(
+            std::path::Path::new(&person_uri)
+                .join("_versions")
+                .join(format!("d{missing_version}.manifest")),
+        )
+        .expect("intermediate source manifest must exist before cleanup");
         drop(source);
         drop(feature);
+        let pins = source_pins(&main, "feature", &["node:Person"]).await;
 
         let probes = MergeWriteProbes::default();
         let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
@@ -712,14 +706,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
             probes.ordered_cursor_scan_calls() >= 2,
             "missing provenance must enter the ordered base/source fallback"
         );
-        assert_eq!(probes.stage_append_calls(), 0);
-        assert_eq!(probes.strict_insert_preflight_calls(), 1);
-        assert_eq!(probes.stage_fenced_insert_calls(), 1);
-        assert_eq!(
-            probes.stage_merge_insert_calls(),
-            0,
-            "ordered-diff insert fallback must reuse the join-free StrictInsert adapter"
-        );
+        assert_pointer_switch_onto_main(&main, &probes, pins).await;
         assert_eq!(
             count_rows(&main, "node:Person").await,
             base_count + 2 + usize::from(ancestor_history)
@@ -755,11 +742,10 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
     }
 }
 
-/// When the target still equals the merge base, the ordered adopt classifier
-/// already knows a changed id is present. Publication must use an
-/// update-only keyed stage rather than the insertion-capable general Upsert.
+/// When main still equals the merge base, a changed-only source adopts onto
+/// main by pointer switch: no keyed stage, update-only or general Upsert.
 #[tokio::test]
-async fn changed_only_adopt_uses_known_present_update() {
+async fn changed_only_adopt_onto_main_is_a_pointer_switch() {
     let dir = tempfile::tempdir().unwrap();
     let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
@@ -773,20 +759,35 @@ async fn changed_only_adopt_uses_known_present_update() {
         )
         .await
         .unwrap();
+    let pins = source_pins(&main, "feature", &["node:Person"]).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
+    assert_eq!(probes.stage_known_present_update_rows(), 0);
+    assert_single_physical_publish(&probes);
+    let alice = query_main(
+        &main,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap()
+    .concat_batches()
+    .unwrap();
     assert_eq!(
-        probes.stage_merge_insert_calls(),
-        0,
-        "known-present adopt updates must not use the insertion-capable general Upsert stage"
+        alice
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap()
+            .value(0),
+        99
     );
-    assert_eq!(probes.stage_known_present_update_calls(), 1);
-    assert_eq!(probes.stage_known_present_update_rows(), 1);
-    assert_single_physical_publish_encloses_keyed_work(&probes);
 }
 
 /// Read `column` for the node whose `id == id` from `main`. Outer `None` = id
@@ -925,23 +926,21 @@ const WIDE_VALIDATION_SCHEMA: &str = r#"
 node Alpha {
     key: String @key
     payload: String
+    size: I32
+    @range(size, 0..100)
 }
 
 node Beta {
     key: String @key
     payload: String
+    size: I32
+    @range(size, 0..100)
 }
 "#;
 
-/// Validation consumes one cross-table ChangeSet. Two individually-valid
-/// scalar deltas must not silently reassemble into an unbounded operation-wide
-/// allocation: the projected batches are streamed, charged before retention,
-/// and rejected before recovery arm when their aggregate crosses 32 MiB.
-///
-/// This fixture deliberately exercises the general ordered-diff fallback: the
-/// first-touch table histories are not eligible for the proven pure-insert
-/// route.  The fallback must retain its bounded cursor and aggregate-budget
-/// guarantees.
+/// Two proven insert chains under a `@range` constraint feed one cross-table
+/// validation delta; its projected batches are charged before retention and
+/// the merge is refused before recovery arm once they cross 32 MiB.
 #[tokio::test]
 async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     const LIMIT: u64 = 32 * 1024 * 1024;
@@ -957,7 +956,7 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
         let payload = fill.to_string().repeat(PER_TABLE_BYTES);
         let row = serde_json::json!({
             "type": type_name,
-            "data": { "key": key, "payload": payload },
+            "data": { "key": key, "payload": payload, "size": 1 },
         })
         .to_string();
         feature
@@ -1001,12 +1000,16 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
         ),
         "wide cross-table validation delta must fail loudly, got {error:?}"
     );
-    assert!(
-        probes.ordered_cursor_scan_calls() >= 4,
-        "the general fallback must scan both sides of both table deltas"
+    assert_eq!(
+        probes.proven_insert_history_read_calls(),
+        2,
+        "each table's one-commit chain is proven by one history read"
     );
-    assert_eq!(probes.ordered_cursor_batch_rows(), 8192);
-    assert_eq!(probes.ordered_cursor_batch_bytes(), LIMIT);
+    assert_eq!(
+        probes.ordered_cursor_scan_calls(),
+        0,
+        "a proven chain needs no ordered base/source diff"
+    );
     assert!(
         probes.validation_scan_batches() >= 2,
         "the aggregate cap must be exercised across multiple projected batches"
@@ -1291,10 +1294,9 @@ async fn hydration_chunks_stay_bounded_when_wide_rows_interleave() {
     run_bounded_hydration_case(rows, ROWS, "k-00001").await;
 }
 
-/// Functional correctness: a fast-forward merge of an append-only branch leaves
-/// main equal to the source branch. The fixture changes both a node and an edge
-/// table so the operation-level publish interval cannot accidentally become a
-/// per-candidate interval. Independent of the cost-budget gate.
+/// A fast-forward merge of an append-only branch leaves main equal to the
+/// source: both the node and the edge table switch pins under one
+/// operation-level publish interval.
 #[tokio::test]
 async fn fast_forward_merge_yields_source_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -1325,18 +1327,15 @@ async fn fast_forward_merge_yields_source_state() {
     let source_knows_count = count_rows_branch(&feature, "feature", "edge:Knows").await;
     assert_eq!(source_person_count, base_person_count + 6);
     assert_eq!(source_knows_count, base_knows_count + 1);
+    let pins = source_pins(&main, "feature", &["node:Person", "edge:Knows"]).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
     assert_eq!(outcome, MergeOutcome::FastForward);
-    assert_eq!(
-        probes.stage_fenced_insert_calls(),
-        2,
-        "node:Person and edge:Knows must each publish one proven-insert candidate"
-    );
-    assert_single_physical_publish_encloses_keyed_work(&probes);
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
+    assert_single_physical_publish(&probes);
 
     // main now equals source: both changed tables landed and their base rows remain.
     assert_eq!(count_rows(&main, "node:Person").await, source_person_count);
@@ -1461,13 +1460,11 @@ query insert_doc($title: String, $content: Blob, $note: String) {
 }
 "#;
 
-/// A provenance-proven fast-forward must keep the pure-insert route even when
-/// the table has a Blob column. Descriptor classification may inspect only the
-/// proven source interval; it must not restore the general base/source ordered
-/// diff that RFC-023's certificate discharged. The Blob bytes still have to
-/// survive the interval scan → streaming fenced-write round-trip.
+/// A proven pure-insert fast-forward on a Blob table is a pointer switch onto
+/// main: no general ordered diff, no Blob payload read, and the managed bytes
+/// of both rows read back through main.
 #[tokio::test]
-async fn fast_forward_merge_streams_blob_columns() {
+async fn fast_forward_merge_switches_blob_table_pin() {
     use omnigraph::loader::LoadMode;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1481,7 +1478,6 @@ async fn fast_forward_merge_streams_blob_columns() {
     .unwrap();
     main.branch_create("feature").await.unwrap();
 
-    // Only the branch is mutated → fast-forward → adopt/fenced-insert path.
     let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
     mutate_branch(
         &feature,
@@ -1496,6 +1492,7 @@ async fn fast_forward_merge_streams_blob_columns() {
     )
     .await
     .unwrap();
+    let pins = source_pins(&main, "feature", &["node:Document"]).await;
 
     let probes = MergeWriteProbes::default();
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
@@ -1505,30 +1502,21 @@ async fn fast_forward_merge_streams_blob_columns() {
     assert_eq!(
         probes.table_walk_interval_count(),
         0,
-        "proven Blob insert replay must bypass the general table walk"
+        "a Blob pointer switch must bypass the general table walk"
     );
-    assert_eq!(probes.stage_fenced_insert_calls(), 1);
-    assert_eq!(probes.stage_fenced_insert_rows(), 1);
-    assert_eq!(probes.stage_merge_insert_calls(), 0);
-    assert_eq!(probes.stage_known_present_update_calls(), 0);
-    assert_eq!(
-        probes.strict_insert_preflight_calls(),
-        0,
-        "the complete source certificate must discharge the target absence preflight"
-    );
+    assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(
         probes.ordered_cursor_scan_calls(),
         0,
         "Blob descriptor classification must not pull a proven insert interval back through the general base/source diff"
     );
-    assert_eq!(probes.stage_append_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
     assert_eq!(
         probes.stage_vector_index_calls(),
         0,
         "branch merge must leave derived index coverage to the reconciler"
     );
 
-    // The new blob row's bytes survive the streaming keyed write; the base row stays intact.
     let readme = read_managed_blob_bytes(
         &main,
         ReadTarget::branch("main"),
@@ -1545,13 +1533,11 @@ async fn fast_forward_merge_streams_blob_columns() {
     assert_eq!(&seed[..], b"Seed");
 }
 
-/// A Blob-bearing general fast-forward classifies an existing id as changed,
-/// so publication must use the update-only keyed stage introduced by #481.
-/// Overwrite retains the admitted external descriptor on the source branch;
-/// merge owns the copied bytes while leaving unchanged valid-empty and null
-/// siblings distinct.
+/// A Blob-bearing changed-only fast-forward, onto main or a named branch, is a
+/// pointer switch: no keyed stage, no external probe or GET, and the changed,
+/// valid-empty and null descriptors read back exactly as stored.
 #[tokio::test]
-async fn blob_changed_only_adopt_uses_known_present_update() {
+async fn blob_changed_only_adopt_is_a_pointer_switch() {
     const SET_NOTE: &str = r#"
 query set_note($title: String, $note: String) {
     update Document set { note: $note } where title = $title
@@ -1659,21 +1645,12 @@ query set_note($title: String, $note: String) {
             .load(source, &source_data, LoadMode::Overwrite)
             .await
             .unwrap();
-        if source_main {
-            let source_snapshot = snapshot_branch(&main, source).await.unwrap();
-            let target_snapshot = snapshot_branch(&main, target).await.unwrap();
-            assert!(
-                source_snapshot
-                    .dataset("node:Document")
-                    .unwrap()
-                    .published_dataset_version
-                    < target_snapshot
-                        .dataset("node:Document")
-                        .unwrap()
-                        .published_dataset_version,
-                "source-main fixture must exercise a lower source version"
-            );
-        }
+        let source_pin = pinned_version(&main, source, "node:Document").await;
+        assert_ne!(
+            source_pin,
+            pinned_version(&main, target, "node:Document").await,
+            "fixture must exercise different pins on the two sides"
+        );
 
         let merger = helpers::session(
             Omnigraph::open(uri)
@@ -1687,13 +1664,12 @@ query set_note($title: String, $note: String) {
             .await
             .unwrap();
         assert_eq!(outcome, MergeOutcome::FastForward);
-        let delta_rows = u64::from(!source_main);
         assert_eq!(
             probes.stage_known_present_update_calls(),
-            delta_rows,
-            "a lower-versioned source on main is a pointer switch and stages nothing (RFC 0062)"
+            0,
+            "a changed-only adopt onto an unadvanced target is a pointer switch and stages nothing"
         );
-        assert_eq!(probes.stage_known_present_update_rows(), delta_rows);
+        assert_eq!(probes.stage_known_present_update_rows(), 0);
         assert_eq!(probes.stage_merge_insert_calls(), 0);
         assert_eq!(probes.stage_fenced_insert_calls(), 0);
         assert_eq!(probes.strict_insert_preflight_calls(), 0);
@@ -1704,34 +1680,29 @@ query set_note($title: String, $note: String) {
         );
         assert_eq!(
             probes.external_blob_probe_inputs(),
-            delta_rows,
-            "only the changed external descriptor belongs to the adopt delta; a pointer switch probes nothing"
+            0,
+            "a pointer switch is not Blob ingress and probes nothing"
         );
-        assert_eq!(probes.external_blob_probe_calls(), delta_rows);
-        assert_eq!(probes.external_blob_payload_read_calls(), delta_rows);
+        assert_eq!(probes.external_blob_probe_calls(), 0);
+        assert_eq!(probes.external_blob_payload_read_calls(), 0);
+        assert_eq!(
+            pinned_version(&merger, target, "node:Document").await,
+            source_pin,
+            "{target} takes the source's pin"
+        );
 
         assert_eq!(count_rows_branch(&merger, target, "node:Document").await, 3);
-        if source_main {
-            let changed = merger
-                .read_blob_at(
-                    ReadTarget::branch(target),
-                    node_blob_cell("Document", "changed", "content"),
-                )
-                .await
-                .unwrap();
-            let BlobContent::External(changed) = changed.content else {
-                panic!("a pointer switch shows the source's external descriptor as stored");
-            };
-            assert_eq!(changed.uri, external_uri);
-        } else {
-            let changed = read_managed_blob_bytes(
-                &merger,
+        let changed = merger
+            .read_blob_at(
                 ReadTarget::branch(target),
                 node_blob_cell("Document", "changed", "content"),
             )
-            .await;
-            assert_eq!(&changed[..], b"Changed externally");
-        }
+            .await
+            .unwrap();
+        let BlobContent::External(changed) = changed.content else {
+            panic!("a pointer switch shows the source's external descriptor as stored");
+        };
+        assert_eq!(changed.uri, external_uri);
 
         let empty = merger
             .read_blob_at(

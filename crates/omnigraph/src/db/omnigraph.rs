@@ -30,6 +30,7 @@ use crate::storage::{
 use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
 
+pub(crate) mod collector;
 mod export;
 pub(crate) mod optimize;
 pub(crate) mod promotion;
@@ -38,11 +39,14 @@ pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;
 pub(crate) mod table_ops;
 
+pub use collector::{
+    CollectorCost, CollectorPathSnapshot, CollectorReport, CollectorRowSummary,
+    RetainedManifestVersions, StagingVerdict, TableCollectionPlan, UnpublishedManifest,
+};
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{export_blob_values, logical_row_image};
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
-pub(crate) use promotion::HeldPromotion;
 pub use repair::{
     DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
 };
@@ -51,7 +55,7 @@ pub use system_column_upgrade::{
     SYSTEM_COLUMNS_PREFLIGHT, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
 };
-pub(crate) use table_ops::{DeferredTableFork, OpenedForMutation};
+pub(crate) use table_ops::OpenedForMutation;
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
 use super::commit_graph::GraphCommit;
@@ -134,6 +138,14 @@ pub(crate) struct WriteAuthorityToken {
     /// from an unvalidated state marker.
     pub(crate) schema_identity_domain: String,
     pub(crate) schema_identity_version: u32,
+}
+
+impl WriteAuthorityToken {
+    /// The witness every detached commit of this attempt records: the pair
+    /// its publication compares and swaps on.
+    pub(crate) fn staging_witness(&self) -> Result<crate::table_store::StagingWitness> {
+        crate::table_store::StagingWitness::new(&self.branch_identifier, self.graph_head.as_deref())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,8 +327,7 @@ pub struct Omnigraph {
 /// inspection — should not trigger writes (they may run with read-only
 /// object-store credentials, and silent open-time mutations are
 /// surprising). Table data needs no open-time pass: reads always resolve
-/// through the manifest pin, which is the consistent snapshot regardless
-/// of any pending promotion on the per-table side.
+/// through the manifest pin, which is the consistent snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
     /// Settle a staged schema contract on open. Default for `Omnigraph::open`.
@@ -2009,8 +2020,8 @@ impl Omnigraph {
     /// 2. `recover_schema_state_files` in promote-only mode installs a staged
     ///    contract whose publishing commit is already in lineage (RFC 0067)
     ///    and leaves anything else alone, since the apply that staged it may
-    ///    still be live. A pending pin needs no pass here: reads resolve it
-    ///    through its staged version and the next writer promotes it.
+    ///    still be live. A table pin needs no pass here: reads resolve it
+    ///    through its staged version.
     /// 3. The schema view reloads if the source changed and the read caches
     ///    drop.
     ///
@@ -2124,65 +2135,6 @@ impl Omnigraph {
                 Err(error)
             }
         }
-    }
-
-    /// Baseline check for a graph-global writer that plans from a table's
-    /// linear HEAD (schema apply, the system-column upgrade, promotion).
-    ///
-    /// Callers hold their complete schema -> branch -> table gate envelope and
-    /// have already promoted any pending pin. The manifest pin is the logical
-    /// authority; a linear HEAD ahead of it is either explained by a newer
-    /// manifest (the caller's read set is stale and it reprepares) or is a
-    /// foreign commit that needs explicit operator repair.
-    pub(crate) async fn ensure_existing_effect_baseline(
-        &self,
-        table_key: &str,
-        table_branch: Option<&str>,
-        expected_version: u64,
-        dataset: &SnapshotHandle,
-    ) -> Result<()> {
-        let head = dataset
-            .dataset()
-            .latest_version_id()
-            .await
-            .map_err(OmniError::storage)?;
-        if head < expected_version {
-            return Err(OmniError::manifest_internal(format!(
-                "{} is at Lance HEAD version {}, behind published dataset version {}",
-                dataset_subject(table_key),
-                head,
-                expected_version,
-            )));
-        }
-        if head == expected_version {
-            return Ok(());
-        }
-
-        // RFC 0067: a promotion that landed after this writer captured its
-        // snapshot moves HEAD one past the published version the writer
-        // holds. When the current manifest explains that HEAD, the writer's
-        // read set is merely stale and it reprepares instead of being sent
-        // to repair.
-        let graph_branch = table_branch
-            .filter(|branch| *branch != "main")
-            .map(crate::branch_names::logical_branch_name);
-        if let Ok(current) = self.fresh_snapshot_for_branch_unchecked(graph_branch).await
-            && let Some(entry) = current.dataset(table_key)
-            && entry.published_dataset_version != expected_version
-        {
-            return Err(OmniError::manifest_read_set_changed(
-                format!("published_dataset_version:{table_key}"),
-                Some(expected_version.to_string()),
-                Some(entry.published_dataset_version.to_string()),
-            ));
-        }
-        Err(OmniError::manifest_conflict(format!(
-            "{} is at Lance HEAD version {}, ahead of published dataset version {}; \
-             run `omnigraph repair` before writing",
-            dataset_subject(table_key),
-            head,
-            expected_version,
-        )))
     }
 
     async fn reload_schema_if_source_changed(&self) -> Result<()> {
@@ -2930,6 +2882,37 @@ impl Omnigraph {
         optimize::cleanup_all_datasets(self, options).await
     }
 
+    /// The tracing collector's plan for `options`, deleting nothing and taking
+    /// no writer gate: each live branch is judged from one `__manifest`
+    /// snapshot, and a publication that lands during the run is judged by
+    /// the next one.
+    pub async fn cleanup_plan(
+        &self,
+        options: optimize::CleanupPolicyOptions,
+    ) -> Result<collector::CollectorReport> {
+        let branches = optimize::cleanup_graph_branches(self).await?;
+        collector::plan_collection(self, &options, &branches).await
+    }
+
+    /// The marked paths of `report` that the tables' object stores do not
+    /// hold, as `(location, path)`; empty when the collector's safety
+    /// predicate holds.
+    pub async fn cleanup_plan_missing_paths(
+        &self,
+        report: &collector::CollectorReport,
+    ) -> Result<Vec<(String, String)>> {
+        collector::missing_marked_paths(self, report).await
+    }
+
+    /// Capture exact retained object paths before cleanup, including inherited
+    /// files and every legacy index member, for an independent later probe.
+    pub async fn cleanup_plan_path_snapshot(
+        &self,
+        report: &collector::CollectorReport,
+    ) -> Result<collector::CollectorPathSnapshot> {
+        collector::capture_marked_paths(self, report).await
+    }
+
     pub(crate) async fn active_branch(&self) -> Option<String> {
         self.coordinator
             .read()
@@ -2958,29 +2941,6 @@ impl Omnigraph {
             }
         }
         queue_keys
-    }
-
-    fn ensure_branch_create_namespace_safe(target: &str, branches: &[String]) -> Result<()> {
-        if branches.iter().any(|candidate| candidate == target) {
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' already exists",
-                target
-            )));
-        }
-
-        let target_prefix = format!("{target}/");
-        if let Some(conflicting) = branches.iter().find(|candidate| {
-            candidate.as_str() != "main"
-                && (candidate.starts_with(&target_prefix)
-                    || target.starts_with(&format!("{candidate}/")))
-        }) {
-            return Err(OmniError::manifest_conflict(format!(
-                "cannot create branch '{target}' while live branch '{conflicting}' shares its \
-                 physical Lance path; live graph branch names may not be ancestors or descendants"
-            )));
-        }
-
-        Ok(())
     }
 
     /// Remove the captured manifest branch authority; cleanup owns table forks.
@@ -3083,8 +3043,6 @@ impl Omnigraph {
             .capture_branch_control_source(source.as_deref())
             .await?;
         validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
-        let branches = source_coord.all_branches().await?;
-        Self::ensure_branch_create_namespace_safe(&target, &branches)?;
         source_coord.branch_create(&target).await?;
         self.invalidate_read_caches().await;
         Ok(())
@@ -3173,8 +3131,6 @@ impl Omnigraph {
             .capture_branch_control_source(branch.as_deref())
             .await?;
         validate_bound_catalog_against_snapshot(&control_catalog, &source_coord.snapshot())?;
-        let branches = source_coord.all_branches().await?;
-        Self::ensure_branch_create_namespace_safe(&target_branch, &branches)?;
         // A locally owned source coordinator cannot be swapped by a concurrent
         // `branch_create_from`; the ref write is durable whichever handle
         // issued it.
@@ -3303,77 +3259,14 @@ impl Omnigraph {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind, txn).await
     }
 
-    /// Fork `table_key` onto `active_branch` from the given source state.
-    /// The fork name is unique per attempt, so a manifest-unreferenced
-    /// leftover from an earlier attempt is never in the way; cleanup reclaims
-    /// it. Callers that reach this MUST already hold the per-`(table_key,
-    /// active_branch)` write queue and must have confirmed via the live
-    /// manifest that the table is not yet on `active_branch`. Both the
-    /// first-write fork path (`open_owned_dataset_for_branch_write`) and
-    /// `branch_merge` satisfy this.
-    pub(crate) async fn fork_dataset_from_entry_state(
-        &self,
-        table_key: &str,
-        identity: crate::db::manifest::TableIdentity,
-        full_path: &str,
-        source_branch: Option<&str>,
-        source_version: u64,
-        active_branch: &str,
-    ) -> Result<SnapshotHandle> {
-        let canonical_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
-        let canonical_full_path = self.storage().dataset_uri(&canonical_path);
-        if full_path != canonical_full_path {
-            return Err(OmniError::manifest_read_set_changed(
-                format!("fork_target_dataset_path:{identity}"),
-                Some(canonical_full_path),
-                Some(full_path.to_string()),
-            ));
-        }
-        table_ops::fork_dataset_from_entry_state(
-            self,
-            table_key,
-            full_path,
-            source_branch,
-            source_version,
-            active_branch,
-        )
-        .await
-    }
-
     /// RFC 0067: the pinned base a writer stages on; see
     /// `promotion::open_pinned_for_write`.
     pub(crate) async fn open_pinned_for_write(
         &self,
-        table_key: &str,
         full_path: &str,
         entry: &crate::db::DatasetEntry,
     ) -> Result<SnapshotHandle> {
-        promotion::open_pinned_for_write(self, table_key, full_path, entry).await
-    }
-
-    /// RFC 0067: promote every pin this writer just published, best effort.
-    pub(crate) async fn promote_held_all(&self, held: Vec<HeldPromotion>) {
-        promotion::promote_held_all(self, held).await
-    }
-
-    /// RFC 0067: promote a pending pin before a linear writer plans on it.
-    pub(crate) async fn promote_pending_pin(
-        &self,
-        table_key: &str,
-        full_path: &str,
-        entry: &crate::db::DatasetEntry,
-        head: SnapshotHandle,
-    ) -> Result<SnapshotHandle> {
-        promotion::promote_pending_pin(self, table_key, full_path, entry, head).await
-    }
-
-    pub(crate) async fn promote_inherited_pin(
-        &self,
-        table_key: &str,
-        full_path: &str,
-        entry: &crate::db::DatasetEntry,
-    ) -> Result<()> {
-        promotion::promote_inherited_pin(self, table_key, full_path, entry).await
+        promotion::open_pinned_for_write(self, full_path, entry).await
     }
 
     // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now

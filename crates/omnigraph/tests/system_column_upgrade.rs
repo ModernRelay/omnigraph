@@ -147,7 +147,7 @@ async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export:
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
     );
     let ir = schema_ir(dir);
     assert_eq!(ir["ir_version"].as_u64(), Some(5));
@@ -263,7 +263,13 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         .unwrap();
     assert_eq!(check.outcome, SystemColumnUpgradeOutcome::CheckPassed);
     assert!(check.success());
-    assert_eq!((check.stamp_before, check.stamp_after), (10, 10));
+    assert_eq!(
+        (check.stamp_before, check.stamp_after),
+        (
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
+        )
+    );
     assert_eq!(
         check.tables,
         ["edge:WorksAt", "node:Company", "node:Person"]
@@ -274,7 +280,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10,
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
         "check mode writes nothing"
     );
     assert_eq!(schema_ir(&dir)["ir_version"].as_u64(), Some(2));
@@ -284,7 +290,13 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         .await
         .unwrap();
     assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
-    assert_eq!((report.stamp_before, report.stamp_after), (10, 10));
+    assert_eq!(
+        (report.stamp_before, report.stamp_after),
+        (
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
+        )
+    );
     assert!(report.findings.is_empty());
     assert!(report.graph_manifest_version.is_some());
     assert_upgraded(&db, &dir, &export_before).await;
@@ -303,7 +315,13 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         .await
         .unwrap();
     assert_eq!(again.outcome, SystemColumnUpgradeOutcome::AlreadyCurrent);
-    assert_eq!((again.stamp_before, again.stamp_after), (10, 10));
+    assert_eq!(
+        (again.stamp_before, again.stamp_after),
+        (
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
+        )
+    );
     drop(db);
 
     let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
@@ -323,7 +341,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
             .internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
     );
 }
 
@@ -371,8 +389,7 @@ async fn system_column_upgrade_keeps_history_readable_after_a_user_id_property()
 
 #[tokio::test]
 async fn system_column_upgrade_history_survives_unrelated_reclaimed_tables() {
-    use lance::Dataset;
-    use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
+    use omnigraph::db::CleanupPolicyOptions;
     use omnigraph::error::OmniError;
 
     let _scenario = FailScenario::setup();
@@ -380,64 +397,47 @@ async fn system_column_upgrade_history_survives_unrelated_reclaimed_tables() {
     let db = legacy_graph_with_data(&dir).await;
     let version_before = version_main(&db).await.unwrap();
     let snapshot_before = db.resolve_snapshot("main").await.unwrap();
+    db.load_jsonl(
+        r#"{"type":"Company","data":{"id":"company-2","name":"Beta"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let company_moved = version_main(&db).await.unwrap();
     let report = db
         .upgrade_system_columns(SystemColumnUpgradeOptions::default())
         .await
         .unwrap();
     assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
 
-    let snap = snapshot_main(&db).await.unwrap();
-    let first = snap.datasets().next().unwrap().type_key.clone();
-    let first_uri = format!(
-        "{}/{}",
-        db.uri().trim_end_matches('/'),
-        snap.dataset(&first)
-            .unwrap()
-            .dataset_path
-            .trim_start_matches('/')
-    );
-    let dataset = Dataset::open(&first_uri).await.unwrap();
-    let removed = cleanup_old_versions(
-        &dataset,
-        CleanupPolicy {
-            before_version: Some(dataset.version().version),
-            delete_unverified: true,
-            error_if_tagged_old_versions: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let first = "node:Company";
+    let keep = CleanupPolicyOptions {
+        keep_versions: Some(
+            u32::try_from(version_main(&db).await.unwrap() - company_moved + 1).unwrap(),
+        ),
+        older_than: None,
+    };
+    let plan = db.cleanup_plan(keep.clone()).await.unwrap();
+    let main = helpers::collector::retained_on(&plan, None);
     assert!(
-        removed.old_versions > 0,
+        main.retained.contains(&company_moved) && main.would_prune.contains(&version_before),
+        "the run keeps the Company write's `__manifest` version and drops the pre-write one: {main:?}"
+    );
+    let stats = db.cleanup(keep).await.unwrap();
+    let row = stats.iter().find(|row| row.type_key == first).unwrap();
+    assert!(row.error.is_none(), "{row:?}");
+    assert!(
+        row.old_versions_removed > 0,
         "precondition: {first} history was reclaimed"
     );
 
-    let (source, name, column, expected, reclaimed_id) = if first == "node:Person" {
-        (
-            COMPANY_QUERY,
-            "company_identity",
-            "c.@id",
-            vec!["company-1"],
-            "Alice",
-        )
-    } else if first == "node:Company" {
-        (
-            OLD_PEOPLE_QUERY,
-            "old_people",
-            "p.@id",
-            vec!["Alice", "Bob"],
-            "company-1",
-        )
-    } else {
-        (
-            OLD_PEOPLE_QUERY,
-            "old_people",
-            "p.@id",
-            vec!["Alice", "Bob"],
-            "works-alice",
-        )
-    };
+    let (source, name, column, expected, reclaimed_id) = (
+        OLD_PEOPLE_QUERY,
+        "old_people",
+        "p.@id",
+        vec!["Alice", "Bob"],
+        "company-1",
+    );
     let historical = db
         .run_query_at(version_before, source, name, &ParamMap::new())
         .await
@@ -460,7 +460,7 @@ async fn system_column_upgrade_history_survives_unrelated_reclaimed_tables() {
         expected
     );
     let error = db
-        .entity_at(&first, reclaimed_id, version_before)
+        .entity_at(first, reclaimed_id, version_before)
         .await
         .expect_err("the reclaimed table's own history stays a typed refusal");
     assert!(
@@ -495,7 +495,7 @@ async fn system_column_upgrade_refuses_before_any_effect() {
         db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
     assert_eq!(schema_ir(&dir)["ir_version"].as_u64(), Some(2));
@@ -697,39 +697,6 @@ async fn system_column_upgrade_post_commit_failure_heals_on_the_same_handle() {
     assert_eq!(retried.outcome, SystemColumnUpgradeOutcome::AlreadyCurrent);
     assert_no_staging(&dir);
     assert_upgraded(&db, &dir, &export_before).await;
-}
-
-/// With the promotion skipped the renamed tables stay pending pins: reads
-/// serve them through the staged versions, the next writer of a table
-/// promotes it, and cleanup promotes the rest.
-#[tokio::test]
-async fn system_column_upgrade_skipped_promotion_leaves_pins_the_next_writer_promotes() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let db = legacy_graph_with_data(&dir).await;
-    let export_before = db.export_jsonl("main", &[]).await.unwrap();
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION.fire_always();
-        let report = db
-            .upgrade_system_columns(SystemColumnUpgradeOptions::default())
-            .await
-            .expect("the publication and the contract are durable");
-        assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
-    }
-    let (head, pin) = person_head_and_pin(&db, &dir).await;
-    assert!(
-        head < pin,
-        "the Person pin is pending: head {head}, pin {pin}"
-    );
-    assert_upgraded(&db, &dir, &export_before).await;
-    let (head, pin) = person_head_and_pin(&db, &dir).await;
-    assert_eq!(head, pin, "the load in the oracle promoted Person");
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(10),
-        older_than: None,
-    })
-    .await
-    .expect("cleanup promotes every remaining pin");
 }
 
 /// RFC 0067: the upgrade arms no recovery sidecar. Its only control-object

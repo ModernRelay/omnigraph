@@ -739,17 +739,23 @@ async fn filtered_nearest_clause_spelling_prefilters_like_inline() {
 /// The #567 fixture shared by the `issue_567_*` probe-ladder tests: 20,000
 /// docs on a line, `keep` on the last thousand, the middle 3,000 deleted,
 /// then the optimize that splits one IVF_FLAT partition into several.
+#[cfg(feature = "failpoints")]
 const ISSUE_567_ROWS: usize = 20_000;
+#[cfg(feature = "failpoints")]
 const ISSUE_567_DELETED: usize = 3_000;
+#[cfg(feature = "failpoints")]
 const ISSUE_567_EDGE_DOCS: usize = 5;
 /// Docs that carry a `Far` edge and `far: true`: five, split across the
 /// optimized index's two partitions (four low on the line, one high). See
 /// `ISSUE_567_FAR_QUERY`.
+#[cfg(feature = "failpoints")]
 const ISSUE_567_FAR_DOCS: [usize; 5] = [0, 2_000, 4_000, 6_000, 15_000];
 /// Query point for the far docs: inside the high partition, near its
 /// centroid, so Lance's initial probe reads that partition alone and the
 /// late search emits the four low docs at `_distance = +inf`.
+#[cfg(feature = "failpoints")]
 const ISSUE_567_FAR_QUERY: [f32; 4] = [13_300.0, 0.0, 0.0, 0.0];
+#[cfg(feature = "failpoints")]
 const ISSUE_567_QUERIES: &str = r#"
 query filtered_nearest($q: Vector(4)) {
     match { $d: Doc { keep: true } }
@@ -814,6 +820,10 @@ query nearest_all_17000($q: Vector(4)) {
 }
 "#;
 
+/// A four-partition IVF index on fixed centroids (the engine builds one-partition
+/// flat ones), built on the `node:Doc` pin restored onto the linear HEAD and
+/// published through the failpoint hook; a delete then tombstones rows under it.
+#[cfg(feature = "failpoints")]
 async fn issue_567_partitioned_docs(uri: &str) -> Session {
     let mut lines = (0..ISSUE_567_ROWS)
         .map(|row| {
@@ -861,11 +871,7 @@ query delete_middle() {
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices().await.unwrap();
-    // The engine builds one-partition flat vector indexes, and RFC 0067's fold
-    // keeps an index's partition count, so the multi-partition shape these
-    // cases exercise is built here explicitly: four partitions with fixed
-    // centroids along the embedding axis, replacing the engine's index under
-    // its name, then published from the table head through repair.
+    helpers::forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
     {
         use lance::index::DatasetIndexExt;
         let doc_path = db
@@ -915,12 +921,9 @@ query delete_middle() {
         .await
         .unwrap();
     }
-    db.repair(omnigraph::db::RepairOptions {
-        confirm: true,
-        force: true,
-    })
-    .await
-    .unwrap();
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
     // The delete leaves the partitioned index with tombstoned rows: the
     // underfilled partitions the ladder and rescan cases exercise.
     let deleted = mutate_main(&db, delete_query, "delete_middle", &params(&[]))
@@ -933,6 +936,7 @@ query delete_middle() {
 /// The engine's maximum-only IVF guard must not lower the requested candidate
 /// count. Under a pushed prefilter and `ann_nprobes = 1` the capped
 /// scan is short of `k` and the scan-site ladder widens it until `limit` fills.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill() {
@@ -1090,6 +1094,7 @@ fn assert_rungs_climb(rungs: &[u64], ladders: usize, context: &str) {
 /// Follow-up to #591 (issue #567): a standalone `nearest` whose `limit`
 /// equals the corpus, under `ann_nprobes = 1`. The ladder climbs
 /// until every ranked partition is read and the answer is the whole corpus.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
@@ -1152,6 +1157,7 @@ async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
 /// Follow-up to #591 (issue #567): the probe cap is for the UNFILTERED scan.
 /// A plain `nearest` under `ann_nprobes = 1` fills `limit` in one
 /// scan, so the ladder never fires.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
@@ -1212,6 +1218,7 @@ async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
 /// Follow-up to #591 (issue #567): the gate's `id IN` list admits fewer rows
 /// than `k`, so the engine answers from ONE flat exact kNN over the admitted
 /// rows (`use_index(false)`) instead of the IVF plan.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
@@ -1293,6 +1300,7 @@ async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
 /// Follow-up to #591 (issue #567), the order defect: a prefilter admitting at
 /// most `k` rows split across partitions. Both routes to the flat exact kNN
 /// return the exact filtered kNN, in order.
+#[cfg(feature = "failpoints")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn issue_567_flat_scan_returns_the_admitted_rows_in_nearest_order() {

@@ -95,8 +95,10 @@ pub struct AdjacencyProof {
     pub child_fragments: Vec<u64>,
     pub parent_fragments: Vec<u64>,
     /// `(parent_version, child_version]`, the `_row_last_updated_at_version`
-    /// window that drops rows a fragment rewrite carried along.
-    pub version_window: (u64, u64),
+    /// window that drops rows a fragment rewrite carried along; `None` for a
+    /// commit whose rows carry no linear stamp (a detached commit), where the
+    /// child scan reads its fragments whole and the join drops unchanged rows.
+    pub version_window: Option<(u64, u64)>,
 }
 
 /// The planner's whole view of the store. Implemented by the engine over its

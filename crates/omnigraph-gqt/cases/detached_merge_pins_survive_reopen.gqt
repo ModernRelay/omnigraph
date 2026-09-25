@@ -1,5 +1,5 @@
 # issue: none
-# notes: A divergent merge publishes node and edge pins despite interrupted promotion; reads, restart and the next target write preserve source isolation.
+# notes: A divergent merge publishes detached node and edge pins on main; reads, restart and the next target write preserve source isolation.
 
 --- runner
 timeout_ms: 10000
@@ -27,12 +27,6 @@ query add_source() { insert Person { name: "bob" } insert Knows { from: "bob", t
 --- mutate branch: main
 query advance_target() { insert Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
-
---- seam
-at: branch_merge.post_publish_pre_promotion
-occurrence: 1
-action: fail
-scope: next_step
 
 --- mutate
 branch merge source into main
