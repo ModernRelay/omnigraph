@@ -1231,3 +1231,81 @@ fn queries_validate_graph_filter_selects_one_graph() {
     );
     assert!(stdout_string(&output).contains("OK"));
 }
+
+/// RFC 0047's diagnostics contract at the CLI: a refused query reports its
+/// code, position, expectation and one fix in every output format, with no
+/// colour and no backtrace, on both transports.
+#[test]
+fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
+    let (_temp, graph) = loaded_graph();
+    let refused = "query name {";
+
+    let json = parse_stdout_json(&output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .arg("--json"),
+    ));
+    assert_eq!(
+        json["error"],
+        "parse error: expected `(`: a query declares its parameters even when it has none"
+    );
+    assert_eq!(json["diagnostic"]["code"], "Q002");
+    assert_eq!(json["diagnostic"]["fix"], "query name()");
+    assert_eq!(json["diagnostic"]["position"]["line"], 1);
+    assert_eq!(json["diagnostic"]["position"]["column"], 11);
+    assert!(
+        json.get("code").is_none(),
+        "an embedded refusal has no HTTP code: {json}"
+    );
+
+    let jsonl = output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .arg("--format")
+            .arg("jsonl"),
+    );
+    let stdout = stdout_string(&jsonl);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "jsonl carries the error as one line: {stdout:?}"
+    );
+    let line: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(line["diagnostic"]["code"], "Q002");
+
+    let human = output_failure(embedded("query", &graph).arg("-e").arg(refused));
+    let stderr = stderr_string(&human);
+    assert!(
+        stderr.contains("error[Q002]: parse error: expected `(`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--> line 1, column 11"), "{stderr}");
+    assert!(stderr.contains("fix: query name()"), "{stderr}");
+    assert!(!stderr.contains("\u{1b}["), "no colour codes: {stderr:?}");
+    assert!(
+        !stderr.contains("Backtrace") && !stderr.contains("Location:"),
+        "no backtrace footer: {stderr}"
+    );
+    assert!(
+        stdout_string(&human).is_empty(),
+        "the human lane writes nothing to stdout"
+    );
+
+    let (_cluster, server) = served_graph();
+    let json = parse_stdout_json(&output_failure(
+        served("query", &server)
+            .arg("-e")
+            .arg(refused)
+            .arg("--json"),
+    ));
+    assert_eq!(json["code"], "bad_request");
+    assert_eq!(json["diagnostic"]["code"], "Q002");
+    assert_eq!(json["diagnostic"]["fix"], "query name()");
+    let served_human = output_failure(served("query", &server).arg("-e").arg(refused));
+    let stderr = stderr_string(&served_human);
+    assert!(stderr.contains("error[Q002]:"), "{stderr}");
+    assert!(stderr.contains("fix: query name()"), "{stderr}");
+}

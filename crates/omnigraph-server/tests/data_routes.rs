@@ -1846,6 +1846,33 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
         let error: ErrorOutput = serde_json::from_value(out).unwrap();
         assert_ne!(error.code, Some(ErrorCode::Forbidden), "{path}");
+        let diagnostic = error
+            .diagnostic
+            .expect("a refused query carries its diagnostic");
+        assert_eq!(diagnostic.code, "Q001", "{path}");
+        assert!(diagnostic.position.is_some(), "{path}");
+
+        // The measured shape, a declaration without its parameter list, is
+        // refused at the name's end with the one fix at every door.
+        let field = if path == "/read" {
+            "query_source"
+        } else {
+            "query"
+        };
+        let missing = json!({field: "query name {", "branch": "main"});
+        let (status, out) = json_response(&app, send(path, token, missing, expected_head)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+        let error: ErrorOutput = serde_json::from_value(out).unwrap();
+        let diagnostic = error
+            .diagnostic
+            .expect("a refused query carries its diagnostic");
+        assert_eq!(diagnostic.code, "Q002", "{path}");
+        assert_eq!(diagnostic.fix.as_deref(), Some("query name()"), "{path}");
+        assert_eq!(
+            diagnostic.position.map(|at| (at.line, at.column)),
+            Some((1, 11)),
+            "{path}"
+        );
     }
 }
 

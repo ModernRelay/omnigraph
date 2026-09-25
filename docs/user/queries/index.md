@@ -314,20 +314,20 @@ Use `set`, `reset`, and `show` to configure query execution. See
 
 ## Linting
 
-Validate queries without running them:
+Validate queries without running them; a refusal reports a stable code, its
+position or stage, the expectation and one fix ([Diagnostics](diagnostics.md)):
 
 ```bash
 omnigraph lint --query queries.gq --schema schema.pg --json
 ```
 
-`Q000` identifies parse errors. A file that holds a [branch
-statement](../branching/index.md) where query declarations were expected also
-reports `Q000`. A [settings line](#session-settings) that names an unknown
-setting or a value outside its row reports `ERROR line <n>, column <c>:
-<message>`. `L201` warns when a nullable
-property is never set by any update query in the inspected set. Type errors
-report the affected query and source location. The command exits nonzero when
-the overall status is an error.
+`Q000` identifies a file the parser refused, at `line <n>, column <c>`; a
+[branch statement](../branching/index.md) where declarations were expected
+and a [settings line](#session-settings) naming an unknown setting or a value
+outside its row report the same way. `L201` warns when a nullable property is
+never set by any update query in the inspected set. Type errors report the
+affected query and their `T…` code. The command exits nonzero when the overall
+status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

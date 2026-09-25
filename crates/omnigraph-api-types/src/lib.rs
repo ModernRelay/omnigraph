@@ -1486,6 +1486,58 @@ pub struct FullTextIndexRebuildRequiredOutput {
     pub reason: String,
 }
 
+/// A source position: 1-based line and column (in characters) and the byte
+/// offset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PositionOutput {
+    pub line: u32,
+    pub column: u32,
+    pub byte: u32,
+}
+
+/// The diagnostics contract for a refused query (RFC 0047): a stable code
+/// (`Q…` parse, `T…` typecheck); where the failure is, as a source position
+/// or as the stage and expression when it is post-parse; what was expected or
+/// violated; and one concrete fix, absent when `expected` names the decision.
+/// Rides `ErrorOutput.diagnostic` as an additive detail because
+/// [`ErrorCode`] is a closed compatibility contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DiagnosticOutput {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<PositionOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    pub expected: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+}
+
+impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
+    fn from(diagnostic: &omnigraph_compiler::QueryDiagnostic) -> Self {
+        Self {
+            code: diagnostic.code.as_str().to_string(),
+            position: diagnostic.position.map(|at| PositionOutput {
+                line: at.line,
+                column: at.column,
+                byte: at.byte,
+            }),
+            stage: diagnostic
+                .stage
+                .as_ref()
+                .map(|stage| stage.name.to_string()),
+            expression: diagnostic
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.expression.clone()),
+            expected: diagnostic.message.clone(),
+            fix: diagnostic.fix.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -1543,6 +1595,34 @@ pub struct ErrorOutput {
     /// preserves the closed [`ErrorCode`] contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
+    /// Set for a refused query: the diagnostics contract's code, position or
+    /// stage, expectation and fix. `error` keeps the one-line rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<DiagnosticOutput>,
+}
+
+impl ErrorOutput {
+    /// An error body carrying `error` and nothing else; every typed detail is
+    /// absent.
+    pub fn message(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            code: None,
+            merge_conflicts: Vec::new(),
+            published_dataset_version_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+            change_feed_gap: None,
+            change_diff_refusal: None,
+            full_text_index_rebuild_required: None,
+            diagnostic: None,
+        }
+    }
 }
 
 pub fn snapshot_payload(

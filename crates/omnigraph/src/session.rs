@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::SettingStmt;
+use omnigraph_compiler::query::codes::Q003;
+use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::query::parser::{has_settings_prefix, parse_query};
 use omnigraph_compiler::settings::{
     DEFINITIONS, SessionSettings, SessionSettingsError, SettingId, SettingRow, SettingValue,
@@ -163,9 +165,13 @@ impl Session {
             return Ok(self.settings.clone());
         }
         let file = parse_query(source).map_err(OmniError::Compiler)?;
-        let scoped = self
-            .with_prefix(&file.settings)
-            .map_err(|error| OmniError::Compiler(CompilerError::Parse(error.to_string())))?;
+        let scoped = self.with_prefix(&file.settings).map_err(|error| {
+            OmniError::Compiler(CompilerError::query(QueryDiagnostic::parse(
+                Q003,
+                error.to_string(),
+                None,
+            )))
+        })?;
         Ok(scoped.settings)
     }
 

@@ -1,13 +1,13 @@
 use pest::Parser;
-use pest::error::InputLocation;
+use pest::error::{ErrorVariant, InputLocation};
 use pest_derive::Parser;
 
-use crate::error::{
-    CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
-};
+use crate::error::{CompilerError, Result, decode_string_literal};
 use crate::settings::{SessionSettings, SessionSettingsError, SettingId, SettingValue};
 
 use super::ast::*;
+use super::codes::{Q001, Q002, Q003, Q004, Q005};
+use super::diagnostic::{Position, QueryDiagnostic};
 
 #[derive(Parser)]
 #[grammar = "query/query.pest"]
@@ -45,7 +45,7 @@ fn reserved_alias_error(word: &str) -> CompilerError {
 }
 
 pub fn parse_query(input: &str) -> Result<QueryFile> {
-    parse_query_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
+    parse_query_diagnostic(input).map_err(CompilerError::query)
 }
 
 /// Whether `input` opens with a settings statement: `set` or `reset` as the
@@ -77,8 +77,10 @@ fn skip_trivia(mut input: &str) -> &str {
     }
 }
 
-pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, ParseDiagnostic> {
-    let pairs = QueryParser::parse(Rule::query_file, input).map_err(pest_error_to_diagnostic)?;
+/// Parse `input` into its file body, refusing with a positioned diagnostic.
+pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, QueryDiagnostic> {
+    let pairs = QueryParser::parse(Rule::query_file, input)
+        .map_err(|error| pest_error_to_diagnostic(input, error))?;
 
     let mut settings = Vec::new();
     let mut queries = Vec::new();
@@ -103,10 +105,24 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
                             Some(FileBody::Explain(_)) => "an `explain` statement",
                             _ => "a branch statement",
                         };
-                        return Err(ParseDiagnostic::new(
+                        return Err(diagnostic_at(
+                            Q004,
                             format!("{subject} stands alone in its file"),
-                            Some(pair_span(&inner)),
+                            &inner,
                         ));
+                    }
+                    Rule::missing_param_list => {
+                        let name = inner
+                            .clone()
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::ident)
+                            .expect("grammar: missing_param_list holds an ident");
+                        return Err(QueryDiagnostic::parse(
+                            Q002,
+                            "expected `(`: a query declares its parameters even when it has none",
+                            Some(Position::at(input, name.as_span().end())),
+                        )
+                        .with_fix(format!("query {}()", name.as_str())));
                     }
                     Rule::query_decl => {
                         queries
@@ -125,7 +141,7 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
 
 fn parse_explain_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<QueryDecl, ParseDiagnostic> {
+) -> std::result::Result<QueryDecl, QueryDiagnostic> {
     let decl = pair
         .into_inner()
         .find(|inner| inner.as_rule() == Rule::query_decl)
@@ -133,14 +149,23 @@ fn parse_explain_stmt(
     parse_query_decl(decl).map_err(compiler_error_to_diagnostic)
 }
 
-fn pair_span(pair: &pest::iterators::Pair<Rule>) -> SourceSpan {
+/// The position of `pair`'s start in the source it was parsed from.
+fn position_of(pair: &pest::iterators::Pair<Rule>) -> Position {
     let span = pair.as_span();
-    render_span(SourceSpan::new(span.start(), span.end()))
+    Position::at(span.get_input(), span.start())
+}
+
+fn diagnostic_at(
+    code: super::diagnostic::QueryCode,
+    message: impl Into<String>,
+    at: &pest::iterators::Pair<Rule>,
+) -> QueryDiagnostic {
+    QueryDiagnostic::parse(code, message, Some(position_of(at)))
 }
 
 fn parse_setting_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<SettingStmt, ParseDiagnostic> {
+) -> std::result::Result<SettingStmt, QueryDiagnostic> {
     let form = pair
         .into_inner()
         .next()
@@ -173,7 +198,7 @@ fn parse_setting_stmt(
 /// The `<name>` or `all` after `reset` or `show`.
 fn parse_setting_target(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<Option<SettingId>, ParseDiagnostic> {
+) -> std::result::Result<Option<SettingId>, QueryDiagnostic> {
     let target = pair
         .into_inner()
         .find(|inner| matches!(inner.as_rule(), Rule::kw_all | Rule::setting_name))
@@ -187,14 +212,14 @@ fn parse_setting_target(
 
 fn parse_setting_id(
     name: &pest::iterators::Pair<Rule>,
-) -> std::result::Result<SettingId, ParseDiagnostic> {
+) -> std::result::Result<SettingId, QueryDiagnostic> {
     SettingId::parse(name.as_str()).map_err(|error| setting_diagnostic(error, name))
 }
 
 fn parse_setting_value(
     id: SettingId,
     pair: &pest::iterators::Pair<Rule>,
-) -> std::result::Result<SettingValue, ParseDiagnostic> {
+) -> std::result::Result<SettingValue, QueryDiagnostic> {
     let token = pair
         .clone()
         .into_inner()
@@ -225,13 +250,13 @@ fn parse_setting_value(
 fn setting_diagnostic(
     error: SessionSettingsError,
     at: &pest::iterators::Pair<Rule>,
-) -> ParseDiagnostic {
-    ParseDiagnostic::new(error.to_string(), Some(pair_span(at)))
+) -> QueryDiagnostic {
+    diagnostic_at(Q003, error.to_string(), at)
 }
 
 fn parse_branch_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<BranchStmt, ParseDiagnostic> {
+) -> std::result::Result<BranchStmt, QueryDiagnostic> {
     let form = pair
         .into_inner()
         .find(|inner| inner.as_rule() != Rule::kw_branch)
@@ -241,7 +266,7 @@ fn parse_branch_stmt(
         .into_inner()
         .filter(|inner| inner.as_rule() == Rule::branch_name)
         .map(parse_branch_name)
-        .collect::<std::result::Result<Vec<_>, ParseDiagnostic>>()?;
+        .collect::<std::result::Result<Vec<_>, QueryDiagnostic>>()?;
     let mut names = names.into_iter();
     match (rule, names.next(), names.next()) {
         (Rule::branch_create, Some(name), from) => {
@@ -262,8 +287,8 @@ fn parse_branch_stmt(
 
 fn parse_branch_name(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<String, ParseDiagnostic> {
-    let span = pair_span(&pair);
+) -> std::result::Result<String, QueryDiagnostic> {
+    let position = position_of(&pair);
     let token = pair
         .into_inner()
         .next()
@@ -276,42 +301,69 @@ fn parse_branch_name(
         other => unreachable!("grammar: branch_name admits no {other:?}"),
     };
     if name.chars().any(char::is_control) {
-        return Err(ParseDiagnostic::new(
+        return Err(QueryDiagnostic::parse(
+            Q004,
             format!("branch name {name:?} contains a control character"),
-            Some(span),
+            Some(position),
         ));
     }
     if name.trim() != name {
-        return Err(ParseDiagnostic::new(
+        return Err(QueryDiagnostic::parse(
+            Q004,
             format!("branch name {name:?} has leading or trailing whitespace"),
-            Some(span),
+            Some(position),
         ));
     }
     if name.is_empty() {
-        return Err(ParseDiagnostic::new(
+        return Err(QueryDiagnostic::parse(
+            Q004,
             format!("branch name {name:?} cannot be empty"),
-            Some(span),
+            Some(position),
         ));
     }
     Ok(name)
 }
 
-fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
-    let span = match err.location {
-        InputLocation::Pos(pos) => Some(render_span(SourceSpan::new(pos, pos))),
-        InputLocation::Span((start, end)) => Some(render_span(SourceSpan::new(start, end))),
+/// A grammar mismatch: positioned at pest's deepest failure, naming the
+/// rules it expected there (pest tracks attempts per rule, so the names are
+/// the grammar's, not tokens).
+fn pest_error_to_diagnostic(input: &str, err: pest::error::Error<Rule>) -> QueryDiagnostic {
+    let byte = match err.location {
+        InputLocation::Pos(pos) => pos,
+        InputLocation::Span((start, _)) => start,
     };
-    ParseDiagnostic::new(err.to_string(), span)
+    let message = match &err.variant {
+        ErrorVariant::ParsingError {
+            positives,
+            negatives,
+        } => {
+            let names = |rules: &[Rule]| {
+                rules
+                    .iter()
+                    .map(|rule| format!("{rule:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            match (positives.is_empty(), negatives.is_empty()) {
+                (false, _) => format!("expected {}", names(positives)),
+                (true, false) => format!("unexpected {}", names(negatives)),
+                (true, true) => "unexpected input".to_string(),
+            }
+        }
+        ErrorVariant::CustomError { message } => message.clone(),
+    };
+    QueryDiagnostic::parse(Q001, message, Some(Position::at(input, byte)))
 }
 
-/// A parse refusal keeps its bare message: `parse_query` adds the one
-/// `parse error:` prefix when it wraps the diagnostic.
-fn compiler_error_to_diagnostic(err: CompilerError) -> ParseDiagnostic {
-    let message = match err {
-        CompilerError::Parse(message) => message,
-        other => other.to_string(),
-    };
-    ParseDiagnostic::new(message, None)
+/// A declaration body the hand-written parser refused: its bare message
+/// names the construct and `Display` adds the one `parse error:` prefix; a
+/// diagnostic it already carries passes through.
+fn compiler_error_to_diagnostic(err: CompilerError) -> QueryDiagnostic {
+    match err {
+        CompilerError::Query(diagnostic) => *diagnostic,
+        CompilerError::Parse(message) => QueryDiagnostic::parse(Q005, message, None),
+        other => QueryDiagnostic::parse(Q005, other.to_string(), None),
+    }
 }
 
 fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {

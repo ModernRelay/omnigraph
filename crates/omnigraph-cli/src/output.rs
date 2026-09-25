@@ -940,6 +940,8 @@ pub(crate) fn print_policy_explain(
 pub(crate) struct QueriesIssue {
     pub(crate) query: String,
     pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<omnigraph_api_types::DiagnosticOutput>,
 }
 
 #[derive(serde::Serialize)]

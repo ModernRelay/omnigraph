@@ -1091,42 +1091,48 @@ pub(crate) fn validate_query_source(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let path = format!("graphs.{graph_id}.queries.{query_name}");
-    match parse_query(source)
-        .map_err(|err| err.to_string())
-        .and_then(stored_declarations)
-    {
-        Ok(queries) => {
-            let Some(query_decl) = queries.iter().find(|q| q.name == query_name) else {
-                diagnostics.push(Diagnostic::error(
-                    "query_key_mismatch",
-                    path,
-                    format!("no `query {query_name}` declaration found in the referenced .gq file"),
-                ));
-                return;
-            };
-            if let Some(catalog) = catalog {
-                if let Err(err) = typecheck_query_decl(catalog, query_decl) {
-                    diagnostics.push(Diagnostic::error(
-                        "query_typecheck_error",
-                        format!("graphs.{graph_id}.queries.{query_name}"),
-                        err.to_string(),
-                    ));
-                }
-            } else {
-                diagnostics.push(Diagnostic::warning(
-                    "query_typecheck_skipped",
-                    format!("graphs.{graph_id}.queries.{query_name}"),
-                    "query parsed, but type-check was skipped because the graph schema is invalid",
-                ));
+    let file = match parse_query(source) {
+        Ok(file) => file,
+        Err(err) => {
+            let detail = err.diagnostic().cloned();
+            diagnostics.push(
+                Diagnostic::error("query_parse_error", path, err.to_string()).with_detail(detail),
+            );
+            return;
+        }
+    };
+    let queries = match stored_declarations(file) {
+        Ok(queries) => queries,
+        Err(message) => {
+            diagnostics.push(Diagnostic::error("query_parse_error", path, message));
+            return;
+        }
+    };
+    let Some(query_decl) = queries.iter().find(|q| q.name == query_name) else {
+        diagnostics.push(Diagnostic::error(
+            "query_key_mismatch",
+            path,
+            format!("no `query {query_name}` declaration found in the referenced .gq file"),
+        ));
+        return;
+    };
+    match catalog {
+        Some(catalog) => {
+            if let Err(err) = typecheck_query_decl(catalog, query_decl) {
+                diagnostics.push(
+                    Diagnostic::error("query_typecheck_error", path, err.to_string())
+                        .with_detail(err.diagnostic().cloned()),
+                );
             }
         }
-        Err(message) => diagnostics.push(Diagnostic::error("query_parse_error", path, message)),
+        None => diagnostics.push(Diagnostic::warning(
+            "query_typecheck_skipped",
+            path,
+            "query parsed, but type-check was skipped because the graph schema is invalid",
+        )),
     }
 }
 
-/// The declarations of a stored `.gq` source. A settings prefix, a branch
-/// statement and a `show` statement are refused by name: a stored query runs
-/// under the process defaults and is always a declaration.
 fn stored_declarations(
     file: QueryFile,
 ) -> Result<Vec<omnigraph_compiler::query::ast::QueryDecl>, String> {

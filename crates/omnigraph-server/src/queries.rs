@@ -201,6 +201,9 @@ impl QueryRegistry {
 pub struct Breakage {
     pub query: String,
     pub message: String,
+    /// The compiler's diagnostic (code, stage, expectation, fix) behind the
+    /// message, when the refusal carries one.
+    pub diagnostic: Option<omnigraph_compiler::QueryDiagnostic>,
 }
 
 /// A non-blocking advisory found during validation. Logged at boot;
@@ -254,6 +257,7 @@ pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
             report.breakages.push(Breakage {
                 query: query.name.clone(),
                 message: err.to_string(),
+                diagnostic: err.diagnostic().cloned(),
             });
         }
         if query.expose {
