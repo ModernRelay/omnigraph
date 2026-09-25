@@ -1216,6 +1216,10 @@ impl Omnigraph {
         schema_apply::ensure_schema_apply_not_locked(self, operation).await
     }
 
+    pub(crate) async fn schema_apply_sentinel_present(&self) -> Result<bool> {
+        schema_apply::schema_apply_sentinel_present(self).await
+    }
+
     /// Engine-facing trait surface around `TableStore`.
     ///
     /// This is the **only** accessor for engine code reaching into the
@@ -1355,7 +1359,24 @@ impl Omnigraph {
         const MAX_CAPTURE_RETRIES: usize = 8;
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
+        let mut parked_behind_apply = false;
         for _ in 0..MAX_CAPTURE_RETRIES {
+            // A standing sentinel means a contract-lifecycle pass is in
+            // flight. An apply on this root holds the exclusive schema
+            // permit for its whole pass, so parking on the shared side
+            // waits it out; the writer then recaptures under the promoted
+            // contract instead of being refused and retrying hot (RFC
+            // 2026-09-18-shared-schema-gate). A cross-process apply grants
+            // the permit at once, so the bounded loop still ends in the
+            // sentinel refusal below. The common path takes no permit here:
+            // `commit_all` takes the writer's, and the gate is never held
+            // twice on one call path.
+            if self.schema_apply_sentinel_present().await? {
+                drop(self.write_queue().acquire_schema_shared().await);
+                parked_behind_apply = true;
+                tokio::task::yield_now().await;
+                continue;
+            }
             // A schema apply publishes graph_head before promoting its staged
             // contract. Read one fully validated IR/catalog, capture coherent
             // manifest authority, then re-read the durable schema marker (the
@@ -1363,8 +1384,6 @@ impl Omnigraph {
             // only (old head, old schema) or (new head, new schema), never the
             // intermediate (new head, old schema) state, without paying for a
             // second full schema parse during capture.
-            self.ensure_schema_apply_not_locked("write preparation")
-                .await?;
             let (schema_ir, schema_state) =
                 load_validated_schema_contract(self.uri(), Arc::clone(&self.storage)).await?;
             let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) =
@@ -1401,6 +1420,12 @@ impl Omnigraph {
             });
         }
 
+        if parked_behind_apply {
+            // The sentinel outlived every park: a cross-process apply (or one
+            // that died holding it) — the same typed refusal as before.
+            self.ensure_schema_apply_not_locked("write preparation")
+                .await?;
+        }
         Err(OmniError::manifest_read_set_changed(
             format!("write_authority:{}", branch.as_deref().unwrap_or("main")),
             None,

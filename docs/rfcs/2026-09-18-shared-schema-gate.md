@@ -37,7 +37,8 @@ The branch gate stays: same-branch writers still serialize from revalidation
 through publication, per RFC 0067's own recommendation. The per-table gates
 stay: they keep two same-table stagers from wasting one staging. Promotion —
 already correct with no gate held — moves after guard release as a separate,
-independently revertible sub-decision.
+independently revertible sub-decision (superseded: see Promotion outside the
+guards).
 
 The net effect is the second step of RFC 0067's throughput path: cross-branch
 writers, independent merges, and reads stop serializing process-wide on one
@@ -113,7 +114,10 @@ in-repo precedent for a shared/exclusive permit pair (`ExportCutPermit` /
 - `SchemaSharedPermit` — read side; taken by commit_all, the no-op
   conditional-mutation CAS, merge, ensure_indices and the full-text rebuild,
   optimize, cleanup, repair, branch create/create-from/delete, and the
-  read-view captures.
+  read-view captures. The write capture (`open_write_txn`) takes it only
+  while a schema-apply sentinel stands: it parks on the shared side until
+  the apply releases, then recaptures; the common path takes no permit
+  there.
 - `SchemaExclusivePermit` — write side; taken by schema apply, the
   system-column upgrade, and the contract-lifecycle passes on the handle:
   open, refresh, `settle_pending_schema_install`, `reload_schema_if_source_changed`,
@@ -142,6 +146,13 @@ interleavings silently stop replaying; with it, the DST arbiter sees the same
 event vocabulary it sees today.
 
 ### Promotion outside the guards
+> Superseded. The implementation measured this move as harmful (decision
+> log, 2026-09-25: the successor writer promotes the same pin concurrently
+> and the two replays serialize on Lance's commit path), and
+> [Detached-only tables](2026-09-21-detached-only-tables.md) then removed
+> promotion altogether, so there is nothing left to move. The
+> `HeldWriteGates` envelope helper this section introduced stays.
+
 
 `promote_held_all` runs today inside all three gates although its own
 contract states the write is already durable and graph-visible and a failure
@@ -182,8 +193,8 @@ implicit in a mutex.
 - One coherent accepted view (invariant 3) is what the exclusive side
   protects: a contract-lifecycle pass still swaps the accepted view with no
   reader or writer in flight, because shared holders drain first.
-- Recovery/pending-pin semantics (RFC 0067) are unchanged; promotion's
-  gate-free correctness is already the engine's documented contract.
+- Recovery and pin semantics (RFC 0067, as amended by detached-only tables)
+  are unchanged.
 - The deny-list line "process-local locks presented as distributed writer
   fencing" is reaffirmed, not weakened: the gate remains an in-process
   contention structure; the durable `__schema_apply_lock__` sentinel, the
@@ -250,7 +261,7 @@ The acceptance bar for the implementation PR, mapped to existing owners:
 ## Rollout
 
 One implementation PR after acceptance: lock + permits + classification +
-promotion move + test re-derivations + the DST arm + doc updates, with the
+test re-derivations + the DST arm + doc updates, with the
 before/after instrument runs in the PR body. No flag; reversibility is a
 one-commit revert.
 
@@ -271,5 +282,32 @@ one-commit revert.
   conservatism. The mis-classification tripwire is
   `parked_writer_blocks_schema_apply`; the plain-mode fairness pin is
   `queued_schema_exclusive_blocks_later_shared`; the DST concurrent
-  universe gained the schema-apply-racing-writers arm with strict replay
-  asserted (`sched_escapes == 0`).
+  universe gained the schema-apply-racing-writers arm (strict replay: see
+  2026-09-25).
+- 2026-09-25 — Two findings from the DST arm's first runs, both now in the
+  implementation. (1) The write capture sat outside the gate:
+  `open_write_txn` checked the durable sentinel before any permit, so a
+  writer arriving on another handle while an apply was in flight was refused
+  with a typed conflict and retried hot until the apply ended, while one that
+  had entered before the apply parked. A capture-scoped shared permit fixed
+  that but cost every attempt two arbiter turns under the seam scheduler
+  (the scheduler pin went from 0.8 s to 5.2 s, near its escape budget); the
+  shipped shape parks on the shared side only when the sentinel probe is
+  positive, then recaptures — zero cost on the common path, and the arm's
+  seeds commit every write and every apply. (2) Promotion after guard
+  release was measured harmful: with the envelope released first, the next
+  same-branch writer finds the pin still pending and replays the same twin,
+  so two promoters serialize on Lance's commit path — an engine-internal
+  wait the seam arbiter cannot see (the scheduler pin escaped on every op,
+  bisected to that commit alone). It was reverted; the `HeldWriteGates`
+  helper stays. Strict replay for the schema arm is a
+  hunt claim, not a CI pin: an apply's table rewrite runs on the single
+  `lance-cpu` pool thread, invisible to the arbiter, so its stall budget
+  trips under load; the plain-mode seeds are the pin and
+  `dst_seam_scheduler_bite_and_replay` pins the permits' turn/epoch protocol.
+- 2026-09-28 — Ported onto main after
+  [detached-only tables](2026-09-21-detached-only-tables.md) removed
+  promotion, which retires the promotion sub-decision outright, and after
+  the `omnigraph-core` extraction. The 22 acquisition sites, the classification
+  and the DST arm carry over unchanged; the write capture's sentinel probe
+  now uses the coordinator's `schema_apply_locked`.

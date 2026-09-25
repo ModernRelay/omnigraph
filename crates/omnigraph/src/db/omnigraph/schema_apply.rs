@@ -1200,8 +1200,15 @@ pub(super) async fn release_schema_apply_lock(db: &Omnigraph) -> Result<()> {
     db.refresh_coordinator_only().await
 }
 
+/// Whether a schema apply's durable sentinel stands on this graph: the
+/// cross-handle and cross-process signal that a contract-lifecycle pass is
+/// in flight.
+pub(super) async fn schema_apply_sentinel_present(db: &Omnigraph) -> Result<bool> {
+    db.coordinator.read().await.schema_apply_locked().await
+}
+
 pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &str) -> Result<()> {
-    if db.coordinator.read().await.schema_apply_locked().await? {
+    if schema_apply_sentinel_present(db).await? {
         return Err(OmniError::manifest_conflict(format!(
             "{} is unavailable while schema apply is in progress",
             operation

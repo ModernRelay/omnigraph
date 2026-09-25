@@ -97,6 +97,10 @@ handoff use the existing complete fold. This is disposable process memory;
 `__manifest` remains the only durable graph authority. Publication still scans
 history for collision, expected-version, and lineage validation.
 
+The capture itself (`open_write_txn`) takes no permit on the common path:
+when a schema-apply sentinel stands it parks on the shared side until the
+apply releases, then recaptures under the promoted contract.
+
 Finalization acquires the root-shared gate order:
 
 1. the schema gate — a shared permit for ordinary writers (only a
@@ -108,11 +112,9 @@ Finalization acquires the root-shared gate order:
 3. touched `(table identity, physical branch)` entries in deterministic order;
 4. coordinator publication.
 
-Promotion runs after the mutation, load, and ensure-indices writers release
-this envelope; it needs no gate for correctness. These gates order work
-inside one process. Correctness still depends on the
-persisted manifest precondition and the exact Lance transaction identity each
-pin records. A retryable pre-effect attempt discards all staged work, captures a new
+These gates order work inside one process. Correctness still depends on the persisted manifest
+precondition and the exact Lance transaction identity each pin records. A
+retryable pre-effect attempt discards all staged work, captures a new
 `WriteTxn`, and repeats boundedly; it never reuses batches against a new base.
 
 ## Writer adapters
