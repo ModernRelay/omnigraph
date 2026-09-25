@@ -1810,7 +1810,10 @@ async fn run(cli: Cli) -> Result<()> {
                         "bytes_removed": s.bytes_removed,
                         "old_versions_removed": s.old_versions_removed,
                         "error": s.error,
-                        "deferred": s.deferred,
+                        "manifests_removed": s.manifests_removed,
+                        "unpublished_manifests": s.unpublished_manifests,
+                        "unpublished_bytes": s.unpublished_bytes,
+                        "foreign_versions": s.foreign_versions,
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
@@ -1819,12 +1822,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
                 let failed: Vec<String> = stats
                     .iter()
-                    .filter(|s| s.error.is_some() && !s.deferred)
-                    .map(|s| graph_type_subject(&s.type_key))
-                    .collect();
-                let deferred: Vec<String> = stats
-                    .iter()
-                    .filter(|s| s.deferred)
+                    .filter(|s| s.error.is_some())
                     .map(|s| graph_type_subject(&s.type_key))
                     .collect();
                 println!(
@@ -1833,17 +1831,8 @@ async fn run(cli: Cli) -> Result<()> {
                     policy_desc,
                     total_versions,
                     total_bytes,
-                    stats.len() - failed.len() - deferred.len()
+                    stats.len() - failed.len()
                 );
-                if !deferred.is_empty() {
-                    println!(
-                        "  {} dataset(s) kept their versions because a blocked pin or an \
-                         unproven detached copy is retained (not a failure; --json names the \
-                         versions): {}",
-                        deferred.len(),
-                        deferred.join(", ")
-                    );
-                }
                 if !failed.is_empty() {
                     println!(
                         "  {} dataset(s) failed and will be retried on the next cleanup: {}",

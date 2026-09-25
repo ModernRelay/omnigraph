@@ -1,0 +1,115 @@
+# issue: none
+# notes: Failed updates plus an insert leave no rows or payload changes; a different successful write must not publish abandoned effects, and retry preserves nullable and untouched properties.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person { name: String @key age: I64 note: String? }
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30,"note":"original"}}
+{"type":"Person","data":{"name":"bob","age":40}}
+{"type":"Person","data":{"name":"sentinel","age":50,"note":"unchanged"}}
+
+--- mutate
+branch create work
+--- expect ok
+
+--- seam
+at: mutation.post_finalize_pre_publisher
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate branch: work
+query mixed_write() { update Person set { age: 31 } where name = "alice" update Person set { age: 41 } where name = "bob" insert Person { name: "carol", age: 20 } }
+--- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
+
+--- query branch: work
+query people() { match { $p: Person } return { $p.name, $p.age, $p.note } }
+--- expect unordered
+{"p.name":"alice","p.age":30,"p.note":"original"}
+{"p.name":"bob","p.age":40}
+{"p.name":"sentinel","p.age":50,"p.note":"unchanged"}
+--- expect shape
+p.name: String
+p.age: I64
+p.note: String?
+
+--- mutate branch: work
+query independent_write() { insert Person { name: "diana", age: 60, note: "after_failure" } }
+--- expect affected: nodes=1 edges=0
+
+--- query branch: work
+query people() { match { $p: Person } return { $p.name, $p.age, $p.note } }
+--- expect unordered
+{"p.name":"alice","p.age":30,"p.note":"original"}
+{"p.name":"bob","p.age":40}
+{"p.name":"sentinel","p.age":50,"p.note":"unchanged"}
+{"p.name":"diana","p.age":60,"p.note":"after_failure"}
+--- expect shape
+p.name: String
+p.age: I64
+p.note: String?
+
+--- restart
+
+--- query branch: work
+query people() { match { $p: Person } return { $p.name, $p.age, $p.note } }
+--- expect unordered
+{"p.name":"alice","p.age":30,"p.note":"original"}
+{"p.name":"bob","p.age":40}
+{"p.name":"sentinel","p.age":50,"p.note":"unchanged"}
+{"p.name":"diana","p.age":60,"p.note":"after_failure"}
+--- expect shape
+p.name: String
+p.age: I64
+p.note: String?
+
+--- mutate branch: work
+query mixed_write() { update Person set { age: 31 } where name = "alice" update Person set { age: 41 } where name = "bob" insert Person { name: "carol", age: 20 } }
+--- expect affected: nodes=3 edges=0
+
+--- query branch: work
+query people() { match { $p: Person } return { $p.name, $p.age, $p.note } }
+--- expect unordered
+{"p.name":"alice","p.age":31,"p.note":"original"}
+{"p.name":"bob","p.age":41}
+{"p.name":"carol","p.age":20}
+{"p.name":"sentinel","p.age":50,"p.note":"unchanged"}
+{"p.name":"diana","p.age":60,"p.note":"after_failure"}
+--- expect shape
+p.name: String
+p.age: I64
+p.note: String?
+
+--- restart
+
+--- query branch: work
+query people() { match { $p: Person } return { $p.name, $p.age, $p.note } }
+--- expect unordered
+{"p.name":"alice","p.age":31,"p.note":"original"}
+{"p.name":"bob","p.age":41}
+{"p.name":"carol","p.age":20}
+{"p.name":"sentinel","p.age":50,"p.note":"unchanged"}
+{"p.name":"diana","p.age":60,"p.note":"after_failure"}
+--- expect shape
+p.name: String
+p.age: I64
+p.note: String?
+
+--- query branch: main
+query people() { match { $p: Person } return { $p.name, $p.age, $p.note } }
+--- expect unordered
+{"p.name":"alice","p.age":30,"p.note":"original"}
+{"p.name":"bob","p.age":40}
+{"p.name":"sentinel","p.age":50,"p.note":"unchanged"}
+--- expect shape
+p.name: String
+p.age: I64
+p.note: String?

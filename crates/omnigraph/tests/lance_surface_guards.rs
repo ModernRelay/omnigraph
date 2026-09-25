@@ -65,7 +65,7 @@ use lance_namespace::LanceNamespace;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use omnigraph_compiler::schema::parser::parse_schema;
 
-use helpers::{init_and_load, open_dataset_head, snapshot_main};
+use helpers::{init_and_load, open_pinned_dataset_for_test, snapshot_main};
 
 #[test]
 fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
@@ -1921,14 +1921,7 @@ async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
     let snapshot = snapshot_main(&db).await.unwrap();
     let entries = snapshot
         .datasets()
-        .map(|entry| {
-            (
-                entry.type_key.clone(),
-                entry.dataset_path.clone(),
-                entry.published_dataset_version,
-                entry.native_dataset_branch.clone(),
-            )
-        })
+        .map(|entry| entry.type_key.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         entries.len(),
@@ -1936,14 +1929,8 @@ async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
         "the shared fixture must exercise every declared node and edge table"
     );
 
-    for (table_key, table_path, table_version, table_branch) in entries {
-        let table_uri = dir.path().join(table_path);
-        let head = open_dataset_head(table_uri.to_str().unwrap(), table_branch.as_deref()).await;
-        let table = if head.version().version == table_version {
-            head
-        } else {
-            head.checkout_version(table_version).await.unwrap()
-        };
+    for table_key in entries {
+        let table = open_pinned_dataset_for_test(&db, "main", &table_key).await;
 
         assert!(
             table.manifest().uses_stable_row_ids(),
@@ -5182,4 +5169,604 @@ async fn rfc_0067_replay_over_its_own_twin_is_refused_only_for_self_conflicting_
         first.version().version,
         "the refused Project twin adds no version"
     );
+}
+
+fn rfc_detached_only_batch(ids: &[&str], values: &[i32]) -> RecordBatch {
+    RecordBatch::try_new(
+        rfc0067_schema(),
+        vec![
+            Arc::new(StringArray::from(ids.to_vec())),
+            Arc::new(Int32Array::from(values.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+/// A detached commit of `transaction` on `base`: the only commit shape a
+/// table takes under the detached-only RFC.
+async fn rfc_detached_only_commit(base: Dataset, transaction: Transaction) -> Dataset {
+    CommitBuilder::new(Arc::new(base))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await
+        .unwrap()
+}
+
+async fn rfc_detached_only_append(base: &Dataset, ids: &[&str]) -> Dataset {
+    let transaction = rfc0067_staged_append(base, ids).await;
+    rfc_detached_only_commit(base.clone(), transaction).await
+}
+
+async fn rfc_detached_only_open_in(uri: &str, version: u64, session: &Arc<Session>) -> Dataset {
+    DatasetBuilder::from_uri(uri)
+        .with_version(version)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap()
+}
+
+fn rfc_detached_only_fragment_ids(ds: &Dataset) -> Vec<u64> {
+    ds.get_fragments().iter().map(|f| f.id() as u64).collect()
+}
+
+fn rfc_detached_only_fragment_files(ds: &Dataset, index: usize) -> Vec<String> {
+    ds.get_fragments()[index]
+        .metadata()
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+async fn rfc_detached_only_values(ds: &Dataset) -> Vec<(String, i32)> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id", "value"]).unwrap();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for batch in batches {
+        let ids = batch.column(0).as_string::<i32>();
+        let values = batch
+            .column(1)
+            .as_primitive::<arrow_array::types::Int32Type>();
+        for row in 0..batch.num_rows() {
+            out.push((ids.value(row).to_string(), values.value(row)));
+        }
+    }
+    out.sort();
+    out
+}
+
+async fn rfc_detached_only_row_ids(ds: &Dataset) -> Vec<(String, u64)> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id"]).unwrap();
+    scanner.with_row_id();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for batch in batches {
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        for row in 0..batch.num_rows() {
+            out.push((ids.value(row).to_string(), row_ids.value(row)));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Detached-only RFC §Garbage collection, probe 1: a detached commit never
+/// runs Lance's auto-cleanup hook, whatever `lance.auto_cleanup.*` says; the
+/// hook lives on the linear commit path only (`record_successful_commit`).
+#[tokio::test]
+async fn rfc_detached_only_detached_commit_never_triggers_auto_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let mut head = rfc0067_create(uri).await;
+    head.update_config(vec![
+        ("lance.auto_cleanup.interval", Some("1")),
+        ("lance.auto_cleanup.older_than", Some("0ms")),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(head.version().version, 2, "the config commit is v2");
+
+    let mut base = head.clone();
+    for ids in [["c1"], ["c2"], ["c3"]] {
+        let transaction = rfc0067_staged_append(&base, &ids).await;
+        base = CommitBuilder::new(Arc::new(base))
+            .with_detached(true)
+            .with_skip_auto_cleanup(false)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert!(lance_table::format::is_detached_version(
+            base.version().version
+        ));
+    }
+    let root = rfc0067_head(uri).await;
+    assert!(
+        root.checkout_version(1).await.is_ok(),
+        "three detached commits with the hook enabled and an aggressive cleanup \
+         config must leave v1 in place: the detached path has no cleanup hook"
+    );
+    assert_eq!(root.list_detached_manifests().await.unwrap().len(), 3);
+
+    let mut linear = root;
+    for ids in [["l1"], ["l2"], ["l3"]] {
+        let transaction = rfc0067_staged_append(&linear, &ids).await;
+        linear = CommitBuilder::new(Arc::new(linear))
+            .with_skip_auto_cleanup(false)
+            .execute(transaction)
+            .await
+            .unwrap();
+    }
+    assert!(
+        rfc0067_head(uri).await.checkout_version(1).await.is_err(),
+        "control: the same config on the linear path reclaims v1; if this \
+         holds, the config never fired and the detached assertion proved nothing"
+    );
+}
+
+/// Detached-only RFC §Garbage collection, probe 2: a detached manifest lists
+/// every fragment of its version by its own file, so marking a version's
+/// files needs no walk of the chain behind it.
+#[tokio::test]
+async fn rfc_detached_only_detached_manifest_lists_every_fragment_of_its_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    rfc0067_create(uri).await;
+    let base = rfc0067_pinned(uri, 1).await;
+    let d1 = rfc_detached_only_append(&base, &["c1"]).await;
+    let d2 = rfc_detached_only_append(&d1, &["d1"]).await;
+
+    let reopened = rfc0067_pinned(uri, d2.version().version).await;
+    assert_eq!(
+        rfc_detached_only_fragment_ids(&reopened),
+        vec![0, 1, 2],
+        "the second detached manifest names the base fragment and both chained ones"
+    );
+    let v1 = rfc0067_pinned(uri, 1).await;
+    assert_eq!(
+        rfc_detached_only_fragment_files(&reopened, 0),
+        rfc_detached_only_fragment_files(&v1, 0),
+        "the base fragment is listed by the same data file v1 names, not by a link"
+    );
+    for index in 0..3 {
+        assert!(
+            !rfc_detached_only_fragment_files(&reopened, index).is_empty(),
+            "fragment {index} lists its data file"
+        );
+    }
+    assert_eq!(rfc0067_ids(&reopened).await, vec!["a1", "a2", "c1", "d1"]);
+    assert_eq!(
+        rfc0067_head(uri).await.versions().await.unwrap().len(),
+        1,
+        "no linear version carries the chained rows"
+    );
+}
+
+/// Detached-only RFC §Content writers, probe 3: two writers on one dataset
+/// take detached ids with no coordination and never collide; each id opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rfc_detached_only_detached_ids_do_not_collide_across_writers() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    rfc0067_create(uri).await;
+
+    let writer = |label: &'static str, uri: String| async move {
+        let base = rfc_detached_only_open_in(&uri, 1, &Arc::new(Session::default())).await;
+        let mut ids = Vec::new();
+        for i in 0..8 {
+            let row = format!("{label}{i}");
+            let transaction = rfc0067_staged_append(&base, &[row.as_str()]).await;
+            let committed = rfc_detached_only_commit(base.clone(), transaction).await;
+            ids.push(committed.version().version);
+        }
+        ids
+    };
+    let left = tokio::spawn(writer("l", uri.to_string()));
+    let right = tokio::spawn(writer("r", uri.to_string()));
+    let (left, right) = (left.await.unwrap(), right.await.unwrap());
+
+    let all: HashSet<u64> = left.iter().chain(right.iter()).copied().collect();
+    assert_eq!(all.len(), 16, "sixteen commits, sixteen distinct ids");
+    assert!(
+        all.iter()
+            .all(|id| lance_table::format::is_detached_version(*id))
+    );
+    let root = rfc0067_head(uri).await;
+    assert_eq!(root.list_detached_manifests().await.unwrap().len(), 16);
+    assert_eq!(root.latest_version_id().await.unwrap(), 1, "HEAD unmoved");
+    for id in &all {
+        let pinned = rfc0067_pinned(uri, *id).await;
+        assert_eq!(
+            rfc0067_ids(&pinned).await.len(),
+            3,
+            "each id opens to its own three rows, none of a sibling's"
+        );
+    }
+}
+
+/// Detached-only RFC §Content writers, probe 4: compaction is planned on a
+/// detached version and its `Rewrite` stages detached from it, the shape
+/// `TableStore::stage_compaction` takes once nothing is linear.
+#[tokio::test]
+async fn rfc_detached_only_rewrite_is_planned_on_and_staged_from_a_detached_version() {
+    use lance::dataset::optimize::plan_compaction;
+    use lance::dataset::transaction::RewriteGroup;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    rfc0067_create(uri).await;
+    let mut tip = rfc0067_pinned(uri, 1).await;
+    for ids in [["r1"], ["r2"], ["r3"]] {
+        tip = rfc_detached_only_append(&tip, &ids).await;
+    }
+    assert_eq!(rfc_detached_only_fragment_ids(&tip), vec![0, 1, 2, 3]);
+
+    let plan = plan_compaction(
+        &tip,
+        &CompactionOptions {
+            target_rows_per_fragment: 1024,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        plan.num_tasks() > 0,
+        "a plan on the detached tip sees its four small fragments"
+    );
+    let base = Arc::new(tip.clone());
+    let mut next_id = tip.manifest().max_fragment_id.map(|id| id + 1).unwrap_or(0);
+    let mut groups = Vec::new();
+    for task in plan.compaction_tasks() {
+        let result = task.execute(&base).await.unwrap();
+        let mut fragments = result.new_fragments.clone();
+        for fragment in fragments.iter_mut() {
+            fragment.id = next_id as u64;
+            next_id += 1;
+        }
+        groups.push(RewriteGroup {
+            old_fragments: result.original_fragments.clone(),
+            new_fragments: fragments,
+        });
+    }
+    let rewrite = Transaction::new(
+        tip.version().version,
+        Operation::Rewrite {
+            groups,
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        },
+        None,
+    );
+    let compacted = rfc_detached_only_commit(tip.clone(), rewrite).await;
+    assert!(lance_table::format::is_detached_version(
+        compacted.version().version
+    ));
+    assert_eq!(
+        rfc0067_ids(&compacted).await,
+        rfc0067_ids(&tip).await,
+        "a rewrite preserves rows"
+    );
+    assert!(
+        compacted.get_fragments().len() < 4,
+        "the rewrite merged fragments: {:?}",
+        rfc_detached_only_fragment_ids(&compacted)
+    );
+    let recorded = compacted.read_transaction().await.unwrap().unwrap();
+    assert_eq!(
+        recorded.read_version,
+        tip.version().version,
+        "the rewrite records its detached base"
+    );
+    assert!(matches!(recorded.operation, Operation::Rewrite { .. }));
+    assert_eq!(
+        rfc0067_head(uri).await.latest_version_id().await.unwrap(),
+        1
+    );
+}
+
+/// Detached-only RFC §Garbage collection, probe 5: transaction properties
+/// set on a staged transaction survive on its detached manifest and read
+/// back cold, by id and through `list_detached_manifests`.
+#[tokio::test]
+async fn rfc_detached_only_transaction_properties_are_readable_from_a_detached_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    rfc0067_create(uri).await;
+    let base = rfc0067_pinned(uri, 1).await;
+    let mut transaction = rfc0067_staged_append(&base, &["c1"]).await;
+    let mut properties = HashMap::new();
+    properties.insert(
+        "omnigraph.staged_against_branch_incarnation".to_string(),
+        "7".to_string(),
+    );
+    properties.insert(
+        "omnigraph.staged_against_graph_head".to_string(),
+        "42".to_string(),
+    );
+    transaction.transaction_properties = Some(Arc::new(properties.clone()));
+    let staged = rfc_detached_only_commit(base, transaction).await;
+    let id = staged.version().version;
+
+    let cold = rfc_detached_only_open_in(uri, id, &Arc::new(Session::default())).await;
+    let recorded = cold.read_transaction().await.unwrap().unwrap();
+    assert_eq!(
+        recorded.transaction_properties.as_deref(),
+        Some(&properties),
+        "a cold open by id reads the properties from the manifest's transaction file"
+    );
+
+    let root = rfc0067_head(uri).await;
+    let listed = root.list_detached_manifests().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let by_listing = root.checkout_version(listed[0].version).await.unwrap();
+    assert_eq!(
+        by_listing
+            .read_transaction()
+            .await
+            .unwrap()
+            .unwrap()
+            .transaction_properties
+            .as_deref(),
+        Some(&properties),
+        "the collector's route, list then checkout, reads the same properties"
+    );
+}
+
+/// Detached-only RFC §Branches, probe 6: two detached chains from one base
+/// carry equal fragment and row ids, and one `Session` scans and merges
+/// each correctly with nothing of the other chain consumed.
+#[tokio::test]
+async fn rfc_detached_only_two_chains_with_equal_ids_scan_and_merge_in_one_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    rfc0067_create(uri).await;
+    let session = Arc::new(Session::default());
+    let base = rfc_detached_only_open_in(uri, 1, &session).await;
+    let left = rfc_detached_only_append(&base, &["x1"]).await;
+    let right = rfc_detached_only_append(&base, &["y1"]).await;
+    assert_eq!(rfc_detached_only_fragment_ids(&left), vec![0, 1]);
+    assert_eq!(
+        rfc_detached_only_fragment_ids(&left),
+        rfc_detached_only_fragment_ids(&right),
+        "both chains allocate the same fragment id for their new fragment"
+    );
+    let left_rows = rfc_detached_only_row_ids(&left).await;
+    let right_rows = rfc_detached_only_row_ids(&right).await;
+    let x1 = left_rows.iter().find(|(id, _)| id == "x1").unwrap().1;
+    let y1 = right_rows.iter().find(|(id, _)| id == "y1").unwrap().1;
+    assert_eq!(x1, y1, "both chains allocate the same stable row id");
+
+    let left_id = left.version().version;
+    let right_id = right.version().version;
+    let left = rfc_detached_only_open_in(uri, left_id, &session).await;
+    let right = rfc_detached_only_open_in(uri, right_id, &session).await;
+    assert_eq!(rfc0067_ids(&left).await, vec!["a1", "a2", "x1"]);
+    assert_eq!(rfc0067_ids(&right).await, vec!["a1", "a2", "y1"]);
+    assert_eq!(
+        rfc0067_ids(&left).await,
+        vec!["a1", "a2", "x1"],
+        "scanning the other chain in the same session leaves this one intact"
+    );
+
+    let upsert = stage_pk_merge(
+        Arc::new(right.clone()),
+        rfc_detached_only_batch(&["y1", "y2"], &[7, 8]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    let merged = rfc_detached_only_commit(right, upsert.transaction).await;
+    assert_eq!(
+        rfc_detached_only_values(&merged).await,
+        vec![
+            ("a1".to_string(), 0),
+            ("a2".to_string(), 1),
+            ("y1".to_string(), 7),
+            ("y2".to_string(), 8),
+        ],
+        "the merge matched y1 on this chain and never saw the other chain's x1"
+    );
+    assert_eq!(
+        rfc0067_ids(&rfc_detached_only_open_in(uri, left_id, &session).await).await,
+        vec!["a1", "a2", "x1"],
+        "the other chain is untouched by the merge"
+    );
+}
+
+/// Detached-only RFC §Resolution, probe 7: a dataset whose only linear
+/// manifest is `v1` opens cold by a detached id and chains on from it.
+#[tokio::test]
+async fn rfc_detached_only_dataset_whose_only_linear_manifest_is_v1_opens_by_detached_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    rfc0067_create(uri).await;
+    let base = rfc0067_pinned(uri, 1).await;
+    let d1 = rfc_detached_only_append(&base, &["c1"]).await;
+    let d2 = rfc_detached_only_append(&d1, &["d1"]).await;
+    let d2_id = d2.version().version;
+
+    let cold = rfc_detached_only_open_in(uri, d2_id, &Arc::new(Session::default())).await;
+    assert_eq!(rfc0067_ids(&cold).await, vec!["a1", "a2", "c1", "d1"]);
+    let root = rfc0067_head(uri).await;
+    assert_eq!(root.version().version, 1, "the linear HEAD is still v1");
+    assert_eq!(root.versions().await.unwrap().len(), 1);
+    assert_eq!(root.list_detached_manifests().await.unwrap().len(), 2);
+
+    let d3 = rfc_detached_only_append(&cold, &["e1"]).await;
+    assert_eq!(
+        d3.read_transaction().await.unwrap().unwrap().read_version,
+        d2_id,
+        "a commit from the cold handle chains on the detached id, not on v1"
+    );
+    assert_eq!(rfc0067_ids(&d3).await, vec!["a1", "a2", "c1", "d1", "e1"]);
+}
+
+/// Detached-only RFC Unresolved question 2, probe 8: Lance accepts a
+/// detached id as a branch source, but the branch has no head: the shallow
+/// clone keeps the source's version number (`Manifest::shallow_clone`).
+#[tokio::test]
+async fn rfc_detached_only_lance_branch_from_a_detached_version_has_no_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let _v2 = rfc0067_append(v1, &["orphan"]).await;
+    let pinned = rfc0067_pinned(uri, 1).await;
+    let d1 = rfc_detached_only_append(&pinned, &["c1"]).await;
+    let d1_id = d1.version().version;
+
+    let mut root = rfc0067_head(uri).await;
+    let fork = root
+        .create_branch("fork", d1_id, None)
+        .await
+        .expect("Lance accepts a detached id as a branch source");
+    assert_eq!(
+        fork.version().version,
+        d1_id,
+        "the branch's first manifest keeps the source's detached number"
+    );
+    assert_eq!(fork.manifest().branch.as_deref(), Some("fork"));
+    let branches = root.list_branches().await.unwrap();
+    assert_eq!(
+        branches["fork"].parent_version, d1_id,
+        "`BranchContents` records the detached parent"
+    );
+    assert!(
+        root.checkout_branch("fork").await.is_err(),
+        "the branch has no linear manifest, so it has no head to check out"
+    );
+
+    let branch_uri = format!("{uri}/tree/fork");
+    let explicit = DatasetBuilder::from_uri(&branch_uri)
+        .with_version(d1_id)
+        .load()
+        .await
+        .expect("the branch opens by its explicit detached id");
+    assert_eq!(rfc0067_ids(&explicit).await, vec!["a1", "a2", "c1"]);
+
+    let transaction = rfc0067_staged_append(&explicit, &["f1"]).await;
+    let linear = rfc0067_linear(explicit.clone()).execute(transaction).await;
+    assert!(
+        linear.is_err(),
+        "a linear commit on the fork would take version id + 1, a detached number: {linear:?}"
+    );
+    let transaction = rfc0067_staged_append(&explicit, &["f1"]).await;
+    let chained = rfc_detached_only_commit(explicit, transaction).await;
+    assert!(
+        lance_table::format::is_detached_version(chained.version().version),
+        "a detached commit on the fork chains as on any table"
+    );
+    assert_eq!(rfc0067_ids(&chained).await, vec!["a1", "a2", "c1", "f1"]);
+}
+
+/// Ref-only retirement preserves descendant HEAD, fork-point and indexed origins.
+#[tokio::test]
+async fn native_ref_unlink_keeps_descendant_head_and_fork_point_readable() {
+    use object_store::ObjectStoreExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("ref-only-retirement.lance");
+    let uri = uri.to_str().unwrap();
+    let mut root = fresh_dataset(uri).await;
+    let version = root.version().version;
+    let mut a = root.create_branch("a", version, None).await.unwrap();
+    append_guard_row(&mut a, "from-a", 10).await;
+    let a_uri = a.uri().to_string();
+    let version = a.version().version;
+    let mut b = a.create_branch("b", version, None).await.unwrap();
+    append_guard_row(&mut b, "from-b", 20).await;
+    let b_uri = b.uri().to_string();
+    let version = b.version().version;
+    let mut c = b.create_branch("c", version, None).await.unwrap();
+    let fork_point = c.version().version;
+    let fork_rows = rfc_detached_only_values(&c).await;
+    assert_eq!(
+        fork_rows,
+        vec![
+            ("alice".to_string(), 1),
+            ("bob".to_string(), 2),
+            ("from-a".to_string(), 10),
+            ("from-b".to_string(), 20),
+        ]
+    );
+    append_guard_row(&mut c, "from-c", 30).await;
+    c.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+    let head_rows = rfc_detached_only_values(&c).await;
+    let bases = c.manifest().base_paths.clone();
+    assert!(bases.values().any(|base| base.path == a_uri));
+    assert!(bases.values().any(|base| base.path == b_uri));
+    let root_path = root.branch_location().find_main().unwrap().path;
+    let store = root.object_store(None).await.unwrap();
+    drop((root, a, b, c));
+    for branch in ["a", "b"] {
+        let path = lance::dataset::refs::branch_contents_path(&root_path, branch);
+        store.inner.delete(&path).await.unwrap();
+    }
+    let cold_root = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let refs = cold_root.list_branches().await.unwrap();
+    assert_eq!(refs.len(), 1);
+    assert!(refs.contains_key("c"));
+    let cold = cold_root
+        .checkout_branch("c")
+        .await
+        .expect("cold descendant HEAD must open without the parent refs");
+    assert_eq!(cold.manifest().base_paths, bases);
+    assert_eq!(rfc_detached_only_values(&cold).await, head_rows);
+    let mut indexed = cold.scan();
+    indexed.project(&["id", "value"]).unwrap();
+    indexed.filter("value = 10").unwrap();
+    assert!(
+        indexed
+            .explain_plan(true)
+            .await
+            .unwrap()
+            .contains("ScalarIndexQuery")
+    );
+    let batch = indexed
+        .try_into_batch()
+        .await
+        .expect("indexed fetch must still read the retired ancestor's data");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "from-a");
+    let fork = cold
+        .checkout_version(fork_point)
+        .await
+        .expect("descendant fork-point history must open without the parent refs");
+    assert_eq!(rfc_detached_only_values(&fork).await, fork_rows);
 }

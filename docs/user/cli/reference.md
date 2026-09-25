@@ -57,8 +57,8 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `upgrade` | Check or execute a registered offline storage migration | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
-| `repair` | Preview or publish classified storage drift | direct |
-| `cleanup` | Delete old versions under an explicit retention policy | direct |
+| `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
+| `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
@@ -135,9 +135,9 @@ omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
 `--store` is an alternative to the positional storage URI. Target format defaults
-to 9: qualified v6 inputs run v6 → v7 → v8 and then the system-column step,
-v7 inputs run v7 → v8 and the step, v8 inputs run the step alone; `--to-format 8`
-stops at v8 with the legacy system column spellings.
+to 11: qualified v6 inputs run v6 → v7 → v8 → v10 → v11, v7 inputs
+v7 → v8 → v10 → v11, v8 and v9 inputs v10 → v11, v10 inputs the v11 step alone;
+`--to-format 8` or `--to-format 10` stops there with the older format.
 Explicit target 7 remains available, but the current binary refuses normal open
 of v7. `--check` performs read-only preflight and reports output-dependent checks
 in `work.deferred_checks`; execution validates those before the affected handler

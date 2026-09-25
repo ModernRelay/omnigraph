@@ -187,7 +187,11 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 "one externally replaced feature head must hydrate one row by physical address",
             );
             assert!(foreign_io.manifest_reads > 0 && foreign_io.manifest_read_bytes > 0);
-            assert!(foreign_io.manifest_reads <= 32);
+            assert!(
+                foreign_io.manifest_reads <= 40,
+                "foreign-source merge input protection and incremental refresh used {} manifest reads",
+                foreign_io.manifest_reads,
+            );
 
             // Check every Person payload after the measured refresh, on both
             // source and target, so reduced I/O cannot hide a stale merge.

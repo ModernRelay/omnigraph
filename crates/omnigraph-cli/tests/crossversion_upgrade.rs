@@ -254,19 +254,20 @@ fn assert_exported_blob_fidelity(label: &str, original: &[u8], rebuilt: &[u8]) {
     );
 }
 
-/// Rebuilt graphs are stamped 10 and use `__id` as the unenforced Lance primary
-/// key (RFC 0040), preserving the primary-key contract of format v6 (RFC 0023).
+/// Rebuilt graphs are stamped at the current format (v11) and use `__id` as
+/// the unenforced Lance primary key (RFC 0040), preserving the primary-key
+/// contract of format v6 (RFC 0023).
 fn assert_rebuilt_v10_graph(graph: &Path) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
-            .expect("open rebuilt v10 graph");
+            .expect("open rebuilt current-format graph");
         assert_eq!(
             db.internal_schema_version_of(ReadTarget::branch("main"))
                 .await
                 .expect("read rebuilt graph storage version"),
-            10,
-            "rebuild must create main's __manifest at storage version 10",
+            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            "rebuild must create main's __manifest at the current storage version",
         );
         let snapshot = db
             .snapshot_of(ReadTarget::branch("main"))
@@ -831,14 +832,14 @@ fn current_binary_reports_already_current_on_a_fresh_graph() {
     for args in [
         vec!["upgrade", uri, "--check", "--json"],
         vec!["upgrade", uri, "--json"],
-        vec!["upgrade", uri, "--check", "--to-format", "10", "--json"],
+        vec!["upgrade", uri, "--check", "--to-format", "11", "--json"],
     ] {
         let report = support::parse_stdout_json(&output_success(cli().args(&args)));
         assert_eq!(report["outcome"], "already_current", "{args:?}");
-        assert_eq!(report["observed_format"], 10, "{args:?}");
+        assert_eq!(report["observed_format"], 11, "{args:?}");
     }
 
-    for lower in ["7", "8"] {
+    for lower in ["7", "8", "10"] {
         let refused = support::parse_stdout_json(&output_failure(cli().args([
             "upgrade",
             uri,
@@ -1513,6 +1514,15 @@ query vectors($q: Vector(4)) {
     assert_eq!(check["target_format"], 8);
     assert_eq!(check["target_defaulted"], false);
     assert_eq!(check["route"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        check["work"]["historical_blob_identity_limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field.as_str().unwrap().ends_with(":payload")),
+        !has_property_lifetime_metadata,
+        "preflight must report the legacy Blob property-lifetime limitation"
+    );
     assert!(
         !check["work"]["deferred_checks"]
             .as_array()
@@ -1558,8 +1568,6 @@ query vectors($q: Vector(4)) {
         payloads(&before),
         "storage migration must preserve every table object without adding table objects"
     );
-    // Check first, then execute: the v8 stop is already current and the
-    // default route continues to v10 through the live branches.
     for check_mode in [true, false] {
         let mut command = cli();
         command.args(["upgrade", uri, "--to-format", "8", "--json"]);
@@ -1575,24 +1583,24 @@ query vectors($q: Vector(4)) {
             default_route.arg("--check");
         }
         let completed = support::parse_stdout_json(&output_success(&mut default_route));
-        assert_eq!(completed["target_format"], 10);
+        assert_eq!(completed["target_format"], 11);
         assert_eq!(completed["target_defaulted"], true);
         if check_mode {
             assert_eq!(
                 completed["outcome"], "check_passed",
-                "the default route reaches v10 through the live branches: {completed}"
+                "the default route reaches v11 through the live branches: {completed}"
             );
             assert_eq!(
                 graph_files(&graph),
                 after,
-                "the v10 check must be effect-free"
+                "the v11 check must be effect-free"
             );
         } else {
             assert_eq!(
                 completed["outcome"], "completed",
-                "the default route restamps a branched graph: {completed}"
+                "the default route takes a branched graph to v11: {completed}"
             );
-            assert_eq!(completed["completed_handlers"].as_array().unwrap().len(), 1);
+            assert_eq!(completed["completed_handlers"].as_array().unwrap().len(), 2);
             after = graph_files(&graph);
         }
         let mut downgrade = cli();
@@ -1608,7 +1616,6 @@ query vectors($q: Vector(4)) {
             "downgrade refusal must be effect-free"
         );
     }
-    // Once the graph is at v10, the v8 stop is a refused downgrade.
     let refused = support::parse_stdout_json(&output_failure(cli().args([
         "upgrade",
         uri,
@@ -1624,7 +1631,7 @@ query vectors($q: Vector(4)) {
             .unwrap()
             .iter()
             .any(|finding| finding["code"] == "target_below_stamp"),
-        "v8 is below the served floor once the graph is at v10: {refused}"
+        "v8 is below the served floor once the graph is at v11: {refused}"
     );
     assert_eq!(
         graph_files(&graph),

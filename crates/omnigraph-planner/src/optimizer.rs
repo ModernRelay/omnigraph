@@ -1612,13 +1612,12 @@ fn fragment_scope(plan: &mut LogicalPlan, source: &dyn PlanSource) -> bool {
             match spec.side {
                 SideId::Child => {
                     spec.fragments = Some(proof.child_fragments.clone());
-                    spec.filter = Some(and_filter(
-                        spec.filter.take(),
-                        Predicate::VersionWindow {
-                            from: proof.version_window.0,
-                            to: proof.version_window.1,
-                        },
-                    ));
+                    if let Some((from, to)) = proof.version_window {
+                        spec.filter = Some(and_filter(
+                            spec.filter.take(),
+                            Predicate::VersionWindow { from, to },
+                        ));
+                    }
                     fired = true;
                 }
                 SideId::Parent => {
@@ -3106,7 +3105,7 @@ mod tests {
             source.with_proof(AdjacencyProof {
                 child_fragments: vec![2],
                 parent_fragments: vec![1],
-                version_window: (7, 8),
+                version_window: Some((7, 8)),
             })
         } else {
             source

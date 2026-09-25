@@ -1,0 +1,170 @@
+# issue: none
+# notes: Branch-local vector updates, deletion and reinsertion change ranking without leaking into main; exact ordered rows survive restart with no stale duplicate.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Doc { slug: String @key embedding: Vector(4) @index }
+
+--- seed
+{"type":"Doc","data":{"slug":"a","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","embedding":[20.0,0.0,0.0,0.0]}}
+
+--- query branch: main
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+{"d.slug":"c"}
+--- expect shape
+d.slug: String
+
+--- mutate
+branch create work
+--- expect ok
+
+--- mutate branch: work
+query move_a($e: Vector(4)) { update Doc set { embedding: $e } where slug = "a" }
+--- params
+{"e":[30.0,0.0,0.0,0.0]}
+--- expect affected: nodes=1 edges=0
+
+--- query branch: work
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"b"}
+{"d.slug":"c"}
+{"d.slug":"a"}
+--- expect shape
+d.slug: String
+
+--- query branch: main
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+{"d.slug":"c"}
+--- expect shape
+d.slug: String
+
+--- mutate branch: work
+query delete_b() { delete Doc where slug = "b" }
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: work
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"c"}
+{"d.slug":"a"}
+--- expect shape
+d.slug: String
+
+--- query branch: main
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+{"d.slug":"c"}
+--- expect shape
+d.slug: String
+
+--- mutate branch: work
+query replace_b($e: Vector(4)) { insert Doc { slug: "b", embedding: $e } }
+--- params
+{"e":[40.0,0.0,0.0,0.0]}
+--- expect affected: nodes=1 edges=0
+
+--- query branch: work
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"c"}
+{"d.slug":"a"}
+{"d.slug":"b"}
+--- expect shape
+d.slug: String
+
+--- restart
+
+--- query branch: main
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+{"d.slug":"c"}
+--- expect shape
+d.slug: String
+
+--- query branch: work
+query nearest_docs($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+--- params
+{"q":[-0.3,0.0,0.0,0.0]}
+--- expect ordered
+{"d.slug":"c"}
+{"d.slug":"a"}
+{"d.slug":"b"}
+--- expect shape
+d.slug: String

@@ -25,10 +25,13 @@ five more changes like this one?**
 2. **There is one graph-content publication door.** A graph change becomes
    authoritative through one `__manifest` publication containing every
    visible table pointer and graph-lineage update. A writer never moves a
-   table's linear HEAD before that publication: its effects are detached
-   commits the manifest pin names, and promotion onto the linear history
-   follows publication and is derived. Per-table publication is never graph
-   publication.
+   table's linear HEAD: its effects are detached commits the `__manifest`
+   pin `(published_dataset_version, staged_version, transaction_uuid)`
+   names, every pin is a detached version that opens, and the pin is the
+   table's version for its whole life. A graph table's linear HEAD stays at
+   its creation version, recorded per registration as
+   `omnigraph.last_linear_version`, and only `repair` reads it. Per-table
+   publication is never graph publication.
 
 3. **Every operation uses one coherent accepted view.** A read holds one
    immutable snapshot for its lifetime. A writer captures schema, catalog,
@@ -43,15 +46,20 @@ five more changes like this one?**
 
 5. **Crash convergence is part of the commit protocol.** An effect that is
    durable before publication must be unreachable: a detached version or a
-   staged file nothing references, which a retry ignores. Cleanup requires
-   proof before reclaiming detached versions, and it retains an unpublished
-   first-touch fork while the graph branch incarnation in its name is live;
-   age does not prove abandonment for either.
-   An effect that is published must carry in the manifest itself what finishes
-   it: a pin's target version, staged version and transaction uuid, a staged
-   schema contract's publishing commit. There is no side record to classify.
-   Ambiguous or foreign movement fails closed: a blocked pin is reported and
-   never adopted. See [recovery.md](recovery.md).
+   staged file nothing references, which a retry ignores. `cleanup`'s
+   collector reclaims such a version only when the publication authority
+   its transaction properties record is provably gone; age does not prove
+   abandonment. A published table effect is complete at publication and
+   nothing finishes it. The one published effect with work left, a staged
+   schema contract, carries its publishing commit in the manifest itself.
+   There is no side record to classify. The collector holds two properties
+   on every run: safety, that every pin of every retained `__manifest`
+   version on every live branch still opens and every path its manifest
+   lists still exists after the run; and progress, that a table version no
+   retained `__manifest` version names is gone after a run that retains
+   nothing else. Foreign movement fails closed: a linear commit above a
+   table's last linear version is reported by `repair` and never adopted.
+   See [recovery.md](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
    non-zero type, property, and table-incarnation identities. A rename
@@ -88,7 +96,9 @@ five more changes like this one?**
     history.
 
 12. **One source of truth, cheaply derived.** Lance, `__manifest`, and the
-    accepted schema are authoritative. Immutable version-pinned state may be
+    accepted schema are authoritative. `__manifest` is a table's only
+    lineage; the table's Lance linear history is not a second, derived
+    history. Immutable version-pinned state may be
     cached; mutable-tip caches are hints, never commit authority. Do not
     maintain a shadow copy that can drift or rebuild a warm projection from
     full history on every call.
@@ -140,7 +150,7 @@ different:
   writers. The residual the boundary carries: if a concurrent read-write open
   discards a live apply's staging and that apply then lands its manifest commit
   but dies before installing from memory, the published outcome is paired with
-  the old contract with no staging left to promote it — a same-identity
+  the old contract with no staging left to install, so a same-identity
   contract change can serve stale until the next apply. Add/drop and
   identity-changing shapes still fail loudly; only a same-identity rewrite is
   silent, and only outside the single-process boundary. Table effects carry no
@@ -156,7 +166,13 @@ code, tests, guide, and—when irreversible—RFC.
 - Does one snapshot or authority token cover the whole operation?
 - Is graph visibility still one manifest publication?
 - Is every pre-publication durable effect unreachable until the manifest names
-  it, and does the pin or staged contract carry what finishing it needs?
+  it, is a published table effect complete at its pin, and does a staged
+  contract carry what finishing it needs?
+- Does the change read a table's linear HEAD anywhere but `repair`, or
+  rebuild a registration row without carrying
+  `omnigraph.last_linear_version` forward?
+- Does the collector's mark set still cover every retained pin, and does its
+  sweep still reach every unretained published version?
 - Are names kept separate from stable identity?
 - Does a missing physical optimization preserve logical correctness?
 - Are retries, memory, I/O, and failure outcomes bounded?

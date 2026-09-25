@@ -6,6 +6,8 @@
 //! synthetic Person/Knows graph, plus a microbench comparing
 //! `HashSet<String>` vs `HashSet<u32>` dedup inside the BFS inner loop.
 
+#![recursion_limit = "256"]
+
 use std::collections::HashSet;
 use std::time::Instant;
 

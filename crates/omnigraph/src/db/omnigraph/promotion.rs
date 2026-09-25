@@ -1,23 +1,14 @@
-//! Promotion of table pins onto their linear history (RFC 0067).
-//!
-//! A pin published as `(target, staged, uuid)` names a detached Lance version
-//! whose twin has not yet been written at `target`. Promotion replays the
-//! recorded transaction at `target - 1` through the sealed storage boundary.
-//! It is derived, idempotent reconciler work: any process may run it, two
-//! promoters racing on one pin leave exactly one twin, and a pin that cannot
-//! be promoted because a foreign commit occupies its target stays readable
-//! through its staged version and degrades only reclamation.
-//!
-//! A chain of detached commits links itself: every detached commit records
-//! the version it was staged on, so a pin whose linear base is absent is the
-//! tip of a chain found by following read-version links, never by reading
-//! manifest history.
+//! Table pins and their detached chains (RFC 0067, detached-only tables).
+//! Writers stage on the pin (`open_pinned_for_write`) and never promote it;
+//! `table_location`, `open_at` and `walk_chain` resolve a pin's versions,
+//! and `blocked_pin_reason` judges one for `repair` without replaying.
+//! The one replay left is the v11 upgrade route's (`replay_pin`), run once
+//! per pending v10 pin.
 
 use crate::db::manifest::DatasetEntry;
 use crate::db::omnigraph::Omnigraph;
 use crate::error::{OmniError, Result};
 use crate::instrumentation::{VersionResolution, open_dataset, table_wrapper};
-use crate::seams::{decide_seam, fail};
 use crate::storage_layer::{PromotionOutcome, SnapshotHandle};
 
 /// Outcome of promoting one pin.
@@ -47,14 +38,12 @@ pub(crate) fn table_location(full_path: &str, table_branch: Option<&str>) -> Str
     }
 }
 
-/// Where Lance keeps a detached version's manifest: `d{version}.manifest`
-/// under `_versions`, the masked version spelled in full.
-pub(crate) fn detached_manifest_path(location: &str, staged: u64) -> String {
-    format!("{location}/_versions/d{staged}.manifest")
-}
-
 /// Open one version of a table, or `None` when that version is reclaimed.
-async fn open_at(db: &Omnigraph, location: &str, version: u64) -> Result<Option<SnapshotHandle>> {
+pub(crate) async fn open_at(
+    db: &Omnigraph,
+    location: &str,
+    version: u64,
+) -> Result<Option<SnapshotHandle>> {
     let session = db.read_caches().session.clone();
     match open_dataset(
         location,
@@ -168,12 +157,10 @@ async fn replay_base(
     })
 }
 
-/// Promote the pin `(target, staged, uuid)` of one table, and every detached
-/// commit behind it, oldest first. A promoter that did not stage the pin
-/// checks the target first: the same pin is registered on every branch that
-/// inherits it, and a promoted pin's detached manifest may already be
-/// reaped. Bounded by the chain length.
-pub(crate) async fn promote_pin(
+/// The pin replay the v11 upgrade step runs once per pending v10 pin, the
+/// last promotion the engine performs (RFC "Detached-only tables", Format
+/// and migration).
+pub(crate) async fn replay_pin(
     db: &Omnigraph,
     table_key: &str,
     full_path: &str,
@@ -343,148 +330,21 @@ async fn promote_step(
     }
 }
 
-decide_seam! {
-    /// Between two pins a writer promotes after one publication, after the
-    /// first twin landed and before the next replay. A failure here leaves
-    /// later pins pending for the next writer or cleanup.
-    pub static PROMOTION_POST_LANDED = ("promotion.post_landed", AnyWrite, [Fail]);
-}
-
-/// What a writer holds after its detached commit: enough to promote the pin
-/// it published without reopening anything (RFC 0067).
-pub(crate) struct HeldPromotion {
-    pub(crate) table_key: String,
-    pub(crate) dataset_path: String,
-    pub(crate) full_path: String,
-    pub(crate) table_branch: Option<String>,
-    /// The linear base the chain was staged on: `target - chain length`.
-    pub(crate) base: SnapshotHandle,
-    /// The detached links behind the tip, oldest first; empty for a single
-    /// detached commit. A branch merge chains one link per chunk.
-    pub(crate) chain: Vec<SnapshotHandle>,
-    /// The detached version the pin names: the chain's tip.
-    pub(crate) detached: SnapshotHandle,
-    pub(crate) target: u64,
-    pub(crate) uuid: String,
-    /// The pin's e-tag, the read-handle cache key the twin is held under.
-    pub(crate) e_tag: Option<String>,
-}
-
-/// Promote a pin this writer just published, from the base handle it staged
-/// on and the detached handles it landed, oldest link first. A twin that a
-/// racing promoter landed first is refused by the replay and recognised on
-/// recheck; a chain then continues from that twin.
-pub(crate) async fn promote_held(db: &Omnigraph, held: HeldPromotion) -> Result<Promotion> {
-    let location = table_location(&held.full_path, held.table_branch.as_deref());
-    let first_target = held.target - held.chain.len() as u64;
-    // A base that is not the first link's predecessor is a detached
-    // predecessor whose promotion is blocked; the replay refuses it as
-    // unsafe and this pin waits behind it.
-    let mut base = held.base;
-    for (offset, link) in held.chain.iter().enumerate() {
-        let target = first_target + offset as u64;
-        let uuid = db.storage().transaction_identity(link)?.uuid;
-        base = match db
-            .storage()
-            .promote_detached(base, link, target, &uuid)
-            .await?
-        {
-            PromotionOutcome::Landed(twin) => twin,
-            PromotionOutcome::Refused => match target_state(db, &location, target, &uuid).await? {
-                Some(Promotion::AlreadyPromoted) => open_at(db, &location, target)
-                    .await?
-                    .ok_or_else(|| OmniError::HistoricalVersionReclaimed {
-                        published_dataset_version: target,
-                    })?,
-                Some(Promotion::Blocked(reason)) => return Ok(Promotion::Blocked(reason)),
-                _ => {
-                    return Ok(Promotion::Blocked(
-                        "replay refused and the target is absent".to_string(),
-                    ));
-                }
-            },
-            PromotionOutcome::Unsafe(reason) => return Ok(Promotion::Blocked(reason)),
-        };
-    }
-    match db
-        .storage()
-        .promote_detached(base, &held.detached, held.target, &held.uuid)
-        .await?
-    {
-        PromotionOutcome::Landed(twin) => {
-            db.read_caches()
-                .handles
-                .insert(
-                    &held.dataset_path,
-                    held.table_branch.as_deref(),
-                    held.target,
-                    held.e_tag.as_deref(),
-                    twin.into_dataset(),
-                )
-                .await;
-            Ok(Promotion::Promoted(held.target))
-        }
-        PromotionOutcome::Refused => Ok(target_state(db, &location, held.target, &held.uuid)
-            .await?
-            .unwrap_or_else(|| {
-                Promotion::Blocked("replay refused and the target is absent".to_string())
-            })),
-        PromotionOutcome::Unsafe(reason) => Ok(Promotion::Blocked(reason)),
-    }
-}
-
-/// Promote every pin a writer just published, best effort: the write is
-/// durable and visible already, so a promotion that fails or is blocked is
-/// logged and left for the next writer of that table or for cleanup.
-pub(crate) async fn promote_held_all(db: &Omnigraph, held: Vec<HeldPromotion>) {
-    for (index, promotion) in held.into_iter().enumerate() {
-        if index > 0
-            && let Err(error) = fail(&PROMOTION_POST_LANDED)
-        {
-            tracing::warn!(error = %error, "promotion interrupted; the next writer promotes");
-            return;
-        }
-        let table_key = promotion.table_key.clone();
-        let target = promotion.target;
-        match Box::pin(promote_held(db, promotion)).await {
-            Ok(Promotion::Promoted(_)) | Ok(Promotion::AlreadyPromoted) => {}
-            Ok(Promotion::Blocked(reason)) => {
-                tracing::warn!(
-                    table = table_key.as_str(),
-                    target,
-                    reason,
-                    "promotion blocked"
-                )
-            }
-            Err(error) => {
-                tracing::warn!(table = table_key.as_str(), target, error = %error, "promotion failed")
-            }
-        }
-    }
-}
-
-/// Open the pinned base a writer stages on. A held handle for the pin costs
-/// no request; otherwise one pinned open resolves it, and a pin still
-/// resolved to its staged version is promoted first so the write stages
-/// from a linear base and its own promotion has a base to land on. A pin
-/// whose promotion is blocked stages the write from its detached version,
-/// and the write's own promotion waits behind the block (RFC 0067); a
-/// linear pin whose table HEAD moved past it without a publication refuses
-/// the write, as every writer does for uncovered drift.
+/// Open the pinned base a writer stages on: a held handle costs no request,
+/// otherwise one pinned open. The linear HEAD is never consulted; a foreign
+/// commit above the pin is `repair`'s `foreign_drift`, not the writer's.
 pub(crate) async fn open_pinned_for_write(
     db: &Omnigraph,
-    table_key: &str,
     full_path: &str,
     entry: &DatasetEntry,
 ) -> Result<SnapshotHandle> {
-    resolve_pinned_for_write(db, table_key, full_path, entry)
+    resolve_pinned_for_write(db, full_path, entry)
         .await
         .map(SnapshotHandle::new)
 }
 
 async fn resolve_pinned_for_write(
     db: &Omnigraph,
-    table_key: &str,
     full_path: &str,
     entry: &DatasetEntry,
 ) -> Result<lance::Dataset> {
@@ -505,80 +365,18 @@ async fn resolve_pinned_for_write(
                     e_tag,
                     entry.version_metadata.staged_version(),
                     entry.version_metadata.transaction_uuid(),
+                    entry.version_metadata.last_linear_version(),
                     &location,
                     Some(&caches.session),
                 )
                 .await?
         }
     };
-    if dataset.version().version == target {
-        // A linear pin: its table HEAD must be the pin itself. HEAD beyond it
-        // is an effect no publication covers, which the shared baseline check
-        // reports as a stale read set or routes to explicit repair.
-        db.ensure_existing_effect_baseline(
-            table_key,
-            table_branch,
-            target,
-            &SnapshotHandle::new(dataset.clone()),
-        )
-        .await?;
-        return Ok(dataset);
-    }
-    let (Some(staged), Some(uuid)) = (
-        entry.version_metadata.staged_version(),
-        entry.version_metadata.transaction_uuid(),
-    ) else {
-        return Ok(dataset);
-    };
-    // Boxed: promotion is the rare path, and its state must not widen the
-    // future of every write that never takes it.
-    match Box::pin(promote_pin(
-        db,
-        table_key,
-        full_path,
-        table_branch,
-        target,
-        staged,
-        uuid,
-    ))
-    .await?
-    {
-        Promotion::Promoted(_) | Promotion::AlreadyPromoted => {
-            let promoted = open_dataset(
-                &location,
-                VersionResolution::At(target),
-                Some(&caches.session),
-                table_wrapper(),
-            )
-            .await?;
-            caches
-                .handles
-                .insert(
-                    &entry.dataset_path,
-                    table_branch,
-                    target,
-                    e_tag,
-                    promoted.clone(),
-                )
-                .await;
-            Ok(promoted)
-        }
-        Promotion::Blocked(reason) => {
-            // Reads stay correct through the staged version, the chain behind
-            // the block waits for it, and `omnigraph repair` reports the table.
-            tracing::warn!(
-                table_key,
-                target,
-                reason,
-                "staging behind a blocked pin; `omnigraph repair` reports it"
-            );
-            Ok(dataset)
-        }
-    }
+    Ok(dataset)
 }
 
-/// The pin's linear twin when this process holds it in the read-handle
-/// cache, which a promoter in this process filled; it costs no request.
+/// The pin's version when this process holds it in the read-handle cache;
+/// it costs no request.
 async fn held_twin(db: &Omnigraph, entry: &DatasetEntry) -> Option<lance::Dataset> {
     let target = entry.published_dataset_version;
     db.read_caches()
@@ -587,28 +385,26 @@ async fn held_twin(db: &Omnigraph, entry: &DatasetEntry) -> Option<lance::Datase
             &entry.dataset_path,
             entry.native_dataset_branch.as_deref(),
             target,
+            entry.version_metadata.staged_version(),
             entry.version_metadata.e_tag(),
         )
         .await
-        .filter(|held| held.version().version == target)
+        .filter(|held| {
+            held.version().version == entry.version_metadata.staged_version().unwrap_or(target)
+        })
 }
 
 /// What a writer that plans on a table's linear HEAD finds at the pin.
 pub(crate) enum PinAtHead {
     /// HEAD carries the pin, or the entry names no detached version.
     Carried,
-    /// A pending pin was promoted; plan on this fresh HEAD.
-    Promoted(SnapshotHandle),
     /// The pin cannot be promoted; the reason names why.
     Blocked(String),
 }
 
-/// Judge the pin from the HEAD a linear writer opened anyway: a HEAD at the
-/// pin's version is checked by its recorded transaction without a request,
-/// a HEAD behind it promotes the pending pin and reopens, a HEAD beyond it
-/// asks the target once. The writers that still commit on the linear HEAD
-/// (branch merge, index builds, schema apply, Optimize, repair) need HEAD to
-/// equal the pin as their protocol expects.
+/// Judge the pin from the HEAD `repair` opened: a HEAD at the pin's version
+/// is checked by its recorded transaction, a HEAD beyond it asks the target
+/// once, and a HEAD behind it is `Blocked`, since nothing promotes a pin.
 pub(crate) async fn promote_pin_at_head(
     db: &Omnigraph,
     table_key: &str,
@@ -616,7 +412,7 @@ pub(crate) async fn promote_pin_at_head(
     entry: &DatasetEntry,
     head: &SnapshotHandle,
 ) -> Result<PinAtHead> {
-    let (Some(staged), Some(uuid)) = (
+    let (Some(_), Some(uuid)) = (
         entry.version_metadata.staged_version(),
         entry.version_metadata.transaction_uuid(),
     ) else {
@@ -641,95 +437,17 @@ pub(crate) async fn promote_pin_at_head(
             _ => PinAtHead::Carried,
         });
     }
-    match Box::pin(promote_pin(
-        db,
-        table_key,
-        full_path,
-        table_branch,
-        target,
-        staged,
-        uuid,
-    ))
-    .await?
-    {
-        Promotion::Promoted(_) | Promotion::AlreadyPromoted => Ok(PinAtHead::Promoted(
-            db.storage()
-                .open_dataset_head(full_path, table_branch)
-                .await?,
-        )),
-        Promotion::Blocked(reason) => Ok(PinAtHead::Blocked(reason)),
-    }
-}
-
-/// A blocked pin refuses a writer that commits on the linear HEAD: its
-/// effect would rebase over the foreign commit occupying the pin's target.
-fn blocked_for_linear_writer(table_key: &str, target: u64, reason: &str) -> OmniError {
-    OmniError::manifest_conflict(format!(
-        "{table_key}: the published pin at version {target} cannot be promoted ({reason}); this writer commits on the table's linear HEAD and is refused while the block stands; `omnigraph repair` reports the block and nothing resolves a blocked pin yet; reads, mutations and loads continue"
-    ))
-}
-
-/// The HEAD a linear writer plans on: the one it opened when that carries
-/// the pin, a fresh one after promoting a pending pin.
-pub(crate) async fn promote_pending_pin(
-    db: &Omnigraph,
-    table_key: &str,
-    full_path: &str,
-    entry: &DatasetEntry,
-    head: SnapshotHandle,
-) -> Result<SnapshotHandle> {
-    match promote_pin_at_head(db, table_key, full_path, entry, &head).await? {
-        PinAtHead::Carried => Ok(head),
-        PinAtHead::Promoted(head) => Ok(head),
-        PinAtHead::Blocked(reason) => Err(blocked_for_linear_writer(
-            table_key,
-            entry.published_dataset_version,
-            &reason,
-        )),
-    }
-}
-
-/// Promote a pending pin a first-touch fork inherits, so the fork has a
-/// linear source version: no request when this process holds the twin.
-pub(crate) async fn promote_inherited_pin(
-    db: &Omnigraph,
-    table_key: &str,
-    full_path: &str,
-    entry: &DatasetEntry,
-) -> Result<()> {
-    let (Some(staged), Some(uuid)) = (
-        entry.version_metadata.staged_version(),
-        entry.version_metadata.transaction_uuid(),
-    ) else {
-        return Ok(());
-    };
-    if held_twin(db, entry).await.is_some() {
-        return Ok(());
-    }
-    let target = entry.published_dataset_version;
-    match Box::pin(promote_pin(
-        db,
-        table_key,
-        full_path,
-        entry.native_dataset_branch.as_deref(),
-        target,
-        staged,
-        uuid,
-    ))
-    .await?
-    {
-        Promotion::Promoted(_) | Promotion::AlreadyPromoted => Ok(()),
-        Promotion::Blocked(reason) => Err(blocked_for_linear_writer(table_key, target, &reason)),
-    }
+    Ok(PinAtHead::Blocked(format!(
+        "{table_key}: promotion to version {target} refused by the no-promotion inventory feature"
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::manifest::DatasetEntry;
-    use crate::instrumentation::open_pinned_dataset;
     use crate::loader::LoadMode;
-    use crate::table_store::{StagedTransactionIdentity, TableStore};
+    use crate::table_store::StagedTransactionIdentity;
 
     const SCHEMA: &str = "node Person { name: String @key }\n";
     const PERSON: &str = "node:Person";
@@ -785,22 +503,36 @@ mod tests {
             .await
             .unwrap()
             .expect("the row exists");
+        let witness = crate::table_store::StagingWitness::new(
+            &lance::dataset::refs::BranchIdentifier::main(),
+            None,
+        )
+        .unwrap();
         db.storage()
-            .commit_staged_detached(base, staged)
+            .commit_staged_detached(base, staged, &witness)
             .await
             .unwrap()
     }
 
-    async fn uuid_at(db: &Omnigraph, location: &str, version: u64) -> Option<String> {
-        open_at(db, location, version)
-            .await
-            .unwrap()
-            .map(|handle| db.storage().transaction_identity(&handle).unwrap().uuid)
-    }
-
-    async fn rows_at(db: &Omnigraph, location: &str, version: u64) -> usize {
-        let handle = open_at(db, location, version).await.unwrap().unwrap();
-        db.storage().count_rows(&handle, None).await.unwrap()
+    /// Replay an entry's pin the way the v11 upgrade route does.
+    async fn replay_entry(db: &Omnigraph, full_path: &str, entry: &DatasetEntry) -> Promotion {
+        replay_pin(
+            db,
+            &entry.type_key,
+            full_path,
+            entry.native_dataset_branch.as_deref(),
+            entry.published_dataset_version,
+            entry
+                .version_metadata
+                .staged_version()
+                .expect("a staged pin"),
+            entry
+                .version_metadata
+                .transaction_uuid()
+                .expect("a pin uuid"),
+        )
+        .await
+        .unwrap()
     }
 
     async fn load_one(db: &crate::Session, name: &str) {
@@ -810,267 +542,14 @@ mod tests {
             .unwrap();
     }
 
-    /// GQT cannot observe a detached Lance version: it never appears in a
-    /// manifest. A detached commit is private, links to its base, resolves
-    /// through its pin, and promotion lands its twin exactly once.
-    #[tokio::test]
-    async fn detached_commit_stays_private_until_its_pin_is_promoted() {
-        let (_dir, db) = graph_with_people().await;
-        let entry = person_entry(&db).await;
-        let (full_path, location) = location_of(&db, &entry);
-        let branch = entry.native_dataset_branch.as_deref();
-        let base = entry.published_dataset_version;
-        let head = db.storage().open_snapshot_at_entry(&entry).await.unwrap();
-
-        let (detached, identity) = detached_delete(&db, head, "b").await;
-        assert!(TableStore::is_detached_version(detached.version()));
-        assert_eq!(identity.read_version, base);
-        assert!(
-            open_at(&db, &location, base + 1).await.unwrap().is_none(),
-            "a detached commit must not move the linear history"
-        );
-        let link = db.storage().transaction_identity(&detached).unwrap();
-        assert_eq!(link.uuid, identity.uuid);
-        assert_eq!(link.read_version, base);
-        assert!(!link.base_is_detached());
-        assert_eq!(db.storage().count_rows(&detached, None).await.unwrap(), 7);
-
-        // While the twin is absent the pin resolves to the staged version.
-        let pending = open_pinned_dataset(
-            &location,
-            base + 1,
-            Some(detached.version()),
-            Some(&identity.uuid),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(pending.version().version, detached.version());
-
-        let promoted = promote_pin(
-            &db,
-            PERSON,
-            &full_path,
-            branch,
-            base + 1,
-            detached.version(),
-            &identity.uuid,
-        )
-        .await
-        .unwrap();
-        assert_eq!(promoted, Promotion::Promoted(base + 1));
-        assert_eq!(
-            uuid_at(&db, &location, base + 1).await.as_deref(),
-            Some(identity.uuid.as_str())
-        );
-        assert_eq!(rows_at(&db, &location, base + 1).await, 7);
-
-        // Promotion is idempotent and the pin now resolves to the twin.
-        let again = promote_pin(
-            &db,
-            PERSON,
-            &full_path,
-            branch,
-            base + 1,
-            detached.version(),
-            &identity.uuid,
-        )
-        .await
-        .unwrap();
-        assert_eq!(again, Promotion::AlreadyPromoted);
-        let resolved = open_pinned_dataset(
-            &location,
-            base + 1,
-            Some(detached.version()),
-            Some(&identity.uuid),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(resolved.version().version, base + 1);
-
-        // Replaying over the landed twin is refused, never duplicated.
-        let stale_base = open_at(&db, &location, base).await.unwrap().unwrap();
-        let refused = db
-            .storage()
-            .promote_detached(stale_base, &detached, base + 1, &identity.uuid)
-            .await
-            .unwrap();
-        assert!(matches!(refused, PromotionOutcome::Refused), "{refused:?}");
-        assert!(open_at(&db, &location, base + 2).await.unwrap().is_none());
-    }
-
-    /// A pin staged on a detached version is the tip of a chain. Promotion
-    /// lands the chain oldest first, and a reaped predecessor does not block
-    /// a tip whose linear base already exists.
-    #[tokio::test]
-    async fn chain_promotes_oldest_first_and_tolerates_reaped_predecessors() {
-        let (_dir, db) = graph_with_people().await;
-        let entry = person_entry(&db).await;
-        let (full_path, location) = location_of(&db, &entry);
-        let branch = entry.native_dataset_branch.as_deref();
-        let base = entry.published_dataset_version;
-        let head = db.storage().open_snapshot_at_entry(&entry).await.unwrap();
-
-        let (first, first_id) = detached_delete(&db, head, "a").await;
-        let first_again = open_at(&db, &location, first.version())
-            .await
-            .unwrap()
-            .unwrap();
-        let (second, second_id) = detached_delete(&db, first_again, "b").await;
-        let link = db.storage().transaction_identity(&second).unwrap();
-        assert!(link.base_is_detached());
-        assert_eq!(link.read_version, first.version());
-
-        let outcome = promote_pin(
-            &db,
-            PERSON,
-            &full_path,
-            branch,
-            base + 2,
-            second.version(),
-            &second_id.uuid,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, Promotion::Promoted(base + 2));
-        assert_eq!(uuid_at(&db, &location, base + 1).await, Some(first_id.uuid));
-        assert_eq!(
-            uuid_at(&db, &location, base + 2).await,
-            Some(second_id.uuid)
-        );
-        assert_eq!(rows_at(&db, &location, base + 2).await, 6);
-
-        // Promote a chain's first link, reap its detached manifest, then
-        // promote the tip through the reaped predecessor.
-        let head = open_at(&db, &location, base + 2).await.unwrap().unwrap();
-        let (third, third_id) = detached_delete(&db, head, "c").await;
-        let third_again = open_at(&db, &location, third.version())
-            .await
-            .unwrap()
-            .unwrap();
-        let (fourth, fourth_id) = detached_delete(&db, third_again, "d").await;
-        let outcome = promote_pin(
-            &db,
-            PERSON,
-            &full_path,
-            branch,
-            base + 3,
-            third.version(),
-            &third_id.uuid,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, Promotion::Promoted(base + 3));
-        db.storage_adapter()
-            .delete(&detached_manifest_path(&location, third.version()))
-            .await
-            .unwrap();
-        assert!(
-            open_at(&db, &location, third.version())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let outcome = promote_pin(
-            &db,
-            PERSON,
-            &full_path,
-            branch,
-            base + 4,
-            fourth.version(),
-            &fourth_id.uuid,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, Promotion::Promoted(base + 4));
-        assert_eq!(
-            uuid_at(&db, &location, base + 4).await,
-            Some(fourth_id.uuid)
-        );
-        assert_eq!(rows_at(&db, &location, base + 4).await, 4);
-    }
-
-    /// A foreign linear commit at the target blocks promotion while the pin
-    /// keeps reading its own staged effect; a target pruned behind the
-    /// linear head is reclaimed, never silently served from the staged
-    /// version.
-    #[tokio::test]
-    async fn foreign_target_blocks_and_resolution_follows_the_linear_head() {
-        let (_dir, db) = graph_with_people().await;
-        let entry = person_entry(&db).await;
-        let (full_path, location) = location_of(&db, &entry);
-        let branch = entry.native_dataset_branch.as_deref();
-        let base = entry.published_dataset_version;
-        let head = db.storage().open_snapshot_at_entry(&entry).await.unwrap();
-        let (detached, identity) = detached_delete(&db, head, "a").await;
-
-        load_one(&db, "z").await;
-        assert_eq!(person_entry(&db).await.published_dataset_version, base + 1);
-        let foreign = uuid_at(&db, &location, base + 1).await.unwrap();
-        assert_ne!(foreign, identity.uuid);
-
-        let outcome = promote_pin(
-            &db,
-            PERSON,
-            &full_path,
-            branch,
-            base + 1,
-            detached.version(),
-            &identity.uuid,
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(&outcome, Promotion::Blocked(reason) if reason.contains("foreign")),
-            "{outcome:?}"
-        );
-        assert_eq!(uuid_at(&db, &location, base + 1).await, Some(foreign));
-        assert!(open_at(&db, &location, base + 2).await.unwrap().is_none());
-        let resolved = open_pinned_dataset(
-            &location,
-            base + 1,
-            Some(detached.version()),
-            Some(&identity.uuid),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(resolved.version().version, detached.version());
-
-        // Once the head has passed a pruned target, the pin is reclaimed.
-        load_one(&db, "y").await;
-        let linear = format!(
-            "{location}/_versions/{:020}.manifest",
-            u64::MAX - (base + 1)
-        );
-        db.storage_adapter().delete(&linear).await.unwrap();
-        let error = open_pinned_dataset(
-            &location,
-            base + 1,
-            Some(detached.version()),
-            Some(&identity.uuid),
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(error, OmniError::HistoricalVersionReclaimed { .. }),
-            "{error}"
-        );
-    }
-
-    /// A copy whose twin was pruned behind the linear head is reclaimable,
-    /// while a foreign transaction at the target never authorizes deletion.
+    /// The v11 route's replay: a pin replayed at its target proves its chain,
+    /// a twin pruned behind the linear head leaves its copies reclaimable, and
+    /// a foreign transaction at the target never authorizes deletion.
     #[tokio::test]
     async fn pruned_twin_is_reclaimable_and_a_foreign_target_is_not() {
         let (_dir, db) = graph_with_people().await;
         let entry = person_entry(&db).await;
-        let (_, location) = location_of(&db, &entry);
+        let (full_path, location) = location_of(&db, &entry);
         let base = entry.published_dataset_version;
         let head = db.storage().open_snapshot_at_entry(&entry).await.unwrap();
         let (detached, identity) = detached_delete(&db, head, "a").await;
@@ -1082,6 +561,23 @@ mod tests {
             .version_metadata
             .staged_version()
             .expect("a load publishes a staged pin");
+        let chain: Vec<u64> = walk_chain(&db, &location, staged)
+            .await
+            .unwrap()
+            .1
+            .into_iter()
+            .map(|(version, _)| version)
+            .collect();
+        assert_eq!(chain[0], staged);
+        assert_eq!(
+            promoted_chain_versions(&db, &pin).await.unwrap(),
+            Vec::<u64>::new(),
+            "a pin no replay promoted proves nothing"
+        );
+        assert_eq!(
+            replay_entry(&db, &full_path, &pin).await,
+            Promotion::Promoted(base + 1)
+        );
         let mut foreign = pin.clone();
         foreign.version_metadata = foreign
             .version_metadata
@@ -1092,10 +588,7 @@ mod tests {
             Vec::<u64>::new(),
             "a foreign transaction at the target proves nothing"
         );
-        assert_eq!(
-            promoted_chain_versions(&db, &pin).await.unwrap(),
-            vec![staged]
-        );
+        assert_eq!(promoted_chain_versions(&db, &pin).await.unwrap(), chain);
         let mut pending = pin.clone();
         pending.published_dataset_version = base + 2;
         assert_eq!(
@@ -1105,6 +598,11 @@ mod tests {
         );
 
         load_one(&db, "y").await;
+        let next = person_entry(&db).await;
+        assert_eq!(
+            replay_entry(&db, &full_path, &next).await,
+            Promotion::Promoted(base + 2)
+        );
         let linear = format!(
             "{location}/_versions/{:020}.manifest",
             u64::MAX - (base + 1)
@@ -1113,7 +611,7 @@ mod tests {
         assert!(open_at(&db, &location, base + 1).await.unwrap().is_none());
         assert_eq!(
             promoted_chain_versions(&db, &pin).await.unwrap(),
-            vec![staged],
+            chain,
             "a twin pruned behind the linear head leaves its copy reclaimable"
         );
     }

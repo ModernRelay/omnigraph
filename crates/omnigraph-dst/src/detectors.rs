@@ -185,7 +185,7 @@ oracles! {
     MaintenanceObligations, "obligation",
         &[Store(Query)],
         "harness.rs::maintenance_obligations",
-        "after every maintenance death the rerun converges (idempotence), post-Cleanup state stays readable, and indexes agree immediately";
+        "a fault-free maintenance retry must succeed without per-table errors, preserve independently saved snapshots, reclaim proved garbage, and restore index agreement";
     DetectedOrHarmless, "obligation",
         &[Store(Claim)],
         "harness.rs damage-attribution window (corruption_detections)",
@@ -198,6 +198,10 @@ oracles! {
         &[Time],
         "harness.rs final audit ensure_indices timeout (real clock)",
         "convergence completes within the real-clock bound — the deadlock detector every state oracle is blind to";
+    CollectorInvariant, "obligation",
+        &[Store(Physical)],
+        "harness.rs::assert_collector_invariants + assert_collector_images (Cleanup, retry and final audit)",
+        "independently saved heads and fork bases remain readable; every captured retained object, including inherited files and each index member, survives; successful cleanup removes unrooted published manifests and proved-dead staging";
 
     // ---- meta (expectation = the harness's own guarantees) --------------
     StrictReplay, "meta",
@@ -499,17 +503,17 @@ mod tests {
         };
         assert_eq!(
             Oracle::ALL.len(),
-            21,
-            "oracle count drifted from the documented 21"
+            22,
+            "oracle count drifted from the documented 22"
         );
         assert_eq!(count("differential"), 7);
         assert_eq!(count("prediction"), 4);
-        assert_eq!(count("obligation"), 8);
+        assert_eq!(count("obligation"), 9);
         assert_eq!(count("meta"), 2);
         // Detector count: one per (source, oracle) pairing.
         let detectors: usize = Oracle::ALL.iter().map(|o| o.sources().len()).sum();
         assert_eq!(
-            detectors, 24,
+            detectors, 25,
             "detector count drifted (three oracles ride two sources each)"
         );
     }

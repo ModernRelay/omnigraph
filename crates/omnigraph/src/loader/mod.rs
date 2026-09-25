@@ -788,7 +788,6 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.table_branch,
             opened.pinned_native_ref,
             opened.entry,
-            opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
         )?;
@@ -842,7 +841,6 @@ async fn load_jsonl_reader_once<R: BufRead>(
             opened.table_branch,
             opened.pinned_native_ref,
             opened.entry,
-            opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
         )?;
@@ -903,9 +901,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
-        promotions,
         guards: _queue_guards,
-    } = staged.commit_all(db, branch, &txn, &lineage_intent).await?;
+    } = staged.commit_all(db, branch, &txn).await?;
     // Same detached-effects → publisher boundary as mutations: every table
     // effect is committed detached, but the graph manifest has not published
     // the result. Reuse the mutation failpoint name so one failpoint pins the
@@ -921,19 +918,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             lineage_intent,
         )
         .await;
-    // RFC 0067: every effect is a detached commit of its pinned base, so a
-    // publish failure leaves the graph unchanged and the error is returned as
-    // is. Promotion then lands each pin's linear twin from the held handles;
-    // the load is durable already, so a failure there is logged and left for
-    // the next writer.
     let commit = publish_result?;
-    match fail(&catalog::MUTATION_POST_PUBLISH_PRE_PROMOTION) {
-        Ok(()) => db.promote_held_all(promotions).await,
-        Err(error) => tracing::warn!(
-            error = %error,
-            "promotion skipped after publication; the next writer promotes"
-        ),
-    }
 
     Ok(LoadReceipt { result, commit })
 }

@@ -159,12 +159,6 @@ decide_seam! {
     pub static SCHEMA_APPLY_POST_LOCK_PRE_EFFECT = ("schema_apply.post_lock_pre_effect", Unreachable, [Fail]);
 }
 
-decide_seam! {
-    /// The manifest published and the schema contract is installed; the
-    /// detached rewrites are not yet promoted onto their linear HEADs.
-    pub static SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION = ("schema_apply.post_publish_pre_promotion", Unreachable, [Fail]);
-}
-
 async fn plan_schema_for_apply_from_accepted(
     db: &Omnigraph,
     desired_schema_source: &str,
@@ -684,27 +678,10 @@ where
         ));
     }
 
-    // Prove every existing physical ref is still exactly at its manifest pin
-    // before staging any effect, promoting a pending pin on the way. Retain
-    // the verified handles and reuse them below: reopening after this check
-    // would create a needless second HEAD observation.
     let mut existing_heads = HashMap::<String, SnapshotHandle>::new();
     for entry in snapshot.datasets() {
         let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
-        let head = db
-            .storage()
-            .open_dataset_head(&dataset_uri, entry.native_dataset_branch.as_deref())
-            .await?;
-        let head = db
-            .promote_pending_pin(&entry.type_key, &dataset_uri, entry, head)
-            .await?;
-        db.ensure_existing_effect_baseline(
-            &entry.type_key,
-            entry.native_dataset_branch.as_deref(),
-            entry.published_dataset_version,
-            &head,
-        )
-        .await?;
+        let head = db.open_pinned_for_write(&dataset_uri, entry).await?;
         existing_heads.insert(entry.type_key.clone(), head);
     }
 
@@ -767,14 +744,11 @@ where
     let mut published_commit: Option<String> = None;
     let effects = async {
         fail(&SCHEMA_APPLY_POST_LOCK_PRE_EFFECT)?;
-        let mut expected_table_versions =
-            HashMap::<crate::db::manifest::TableIdentity, u64>::new();
-        let mut promotions = Vec::<crate::db::HeldPromotion>::new();
+        let mut expected_table_versions = HashMap::<crate::db::manifest::TableIdentity, u64>::new();
 
         for table_key in &added_tables {
             let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
-            let table_path =
-                crate::db::manifest::table_path_for_identity(table_key, identity)?;
+            let table_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
             let dataset_uri = db.storage().dataset_uri(&table_path);
             let schema = schema_for_table_key(&desired_catalog, table_key)?;
             let batch = RecordBatch::new_empty(schema);
@@ -796,6 +770,9 @@ where
             let state = db.storage().table_state(&dataset_uri, &ds).await?;
             expected_table_versions.insert(identity, 0);
             table_registrations.insert(table_key.clone(), (identity, table_path));
+            let version_metadata = state
+                .version_metadata
+                .with_last_linear_version(Some(state.version));
             table_updates.insert(
                 identity,
                 crate::db::DatasetUpdate {
@@ -804,7 +781,7 @@ where
                     published_dataset_version: state.version,
                     native_dataset_branch: None,
                     entity_count: state.row_count,
-                    version_metadata: state.version_metadata,
+                    version_metadata,
                 },
             );
             fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
@@ -848,13 +825,13 @@ where
                     table_key, entry.identity, identity
                 )));
             }
-            // RFC 0067: the rewrite lands as a detached version behind a pin
-            // one past the published version; promotion replays it onto the
-            // linear HEAD after the manifest publishes.
-            let base = source_ds.clone();
+            let witness = crate::table_store::StagingWitness::new(
+                &base_branch_identifier,
+                base_graph_head.as_deref(),
+            )?;
             let (detached, transaction) = db
                 .storage()
-                .commit_staged_detached(source_ds, staged)
+                .commit_staged_detached(source_ds, staged, &witness)
                 .await?;
             // The rewrite drops the table's existing index coverage; it is
             // restored off the critical path by optimize's optimize_indices /
@@ -863,19 +840,8 @@ where
             let published_dataset_version = entry.published_dataset_version + 1;
             let version_metadata = state
                 .version_metadata
-                .with_staged(state.version, transaction.uuid.clone());
-            promotions.push(crate::db::HeldPromotion {
-                table_key: table_key.clone(),
-                dataset_path: entry.dataset_path.clone(),
-                full_path: dataset_uri.clone(),
-                table_branch: None,
-                base,
-                chain: Vec::new(),
-                detached,
-                target: published_dataset_version,
-                uuid: transaction.uuid,
-                e_tag: version_metadata.e_tag().map(str::to_string),
-            });
+                .with_staged(state.version, transaction.uuid.clone())
+                .with_last_linear_version(entry.version_metadata.last_linear_version());
             expected_table_versions.insert(identity, entry.published_dataset_version);
             table_updates.insert(
                 identity,
@@ -996,7 +962,10 @@ where
             Some(publication.clone()),
         )?;
         db.storage
-            .write_text(&schema_source_staging_uri(&db.root_uri), desired_schema_source)
+            .write_text(
+                &schema_source_staging_uri(&db.root_uri),
+                desired_schema_source,
+            )
             .await?;
         db.storage
             .write_text(
@@ -1053,8 +1022,7 @@ where
             },
         )
         .await?;
-        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref())
-            .await?;
+        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref()).await?;
 
         db.store_schema_view(
             desired_catalog,
@@ -1065,12 +1033,6 @@ where
         db.runtime_cache.invalidate_all().await;
         if changed_edge_tables {
             db.invalidate_graph_index().await;
-        }
-        match fail(&SCHEMA_APPLY_POST_PUBLISH_PRE_PROMOTION) {
-            Ok(()) => db.promote_held_all(promotions).await,
-            Err(error) => {
-                tracing::warn!(error = %error, "schema apply promotion interrupted; the next writer promotes")
-            }
         }
         Ok::<u64, OmniError>(graph_manifest_version)
     }
@@ -1102,7 +1064,7 @@ where
     // remain on disk as orphans (reclaimable via `omnigraph cleanup`).
     // We do NOT fail the apply on cleanup error; the manifest change
     // is the load-bearing operation.
-    for (table_key, full_uri) in &hard_cleanup_targets {
+    for (table_key, full_uri) in &stock_reclaim_targets() {
         match cleanup_dataset_old_versions(db, full_uri).await {
             Ok(()) => {}
             Err(err) => {
@@ -1121,6 +1083,13 @@ where
         graph_manifest_version: manifest_version,
         steps: plan.steps,
     })
+}
+
+/// The hard-drop targets stock version GC may reclaim: none, since the prior
+/// version is a detached pin whose files stock GC would strip; `cleanup`
+/// reclaims it once `--keep` prunes its version.
+fn stock_reclaim_targets() -> Vec<(String, String)> {
+    Vec::new()
 }
 
 /// Run `cleanup_old_versions` on a dataset URI with `before_timestamp = now`.
@@ -1229,15 +1198,7 @@ pub(super) async fn release_schema_apply_lock(db: &Omnigraph) -> Result<()> {
 }
 
 pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &str) -> Result<()> {
-    if db
-        .coordinator
-        .read()
-        .await
-        .all_branches()
-        .await?
-        .iter()
-        .any(|branch| is_schema_apply_lock_branch(branch))
-    {
+    if db.coordinator.read().await.schema_apply_locked().await? {
         return Err(OmniError::manifest_conflict(format!(
             "{} is unavailable while schema apply is in progress",
             operation

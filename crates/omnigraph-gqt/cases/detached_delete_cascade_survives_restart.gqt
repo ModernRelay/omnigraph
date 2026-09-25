@@ -1,5 +1,5 @@
 # issue: none
-# notes: Beyond mutation_pending_pin_survives_reopen: the pending pins are a node DELETE and its edge cascade, so the staged versions of two tables must both serve the removal across restart. Reinserting the key must not resurrect incident edges.
+# notes: A node DELETE and its edge cascade on a branch publish detached pins on two tables; both staged versions serve the removal across restart. Reinserting the key must not resurrect incident edges.
 
 --- runner
 timeout_ms: 10000
@@ -30,12 +30,6 @@ edge Knows: Person -> Person {
 branch create work
 
 --- expect ok
-
---- seam
-at: mutation.post_publish_pre_promotion
-occurrence: 1
-action: fail
-scope: next_step
 
 --- mutate branch: work
 query delete_bob() { delete Person where name = "bob" }

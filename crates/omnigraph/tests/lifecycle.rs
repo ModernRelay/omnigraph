@@ -102,8 +102,8 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        10,
-        "fresh graphs are stamped at the current manifest format (v10, RFC 0067 detached table commits over RFC 0040 system columns and RFC 0042 retirement metadata)"
+        11,
+        "fresh graphs are stamped at the current manifest format (v11, detached-only tables over RFC 0067 detached table commits, RFC 0040 system columns and RFC 0042 retirement metadata)"
     );
     assert!(snap.dataset("node:Person").is_some());
     assert!(snap.dataset("node:Company").is_some());

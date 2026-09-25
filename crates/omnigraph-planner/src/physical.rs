@@ -88,8 +88,8 @@ pub enum PrefilterMode {
 }
 
 /// The identity of one dataset the planner read: its path, the Lance branch
-/// it lives on, and its published version. A replay is refused unless the
-/// snapshot holds exactly this.
+/// it lives on, and its staged manifest version when present, otherwise its
+/// published version. A replay is refused unless the snapshot holds this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetPin {
     pub dataset_path: String,

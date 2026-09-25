@@ -94,7 +94,10 @@ pub(crate) fn dataset_pin(entry: &DatasetEntry) -> DatasetPin {
     DatasetPin {
         dataset_path: entry.dataset_path.clone(),
         native_branch: entry.native_dataset_branch.clone(),
-        version: entry.published_dataset_version,
+        version: entry
+            .version_metadata
+            .staged_version()
+            .unwrap_or(entry.published_dataset_version),
     }
 }
 

@@ -1086,7 +1086,7 @@ fn publish_outcome_in_doubt(
     graph_commit_id: &str,
     cause: impl std::fmt::Display,
 ) -> OmniError {
-    OmniError::manifest_internal(format!(
+    OmniError::manifest_publish_in_doubt(format!(
         "manifest publish outcome is in doubt: graph commit {graph_commit_id} may be durable but \
          it could not be confirmed ({cause}); reopen the graph and look that commit up before \
          retrying a non-idempotent write. original error: {original}"

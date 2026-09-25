@@ -1002,60 +1002,46 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
 }
 
 #[test]
-fn repair_confirm_json_refuses_suspicious_drift_with_nonzero_exit_then_force_succeeds() {
+fn repair_confirm_json_reports_foreign_drift_and_publishes_nothing_even_when_forced() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
     load_fixture(&graph);
     let graph_manifest_before = manifest_dataset_version(&graph);
-    let (table_manifest_before, table_head_before) = forge_person_delete_drift(&graph);
+    let (table_manifest_before, table_head_before) = forge_person_foreign_commit(&graph);
 
-    let refused = output_failure(
-        cli()
-            .arg("repair")
-            .arg("--confirm")
-            .arg("--json")
-            .arg(&graph),
-    );
-    let refused_payload: Value = serde_json::from_slice(&refused.stdout).unwrap();
-    assert_eq!(refused_payload["graph_manifest_version"], Value::Null);
-    let person = refused_payload["datasets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|dataset| dataset["type_key"] == "node:Person")
-        .unwrap();
-    assert_eq!(person["classification"], "suspicious");
-    assert_eq!(person["action"], "refused");
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("repair refused"),
-        "stderr should explain the non-zero exit; got: {}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
-
-    let forced = output_success(
-        cli()
-            .arg("repair")
-            .arg("--force")
-            .arg("--confirm")
-            .arg("--json")
-            .arg(&graph),
-    );
-    let forced_payload: Value = serde_json::from_slice(&forced.stdout).unwrap();
-    let forced_manifest = forced_payload["graph_manifest_version"].as_u64().unwrap();
-    assert!(forced_manifest > graph_manifest_before);
-    let person = forced_payload["datasets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|dataset| dataset["type_key"] == "node:Person")
-        .unwrap();
-    assert_eq!(person["classification"], "suspicious");
-    assert_eq!(person["action"], "forced");
-    assert_eq!(person["published_dataset_version"], table_manifest_before);
-    assert_eq!(person["lance_head_version"], table_head_before);
-    assert_eq!(manifest_dataset_version(&graph), forced_manifest);
+    for force in [false, true] {
+        let mut command = cli();
+        command.arg("repair").arg("--confirm");
+        if force {
+            command.arg("--force");
+        }
+        let output = output_success(command.arg("--json").arg(&graph));
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            payload["graph_manifest_version"],
+            Value::Null,
+            "force {force}"
+        );
+        let person = payload["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dataset| dataset["type_key"] == "node:Person")
+            .unwrap();
+        assert_eq!(person["classification"], "foreign_drift", "force {force}");
+        assert_eq!(person["action"], "no_op", "force {force}");
+        assert_eq!(person["published_dataset_version"], table_manifest_before);
+        assert_eq!(person["lance_head_version"], table_head_before);
+        assert!(
+            person["operations"][0]
+                .as_str()
+                .is_some_and(|operation| operation.contains("foreign linear version")),
+            "force {force}: {}",
+            person["operations"]
+        );
+        assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+    }
 }
 
 #[test]

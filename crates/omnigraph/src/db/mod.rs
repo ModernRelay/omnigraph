@@ -14,14 +14,16 @@ pub use manifest::{
 };
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
-    CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
+    CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
+    CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
     Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction, RepairClassification,
-    RepairOptions, RepairStats, SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyOptions, SchemaApplyResult,
-    SkipReason, SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
-    SystemColumnUpgradeReport,
+    RepairOptions, RepairStats, RetainedManifestVersions, SYSTEM_COLUMNS_PREFLIGHT,
+    SchemaApplyOptions, SchemaApplyResult, SkipReason, StagingVerdict, SystemColumnUpgradeFinding,
+    SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
+    TableCollectionPlan, UnpublishedManifest,
 };
-pub(crate) use omnigraph::{DeferredTableFork, HeldPromotion, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 pub(crate) use schema_state::SchemaContractText;
 

@@ -22,7 +22,7 @@
 //! dictionary, then per edge type its csr-offsets / csr-targets / csc-offsets
 //! / csc-targets.
 //!
-//! **Sections are self-describing (format v2):** every section opens with a
+//! **Sections are self-describing (since format v2):** every section opens with a
 //! prelude INSIDE the digested payload — a kind byte and the section's name,
 //! and for adjacencies the edge's full identity stamp. The header is thereby
 //! an advisory index only: everything that gives bytes meaning (which edge,
@@ -37,7 +37,7 @@
 //! loader verifies freshness PER REQUESTED EDGE against embedded identity
 //! stamps: each stamp carries the same physical-identity fields as
 //! `runtime_cache::GraphIndexCacheKey` (`TableIdentity`, published dataset
-//! version, native branch, Lance manifest e_tag, catalog endpoints), and
+//! version, staged version, native branch, Lance manifest e_tag, catalog endpoints), and
 //! every requested edge must match its stamp exactly. A superset artifact
 //! serves any scoped subset — extra edges and extra dictionary nodes are
 //! semantically inert, since executors look adjacency up by edge name and
@@ -69,10 +69,9 @@ use super::{CsrIndex, GraphIndex, TypeIndex};
 
 const MAGIC: &[u8; 8] = b"OGCSRIDX";
 
-/// Bump when the layout changes; a version mismatch is a miss (the loader
-/// rejects and rebuilds in memory, and the next optimize rewrites current).
-/// v2: self-describing section preludes inside the digested payload.
-const FORMAT_VERSION: u32 = 2;
+/// Layout version: v3 stamps include the staged pin and digested section
+/// preludes. A mismatch rebuilds in memory; optimize rewrites the artifact.
+const FORMAT_VERSION: u32 = 3;
 
 /// Section prelude kind bytes (see the module contract).
 const SECTION_DICT: u8 = 1;
@@ -125,6 +124,9 @@ pub(crate) struct TableStamp {
     /// `TableIdentity` rendered via its stable `Display` (`stable:incarnation`).
     identity: String,
     table_version: u64,
+    /// The detached pin the version resolves to; `table_version` is a
+    /// per-lineage counter two branches can share.
+    staged_version: Option<u64>,
     table_branch: Option<String>,
     e_tag: Option<String>,
     from_type: String,
@@ -152,6 +154,7 @@ fn snapshot_stamp(
         edge_name: edge_name.to_string(),
         identity: entry.identity.to_string(),
         table_version: entry.published_dataset_version,
+        staged_version: entry.version_metadata.staged_version(),
         table_branch: entry.native_dataset_branch.clone(),
         e_tag: entry.version_metadata.e_tag().map(str::to_string),
         from_type: from_type.to_string(),
@@ -719,6 +722,7 @@ mod tests {
             edge_name: "Knows".to_string(),
             identity: "0000000000000001:0000000000000002".to_string(),
             table_version: 7,
+            staged_version: Some(1 << 63 | 7),
             table_branch: None,
             e_tag: Some("etag-1".to_string()),
             from_type: "Person".to_string(),

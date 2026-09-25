@@ -832,9 +832,6 @@ async fn four_version_chain_insert_update_delete() {
 /// caller would have to parse.
 #[tokio::test]
 async fn historical_read_of_reclaimed_version_is_typed() {
-    use lance::Dataset;
-    use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
-    use omnigraph::db::ReadTarget;
     use omnigraph::error::OmniError;
 
     let dir = tempfile::tempdir().unwrap();
@@ -855,28 +852,14 @@ async fn historical_read_of_reclaimed_version_is_typed() {
     .await
     .unwrap();
 
-    // …then reclaim every pre-current Person version directly.
-    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let person_path = &snapshot.dataset("node:Person").unwrap().dataset_path;
-    let person_uri = format!(
-        "{}/{}",
-        db.uri().trim_end_matches('/'),
-        person_path.trim_start_matches('/')
-    );
-    let person = Dataset::open(&person_uri).await.unwrap();
-    let removed = cleanup_old_versions(
-        &person,
-        CleanupPolicy {
-            before_version: Some(person.version().version),
-            delete_unverified: true,
-            error_if_tagged_old_versions: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let stats = db.cleanup(helpers::collector::keep_one()).await.unwrap();
+    let person = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .expect("Person cleanup row");
+    assert!(person.error.is_none(), "{person:?}");
     assert!(
-        removed.old_versions > 0,
+        person.old_versions_removed > 0,
         "precondition: history was reclaimed"
     );
 

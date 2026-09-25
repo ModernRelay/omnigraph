@@ -33,7 +33,6 @@ use omnigraph_compiler::types::ScalarType;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
 use crate::db::{MergeOutcome, Omnigraph, WriteTxn, is_internal_system_branch};
 use crate::db::{ReadTarget, Snapshot};

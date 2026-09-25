@@ -18,6 +18,9 @@ const OMNIGRAPH_TABLE_FORK_OWNER_KEY: &str = "omnigraph.table_fork_owner";
 /// RFC 0067 prototype pin fields, carried like the fork owner.
 const OMNIGRAPH_STAGED_VERSION_KEY: &str = "omnigraph.staged_version";
 const OMNIGRAPH_TRANSACTION_UUID_KEY: &str = "omnigraph.transaction_uuid";
+/// RFC "Detached-only tables": the table's last linear version, carried
+/// forward by every writer once the v11 upgrade records it.
+const OMNIGRAPH_LAST_LINEAR_VERSION_KEY: &str = "omnigraph.last_linear_version";
 
 pub(super) fn namespace_version_metadata(
     row_count: u64,
@@ -63,6 +66,9 @@ pub(super) fn parse_namespace_version_request(
             .get(OMNIGRAPH_STAGED_VERSION_KEY)
             .and_then(|value| value.parse::<u64>().ok()),
         transaction_uuid: metadata.get(OMNIGRAPH_TRANSACTION_UUID_KEY).cloned(),
+        last_linear_version: metadata
+            .get(OMNIGRAPH_LAST_LINEAR_VERSION_KEY)
+            .and_then(|value| value.parse::<u64>().ok()),
     };
 
     Ok((
@@ -86,10 +92,15 @@ pub(crate) struct TableVersionMetadata {
     /// as before publication. `None` on a linear pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     staged_version: Option<u64>,
-    /// RFC 0067: the uuid of the staged transaction; promotion
-    /// replays it at the linear target and readers verify it.
+    /// RFC 0067: the uuid of the staged transaction, which readers check
+    /// at a v10 pin's linear twin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transaction_uuid: Option<String>,
+    /// RFC "Detached-only tables": the table's last linear version, recorded
+    /// by the v11 upgrade or `1` at creation and copied forward by every
+    /// writer; `None` only on a row older than the upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_linear_version: Option<u64>,
 }
 
 impl TableVersionMetadata {
@@ -110,6 +121,7 @@ impl TableVersionMetadata {
             table_fork_owner: None,
             staged_version: None,
             transaction_uuid: None,
+            last_linear_version: None,
         })
     }
 
@@ -117,12 +129,22 @@ impl TableVersionMetadata {
         self.staged_version
     }
 
+    pub(crate) fn last_linear_version(&self) -> Option<u64> {
+        self.last_linear_version
+    }
+
+    /// Carry the base row's last linear version onto a rebuilt row.
+    pub(crate) fn with_last_linear_version(mut self, version: Option<u64>) -> Self {
+        self.last_linear_version = version;
+        self
+    }
+
     pub(crate) fn transaction_uuid(&self) -> Option<&str> {
         self.transaction_uuid.as_deref()
     }
 
-    /// RFC 0067: mark this pin as staged at a detached version whose linear
-    /// twin promotion replays under `uuid`.
+    /// RFC 0067: mark this pin as staged at a detached version committed
+    /// under `uuid`.
     pub(crate) fn with_staged(mut self, staged_version: u64, transaction_uuid: String) -> Self {
         self.staged_version = Some(staged_version);
         self.transaction_uuid = Some(transaction_uuid);
@@ -131,7 +153,7 @@ impl TableVersionMetadata {
 
     /// RFC 0067: whether `dataset` is the manifest this pin
     /// witnesses. The e_tag identifies the exact manifest object; a pin that
-    /// carries a transaction uuid also accepts the promoted twin, whose
+    /// carries a transaction uuid also accepts a v10 pin's linear twin, whose
     /// manifest differs but whose transaction is the same.
     pub(crate) fn witnesses(&self, dataset: &Dataset) -> bool {
         match self.e_tag.as_deref() {
@@ -148,6 +170,28 @@ impl TableVersionMetadata {
         }
     }
 
+    /// Compare read evidence; the linear boundary affects only staged pins.
+    pub(crate) fn same_read_witness(&self, other: &Self) -> bool {
+        let Self {
+            manifest_path,
+            manifest_size,
+            e_tag,
+            naming_scheme,
+            table_fork_owner,
+            staged_version,
+            transaction_uuid,
+            last_linear_version,
+        } = self;
+        manifest_path == &other.manifest_path
+            && manifest_size == &other.manifest_size
+            && e_tag == &other.e_tag
+            && naming_scheme == &other.naming_scheme
+            && table_fork_owner == &other.table_fork_owner
+            && staged_version == &other.staged_version
+            && transaction_uuid == &other.transaction_uuid
+            && (staged_version.is_none() || last_linear_version == &other.last_linear_version)
+    }
+
     pub(crate) fn table_fork_owner(&self) -> Option<&str> {
         self.table_fork_owner.as_deref()
     }
@@ -157,6 +201,7 @@ impl TableVersionMetadata {
         self
     }
 
+    #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fn is_table_fork_of(&self, fork: &str, owner: &str) -> bool {
         self.table_fork_owner
             .as_deref()
@@ -216,6 +261,12 @@ impl TableVersionMetadata {
         }
         if let Some(uuid) = &self.transaction_uuid {
             metadata.insert(OMNIGRAPH_TRANSACTION_UUID_KEY.to_string(), uuid.clone());
+        }
+        if let Some(last) = self.last_linear_version {
+            metadata.insert(
+                OMNIGRAPH_LAST_LINEAR_VERSION_KEY.to_string(),
+                last.to_string(),
+            );
         }
         request.metadata = Some(metadata);
         request
@@ -379,6 +430,58 @@ mod tests {
     const OWNER: &str = "source.01ARZ3NDEKTSV4RRFFQ69G5FAV";
     const TARGET: &str = "target.01ARZ3NDEKTSV4RRFFQ69G5FAW";
     const FORK: &str = "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAX";
+
+    /// GQT cannot vary persisted registration metadata independently of table bytes.
+    #[test]
+    fn unstaged_blob_read_witness_ignores_only_linear_boundary() {
+        let legacy = TableVersionMetadata::from_json_str(LEGACY_JSON).unwrap();
+        let upgraded = legacy.clone().with_last_linear_version(Some(7));
+        assert_ne!(legacy, upgraded);
+        assert!(legacy.same_read_witness(&upgraded));
+        assert!(upgraded.same_read_witness(&legacy));
+        for changed in [
+            TableVersionMetadata {
+                manifest_path: "other/7.manifest".to_string(),
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                manifest_size: None,
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                e_tag: None,
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                naming_scheme: None,
+                ..upgraded.clone()
+            },
+            upgraded.clone().with_table_fork_owner(Some(OWNER)),
+            TableVersionMetadata {
+                staged_version: Some(9_223_372_036_854_775_815),
+                ..upgraded.clone()
+            },
+            TableVersionMetadata {
+                transaction_uuid: Some("different-transaction".to_string()),
+                ..upgraded.clone()
+            },
+        ] {
+            assert!(!legacy.same_read_witness(&changed), "{changed:?}");
+            assert!(!changed.same_read_witness(&legacy), "{changed:?}");
+        }
+    }
+
+    /// Staged resolution can choose a detached pin or its linear twin.
+    #[test]
+    fn staged_blob_read_witness_keeps_linear_boundary() {
+        let staged = TableVersionMetadata::from_json_str(LEGACY_JSON)
+            .unwrap()
+            .with_staged(9_223_372_036_854_775_815, "staged-transaction".to_string());
+        assert!(staged.same_read_witness(&staged));
+        let changed = staged.clone().with_last_linear_version(Some(7));
+        assert!(!staged.same_read_witness(&changed));
+        assert!(!changed.same_read_witness(&staged));
+    }
 
     /// GQT cannot inject absent owner metadata or inspect its serialized omission.
     #[test]

@@ -327,13 +327,10 @@ impl StagedHandle {
         self.inner.transaction_identity()
     }
 
-    /// Replace Lance's random transaction UUID with the identity minted
-    /// before a deferred first-touch fork. The read version must still match.
-    pub(crate) fn bind_transaction_identity(
-        &mut self,
-        planned: &StagedTransactionIdentity,
-    ) -> Result<()> {
-        self.inner.bind_transaction_identity(planned)
+    /// Record the ids a staged delete removes on its transaction; see
+    /// `StagedWrite::record_deleted_ids`.
+    pub(crate) async fn record_deleted_ids(&mut self, ds: &Dataset, ids: &[String]) -> Result<()> {
+        self.inner.record_deleted_ids(ds, ids).await
     }
 }
 
@@ -411,15 +408,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<lance::dataset::refs::BranchIdentifier>;
-
-    async fn fork_branch_from_state(
-        &self,
-        dataset_uri: &str,
-        source_branch: Option<&str>,
-        table_key: &str,
-        source_version: u64,
-        target_branch: &str,
-    ) -> Result<SnapshotHandle>;
 
     /// Idempotent branch-tree reclaim used by the best-effort fork cleanup
     /// under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
@@ -692,19 +680,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch_bytes: u64,
     ) -> Result<SendableRecordBatchStream>;
 
-    /// Stream a provenance-proven pure-insert source interval as bounded
-    /// full-row batches for the existing per-chunk strict keyed writer.
-    /// `source` must be pinned at `end_version`; only rows whose
-    /// `_row_created_at_version` lies in `(begin_version, end_version]` are
-    /// emitted. Blob materialization consumes the caller's operation-wide
-    /// external-source proof, so it never repeats policy checks or HEADs per
-    /// row. This read-only primitive writes no files and advances no HEAD.
+    /// Stream only the proven rows of a pure-insert source interval (`source`
+    /// pinned at its end) as bounded full-row batches for the strict keyed
+    /// writer; read-only, it writes no files and advances no HEAD.
     async fn scan_proven_insert_delta_bounded(
         &self,
         source: &SnapshotHandle,
         table_key: &str,
-        begin_version: u64,
-        end_version: u64,
+        interval: &crate::table_store::ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream>;
@@ -734,11 +717,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
 
-    /// RFC 0067: commit one staged effect as a detached version.
+    /// RFC 0067: commit one staged effect as a detached version, stamped
+    /// with the authority it was staged against.
     async fn commit_staged_detached(
         &self,
         snapshot: SnapshotHandle,
         staged: StagedHandle,
+        witness: &crate::table_store::StagingWitness,
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
@@ -876,26 +861,6 @@ impl TableStorage for TableStore {
         crate::branch_control::dataset_branch_identifier(snapshot.dataset())
             .await
             .map_err(OmniError::storage)
-    }
-
-    async fn fork_branch_from_state(
-        &self,
-        dataset_uri: &str,
-        source_branch: Option<&str>,
-        table_key: &str,
-        source_version: u64,
-        target_branch: &str,
-    ) -> Result<SnapshotHandle> {
-        let dataset = TableStore::fork_branch_from_state(
-            self,
-            dataset_uri,
-            source_branch,
-            table_key,
-            source_version,
-            target_branch,
-        )
-        .await?;
-        Ok(SnapshotHandle::new(dataset))
     }
 
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
@@ -1257,8 +1222,7 @@ impl TableStorage for TableStore {
         &self,
         source: &SnapshotHandle,
         table_key: &str,
-        begin_version: u64,
-        end_version: u64,
+        interval: &crate::table_store::ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
     ) -> Result<SendableRecordBatchStream> {
@@ -1266,8 +1230,7 @@ impl TableStorage for TableStore {
             self,
             source.dataset(),
             table_key,
-            begin_version,
-            end_version,
+            interval,
             external_preflight,
             system_columns,
         )
@@ -1304,13 +1267,14 @@ impl TableStorage for TableStore {
         &self,
         snapshot: SnapshotHandle,
         staged: StagedHandle,
+        witness: &crate::table_store::StagingWitness,
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
     )> {
         let ds_arc = snapshot.into_arc();
         let (dataset, identity) =
-            TableStore::commit_staged_detached(self, ds_arc, staged.into_staged()).await?;
+            TableStore::commit_staged_detached(self, ds_arc, staged.into_staged(), witness).await?;
         Ok((SnapshotHandle::new(dataset), identity))
     }
 

@@ -40,6 +40,9 @@ pub enum RepairClassification {
     /// occupies its target version (RFC 0067). Reads resolve the pin and
     /// mutations chain behind it; repair never adopts the foreign commit.
     BlockedPromotion,
+    /// Linear commits above the table's last linear version, which no read or
+    /// write resolves (RFC "Detached-only tables"); reported, never published.
+    ForeignDrift,
 }
 
 impl RepairClassification {
@@ -51,6 +54,7 @@ impl RepairClassification {
             Self::Suspicious => "suspicious",
             Self::Unverifiable => "unverifiable",
             Self::BlockedPromotion => "blocked_promotion",
+            Self::ForeignDrift => "foreign_drift",
         }
     }
 }
@@ -212,6 +216,10 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         // staged-write trait does not surface. The raw borrow is an enumerated,
         // read-only escape; repair never takes ownership or moves Lance HEAD.
         let handle = db.storage().open_dataset_head(&full_path, None).await?;
+        if let Some(row) = judge_against_last_linear_version(&table_key, &entry, &handle)? {
+            tables.push(row);
+            continue;
+        }
         // A pending pin is promoted before drift is judged; a blocked one is
         // reported, never adopted.
         let handle = match super::promotion::promote_pin_at_head(
@@ -220,7 +228,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         .await?
         {
             super::promotion::PinAtHead::Carried => handle,
-            super::promotion::PinAtHead::Promoted(handle) => handle,
             super::promotion::PinAtHead::Blocked(reason) => {
                 tables.push(DatasetRepairStats {
                     type_key: table_key,
@@ -277,6 +284,7 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
             (true, _, RepairClassification::NoDrift) => RepairAction::NoOp,
             // Reported above, before drift is classified; never adopted.
             (true, _, RepairClassification::BlockedPromotion) => RepairAction::Refused,
+            (true, _, RepairClassification::ForeignDrift) => RepairAction::NoOp,
         };
 
         if matches!(action, RepairAction::Healed | RepairAction::Forced) {
@@ -287,7 +295,9 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
                 published_dataset_version: state.version,
                 native_dataset_branch: None,
                 entity_count: state.row_count,
-                version_metadata: state.version_metadata,
+                version_metadata: state
+                    .version_metadata
+                    .with_last_linear_version(entry.version_metadata.last_linear_version()),
             });
             expected.insert(
                 identity,
@@ -308,61 +318,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
             operations: classification.operations,
             error: classification.error,
         });
-    }
-
-    let mut judged = snapshot
-        .datasets()
-        .map(pin_key)
-        .collect::<std::collections::HashSet<_>>();
-    for branch in optimize::cleanup_graph_branches(db)
-        .await?
-        .into_iter()
-        .flatten()
-    {
-        if crate::db::is_internal_system_branch(&branch) {
-            continue;
-        }
-        let branch_snapshot = match db.fresh_snapshot_for_branch(Some(&branch)).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(branch, %error, "repair could not read a branch's pins; its blocked pins are not reported");
-                continue;
-            }
-        };
-        for entry in branch_snapshot.datasets() {
-            if !judged.insert(pin_key(entry)) {
-                continue;
-            }
-            let reason = match super::promotion::blocked_pin_reason(db, entry).await {
-                Ok(Some(reason)) => reason,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(branch, table = %entry.type_key, %error, "repair could not judge a branch pin; it is not reported");
-                    continue;
-                }
-            };
-            let full_path = format!("{}/{}", db.root_uri, entry.dataset_path);
-            let head = match db
-                .storage()
-                .open_dataset_head(&full_path, entry.native_dataset_branch.as_deref())
-                .await
-            {
-                Ok(head) => head,
-                Err(error) => {
-                    tracing::warn!(branch, table = %entry.type_key, %error, "repair could not open a branch table head; its blocked pin is not reported");
-                    continue;
-                }
-            };
-            tables.push(DatasetRepairStats {
-                type_key: entry.type_key.clone(),
-                published_dataset_version: entry.published_dataset_version,
-                lance_head_version: head.version(),
-                classification: RepairClassification::BlockedPromotion,
-                action: RepairAction::Refused,
-                operations: Vec::new(),
-                error: Some(format!("branch '{branch}': {reason}")),
-            });
-        }
     }
 
     let manifest_version = if updates.is_empty() {
@@ -398,15 +353,43 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
     })
 }
 
-/// One pin as several branches can share it: table, lineage and target.
-fn pin_key(
+/// The detached-only rule: the recorded last linear version is the baseline
+/// (`no_drift` at it, `foreign_drift` above, an error below); a staged pin
+/// without one is `no_drift`, a linear pin without one takes the v10 rule.
+fn judge_against_last_linear_version(
+    table_key: &str,
     entry: &crate::db::manifest::DatasetEntry,
-) -> (crate::db::manifest::TableIdentity, Option<String>, u64) {
-    (
-        entry.identity,
-        entry.native_dataset_branch.clone(),
-        entry.published_dataset_version,
-    )
+    handle: &crate::storage_layer::SnapshotHandle,
+) -> Result<Option<DatasetRepairStats>> {
+    let head = handle.version();
+    let row = |classification, operations| DatasetRepairStats {
+        type_key: table_key.to_string(),
+        published_dataset_version: entry.published_dataset_version,
+        lance_head_version: head,
+        classification,
+        action: RepairAction::NoOp,
+        operations,
+        error: None,
+    };
+    match (
+        entry.version_metadata.last_linear_version(),
+        entry.version_metadata.staged_version(),
+    ) {
+        (Some(last), _) if head == last => Ok(Some(row(RepairClassification::NoDrift, Vec::new()))),
+        (Some(last), _) if head > last => Ok(Some(row(
+            RepairClassification::ForeignDrift,
+            vec![format!(
+                "last linear version {last}, Lance HEAD {head}: {} foreign linear version(s) above it, not resolved by any read or write",
+                head - last
+            )],
+        ))),
+        (Some(last), _) => Err(OmniError::manifest_internal(format!(
+            "{} is at Lance HEAD version {head}, behind its last linear version {last}",
+            dataset_subject(table_key)
+        ))),
+        (None, Some(_)) => Ok(Some(row(RepairClassification::NoDrift, Vec::new()))),
+        (None, None) => Ok(None),
+    }
 }
 
 async fn classify_drift(
