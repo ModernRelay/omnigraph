@@ -14,6 +14,7 @@ deployment.
 
 - [Schema language](schema/index.md)
 - [Query language](queries/index.md), [session settings](queries/settings.md), and [explain](queries/explain.md)
+- [Diagnostics](queries/diagnostics.md)
 - [Mutations and loading](mutations/index.md)
 - [Search](search/index.md) and [embeddings](search/embeddings.md)
 - [Blob values](blobs.md)

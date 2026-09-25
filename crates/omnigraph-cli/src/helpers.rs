@@ -482,27 +482,10 @@ pub(crate) fn precondition_failed_cli(
     expected: String,
     actual: Option<String>,
 ) -> PreconditionFailedCli {
-    PreconditionFailedCli {
-        output: ErrorOutput {
-            error: message,
-            code: None,
-            merge_conflicts: Vec::new(),
-            published_dataset_version_conflict: None,
-            read_set_conflict: None,
-            key_conflict: None,
-            resource_limit: None,
-            blob_range: None,
-            external_blob_source: None,
-            recovery_required: None,
-            precondition_failure: Some(omnigraph_api_types::PreconditionFailureOutput {
-                expected,
-                actual,
-            }),
-            change_feed_gap: None,
-            change_diff_refusal: None,
-            full_text_index_rebuild_required: None,
-        },
-    }
+    let mut output = ErrorOutput::message(message);
+    output.precondition_failure =
+        Some(omnigraph_api_types::PreconditionFailureOutput { expected, actual });
+    PreconditionFailedCli { output }
 }
 
 pub(crate) async fn remote_json<T: DeserializeOwned>(
@@ -1091,12 +1074,17 @@ pub(crate) async fn execute_queries_validate(
             breakages.push(QueriesIssue {
                 query: b.query.clone(),
                 message: b.message.clone(),
+                diagnostic: b
+                    .diagnostic
+                    .as_ref()
+                    .map(omnigraph_api_types::DiagnosticOutput::from),
             });
         }
         for w in &report.warnings {
             warnings.push(QueriesIssue {
                 query: w.query.clone(),
                 message: w.message.clone(),
+                diagnostic: None,
             });
         }
     }
@@ -1124,7 +1112,13 @@ pub(crate) async fn execute_queries_validate(
             );
         }
         for issue in &output.breakages {
-            println!("ERROR  query '{}': {}", issue.query, issue.message);
+            match issue.diagnostic.as_ref().and_then(|d| d.fix.as_deref()) {
+                Some(fix) => println!(
+                    "ERROR  query '{}': {}; fix: {fix}",
+                    issue.query, issue.message
+                ),
+                None => println!("ERROR  query '{}': {}", issue.query, issue.message),
+            }
         }
         for issue in &output.warnings {
             println!("WARN   query '{}': {}", issue.query, issue.message);

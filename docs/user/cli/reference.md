@@ -93,7 +93,7 @@ Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
 `table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
-envelope pretty and the `rows` array compact, verbatim.
+envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](../queries/diagnostics.md).
 
 ### Machine-readable read and write positions
 

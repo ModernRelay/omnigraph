@@ -464,8 +464,15 @@ impl Omnigraph {
         if let Some(compiled) = cache.get(catalog, &key) {
             return Ok(compiled);
         }
-        let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
-            .map_err(|e| OmniError::manifest(e.to_string()))?;
+        let statement = omnigraph_compiler::find_read_statement(query_source, query_name).map_err(
+            |e| match e {
+                // A compile diagnostic keeps its code, position and fix.
+                omnigraph_compiler::RunInputError::Core(
+                    query @ omnigraph_compiler::error::CompilerError::Query(_),
+                ) => OmniError::Compiler(query),
+                other => OmniError::manifest(other.to_string()),
+            },
+        )?;
         let type_ctx = typecheck_query(catalog, statement.decl())?;
         let ir = Arc::new(lower_query(catalog, statement.decl(), &type_ctx)?);
         let compiled = if statement.is_explain() {

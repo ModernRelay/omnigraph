@@ -140,8 +140,13 @@ fn installed_file_is_current(installed: &fs::File, path: &std::path::Path) -> Re
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    color_eyre::install()?;
-    let (cli, json) = {
+    // No environment or location footer: a refusal is documentation for the
+    // reader, and a backtrace hint is never its fix.
+    color_eyre::config::HookBuilder::default()
+        .display_env_section(false)
+        .display_location_section(false)
+        .install()?;
+    let (cli, machine) = {
         let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
@@ -156,23 +161,38 @@ async fn main() -> Result<()> {
         while let Some((_, child)) = command_matches.subcommand() {
             command_matches = child;
         }
+        let format = command_matches
+            .try_get_one::<ReadOutputFormat>("format")
+            .ok()
+            .flatten()
+            .copied();
         let json = command_matches
             .try_get_one::<bool>("json")
             .ok()
             .flatten()
             .copied()
             .unwrap_or(false)
-            || command_matches
-                .try_get_one::<ReadOutputFormat>("format")
-                .ok()
-                .flatten()
-                == Some(&ReadOutputFormat::Json);
-        (Cli::from_arg_matches(&matches)?, json)
+            || format == Some(ReadOutputFormat::Json);
+        let machine = if json {
+            Some(MachineErrors::Json)
+        } else if format == Some(ReadOutputFormat::Jsonl) {
+            Some(MachineErrors::Jsonl)
+        } else {
+            None
+        };
+        (Cli::from_arg_matches(&matches)?, machine)
     };
     match run(cli).await {
-        Err(error) if json => {
-            if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
-                print_json(&remote.output)?;
+        Err(error) => {
+            if let Some(output) = error_output_of(&error) {
+                match machine {
+                    Some(MachineErrors::Json) => print_json(&output)?,
+                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(&output)?),
+                    None => match &output.diagnostic {
+                        Some(diagnostic) => eprintln!("{}", render_diagnostic(&output, diagnostic)),
+                        None => return Err(error),
+                    },
+                }
                 std::io::stdout().flush()?;
                 std::process::exit(1);
             }
@@ -180,6 +200,56 @@ async fn main() -> Result<()> {
         }
         result => result,
     }
+}
+
+/// The machine error format a run's output format asks for: `--json` (and
+/// `--format json`) print the error body pretty, `--format jsonl` prints it
+/// as one line, like the rows it would have carried.
+#[derive(Clone, Copy)]
+enum MachineErrors {
+    Json,
+    Jsonl,
+}
+
+/// The error body a failed run would carry on the wire: a served refusal's
+/// own body, or an embedded compile refusal rendered the way the server
+/// renders it, so `--json` output is transport-uniform.
+fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput> {
+    if let Some(remote) = error.downcast_ref::<RemoteErrorCli>() {
+        return Some(remote.output.clone());
+    }
+    let diagnostic = if let Some(engine) = error.downcast_ref::<omnigraph::error::OmniError>() {
+        engine.diagnostic()
+    } else if let Some(compiler) = error.downcast_ref::<omnigraph_compiler::error::CompilerError>()
+    {
+        compiler.diagnostic()
+    } else {
+        None
+    }?;
+    let mut output = ErrorOutput::message(error.to_string());
+    output.diagnostic = Some(omnigraph_api_types::DiagnosticOutput::from(diagnostic));
+    Some(output)
+}
+
+/// The human rendering of the diagnostics contract: the code and the
+/// expectation, where it is, and the one fix.
+fn render_diagnostic(
+    output: &ErrorOutput,
+    diagnostic: &omnigraph_api_types::DiagnosticOutput,
+) -> String {
+    let mut lines = vec![format!("error[{}]: {}", diagnostic.code, output.error)];
+    if let Some(at) = &diagnostic.position {
+        lines.push(format!("  --> line {}, column {}", at.line, at.column));
+    } else if let Some(stage) = &diagnostic.stage {
+        match &diagnostic.expression {
+            Some(expression) => lines.push(format!("  --> {stage}: {expression}")),
+            None => lines.push(format!("  --> {stage}")),
+        }
+    }
+    if let Some(fix) = &diagnostic.fix {
+        lines.push(format!("  fix: {fix}"));
+    }
+    lines.join("\n")
 }
 
 async fn run(cli: Cli) -> Result<()> {

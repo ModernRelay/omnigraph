@@ -940,6 +940,8 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ErrorCode",
     "ErrorOutput",
     "FullTextIndexRebuildRequiredOutput",
+    "DiagnosticOutput",
+    "PositionOutput",
     "EntityKindOutput",
     "ChangeFeedGapOutput",
     "ChangeOpOutput",
@@ -1330,6 +1332,34 @@ fn error_output_schema_has_expected_fields() {
         .map(|field| field.as_str().unwrap())
         .collect();
     assert_eq!(required, HashSet::from(["index", "reason"]));
+    // A refused query's diagnostic is an optional detail with the contract's
+    // four fields; the code and the expectation are always present.
+    let diagnostic = &props["diagnostic"];
+    assert!(
+        diagnostic["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|schema| { schema["$ref"] == "#/components/schemas/DiagnosticOutput" })
+    );
+    assert!(
+        !schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "diagnostic")
+    );
+    let details = &doc["components"]["schemas"]["DiagnosticOutput"];
+    let required: HashSet<&str> = details["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect();
+    assert_eq!(required, HashSet::from(["code", "expected"]));
+    for field in ["position", "stage", "expression", "fix"] {
+        assert!(details["properties"].get(field).is_some(), "{field}");
+    }
     for path in [
         "/graphs/{graph_id}/query",
         "/graphs/{graph_id}/read",

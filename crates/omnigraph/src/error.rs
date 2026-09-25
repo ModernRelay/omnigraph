@@ -617,6 +617,15 @@ impl OmniError {
         )
     }
 
+    /// The structured query compile diagnostic behind this error, when it is
+    /// one (RFC 0047's diagnostics contract).
+    pub fn diagnostic(&self) -> Option<&omnigraph_compiler::QueryDiagnostic> {
+        match self {
+            Self::Compiler(err) => err.diagnostic(),
+            _ => None,
+        }
+    }
+
     pub fn manifest(message: impl Into<String>) -> Self {
         Self::Manifest(ManifestError::new(ManifestErrorKind::BadRequest, message))
     }

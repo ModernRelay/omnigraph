@@ -4452,6 +4452,50 @@
           }
         }
       },
+      "DiagnosticOutput": {
+        "type": "object",
+        "description": "The diagnostics contract for a refused query (RFC 0047): a stable code\n(`Q…` parse, `T…` typecheck); where the failure is, as a source position\nor as the stage and expression when it is post-parse; what was expected or\nviolated; and one concrete fix, absent when `expected` names the decision.\nRides `ErrorOutput.diagnostic` as an additive detail because\n[`ErrorCode`] is a closed compatibility contract.",
+        "required": [
+          "code",
+          "expected"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "expected": {
+            "type": "string"
+          },
+          "expression": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fix": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "position": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PositionOutput"
+              }
+            ]
+          },
+          "stage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "EntityChangeOutput": {
         "type": "object",
         "description": "One entity change. Cause is stated once on the enclosing block, never here.\nAn insert carries only `after`, an update exact `before` and `after`, a\ndelete only `before`.",
@@ -4563,6 +4607,17 @@
               },
               {
                 "$ref": "#/components/schemas/ErrorCode"
+              }
+            ]
+          },
+          "diagnostic": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DiagnosticOutput",
+                "description": "Set for a refused query: the diagnostics contract's code, position or\nstage, expectation and fix. `error` keeps the one-line rendering."
               }
             ]
           },
@@ -5204,6 +5259,32 @@
           "vector",
           "list"
         ]
+      },
+      "PositionOutput": {
+        "type": "object",
+        "description": "A source position: 1-based line and column (in characters) and the byte\noffset.",
+        "required": [
+          "line",
+          "column",
+          "byte"
+        ],
+        "properties": {
+          "byte": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "column": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "line": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
       },
       "PreconditionFailureOutput": {
         "type": "object",

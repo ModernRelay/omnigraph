@@ -101,7 +101,7 @@ fn describe_checked_query_operation(
         }
         CheckedQuery::Mutation(ctx) => {
             if ctx.targets.len() != query.mutations.len() {
-                return Err(CompilerError::Type(
+                return Err(CompilerError::Plan(
                     "typechecked mutation target count does not match the query".to_string(),
                 ));
             }
@@ -113,7 +113,7 @@ fn describe_checked_query_operation(
                 match (mutation, target) {
                     (Mutation::Insert(_), MutationTarget::Edge { type_name }) => {
                         let edge = catalog.edge_types.get(type_name).ok_or_else(|| {
-                            CompilerError::Type(format!(
+                            CompilerError::Plan(format!(
                                 "typechecked edge type `{type_name}` is absent from the catalog"
                             ))
                         })?;
@@ -160,7 +160,7 @@ fn collect_clause_reads(
                 let edge = catalog
                     .lookup_edge_by_name(&traversal.edge_name)
                     .ok_or_else(|| {
-                        CompilerError::Type(format!(
+                        CompilerError::Plan(format!(
                             "typechecked edge type `{}` is absent from the catalog",
                             traversal.edge_name
                         ))
@@ -213,7 +213,7 @@ fn result_value_shape(
     match data_type {
         DataType::FixedSizeList(field, dim) if field.data_type() == &DataType::Float32 => {
             let dim = u32::try_from(*dim).map_err(|_| {
-                CompilerError::Type(format!(
+                CompilerError::Plan(format!(
                     "query result vector dimension `{dim}` cannot be represented"
                 ))
             })?;
@@ -222,7 +222,7 @@ fn result_value_shape(
         DataType::List(field) => {
             let (item_kind, nested_item, vector_dim) = result_value_shape(field.data_type())?;
             if nested_item.is_some() || item_kind == QueryValueKind::List {
-                return Err(CompilerError::Type(
+                return Err(CompilerError::Plan(
                     "nested query result lists are not representable".to_string(),
                 ));
             }
@@ -243,7 +243,7 @@ fn scalar_result_kind(data_type: &DataType) -> Result<QueryValueKind> {
         DataType::Date32 => Ok(QueryValueKind::Date),
         DataType::Date64 => Ok(QueryValueKind::DateTime),
         DataType::LargeBinary => Ok(QueryValueKind::Blob),
-        other => Err(CompilerError::Type(format!(
+        other => Err(CompilerError::Plan(format!(
             "query result data type `{other}` is not representable"
         ))),
     }
