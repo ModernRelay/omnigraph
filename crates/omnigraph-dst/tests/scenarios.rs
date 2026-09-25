@@ -4581,6 +4581,7 @@ fn dst_concurrent_two_writers_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             readers: 0,
@@ -4630,6 +4631,7 @@ fn dst_concurrent_contention_hunt() {
             writers: 4,
             ops_per_writer: 20,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             readers: 0,
@@ -4669,6 +4671,7 @@ fn dst_maintenance_actor_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 8,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             readers: 0,
@@ -4698,6 +4701,128 @@ fn dst_maintenance_actor_first_contact() {
     }
 }
 
+/// Schema apply racing live writers — the deterministic coverage the
+/// shared/exclusive schema gate ships with (RFC 2026-09-18-shared-schema-gate;
+/// before it, writers-racing-apply had NO DST coverage). A dedicated schema
+/// actor performs monotone additive applies (each takes the gate's EXCLUSIVE
+/// side, draining every writer's shared permit) while two data writers race
+/// under shared permits. Oracles: every writer claim commits (no wedge under
+/// schema contention), every apply commits (writers cannot starve the
+/// exclusive side), each apply lands exactly one empty-person-diff era
+/// commit, and — across the seed budget — the writers genuinely interleaved
+/// (alternations ≥ 1 somewhere, or the green is vacuous). Plain mode only:
+/// an apply's table rewrite runs on the single `lance-cpu` pool thread,
+/// which the seam arbiter deliberately cannot see, so under the seam
+/// scheduler its stall budget trips on a loaded machine (measured: 0, 4,
+/// 12, 18 or 27 escapes across runs of one seed). The strict-replay claim
+/// for this arm (`sched_escapes == 0`) is therefore the hunt's, run
+/// explicitly on an idle machine; the permits' turn/epoch protocol itself
+/// is pinned by `dst_seam_scheduler_bite_and_replay`.
+#[test]
+#[serial]
+fn dst_schema_apply_racing_writers_first_contact() {
+    use omnigraph_dst::concurrent::{ConcurrentScenario, run_concurrent_universe};
+    let mut interleaved_somewhere = false;
+    for seed in dst_seeds(&[24_301, 24_302, 24_303]) {
+        let sched = false;
+        let root = format!("shared-memory://dst-s24-schema-{seed}");
+        let sc = ConcurrentScenario {
+            seed,
+            writers: 2,
+            ops_per_writer: 12,
+            maintenance_ops: 0,
+            schema_ops: 3,
+            kill_writer: None,
+            branch_cycles: 0,
+            readers: 1,
+            writer_fault_pct: 0,
+            seam_schedule: sched,
+            park_deleter_hold: false,
+        };
+        let report = run_concurrent_universe(&root, &sc);
+        assert_eq!(
+            report.committed, 24,
+            "every data write must commit despite schema contention"
+        );
+        assert_eq!(
+            report.schema_committed, 3,
+            "every schema apply must commit; writers cannot starve the exclusive side"
+        );
+        assert_eq!(
+            report.maintenance_commits, 3,
+            "each apply lands exactly one empty-person-diff era commit"
+        );
+        if sched {
+            assert_eq!(
+                report.sched_escapes, 0,
+                "the schema permits' turn/epoch protocol must keep the \
+                 interleaving seed-ordered (strict replay)"
+            );
+        }
+        interleaved_somewhere |= report.alternations >= 1;
+        println!(
+            "dst s24 schema [seed={seed} sched={sched}]: committed={} occ_retries={} \
+             schema(committed={} retries={}) alternations={} sched_escapes={}",
+            report.committed,
+            report.occ_retries,
+            report.schema_committed,
+            report.schema_retries,
+            report.alternations,
+            report.sched_escapes
+        );
+    }
+    assert!(
+        interleaved_somewhere,
+        "no seed produced interleaved writer commits — a vacuous green for the \
+         concurrency claim; widen the seed budget"
+    );
+}
+
+/// The schema-arm hunt instrument: wider seeds, scheduler on, faults on —
+/// run explicitly when hunting interleavings around the shared/exclusive
+/// boundary (`OMNIGRAPH_DST_SEEDS` widens the search).
+#[test]
+#[serial]
+#[ignore = "hunt: schema-apply-vs-writers interleaving search — run explicitly"]
+fn dst_schema_apply_racing_writers_hunt() {
+    use omnigraph_dst::concurrent::{ConcurrentScenario, run_concurrent_universe};
+    // 24_304 is the first-contact scenario's own shape under the scheduler
+    // (see the pin for why strict replay is a hunt claim for this arm).
+    for seed in dst_seeds(&[
+        24_304, 24_310, 24_311, 24_312, 24_313, 24_314, 24_315, 24_316, 24_317,
+    ]) {
+        let root = format!("shared-memory://dst-s24-schema-hunt-{seed}");
+        let sc = ConcurrentScenario {
+            seed,
+            writers: 3,
+            ops_per_writer: 10,
+            maintenance_ops: 0,
+            schema_ops: 4,
+            kill_writer: None,
+            branch_cycles: 0,
+            readers: 2,
+            writer_fault_pct: 10,
+            seam_schedule: true,
+            park_deleter_hold: false,
+        };
+        let report = run_concurrent_universe(&root, &sc);
+        assert_eq!(report.committed, 30);
+        assert_eq!(report.schema_committed, 4);
+        assert_eq!(report.sched_escapes, 0, "strict replay must hold");
+        println!(
+            "dst s24 schema-hunt [seed={seed}]: committed={} schema(committed={} \
+             retries={}) faults={} alternations={} sched(turns={} escapes={})",
+            report.committed,
+            report.schema_committed,
+            report.schema_retries,
+            report.writer_faults_injected,
+            report.alternations,
+            report.sched_turns,
+            report.sched_escapes
+        );
+    }
+}
+
 /// ARM 2 — crash one writer mid-op while the other keeps racing:
 /// writer 0's adapter-realm storage dies at its k-th write-class call
 /// (post-mortem refusal, no revive — the one-participant process-death
@@ -4719,6 +4844,7 @@ fn dst_crash_one_writer_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: Some((0, kill_at)),
             branch_cycles: 0,
             readers: 0,
@@ -4772,6 +4898,7 @@ fn dst_branch_actor_first_contact() {
             writers: 2,
             ops_per_writer: 12,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 4,
             readers: 0,
@@ -4821,6 +4948,7 @@ fn dst_concurrent_fleet() {
             writers: 3,
             ops_per_writer: 10,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 0,
             // Readers in EVERY fleet arm — live differential reads during
@@ -4842,6 +4970,7 @@ fn dst_concurrent_fleet() {
             (
                 "crash",
                 ConcurrentScenario {
+                    schema_ops: 0,
                     kill_writer: Some((0, 7 + (seed as usize % 17))),
                     ..base.clone()
                 },
@@ -4915,6 +5044,7 @@ fn dst_seam_scheduler_bite_and_replay() {
         writers: 2,
         ops_per_writer: 8,
         maintenance_ops: 0,
+        schema_ops: 0,
         kill_writer: None,
         branch_cycles: 0,
         readers: 0,
@@ -5016,6 +5146,7 @@ fn dst_optimize_races_branch_delete() {
             writers: 3,
             ops_per_writer: 10,
             maintenance_ops: 4,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 3,
             readers: 0,
@@ -5084,6 +5215,7 @@ fn dst_optimize_races_branch_delete_seed_search() {
             writers: 2,
             ops_per_writer: 6,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 3,
             readers: 0,
@@ -5180,6 +5312,7 @@ fn dst_optimize_races_branch_delete_directed_hold() {
             writers: 2,
             ops_per_writer: 6,
             maintenance_ops: 0,
+            schema_ops: 0,
             kill_writer: None,
             branch_cycles: 3,
             readers: 0,
