@@ -1083,6 +1083,7 @@ async fn issue_567_bounded_nearest_and_rrf_retry_after_partitioned_ivf_underfill
 /// Asserts `rungs` (the `ann_rung_partitions_searched` probe) forms exactly
 /// `ladders` strictly increasing runs: a new ladder starts wherever the
 /// searched-partition count does not grow.
+#[cfg(feature = "failpoints")]
 fn assert_rungs_climb(rungs: &[u64], ladders: usize, context: &str) {
     let runs = 1 + rungs.windows(2).filter(|pair| pair[1] <= pair[0]).count();
     assert_eq!(

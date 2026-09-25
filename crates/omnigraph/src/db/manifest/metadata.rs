@@ -179,6 +179,7 @@ impl TableVersionMetadata {
         self
     }
 
+    #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fn is_table_fork_of(&self, fork: &str, owner: &str) -> bool {
         self.table_fork_owner
             .as_deref()
