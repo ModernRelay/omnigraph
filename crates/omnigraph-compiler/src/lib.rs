@@ -44,6 +44,7 @@ pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
     QueryValueKind, describe_query_operation,
 };
+pub use query::diagnostic::{Position, QueryCode, QueryDiagnostic, QueryDiagnosticKind, Stage};
 pub use query::lint::{
     QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
     QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,

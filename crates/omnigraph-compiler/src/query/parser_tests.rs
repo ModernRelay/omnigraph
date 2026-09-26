@@ -1376,7 +1376,7 @@ return { $p.name
 }
 "#;
     let err = parse_query_diagnostic(input).unwrap_err();
-    assert!(err.span.is_some());
+    assert!(err.position.is_some());
 }
 
 #[test]
@@ -1613,7 +1613,12 @@ fn explain_statement_never_shares_a_file_with_a_declaration() {
         format!("branch list\nexplain {decl}"),
     ] {
         let error = parse_query(&input).unwrap_err();
-        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+        assert!(
+            error.diagnostic().is_some_and(|diagnostic| {
+                diagnostic.kind == crate::query::diagnostic::QueryDiagnosticKind::Parse
+            }),
+            "{input}: {error}"
+        );
     }
 }
 
@@ -1628,7 +1633,12 @@ fn explain_keyword_ends_at_a_word_boundary_and_needs_a_declaration() {
         format!("explain explain {decl}"),
     ] {
         let error = parse_query(&input).unwrap_err();
-        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+        assert!(
+            error.diagnostic().is_some_and(|diagnostic| {
+                diagnostic.kind == crate::query::diagnostic::QueryDiagnosticKind::Parse
+            }),
+            "{input}: {error}"
+        );
     }
 }
 
@@ -1801,7 +1811,7 @@ fn settings_statements_are_checked_against_the_definition() {
             "{input}: {} (the full text is `settings::tests::messages_follow_the_definition`'s)",
             err.message
         );
-        assert!(err.span.is_some(), "{input} carries a position");
+        assert!(err.position.is_some(), "{input} carries a position");
     }
     let rendered = parse_query("set merge_lineage = v3;")
         .unwrap_err()
@@ -1895,4 +1905,48 @@ return { $p.set, $q.traversal as all }
     assert_eq!(file.single_decl().name, "q");
     assert_eq!(parse_branch("branch create set"), create("set", None));
     assert_eq!(parse_branch("branch create all"), create("all", None));
+}
+
+#[test]
+fn query_without_parameter_list_reports_q002_at_the_name_end_with_fix() {
+    let err =
+        parse_query_diagnostic("query name {\n  match { $p: Person }\n  return { $p.name }\n}")
+            .unwrap_err();
+    assert_eq!(err.code.as_str(), "Q002");
+    assert_eq!(
+        err.message,
+        "expected `(`: a query declares its parameters even when it has none"
+    );
+    assert_eq!(err.fix.as_deref(), Some("query name()"));
+    let at = err.position.expect("positioned at the name's end");
+    assert_eq!((at.line, at.column, at.byte), (1, 11, 10));
+    assert!(err.stage.is_none());
+    let rendered = parse_query("query name {").unwrap_err().to_string();
+    assert_eq!(
+        rendered,
+        "parse error: expected `(`: a query declares its parameters even when it has none"
+    );
+    // A well-formed declaration before the broken one leaves the fix's
+    // subject the broken one.
+    let err =
+        parse_query_diagnostic("query a() { match { $p: Person } return { $p.name } }\nquery b {")
+            .unwrap_err();
+    assert_eq!(err.fix.as_deref(), Some("query b()"));
+    assert_eq!(err.position.unwrap().line, 2);
+    // The declaration keeps its parameter list when it has one.
+    assert!(parse_query("query a() { match { $p: Person } return { $p.name } }").is_ok());
+}
+
+#[test]
+fn grammar_mismatch_reports_q001_at_the_deepest_failure() {
+    let err = parse_query_diagnostic("mutation { insert Person { name: \"a\" } }").unwrap_err();
+    assert_eq!(err.code.as_str(), "Q001");
+    assert!(err.message.starts_with("expected "), "{}", err.message);
+    assert_eq!(err.position.unwrap().byte, 0);
+    assert!(err.fix.is_none());
+    // A settings refusal is positioned at the offending token.
+    let err = parse_query_diagnostic("set merge_lineage = v3;").unwrap_err();
+    assert_eq!(err.code.as_str(), "Q003");
+    let at = err.position.unwrap();
+    assert_eq!((at.line, at.column), (1, 21));
 }
