@@ -28,20 +28,36 @@ issue and implementation PR are usually enough.
 
 ## File and heading format
 
-- Filename: `NNNN-kebab-title.md`.
-- Heading: `# RFC NNNN: Title`.
-- Reference labels use `RFC NNNN` and point to the canonical RFC filename.
+- Filename: `YYYY-MM-DD-kebab-title.md`. The date is the day drafting started
+  and equals the `created` frontmatter field. The author chooses it alone; no
+  registry, issue, or PR has to allocate anything first.
+- Heading: `# RFC: Title`.
+- The RFC id is the filename without `.md`. A reference is a link whose text
+  is the RFC title and whose target is the canonical RFC filename.
 - `0000-template.md` is reserved and is not an RFC.
-- Allocate the number only when adding the RFC file. Numbers are never reused
-  or backfilled, including numbers from rejected, superseded, abandoned, or
-  out-of-tree drafts.
+- Two RFCs may share a date; their slugs differ. Two RFCs never share a slug
+  on the same day. A retitled RFC keeps its filename; the decision log records
+  the new title.
 - Do not create `pre-merge`, `final`, `v2`, `internal`, or review-ledger copies.
   Revise the canonical file; preserve meaningful changes in its decision log.
 
-The next available number is **0067**; lower gaps are historical and must
-not be reused (0047 and 0048 are allocated by PR #606; 0050 by the
-`rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0058 by
-PR #662 for retained merged ancestry; 0059 by PR #675; 0060 by PR #677).
+### Numbered RFCs 0001 to 0068
+
+RFCs 0001 to 0068 use `NNNN-kebab-title.md`, the heading
+`# RFC NNNN: Title`, and the reference label `RFC NNNN`. That namespace is
+closed at 0068: no new number is allocated, and `scripts/check-docs.py`
+rejects any numbered filename outside the allocated and reserved numbers it
+lists. Numbers reserved by PRs that were open
+when the namespace closed (0047 and 0048 by PR #606; 0050 by the
+`rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0059 by PR #675;
+0060 by PR #677; 0067 and 0068 by PR #725) may still land under their
+reserved numbers. Every other gap
+is historical and is never reused or backfilled.
+
+The numbered scheme allocated an identifier only at merge, so every draft
+carried a working number that went stale whenever another RFC merged first,
+and the rename touched the filename, frontmatter, heading, registry row, and
+every reference. A date the author owns removes the allocation step.
 
 ## Required frontmatter
 
@@ -49,15 +65,15 @@ Every RFC uses exactly this schema:
 
 ```yaml
 ---
-rfc: "0042"
+rfc: "2026-09-15-short-descriptive-title"
 title: "Short descriptive title"
 track: maintainer
 status: draft
 implementation: not-started
 authors:
   - Name or handle
-created: 2026-08-23
-updated: 2026-08-23
+created: 2026-09-15
+updated: 2026-09-15
 discussion: null
 supersedes: []
 superseded_by: []
@@ -67,17 +83,19 @@ blocked_on: []
 
 Field rules:
 
-- `rfc` is the four-digit string from the filename and heading.
+- `rfc` is the RFC id: the filename without `.md`. Numbered RFCs keep their
+  four-digit string.
 - `title` matches the heading text.
 - `track` is `public` or `maintainer`; both follow the same lifecycle.
 - `status` is one of `draft`, `accepted`, `rejected`, or `superseded`.
 - `implementation` is one of `not-started`, `in-progress`, `partial`,
   `complete`, `removed`, or `n/a`.
 - `authors` is a non-empty list.
-- `created` and `updated` use `YYYY-MM-DD`.
+- `created` and `updated` use `YYYY-MM-DD`; `created` equals the filename's
+  date prefix.
 - `discussion` is a durable issue/PR URL or `null`.
-- `supersedes` and `superseded_by` contain four-digit RFC strings. Update both
-  sides when the relationship applies to the whole decision.
+- `supersedes` and `superseded_by` contain RFC ids as quoted strings. Update
+  both sides when the relationship applies to the whole decision.
 - `blocked_on` contains concrete evidence or dependency gates. Research being
   blocked is not a lifecycle status; it is a draft with a non-empty list.
 
@@ -112,7 +130,8 @@ dependencies do.
 
 ## Process
 
-1. Copy [the template](0000-template.md) to the next available number.
+1. Copy [the template](0000-template.md) to `YYYY-MM-DD-kebab-title.md`, dated
+   the day drafting starts.
 2. Set every frontmatter field and open a PR in `draft` status.
 3. Review the problem, user/operational behavior, invariants, substrate
    alignment, compatibility, evidence, alternatives, and rollout.
@@ -131,7 +150,10 @@ extend existing owners according to [the test map](../dev/testing.md).
 
 ## Registry
 
-This table is the human index for the canonical RFC corpus.
+This table is the human index for the canonical RFC corpus. The first column
+links the canonical file; its text is the number for numbered RFCs and the
+`created` date for dated ones. Rows are in creation order: numbered RFCs first,
+then dated RFCs by date.
 
 | RFC | Decision | Track | Status | Implementation |
 |---|---|---|---|---|
@@ -169,7 +191,7 @@ This table is the human index for the canonical RFC corpus.
 | [0037](0037-deterministic-simulation-harness.md) | Deterministic simulation harness | public | accepted | in-progress |
 | [0038](0038-typed-storage-failures.md) | Typed storage failures | public | accepted | complete |
 | [0039](0039-end-to-end-benchmark.md) | The end-to-end benchmark | public | accepted | in-progress |
-| [0040](0040-system-column-namespace.md) | System column namespace | public | draft | in-progress |
+| [0040](0040-system-column-namespace.md) | System column namespace | public | accepted | in-progress |
 | [0041](0041-inline-stored-queries.md) | Inline and stored queries | maintainer | accepted | partial |
 | [0042](0042-incarnation-suffixed-branch-refs.md) | Incarnation-suffixed native branch refs | maintainer | accepted | complete |
 | [0043](0043-full-text-index-compatibility.md) | Full-text index compatibility and explicit rebuild | maintainer | accepted | complete |
@@ -187,6 +209,15 @@ This table is the human index for the canonical RFC corpus.
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
-| [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | draft | in-progress |
+| [0064](0064-explicit-storage-upgrades.md) | Explicit storage upgrades | maintainer | accepted | in-progress |
 | [0065](0065-isolated-branch-merge-publication.md) | Isolated branch merge publication | maintainer | draft | not-started |
-| [0066](0066-server-lifecycle-and-online-deployment.md) | Server lifecycle and online deployment | maintainer | draft | not-started |
+| [0066](0066-one-seam-type.md) | One seam type for test-time behavior substitution | maintainer | draft | in-progress |
+| [0067](0067-detached-table-commits.md) | Detached table commits | maintainer | accepted | complete |
+| [0068](0068-graph-commit-record.md) | Graph commit record | maintainer | draft | not-started |
+| [2026-09-09](2026-09-09-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | accepted | complete |
+| [2026-09-10](2026-09-10-server-lifecycle-and-online-deployment.md) | Server lifecycle and online deployment | maintainer | draft | not-started |
+| [2026-09-14](2026-09-14-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
+| [2026-09-16](2026-09-16-session-settings.md) | Session settings | maintainer | draft | in-progress |
+| [2026-09-18](2026-09-18-shared-schema-gate.md) | Shared schema gate and the write critical section | maintainer | draft | not-started |
+| [2026-09-21](2026-09-21-detached-only-tables.md) | Detached-only tables | maintainer | accepted | in-progress |
+| [2026-09-24](2026-09-24-shared-expression-model.md) | Shared expression model | maintainer | draft | in-progress |

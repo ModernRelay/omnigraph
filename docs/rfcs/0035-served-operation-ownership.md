@@ -12,12 +12,12 @@ discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
-  - "RFC 0066 minimum T10 ownership gate (increment B)"
+  - "Server lifecycle and online deployment RFC (2026-09-10): minimum T10 ownership gate (increment B)"
 ---
 
 # RFC 0035: Served operation ownership
 
-**Depends on:** existing engine write and recovery contracts; no runtime-activation or recovery-supervision design; historical admission (§7.3) and the shipping gate in §10 are owned by RFC 0066.
+**Depends on:** existing engine write and recovery contracts; no runtime-activation or recovery-supervision design; historical admission (§7.3) and the shipping gate in §10 are owned by [Server lifecycle and online deployment](2026-09-10-server-lifecycle-and-online-deployment.md), the server lifecycle RFC.
 **Replaces:** [PR #490](https://github.com/ModernRelay/omnigraph/pull/490), retaining its cancellation evidence rather than its stacked implementation.
 **Audience:** server, engine, API, operations, and test maintainers.
 
@@ -46,7 +46,7 @@ This server-lifetime contract adds no storage format, durable request ledger, tr
 
 An Axum handler currently owns and awaits the engine future, workload guard, and inputs. Peer disconnect or timeout drops that handler and therefore the engine future.
 
-Caller cancellation is not rollback. Current content writers stage detached table versions before graph publication; schema staging and first-touch control effects have their own completion rules. Preserve exact publication evidence and pending-work ownership instead of inferring an abort from a dropped future. The [lifecycle proposal](0066-server-lifecycle-and-online-deployment.md#failed-writes-and-recovery-progress) describes this current-engine boundary.
+Caller cancellation is not rollback. Current content writers stage detached table versions before graph publication; schema staging and first-touch control effects have their own completion rules. Preserve exact publication evidence and pending-work ownership instead of inferring an abort from a dropped future. The [lifecycle proposal](2026-09-10-server-lifecycle-and-online-deployment.md#failed-writes-and-recovery-progress) describes this current-engine boundary.
 
 Automatic replay is equally wrong: disconnect, panic, timeout, or ambiguous store response does not prove no first effect. Replay can duplicate a mutation or use a different head; cancellation and retry policy are not transaction evidence.
 
@@ -241,7 +241,7 @@ body/stream terminal. Health and configured-entry listing do not capture a gener
 
 Source guards fail CI for HTTP route writers outside `try_start_write` and
 target observers outside typed capture. Writers owned by the transition owner's
-task set (RFC 0036 `RecoveryTaskSet`; RFC 0066 deployment apply) are the only
+task set (RFC 0036 `RecoveryTaskSet`; the server lifecycle RFC's deployment apply) are the only
 exempt class; each such call site carries a `// forbidden-api-allow: <reason>`
 sentinel so the exemption is visible in review. The exemption covers the apply
 task the transition owner runs; a deployment is declared through the
@@ -325,7 +325,7 @@ remains unknown unless ordinary graph state proves it.
 
 ### 7.3 Independent historical read admission
 
-The [lifecycle proposal](0066-server-lifecycle-and-online-deployment.md#independent-historical-reads)
+The [lifecycle proposal](2026-09-10-server-lifecycle-and-online-deployment.md#independent-historical-reads)
 owns historical execution and retention semantics. Historical reads use separate
 admission and lifetime accounting from changing live state. Live replacement
 closes the replaced cell; it does not close qualified historical admission or
@@ -439,7 +439,7 @@ Read permits are lightweight lifecycle counts, not a new byte/concurrency budget
 existing Blob/export transport bounds still apply. Owned execution must also
 qualify process-wide admission/input bounds, a finite queue or immediate refusal,
 and isolated completion/recovery/status reserves before shipping; see the
-[lifecycle minimum T10 gate](0066-server-lifecycle-and-online-deployment.md#server-validation). A write task holds both its
+[lifecycle minimum T10 gate](2026-09-10-server-lifecycle-and-online-deployment.md#server-validation). A write task holds both its
 per-actor workload guard and write permit. Neither class waits for a gate permit.
 
 Lifecycle lock order is latch -> cell lanes; request capture never takes the latch.
@@ -567,8 +567,8 @@ uninterrupted recovery, exactly-once retry, nor durable operation lookup.
   Zero requests immediate cutoff", "RFC 0035 knows no task type" and the §12
   step 3 "independent hard watchdog". §9 adds the `historical_unavailable`
   outcome for an expired or unavailable historical target. The front matter
-  blocks on the RFC 0066 minimum T10 ownership gate, superseding
-  `blocked_on: []`, and the dependency line names RFC 0066 as owner of
+  blocks on the server lifecycle RFC's minimum T10 ownership gate, superseding
+  `blocked_on: []`, and the dependency line names that RFC as owner of
   historical admission (§7.3) and the §10 shipping gate.
 - 2026-09-25: §0 and invariants 9 and 11 hold a write through settlement of
   its scoped work, including submitted storage I/O, rather than task
@@ -587,6 +587,6 @@ uninterrupted recovery, exactly-once retry, nor durable operation lookup.
   `DrainedProof` only after selected ownership settles; supersedes "returns an
   unforgeable `DrainedProof` if all selected permits released". New §7.3
   keeps historical read admission independent of live replacement under
-  RFC 0066. §10 requires the RFC 0066 minimum T10 gate before owned
+  the server lifecycle RFC. §10 requires its minimum T10 gate before owned
   execution ships. §13 adds settlement, historical-acquisition and saturation rows;
   supersedes "terminal drop emits wake then proof".

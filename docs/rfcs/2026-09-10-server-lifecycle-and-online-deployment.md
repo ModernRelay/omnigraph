@@ -1,5 +1,5 @@
 ---
-rfc: "0066"
+rfc: "2026-09-10-server-lifecycle-and-online-deployment"
 title: "Server lifecycle and online deployment"
 track: maintainer
 status: draft
@@ -19,7 +19,7 @@ blocked_on:
   - Qualified resource budgets for replacement overlap and completion capacity
 ---
 
-# RFC 0066: Server lifecycle and online deployment
+# RFC: Server lifecycle and online deployment
 
 ## Summary
 

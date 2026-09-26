@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on:
   - RFC 0034 acceptance and implementation
   - RFC 0035 acceptance and implementation
-  - "RFC 0066 historical-read capture, retention and reconstruction interface (§5.1)"
+  - "Server lifecycle and online deployment RFC (2026-09-10): historical-read capture, retention and reconstruction interface (§5.1)"
 ---
 
 # RFC 0036: Atomic runtime activation and graph availability supervision
@@ -113,7 +113,7 @@ it does not classify by matching error strings or redefine the taxonomy.
 This RFC does not define recovery formats or choices, HTTP-write cancellation
 or acknowledgement, shutdown, general hot config reload, graph add/remove, multi-writer
 fencing, durable reader leases, or warm correctness-cache transfer. It exposes
-no raw storage diagnostic over HTTP. The [lifecycle proposal](0066-server-lifecycle-and-online-deployment.md)
+no raw storage diagnostic over HTTP. The [lifecycle proposal](2026-09-10-server-lifecycle-and-online-deployment.md)
 extends this draft for schema/query deployment, qualified reuse of settled mutable
 engine state and independently admitted historical reads. Its four acceptance
 gates remain required. Other configuration classes are separately qualified.
@@ -230,7 +230,7 @@ generation.
 
 ### 5.1 Historical execution and live activation
 
-The [independent historical-read contract](0066-server-lifecycle-and-online-deployment.md#independent-historical-reads)
+The [independent historical-read contract](2026-09-10-server-lifecycle-and-online-deployment.md#independent-historical-reads)
 owns exact data/schema/query binding, current authorization, effect-free
 reconstruction after eviction/restart and acquisition versus reclamation. It
 extends the default-generation model; an old engine `Arc` is not a historical
@@ -318,7 +318,7 @@ flag does not promise that every historical target or caller can be served.
 Historical routes use that owner, never the live `read_ready` routing check.
 Status reads a bounded observation; it must not reconstruct a historical view.
 
-The [lifecycle readiness contract](0066-server-lifecycle-and-online-deployment.md#status-and-embedding-diagnostics)
+The [lifecycle readiness contract](2026-09-10-server-lifecycle-and-online-deployment.md#status-and-embedding-diagnostics)
 owns aggregation of live and historical capability and their separate counts.
 If no retained supported target remains available, historical readiness is
 false even if previously admitted readers are still finishing.
@@ -744,7 +744,8 @@ schema token, and boolean versus view-enum spelling for `include=all`.
   routing cost to default-live routing; supersedes "Healthy routing does". §15
   adds candidate-deadline and historical-only readiness cases; supersedes
   "guard lifetime through activation/drop". The front matter blocks on the
-  RFC 0066 historical-read capture, retention and reconstruction interface. The
+  [Server lifecycle and online deployment](2026-09-10-server-lifecycle-and-online-deployment.md)
+  historical-read capture, retention and reconstruction interface. The
   dependency line takes the Lance and manifest versions pinned by the
   workspace `Cargo.toml`; supersedes "internal manifest schema v6; Lance
   10.0.0". §11.3 counts the build permit, not a slot. §12.1 keeps the RFC 0049
