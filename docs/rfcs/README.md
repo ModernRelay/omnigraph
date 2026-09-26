@@ -215,6 +215,7 @@ then dated RFCs by date.
 | [0067](0067-detached-table-commits.md) | Detached table commits | maintainer | accepted | complete |
 | [0068](0068-graph-commit-record.md) | Graph commit record | maintainer | draft | not-started |
 | [2026-09-09](2026-09-09-identity-credentials-and-applied-policy.md) | Identity credentials and applied policy authorization | maintainer | accepted | complete |
+| [2026-09-10](2026-09-10-server-lifecycle-and-online-deployment.md) | Server lifecycle and online deployment | maintainer | draft | not-started |
 | [2026-09-14](2026-09-14-compatibility-surfaces.md) | Compatibility surfaces | maintainer | draft | not-started |
 | [2026-09-16](2026-09-16-session-settings.md) | Session settings | maintainer | draft | in-progress |
 | [2026-09-18](2026-09-18-shared-schema-gate.md) | Shared schema gate and the write critical section | maintainer | draft | not-started |
