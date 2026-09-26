@@ -7,16 +7,17 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-08-13
-updated: 2026-08-23
+updated: 2026-09-26
 discussion: null
 supersedes: []
 superseded_by: []
-blocked_on: []
+blocked_on:
+  - "RFC 0066 minimum T10 ownership gate (increment B)"
 ---
 
 # RFC 0035: Served operation ownership
 
-**Depends on:** existing engine write and recovery contracts; no runtime-activation or recovery-supervision design.
+**Depends on:** existing engine write and recovery contracts; no runtime-activation or recovery-supervision design; historical admission (§7.3) and the shipping gate in §10 are owned by RFC 0066.
 **Replaces:** [PR #490](https://github.com/ModernRelay/omnigraph/pull/490), retaining its cancellation evidence rather than its stacked implementation.
 **Audience:** server, engine, API, operations, and test maintainers.
 
@@ -24,7 +25,7 @@ blocked_on: []
 
 ## 0. Decision summary
 
-Once admitted, a graph write belongs to the server until engine-terminal result, caught panic, or the shutdown deadline. Disconnect, HTTP/2 reset, timeout, or a dropped result receiver changes delivery only; it does not cancel or replay.
+Once admitted, a graph write belongs to the server through task termination and settlement of its scoped work, or the shared shutdown cutoff. Task completion or a caught panic does not itself settle submitted storage I/O. Disconnect, HTTP/2 reset, timeout, or a dropped result receiver changes delivery only; it does not cancel or replay.
 
 Reads remain request-owned and cancel normally. Before target observation they capture the exact generation and a `ReadObserver` permit through body/stream end.
 
@@ -45,7 +46,7 @@ This server-lifetime contract adds no storage format, durable request ledger, tr
 
 An Axum handler currently owns and awaits the engine future, workload guard, and inputs. Peer disconnect or timeout drops that handler and therefore the engine future.
 
-That is safe only before a durable effect. Writers may arm recovery and move Lance table heads before graph-wide manifest publication. Cancelling the caller wait is not rollback; afterward only terminal completion or an explicit unknown outcome under the existing recovery protocol is correct.
+Caller cancellation is not rollback. Current content writers stage detached table versions before graph publication; schema staging and first-touch control effects have their own completion rules. Preserve exact publication evidence and pending-work ownership instead of inferring an abort from a dropped future. The [lifecycle proposal](0066-server-lifecycle-and-online-deployment.md#failed-writes-and-recovery-progress) describes this current-engine boundary.
 
 Automatic replay is equally wrong: disconnect, panic, timeout, or ambiguous store response does not prove no first effect. Replay can duplicate a mutation or use a different head; cancellation and retry policy are not transaction evidence.
 
@@ -111,9 +112,9 @@ The server therefore keeps admitted writes alive and delegates commit truth to t
 6. **Read observation stays caller-owned.** Its permit follows body and scoped producer; disconnect/timeout/drop cancels normally and releases after settling.
 7. **Write transfer has no await gap.** Acquire, registration, and spawn are synchronous; after `try_start_write`, caller cancellation owns nothing.
 8. **At most one top-level write invocation.** Lifecycle events never call it again; cutoff may interrupt it, while engine-internal attempts stay inside.
-9. **Permit completion is exact.** Normal read end or write terminal/panic drops its permit. Terminal and cutoff race once; cutoff suppresses late delivery.
+9. **Permit completion is exact.** Release follows settlement of scoped work, including producers and submitted storage I/O. A task result or panic alone cannot release pending ownership. An atomic transfer to a registered successor preserves the original generation drain and reservations without a gap. Cutoff suppresses late delivery and never proves drain.
 10. **Delivery is lossy; write execution is not.** Failed result send is a metric, not an engine error or replay reason.
-11. **Write panic is contained.** It releases permits, reports lifecycle-owned unknown outcome to the result receiver, and emits one wake without unwinding peers.
+11. **Write panic is contained.** It reports lifecycle-owned unknown outcome and emits one wake without unwinding peers. Pending work retains counted ownership until qualified settlement or the shared cutoff.
 12. **`RecoveryRequired` is not replayable.** The original result and one wake pass through; the executor neither parses authority nor chooses recovery/retry.
 13. **Drain is exact and generation-scoped.** `drained(mask)` needs every selected lane closed and permit released; another graph/unselected lane is unaffected.
 14. **Transition timeout is not cutoff.** It returns no proof, leaves lanes closed, and cannot abort, replay, recover, replace, or reinterpret active work.
@@ -124,7 +125,9 @@ The server therefore keeps admitted writes alive and delegates commit truth to t
 
 ### 6.1 `ServedAdmissionCell` and lane state
 
-Registry publication exposes one opaque, indivisible cell:
+Live registry publication exposes one opaque, indivisible cell. Independent
+historical admission is a separately qualified extension in §7.3; the two-lane
+pseudocode below does not define its capture API:
 
 ```rust
 struct ServedAdmissionCell<G> {
@@ -203,10 +206,21 @@ Prepared (effect-free, request-owned)
    -- try_start_write --> Owned + registered (write/workload permits retained)
           +--> shutdown cutoff: unfinished; abort requested; hard exit
           +--> one top-level closure (engine owns internal attempts)
-                    --> terminal/panic --> send if receiver exists
+                    --> terminal/panic --> record result; attempt delivery
                                        --> opaque wake iff required
-                                       --> release registration + permits
+                                       --> settle scoped work, or retain counted
+                                           unresolved ownership
+                                       --> release registration + permits only
+                                           after qualified settlement
 ```
+
+The registration owns permits and reservations outside the invoked closure, so
+stack unwinding cannot release unsettled work. Result delivery does not own settlement. Dropping a receiver, joining a task or
+emitting a wake cannot release pending work. The engine supplies settlement and
+effect evidence; the executor cannot infer it from an error class, current HEAD
+or a zero count of submitted futures. If external settlement is unproved, retain
+explicit counted ownership in the original drain. That accounting grants no
+recovery, replay or compensation authority.
 
 Receiver drop only discards eventual send. Optional source deletion stays in the
 owned task, preserving “merge committed, deletion may fail” and honest drain.
@@ -218,12 +232,21 @@ The write choke point covers `/mutate`, `/mutate/if-graph-commit`, deprecated
 `/schema/apply`, `/load`, `/load/ndjson`, deprecated `/ingest`, and branch
 create/delete/merge with optional source deletion.
 
+Read capture and stream preparation must be effect-free. Any required schema
+completion runs as separately owned work before cancellable delivery.
+
 Other target-observing graph routes use `ReadObserver`: read/query/stored reads;
 snapshot/schema/query/branch/commit catalogs; Blob GET/HEAD; and export through
 body/stream terminal. Health and configured-entry listing do not capture a generation.
 
-Source guards fail CI for writers outside `try_start_write` or target observers
-outside typed capture. Future Blob/maintenance writers join `Write`.
+Source guards fail CI for HTTP route writers outside `try_start_write` and
+target observers outside typed capture. Writers owned by the transition owner's
+task set (RFC 0036 `RecoveryTaskSet`; RFC 0066 deployment apply) are the only
+exempt class; each such call site carries a `// forbidden-api-allow: <reason>`
+sentinel so the exemption is visible in review. The exemption covers the apply
+task the transition owner runs; a deployment is declared through the
+configuration ledger and observed by the server, so no route submits it.
+Future Blob/maintenance writers join `Write`.
 
 ### 6.6 Opaque recovery wake
 
@@ -258,7 +281,7 @@ enum TransitionDrainOutcome {
 struct DrainReadyWake { graph: GraphKey, token: ServedGenerationToken, mask: AdmissionMask }
 ```
 
-`begin_transition_drain(cell, mask)` synchronously closes selected lanes before returning the strong, token/mask-bound `TransitionDrain`. `wait_until(deadline)` linearizes final-drop against expiry: it returns an unforgeable `DrainedProof` if all selected permits released, otherwise `DrainPending` with exact, nonzero per-class counts at that instant. Expiry leaves lane state `Closing`; counts are diagnostic and never proof.
+`begin_transition_drain(cell, mask)` synchronously closes selected lanes before returning the strong, token/mask-bound `TransitionDrain`. `wait_until(deadline)` linearizes final-drop against expiry: it returns an unforgeable `DrainedProof` only after all selected ownership has settled and released, including registered successors retaining submitted I/O after task termination; otherwise `DrainPending` with exact, nonzero per-class counts at that instant. Expiry leaves lane state `Closing`; counts are diagnostic and never proof.
 
 Pending never aborts/cancels/replays a write and never authorizes generation build, replacement, or recovery. Request-owned reads may cancel normally, but a stalled body/scoped producer remains counted until it actually settles. The graph stays blocked for selected admission.
 
@@ -300,11 +323,30 @@ receives traffic. No process-local proof, operation, or receiver crosses that
 boundary; overlap needs a separate distributed fence. After disconnect, outcome
 remains unknown unless ordinary graph state proves it.
 
+### 7.3 Independent historical read admission
+
+The [lifecycle proposal](0066-server-lifecycle-and-online-deployment.md#independent-historical-reads)
+owns historical execution and retention semantics. Historical reads use separate
+admission and lifetime accounting from changing live state. Live replacement
+closes the replaced cell; it does not close qualified historical admission or
+retarget its permits. Existing historical readers and new requests for retained
+versions remain available during deployment under that contract.
+
+The exact capture and registration interface is acceptance work. The historical
+admission owner must register atomically with the shutdown latch before it is
+published; request capture uses that registered owner without an ownership gap.
+It remains bounded and closes under the same shutdown deadline. Reads stay request-owned
+and cooperatively cancellable; bodies, reconstruction and scoped producers remain
+counted through settlement. This extension does not reopen old live cells.
+
 ## 8. One bounded shutdown budget
 
-V1 adds `--shutdown-grace-seconds <u64>`, defaulting to 25 and injectable in
-tests. Zero requests immediate cutoff. The outer orchestrator termination grace
-must remain strictly longer.
+RFC 0049 landed `--shutdown-grace-seconds <u64>` (default 25, env fallback,
+zero = immediate cutoff) and the operating-system watchdog thread that exits 2
+at the deadline. V1 adds the participant interface below to that existing
+deadline; it changes neither the flag nor the exit path. The deadline half of
+this section is implemented by RFC 0049; the participant half is not started.
+The outer orchestrator termination grace must remain strictly longer.
 
 The lifecycle API is deliberately substrate-neutral:
 
@@ -327,7 +369,8 @@ Completed outputs/guards stay counted until drop or atomic registered-participan
 Initial participants are HTTP connections and served generations. Latch stop
 already closes cell `All`; the generation participant owns their exact drains and
 write abort handles. RFC 0036's separate `RecoveryTaskSet` may implement the trait;
-RFC 0035 knows no task type, recovery call/result, or ownership rule.
+RFC 0035 defines no task type, recovery call/result, or ownership rule of its
+own, and names task sets only to exempt their writers from the §6.5 source guard.
 
 At signal receipt `ts`, the coordinator creates `ShutdownDeadline(ts + grace)` and
 arms its already-running watchdog before any wait. `latch.stop(deadline)` then
@@ -360,6 +403,7 @@ optional rolling-safe `lifecycle` detail whose `kind` and `outcome` are strings
 | Selected lane closed/draining, including after transition timeout | 503; `code` absent | `generation_draining` | `not_started` |
 | `TransitionDrain` deadline expires | no initiating HTTP response; selected requests use the 503 above | `transition_drain_pending` diagnostic | `blocked` |
 | New request/registration sees Stopping latch | 503; `code` absent | `server_stopping` | `not_started` |
+| Historical target expired or unavailable | 404; `code` absent | `historical_unavailable` | `not_started` |
 | Caught write panic or result channel closes without a terminal value | 500; `code: Internal` | `operation_outcome_unknown` | `unknown` |
 | Result receiver was already dropped | executor emits nothing; write stays owned | — | `unknown_to_client` |
 | Cutoff wins an active operation | force-close/body error; never synthesize success | `shutdown_cutoff` in diagnostics only | `unknown` |
@@ -392,7 +436,10 @@ metrics remain the substrate view; server-operation metrics do not replace them.
 ## 10. Resource and security posture
 
 Read permits are lightweight lifecycle counts, not a new byte/concurrency budget;
-existing Blob/export transport bounds still apply. A write task holds both its
+existing Blob/export transport bounds still apply. Owned execution must also
+qualify process-wide admission/input bounds, a finite queue or immediate refusal,
+and isolated completion/recovery/status reserves before shipping; see the
+[lifecycle minimum T10 gate](0066-server-lifecycle-and-online-deployment.md#server-validation). A write task holds both its
 per-actor workload guard and write permit. Neither class waits for a gate permit.
 
 Lifecycle lock order is latch -> cell lanes; request capture never takes the latch.
@@ -425,8 +472,8 @@ engine gates; rejection reverses it, and bearer plaintext enters neither owner.
 2. Cut every current route over at once and extend source guards; add the
    `ServingRegistrationLatch` and opaque activation bridge before replacement is
    enabled.
-3. Add `ShutdownDeadline`, participant registry, connection/generation
-   participants, independent hard watchdog, and lifecycle wire outcomes.
+3. Add `ShutdownDeadline`, participant registry and connection/generation
+   participants over the RFC 0049 watchdog, plus lifecycle wire outcomes.
 4. Land transport/failpoint/subprocess evidence, metrics, docs, and release notes.
 
 These steps require no storage migration. A later RFC may consume the close/drain and opaque-wake interfaces unchanged.
@@ -443,12 +490,12 @@ These steps require no storage migration. A later RFC may consume the close/drai
 | Activation/retirement versus shutdown t0 cannot publish or omit a live cell after snapshot | server registry/shutdown race test |
 | Fresh publication of the same runtime gets a new cell/token; old lanes remain closed | server registry/admission tests |
 | Transition expiry with a stalled read stream returns non-proof read counts and 503s new observers; cancellation plus producer settlement emits wake then proof | Blob/export transport and admission failpoint tests |
-| Transition expiry with a stalled write returns non-proof write counts, releases scheduler capacity, and neither aborts/replays/recovers; terminal drop emits wake then proof | write-cancellation and transition-scheduler failpoint tests |
+| Transition expiry with a stalled write returns non-proof write counts, releases scheduler capacity, and neither aborts/replays/recovers; qualified settlement and final release emit wake then proof | write-cancellation and transition-scheduler failpoint tests |
 | Same-process replacement under unchanged writer authority requires selected proof and a fresh cell; cross-process replacement remains stop-before-start | registry/transition subprocess tests |
 | External task-set output/guard handoff is atomic, shares the deadline, and cannot falsely drain | shutdown-participant unit test |
 | `RecoveryRequired` and panic emit one opaque wake; ordinary errors do not | server in-source operation-lifetime tests |
 | Merge-delete preauthorizes both; delete denial stays 200/`branch_deleted:false`, and nested `RecoveryRequired` wakes | branch route and operation-lifetime tests |
-| Every writer uses the executor and every target-observing route uses a typed capture | `crates/omnigraph/tests/forbidden_apis.rs` plus server source guards |
+| Every HTTP route writer uses the executor, every target-observing route uses a typed capture, and every exempt transition-owner writer carries the `forbidden-api-allow` sentinel | `crates/omnigraph/tests/forbidden_apis.rs` plus server source guards |
 | HTTP/1 disconnect, HTTP/2 reset, and timeout after durable arm do not cancel or replay | new `crates/omnigraph-server/tests/write_cancellation.rs`, extending engine failpoint seams |
 | Graph A close/drain does not affect graph B | `crates/omnigraph-server/tests/multi_graph.rs` |
 | Short operation completes and responds during graceful shutdown | real-server shutdown test |
@@ -457,6 +504,9 @@ These steps require no storage migration. A later RFC may consume the close/drai
 | Closed lane and Stopping latch map to lifecycle 503; panic/channel loss to unknown 500; cutoff never sends success | server API/OpenAPI and subprocess tests |
 | Denied/malformed input never starts owned work; post-close keep-alive requests never enter target work | server route and operation-lifetime tests |
 | Immediate completion/panic cannot race registration or cutoff accounting | server in-source operation-lifetime tests |
+| Error/panic after accepted I/O retains ownership; atomic successor transfer stays in the original drain; no proof or capacity release before settlement | server storage-decorator and lifetime tests; lifecycle T6 |
+| Historical acquisition races live replacement, cleanup and shutdown without a registration or retention gap | server/engine historical-view and shutdown tests; lifecycle T8 |
+| Process admission bounds, queue policy, disconnected lifetime and completion reserves hold under saturation | server resource/lifetime owners; lifecycle minimum T10 gate |
 
 The cancellation suite must be feature-gated on server failpoints and must run
 non-vacuously in CI. Add:
@@ -500,3 +550,43 @@ orchestrator grace exceed server grace. Operator docs require stop-before-start
 for cross-process replacement under the current writer boundary and describe
 proof-gated same-process replacement. Release notes promise neither
 uninterrupted recovery, exactly-once retry, nor durable operation lookup.
+
+## Decision log
+
+- 2026-09-26: §6.5 limits the source guard to HTTP route writers and target
+  observers and names one exempt class, writers owned by the transition
+  owner's task set, each marked by a `// forbidden-api-allow: <reason>`
+  sentinel; the exemption covers the transition owner's apply task, and a
+  deployment is declared through the configuration ledger rather than
+  submitted by a route; supersedes "Source guards fail CI
+  for writers outside `try_start_write` or target observers outside typed
+  capture" and the §13 row "Every writer uses the executor". §8 records
+  that RFC 0049 implements the shutdown flag and watchdog and that V1 adds
+  only the participant interface; supersedes "V1 adds
+  `--shutdown-grace-seconds <u64>`, defaulting to 25 and injectable in tests.
+  Zero requests immediate cutoff", "RFC 0035 knows no task type" and the §12
+  step 3 "independent hard watchdog". §9 adds the `historical_unavailable`
+  outcome for an expired or unavailable historical target. The front matter
+  blocks on the RFC 0066 minimum T10 ownership gate, superseding
+  `blocked_on: []`, and the dependency line names RFC 0066 as owner of
+  historical admission (§7.3) and the §10 shipping gate.
+- 2026-09-25: §0 and invariants 9 and 11 hold a write through settlement of
+  its scoped work, including submitted storage I/O, rather than task
+  termination; supersedes "belongs to the server until engine-terminal
+  result, caught panic, or the shutdown deadline", "Normal read end or write
+  terminal/panic drops its permit" and "It releases permits, reports
+  lifecycle-owned unknown outcome to the result receiver". §1 describes the
+  detached-publication engine; supersedes "Writers may arm recovery and move
+  Lance table heads before graph-wide manifest publication". §6.1 scopes the
+  two-lane cell to live admission; supersedes "Registry publication exposes
+  one opaque, indivisible cell". §6.4 releases registration and permits only
+  after qualified settlement; supersedes "terminal/panic --> send if receiver
+  exists" and the diagram step "--> release registration + permits" with no
+  settlement condition. §6.5
+  requires effect-free read capture and stream preparation. §7.1 grants
+  `DrainedProof` only after selected ownership settles; supersedes "returns an
+  unforgeable `DrainedProof` if all selected permits released". New §7.3
+  keeps historical read admission independent of live replacement under
+  RFC 0066. §10 requires the RFC 0066 minimum T10 gate before owned
+  execution ships. §13 adds settlement, historical-acquisition and saturation rows;
+  supersedes "terminal drop emits wake then proof".

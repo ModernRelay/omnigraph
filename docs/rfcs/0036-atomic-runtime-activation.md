@@ -7,20 +7,22 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-08-13
-updated: 2026-08-23
+updated: 2026-09-26
 discussion: null
 supersedes: []
 superseded_by: []
 blocked_on:
   - RFC 0034 acceptance and implementation
   - RFC 0035 acceptance and implementation
+  - "RFC 0066 historical-read capture, retention and reconstruction interface (§5.1)"
 ---
 
 # RFC 0036: Atomic runtime activation and graph availability supervision
 
 - **Depends on:** RFC 0034 durable recovery authority; RFC 0035 served-operation
   admission and lifetime; RFC 0038 typed storage-failure classification;
-  internal manifest schema v6; Lance 10.0.0.
+  internal manifest schema and Lance as pinned by the workspace `Cargo.toml`
+  (Lance 11.0.0 at `24da4f54`).
 - **Replaces:** the unmerged graph-supervision direction in PR #489. Useful
   tests and operational requirements from that PR remain inputs, but its
   implementation is not the architecture.
@@ -29,9 +31,10 @@ blocked_on:
 
 ## 0. Decision summary
 
-Each graph serves one immutable generation containing engine, accepted catalog,
+Each graph serves one immutable default generation containing engine, accepted catalog,
 policy, queries, providers, witnesses, readiness, and correctness caches. None
-publishes independently.
+publishes independently. Qualified historical reads use separately admitted
+immutable execution views under the extension in §5.1.
 
 A supervisor builds away from serving. Its supervision-owned task set obtains
 RFC 0034's opaque `FinalizedRecoveryGuard` by recovery or no-effect verification.
@@ -43,8 +46,9 @@ releases the guard. No fallible work follows predecessor close.
 
 Requests pin one generation and its local caches; hard read-only replicas have no
 write capability. Supervisors are singleflight, wakes coalesce without resetting
-backoff, and bounded graph-local work cannot block peers. One state derives
-readiness. Status is additive; unavailable entries require `include=all`.
+backoff, and bounded graph-local work cannot block peers. The live state derives
+live readiness; historical availability is observed separately under §6. Status
+is additive; entries without live read readiness require `include=all`.
 
 ## 1. Problem
 
@@ -85,7 +89,8 @@ RFC 0035 owns served-operation admission, request/task lifetime, disconnect
 behavior, per-graph draining, and shutdown ordering. RFC 0036 consumes its
 indivisible serving cell: one non-reusable token, exact `ReadObserver` and `Write`
 admission lanes, and one runtime `Arc`. A request retains the matching lane
-permit and that `Arc` until terminal completion. RFC 0036 chooses which lanes a
+permit and that `Arc` until scoped-work settlement, including submitted I/O;
+task completion or panic alone cannot release pending ownership. RFC 0036 chooses which lanes a
 transition closes; RFC 0035 implements close/drain and task settlement.
 
 Fresh cells publish only through RFC 0035's process-wide
@@ -94,7 +99,9 @@ Fresh cells publish only through RFC 0035's process-wide
 the registry store against `Running -> Stopping`; RFC 0035 owns their mechanics.
 
 RFC 0036 also consumes RFC 0035's typed `TransitionDrain`. Required lanes close
-before recovery or build, and only `Drained(DrainedProof)` authorizes progress.
+before effectful recovery or live transition construction, and only
+`Drained(DrainedProof)` authorizes that progress. Effect-free historical
+reconstruction under §5.1 does not wait for the live drain.
 `DrainPending` parks the strong drain and does not authorize work. Recovery tasks
 join RFC 0035's one `ShutdownDeadline`; this RFC neither resets it nor defines cutoff.
 
@@ -104,9 +111,14 @@ after its operation-local effect and recovery rules authorize another attempt;
 it does not classify by matching error strings or redefine the taxonomy.
 
 This RFC does not define recovery formats or choices, HTTP-write cancellation
-or acknowledgement, shutdown, hot config reload, graph add/remove, multi-writer
+or acknowledgement, shutdown, general hot config reload, graph add/remove, multi-writer
 fencing, durable reader leases, or warm correctness-cache transfer. It exposes
-no raw storage diagnostic over HTTP.
+no raw storage diagnostic over HTTP. The [lifecycle proposal](0066-server-lifecycle-and-online-deployment.md)
+extends this draft for schema/query deployment, qualified reuse of settled mutable
+engine state and independently admitted historical reads. Its four acceptance
+gates remain required. Other configuration classes are separately qualified.
+Earlier sidecar-specific RFC 0034 interfaces also require reconciliation with
+the current detached-publication engine; they are not available implementation APIs.
 
 ## 3. Normative invariants
 
@@ -121,14 +133,16 @@ no raw storage diagnostic over HTTP.
    through the unactivated wrapper, to post-store release; factories borrow it.
 6. Both factory modes are effect-free. Every writable candidate owns a finalized
    guard; managed recovery is roll-forward-only; read-only is never write-ready.
-7. No recovery or build starts without `DrainedProof`; pending drains hold no
+7. No effectful recovery or live transition build starts without `DrainedProof`; pending drains hold no
    global scheduler permit and never reopen a lane.
-8. Readiness derives from one state. A closed gate never reopens; reuse of an
+8. Live readiness derives from one state. A closed gate never reopens; reuse of an
    unchanged runtime requires a fresh serving cell and a no-change proof.
 9. Replacement closes every predecessor lane before publishing its fresh cell,
-   all under the shutdown latch; no old permit can start after the store.
-10. Generation residency, retries, queue depth, build time, and hot-path work
-   are bounded and observable.
+   all under the shutdown latch; no replaced live-cell permit can start after
+    the store. Independent historical admission follows §5.1.
+10. Generation residency, retries, queue depth, candidate admission and hot-path
+    work are bounded and observable. A build deadline initiates cancellation;
+    §11.3 retains accounting until settlement rather than promising immediate termination.
 
 ## 4. Immutable construction input
 
@@ -205,13 +219,29 @@ The `RecoveryTaskSet` graph slot owns every writable path and its non-cloneable
 guard: roll-forward supplies it after recovery; clean `ReadWriteNoRecovery`
 supplies its equivalent by effect-free verification. The factory borrows it
 under the same root-gate domain, then the wrapper owns it. Task ownership remains
-counted through activation/drop, with no handoff gap. Store precedes guard release;
-failure, timeout, stale result, or discard drops it. Only `ReadOnlyProbe` may
-produce a wrapper with `None`.
+counted through activation or settled disposal, with no handoff gap. Store
+precedes guard release; failure, timeout, stale result or discard follows §11.3
+before releasing the guard or reservations. Only `ReadOnlyProbe` may produce a
+wrapper with `None`.
 
 The witness is an installation proof, not a claim that data commits stop. Data
 HEADs may advance normally; an accepted-schema identity change requires a new
 generation.
+
+### 5.1 Historical execution and live activation
+
+The [independent historical-read contract](0066-server-lifecycle-and-online-deployment.md#independent-historical-reads)
+owns exact data/schema/query binding, current authorization, effect-free
+reconstruction after eviction/restart and acquisition versus reclamation. It
+extends the default-generation model; an old engine `Arc` is not a historical
+view. The server's historical admission registers independently with RFC 0035's
+shutdown lifetime and cannot reach mutable catalog or cache state changed by apply.
+
+The state machine and predecessor closure below govern default live serving.
+Historical reconstruction does not run its effectful recovery/build sequence or
+wait for its live drain. It still requires retained authoritative state, current
+authorization, resource reservations and shutdown registration. Its interface
+and durable reference/retention representation remain acceptance work.
 
 ## 6. Registry state and generation state machine
 
@@ -268,9 +298,10 @@ durable authority, and accepted-schema identity did not change and no durable
 recovery effect began. The transition proves required E1 lanes drained and
 mints a new token and gates. If an effect may have occurred, the graph remains
 `Blocked`; only an old lane that was never closed and is explicitly safe under
-the external proof can contribute readiness.
+the external proof can contribute live readiness. Historical availability uses
+its separate admission owner.
 
-Readiness is derived as follows:
+Live readiness is derived as follows:
 
 - `read_ready` requires an open `ReadObserver` on the current/drain-held cell
   whose transition proof permits routing;
@@ -278,10 +309,24 @@ Readiness is derived as follows:
   lane; and
 - a hard read-only role always reports `write_ready = false`.
 
+With the lifecycle extension, `historical_read_ready` is independent of these
+live flags. It is true only while the registered historical admission owner is
+open and has verified retained authority for at least one supported target;
+resident cache entries are not required. Each request still checks its exact
+target, current authorization, retention acquisition and resource budget. This
+flag does not promise that every historical target or caller can be served.
+Historical routes use that owner, never the live `read_ready` routing check.
+Status reads a bounded observation; it must not reconstruct a historical view.
+
+The [lifecycle readiness contract](0066-server-lifecycle-and-online-deployment.md#status-and-embedding-diagnostics)
+owns aggregation of live and historical capability and their separate counts.
+If no retained supported target remains available, historical readiness is
+false even if previously admitted readers are still finishing.
+
 `DrainPending` is internal `transition_drain_pending`/`blocked` and public
 `draining`, with no retry or public counts.
 `RecoveryDisposition::NeedsCompensation` projects blocked `operator_required`,
-no retry, and only unclosed-lane readiness. `RecoveryDisposition::Blocked`
+no retry, and only unclosed-lane live readiness. `RecoveryDisposition::Blocked`
 projects its RFC 0034-owned blocker without guessing retryability.
 
 ## 7. Candidate construction and atomic activation
@@ -305,13 +350,15 @@ For one attempt, the supervisor:
    retains closed graph-local state without a build permit.
    `NeedsCompensation` publishes `Blocked/OperatorRequired`, `Blocked` preserves
    the RFC 0034 blocker, and only `Clean` supplies the finalized guard;
-5. invokes only `ReadWriteNoRecovery(ReadWriteLeaderGuard)` for writable
+5. records the absolute candidate deadline, then invokes only
+   `ReadWriteNoRecovery(ReadWriteLeaderGuard)` for writable
    construction, borrowing that existing guard after recovery or obtaining an
    equivalent guard by no-effect verification. A hard read-only path instead
    invokes `ReadOnlyProbe` and carries no guard;
 6. builds fresh schema/catalog, policy, queries, providers, facades, and caches
    from one coherent view, then binds the generation into a fresh RFC 0035 cell;
-7. checks the complete witness and moves any finalized guard into one
+7. proves scoped construction has settled, checks the complete witness and
+   moves any finalized guard into one
    `UnactivatedGeneration`; and
 8. submits that wrapper for activation.
 
@@ -322,21 +369,23 @@ only for `RollForwardRequired`; a `Clean` result includes the guard.
 
 Candidate construction is graph-state read-only. It may allocate local memory,
 open network connections, and read object storage, but creates no durable graph
-effect. Its scoped children may therefore be canceled at the build deadline.
-The separately owned recovery task is not a child and is never canceled by that
-deadline.
+effect. Its build deadline requests cancellation under §11.3; effect-free work
+does not imply bounded cancellation latency. The separately owned recovery task
+is not a child and is never canceled by that deadline.
 
 ### 7.2 Activation linearization point
 
 Activation takes the short transition mutex, performs no I/O, and checks:
 
 - entry identity, `config_generation`, active attempt, and expected predecessor;
+- the absolute candidate deadline has not expired, independent of whether its
+  timer task has run, and scoped construction has settled;
 - config digest and predecessor durable graph identity;
 - exact predecessor token/mask `DrainedProof`, or proof of no predecessor;
 - the candidate admission token and both gates are fresh and unpublished; and
 - residency limits permit retirement of the predecessor.
 
-Failure drops the wrapper and guard. Under the transition mutex, initial activation
+Failure rejects the wrapper and disposes of it under §11.3. Under the transition mutex, initial activation
 calls `register_and_publish(new, no_fail_store)`; replacement calls
 `replace_and_publish(old, new, proof, no_fail_store)`, consuming the matching
 token/mask `DrainedProof`. The latch first prunes dead entries
@@ -364,8 +413,10 @@ strong cell reference. The bounded weak index cannot retain generations and prun
 
 Deregistration and `Stopping` share the latch. If deregistration wins, both-lane
 proof makes omission safe; if stop wins, its upgraded strong snapshot retains
-G1 regardless of later index removal. At most one retiring generation is
-admitted; another non-essential build waits.
+G1 regardless of later index removal. At most one retiring default engine generation is
+admitted; another non-essential build waits. This is not a historical-version
+retention count. Historical residency, reconstruction and retention have their
+own finite budgets and remain charged until actual release.
 
 ## 8. Schema, policy, and query coherence
 
@@ -373,9 +424,11 @@ Data movement under the same accepted-schema identity may refresh the engine tip
 through existing coherent snapshot logic. A different identity must never
 appear behind the catalog of an in-flight generation. The engine exposes a
 schema token; a fresh operation seeing a mismatch returns `GenerationStale`
-before schema-dependent work and wakes the supervisor.
+before schema-dependent work and wakes the supervisor. Qualified historical
+execution instead validates its selected immutable schema identity; a newer
+default identity alone does not invalidate it.
 
-Policy and query content come only from `AppliedGraphConfig`, never reread
+Default-generation policy and query content come only from `AppliedGraphConfig`, never reread
 paths. All queries check against the candidate catalog. Any query or policy
 compile failure rejects the whole candidate; it neither publishes a partial
 registry nor borrows predecessor policy for availability.
@@ -447,12 +500,12 @@ and re-probes authority before deciding whether more work exists.
 
 The supervision layer owns one process-wide `RecoveryTaskSet`, the recovery
 executor; each graph supervisor exclusively owns its graph slot. At most one
-terminally owned writable-authority task exists per graph, tracked until a typed
-failure or wrapper activation/drop, even if its waiter disappears. Only that
+owned writable-authority task exists per graph, tracked through a typed failure
+until settlement or through wrapper activation/settled disposal, even if its
+waiter disappears. Only that
 counted task receives `FinalizedRecoveryGuard`, lends it to the factory, and
-retains the wrapper. A candidate timeout may cancel the effect-free factory
-scope; it cannot detach the recovery task, which must settle and dispose of any
-retained guard.
+retains the wrapper. A candidate timeout requests cancellation under §11.3;
+it cannot detach the recovery task, which must settle and dispose of any retained guard.
 
 The task set is an RFC 0035 `ShutdownParticipant`. It receives the same absolute
 `ShutdownDeadline` as connection and served-operation drain and may consume
@@ -484,8 +537,8 @@ not retry authority, and exist only when retry is scheduled.
 
 Only one attempt runs per graph. Attempt identity is a tuple of process boot
 nonce, entry identity, config generation, and monotonic attempt sequence. A
-late result that fails the activation checks is discarded and recorded; it
-cannot mark a newer request ready.
+late result that fails the activation checks is rejected and recorded, with
+settled disposal under §11.3; it cannot mark a newer request ready.
 
 ### 11.3 Global bounds and fairness
 
@@ -495,10 +548,27 @@ wakes occupy one position and launch order rotates after each task. A slow
 candidate cannot consume recovery capacity, and repeated recovery for one graph
 cannot starve another graph or consume all build permits.
 
-Candidate build is non-mutating and cancellation-safe, so its deadline is a
-hard execution bound: the scoped build task and its children are canceled and
-the build permit is released. Recovery remains owned until activation/drop and
-is never hidden inside that permit or abandoned by this deadline.
+Candidate cancellation and settlement follow one rule:
+
+1. The absolute candidate deadline forbids activation of the expired attempt
+   and requests cancellation of its factory and scoped children. It does not
+   prove termination or release capacity.
+2. Keep the build permit, byte reservations and any borrowed authority
+   counted until construction, producers and submitted I/O settle. An atomic
+   registered-successor transfer preserves the same accounting; it does not
+   free the build permit. Disposal releases the guard only after settlement.
+3. Until settlement, a queued candidate cannot reuse that permit.
+   Queues remain finite; other graphs use only genuinely free capacity. Late
+   results cannot activate. Completed candidates remain charged until activation
+   transfers their resident allocations to serving ownership or settled disposal
+   releases them.
+4. The shared shutdown cutoff reports unresolved work if settlement cannot be
+   proved. It remains the process-exit bound; a candidate deadline adds no second
+   cutoff and makes no hard execution-time guarantee.
+
+Recovery retains its independent ownership, budget and shutdown registration;
+candidate cancellation cannot abandon it. A parked drain may still release an
+unused scheduler reservation before any construction starts.
 
 Both queue lengths are bounded by configured graph count; each graph has at most
 one candidate and recovery task. Parked drains hold neither permit; independent
@@ -508,8 +578,9 @@ limits stay observable and no detached task collection grows.
 
 Cluster-global validation completes before listener bind. Default startup then
 creates every configured entry, starts supervisors, and binds without waiting
-for every graph to open. A graph route returns bounded 503 status until a
-generation is ready; healthy graphs become available independently.
+for every graph to open. A default live graph route returns bounded 503 status
+until its default generation is ready; healthy graphs become available
+independently. Historical admission follows §5.1 without waiting for that generation.
 
 `--require-all-graphs` remains an operator-selected barrier. It has an explicit
 deadline and fails startup if any graph is blocked or unready at that boundary.
@@ -520,26 +591,41 @@ reported by graph status.
 
 ### 12.1 Listing semantics
 
-The existing `GET /graphs` default continues to list only read-ready served
-graphs, sorted by `graph_id`. This preserves the meaning consumed by older
-clients.
+The existing `GET /graphs` default continues to list only live-read-ready served
+graphs, sorted by `graph_id`. Historical-only availability does not add a graph
+to this legacy list. This preserves the meaning consumed by older clients. The
+RFC 0049 `quarantined` list keeps its computation, applied graphs with no
+registry entry, and narrows to graphs the registry never admitted. A `Blocked`
+entry is a registry entry, so it appears under `include=all`
+with `state=blocked` and not in `quarantined`; once every applied graph gets an
+entry, `quarantined` is empty and stays for compatibility.
 
 `GET /graphs?include=all` lists every configured entry. `GraphInfo` keeps required
 `graph_id`/`uri` and adds optional `availability { state, read_ready, write_ready,
-role, failure_class, retry_at }`.
+role, failure_class, retry_at }`. The lifecycle extension adds optional
+`historical_read_ready` with the meaning in §6. Historical-only graphs remain
+discoverable through this authorized all-entry view.
 
 `availability` is `Option` with a Serde default. On an old server, absence means
 legacy ready-list behavior: read ready, write capability unknown; old clients
-ignore the addition. `state`, `role`, and `failure_class` are open strings, and
+ignore the addition. Absence of `historical_read_ready` means historical
+capability is unknown, not false or implied by `read_ready`. `state`, `role`, and `failure_class` are open strings, and
 shared clients preserve/map unknown values rather than fail deserialization.
+Current `state` values: `opening`, `serving`, `draining`, `rebuilding` and
+`blocked`; `operator_required` is a `failure_class` value carried beside `blocked`.
 
-One graph's object comes from one `RuntimeState`; a list may span transitions
-across graphs. Activation IDs, backend detail, credentials, and retry counters
-are not public contract.
+One graph's live fields come from one `RuntimeState`. Its historical field comes
+from a bounded observation of the independently registered historical owner;
+these are capability observations, not an atomic cross-owner serving witness.
+A list may span transitions across graphs. Activation IDs, backend detail,
+credentials, and retry counters are not public contract.
 
 ### 12.2 Route failure
 
-False route readiness returns 503, not 404. A selected closed/draining lane uses
+False live route readiness returns 503, not 404. An explicitly historical route
+checks its historical owner and exact selected target instead; a closed live
+lane alone cannot refuse it. Unavailable history follows the lifecycle contract
+without substituting current data. A selected closed/draining live lane uses
 RFC 0035's no-`ErrorCode` lifecycle `kind=generation_draining`,
 `outcome=not_started`; other bodies carry graph, state, broad failure class,
 and optional retry. Pre-Cedar
@@ -553,7 +639,7 @@ and lists 503 on every per-graph route that can fail at routing admission.
 
 ## 13. Cost and observability
 
-Healthy routing does one registry lookup, one `Arc` clone, and RFC 0035 admission;
+Healthy default-live routing does one registry lookup, one `Arc` clone, and RFC 0035 admission;
 it never opens a graph, scans a manifest, or compiles policy/query content.
 Freshness uses the cheap Lance/manifest probe and never reconstructs history per
 request; same-schema data commits do not rebuild a generation.
@@ -577,14 +663,20 @@ No phase exposes a partial generation or a wake without a live supervisor.
 Existing test owners are extended, not duplicated:
 
 - `registry.rs`: G1-or-G2 atomicity, exact token/lane/runtime capture, coherent
-  readiness, stale loss, and proof that G1 capture fails after the G2 store.
+  readiness, stale loss, and proof that replaced live G1 capture fails after the
+  G2 store while qualified historical admission remains independent.
 - transition tests: closed G1 never reopens; only an unchanged pre-effect proof
   yields G1/E2; pending drain releases scheduler permits, does no work, and only
   an opaque wake plus rechecked proof resumes it.
 - factory/recovery tests: both exact effect-free modes, clean/recovered writable
   guards, all four exact `RecoveryDisposition` variants,
   RollForwardOnly/no-Exclusive, offline compensation,
-  guard lifetime through activation/drop, and shutdown at wrapper handoff.
+  guard lifetime through activation/settled disposal, and shutdown at wrapper handoff.
+  Hold a candidate producer beyond its deadline with one build permit: no late
+  activation or capacity release, and no next build until producer settlement.
+  Release it and observe one queued build proceed. Race a delayed timer with
+  activation to verify the deadline check itself; separately hold the producer
+  through shutdown cutoff and require unresolved reporting, not graceful drain.
 - `stored_queries.rs`, `schema_routes.rs`, `auth_policy.rs`: exact component
   binding, pre-execution schema-stale detection, and all-or-nothing failure.
 - engine cache failpoints/server tests: a paused G1 fill cannot reach G2; local
@@ -599,6 +691,8 @@ Existing test owners are extended, not duplicated:
   shutdown/deregister interleaving.
 - `boot_settings.rs`/`openapi.rs`: ready-only default, `include=all`, legacy and
   unknown-value decoding, safe 404/503, conditional retry, no backend detail.
+  Include the lifecycle T8/T11 one-graph historical-only readiness case and
+  absence-as-unknown decoding for the optional historical flag.
 
 Use the [test ownership map](../dev/testing.md), deterministic barriers, shared
 cost harness, and RustFS transient/e-tag cells. RFC 0034 owns recovery evidence;
@@ -614,8 +708,11 @@ unready graphs by default; and restart-only recovery except as emergency fallbac
 
 ## 17. Compatibility, reversibility, and open questions
 
-This changes no durable format. Process-local supervision is reversible; additive
-status and opt-in `include=all` preserve old list behavior.
+Process-local supervision requires no graph-format change. Historical
+reconstruction and deployment may require versioned references or retention
+evidence in existing authority; their representation and compatibility remain
+acceptance work, without a second graph-publication authority. Additive status
+and opt-in `include=all` preserve old list behavior.
 
 Per the [invariants](../dev/invariants.md), [immutable versions](https://lance.org/guide/read_and_write/)
 pin old reads; sharing stays graph-neutral; [branch versions](https://lance.org/guide/tags_and_branches/)
@@ -623,3 +720,54 @@ are not identity; [object-store metrics](https://lance.org/guide/observability/)
 
 Before acceptance, settle concrete build/recovery/residency limits, the cheap
 schema token, and boolean versus view-enum spelling for `include=all`.
+
+## Decision log
+
+- 2026-09-26: §0 and invariant 8 derive live readiness from the live state and
+  observe historical availability separately; supersede "One state derives
+  readiness" and "unavailable entries require `include=all`". Invariant 10,
+  §5, §7.1, §7.2, §11.1, §11.2 and §11.3 make a candidate deadline request
+  cancellation and keep permit, reservations and guard counted until
+  settlement; supersede "queue depth, build time, and hot-path work", "failure, timeout, stale result, or
+  discard drops it", "Its scoped children may therefore be canceled at the
+  build deadline", "Failure drops the wrapper and guard", "A candidate timeout
+  may cancel the effect-free factory scope", "is discarded and recorded" and
+  "its deadline is a hard execution bound". §6 adds `historical_read_ready`,
+  independent of the live flags; supersedes "can contribute readiness" and
+  "Readiness is derived as follows". §11.4 scopes startup 503 to default live
+  routes; supersedes "A graph route returns bounded 503 status until a
+  generation is ready". §12.1 lists only live-read-ready graphs by default and
+  adds the optional historical flag, absent meaning unknown; supersedes "list
+  only read-ready served graphs" and "One graph's object comes from one
+  `RuntimeState`". §12.2 checks the historical owner on historical routes;
+  supersedes "False route readiness returns 503, not 404". §13 scopes the
+  routing cost to default-live routing; supersedes "Healthy routing does". §15
+  adds candidate-deadline and historical-only readiness cases; supersedes
+  "guard lifetime through activation/drop". The front matter blocks on the
+  RFC 0066 historical-read capture, retention and reconstruction interface. The
+  dependency line takes the Lance and manifest versions pinned by the
+  workspace `Cargo.toml`; supersedes "internal manifest schema v6; Lance
+  10.0.0". §11.3 counts the build permit, not a slot. §12.1 keeps the RFC 0049
+  `quarantined` computation for applied graphs with no registry entry, lists a
+  blocked entry under `include=all` instead, and lists the current `state`
+  values with `operator_required` as a `failure_class`.
+- 2026-09-25: §0 serves one default generation and admits historical reads
+  through separate immutable views; supersedes "Each graph serves one
+  immutable generation". §2 holds a request's permit and `Arc` until
+  scoped-work settlement; supersedes "until terminal completion". §2 and
+  invariant 7 require `DrainedProof` only for effectful recovery or live
+  transition construction; supersede "Required lanes close before recovery or
+  build" and "No recovery or build starts without `DrainedProof`". §2 names
+  the lifecycle extension and the detached-publication reconciliation of
+  RFC 0034 interfaces; supersedes "shutdown, hot config reload, graph
+  add/remove". Invariant 9 limits
+  predecessor closure to live cells; supersedes "no old permit can start after
+  the store". New §5.1 defines historical execution beside live activation.
+  §7.3 limits the one-retiring-generation rule to default engine generations;
+  supersedes "At most one retiring generation is admitted". §8 lets historical
+  execution validate its own schema identity and scopes policy and query
+  content to the default generation; supersedes "Policy and query content come
+  only from `AppliedGraphConfig`". §15 keeps historical admission independent
+  of replaced G1 capture; supersedes "proof that G1 capture fails after the G2
+  store". §17 allows versioned references or retention evidence in existing
+  authority; supersedes "This changes no durable format".
